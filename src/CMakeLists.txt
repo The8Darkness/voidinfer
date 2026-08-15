@@ -10,6 +10,9 @@ function(ninfer_cuda_archive target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  if(WIN32)
+    set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
@@ -31,7 +34,7 @@ add_library(ninfer_core STATIC
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3)
+target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -54,8 +57,11 @@ ninfer_internal_includes(ninfer_nvfp4_tma)
 set_target_properties(ninfer_nvfp4_tma PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+if(WIN32)
+  set_target_properties(ninfer_nvfp4_tma PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+endif()
 target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
@@ -244,18 +250,22 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC)
 
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)
 ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+target_link_libraries(ninfer_media_decode PRIVATE ${NINFER_FFMPEG_TARGET})
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
   add_library(ninfer_media_acquire STATIC
     product/media_acquire/acquire.cpp)
   ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+  if(WIN32)
+    target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)
@@ -314,5 +324,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire CUDA::cudart)
+    PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET})
 endif()
