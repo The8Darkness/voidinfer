@@ -46,13 +46,15 @@ class SequencePlanner;
 // These are the complete family execution types. Exact packages bind them to a private Variant;
 // target selection remains outside this layer and happens once in the closed Engine registry.
 //
-// The movable plan types default their moves in-class: every TU that moves a plan must see the
-// definition, and out-of-line explicit specializations of these moves do not link on MSVC.
+// The plan types declare their moves/move-assignments here and define them per variant in
+// api_impl.h with explicit bodies: any implicit definition needs the complete detail impl types
+// (only the exact target TUs have them), and MSVC 19.44 does not emit out-of-line `= default`
+// explicit specializations of these moves (LNK2019 at the final Windows link).
 template <class Variant>
 class SequencePlan {
 public:
-    SequencePlan(SequencePlan&&) noexcept = default;
-    SequencePlan& operator=(SequencePlan&&) noexcept = default;
+    SequencePlan(SequencePlan&&) noexcept;
+    SequencePlan& operator=(SequencePlan&&) noexcept;
     ~SequencePlan();
 
     SequencePlan(const SequencePlan&)            = delete;
@@ -79,8 +81,8 @@ public:
 template <class Variant>
 class SequencePlanner {
 public:
-    SequencePlanner(SequencePlanner&&) noexcept = default;
-    SequencePlanner& operator=(SequencePlanner&&) noexcept = default;
+    SequencePlanner(SequencePlanner&&) noexcept;
+    SequencePlanner& operator=(SequencePlanner&&) noexcept;
     ~SequencePlanner();
 
     SequencePlanner(const SequencePlanner&)            = delete;
@@ -101,8 +103,8 @@ public:
 template <class Variant>
 class RequestBasePlan {
 public:
-    RequestBasePlan(RequestBasePlan&&) noexcept = default;
-    RequestBasePlan& operator=(RequestBasePlan&&) noexcept = default;
+    RequestBasePlan(RequestBasePlan&&) noexcept;
+    RequestBasePlan& operator=(RequestBasePlan&&) noexcept;
     ~RequestBasePlan();
 
     RequestBasePlan(const RequestBasePlan&)            = delete;
@@ -118,8 +120,8 @@ public:
 template <class Variant>
 class RequestPlan {
 public:
-    RequestPlan(RequestPlan&&) noexcept = default;
-    RequestPlan& operator=(RequestPlan&&) noexcept = default;
+    RequestPlan(RequestPlan&&) noexcept;
+    RequestPlan& operator=(RequestPlan&&) noexcept;
     ~RequestPlan();
 
     RequestPlan(const RequestPlan&)            = delete;
