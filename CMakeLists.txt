@@ -29,11 +29,6 @@ if(MSVC)
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
-  # The NVFP4/TMA kernels pass 128-byte-aligned CUtensorMap descriptor structs by value
-  # (__grid_constant__). MSVC rejects over-aligned formal parameters (C2719) unless
-  # /d2FH4- is set; every call site in this repository passes properly aligned objects,
-  # so the guarantee the check would enforce holds by construction.
-  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/d2FH4->)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
   # the project-wide /MD runtime. Keep one CRT in the final process.
   add_link_options(/NODEFAULTLIB:LIBCMT)
