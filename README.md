@@ -121,8 +121,8 @@ binary distribution; NInfer is run from its source build tree.
 ### Linux
 
 ```bash
-git clone https://github.com/natpate/ninfer.git
-cd ninfer
+git clone https://github.com/natpate/ninfer-windows.git
+cd ninfer-windows
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
@@ -143,8 +143,8 @@ Use Visual Studio 2022 (with MSVC) and vcpkg; the manifest in the repository roo
 `curl`, `ffmpeg`, and `pkgconf`:
 
 ```powershell
-git clone https://github.com/natpate/ninfer.git
-cd ninfer
+git clone https://github.com/natpate/ninfer-windows.git
+cd ninfer-windows
 
 cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 `
   -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake `
