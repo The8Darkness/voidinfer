@@ -37,8 +37,8 @@ From the **x64 Native Tools Command Prompt for VS 2022** (or any shell with the 
 and the CUDA toolkit in `PATH`):
 
 ```powershell
-git clone https://github.com/natpate/ninfer.git
-cd ninfer
+git clone https://github.com/natpate/ninfer-windows.git
+cd ninfer-windows
 
 cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 `
   -DCMAKE_TOOLCHAIN_FILE=C:/src/vcpkg/scripts/buildsystems/vcpkg.cmake `
