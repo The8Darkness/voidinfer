@@ -12,7 +12,11 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -235,11 +239,13 @@ int main() {
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
     failures +=
-        check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
+        check(done.at("timings_seconds").at("ttft").get<double>() ==
+                          outcome.metrics.ttft_seconds,
               "TTFT missing or lost precision");
-    failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
+    failures += check(done.at("speculative").at("backend") == "mtp",
+                      "speculative backend missing");
     failures +=
-        check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
+        check(done.at("speculative").at("draft_window") == 3, "draft window missing");
     failures += check(done.at("speculative").at("fallback_steps") == 2,
                       "speculative fallback count missing");
     failures +=
@@ -295,7 +301,12 @@ int main() {
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
+        ("ninfer-request-log-test-" +
+#ifdef _WIN32
+         std::to_string(static_cast<long long>(::_getpid())) +
+#else
+         std::to_string(static_cast<long long>(::getpid())) +
+#endif
          ".jsonl");
     std::filesystem::remove(log_path);
     {
