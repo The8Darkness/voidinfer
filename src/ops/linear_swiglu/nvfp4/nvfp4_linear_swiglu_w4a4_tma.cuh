@@ -237,7 +237,7 @@ __global__ __launch_bounds__(
             auto* destination0 = reinterpret_cast<__nv_bfloat162*>(
                 shared_output + token0 * kOutputStride + pair_row);
             auto* destination1 = reinterpret_cast<__nv_bfloat162*>(
-                shared_output + token1 * kOutputStride + parent_row);
+                shared_output + token1 * kOutputStride + pair_row);
             const auto& gate = accumulators[mma_m][mma_n];
             const auto& up   = accumulators[mma_m][mma_n + kGateMmaFragments];
             *destination0    = __floats2bfloat162_rn(silu(gate[0] * alpha) * (up[0] * alpha),
