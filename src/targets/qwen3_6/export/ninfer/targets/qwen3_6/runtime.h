@@ -45,11 +45,14 @@ class SequencePlanner;
 
 // These are the complete family execution types. Exact packages bind them to a private Variant;
 // target selection remains outside this layer and happens once in the closed Engine registry.
+//
+// The movable plan types default their moves in-class: every TU that moves a plan must see the
+// definition, and out-of-line explicit specializations of these moves do not link on MSVC.
 template <class Variant>
 class SequencePlan {
 public:
-    SequencePlan(SequencePlan&&) noexcept;
-    SequencePlan& operator=(SequencePlan&&) noexcept;
+    SequencePlan(SequencePlan&&) noexcept = default;
+    SequencePlan& operator=(SequencePlan&&) noexcept = default;
     ~SequencePlan();
 
     SequencePlan(const SequencePlan&)            = delete;
@@ -76,8 +79,8 @@ public:
 template <class Variant>
 class SequencePlanner {
 public:
-    SequencePlanner(SequencePlanner&&) noexcept;
-    SequencePlanner& operator=(SequencePlanner&&) noexcept;
+    SequencePlanner(SequencePlanner&&) noexcept = default;
+    SequencePlanner& operator=(SequencePlanner&&) noexcept = default;
     ~SequencePlanner();
 
     SequencePlanner(const SequencePlanner&)            = delete;
@@ -98,8 +101,8 @@ public:
 template <class Variant>
 class RequestBasePlan {
 public:
-    RequestBasePlan(RequestBasePlan&&) noexcept;
-    RequestBasePlan& operator=(RequestBasePlan&&) noexcept;
+    RequestBasePlan(RequestBasePlan&&) noexcept = default;
+    RequestBasePlan& operator=(RequestBasePlan&&) noexcept = default;
     ~RequestBasePlan();
 
     RequestBasePlan(const RequestBasePlan&)            = delete;
@@ -115,8 +118,8 @@ public:
 template <class Variant>
 class RequestPlan {
 public:
-    RequestPlan(RequestPlan&&) noexcept;
-    RequestPlan& operator=(RequestPlan&&) noexcept;
+    RequestPlan(RequestPlan&&) noexcept = default;
+    RequestPlan& operator=(RequestPlan&&) noexcept = default;
     ~RequestPlan();
 
     RequestPlan(const RequestPlan&)            = delete;
