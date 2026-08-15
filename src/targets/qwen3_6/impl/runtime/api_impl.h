@@ -18,10 +18,6 @@ SequencePlan<Variant>::SequencePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlan<Variant>::SequencePlan(SequencePlan&&) noexcept = default;
-template <>
-SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&&) noexcept = default;
-template <>
 SequencePlan<Variant>::~SequencePlan() = default;
 
 template <>
@@ -60,10 +56,6 @@ SequencePlanner<Variant>::SequencePlanner(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
-template <>
-SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
-template <>
 SequencePlanner<Variant>::~SequencePlanner() = default;
 
 template <>
@@ -85,10 +77,6 @@ RequestBasePlan<Variant>::RequestBasePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
-template <>
-RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
-template <>
 RequestBasePlan<Variant>::~RequestBasePlan() = default;
 
 template <>
@@ -101,10 +89,6 @@ template <>
 RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
-template <>
-RequestPlan<Variant>::RequestPlan(RequestPlan&&) noexcept = default;
-template <>
-RequestPlan<Variant>& RequestPlan<Variant>::operator=(RequestPlan&&) noexcept = default;
 template <>
 RequestPlan<Variant>::~RequestPlan() = default;
 
