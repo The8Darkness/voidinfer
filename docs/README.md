@@ -1,7 +1,7 @@
 # NInfer documentation
 
 Start with the [project README](../README.md) to build NInfer, download a published artifact, and
-run the CLI or HTTP server.
+run the CLI or HTTP server. Windows 11 users should also read the [Windows guide](windows.md).
 
 ## User guides
 
@@ -10,6 +10,7 @@ run the CLI or HTTP server.
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
+| [Windows](windows.md) | native Windows 11 x64 requirements, vcpkg setup, build commands, and run notes |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
