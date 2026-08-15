@@ -4,7 +4,8 @@
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs.
+OpenAI-/Anthropic-compatible HTTP APIs. It builds and runs natively on 64-bit Linux and
+Windows 11 x64.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
@@ -100,14 +101,16 @@ notes.
 
 NInfer currently requires:
 
-- 64-bit Linux;
+- 64-bit Linux or Windows 11 x64;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
-- CMake 3.28 or newer and a C++20-capable host compiler;
-- `pkg-config`;
+- CMake 3.28 or newer and a C++20-capable host compiler (GCC or Clang on Linux, MSVC from
+  Visual Studio 2022 on Windows);
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
   `libavutil >= 58`, and `libswscale >= 7`;
 - `libcurl >= 7.85`;
+- `pkg-config` on Linux, or [vcpkg](https://github.com/microsoft/vcpkg) on Windows (the
+  repository pins the dependency baseline in `vcpkg.json`);
 - Ninja, when using the commands below.
 
 The build rejects CUDA architectures other than `120a`. There is no install target or packaged
@@ -115,8 +118,10 @@ binary distribution; NInfer is run from its source build tree.
 
 ## Build
 
+### Linux
+
 ```bash
-git clone https://github.com/Neroued/ninfer.git
+git clone https://github.com/natpate/ninfer.git
 cd ninfer
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -131,6 +136,31 @@ build/apps/ninfer-serve
 ```
 
 Tests, benchmarks, and maintainer tools are excluded from the default build.
+
+### Windows
+
+Use Visual Studio 2022 (with MSVC) and vcpkg; the manifest in the repository root pins
+`curl`, `ffmpeg`, and `pkgconf`:
+
+```powershell
+git clone https://github.com/natpate/ninfer.git
+cd ninfer
+
+cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake `
+  -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build-windows --config Release --parallel
+```
+
+The default configuration builds:
+
+```text
+build-windows/apps/Release/ninfer.exe
+build-windows/apps/Release/ninfer-serve.exe
+```
+
+See [the Windows guide](docs/windows.md) for complete setup instructions, vcpkg installation, and
+notes on the resulting DLL layout.
 
 ## Docker
 
@@ -315,7 +345,16 @@ from one to fifteen.
 - [CLI](docs/cli.md)
 - [HTTP serving](docs/serving.md)
 - [Performance](docs/performance.md)
+- [Windows](docs/windows.md)
 - [CLI examples](examples/cli/)
+
+## Upstream
+
+This repository is a fork of [Neroued/ninfer](https://github.com/Neroued/ninfer) that adds native
+Windows 11 build and run support while preserving the upstream RTX 5090 (`sm_120a`) target, the
+CUDA 13.1 requirement, and the NVFP4/W4A4 Blackwell execution paths. The Windows compatibility
+layer is ported from [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) without its
+RTX 3090 (`sm_86`) retargeting, kernel reschedules, or release packaging.
 
 ## License
 
