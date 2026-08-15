@@ -53,6 +53,29 @@ static_assert((kQueryRows % TmaM256N128::kBlockN) == 0);
 static_assert((kKeyRows % TmaM256N128::kBlockN) == 0);
 static_assert((kGateRows % TmaM256N128::kBlockN) == 0);
 
+#ifdef _WIN32
+// MSVC cannot pass an alignas(128) struct by value as a kernel parameter (C2719). Keep the
+// descriptor block in a device buffer and hand the kernel a pointer; the TMA unit reads the
+// tensor map from that address. cudaMallocAsync is pool-backed; the free is stream-ordered
+// after the kernel that consumes the block.
+struct Nvfp4TmaDescriptorBlock {
+    Nvfp4W4a4TmaDescriptors* device = nullptr;
+
+    explicit Nvfp4TmaDescriptorBlock(cudaStream_t stream) {
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&device),
+                                   sizeof(Nvfp4W4a4TmaDescriptors), stream));
+    }
+
+    Nvfp4TmaDescriptorBlock(const Nvfp4TmaDescriptorBlock&)            = delete;
+    Nvfp4TmaDescriptorBlock& operator=(const Nvfp4TmaDescriptorBlock&) = delete;
+
+    ~Nvfp4TmaDescriptorBlock() {
+        if (device == nullptr) { return; }
+        CUDA_CHECK(cudaFreeAsync(device, nullptr));
+    }
+};
+#endif
+
 template <class Geometry, class Schedule, class Epilogue, class Output>
 void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
                 const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
@@ -71,8 +94,16 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     (void)kConfigured;
 
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
-    nvfp4_w4a4_tma_kernel<Geometry, Schedule>
+#ifdef _WIN32
+    Nvfp4TmaDescriptorBlock block(stream);
+    CUDA_CHECK(cudaMemcpyAsync(block.device, &descriptors, sizeof(descriptors),
+                               cudaMemcpyHostToDevice, stream));
+    nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>
+        <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(block.device, alpha, epilogue, output);
+#else
+    nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>
         <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(descriptors, alpha, epilogue, output);
+#endif
     CUDA_CHECK(cudaGetLastError());
 }
 
