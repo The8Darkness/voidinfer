@@ -318,11 +318,15 @@ if(NINFER_BUILD_SERVE)
     serve/request_log.cpp
     serve/http_server.cpp
     serve/responses_http.cpp
-    serve/serve_options.cpp)
+    serve/serve_options.cpp
+    serve/webui_update.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
     PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET})
+  if(WIN32)
+    target_link_libraries(ninfer_serve PRIVATE winhttp)
+  endif()
 endif()
