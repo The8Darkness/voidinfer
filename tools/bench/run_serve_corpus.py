@@ -24,6 +24,7 @@ MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 TARGET_MODEL_IDS = {
     "qwen3_6_35b_a3b": "qwen3.6-35b-a3b",
     "qwen3_6_27b": "qwen3.6-27b",
+    "qwen3_8_27b": "qwen3.8-27b",
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
 SPECULATIVE_MODES = {
@@ -82,7 +83,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 8
+SERVER_LOG_SCHEMA_VERSION = 9
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0

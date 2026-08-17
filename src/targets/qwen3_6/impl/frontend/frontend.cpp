@@ -244,7 +244,7 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     result.reserve(messages.size());
     for (ChatMessage& source : messages) {
         fi::ChatMessage target;
-        target.role              = std::move(source.role);
+        target.role              = source.role;
         target.reasoning_content = std::move(source.reasoning_content);
         target.tool_call_id      = std::move(source.tool_call_id);
         target.tool_calls.reserve(source.tool_calls.size());
@@ -858,18 +858,18 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         for (fi::VisionItem& item : processed.vision_items) {
             result.vision_items.push_back(convert_vision_item(std::move(item)));
         }
-        result.prepare.media_items            = processed.stats.media_items;
-        result.prepare.raw_patches            = processed.stats.raw_patches;
-        result.prepare.vision_tokens          = processed.stats.vision_tokens;
-        result.prepare.attention_pairs        = processed.stats.attention_pairs;
-        result.prepare.patch_bytes            = processed.stats.patch_bytes;
-        result.identity.turn_rewrite_boundary = processed.turn_rewrite_boundary;
+        result.prepare.media_items         = processed.stats.media_items;
+        result.prepare.raw_patches         = processed.stats.raw_patches;
+        result.prepare.vision_tokens       = processed.stats.vision_tokens;
+        result.prepare.attention_pairs     = processed.stats.attention_pairs;
+        result.prepare.patch_bytes         = processed.stats.patch_bytes;
+        result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options));
-        fi::EncodedChat encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
-        result.token_ids        = std::move(encoded.input_ids);
-        result.identity.turn_rewrite_boundary = encoded.turn_rewrite_boundary;
+        fi::EncodedChat encoded            = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+        result.token_ids                   = std::move(encoded.input_ids);
+        result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
@@ -894,9 +894,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input) const {
         return checked_token_count(impl_->tokenizer->encode(rendered.text).size());
     }
 
-    fi::ProcessorOptions processor_options = impl_->processor;
-    processor_options.max_prompt_tokens    = std::numeric_limits<std::size_t>::max();
-    fi::Processor processor(*impl_->tokenizer, impl_->chat_template, processor_options);
+    fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor);
     try {
         return checked_token_count(
             processor.process(messages, render_options(options)).input_ids.size());

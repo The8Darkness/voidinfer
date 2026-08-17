@@ -39,9 +39,19 @@ struct VisionItem {
     std::vector<TokenSpan> token_spans;
 };
 
+enum class RewriteCheckpointKind : std::uint8_t {
+    TurnClosure,
+    ResponseReplay,
+};
+
+struct RewriteCheckpointSpec {
+    RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
+    std::uint32_t frontier     = 0;
+};
+
 struct PromptIdentity {
     bool reusable = true;
-    std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
 };
 
 struct PrepareStats {
@@ -49,7 +59,7 @@ struct PrepareStats {
     std::size_t media_items       = 0;
     std::uint64_t raw_patches     = 0;
     std::uint64_t vision_tokens   = 0;
-    std::uint64_t attention_pairs = 0;
+    std::uint64_t attention_pairs = 0; // Informational; not enforced against any budget.
     std::size_t patch_bytes       = 0;
 };
 

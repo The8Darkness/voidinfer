@@ -87,6 +87,11 @@ The request `model` must equal the public model ID: the artifact `identity.model
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
+Message roles retain their input order through schema translation. The Qwen family frontend maps
+both `system` and `developer` to system-class ChatML blocks at their original positions; it does not
+move later instructions to the beginning of the conversation. A leading instruction keeps the
+artifact template's existing tool/reasoning-instruction composition.
+
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
@@ -130,6 +135,18 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
+
+Text and media requests use one context contract. After chat-template rendering and media-token
+expansion, the complete prompt is admitted only against Engine `--max-context`; there is no
+separate 32K multimodal prompt ceiling. Media preprocessing retains independent resource limits
+for source bytes, decoded pixels, media-item count, raw patches, and Vision tokens.
+`attention_pairs` remains preparation diagnostics and is not an admission limit.
+
+An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
+the prepared token count and configured context ceiling. A media preprocessing resource rejection
+returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
+body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
+resource errors.
 
 ## OpenAI Responses Core
 
@@ -220,6 +237,10 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 Adjacent function-call Items are grouped into one assistant history turn. A reasoning Item attaches
 to the following assistant message or function call. Input Item IDs are preserved when supplied and
 generated otherwise; duplicate IDs fail.
+
+System and developer message Items retain their positions in the input array. Top-level
+`instructions` is represented as a leading developer turn for the current request; target-specific
+role lowering occurs only in the Qwen family frontend.
 
 `input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning summaries or
 encrypted reasoning, message `phase`, and other Item/content types are not supported. HTTP media
@@ -322,7 +343,8 @@ prefix reuse applies naturally.
 
 A stored Response also retains its resolved `preserve_thinking` value. A child which omits the
 field inherits the parent value. An explicit different value creates a new semantic branch; prompt
-identity then determines whether the Engine restores a turn checkpoint or performs a full reset.
+rendering and identity still determine reuse. Changing the boolean alone never invalidates an exact
+current frontier or a complete matching rewrite checkpoint.
 
 Resource behavior:
 
@@ -373,9 +395,15 @@ curl http://127.0.0.1:8080/v1/messages \
   }'
 ```
 
-The endpoint supports system text, user/assistant history, text and image blocks, thinking blocks,
-tool-use history, tool results, client-defined tools, non-streaming responses, and Anthropic SSE
-events. `thinking.type: "disabled"` disables thinking; other supported values enable it.
+The endpoint supports top-level system text, ordered mid-conversation system messages,
+user/assistant history, text and image blocks, thinking blocks, tool-use history, tool results,
+client-defined tools, non-streaming responses, and Anthropic SSE events.
+Mid-conversation system messages remain at their `messages` array position and are not merged into
+the top-level system instruction. A system section must follow a user/tool-result message and be
+final or immediately precede an assistant message; it cannot interrupt a tool-use/tool-result pair.
+Consecutive system messages remain separate ordered turns.
+
+`thinking.type: "disabled"` disables thinking; other supported values enable it.
 The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
 uses the server default.
 
@@ -471,7 +499,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v8 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v9 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -479,6 +507,7 @@ that server instance.
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 | `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
@@ -491,10 +520,12 @@ derived downstream from raw token counts and seconds instead of rounded stderr s
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
 but are rounded and are not the aggregation source. Console lines use local
-`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. Structured request events cover successfully
-prepared OpenAI Responses, OpenAI Chat, and Anthropic generation requests and errors during their
-generation; schema rejection
-and token-count-only calls are not measurement requests and do not receive request IDs.
+`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, and Anthropic
+generation requests receive a request ID when they enter synchronous preparation. Successful
+preparation produces `request_start`; a preparation failure produces `request_rejected` without a
+matching start. Later generation failures produce `request_error`. Schema/model validation
+rejections before preparation and token-count-only calls are not measurement requests and do not
+receive request IDs.
 
 By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
 suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts
@@ -557,14 +588,30 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-The shared family runtime distinguishes `full_reset`, `append_frontier`, and
-`restore_turn_checkpoint`. A turn checkpoint includes the recurrent and selected
-speculative-backend continuation state required to recompute a rewritten suffix; matching KV
-tokens alone never authorize a partial hit. Stable `preserve_thinking=true` histories normally
-append, while stable `false` histories restore the previous open-turn checkpoint when a new user
-closes that turn. The JSONL completion record exposes the selected path as `prefix_reuse_path`.
-Changing reasoning effort changes the rendered prompt and therefore does not reuse a prefix whose
-effort instruction differs.
+The shared family runtime distinguishes `full_reset`, `append_frontier`,
+`restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
+recurrent, hidden, and selected speculative-backend continuation state required to recompute a
+rewritten suffix; matching KV tokens alone never authorize a partial hit. With stable
+`preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current
+response's complete deterministic generation prologue. For thinking generation this includes
+`<think>\n`; for non-thinking generation it includes the complete empty thinking block. Capturing
+that frontier does not split a tiny trailing prologue into a separate prefill unit, and a normalized
+response which no longer matches the raw generated tokens replays only that response and its
+suffix. Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
+be recomputed without its reasoning.
+
+`preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility
+bit. An exact current frontier or matching complete checkpoint remains reusable across a mode
+change. If the newly desired boundary is already behind the selected reuse frontier and no snapshot
+exists there, the Engine keeps the valid hit and defers installing that new checkpoint rather than
+forcing an eager full reset. A later request that diverges before every retained checkpoint then
+resets normally. The JSONL completion record exposes the checkpoint actually restored as
+`prefix_reuse_path`. Changing reasoning effort changes rendered tokens and therefore does not reuse
+a prefix whose effort instruction differs.
+
+An appended mid-conversation system message is an ordinary prompt suffix, so an unchanged prior
+history remains eligible for `append_frontier`. If the client modifies, removes, or moves a
+historical system message, the token prefix genuinely differs and a miss/reset is correct.
 
 Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
 or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the

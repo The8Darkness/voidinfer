@@ -31,6 +31,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
   `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current protocol translation,
   Responses Item/state/SSE behavior, and incremental tool-call behavior;
+- `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
+  preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
 - `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
@@ -149,7 +151,8 @@ state, streaming, and multimodal requests.
 
 The thinking-preservation fixture starts and stops its own server, submits a fixed two-step tool
 history, compares restored and cold greedy output, compares stripped and preserved closed-turn
-prompt lengths, and verifies request-log reuse paths and Responses inheritance:
+prompt lengths, and verifies turn/response rewrite-checkpoint reuse paths plus Responses
+inheritance:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \

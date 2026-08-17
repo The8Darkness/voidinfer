@@ -15,13 +15,16 @@ runtime:
 | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
 | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 18,324,064,000 bytes (17.07 GiB) | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
 | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes (16.96 GiB) | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
+| [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 bytes (20.02 GiB) | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
 
-The two Qwen3.6-27B weight profiles bind to the registered `qwen3_6_27b` target; the version-2
-artifact identity selects the profile without a separate runtime flag. Qwen3.8-27B is separately
-registered as `qwen3_8_27b` and shares the 27B execution package while using W8 token-embedding and
-full-output-head weights. The `nvfp4` profile uses W4A4 Tensor Core MMA for prefill and A16 NVFP4
-kernels for decode. All three 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
+Qwen3.6-27B and Qwen3.8-27B each expose two registered weight profiles. The version-2 artifact
+identity selects the profile without a separate runtime flag; Qwen3.8 uses target key
+`qwen3_8_27b` while sharing the 27B execution package. The Qwen3.6 `nvfp4` profile uses W4A4 Tensor
+Core MMA for prefill and A16 NVFP4 kernels for decode. The Qwen3.8 `nvfp4` profile preserves its
+source's mixed allocation: NVFP4 MLP weights in Text layers 0–55 and row-scaled FP8 for the token
+embedding, attention input/output projections, GDN Q/K/V/Z and output projections, output head, and
+remaining MLP weights. All four 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
 and serving routes.
 
 ## Upstream
@@ -60,8 +63,9 @@ requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from 
 
 ## Performance
 
-The published measurements currently cover the three Qwen3.6 artifact profiles. Qwen3.8-27B is
-supported by current NInfer builds but is not yet included in the benchmark campaign.
+The published measurements currently cover the three Qwen3.6 artifact profiles. Both registered
+Qwen3.8-27B profiles are supported by current NInfer builds but are not yet included in the
+benchmark campaign.
 
 ### Concurrent MTP3 decode
 
@@ -125,7 +129,8 @@ enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per proble
 | [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
 | [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
 
-Qwen3.8-27B is supported but has not yet been added to this published evaluation campaign.
+Both Qwen3.8-27B profiles are supported but have not yet been added to this published evaluation
+campaign.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
@@ -274,16 +279,21 @@ hf download neroued/Qwen3.8-27B-NInfer \
   qwen3_8_27b.ninfer \
   --local-dir models
 
+# Or Qwen3.8-27B NVFP4:
+hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer \
+  --local-dir models
+
 # Or:
 hf download neroued/Qwen3.6-35B-A3B-NInfer \
   qwen3_6_35b_a3b.ninfer \
   --local-dir models
 ```
 
-Current NInfer builds accept only the version-2 artifact container, and all four downloads above
+Current NInfer builds accept only the version-2 artifact container, and all five downloads above
 are version 2. Migration applies only to Qwen3.6 artifacts downloaded before their version-2
-publication; Qwen3.8-27B was published directly as version 2. Migrate an older exact local file in
-place:
+publication; both Qwen3.8-27B profiles were published directly as version 2. Migrate an older exact
+local file in place:
 
 ```bash
 python3 -m tools.artifact.migrate_v1_to_v2 models/qwen3_6_27b.ninfer
@@ -380,7 +390,7 @@ from one to fifteen.
 
 ## Current limits
 
-- Only the four `(model_id, weights_id)` artifact identities listed above are accepted product
+- Only the five `(model_id, weights_id)` artifact identities listed above are accepted product
   identities.
 - Execution is specialized for one RTX 5090 and one CUDA device.
 - One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
@@ -414,8 +424,10 @@ NInfer is licensed under the [Apache License 2.0](LICENSE).
 The published artifacts are derived from
 [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),
 [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The 27B NVFP4 artifact also
-uses the fixed packed weights from
+[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The Qwen3.6-27B NVFP4 artifact
+also uses the fixed packed weights from
 [rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
-These source repositories are distributed under Apache-2.0. Vendored dependencies retain their own
-license files under `third_party/`.
+The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
+[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
+repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
+under `third_party/`.

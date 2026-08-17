@@ -30,9 +30,10 @@ namespace detail {
 struct Variant;
 
 enum class WeightsProfile : std::uint8_t {
-    GroupwiseInt,
-    GroupwiseIntW8Endpoints,
-    Nvfp4,
+    Qwen36GroupwiseInt,
+    Qwen38GroupwiseInt,
+    Qwen36Nvfp4,
+    Qwen38Nvfp4,
 };
 
 using Frontend       = qwen3_6::Frontend;

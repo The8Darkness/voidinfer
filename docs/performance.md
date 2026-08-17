@@ -21,7 +21,8 @@ NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode wit
 decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The 27B
 results report its `groupwise-int` and `nvfp4` weight profiles separately. The concurrent
 decode-saturation campaign measures the same three Qwen3.6 artifact profiles at C=1, 2, 4, and 8.
-Qwen3.8-27B is supported by current NInfer builds but is not included in this published campaign.
+Both registered Qwen3.8-27B profiles are supported by current NInfer builds but are not included in
+this published campaign.
 
 The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
 over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed

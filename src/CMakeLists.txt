@@ -108,6 +108,10 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
   ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
   ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
+  ops/attn_input_proj/fp8/fp8_attn_input_decode.cu
+  ops/attn_input_proj/fp8/fp8_attn_input_small_t.cu
+  ops/attn_input_proj/fp8/fp8_attn_input_a8.cu
+  ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
@@ -120,6 +124,12 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/w8/w8_attn_input_gemm_simt.cu
   ops/attn_input_proj/w8/w8_attn_input_gemm_splitk.cu
   ops/attn_input_proj/w8/w8_attn_input_plan.cpp
+  ops/gdn_input_proj/fp8/fp8_gdn_input_decode.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_input_small_t.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_input_plan.cpp
+  ops/gdn_input_proj/fp8/fp8_gdn_conv_fused.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
@@ -143,6 +153,12 @@ add_library(ninfer_ops STATIC
   ops/linear/bf16/bf16_gemm_mma.cu
   ops/linear/bf16/bf16_small_t.cu
   ops/linear/bf16/bf16_dispatch.cpp
+  ops/linear/fp8/fp8_format.cpp
+  ops/linear/fp8/fp8_gemv.cu
+  ops/linear/fp8/fp8_small_t.cu
+  ops/linear/fp8/fp8_a16_mma.cu
+  ops/linear/fp8/fp8_a8.cu
+  ops/linear/fp8/fp8_dispatch.cpp
   ops/linear/nvfp4/nvfp4_format.cpp
   ops/linear/nvfp4/nvfp4_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu
@@ -165,6 +181,10 @@ add_library(ninfer_ops STATIC
   ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
+  ops/linear_add/fp8/fp8_linear_add_decode.cu
+  ops/linear_add/fp8/fp8_linear_add_small_t.cu
+  ops/linear_add/fp8/fp8_linear_add_a8.cu
+  ops/linear_add/fp8/fp8_linear_add_plan.cpp
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
@@ -180,6 +200,10 @@ add_library(ninfer_ops STATIC
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_decode.cu
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_small_t.cu
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.cpp
   ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
   ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu
   ops/linear_swiglu/w8/w8_linear_swiglu_gemm_splitk.cu

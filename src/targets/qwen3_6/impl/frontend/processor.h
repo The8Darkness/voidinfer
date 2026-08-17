@@ -80,8 +80,6 @@ struct ProcessorOptions {
     std::size_t max_media_items            = 16;
     std::uint64_t max_raw_patches          = 131'072;
     std::uint64_t max_vision_tokens        = 32'768;
-    std::uint64_t max_attention_pairs      = 128ULL * 1024ULL * 1024ULL;
-    std::size_t max_prompt_tokens          = 32'768;
     double video_fps                       = 2.0;
     int video_min_frames                   = 4;
     int video_max_frames                   = 768;
@@ -96,7 +94,7 @@ struct ProcessedInput {
     // Row-major [sum(raw_patches), 1536], in the exact merger-friendly order.
     std::vector<float> patches;
     std::vector<VisionItem> vision_items;
-    std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     PreprocessStats stats;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
@@ -104,7 +102,7 @@ struct ProcessedInput {
 
 struct EncodedChat {
     std::vector<int> input_ids;
-    std::optional<std::uint32_t> turn_rewrite_boundary;
+    std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
 };
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
