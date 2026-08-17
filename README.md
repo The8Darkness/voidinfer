@@ -176,9 +176,11 @@ a `models\` folder, a `README.txt`, and `SHA256SUMS`:
    identical to a source build (see [Run the HTTP server](#run-the-http-server)).
 
 The launchers default to a 150,000-token context (`--max-context` / `--default-max-tokens`) to
-leave VRAM headroom for the Windows desktop; 200,000 is safe on the 32 GB RTX 5090 when VRAM
-is completely free at startup. Hardware requirements are unchanged: Windows 11 x64, RTX 5090,
-and an NVIDIA driver supporting CUDA 13.1.
+leave VRAM headroom for the Windows desktop. On the 32 GB RTX 5090, the smaller models
+(`qwen3_6_27b`, `qwen3_6_27b_nvfp4`, and `qwen3_8_27b`) can be safely raised to 200,000 when
+VRAM is completely free at startup; the two larger models (`qwen3_8_27b_nvfp4` and
+`qwen3_6_35b_a3b`) do not fit at 200,000 and should stay at 150,000. Hardware requirements are
+unchanged: Windows 11 x64, RTX 5090, and an NVIDIA driver supporting CUDA 13.1.
 
 ## Build
 
