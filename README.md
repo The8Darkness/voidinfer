@@ -24,6 +24,40 @@ full-output-head weights. The `nvfp4` profile uses W4A4 Tensor Core MMA for pref
 kernels for decode. All three 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
 and serving routes.
 
+## Upstream
+
+NInfer is [Neroued](https://github.com/Neroued)'s project
+([Neroued/ninfer](https://github.com/Neroued/ninfer)). This repository is a fork of that
+project that adds native Windows support. The engine, model artifacts, API surface, and
+published benchmarks are all upstream's work, and the upstream repository remains the
+reference implementation (this fork tracks upstream `master` with the additions below).
+
+What this fork adds on top of upstream:
+
+- **Native Windows 11 x64 build and run** — CMake with Visual Studio 2022 (MSVC), with
+  [vcpkg](https://github.com/microsoft/vcpkg) resolving FFmpeg, libcurl, and zlib via the
+  `vcpkg.json` manifest; the CUDA runtime is statically linked, so the CUDA Toolkit is only
+  needed at build time. The Windows compatibility layer is ported from
+  [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090), without its RTX 3090
+  (`sm_86`) retargeting, kernel reschedules, or release packaging.
+- **Windows porting of the runtime** — memory-mapped artifact reading with unbuffered
+  overlapped I/O (the Windows counterpart of POSIX `O_DIRECT`/`pread`, with the same 4096-byte
+  alignment contract), portable console logging and load progress, and portable media
+  acquisition for image and video input.
+- **MSVC/TMA kernel compatibility** — fixes that let the upstream Blackwell kernels compile
+  under MSVC: device-pointer NVFP4 TMA descriptors, the pair-row SwiGLU TMA epilogue, and
+  MSVC move-construction details in the target runtime.
+- **Stock llama.cpp WebUI** — the HTTP server additionally accepts the stock llama.cpp WebUI's
+  API dialect (compatible with the upstream `tools/ui` client), and `ninfer-serve` can serve
+  the unmodified WebUI in-process: `--webui` downloads the latest build from the
+  [ggml-org/llama-ui](https://huggingface.co/ggml-org/llama-ui) bucket on first start, or
+  `--webui-dir DIR` serves an existing local copy.
+- **Portable Windows release** — a self-contained zip containing the executables and all
+  runtime DLLs; see [Prebuilt Windows release](#prebuilt-windows-release).
+
+Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
+requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.
+
 ## Performance
 
 The published measurements currently cover the three Qwen3.6 artifact profiles. Qwen3.8-27B is
@@ -113,8 +147,33 @@ NInfer currently requires:
   repository pins the dependency baseline in `vcpkg.json`);
 - Ninja, when using the commands below.
 
-The build rejects CUDA architectures other than `120a`. There is no install target or packaged
-binary distribution; NInfer is run from its source build tree.
+The build rejects CUDA architectures other than `120a`. On Linux, NInfer is run from its
+source build tree; on Windows, the [prebuilt portable release](#prebuilt-windows-release)
+provides the same binaries without a toolchain.
+
+## Prebuilt Windows release
+
+Windows users who would rather not build can use the portable release instead of the build
+steps below. The v0.1.0 zip is self-contained — executables, all runtime DLLs (FFmpeg,
+libcurl, zlib, and the VC++ runtime; the CUDA runtime is statically linked), launcher scripts,
+a `models\` folder, a `README.txt`, and `SHA256SUMS`:
+
+1. Download `ninfer-windows-0.1.0-win64-cuda131.zip` from
+   [GitHub Releases](https://github.com/natpate/ninfer-windows/releases). Verify files against
+   `SHA256SUMS`, e.g. `Get-FileHash ninfer-serve.exe -Algorithm SHA256`.
+2. Extract it anywhere — the launcher scripts use relative paths and work from any location.
+3. Download a model into `models\` as in [Download a model](#download-a-model).
+4. Run the matching launcher, e.g. `.\qwen3_8_27b.bat`. This starts `ninfer-serve` on
+   `http://127.0.0.1:8080` (API at `/v1`) and serves the WebUI at the root URL; `--webui`
+   downloads the WebUI on first start, so the first run needs an internet connection (later
+   runs reuse the local copy).
+5. Or run `.\ninfer-serve.exe models\<model>.ninfer [flags]` directly — the options are
+   identical to a source build (see [Run the HTTP server](#run-the-http-server)).
+
+The launchers default to a 150,000-token context (`--max-context` / `--default-max-tokens`) to
+leave VRAM headroom for the Windows desktop; 200,000 is safe on the 32 GB RTX 5090 when VRAM
+is completely free at startup. Hardware requirements are unchanged: Windows 11 x64, RTX 5090,
+and an NVIDIA driver supporting CUDA 13.1.
 
 ## Build
 
@@ -347,14 +406,6 @@ from one to fifteen.
 - [Performance](docs/performance.md)
 - [Windows](docs/windows.md)
 - [CLI examples](examples/cli/)
-
-## Upstream
-
-This repository is a fork of [Neroued/ninfer](https://github.com/Neroued/ninfer) that adds native
-Windows 11 build and run support while preserving the upstream RTX 5090 (`sm_120a`) target, the
-CUDA 13.1 requirement, and the NVFP4/W4A4 Blackwell execution paths. The Windows compatibility
-layer is ported from [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) without its
-RTX 3090 (`sm_86`) retargeting, kernel reschedules, or release packaging.
 
 ## License
 
