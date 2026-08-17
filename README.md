@@ -159,11 +159,11 @@ provides the same binaries without a toolchain.
 ## Prebuilt Windows release
 
 Windows users who would rather not build can use the portable release instead of the build
-steps below. The v0.1.0 zip is self-contained — executables, all runtime DLLs (FFmpeg,
+steps below. The zip is self-contained — executables, all runtime DLLs (FFmpeg,
 libcurl, zlib, and the VC++ runtime; the CUDA runtime is statically linked), launcher scripts,
 a `models\` folder, a `README.txt`, and `SHA256SUMS`:
 
-1. Download `ninfer-windows-0.1.0-win64-cuda131.zip` from
+1. Download the latest `ninfer-windows-<version>-win64-cuda131.zip` from
    [GitHub Releases](https://github.com/natpate/ninfer-windows/releases). Verify files against
    `SHA256SUMS`, e.g. `Get-FileHash ninfer-serve.exe -Algorithm SHA256`.
 2. Extract it anywhere — the launcher scripts use relative paths and work from any location.
