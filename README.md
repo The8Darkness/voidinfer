@@ -55,6 +55,10 @@ What this fork adds on top of upstream:
   the unmodified WebUI in-process: `--webui` downloads the latest build from the
   [ggml-org/llama-ui](https://huggingface.co/ggml-org/llama-ui) bucket on first start, or
   `--webui-dir DIR` serves an existing local copy.
+- **Context window reporting** — `ninfer-serve` advertises the served context ceiling in the
+  OpenAI dialect: the objects returned by `/v1/models` and `/v1/models/{id}` carry
+  `meta.n_ctx` = the `--max-context` value in force, so clients that auto-detect the context
+  window (the stock WebUI, OpenAI-compatible frontends) need no manual configuration.
 - **Portable Windows release** — a self-contained zip containing the executables and all
   runtime DLLs; see [Prebuilt Windows release](#prebuilt-windows-release).
 
