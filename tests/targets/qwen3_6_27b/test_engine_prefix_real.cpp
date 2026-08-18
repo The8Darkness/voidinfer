@@ -22,11 +22,12 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     return options;
 }
 
-std::vector<std::uint8_t> gradient_ppm() {
+std::vector<std::uint8_t> gradient_ppm(int width = 64, int height = 64) {
     std::vector<std::uint8_t> ppm;
-    const std::string header = "P6\n64 64\n255\n";
+    const std::string header =
+        "P6\n" + std::to_string(width) + ' ' + std::to_string(height) + "\n255\n";
     ppm.insert(ppm.end(), header.begin(), header.end());
-    for (int index = 0; index < 64 * 64; ++index) {
+    for (int index = 0; index < width * height; ++index) {
         ppm.push_back(static_cast<std::uint8_t>(index & 0xff));
         ppm.push_back(static_cast<std::uint8_t>((index * 3) & 0xff));
         ppm.push_back(static_cast<std::uint8_t>((index * 7) & 0xff));
@@ -319,6 +320,18 @@ int exercise_vision(ninfer::Engine& engine) {
         result.stop.include_model_defaults       = false;
         return result;
     };
+
+    // The 1024 merged Vision columns begin after the chat prefix, so the same item necessarily
+    // crosses a 1024-token prefill boundary. Its host payload may be released after the first
+    // encode, while later chunks must continue to reuse the resident Vision transient.
+    ninfer::RequestOptions cross_chunk_options            = options(false);
+    cross_chunk_options.execution.requested_output_tokens = 1;
+    const ninfer::GenerationResult cross_chunk =
+        engine.generate(engine.prepare(first_input(gradient_ppm(1024, 1024))), cross_chunk_options);
+    if (!cross_chunk.prompt.has_media || cross_chunk.generated_token_ids.size() != 1) {
+        std::cerr << "cross-chunk Vision item did not complete after releasing its host payload\n";
+        return 1;
+    }
 
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare(first_input(image_bytes)), options(false));

@@ -63,33 +63,38 @@ requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from 
 
 ## Performance
 
-The published measurements currently cover the three Qwen3.6 artifact profiles. Both registered
-Qwen3.8-27B profiles are supported by current NInfer builds but are not yet included in the
-benchmark campaign.
+The published measurements cover the three Qwen3.6 artifact profiles and the Qwen3.8-27B NVFP4
+profile. The Qwen3.8-27B `groupwise-int` profile is supported by current NInfer builds but is not
+yet included in a published benchmark campaign.
 
 ### Concurrent MTP3 decode
 
 Saturated decode was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, MTP3, and
 one 8,192-token generation per active request. The values below are aggregate committed decode
 throughput from complete one-second intervals in which the actual decode batch remained equal to
-the configured concurrency. Each profile should be read independently.
+the configured concurrency. MTP acceptance is aggregated over the complete request wave. Each
+concurrency cell reports `decode tok/s / MTP acceptance`; profiles should be read independently.
 
-| Model profile | C=1 | C=2 | C=4 | C=8 | C8 / C1 |
+| Model profile | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept | C8 / C1 |
 |---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` | 185.8 tok/s | 247.0 tok/s | 309.5 tok/s | 535.0 tok/s | 2.88× |
-| Qwen3.6-27B `nvfp4` | 202.4 tok/s | 399.7 tok/s | 699.7 tok/s | 1,146.9 tok/s | 5.67× |
-| Qwen3.6-35B-A3B `groupwise-int` | 593.0 tok/s | 877.7 tok/s | 1,166.0 tok/s | 1,313.8 tok/s | 2.22× |
+| Qwen3.6-27B `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% | 2.88× |
+| Qwen3.6-27B `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% | 5.67× |
+| Qwen3.6-35B-A3B `groupwise-int` | 593.0 / 67.2% | 877.7 / 68.2% | 1,166.0 / 69.8% | 1,313.8 / 67.3% | 2.22× |
+| Qwen3.8-27B `nvfp4` | 143.8 / 48.9% | 267.6 / 48.1% | 461.1 / 45.8% | 766.6 / 46.0% | 5.33× |
 
-At C=8, Qwen3.6-35B-A3B reaches **1,313.8 aggregate decode tok/s**. The 27B NVFP4 profile reaches
-**1,146.9 tok/s** and **5.67×** its C=1 throughput.
+At C=8, Qwen3.6-35B-A3B reaches **1,313.8 aggregate decode tok/s**. Qwen3.6-27B NVFP4 reaches
+**1,146.9 tok/s** and **5.67×** its C=1 throughput. Qwen3.8-27B NVFP4 has **45.8–48.9%** MTP
+acceptance, versus **67.2–71.4%** across the other measured profiles, so aggregate committed
+throughput reflects both execution performance and speculative acceptance.
 
 ### Single-request serving
 
 The single-request corpus was measured on the same GPU with INT8 group-64 KV cache, CUDA Graphs,
 and a 1,024-token prefill chunk. Each reported fixture uses five fixed seeds after server warm-up.
-The two measured targets are reported independently and are not cross-target comparisons. The two
-27B weight profiles are reported separately. Requests were submitted serially to a persistent
-server.
+Targets and weight profiles are reported independently rather than as cross-target comparisons.
+Requests were submitted serially to a persistent server. The Qwen3.8-27B NVFP4 MTP0 results use the
+same dedicated serial corpus runner as the Qwen3.6 profiles; its MTP3 results come from the C=1 point
+of the fixed concurrent-corpus campaign documented in [Performance](docs/performance.md).
 
 **Qwen3.6-35B-A3B**
 
@@ -114,6 +119,13 @@ server.
 - Against groupwise-int on the same corpus and runtime options: **3.48× the 7,680-token prefill
   throughput**, **1.55× the 260,096-token prefill throughput**, and **30–32% higher MTP3 decode
   throughput**.
+
+**Qwen3.8-27B (`nvfp4`)**
+
+- MTP0 at a 7,680-token prompt: **8,340.4 prefill tok/s** and **71.2 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **2,203.1 prefill tok/s** and **52.9 decode tok/s**.
+- MTP3 long reasoning: **151.4–195.2 decode tok/s** with **56.2–76.0% acceptance**.
+- MTP3 structured output: **219.8 decode tok/s**, **90.8% acceptance**, and **3.72 tokens/round**.
 
 See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
 and per-fixture results.

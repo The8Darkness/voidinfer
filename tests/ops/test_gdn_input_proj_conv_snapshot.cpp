@@ -824,14 +824,17 @@ int run_nvfp4() {
 }
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
-                 std::int32_t initial_slot, bool convenience = false) {
-    constexpr std::int32_t kHidden           = 5120;
-    constexpr std::int32_t kValueRows        = 6144;
-    constexpr std::int32_t kZRows            = 6144;
-    constexpr std::int32_t kChannels         = 10240;
-    constexpr std::int32_t kRows             = kChannels + kZRows;
-    constexpr std::int32_t kSnapshotBaseSlot = 1;
-    const std::int32_t slots                 = std::max(tokens + 2, initial_slot + 1);
+                 std::int32_t initial_slot, bool convenience = false,
+                 bool shared_state_selectors = false) {
+    constexpr std::int32_t kHidden               = 5120;
+    constexpr std::int32_t kValueRows            = 6144;
+    constexpr std::int32_t kZRows                = 6144;
+    constexpr std::int32_t kChannels             = 10240;
+    constexpr std::int32_t kRows                 = kChannels + kZRows;
+    constexpr std::int32_t kSeparateSnapshotBase = 1;
+    const std::int32_t snapshot_base_slot =
+        shared_state_selectors ? initial_slot : kSeparateSnapshotBase;
+    const std::int32_t slots = std::max(tokens + snapshot_base_slot + 1, initial_slot + 1);
     const std::vector<float> activation =
         make_bf16_activation(kHidden, tokens, 907U + static_cast<std::uint32_t>(tokens));
     const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
@@ -840,7 +843,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     const std::vector<std::uint16_t> state_before =
         make_state(kChannels, slots, initial_slot, 919U + static_cast<std::uint32_t>(tokens));
     const std::vector<std::int32_t> initial_value{initial_slot};
-    const std::vector<std::int32_t> snapshot_base_value{kSnapshotBaseSlot};
+    const std::vector<std::int32_t> snapshot_base_value{snapshot_base_slot};
 
     DeviceBuffer device_activation    = to_device(activation_bits);
     DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
@@ -856,7 +859,8 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
     Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
     Tensor initial(device_initial.p, DType::I32, {1});
-    Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
+    Tensor snapshot_base =
+        shared_state_selectors ? initial : Tensor(device_snapshot_base.p, DType::I32, {1});
     Tensor q                          = query.tensor();
     Tensor k                          = key.tensor();
     Tensor v                          = value.tensor();
@@ -889,16 +893,17 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
                                                   : kFp8GdnInputProjConvSnapshotA16Tolerance;
     const std::string suffix =
         std::string(" FP8 ") + (uses_a8 ? "A8" : "A16") + " T=" + std::to_string(tokens) +
-        " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(kSnapshotBaseSlot);
+        " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(snapshot_base_slot);
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
-    failures += compare("snapshot state" + suffix,
-                        gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
-                        oracle.state, criterion);
+    failures +=
+        compare("snapshot state" + suffix,
+                gather_state(state_after, kChannels, kValueRows, tokens, snapshot_base_slot),
+                oracle.state, criterion);
     failures += state.verify_guards("snapshot state" + suffix);
     failures += verify_state_effects("snapshot state" + suffix, state_before, state_after,
-                                     kChannels, tokens, slots, kSnapshotBaseSlot);
+                                     kChannels, tokens, slots, snapshot_base_slot);
     failures += z.verify_guards("snapshot z" + suffix);
     failures += z.verify_fully_written("snapshot z" + suffix);
     failures +=
@@ -931,7 +936,7 @@ int run_fp8() {
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 929U));
 
     int failures = 0;
-    failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, 2, true);
+    failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, 2, true, true);
     failures += run_fp8_case(parent, 3, ops::LinearPolicy::A16Only, 4);
     failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, 5);
     failures += run_fp8_case(parent, 6, ops::LinearPolicy::A16Only, 7);

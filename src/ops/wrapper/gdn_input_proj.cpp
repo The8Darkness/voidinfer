@@ -190,7 +190,10 @@ void require_snapshot_nonoverlap(const Tensor& x, const Tensor& conv_weight,
     for (std::size_t lhs = 0; lhs < tensors.size(); ++lhs) {
         if (tensors[lhs]->data == nullptr) { continue; }
         for (std::size_t rhs = lhs + 1; rhs < tensors.size(); ++rhs) {
-            if (tensors[rhs]->data != nullptr && overlaps(*tensors[lhs], *tensors[rhs])) {
+            const bool shared_state_selectors =
+                tensors[lhs] == &initial_state_slots && tensors[rhs] == &snapshot_base_slots;
+            if (!shared_state_selectors && tensors[rhs]->data != nullptr &&
+                overlaps(*tensors[lhs], *tensors[rhs])) {
                 throw std::invalid_argument(
                     "gdn_input_proj_conv_snapshot: tensor operands must not overlap");
             }

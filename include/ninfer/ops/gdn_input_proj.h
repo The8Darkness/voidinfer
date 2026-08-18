@@ -149,7 +149,9 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  * B=2..8 and W=1..16. For FP8 B=1, A16 is fused at W=1..3 and W=7..10 and materialized
  * otherwise; AllowA8 uses the same winners through W=9 and A8 from W=10. Batched AllowA8 uses A8
  * when B*W>=9. Tensor operands, the complete FP8 parent, and live workspace must be mutually
- * non-overlapping; same-row state-slot overlap remains governed by the snapshot state contract.
+ * non-overlapping, except that the read-only initial_state_slots and snapshot_base_slots selectors
+ * may alias each other; same-row state-slot overlap remains governed by the snapshot state
+ * contract.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,

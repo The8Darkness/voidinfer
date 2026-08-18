@@ -148,7 +148,7 @@ int run(const Options& options) {
         ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
     auto model =
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
-    auto frontend = target::Package::make_frontend(*model);
+    auto frontend = target::Package::make_frontend(*model, engine);
     auto prompt   = frontend.prepare_tokens(seed, false);
 
     auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
