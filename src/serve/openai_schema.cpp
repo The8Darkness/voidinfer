@@ -750,7 +750,7 @@ std::string make_models_list(const std::string& model_id, std::uint32_t max_cont
                                              {"created", created},
                                              {"owned_by", "ninfer"},
                                              {"status", Json{{"value", "loaded"}}},
-                                             {"meta", Json{{"n_ctx", max_context}}}}}})};
+                                             {"meta", Json{{"n_ctx", max_context}}}}})}};
     return payload.dump();
 }
 
