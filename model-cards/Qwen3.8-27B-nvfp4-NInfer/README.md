@@ -18,6 +18,22 @@ tags:
   - conversational
   - cuda
   - rtx-5090
+model-index:
+  - name: Qwen3.8-27B-nvfp4-NInfer
+    results:
+      - task:
+          type: text-generation
+          name: Text Generation
+        dataset:
+          name: GPQA-Diamond
+          type: gpqa_diamond
+        metrics:
+          - type: accuracy
+            value: 88.38
+            name: Accuracy (0-shot, rule)
+        source:
+          url: https://github.com/Neroued/ninfer/tree/master/eval
+          name: NInfer EvalScope 1.9.0
 ---
 
 # Qwen3.8-27B NVFP4 for NInfer
@@ -178,6 +194,21 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 See the
 [full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md)
 for metric definitions and the exact reproduction command.
+
+## Evaluation
+
+The artifact was evaluated on GPQA-Diamond through NInfer's OpenAI-compatible serving route with
+thinking enabled, MTP=3, and INT8 group-64 KV. EvalScope 1.9.0 used 0-shot prompts, rule-based
+scoring, and one sample per problem with temperature 0.6, top-p 0.95, top-k 20, presence penalty
+1.0, and seed 42.
+
+| Benchmark | Accuracy | Correct / total |
+|---|---:|---:|
+| GPQA-Diamond | 88.38% | 175 / 198 |
+
+Two samples reached the initial concurrent run's 73,728-token output limit. Both reruns completed
+normally at concurrency 1 with a 262,144-token context and output limit; the mixed score above uses
+those completed rerun predictions. This is a single-sample result, not pass@k.
 
 ## Limits
 
