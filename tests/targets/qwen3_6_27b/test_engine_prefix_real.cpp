@@ -19,6 +19,8 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.enable_vision             = true;
+    options.max_concurrency           = 1;
+    options.max_pending_requests      = 1;
     return options;
 }
 
@@ -72,6 +74,48 @@ int exercise_full_prefill_chunk(ninfer::Engine& engine) {
     if (result.generated_token_ids.size() != 1 ||
         result.finish_reason != ninfer::FinishReason::OutputLimit) {
         std::cerr << "full-chunk prefill did not complete through the planned workspace\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_abandoned_handle_capacity(ninfer::Engine& engine) {
+    const std::vector<ninfer::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = false;
+    request.stop.include_model_defaults       = false;
+
+    {
+        auto abandoned = engine.submit(engine.prepare_tokens(prompt), request);
+        if (!abandoned) {
+            std::cerr << "abandonment fixture did not create a generation handle\n";
+            return 1;
+        }
+    }
+    const auto crossed = engine.generate(engine.prepare_tokens(prompt), request);
+    if (crossed.generated_token_ids.size() != 1) {
+        std::cerr << "request after an abandoned handle did not complete\n";
+        return 1;
+    }
+
+    auto first      = engine.submit(engine.prepare_tokens(prompt), request);
+    auto second     = engine.submit(engine.prepare_tokens(prompt), request);
+    bool overloaded = false;
+    try {
+        auto third = engine.submit(engine.prepare_tokens(prompt), request);
+        (void)third;
+    } catch (const ninfer::RequestError& error) {
+        overloaded = error.kind() == ninfer::RequestErrorKind::Overloaded;
+    }
+    if (!overloaded) {
+        std::cerr << "outstanding capacity was released twice or not enforced\n";
+        return 1;
+    }
+    if (first.wait().generated_token_ids.size() != 1 ||
+        second.wait().generated_token_ids.size() != 1) {
+        std::cerr << "requests retained after the overload check did not complete\n";
         return 1;
     }
     return 0;
@@ -477,6 +521,9 @@ int exercise_artifact(const char* artifact) {
     if (const int result = exercise_prefix(engine); result != 0) { return result; }
     if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
     if (const int result = exercise_vision(engine); result != 0) { return result; }
+    if (const int result = exercise_abandoned_handle_capacity(engine); result != 0) {
+        return result;
+    }
     return 0;
 }
 

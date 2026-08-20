@@ -151,7 +151,6 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
                                          Qwen3_6_27B::SequencePlan sequence_plan,
                                          DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 
@@ -168,7 +167,6 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
                                                Qwen3_6_35BA3B::SequencePlan sequence_plan,
                                                DeviceContext& device)
     : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
-      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_35BA3B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
 

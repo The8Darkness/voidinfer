@@ -2,7 +2,6 @@
 
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
-#include "runtime/contract/transient_region.h"
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
 
@@ -36,9 +35,10 @@ enum class WeightsProfile : std::uint8_t {
     Qwen38Nvfp4,
 };
 
-using Frontend       = qwen3_6::Frontend;
-using PreparedPrompt = qwen3_6::PreparedPrompt;
-using OutputSession  = qwen3_6::OutputSession;
+using Frontend        = qwen3_6::Frontend;
+using PreparedPrompt  = qwen3_6::PreparedPrompt;
+using OutputSession   = qwen3_6::OutputSession;
+using PublishedOutput = qwen3_6::PublishedOutput;
 
 class LoadPlan {
 public:
@@ -84,17 +84,28 @@ struct Package {
     static constexpr std::string_view qwen3_8_model_id   = "qwen3.8-27b";
     static constexpr std::string_view qwen3_8_target_key = "qwen3_8_27b";
 
-    using WeightsProfile  = detail::WeightsProfile;
-    using LoadPlan        = detail::LoadPlan;
-    using LoadedModel     = detail::LoadedModel;
-    using Frontend        = detail::Frontend;
-    using PreparedPrompt  = detail::PreparedPrompt;
-    using OutputSession   = detail::OutputSession;
-    using SequencePlanner = qwen3_6::SequencePlanner<detail::Variant>;
-    using SequencePlan    = qwen3_6::SequencePlan<detail::Variant>;
-    using RequestBasePlan = qwen3_6::RequestBasePlan<detail::Variant>;
-    using RequestPlan     = qwen3_6::RequestPlan<detail::Variant>;
-    using Program         = qwen3_6::Program<detail::Variant>;
+    using WeightsProfile     = detail::WeightsProfile;
+    using LoadPlan           = detail::LoadPlan;
+    using LoadedModel        = detail::LoadedModel;
+    using Frontend           = detail::Frontend;
+    using PreparedPrompt     = detail::PreparedPrompt;
+    using OutputSession      = detail::OutputSession;
+    using PublishedOutput    = detail::PublishedOutput;
+    using SequencePlanner    = qwen3_6::SequencePlanner<detail::Variant>;
+    using SequencePlan       = qwen3_6::SequencePlan<detail::Variant>;
+    using RequestBasePlan    = qwen3_6::RequestBasePlan<detail::Variant>;
+    using AdmissionPlan      = qwen3_6::AdmissionPlan<detail::Variant>;
+    using SequenceHandle     = qwen3_6::SequenceHandle<detail::Variant>;
+    using ContinuationHandle = qwen3_6::ContinuationHandle<detail::Variant>;
+    using PendingBatch       = qwen3_6::PendingBatch<detail::Variant>;
+    using StartResult        = qwen3_6::StartResult<detail::Variant>;
+    using PrefillProgress    = qwen3_6::PrefillProgress<detail::Variant>;
+    using CommitResult       = qwen3_6::CommitResult<detail::Variant>;
+    using DiscardResult      = qwen3_6::DiscardResult<detail::Variant>;
+    using FinishResult       = qwen3_6::FinishResult<detail::Variant>;
+    using AbortResult        = qwen3_6::AbortResult<detail::Variant>;
+    using ReleaseResult      = qwen3_6::ReleaseResult<detail::Variant>;
+    using Program            = qwen3_6::Program<detail::Variant>;
 
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);

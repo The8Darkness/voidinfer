@@ -17,20 +17,10 @@ SequencePlan<Variant>::SequencePlan(
     std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
-// Explicit bodies instead of `= default`: MSVC 19.44 does not emit out-of-line `= default`
-// explicit specializations of these moves (LNK2019 for the plan moves at the final Windows
-// link), while out-of-line specializations with bodies link fine. The bodies are exactly what
-// `= default` would generate: a move of the unique_ptr impl member.
 template <>
-SequencePlan<Variant>::SequencePlan(SequencePlan&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-
+SequencePlan<Variant>::SequencePlan(SequencePlan&&) noexcept = default;
 template <>
-SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-
+SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&&) noexcept = default;
 template <>
 SequencePlan<Variant>::~SequencePlan() = default;
 
@@ -70,15 +60,9 @@ SequencePlanner<Variant>::SequencePlanner(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlanner<Variant>::SequencePlanner(SequencePlanner&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-
+SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
 template <>
-SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-
+SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
 template <>
 SequencePlanner<Variant>::~SequencePlanner() = default;
 
@@ -101,15 +85,9 @@ RequestBasePlan<Variant>::RequestBasePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-
+RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
 template <>
-RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-
+RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
 template <>
 RequestBasePlan<Variant>::~RequestBasePlan() = default;
 
@@ -120,24 +98,19 @@ const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noe
 }
 
 template <>
-RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
+AdmissionPlan<Variant>::AdmissionPlan(
+    std::unique_ptr<detail::AdmissionPlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
 template <>
-RequestPlan<Variant>::RequestPlan(RequestPlan&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
+AdmissionPlan<Variant>::AdmissionPlan(AdmissionPlan&&) noexcept = default;
+template <>
+AdmissionPlan<Variant>& AdmissionPlan<Variant>::operator=(AdmissionPlan&&) noexcept = default;
+template <>
+AdmissionPlan<Variant>::~AdmissionPlan() = default;
 
 template <>
-RequestPlan<Variant>& RequestPlan<Variant>::operator=(RequestPlan&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-
-template <>
-RequestPlan<Variant>::~RequestPlan() = default;
-
-template <>
-const runtime::RequestPlanSummary& RequestPlan<Variant>::summary() const noexcept {
+const runtime::RequestPlanSummary& AdmissionPlan<Variant>::summary() const noexcept {
     static const runtime::RequestPlanSummary empty;
     return impl_ != nullptr ? impl_->summary : empty;
 }
@@ -151,28 +124,16 @@ Program<Variant>::~Program() noexcept = default;
 
 template <>
 RequestBasePlan<Variant>
-Program<Variant>::plan_request_base(const PreparedPrompt& prompt,
-                                    const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request_base(PreparedPromptAccess::view(prompt), options);
+Program<Variant>::plan_request(const PreparedPrompt& prompt,
+                               const runtime::ResolvedExecutionOptions& options) {
+    return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
 }
 
 template <>
-RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
-                                                             const PreparedPrompt& prompt,
-                                                             const RequestBasePlan<Variant>& base) {
-    return impl_->plan_request_for_lane(lane, PreparedPromptAccess::view(prompt), base);
-}
-
-template <>
-bool Program<Variant>::can_admit_lane(std::uint32_t lane,
-                                      const RequestPlan<Variant>& plan) const noexcept {
-    return impl_->can_admit_lane(lane, plan);
-}
-
-template <>
-bool Program<Variant>::can_admit_lane_after_retained_eviction(
-    std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
-    return impl_->can_admit_lane_after_retained_eviction(lane, plan);
+AdmissionPlan<Variant> Program<Variant>::inspect_admission(
+    const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base, runtime::LaneId destination,
+    const ContinuationHandle<Variant>* source) {
+    return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source);
 }
 
 template <>
@@ -181,62 +142,56 @@ runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcep
 }
 
 template <>
-runtime::PrefillStepResult
-Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
-                                     RequestPlan<Variant>&& plan,
-                                     runtime::TransientRegion transient) {
-    return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
-                                     std::move(plan), transient);
+StartResult<Variant>
+Program<Variant>::start_request(AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
+                                std::optional<ContinuationHandle<Variant>>&& source) {
+    return impl_->start_request(std::move(plan), PreparedPromptAccess::take(std::move(prompt)),
+                                std::move(source));
 }
 
 template <>
-runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t lane) {
-    return impl_->advance_prefill_lane(lane);
+PrefillProgress<Variant> Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence) {
+    return impl_->advance_prefill(sequence);
 }
 
 template <>
-runtime::BatchedGeneratedRound
-Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
-                               std::span<const runtime::RoundBudget> budgets) {
-    return impl_->decode_batch(lanes, budgets);
+PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Variant>> sequences,
+                                               std::span<const runtime::RoundBudget> budgets) {
+    return impl_->decode(sequences, budgets);
 }
 
 template <>
-void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
-                                             std::span<const std::uint32_t> accepted_tokens,
-                                             std::span<const std::uint8_t> terminal,
-                                             std::span<const std::uint8_t> cancelled) {
-    impl_->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled);
+CommitResult<Variant> Program<Variant>::commit(PendingBatch<Variant>&& pending,
+                                               std::span<const runtime::CommitDecision> decisions,
+                                               runtime::CommitObservation observation) {
+    return impl_->commit(std::move(pending), decisions, observation);
 }
 
 template <>
-void Program<Variant>::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
-    impl_->resolve_prefill_lane(lane, terminal);
+DiscardResult<Variant> Program<Variant>::abort_pending(PendingBatch<Variant>&& pending) noexcept {
+    return impl_->abort_pending(std::move(pending));
 }
 
 template <>
-void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
-    impl_->abort_lane(lane);
+FinishResult<Variant> Program<Variant>::finish(SequenceHandle<Variant> sequence,
+                                               runtime::RetentionDecision decision) noexcept {
+    return impl_->finish(sequence, decision);
 }
 
 template <>
-bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
-    return impl_->has_retained_lane(lane);
+AbortResult<Variant> Program<Variant>::abort(SequenceHandle<Variant> sequence) noexcept {
+    return impl_->abort(sequence);
 }
 
 template <>
-void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
-    impl_->evict_retained_lane(lane);
+ReleaseResult<Variant>
+Program<Variant>::release_continuation(ContinuationHandle<Variant>&& continuation) noexcept {
+    return impl_->release_continuation(std::move(continuation));
 }
 
 template <>
-GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
-    return impl_->generation_timings_lane(lane);
-}
-
-template <>
-SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
-    return impl_->speculative_stats_lane(lane);
+void Program<Variant>::fail_all_cleanup() noexcept {
+    impl_->fail_all_cleanup();
 }
 
 template <>

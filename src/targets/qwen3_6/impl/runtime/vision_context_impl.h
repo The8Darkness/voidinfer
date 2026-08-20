@@ -313,7 +313,7 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
                                            WorkspaceArena& workspace,
                                            qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient)
+                                           RequestTransientArena::Region transient)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
       context_(device, model) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {

@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include "runtime/engine/request_memory.h"
+#include "core/request_transient_arena.h"
 
 #include <cuda_runtime.h>
 
@@ -44,7 +44,7 @@ int main() {
 
     int failures = 0;
     ninfer::DeviceContext device(0);
-    ninfer::runtime::RequestMemory memory(device, 1024);
+    ninfer::RequestTransientArena memory(device, 1024);
     failures += expect(memory.summary().capacity_bytes == 1024,
                        "constructor did not freeze the requested capacity");
 
@@ -79,7 +79,7 @@ int main() {
     failures += expect(memory.summary().peak_used_bytes == 0,
                        "reset_peak on inactive memory did not clear the peak");
 
-    ninfer::runtime::RequestMemory empty(device, 0);
+    ninfer::RequestTransientArena empty(device, 0);
     empty.activate(0, 1);
     failures += expect(empty.region().data == nullptr && empty.summary().capacity_bytes == 0,
                        "zero-capacity request memory exposed a device allocation");

@@ -9,7 +9,6 @@
 #include "ninfer/ops/kv_cache_append_prefix.h"
 #include "ninfer/ops/swa.h"
 #include "core/decode_graph.h"
-#include "runtime/contract/transient_region.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"

@@ -16,12 +16,15 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -189,6 +192,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
+      request_transient(device_in, plan.request_transient_capacity_bytes),
       round_host(sizeof(TokenId)),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
@@ -255,6 +259,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         SequenceState& sequence = sequences[lane];
+        lane_epochs[lane]       = 1;
         sequence.lane           = lane;
         sequence.tail_hidden    = tail_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
         sequence.rewrite_checkpoint_hidden =
@@ -312,73 +317,404 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
-bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
-    if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
-    const RequestControl& request = requests[lane];
-    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
-        request.lifecycle == Lifecycle::Pending) {
-        return false;
+AdmissionPlan ProgramImplCore::inspect_admission(const PreparedPromptData& prompt,
+                                                 const RequestBasePlan& base,
+                                                 runtime::LaneId destination,
+                                                 const ContinuationHandle* source) {
+    const std::uint32_t lane = destination.value;
+    if (lane >= max_concurrency) { throw std::out_of_range("admission lane is out of range"); }
+    const bool resident = requests[lane].lifecycle == Lifecycle::Resident;
+    if (source != nullptr) {
+        if (!resident || !valid_continuation(*source) ||
+            ContractAccess::lane(*source) != destination) {
+            throw std::logic_error("admission source does not own the resident lane");
+        }
+    } else if (resident) {
+        throw std::logic_error("resident admission lane requires its continuation source");
     }
-    const SequenceState& sequence = sequences[lane];
-    const auto can_replace        = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t new_pages) {
-        return old_pages <= pool.entitled_pages() && new_pages <= pool.logical_page_capacity() &&
-               new_pages <= pool.page_group_count() - (pool.entitled_pages() - old_pages);
-    };
-    const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
-        return false;
+    if (!resident && requests[lane].lifecycle != Lifecycle::Empty) {
+        throw std::logic_error("admission destination is active");
     }
-    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
-    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
-    const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, plan.impl_->backend_kv_page_entitlement);
+
+    AdmissionPlan plan            = inspect_lane(lane, prompt, base);
+    plan.impl_->destination       = destination;
+    plan.impl_->destination_epoch = lane_epochs[lane];
+    plan.impl_->has_source        = source != nullptr;
+    plan.impl_->source_epoch      = source != nullptr ? ContractAccess::epoch(*source) : 0;
+    return plan;
 }
 
-bool ProgramImplCore::can_admit_lane_after_retained_eviction(
-    std::uint32_t lane, const RequestPlan& plan) const noexcept {
-    if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
-    const RequestControl& request = requests[lane];
-    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
-        request.lifecycle == Lifecycle::Pending) {
+bool ProgramImplCore::valid_sequence(SequenceHandle handle) const noexcept {
+    if (ContractAccess::owner(handle) != this) { return false; }
+    const std::uint32_t lane = ContractAccess::lane(handle).value;
+    if (lane >= max_concurrency || ContractAccess::epoch(handle) != lane_epochs[lane]) {
         return false;
     }
+    const Lifecycle lifecycle = requests[lane].lifecycle;
+    return lifecycle == Lifecycle::Prefilling || lifecycle == Lifecycle::Active ||
+           lifecycle == Lifecycle::Pending || lifecycle == Lifecycle::Finishable;
+}
 
-    std::uint32_t reclaimable_text    = 0;
-    std::uint32_t reclaimable_backend = 0;
-    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
-        if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
-        reclaimable_text += sequences[other].kv->text.page_entitlement();
-        if (sequences[other].kv->backend) {
-            reclaimable_backend += sequences[other].kv->backend->page_entitlement();
-        }
+bool ProgramImplCore::valid_continuation(const ContinuationHandle& handle) const noexcept {
+    if (ContractAccess::owner(handle) != this) { return false; }
+    const std::uint32_t lane = ContractAccess::lane(handle).value;
+    return lane < max_concurrency && ContractAccess::epoch(handle) == lane_epochs[lane] &&
+           requests[lane].lifecycle == Lifecycle::Resident;
+}
+
+bool ProgramImplCore::valid_pending(const PendingBatch& pending) const noexcept {
+    if (ContractAccess::owner(pending) != this || !pending_transaction_ ||
+        ContractAccess::transaction(pending) != pending_transaction_->id) {
+        return false;
     }
-
-    const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
-                                std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
-        if (old_pages > pool.entitled_pages() ||
-            reclaimable_pages > pool.entitled_pages() - old_pages ||
-            new_pages > pool.logical_page_capacity()) {
+    const auto rows = ContractAccess::rows(pending);
+    if (rows.size() != pending_transaction_->size) { return false; }
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+        if (!valid_sequence(rows[row]) ||
+            ContractAccess::lane(rows[row]).value != pending_transaction_->lanes[row] ||
+            ContractAccess::epoch(rows[row]) != pending_transaction_->epochs[row] ||
+            requests[pending_transaction_->lanes[row]].lifecycle != Lifecycle::Pending) {
             return false;
         }
-        const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
-        return new_pages <= pool.page_group_count() - committed;
+    }
+    return true;
+}
+
+void ProgramImplCore::invalidate_lane(std::uint32_t lane) noexcept {
+    if (lane >= max_concurrency) { return; }
+    ++lane_epochs[lane];
+    if (lane_epochs[lane] == 0) { ++lane_epochs[lane]; }
+}
+
+runtime::AdmissionResources ProgramImplCore::resident_resources(std::uint32_t lane) const noexcept {
+    if (lane >= max_concurrency || !sequences[lane].kv) { return {}; }
+    const SequenceKVBundle& kv = *sequences[lane].kv;
+    return runtime::AdmissionResources{
+        .active_lanes     = 0,
+        .main_kv_pages    = kv.text.page_entitlement(),
+        .backend_kv_pages = kv.backend ? kv.backend->page_entitlement() : 0U,
+    };
+}
+
+PendingBatch ProgramImplCore::wrap_pending(std::span<const std::uint32_t> lanes,
+                                           const runtime::BatchedGeneratedRound& round) {
+    if (pending_transaction_ || lanes.empty() || lanes.size() > max_concurrency) {
+        throw std::logic_error("Program already owns a pending transaction");
+    }
+    PendingTransaction transaction;
+    transaction.id   = next_transaction_id_++;
+    transaction.size = lanes.size();
+    std::array<SequenceHandle, kMaximumConcurrency> handles{};
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending) {
+            throw std::logic_error("pending transaction membership is invalid");
+        }
+        transaction.lanes[row]  = lane;
+        transaction.epochs[row] = lane_epochs[lane];
+        handles[row] =
+            ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
+    }
+    pending_transaction_ = transaction;
+    return ContractAccess::make_pending(
+        this, transaction.id, std::span<const SequenceHandle>(handles.data(), lanes.size()),
+        round.tokens, round.row_counts, round.row_stride);
+}
+
+PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step) {
+    PrefillProgress out;
+    out.summary                 = step.summary;
+    out.processed_prompt_tokens = step.processed_prompt_tokens;
+    out.complete                = step.complete;
+    if (step.complete) {
+        const std::array<std::uint32_t, 1> lanes{lane};
+        const runtime::BatchedGeneratedRound round{
+            .tokens     = step.round.tokens,
+            .row_counts = {},
+            .row_stride = 1,
+        };
+        out.pending.emplace(wrap_pending(lanes, round));
+    }
+    return out;
+}
+
+StartResult ProgramImplCore::start_request(AdmissionPlan&& plan, PreparedPromptData&& prompt,
+                                           std::optional<ContinuationHandle>&& source) {
+    AdmissionPlan owned_plan(std::move(plan));
+    std::optional<std::uint32_t> destination;
+    if (owned_plan.impl_ != nullptr) { destination = owned_plan.impl_->destination.value; }
+    const auto consume_source = [&]() noexcept {
+        if (source) { ContractAccess::consume(*source); }
+        source.reset();
+    };
+    try {
+        if (owned_plan.impl_ == nullptr || !destination || *destination >= max_concurrency) {
+            throw std::invalid_argument("admission plan is empty or invalid");
+        }
+        const std::uint32_t lane         = *destination;
+        const AdmissionPlanImpl& details = *owned_plan.impl_;
+        if (details.destination_epoch != lane_epochs[lane] ||
+            details.has_source != source.has_value()) {
+            throw std::logic_error("admission plan physical epoch is stale");
+        }
+        if (source) {
+            if (!valid_continuation(*source) || ContractAccess::lane(*source).value != lane ||
+                ContractAccess::epoch(*source) != details.source_epoch) {
+                throw std::logic_error("admission source capability is stale");
+            }
+        } else if (requests[lane].lifecycle != Lifecycle::Empty) {
+            throw std::logic_error("source-free admission destination is not free");
+        }
+
+        const runtime::AdmissionResources active = details.summary.admission;
+        consume_source();
+        runtime::PrefillStepResult first =
+            start_sequence(lane, std::move(prompt), std::move(owned_plan));
+        requests[lane].active_resources = active;
+        invalidate_lane(lane);
+        const SequenceHandle handle =
+            ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
+        return StartResult{
+            .sequence         = handle,
+            .active_resources = active,
+            .progress         = wrap_prefill(lane, std::move(first)),
+        };
+    } catch (...) {
+        consume_source();
+        if (destination && *destination < max_concurrency) {
+            clear_lane(sequences[*destination], requests[*destination]);
+            invalidate_lane(*destination);
+        }
+        throw;
+    }
+}
+
+PrefillProgress ProgramImplCore::advance_prefill(SequenceHandle sequence) {
+    if (pending_transaction_ || !valid_sequence(sequence)) {
+        throw std::logic_error("prefill sequence capability is invalid");
+    }
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    if (requests[lane].lifecycle != Lifecycle::Prefilling) {
+        throw std::logic_error("prefill advance requires a prefilling sequence");
+    }
+    try {
+        return wrap_prefill(lane, advance_prefill_raw(lane));
+    } catch (...) {
+        clear_lane(sequences[lane], requests[lane]);
+        invalidate_lane(lane);
+        throw;
+    }
+}
+
+PendingBatch ProgramImplCore::decode(std::span<const SequenceHandle> members,
+                                     std::span<const runtime::RoundBudget> budgets) {
+    if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
+        budgets.size() != members.size()) {
+        throw std::invalid_argument("decode membership is invalid");
+    }
+    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    for (std::size_t row = 0; row < members.size(); ++row) {
+        if (!valid_sequence(members[row])) {
+            throw std::logic_error("decode sequence capability is invalid");
+        }
+        const std::uint32_t lane = ContractAccess::lane(members[row]).value;
+        if (requests[lane].lifecycle != Lifecycle::Active ||
+            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+            throw std::logic_error("decode membership is duplicate or not active");
+        }
+        lanes[row] = lane;
+    }
+    const auto lane_span = std::span<const std::uint32_t>(lanes.data(), members.size());
+    try {
+        return wrap_pending(lane_span, decode_raw(lane_span, budgets));
+    } catch (...) {
+        for (const std::uint32_t lane : lane_span) {
+            clear_lane(sequences[lane], requests[lane]);
+            invalidate_lane(lane);
+        }
+        pending_transaction_.reset();
+        throw;
+    }
+}
+
+CommitResult ProgramImplCore::commit(PendingBatch&& pending,
+                                     std::span<const runtime::CommitDecision> decisions,
+                                     runtime::CommitObservation observation) {
+    std::array<SequenceHandle, kMaximumConcurrency> members{};
+    const auto input_rows       = ContractAccess::rows(pending);
+    const std::size_t row_count = input_rows.size();
+    for (std::size_t row = 0; row < row_count; ++row) { members[row] = input_rows[row]; }
+    const bool valid = valid_pending(pending);
+    ContractAccess::consume(pending);
+
+    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    std::array<runtime::AdmissionResources, kMaximumConcurrency> active{};
+    std::array<GenerationTimings, kMaximumConcurrency> timings{};
+    std::array<SpeculativeStats, kMaximumConcurrency> speculative{};
+    const auto release_members = [&]() noexcept {
+        for (std::size_t row = 0; row < row_count; ++row) {
+            if (ContractAccess::owner(members[row]) != this) { continue; }
+            const std::uint32_t lane = ContractAccess::lane(members[row]).value;
+            if (lane >= max_concurrency) { continue; }
+            clear_lane(sequences[lane], requests[lane]);
+            invalidate_lane(lane);
+        }
+        pending_transaction_.reset();
     };
 
-    const SequenceState& sequence = sequences[lane];
-    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
-    if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
-                     plan.impl_->text_kv_page_entitlement)) {
-        return false;
-    }
+    try {
+        if (!valid || row_count == 0 || row_count > max_concurrency ||
+            decisions.size() != row_count) {
+            throw std::logic_error("pending transaction capability or decision shape is invalid");
+        }
+        std::array<std::uint32_t, kMaximumConcurrency> accepted{};
+        std::array<std::uint8_t, kMaximumConcurrency> terminal{};
+        std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
+        for (std::size_t row = 0; row < row_count; ++row) {
+            const std::uint32_t lane                = ContractAccess::lane(members[row]).value;
+            lanes[row]                              = lane;
+            active[row]                             = requests[lane].active_resources;
+            const PendingCandidate& candidate       = requests[lane].pending;
+            const runtime::CommitDecision& decision = decisions[row];
+            if ((decision.cancelled && (decision.accepted_tokens != 0 || !decision.terminal)) ||
+                (!decision.cancelled &&
+                 (decision.accepted_tokens == 0 || decision.accepted_tokens > candidate.produced ||
+                  (!decision.terminal && decision.accepted_tokens != candidate.produced)))) {
+                throw std::logic_error("pending transaction decision is invalid");
+            }
+            accepted[row]  = decision.accepted_tokens;
+            terminal[row]  = decision.terminal ? 1U : 0U;
+            cancelled[row] = decision.cancelled ? 1U : 0U;
+            if (decision.cancelled) {
+                timings[row]     = requests[lane].timings;
+                speculative[row] = std::move(requests[lane].speculative_stats);
+            }
+        }
 
-    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
-    if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
-    const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
-    return can_replace(backend->pool(), old_backend, reclaimable_backend,
-                       plan.impl_->backend_kv_page_entitlement);
+        resolve_pending_raw(std::span<const std::uint32_t>(lanes.data(), row_count),
+                            std::span<const std::uint32_t>(accepted.data(), row_count),
+                            std::span<const std::uint8_t>(terminal.data(), row_count),
+                            std::span<const std::uint8_t>(cancelled.data(), row_count));
+        pending_transaction_.reset();
+
+        CommitResult out;
+        out.row_count = row_count;
+        for (std::size_t row = 0; row < row_count; ++row) {
+            if (decisions[row].cancelled) {
+                invalidate_lane(lanes[row]);
+                out.rows[row] = CommitRowResult{
+                    .disposition        = runtime::CommitDisposition::CancelledReleased,
+                    .released_resources = active[row],
+                    .timings            = timings[row],
+                    .speculative        = std::move(speculative[row]),
+                };
+            } else if (decisions[row].terminal) {
+                out.rows[row].disposition = runtime::CommitDisposition::Finishable;
+                if (observation == runtime::CommitObservation::AllRows) {
+                    out.rows[row].timings     = requests[lanes[row]].timings;
+                    out.rows[row].speculative = requests[lanes[row]].speculative_stats;
+                }
+            } else {
+                out.rows[row].disposition = runtime::CommitDisposition::Active;
+                if (observation == runtime::CommitObservation::AllRows) {
+                    out.rows[row].timings     = requests[lanes[row]].timings;
+                    out.rows[row].speculative = requests[lanes[row]].speculative_stats;
+                }
+            }
+        }
+        return out;
+    } catch (...) {
+        release_members();
+        throw;
+    }
+}
+
+DiscardResult ProgramImplCore::abort_pending(PendingBatch&& pending) noexcept {
+    DiscardResult out;
+    const auto rows  = ContractAccess::rows(pending);
+    const bool valid = valid_pending(pending);
+    out.row_count    = std::min<std::size_t>(rows.size(), kMaximumConcurrency);
+    std::array<SequenceHandle, kMaximumConcurrency> members{};
+    for (std::size_t row = 0; row < out.row_count; ++row) { members[row] = rows[row]; }
+    ContractAccess::consume(pending);
+    if (!valid) { return out; }
+    for (std::size_t row = 0; row < out.row_count; ++row) {
+        const std::uint32_t lane    = ContractAccess::lane(members[row]).value;
+        out.released_resources[row] = requests[lane].active_resources;
+        clear_lane(sequences[lane], requests[lane]);
+        invalidate_lane(lane);
+    }
+    pending_transaction_.reset();
+    out.status = runtime::ConsumeStatus::Consumed;
+    return out;
+}
+
+FinishResult ProgramImplCore::finish(SequenceHandle sequence,
+                                     runtime::RetentionDecision decision) noexcept {
+    FinishResult out;
+    if (!valid_sequence(sequence)) { return out; }
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    RequestControl& request  = requests[lane];
+    SequenceState& state     = sequences[lane];
+    if (request.lifecycle != Lifecycle::Finishable) { return out; }
+    out.timings            = request.timings;
+    out.speculative        = std::move(request.speculative_stats);
+    out.released_resources = request.active_resources;
+    if (decision == runtime::RetentionDecision::RetainResident) {
+        release_sequence_growth_entitlement(state);
+        unbind_sequence_kv(state);
+        out.resident_resources   = resident_resources(lane);
+        request.active_resources = {};
+        request.lifecycle        = Lifecycle::Resident;
+        invalidate_lane(lane);
+        out.continuation.emplace(
+            ContractAccess::make_continuation(this, runtime::LaneId{lane}, lane_epochs[lane]));
+    } else {
+        clear_lane(state, request);
+        invalidate_lane(lane);
+    }
+    out.status = runtime::ConsumeStatus::Consumed;
+    return out;
+}
+
+AbortResult ProgramImplCore::abort(SequenceHandle sequence) noexcept {
+    AbortResult out;
+    if (!valid_sequence(sequence)) { return out; }
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    RequestControl& request  = requests[lane];
+    if (request.lifecycle == Lifecycle::Pending || request.lifecycle == Lifecycle::Resident ||
+        request.lifecycle == Lifecycle::Empty) {
+        return out;
+    }
+    out.timings            = request.timings;
+    out.speculative        = std::move(request.speculative_stats);
+    out.released_resources = request.active_resources;
+    clear_lane(sequences[lane], request);
+    invalidate_lane(lane);
+    out.status = runtime::ConsumeStatus::Consumed;
+    return out;
+}
+
+ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continuation) noexcept {
+    ReleaseResult out;
+    const bool valid         = valid_continuation(continuation);
+    const std::uint32_t lane = ContractAccess::lane(continuation).value;
+    ContractAccess::consume(continuation);
+    if (!valid) { return out; }
+    out.released_resources = resident_resources(lane);
+    clear_lane(sequences[lane], requests[lane]);
+    invalidate_lane(lane);
+    out.status = runtime::ConsumeStatus::Consumed;
+    return out;
+}
+
+void ProgramImplCore::fail_all_cleanup() noexcept {
+    pending_transaction_.reset();
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        clear_lane(sequences[lane], requests[lane]);
+        invalidate_lane(lane);
+    }
 }
 
 runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {
@@ -390,15 +726,14 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
     };
 }
 
-runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
-                                                               PreparedPromptData&& prompt,
-                                                               RequestPlan&& plan,
-                                                               runtime::TransientRegion transient) {
+runtime::PrefillStepResult ProgramImplCore::start_sequence(std::uint32_t lane,
+                                                           PreparedPromptData&& prompt,
+                                                           AdmissionPlan&& plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
     if (plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
-    RequestPlanImpl& request_plan = *plan.impl_;
+    AdmissionPlanImpl& request_plan = *plan.impl_;
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
         request.lifecycle == Lifecycle::Pending) {
         throw std::logic_error("staged prefill requires a free request lane");
@@ -420,13 +755,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     if (suffix_has_visual != request_plan.vision.has_value()) {
         throw std::invalid_argument("request plan does not describe the prompt suffix modality");
     }
-    if (request_plan.summary.transient_bytes != 0 &&
-        (transient.data == nullptr || transient.size < request_plan.summary.transient_bytes ||
-         transient.alignment < request_plan.summary.transient_alignment)) {
-        throw std::invalid_argument("request transient region does not satisfy the plan");
-    }
     if (request_plan.reuse != ReusePath::FullReset &&
-        (!sequence.retained ||
+        (request.lifecycle != Lifecycle::Resident ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           request_plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
@@ -475,8 +805,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         throw std::logic_error("planned rewrite checkpoint deferral is invalid");
     }
 
-    const auto started       = Clock::now();
-    const std::uint32_t base = request_plan.reuse_base;
+    request_transient.activate(request_plan.transient_bytes, request_plan.transient_alignment);
+    const RequestTransientArena::Region transient = request_transient.region();
+    const auto started                            = Clock::now();
+    const std::uint32_t base                      = request_plan.reuse_base;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp
             ? std::min({draft_window,
@@ -486,7 +818,6 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
     request.lifecycle = Lifecycle::Empty;
-    sequence.retained = false;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
@@ -632,31 +963,50 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         try {
             device.synchronize();
         } catch (...) {}
+        request_transient.deactivate();
         clear_lane(sequence, request);
         throw;
     }
 }
 
-runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t lane) {
+runtime::PrefillStepResult ProgramImplCore::advance_prefill_raw(std::uint32_t lane) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     return advance_prefill(sequences[lane], requests[lane]);
 }
 
-void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
+void ProgramImplCore::resolve_prefill_raw(std::uint32_t lane, bool terminal) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     if (requests[lane].pending.kind != PendingKind::Begin) {
-        throw std::logic_error("resolve_prefill_lane requires a pending prefill token");
+        throw std::logic_error("prefill resolution requires a pending prefill token");
     }
     resolve_non_speculative_pending(sequences[lane], requests[lane], 1, terminal);
 }
 
-void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes,
-                                            std::span<const std::uint32_t> accepted_tokens,
-                                            std::span<const std::uint8_t> terminal,
-                                            std::span<const std::uint8_t> cancelled) {
+void ProgramImplCore::resolve_pending_raw(std::span<const std::uint32_t> lanes,
+                                          std::span<const std::uint32_t> accepted_tokens,
+                                          std::span<const std::uint8_t> terminal,
+                                          std::span<const std::uint8_t> cancelled) {
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
         terminal.size() != lanes.size() || cancelled.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
+    }
+
+    if (lanes.size() == 1 && lanes.front() < max_concurrency &&
+        requests[lanes.front()].pending.kind == PendingKind::Begin) {
+        const std::uint32_t lane = lanes.front();
+        if (requests[lane].lifecycle != Lifecycle::Pending) {
+            throw std::logic_error("prefill pending token no longer matches Program state");
+        }
+        if (cancelled.front()) {
+            if (accepted_tokens.front() != 0 || !terminal.front()) {
+                throw std::logic_error("cancelled prefill pending decision is invalid");
+            }
+            clear_lane(sequences[lane], requests[lane]);
+        } else {
+            resolve_non_speculative_pending(sequences[lane], requests[lane],
+                                            accepted_tokens.front(), terminal.front() != 0);
+        }
+        return;
     }
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -831,10 +1181,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
             if (terminal[row]) {
-                release_sequence_growth_entitlement(sequence);
-                unbind_sequence_kv(sequence);
-                sequence.retained = true;
-                request.lifecycle = Lifecycle::Complete;
+                request.lifecycle = Lifecycle::Finishable;
             } else {
                 request.lifecycle = Lifecycle::Active;
             }
@@ -849,29 +1196,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     }
 }
 
-void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
-    if (lane >= max_concurrency) { return; }
-    clear_lane(sequences[lane], requests[lane]);
-}
-
-bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
-    return lane < max_concurrency && sequences[lane].retained;
-}
-
-void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
-    if (!has_retained_lane(lane)) { return; }
-    clear_lane(sequences[lane], requests[lane]);
-}
-
-GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
-    return lane < max_concurrency ? requests[lane].timings : GenerationTimings{};
-}
-
-SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
-    return lane < max_concurrency ? requests[lane].speculative_stats : SpeculativeStats{};
-}
-
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    if (request.prefill) { request_transient.deactivate(); }
     request.prefill.reset();
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
@@ -884,9 +1210,9 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.dflash_context_frontier = 0;
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
-    sequence.retained                = false;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
+    request.active_resources         = {};
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
@@ -1703,6 +2029,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 
         staged.prompt.release_all_media_payloads();
 
+        request_transient.deactivate();
         request.prefill.reset();
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
@@ -2153,8 +2480,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 }
 
 runtime::BatchedGeneratedRound
-ProgramImplCore::decode_batch(std::span<const std::uint32_t> lanes,
-                              std::span<const runtime::RoundBudget> budgets) {
+ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
+                            std::span<const runtime::RoundBudget> budgets) {
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets);
     }
@@ -2194,13 +2521,8 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         throw std::logic_error("resolved round did not establish a valid frontier");
     }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
-    if (terminal) {
-        sequence.mtp_draft_count = 0;
-        release_sequence_growth_entitlement(sequence);
-        unbind_sequence_kv(sequence);
-        sequence.retained = true;
-    }
-    request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
+    if (terminal) { sequence.mtp_draft_count = 0; }
+    request.lifecycle = terminal ? Lifecycle::Finishable : Lifecycle::Active;
     request.pending   = {};
 }
 
@@ -2215,6 +2537,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
+    out.request_transient            = request_transient.summary();
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
@@ -2226,6 +2549,7 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
     model.weights_arena->reset_peak();
     persistent.reset_peak();
     work.reset_peak();
+    request_transient.reset_peak();
     workspace_logical_peak_bytes = 0;
 }
 

@@ -27,11 +27,22 @@ using GdnProjectionWeights           = typename Variant::GdnProjectionWeights;
 using VisionWeights                  = typename Variant::VisionWeights;
 using GraphExecutionProfile          = typename Variant::GraphExecutionProfile;
 
-using SequencePlan    = qwen3_6::SequencePlan<Variant>;
-using SequencePlanner = qwen3_6::SequencePlanner<Variant>;
-using RequestBasePlan = qwen3_6::RequestBasePlan<Variant>;
-using RequestPlan     = qwen3_6::RequestPlan<Variant>;
-using Program         = qwen3_6::Program<Variant>;
+using SequencePlan       = qwen3_6::SequencePlan<Variant>;
+using SequencePlanner    = qwen3_6::SequencePlanner<Variant>;
+using RequestBasePlan    = qwen3_6::RequestBasePlan<Variant>;
+using AdmissionPlan      = qwen3_6::AdmissionPlan<Variant>;
+using SequenceHandle     = qwen3_6::SequenceHandle<Variant>;
+using ContinuationHandle = qwen3_6::ContinuationHandle<Variant>;
+using PendingBatch       = qwen3_6::PendingBatch<Variant>;
+using PrefillProgress    = qwen3_6::PrefillProgress<Variant>;
+using StartResult        = qwen3_6::StartResult<Variant>;
+using CommitResult       = qwen3_6::CommitResult<Variant>;
+using DiscardResult      = qwen3_6::DiscardResult<Variant>;
+using FinishResult       = qwen3_6::FinishResult<Variant>;
+using AbortResult        = qwen3_6::AbortResult<Variant>;
+using ReleaseResult      = qwen3_6::ReleaseResult<Variant>;
+using ContractAccess     = qwen3_6::detail::RuntimeContractAccess<Variant>;
+using Program            = qwen3_6::Program<Variant>;
 
 inline constexpr float kAttentionScale                   = Variant::attention_scale;
 inline constexpr float kGdnScale                         = Variant::gdn_scale;

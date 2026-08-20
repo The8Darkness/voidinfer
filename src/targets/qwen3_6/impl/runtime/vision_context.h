@@ -1,4 +1,6 @@
 #pragma once
+
+#include "core/request_transient_arena.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -7,7 +9,6 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
-#include "runtime/contract/transient_region.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <array>
@@ -93,7 +94,7 @@ class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                          WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
-                         const VisionPrefillPlan& plan, runtime::TransientRegion transient);
+                         const VisionPrefillPlan& plan, RequestTransientArena::Region transient);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     void release_encoded_media_payloads() noexcept;
@@ -104,7 +105,7 @@ private:
     WorkspaceArena& workspace_;
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
-    runtime::TransientRegion transient_;
+    RequestTransientArena::Region transient_;
     VisionContext context_;
     std::optional<std::uint32_t> active_item_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;

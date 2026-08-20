@@ -65,8 +65,9 @@ ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
-ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
+ninfer_add_test(ninfer_request_transient_arena_test SOURCES test_request_transient_arena.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
+ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
@@ -89,7 +90,7 @@ set_tests_properties(
   ninfer_device_test
   ninfer_decode_graph_test
   ninfer_arena_test
-  ninfer_request_memory_test
+  ninfer_request_transient_arena_test
   ninfer_kv_cache_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)

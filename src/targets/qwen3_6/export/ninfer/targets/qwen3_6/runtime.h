@@ -1,14 +1,16 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <memory>
+#include <optional>
 #include <span>
+#include <utility>
 
 namespace ninfer {
 struct DeviceContext;
@@ -33,11 +35,13 @@ struct SequencePlanImpl;
 template <class Variant>
 struct SequencePlannerImpl;
 template <class Variant>
-struct RequestPlanImpl;
+struct AdmissionPlanImpl;
 template <class Variant>
 struct RequestBasePlanImpl;
 template <class Variant>
 class ProgramImpl;
+template <class Variant>
+struct RuntimeContractAccess;
 } // namespace detail
 
 template <class Variant>
@@ -118,22 +122,158 @@ public:
 };
 
 template <class Variant>
-class RequestPlan {
+class AdmissionPlan {
 public:
-    RequestPlan(RequestPlan&&) noexcept;
-    RequestPlan& operator=(RequestPlan&&) noexcept;
-    ~RequestPlan();
+    AdmissionPlan(AdmissionPlan&&) noexcept;
+    AdmissionPlan& operator=(AdmissionPlan&&) noexcept;
+    ~AdmissionPlan();
 
-    RequestPlan(const RequestPlan&)            = delete;
-    RequestPlan& operator=(const RequestPlan&) = delete;
+    AdmissionPlan(const AdmissionPlan&)            = delete;
+    AdmissionPlan& operator=(const AdmissionPlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
 
 public:
-    // Family-private construction/storage seam. This header is repository-internal; exact
-    // packages expose only the completed alias and never inspect this pointer.
-    explicit RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept;
-    std::unique_ptr<detail::RequestPlanImpl<Variant>> impl_;
+    // Family-private construction/storage seam. Exact packages expose only the completed alias;
+    // Engine code can inspect summary() but not target planning state.
+    explicit AdmissionPlan(std::unique_ptr<detail::AdmissionPlanImpl<Variant>> impl) noexcept;
+    std::unique_ptr<detail::AdmissionPlanImpl<Variant>> impl_;
+};
+
+template <class Variant>
+class SequenceHandle {
+public:
+    SequenceHandle() noexcept                                 = default;
+    SequenceHandle(const SequenceHandle&) noexcept            = default;
+    SequenceHandle& operator=(const SequenceHandle&) noexcept = default;
+
+private:
+    const void* owner_ = nullptr;
+    runtime::LaneId lane_{};
+    std::uint64_t epoch_ = 0;
+
+    friend struct detail::RuntimeContractAccess<Variant>;
+};
+
+template <class Variant>
+class ContinuationHandle {
+public:
+    ContinuationHandle() noexcept = default;
+    ~ContinuationHandle()         = default;
+
+    ContinuationHandle(ContinuationHandle&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)), lane_(other.lane_),
+          epoch_(std::exchange(other.epoch_, 0)) {}
+
+    ContinuationHandle& operator=(ContinuationHandle&&)      = delete;
+    ContinuationHandle(const ContinuationHandle&)            = delete;
+    ContinuationHandle& operator=(const ContinuationHandle&) = delete;
+
+private:
+    const void* owner_ = nullptr;
+    runtime::LaneId lane_{};
+    std::uint64_t epoch_ = 0;
+
+    friend struct detail::RuntimeContractAccess<Variant>;
+};
+
+template <class Variant>
+class PendingBatch {
+public:
+    PendingBatch() noexcept = default;
+    ~PendingBatch()         = default;
+
+    PendingBatch(PendingBatch&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)),
+          transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
+          row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
+          row_counts_(other.row_counts_), row_stride_(other.row_stride_) {
+        other.tokens_     = {};
+        other.row_counts_ = {};
+        other.row_stride_ = 0;
+    }
+
+    PendingBatch& operator=(PendingBatch&&)      = delete;
+    PendingBatch(const PendingBatch&)            = delete;
+    PendingBatch& operator=(const PendingBatch&) = delete;
+
+    [[nodiscard]] std::size_t row_count() const noexcept { return row_count_; }
+
+    [[nodiscard]] std::span<const TokenId> tokens() const noexcept { return tokens_; }
+
+    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return row_counts_; }
+
+    [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
+
+private:
+    const void* owner_         = nullptr;
+    std::uint64_t transaction_ = 0;
+    std::array<SequenceHandle<Variant>, kMaximumConcurrency> rows_{};
+    std::size_t row_count_ = 0;
+    std::span<const TokenId> tokens_;
+    std::span<const std::int32_t> row_counts_;
+    std::uint32_t row_stride_ = 0;
+
+    friend struct detail::RuntimeContractAccess<Variant>;
+};
+
+template <class Variant>
+struct PrefillProgress {
+    runtime::BeginSummary summary;
+    std::uint32_t processed_prompt_tokens = 0;
+    bool complete                         = false;
+    std::optional<PendingBatch<Variant>> pending;
+};
+
+template <class Variant>
+struct StartResult {
+    SequenceHandle<Variant> sequence;
+    runtime::AdmissionResources active_resources;
+    PrefillProgress<Variant> progress;
+};
+
+struct CommitRowResult {
+    runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
+    runtime::AdmissionResources released_resources;
+    GenerationTimings timings;
+    SpeculativeStats speculative;
+};
+
+template <class Variant>
+struct CommitResult {
+    std::array<CommitRowResult, kMaximumConcurrency> rows{};
+    std::size_t row_count = 0;
+};
+
+template <class Variant>
+struct DiscardResult {
+    runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
+    std::array<runtime::AdmissionResources, kMaximumConcurrency> released_resources{};
+    std::size_t row_count = 0;
+};
+
+template <class Variant>
+struct FinishResult {
+    runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
+    GenerationTimings timings;
+    SpeculativeStats speculative;
+    runtime::AdmissionResources released_resources;
+    runtime::AdmissionResources resident_resources;
+    std::optional<ContinuationHandle<Variant>> continuation;
+};
+
+template <class Variant>
+struct AbortResult {
+    runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
+    GenerationTimings timings;
+    SpeculativeStats speculative;
+    runtime::AdmissionResources released_resources;
+};
+
+template <class Variant>
+struct ReleaseResult {
+    runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
+    runtime::AdmissionResources released_resources;
 };
 
 template <class Variant>
@@ -146,39 +286,31 @@ public:
     Program(Program&&)                 = delete;
     Program& operator=(Program&&)      = delete;
 
-    // Engine-internal fixed-lane execution surface. The public Engine owns scheduling; Program
-    // owns target state images and executes one immutable decode batch membership.
+    // Engine owns scheduling and logical residency policy. Program owns physical lanes, opaque
+    // capabilities, model state and one immutable pending transaction at a time.
     [[nodiscard]] RequestBasePlan<Variant>
-    plan_request_base(const PreparedPrompt& prompt,
-                      const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
-                                                             const PreparedPrompt& prompt,
-                                                             const RequestBasePlan<Variant>& base);
-    [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
-                                      const RequestPlan<Variant>& plan) const noexcept;
-    [[nodiscard]] bool
-    can_admit_lane_after_retained_eviction(std::uint32_t lane,
-                                           const RequestPlan<Variant>& plan) const noexcept;
-    [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
-    [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
-                                                                PreparedPrompt&& prompt,
-                                                                RequestPlan<Variant>&& plan,
-                                                                runtime::TransientRegion transient);
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
-    [[nodiscard]] runtime::BatchedGeneratedRound
-    decode_batch(std::span<const std::uint32_t> lanes,
-                 std::span<const runtime::RoundBudget> budgets);
-    void resolve_prefill_lane(std::uint32_t lane, bool terminal);
-    void resolve_pending_batch(std::span<const std::uint32_t> lanes,
-                               std::span<const std::uint32_t> accepted_tokens,
-                               std::span<const std::uint8_t> terminal,
-                               std::span<const std::uint8_t> cancelled);
-    void abort_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
-    void evict_retained_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options);
+    [[nodiscard]] AdmissionPlan<Variant>
+    inspect_admission(const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base,
+                      runtime::LaneId destination, const ContinuationHandle<Variant>* source);
+    [[nodiscard]] StartResult<Variant>
+    start_request(AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
+                  std::optional<ContinuationHandle<Variant>>&& source);
+    [[nodiscard]] PrefillProgress<Variant> advance_prefill(SequenceHandle<Variant> sequence);
+    [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
+                                               std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] CommitResult<Variant>
+    commit(PendingBatch<Variant>&& pending, std::span<const runtime::CommitDecision> decisions,
+           runtime::CommitObservation observation = runtime::CommitObservation::AllRows);
+    [[nodiscard]] DiscardResult<Variant> abort_pending(PendingBatch<Variant>&& pending) noexcept;
+    [[nodiscard]] FinishResult<Variant> finish(SequenceHandle<Variant> sequence,
+                                               runtime::RetentionDecision decision) noexcept;
+    [[nodiscard]] AbortResult<Variant> abort(SequenceHandle<Variant> sequence) noexcept;
+    [[nodiscard]] ReleaseResult<Variant>
+    release_continuation(ContinuationHandle<Variant>&& continuation) noexcept;
+    void fail_all_cleanup() noexcept;
 
+    [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
@@ -191,6 +323,97 @@ private:
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
                                                       DeviceContext&);
 };
+
+namespace detail {
+
+template <class Variant>
+struct RuntimeContractAccess {
+    [[nodiscard]] static SequenceHandle<Variant>
+    make_sequence(const void* owner, runtime::LaneId lane, std::uint64_t epoch) noexcept {
+        SequenceHandle<Variant> out;
+        out.owner_ = owner;
+        out.lane_  = lane;
+        out.epoch_ = epoch;
+        return out;
+    }
+
+    [[nodiscard]] static ContinuationHandle<Variant>
+    make_continuation(const void* owner, runtime::LaneId lane, std::uint64_t epoch) noexcept {
+        ContinuationHandle<Variant> out;
+        out.owner_ = owner;
+        out.lane_  = lane;
+        out.epoch_ = epoch;
+        return out;
+    }
+
+    [[nodiscard]] static const void* owner(const SequenceHandle<Variant>& handle) noexcept {
+        return handle.owner_;
+    }
+
+    [[nodiscard]] static runtime::LaneId lane(const SequenceHandle<Variant>& handle) noexcept {
+        return handle.lane_;
+    }
+
+    [[nodiscard]] static std::uint64_t epoch(const SequenceHandle<Variant>& handle) noexcept {
+        return handle.epoch_;
+    }
+
+    [[nodiscard]] static const void* owner(const ContinuationHandle<Variant>& handle) noexcept {
+        return handle.owner_;
+    }
+
+    [[nodiscard]] static runtime::LaneId lane(const ContinuationHandle<Variant>& handle) noexcept {
+        return handle.lane_;
+    }
+
+    [[nodiscard]] static std::uint64_t epoch(const ContinuationHandle<Variant>& handle) noexcept {
+        return handle.epoch_;
+    }
+
+    static void consume(ContinuationHandle<Variant>& handle) noexcept {
+        handle.owner_ = nullptr;
+        handle.epoch_ = 0;
+    }
+
+    [[nodiscard]] static PendingBatch<Variant>
+    make_pending(const void* owner, std::uint64_t transaction,
+                 std::span<const SequenceHandle<Variant>> rows, std::span<const TokenId> tokens,
+                 std::span<const std::int32_t> row_counts, std::uint32_t row_stride) {
+        PendingBatch<Variant> out;
+        out.owner_       = owner;
+        out.transaction_ = transaction;
+        out.row_count_   = rows.size();
+        for (std::size_t i = 0; i < rows.size(); ++i) { out.rows_[i] = rows[i]; }
+        out.tokens_     = tokens;
+        out.row_counts_ = row_counts;
+        out.row_stride_ = row_stride;
+        return out;
+    }
+
+    [[nodiscard]] static const void* owner(const PendingBatch<Variant>& pending) noexcept {
+        return pending.owner_;
+    }
+
+    [[nodiscard]] static std::uint64_t transaction(const PendingBatch<Variant>& pending) noexcept {
+        return pending.transaction_;
+    }
+
+    [[nodiscard]] static std::span<const SequenceHandle<Variant>>
+    rows(const PendingBatch<Variant>& pending) noexcept {
+        return {pending.rows_.data(), pending.row_count_};
+    }
+
+    static void consume(PendingBatch<Variant>& pending) noexcept {
+        pending.owner_       = nullptr;
+        pending.transaction_ = 0;
+        pending.row_count_   = 0;
+        pending.tokens_      = {};
+        pending.row_counts_  = {};
+        pending.row_stride_  = 0;
+    }
+};
+
+} // namespace detail
 
 template <class Variant>
 [[nodiscard]] SequencePlanner<Variant>

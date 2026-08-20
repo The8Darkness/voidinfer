@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/request_transient_arena.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -71,7 +72,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
 };
 
 template <>
-struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
+struct AdmissionPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
     std::uint32_t reuse_base                  = 0;
@@ -85,13 +86,19 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::size_t transient_bytes               = 0;
+    std::size_t transient_alignment           = 1;
+    runtime::LaneId destination{};
+    std::uint64_t destination_epoch = 0;
+    bool has_source                 = false;
+    std::uint64_t source_epoch      = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
-using RequestPlanImpl     = qwen3_6::detail::RequestPlanImpl<Variant>;
+using AdmissionPlanImpl   = qwen3_6::detail::AdmissionPlanImpl<Variant>;
 using RequestBasePlanImpl = qwen3_6::detail::RequestBasePlanImpl<Variant>;
 
 enum class PendingKind : std::uint8_t {
@@ -114,7 +121,8 @@ enum class Lifecycle : std::uint8_t {
     Prefilling,
     Active,
     Pending,
-    Complete,
+    Finishable,
+    Resident,
 };
 
 struct RewriteCheckpoint {
@@ -167,7 +175,6 @@ struct SequenceState {
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
-    bool retained                 = false;
     RewriteCheckpoint rewrite_checkpoint;
 };
 
@@ -179,12 +186,13 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
+    runtime::AdmissionResources active_resources;
 
     struct Prefill {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<schedule::VisionPrefillSession> vision;
-        runtime::TransientRegion transient;
+        RequestTransientArena::Region transient;
         std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
@@ -205,35 +213,27 @@ public:
                     DeviceContext& device);
     ~ProgramImplCore() noexcept;
 
-    [[nodiscard]] RequestBasePlan
-    plan_request_base(const PreparedPromptData& prompt,
-                      const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
-                                                    const PreparedPromptData& prompt,
-                                                    const RequestBasePlan& base);
-    [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
-    [[nodiscard]] bool
-    can_admit_lane_after_retained_eviction(std::uint32_t lane,
-                                           const RequestPlan& plan) const noexcept;
+    [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
+                                               const runtime::ResolvedExecutionOptions& options);
+    [[nodiscard]] AdmissionPlan inspect_admission(const PreparedPromptData& prompt,
+                                                  const RequestBasePlan& base,
+                                                  runtime::LaneId destination,
+                                                  const ContinuationHandle* source);
+    [[nodiscard]] StartResult start_request(AdmissionPlan&& plan, PreparedPromptData&& prompt,
+                                            std::optional<ContinuationHandle>&& source);
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence);
+    [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
+                                      std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] CommitResult commit(PendingBatch&& pending,
+                                      std::span<const runtime::CommitDecision> decisions,
+                                      runtime::CommitObservation observation);
+    [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
+    [[nodiscard]] FinishResult finish(SequenceHandle sequence,
+                                      runtime::RetentionDecision decision) noexcept;
+    [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
+    [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
+    void fail_all_cleanup() noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
-    [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
-                                                                PreparedPromptData&& prompt,
-                                                                RequestPlan&& plan,
-                                                                runtime::TransientRegion transient);
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
-    [[nodiscard]] runtime::BatchedGeneratedRound
-    decode_batch(std::span<const std::uint32_t> lanes,
-                 std::span<const runtime::RoundBudget> budgets);
-    void resolve_prefill_lane(std::uint32_t lane, bool terminal);
-    void resolve_pending_batch(std::span<const std::uint32_t> lanes,
-                               std::span<const std::uint32_t> accepted_tokens,
-                               std::span<const std::uint8_t> terminal,
-                               std::span<const std::uint8_t> cancelled);
-    void abort_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
-    void evict_retained_lane(std::uint32_t lane) noexcept;
-    [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -260,6 +260,7 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    RequestTransientArena request_transient;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
@@ -272,6 +273,7 @@ public:
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
+    std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
@@ -292,6 +294,36 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
 
 private:
+    struct PendingTransaction {
+        std::uint64_t id = 0;
+        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::array<std::uint64_t, kMaximumConcurrency> epochs{};
+        std::size_t size = 0;
+    };
+
+    std::optional<PendingTransaction> pending_transaction_;
+    std::uint64_t next_transaction_id_ = 1;
+
+    [[nodiscard]] AdmissionPlan inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt,
+                                             const RequestBasePlan& base);
+    [[nodiscard]] runtime::PrefillStepResult
+    start_sequence(std::uint32_t lane, PreparedPromptData&& prompt, AdmissionPlan&& plan);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_raw(std::uint32_t lane);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets);
+    void resolve_prefill_raw(std::uint32_t lane, bool terminal);
+    void resolve_pending_raw(std::span<const std::uint32_t> lanes,
+                             std::span<const std::uint32_t> accepted_tokens,
+                             std::span<const std::uint8_t> terminal,
+                             std::span<const std::uint8_t> cancelled);
+    [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
+    [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_pending(const PendingBatch& pending) const noexcept;
+    [[nodiscard]] runtime::AdmissionResources resident_resources(std::uint32_t lane) const noexcept;
+    [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step);
+    [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t> lanes,
+                                            const runtime::BatchedGeneratedRound& round);
+    void invalidate_lane(std::uint32_t lane) noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();

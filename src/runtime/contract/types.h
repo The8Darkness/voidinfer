@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -38,13 +39,61 @@ struct OutputDecision {
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };
 
+struct LaneId {
+    std::uint32_t value = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(LaneId, LaneId) noexcept  = default;
+    [[nodiscard]] friend constexpr auto operator<=>(LaneId, LaneId) noexcept = default;
+};
+
+enum class RetentionDecision : std::uint8_t {
+    RetainResident,
+    Release,
+};
+
+enum class ConsumeStatus : std::uint8_t {
+    Consumed,
+    InvariantMismatch,
+};
+
+enum class CommitDisposition : std::uint8_t {
+    Active,
+    Finishable,
+    CancelledReleased,
+};
+
+// The product Engine only needs statistics for rows whose sequence is released by commit.
+// Direct diagnostic callers may temporarily request cumulative snapshots for every row.
+enum class CommitObservation : std::uint8_t {
+    ReleasedRowsOnly,
+    AllRows,
+};
+
+struct CommitDecision {
+    std::uint32_t accepted_tokens = 0;
+    bool terminal                 = false;
+    bool cancelled                = false;
+};
+
 // Complete request-lifetime ownership in the three independently exhausted admission domains.
 // Values are already rounded to the physical allocation granularity by the target.
 struct AdmissionResources {
     std::uint32_t active_lanes     = 0;
     std::uint32_t main_kv_pages    = 0;
     std::uint32_t backend_kv_pages = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(const AdmissionResources&,
+                                                   const AdmissionResources&) noexcept = default;
 };
+
+[[nodiscard]] constexpr AdmissionResources operator+(AdmissionResources lhs,
+                                                     AdmissionResources rhs) noexcept {
+    return AdmissionResources{
+        .active_lanes     = lhs.active_lanes + rhs.active_lanes,
+        .main_kv_pages    = lhs.main_kv_pages + rhs.main_kv_pages,
+        .backend_kv_pages = lhs.backend_kv_pages + rhs.backend_kv_pages,
+    };
+}
 
 struct RequestPlanSummary {
     std::uint32_t prompt_tokens           = 0;
@@ -52,8 +101,7 @@ struct RequestPlanSummary {
     std::uint32_t requested_output_tokens = 0;
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;
-    std::size_t transient_bytes           = 0;
-    std::size_t transient_alignment       = 1;
+    PrefixReusePath prefix_reuse_path     = PrefixReusePath::FullReset;
     AdmissionResources admission;
     std::uint64_t service_work_quanta = 0;
 };

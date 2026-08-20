@@ -27,12 +27,12 @@ add_library(ninfer_core STATIC
   core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
+  core/request_transient_arena.cpp
   core/tensor.cpp
   core/decode_graph.cpp
   runtime/engine/admission_policy.cpp
   runtime/engine/kv_capacity.cpp
-  runtime/engine/public_types.cpp
-  runtime/engine/request_memory.cpp)
+  runtime/engine/public_types.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads)

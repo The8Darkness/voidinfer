@@ -3,7 +3,7 @@
 #include "core/device.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
-#include "runtime/engine/concurrent_executor.h"
+#include "runtime/engine/engine_core.h"
 #include "targets/registry.h"
 
 #include <stdexcept>
@@ -130,10 +130,9 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
-    using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
-    using Executor =
-        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+    using Core27 = runtime::EngineCore<targets::Qwen3_6_27BInstance>;
+    using Core35 = runtime::EngineCore<targets::Qwen3_6_35BA3BInstance>;
+    using Core   = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
@@ -141,21 +140,21 @@ public:
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
-        executor          = std::visit(
-            [&](auto& target_ptr) -> Executor {
+        core              = std::visit(
+            [&](auto& target_ptr) -> Core {
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    return std::make_unique<Executor27>(*target_ptr, options);
+                    return std::make_unique<Core27>(*target_ptr, options);
                 } else {
-                    return std::make_unique<Executor35>(*target_ptr, options);
+                    return std::make_unique<Core35>(*target_ptr, options);
                 }
             },
             active);
     }
 
     ~Impl() noexcept {
-        executor.emplace<std::monostate>();
+        core.emplace<std::monostate>();
         try {
             device.synchronize();
         } catch (...) {}
@@ -166,7 +165,7 @@ public:
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
-    Executor executor;
+    Core core;
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
@@ -278,19 +277,19 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     }
 
     return std::visit(
-        [&](auto& executor) -> GenerationHandle {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (std::is_same_v<Executor, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
+        [&](auto& core) -> GenerationHandle {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
             } else {
-                auto submission = executor->submit(std::move(prompt.impl_->value), prompt_summary,
-                                                   prepare_seconds, std::move(resolved_options),
-                                                   pending_deadline);
+                auto submission =
+                    core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
+                                 std::move(resolved_options), pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
         },
-        impl_->executor);
+        impl_->core);
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -311,15 +310,15 @@ LoadSummary Engine::load_summary() const {
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
-        [](const auto& executor) -> MemorySummary {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (std::is_same_v<Executor, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
+        [](const auto& core) -> MemorySummary {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
             } else {
-                return executor->memory_summary();
+                return core->memory_summary();
             }
         },
-        impl_->executor);
+        impl_->core);
 }
 
 MediaCacheSummary Engine::media_cache_summary() const {
@@ -335,27 +334,27 @@ MediaCacheSummary Engine::media_cache_summary() const {
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
-        [](const auto& executor) -> RuntimeStats {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (std::is_same_v<Executor, std::monostate>) {
-                throw std::logic_error("concurrent Engine executor is unavailable");
+        [](const auto& core) -> RuntimeStats {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
             } else {
-                return executor->runtime_stats();
+                return core->runtime_stats();
             }
         },
-        impl_->executor);
+        impl_->core);
 }
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(
-        [](auto& executor) {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (!std::is_same_v<Executor, std::monostate>) {
-                executor->reset_memory_peaks();
+        [](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
+                core->reset_memory_peaks();
             }
         },
-        impl_->executor);
+        impl_->core);
 }
 
 } // namespace ninfer

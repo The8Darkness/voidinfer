@@ -57,9 +57,8 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 
 } // namespace
 
-RequestBasePlan
-ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
-                                   const runtime::ResolvedExecutionOptions& options) {
+RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
+                                              const runtime::ResolvedExecutionOptions& options) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -102,8 +101,6 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.effective_limit_reason = options.requested_output_tokens <= capacity_output
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
-    base->summary.transient_alignment    = 1;
-    base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     const std::uint32_t reserved_context_tokens =
@@ -172,26 +169,25 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     return RequestBasePlan(std::move(base));
 }
 
-RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
-                                                   const PreparedPromptData& prompt,
-                                                   const RequestBasePlan& base_plan) {
+AdmissionPlan ProgramImplCore::inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt,
+                                            const RequestBasePlan& base_plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
     const SequenceState& sequence = sequences[lane];
-    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
-        request.lifecycle == Lifecycle::Pending) {
-        throw std::logic_error("cannot plan a request while Program is active or pending");
+    if (request.lifecycle != Lifecycle::Empty && request.lifecycle != Lifecycle::Resident) {
+        throw std::logic_error("admission inspection requires a free or resident lane");
     }
     if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
     const RequestBasePlanImpl& base = *base_plan.impl_;
 
-    auto plan                         = std::make_unique<RequestPlanImpl>();
+    auto plan                         = std::make_unique<AdmissionPlanImpl>();
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
-    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
+    if (base.allow_prefix_reuse && prompt.identity.reusable &&
+        request.lifecycle == Lifecycle::Resident) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
@@ -255,6 +251,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
+    plan->summary.prefix_reuse_path      = plan->reuse;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;
@@ -285,9 +282,9 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index)});
         }
         if (!vision.uses.empty()) {
-            plan->summary.transient_alignment = 256;
-            plan->summary.transient_bytes     = base.vision_transient_bytes;
-            plan->vision                      = std::move(vision);
+            plan->transient_alignment = 256;
+            plan->transient_bytes     = base.vision_transient_bytes;
+            plan->vision              = std::move(vision);
         }
     }
 
@@ -299,7 +296,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
              : 0ULL);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
-    return RequestPlan(std::move(plan));
+    return AdmissionPlan(std::move(plan));
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
