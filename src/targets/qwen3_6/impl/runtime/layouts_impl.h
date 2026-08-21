@@ -162,11 +162,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
-            PagedKVPoolSpec full_pool{
-                .page_group_count      = physical_pages,
-                .logical_page_capacity = logical_pages,
-                .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
-                .plane_order           = PagedKVPlaneOrder::HeadMajor,
+            KVPageGeometry full_geometry{
+                .page_tokens        = kPagedKVPageSize,
+                .device_plane_order = PagedKVPlaneOrder::HeadMajor,
                 .planes =
                     {
                         {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
@@ -174,7 +172,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                     },
             };
             dflash.full = qwen3_6::PagedKVCacheLayout{
-                .pool        = plan_paged_kv_pool(builder, full_pool),
+                .pages = plan_device_kv_page_pool(
+                    builder, DeviceKVPagePoolSpec{.page_group_count = physical_pages,
+                                                  .geometry         = std::move(full_geometry)}),
+                .execution_tables = plan_kv_execution_tables(
+                    builder,
+                    KVExecutionTableSpec{
+                        .logical_page_capacity = logical_pages,
+                        .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
+                    }),
                 .layers      = 1,
                 .max_context = plan.capacity,
                 .kv_heads    = DFlashConfig::kv_heads,

@@ -13,14 +13,14 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
       pending_features(layout.pending_features.bind(backing)) {
     if (local.layer_count() != DFlashConfig::local_layers ||
         local.capacity() != DFlashConfig::local_capacity || full.layers() != 1 ||
-        full.max_context() != layout.full.max_context || full.pool().plane_count() != 2 ||
+        full.max_context() != layout.full.max_context || full.page_pool().plane_count() != 2 ||
         local.num_kv_heads() != DFlashConfig::kv_heads ||
         local.head_dim() != DFlashConfig::head_dim ||
-        local.lane_capacity() != 2 * full.pool().table_row_count() ||
-        full.pool().plane(0).dtype != DType::BF16 ||
-        full.pool().plane(0).ne[0] != DFlashConfig::head_dim ||
-        full.pool().plane(0).ne[1] != kPagedKVPageSize ||
-        full.pool().plane(0).ne[3] != DFlashConfig::kv_heads) {
+        local.lane_capacity() != 2 * full.execution_tables().row_count() ||
+        full.page_pool().plane(0).dtype != DType::BF16 ||
+        full.page_pool().plane(0).ne[0] != DFlashConfig::head_dim ||
+        full.page_pool().plane(0).ne[1] != kPagedKVPageSize ||
+        full.page_pool().plane(0).ne[3] != DFlashConfig::kv_heads) {
         throw std::invalid_argument("DFlash persistent cache layout is invalid");
     }
 }

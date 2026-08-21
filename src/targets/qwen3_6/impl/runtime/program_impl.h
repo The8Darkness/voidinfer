@@ -728,8 +728,8 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
     return runtime::AdmissionResources{
         .active_lanes     = max_concurrency,
-        .main_kv_pages    = decoder->text_kv.pool().page_group_count(),
-        .backend_kv_pages = backend != nullptr ? backend->pool().page_group_count() : 0U,
+        .main_kv_pages    = decoder->text_kv.page_pool().capacity_pages(),
+        .backend_kv_pages = backend != nullptr ? backend->page_pool().capacity_pages() : 0U,
     };
 }
 
@@ -1247,24 +1247,21 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
         throw std::invalid_argument("KV allocation entitlement does not match the active backend");
     }
 
-    std::array<PagedKVReservation, 2> reservations{};
-    std::size_t count     = 0;
-    reservations[count++] = PagedKVReservation{
-        .pool             = &decoder->text_kv.pool(),
-        .page_entitlement = text_pages,
-    };
-    if (qwen3_6::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
-        reservations[count++] = PagedKVReservation{
-            .pool             = &backend->pool(),
-            .page_entitlement = backend_pages,
-        };
+    DeviceKVPagePool& text_pool = decoder->text_kv.page_pool();
+    std::array<DeviceKVPageReservationRequest, 2> requests{};
+    std::size_t count              = 0;
+    requests[count++]              = {.pool = &text_pool, .pages = text_pages};
+    qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    if (backend != nullptr) {
+        requests[count++] = {.pool = &backend->page_pool(), .pages = backend_pages};
     }
-
-    std::vector<PagedKVAllocation> allocations =
-        reserve_paged_kv_bundle(std::span<const PagedKVReservation>(reservations.data(), count));
+    std::vector<DeviceKVPageReservation> reservations = reserve_device_kv_page_bundle(
+        std::span<const DeviceKVPageReservationRequest>(requests.data(), count));
     SequenceKVBundle bundle;
-    bundle.text = std::move(allocations[0]);
-    if (count == 2) { bundle.backend.emplace(std::move(allocations[1])); }
+    bundle.text = PrivateKVMapping(text_pool, std::move(reservations[0]), text_pages);
+    if (backend != nullptr) {
+        bundle.backend.emplace(backend->page_pool(), std::move(reservations[1]), backend_pages);
+    }
     sequence.kv.emplace(std::move(bundle));
 }
 
@@ -1275,21 +1272,29 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
         (sequence.kv->backend.has_value() != (backend_pages != 0))) {
         throw std::invalid_argument("KV resize entitlement does not match the sequence bundle");
     }
-    std::array<PagedKVResize, 2> changes{};
-    std::size_t count = 0;
-    changes[count++]  = PagedKVResize{
-         .allocation       = &sequence.kv->text,
-         .mapped_pages     = sequence.kv->text.mapped_page_count(),
-         .page_entitlement = text_pages,
+    const auto validate = [](const PrivateKVMapping& mapping, std::uint32_t entitlement) {
+        if (!mapping.valid() || entitlement < mapping.mapped_page_count()) {
+            throw std::invalid_argument("KV entitlement is smaller than mapped pages");
+        }
+        const std::uint32_t remaining = entitlement - mapping.mapped_page_count();
+        if (!mapping.pool->can_resize_reservation(mapping.remaining_growth, remaining)) {
+            throw std::bad_alloc();
+        }
     };
+    validate(sequence.kv->text, text_pages);
+    if (sequence.kv->backend) { validate(*sequence.kv->backend, backend_pages); }
+
+    // Complete every potentially throwing host allocation before changing pool accounting.
+    sequence.kv->text.pages.reserve(text_pages);
+    if (sequence.kv->backend) { sequence.kv->backend->pages.reserve(backend_pages); }
+
+    sequence.kv->text.pool->resize_reservation(sequence.kv->text.remaining_growth,
+                                               text_pages - sequence.kv->text.mapped_page_count());
     if (sequence.kv->backend) {
-        changes[count++] = PagedKVResize{
-            .allocation       = &*sequence.kv->backend,
-            .mapped_pages     = sequence.kv->backend->mapped_page_count(),
-            .page_entitlement = backend_pages,
-        };
+        sequence.kv->backend->pool->resize_reservation(
+            sequence.kv->backend->remaining_growth,
+            backend_pages - sequence.kv->backend->mapped_page_count());
     }
-    resize_paged_kv_bundle(std::span<PagedKVResize>(changes.data(), count));
 }
 
 void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
@@ -1298,25 +1303,31 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
         throw std::logic_error("KV allocation bundle is unavailable or already bound");
     }
     const std::int32_t row = static_cast<std::int32_t>(sequence.lane);
-    sequence.kv->text.bind_row(row, device.stream);
+    sequence.kv->text.execution_row.emplace(decoder->text_kv.execution_tables().acquire(row));
     try {
-        if (sequence.kv->backend) { sequence.kv->backend->bind_row(row, device.stream); }
+        decoder->text_kv.execution_tables().publish(sequence.kv->text.execution_row->handle(), 0,
+                                                    sequence.kv->text.pages, device.stream);
+        if (sequence.kv->backend) {
+            qwen3_6::PagedKVCache* backend = backend_kv_cache();
+            if (backend == nullptr) { throw std::logic_error("KV backend cache is unavailable"); }
+            sequence.kv->backend->execution_row.emplace(backend->execution_tables().acquire(row));
+            backend->execution_tables().publish(sequence.kv->backend->execution_row->handle(), 0,
+                                                sequence.kv->backend->pages, device.stream);
+        }
         set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
         set_device_i32(io.backend_kv_table_row,
                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
     } catch (...) {
-        if (sequence.kv->backend && sequence.kv->backend->bound_row() >= 0) {
-            sequence.kv->backend->unbind_row();
-        }
-        sequence.kv->text.unbind_row();
+        if (sequence.kv->backend) { sequence.kv->backend->execution_row.reset(); }
+        sequence.kv->text.execution_row.reset();
         throw;
     }
 }
 
 void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
-    if (sequence.kv->backend) { sequence.kv->backend->unbind_row(); }
-    sequence.kv->text.unbind_row();
+    if (sequence.kv->backend) { sequence.kv->backend->execution_row.reset(); }
+    sequence.kv->text.execution_row.reset();
 }
 
 void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
@@ -1327,11 +1338,26 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
-    if (main_tokens > sequence.kv->text.mapped_token_capacity()) {
-        sequence.kv->text.materialize_tokens(main_tokens, device.stream);
-    }
-    if (backend_tokens != 0 && backend_tokens > sequence.kv->backend->mapped_token_capacity()) {
-        sequence.kv->backend->materialize_tokens(backend_tokens, device.stream);
+    const auto materialize = [&](PrivateKVMapping& mapping, qwen3_6::PagedKVCache& cache,
+                                 std::uint32_t tokens) {
+        const std::uint32_t target =
+            tokens == 0 ? 0 : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+        if (target <= mapping.mapped_page_count()) { return; }
+        const std::uint32_t first = mapping.mapped_page_count();
+        mapping.pool->materialize(mapping.remaining_growth, target, mapping.pages);
+        if (mapping.execution_row) {
+            cache.execution_tables().publish(
+                mapping.execution_row->handle(), first,
+                std::span<const DeviceKVPageLease>(mapping.pages.data() + first,
+                                                   mapping.pages.size() - first),
+                device.stream);
+        }
+    };
+    materialize(sequence.kv->text, decoder->text_kv, main_tokens);
+    if (backend_tokens != 0) {
+        qwen3_6::PagedKVCache* backend = backend_kv_cache();
+        if (backend == nullptr) { throw std::logic_error("KV backend cache is unavailable"); }
+        materialize(*sequence.kv->backend, *backend, backend_tokens);
     }
 }
 
@@ -1349,21 +1375,24 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
 
 void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
-    sequence.kv->text.cancel_unmapped_entitlement();
-    if (sequence.kv->backend) { sequence.kv->backend->cancel_unmapped_entitlement(); }
+    sequence.kv->text.remaining_growth.clear();
+    if (sequence.kv->backend) { sequence.kv->backend->remaining_growth.clear(); }
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::text_kv_view(const SequenceState& sequence) const {
-    if (!sequence.kv) { throw std::logic_error("sequence has no KV allocation bundle"); }
-    return decoder->text_kv.execution_view(sequence.kv->text);
+    if (!sequence.kv || !sequence.kv->text.execution_row) {
+        throw std::logic_error("sequence has no active KV execution mapping");
+    }
+    return decoder->text_kv.execution_view(*sequence.kv->text.execution_row);
 }
 
 qwen3_6::PagedKVCacheView ProgramImplCore::mtp_kv_view(const SequenceState& sequence) const {
     if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
-    if (decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend) {
-        throw std::logic_error("sequence has no MTP KV allocation");
+    if (decoder->mtp_cache() == nullptr || !sequence.kv || !sequence.kv->backend ||
+        !sequence.kv->backend->execution_row) {
+        throw std::logic_error("sequence has no active MTP KV execution mapping");
     }
-    return decoder->mtp_cache()->execution_view(*sequence.kv->backend);
+    return decoder->mtp_cache()->execution_view(*sequence.kv->backend->execution_row);
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -1388,32 +1417,33 @@ void ProgramImplCore::prepare_graphs() {
     if (!use_cuda_graph) { return; }
     SequenceState& sequence = sequences[0];
 
-    std::vector<PagedKVAllocation> text_capture_allocations;
-    std::vector<PagedKVAllocation> mtp_capture_allocations;
-    std::vector<PagedKVAllocation> dflash_capture_allocations;
+    std::vector<PrivateKVMapping> text_capture_allocations;
+    std::vector<PrivateKVMapping> mtp_capture_allocations;
+    std::vector<PrivateKVMapping> dflash_capture_allocations;
     const auto reserve_capture_rows = [&](qwen3_6::PagedKVCache& cache,
-                                          std::vector<PagedKVAllocation>& allocations,
+                                          std::vector<PrivateKVMapping>& allocations,
                                           const char* label) {
-        PagedKVPool& pool = cache.pool();
-        if (pool.page_group_count() < max_concurrency) {
+        DeviceKVPagePool& pool       = cache.page_pool();
+        KVExecutionTablePool& tables = cache.execution_tables();
+        if (pool.capacity_pages() < max_concurrency) {
             throw std::invalid_argument(std::string(label) +
                                         " cannot provide one Paged KV page per concurrent request");
         }
         allocations.reserve(max_concurrency);
         for (std::uint32_t row = 0; row < max_concurrency; ++row) {
-            allocations.push_back(pool.reserve(1));
-            PagedKVAllocation& allocation = allocations.back();
-            allocation.bind_row(static_cast<std::int32_t>(row), device.stream);
-            allocation.materialize_pages(1, device.stream);
+            std::optional<DeviceKVPageReservation> reservation = pool.reserve(1);
+            if (!reservation) { throw std::bad_alloc(); }
+            allocations.emplace_back(pool, std::move(*reservation), 1);
+            PrivateKVMapping& allocation = allocations.back();
+            allocation.execution_row.emplace(tables.acquire(static_cast<std::int32_t>(row)));
+            pool.materialize(allocation.remaining_growth, 1, allocation.pages);
 
             // Capture profiles exercise arbitrary context envelopes. Repeating each row's private
             // page across its temporary table keeps every dummy read/write address valid without
             // reserving C full contexts solely for graph construction.
-            const std::int32_t page = allocation.page_ids().front();
-            std::vector<std::int32_t> repeated(pool.logical_page_capacity(), page);
-            Tensor table = pool.block_table_row(static_cast<std::int32_t>(row));
-            CUDA_CHECK(cudaMemcpyAsync(table.data, repeated.data(), table.bytes(),
-                                       cudaMemcpyHostToDevice, device.stream));
+            tables.publish_repeated(allocation.execution_row->handle(),
+                                    allocation.pages.front().handle(),
+                                    tables.logical_page_capacity(), device.stream);
         }
     };
     reserve_capture_rows(decoder->text_kv, text_capture_allocations, "target KV cache");
@@ -1447,14 +1477,14 @@ void ProgramImplCore::prepare_graphs() {
         }
     };
     const auto zero_capture_pages = [&](qwen3_6::PagedKVCache& cache,
-                                        const std::vector<PagedKVAllocation>& allocations,
+                                        const std::vector<PrivateKVMapping>& allocations,
                                         std::uint32_t batch_size) {
-        std::vector<std::int32_t> pages;
+        std::vector<DeviceKVPageHandle> pages;
         pages.reserve(batch_size);
         for (std::uint32_t row = 0; row < batch_size; ++row) {
-            pages.push_back(allocations[row].page_ids().front());
+            pages.push_back(allocations[row].pages.front().handle());
         }
-        cache.pool().zero_pages(pages, device.stream);
+        cache.page_pool().zero_pages(pages, device.stream);
     };
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size) {
         if (batch_size == 0 || batch_size > max_concurrency) {
@@ -1705,11 +1735,8 @@ void ProgramImplCore::prepare_graphs() {
                                  " bytes, exceeding the planned allowance of " +
                                  std::to_string(graph_allowance_bytes) + " bytes");
     }
-    for (PagedKVAllocation& allocation : dflash_capture_allocations) { allocation.unbind_row(); }
     dflash_capture_allocations.clear();
-    for (PagedKVAllocation& allocation : mtp_capture_allocations) { allocation.unbind_row(); }
     mtp_capture_allocations.clear();
-    for (PagedKVAllocation& allocation : text_capture_allocations) { allocation.unbind_row(); }
     text_capture_allocations.clear();
 }
 

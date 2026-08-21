@@ -67,7 +67,10 @@ Pending implementation work:
   contracts for the upcoming context-cache implementation; it does not describe the current Engine.
 - [Resource scheduling and context-cache implementation record](maintainer/resource-scheduling-and-context-cache-implementation-record.md)
   tracks the ordered implementation steps, decisions, actual changes, verification, and commits for
-  that architecture; currently only Step 1 has been opened.
+  that architecture; Steps 1 and 2 are complete.
 - [StateImage physical-container implementation plan](maintainer/state-image-container-implementation-plan.md)
-  is the executable plan for the current Linear Attention, continuation-hidden, DFlash fixed-state,
-  and Host-image container step; it is not a second architecture reference.
+  records the completed Linear Attention, continuation-hidden, DFlash fixed-state, and Host-image
+  container step; it is not a second architecture reference.
+- [Paged KV physical-container implementation plan](maintainer/paged-kv-physical-container-implementation-plan.md)
+  records the completed Device page ownership, execution mapping, packed Host allocation, physical
+  transfer, and current Program-cutover step.

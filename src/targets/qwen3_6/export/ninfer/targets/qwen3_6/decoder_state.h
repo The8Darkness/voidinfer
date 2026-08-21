@@ -26,7 +26,8 @@ struct DecoderStateSpec {
 };
 
 struct PagedKVCacheLayout {
-    PagedKVPoolLayout pool;
+    DeviceKVPagePoolLayout pages;
+    KVExecutionTableLayout execution_tables;
     std::uint32_t layers      = 0;
     std::uint32_t max_context = 0;
     std::int32_t kv_heads     = 0;
@@ -34,7 +35,7 @@ struct PagedKVCacheLayout {
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
 
-    [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
+    [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
 
 class PagedKVCache;
@@ -69,11 +70,17 @@ public:
 
     [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
 
-    [[nodiscard]] PagedKVPool& pool() noexcept { return pool_; }
+    [[nodiscard]] DeviceKVPagePool& page_pool() noexcept { return pages_; }
 
-    [[nodiscard]] const PagedKVPool& pool() const noexcept { return pool_; }
+    [[nodiscard]] const DeviceKVPagePool& page_pool() const noexcept { return pages_; }
 
-    [[nodiscard]] PagedKVCacheView execution_view(const PagedKVAllocation& allocation) const;
+    [[nodiscard]] KVExecutionTablePool& execution_tables() noexcept { return execution_tables_; }
+
+    [[nodiscard]] const KVExecutionTablePool& execution_tables() const noexcept {
+        return execution_tables_;
+    }
+
+    [[nodiscard]] PagedKVCacheView execution_view(const KVExecutionRowLease& row) const;
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
@@ -81,7 +88,8 @@ private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
-    PagedKVPool pool_;
+    DeviceKVPagePool pages_;
+    KVExecutionTablePool execution_tables_;
     std::uint32_t layers_      = 0;
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;

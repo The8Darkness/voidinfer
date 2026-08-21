@@ -22,6 +22,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -131,9 +133,66 @@ struct RewriteCheckpoint {
     std::uint32_t frontier     = 0;
 };
 
+struct PrivateKVMapping {
+    DeviceKVPagePool* pool = nullptr;
+    std::vector<DeviceKVPageLease> pages;
+    DeviceKVPageReservation remaining_growth;
+    std::optional<KVExecutionRowLease> execution_row;
+
+    PrivateKVMapping() noexcept = default;
+
+    PrivateKVMapping(DeviceKVPagePool& page_pool, DeviceKVPageReservation&& reservation,
+                     std::uint32_t page_entitlement)
+        : pool(&page_pool), remaining_growth(std::move(reservation)) {
+        if (!remaining_growth.belongs_to(page_pool) ||
+            remaining_growth.pages() != page_entitlement) {
+            throw std::invalid_argument("Private KV mapping reservation is inconsistent");
+        }
+        pages.reserve(page_entitlement);
+    }
+
+    PrivateKVMapping(const PrivateKVMapping&)                = delete;
+    PrivateKVMapping& operator=(const PrivateKVMapping&)     = delete;
+    PrivateKVMapping(PrivateKVMapping&&) noexcept            = default;
+    PrivateKVMapping& operator=(PrivateKVMapping&&) noexcept = default;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return pool != nullptr && remaining_growth.belongs_to(*pool);
+    }
+
+    [[nodiscard]] std::uint32_t mapped_page_count() const noexcept {
+        return static_cast<std::uint32_t>(pages.size());
+    }
+
+    [[nodiscard]] std::uint32_t mapped_token_capacity() const noexcept {
+        return mapped_page_count() * static_cast<std::uint32_t>(kPagedKVPageSize);
+    }
+
+    [[nodiscard]] std::uint32_t page_entitlement() const noexcept {
+        return mapped_page_count() + remaining_growth.pages();
+    }
+
+    [[nodiscard]] std::int32_t bound_row() const noexcept {
+        return execution_row ? execution_row->row_index() : -1;
+    }
+
+    void trim_pages(std::uint32_t count) {
+        if (!valid() || count > pages.size()) {
+            throw std::invalid_argument("Private KV trim exceeds mapped pages");
+        }
+        pool->dematerialize(remaining_growth, count, pages);
+    }
+
+    void trim_tokens(std::uint32_t tokens) {
+        const std::uint32_t count =
+            tokens == 0 ? 0 : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+        trim_pages(count);
+    }
+};
+
 struct SequenceKVBundle {
-    PagedKVAllocation text;
-    std::optional<PagedKVAllocation> backend;
+    PrivateKVMapping text;
+    std::optional<PrivateKVMapping> backend;
 };
 
 struct DecodeGraphProfile {
