@@ -51,17 +51,6 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
-        .linear_attention =
-            {
-                .layers         = 3,
-                .conv_channels  = 10,
-                .conv_width     = 3,
-                .value_heads    = 4,
-                .value_head_dim = 5,
-                .key_head_dim   = 6,
-                .slot_count     = 4,
-                .conv_dtype     = ninfer::DType::BF16,
-            },
     };
 }
 
@@ -81,9 +70,6 @@ void test_decoder_layout() {
                        }),
            "BF16 KV has no scale planes");
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
-    expect(bf16.linear_attention.conv.size() == 3 && bf16.linear_attention.recurrent.size() == 3,
-           "Linear Attention layer storage");
-    expect(bf16.linear_attention.spec.slot_count == 4, "Linear Attention slot geometry");
     expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
 
     ninfer::LayoutBuilder int8_builder;

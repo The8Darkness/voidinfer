@@ -2,7 +2,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
-#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 
 #include "core/arena.h"
 #include "core/device.h"

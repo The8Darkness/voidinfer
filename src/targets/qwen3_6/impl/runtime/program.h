@@ -11,7 +11,7 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
-#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/state_image_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -262,14 +262,13 @@ public:
     WorkspaceArena work;
     RequestTransientArena request_transient;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
     Tensor token_counts;
-    Tensor tail_hidden_store;
-    Tensor rewrite_checkpoint_hidden_store;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/linear_attention_state.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
 
@@ -24,7 +23,6 @@ struct DecoderStateSpec {
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
-    LinearAttentionStatePoolSpec linear_attention;
 };
 
 struct PagedKVCacheLayout {
@@ -95,7 +93,6 @@ private:
 struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;
     std::optional<PagedKVCacheLayout> mtp_kv;
-    LinearAttentionStatePoolLayout linear_attention;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
 };
@@ -106,7 +103,6 @@ struct DecoderStateLayout {
 struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
-    LinearAttentionStatePool linear_attention;
 
     DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
 

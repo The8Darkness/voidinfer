@@ -67,7 +67,6 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups);
     }
-    layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;
 }
 
@@ -136,7 +135,7 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
 }
 
 DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
-    : text_kv(backing, layout.text_kv), linear_attention(backing, layout.linear_attention) {
+    : text_kv(backing, layout.text_kv) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
 }
 

@@ -880,7 +880,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor key_output       = kc.view({kCfg.key_dim, width, active_sequence_batch_});
         Tensor value_output     = vc.view({kCfg.value_dim, width, active_sequence_batch_});
         Tensor gate_output      = z.view({kCfg.value_dim, width, active_sequence_batch_});
-        Tensor& conv_states     = state_.conv.at(static_cast<std::size_t>(gidx));
+        Tensor conv_states      = state_.layer_view(static_cast<std::uint32_t>(gidx)).conv;
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             if (replay_records_ == nullptr) {
@@ -917,7 +917,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     if (ph == Phase::Verify) {
-        Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
+        Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
         const std::int32_t width = active_sequence_width_;
         Tensor q_batch =
             q_recurrent.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, width, active_sequence_batch_});

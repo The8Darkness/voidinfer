@@ -1,6 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
-#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/state_image_slots.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -91,8 +91,7 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
-    const std::int32_t linear_state_slots =
-        LinearStateSlots::state_slot_count(plan.max_concurrency);
+    const std::int32_t state_image_slots = StateImageSlots::state_slot_count(plan.max_concurrency);
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -121,18 +120,32 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
-                     .linear_attention =
-                         {
-                             .layers         = TextConfig::gdn_layers(),
-                             .conv_channels  = TextConfig::convolution_dim,
-                             .conv_width     = TextConfig::gdn_conv_state_width,
-                             .value_heads    = TextConfig::gdn_value_heads,
-                             .value_head_dim = TextConfig::gdn_value_head_dim,
-                             .key_head_dim   = TextConfig::gdn_key_head_dim,
-                             .slot_count     = linear_state_slots,
-                             .conv_dtype     = DType::BF16,
-                         },
                  });
+    qwen3_6::StateImageSpec state_image_spec{
+        .linear =
+            {
+                .layers         = TextConfig::gdn_layers(),
+                .conv_channels  = TextConfig::convolution_dim,
+                .conv_width     = TextConfig::gdn_conv_state_width,
+                .value_heads    = TextConfig::gdn_value_heads,
+                .value_head_dim = TextConfig::gdn_value_head_dim,
+                .key_head_dim   = TextConfig::gdn_key_head_dim,
+                .slot_count     = state_image_slots,
+                .conv_dtype     = DType::BF16,
+            },
+        .hidden = TextConfig::hidden,
+    };
+    if constexpr (Variant::supports_dflash) {
+        if (plan.features.dflash()) {
+            state_image_spec.dflash_local = qwen3_6::DFlashLocalStateSpec{
+                .layers   = DFlashConfig::local_layers,
+                .capacity = DFlashConfig::local_capacity,
+                .kv_heads = DFlashConfig::kv_heads,
+                .head_dim = DFlashConfig::head_dim,
+            };
+        }
+    }
+    out.state_images = qwen3_6::plan_state_image_device_pool(builder, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
@@ -149,14 +162,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
-            dflash.local = plan_cyclic_kv_cache(builder, DFlashConfig::local_layers,
-                                                DFlashConfig::local_capacity,
-                                                DFlashConfig::kv_heads, DFlashConfig::head_dim,
-                                                static_cast<std::int32_t>(plan.max_concurrency));
-            dflash.rewrite_checkpoint_local = plan_cyclic_kv_cache(
-                builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
-                DFlashConfig::kv_heads, DFlashConfig::head_dim,
-                static_cast<std::int32_t>(plan.max_concurrency));
             PagedKVPoolSpec full_pool{
                 .page_group_count      = physical_pages,
                 .logical_page_capacity = logical_pages,
@@ -212,12 +217,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
-    out.tail_hidden = add_tensor(
-        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
-        "tail hidden");
-    out.rewrite_checkpoint_hidden = add_tensor(
-        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
-        "rewrite checkpoint hidden");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
