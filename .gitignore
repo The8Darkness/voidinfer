@@ -54,3 +54,41 @@ dist/*
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Local agent, authentication, session, memory, and observability state
+.pi/
+.agents/
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+tokens.json
+oauth.json
+sessions/
+memory/
+observability/
+*.db
+*.db-*
+*.sqlite-*
+*.trace
+*.dmp
+
+# Model/checkpoint and tensor artifacts
+*.ninfer
+*.ckpt
+*.onnx
+*.pt
+*.pth
+*.npy
+*.npz
+
+# Local caches and scratch output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+cache/
+caches/
+logs/
+tmp/
+temp/
