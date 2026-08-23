@@ -1,0 +1,37 @@
+{
+  "settings": {
+    "hostConfigDiscovery": "off",
+    "directTools": false,
+    "scriptMode": true,
+    "autoAuth": false,
+    "sampling": false,
+    "elicitation": false,
+    "outputGuard": {
+      "maxBytes": 65536,
+      "maxLines": 1000,
+      "detailsMaxBytes": 16384
+    }
+  },
+  "mcpServers": {
+    "nvidia-cuda-docs": {
+      "url": "https://api.copilot.nsight.ngc.nvidia.com/mcp/cuda-docs",
+      "auth": "oauth",
+      "lifecycle": "lazy",
+      "directTools": false,
+      "requestTimeoutMs": 60000
+    },
+    "github": {
+      "command": "D:\\AI\\Pi\\apps\\github-mcp-server-v1.10.1\\github-mcp-server.exe",
+      "args": [
+        "stdio",
+        "--read-only",
+        "--lockdown-mode",
+        "--toolsets=context,repos,issues,pull_requests,actions,code_security,secret_protection",
+        "--oauth-scopes=repo,read:org"
+      ],
+      "lifecycle": "lazy",
+      "directTools": false,
+      "requestTimeoutMs": 120000
+    }
+  }
+}
