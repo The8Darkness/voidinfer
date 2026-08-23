@@ -60,6 +60,9 @@ std::string read_file(const char* path) {
 
 std::string read_template_fixture(const char* path) {
     std::string source = read_file(path);
+    for (std::size_t offset = 0; (offset = source.find("\r\n", offset)) != std::string::npos;) {
+        source.erase(offset, 1);
+    }
     if (!source.empty() && source.back() == '\n') { source.pop_back(); }
     return source;
 }
@@ -99,6 +102,13 @@ const fi::Tokenizer& official_tokenizer() {
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
     return tokenizer;
+}
+
+bool official_tokenizer_available() {
+    std::ifstream stream(
+        "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json",
+        std::ios::binary);
+    return static_cast<bool>(stream);
 }
 
 nlohmann::json added(int id, std::string content, bool special = false) {
@@ -163,6 +173,14 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     result.video_preprocessor_config_json =
         R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":4096,"longest_edge":25165824}})";
     return result;
+}
+
+const fi::Tokenizer& test_tokenizer() {
+    static const FrontendResources owned = resources();
+    static const fi::Tokenizer tokenizer({.tokenizer_json         = owned.tokenizer_json,
+                                          .tokenizer_config_json  = owned.tokenizer_config_json,
+                                          .generation_config_json = owned.generation_config_json});
+    return tokenizer;
 }
 
 std::vector<std::uint8_t> gradient_ppm() {
@@ -319,7 +337,7 @@ int test_repeated_special_tokens_scan_linearly() {
     std::string text;
     text.reserve(token.size() * 5'000);
     for (int index = 0; index < 5'000; ++index) { text += token; }
-    const std::vector<int> encoded = official_tokenizer().encode(text);
+    const std::vector<int> encoded = test_tokenizer().encode(text);
     return check(encoded.size() == 5'000 && std::all_of(encoded.begin(), encoded.end(),
                                                         [](int id) { return id == 248056; }),
                  "repeated special-token scan changed tokenization semantics");
@@ -449,12 +467,15 @@ int test_ordered_instruction_turns() {
                           appended_diagnostics.substr(stable_history.size()) ==
                               "<|im_start|>system\ncurrent diagnostics<|im_end|>\n",
                       "appended diagnostics changed the stable serialized history prefix");
-    const std::vector<int> stable_tokens   = official_tokenizer().encode(stable_history);
-    const std::vector<int> appended_tokens = official_tokenizer().encode(appended_diagnostics);
-    failures +=
-        check(appended_tokens.size() > stable_tokens.size() &&
-                  std::equal(stable_tokens.begin(), stable_tokens.end(), appended_tokens.begin()),
-              "appended diagnostics changed the stable token prefix");
+    if (official_tokenizer_available()) {
+        const std::vector<int> stable_tokens = official_tokenizer().encode(stable_history);
+        const std::vector<int> appended_tokens =
+            official_tokenizer().encode(appended_diagnostics);
+        failures +=
+            check(appended_tokens.size() > stable_tokens.size() &&
+                      std::equal(stable_tokens.begin(), stable_tokens.end(), appended_tokens.begin()),
+                  "appended diagnostics changed the stable token prefix");
+    }
 
     fi::ChatRenderOptions tools = no_generation;
     tools.tool_jsons.push_back(
@@ -878,7 +899,7 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     options.max_encoded_media_bytes = bytes.size() * 2 - 1;
     auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
                                                             ninfer::kDefaultMediaLiveBytes);
-    fi::Processor processor(official_tokenizer(), thinking_toggle_template(), options,
+    fi::Processor processor(test_tokenizer(), thinking_toggle_template(), options,
                             std::move(cache));
     fi::ChatMessage internal_message;
     internal_message.role = ninfer::ChatRole::User;
@@ -1308,7 +1329,11 @@ int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
-    failures += test_official_tokenizer_merge();
+    if (official_tokenizer_available()) {
+        failures += test_official_tokenizer_merge();
+    } else {
+        std::cerr << "SKIP: official Qwen tokenizer fixture is unavailable\n";
+    }
     failures += test_repeated_special_tokens_scan_linearly();
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();

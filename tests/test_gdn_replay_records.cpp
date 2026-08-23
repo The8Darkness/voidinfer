@@ -9,14 +9,30 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 namespace {
 
-using AlignedBacking = std::unique_ptr<void, decltype(&std::free)>;
+void free_aligned(void* data) noexcept {
+#ifdef _WIN32
+    _aligned_free(data);
+#else
+    std::free(data);
+#endif
+}
+
+using AlignedBacking = std::unique_ptr<void, decltype(&free_aligned)>;
 
 AlignedBacking make_backing(std::size_t bytes) {
+#ifdef _WIN32
+    void* data = _aligned_malloc(bytes, 256);
+#else
     void* data = std::aligned_alloc(256, bytes);
+#endif
     if (data == nullptr) { throw std::bad_alloc(); }
-    return AlignedBacking(data, &std::free);
+    return AlignedBacking(data, &free_aligned);
 }
 
 int fail(const char* label) {
