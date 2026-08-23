@@ -1,0 +1,66 @@
+name: Windows integrity
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  secret-and-artifact-checks:
+    runs-on: windows-2025
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate repository text
+        shell: pwsh
+        run: |
+          git diff --check HEAD^
+
+          $rules = [ordered]@{
+            aws         = 'AKIA[0-9A-Z]{16}'
+            github      = '(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})'
+            openai      = 'sk-[A-Za-z0-9_-]{20,}'
+            private_key = '-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----'
+            bearer      = 'Bearer[ ]+[A-Za-z0-9._~+/=-]{24,}'
+          }
+          $findings = [System.Collections.Generic.List[string]]::new()
+          foreach ($rule in $rules.GetEnumerator()) {
+            $paths = @(git grep -I -l -E -- $rule.Value -- . 2>$null)
+            foreach ($path in $paths) { $findings.Add("$($rule.Key):$path") }
+          }
+          if ($findings.Count -ne 0) {
+            $findings | Sort-Object -Unique | Write-Error
+            throw 'High-confidence secret pattern detected.'
+          }
+
+      - name: Reject local and generated artifacts
+        shell: pwsh
+        run: |
+          $pattern = '(?i)(^|/)(auth|credentials|tokens|oauth)\.json$|(^|/)\.env($|\.)|\.(ncu-rep|nsys-rep|dmp|trace|sqlite|db|ninfer|ckpt|onnx|pt|pth|npy|npz|safetensors|gguf)$'
+          $blocked = @(git ls-files | Where-Object { $_ -match $pattern })
+          if ($blocked.Count -ne 0) {
+            $blocked | Write-Error
+            throw 'Local, credential, model, or profiler artifact is tracked.'
+          }
+
+      - name: Validate MCP configuration
+        shell: pwsh
+        run: |
+          $config = Get-Content -LiteralPath .mcp.json -Raw | ConvertFrom-Json
+          if ($config.mcpServers.'nvidia-cuda-docs'.auth -ne 'oauth') {
+            throw 'NVIDIA MCP must use OAuth.'
+          }
+          $github = $config.mcpServers.github
+          if ($github.command -notmatch 'github-mcp-server\.exe$') {
+            throw 'GitHub MCP must use the official local server.'
+          }
+          foreach ($required in @('--read-only', '--lockdown-mode')) {
+            if ($required -notin $github.args) { throw "GitHub MCP is missing $required." }
+          }

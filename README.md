@@ -1,8 +1,9 @@
-# NInfer-windows
+# VoidInfer — Native RTX 5090 Inference Engine
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-NInfer-windows is a Windows 11 port of [Neroued/ninfer](https://github.com/Neroued/ninfer), a from-scratch C++/CUDA inference 
+VoidInfer is the public project name for this Windows-focused fork of NInfer. NInfer-windows is a
+Windows 11 port of [Neroued/ninfer](https://github.com/Neroued/ninfer), a from-scratch C++/CUDA inference
 engine for explicitly registered Qwen checkpoints on a single NVIDIA GeForce RTX 5090.
 It runs text, image, and video prompts through a local CLI, OpenAI-/Anthropic-compatible HTTP APIs, 
 or the included llama.cpp webui. It builds and runs natively on Windows 11 x64. Fork changes should 
