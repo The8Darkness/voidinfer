@@ -39,6 +39,7 @@ jobs:
             $findings | Sort-Object -Unique | Write-Error
             throw 'High-confidence secret pattern detected.'
           }
+          exit 0
 
       - name: Reject local and generated artifacts
         shell: pwsh
