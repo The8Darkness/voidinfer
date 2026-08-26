@@ -9,7 +9,10 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-inline constexpr std::int32_t kKvQuantGroup = 64;
+inline constexpr std::int32_t kKvInt8QuantGroup = 64;
+inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
+// Existing family layout code names the production INT8-G64 profile this way.
+inline constexpr std::int32_t kKvQuantGroup = kKvInt8QuantGroup;
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;

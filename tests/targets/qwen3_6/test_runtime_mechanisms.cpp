@@ -47,7 +47,7 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .kv_heads                  = 2,
         .attention_head_dim        = 64,
         .kv_dtype                  = dtype,
-        .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvInt8QuantGroup : 0,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
@@ -59,14 +59,14 @@ void test_decoder_layout() {
     const q36::DecoderStateLayout bf16 =
         q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
     (void)bf16_builder.finish(256);
-    expect(bf16.text_kv.pool.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
-    expect(bf16.text_kv.pool.spec.page_group_count == 5 &&
-               bf16.text_kv.pool.spec.logical_page_capacity == 3 &&
-               bf16.text_kv.pool.spec.table_rows == 1,
+    expect(bf16.text_kv.pages.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
+    expect(bf16.text_kv.pages.spec.page_group_count == 5 &&
+               bf16.text_kv.execution_tables.spec.logical_page_capacity == 3 &&
+               bf16.text_kv.execution_tables.spec.table_rows == 1,
            "Text KV separates five physical pages from three logical pages");
-    expect(std::all_of(bf16.text_kv.pool.planes.begin(), bf16.text_kv.pool.planes.end(),
-                       [](const ninfer::PagedKVPlaneLayout& plane) {
-                           return plane.spec.dtype == ninfer::DType::BF16;
+    expect(std::all_of(bf16.text_kv.pages.planes.begin(), bf16.text_kv.pages.planes.end(),
+                       [](const ninfer::DeviceKVPlaneLayout& plane) {
+                           return plane.geometry.dtype == ninfer::DType::BF16;
                        }),
            "BF16 KV has no scale planes");
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
@@ -76,20 +76,38 @@ void test_decoder_layout() {
     const q36::DecoderStateLayout int8 =
         q36::plan_decoder_state(int8_builder, decoder_spec(ninfer::DType::I8, true));
     (void)int8_builder.finish(256);
-    expect(int8.text_kv.pool.planes.size() == 8 &&
-               int8.text_kv.pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
-               int8.text_kv.pool.planes[3].spec.dtype == ninfer::DType::FP16,
+    expect(int8.text_kv.pages.planes.size() == 8 &&
+               int8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               int8.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::FP16,
            "INT8 Text KV has code and scale planes per layer");
     expect(int8.mtp_kv.has_value() && int8.mtp_kv->layers == 1 &&
-               int8.mtp_kv->pool.planes.size() == 4 &&
-               int8.mtp_kv->pool.spec.page_group_count == 4 &&
-               int8.mtp_kv->pool.spec.logical_page_capacity == 3,
+               int8.mtp_kv->pages.planes.size() == 4 &&
+               int8.mtp_kv->pages.spec.page_group_count == 4 &&
+               int8.mtp_kv->execution_tables.spec.logical_page_capacity == 3,
            "enabled MTP has one paged KV layer");
-    expect(int8.mtp_kv && int8.mtp_kv->pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
-               int8.mtp_kv->pool.planes[3].spec.dtype == ninfer::DType::FP16,
+    expect(int8.mtp_kv && int8.mtp_kv->pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               int8.mtp_kv->pages.planes[3].geometry.dtype == ninfer::DType::FP16,
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
+
+    q36::DecoderStateSpec fp8_spec = decoder_spec(ninfer::DType::FP8_E4M3FN, true);
+    fp8_spec.attention_head_dim    = q36::kKvFp8QuantGroup;
+    fp8_spec.kv_quant_group        = q36::kKvFp8QuantGroup;
+    ninfer::LayoutBuilder fp8_builder;
+    const q36::DecoderStateLayout fp8 = q36::plan_decoder_state(fp8_builder, fp8_spec);
+    (void)fp8_builder.finish(256);
+    expect(fp8.text_kv.pages.planes.size() == 8 &&
+               fp8.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               fp8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               fp8.text_kv.pages.planes[2].geometry.leading_extent == 1,
+           "FP8 Text KV has row-scaled code and scale planes per layer");
+    expect(fp8.mtp_kv && fp8.mtp_kv->pages.planes.size() == 4 &&
+               fp8.mtp_kv->pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               fp8.mtp_kv->pages.planes[2].geometry.leading_extent == 1,
+           "FP8 MTP KV has row-scaled code and scale planes");
+    expect(fp8.kv_payload_bytes() == fp8.text_kv.payload_bytes() + fp8.mtp_kv->payload_bytes(),
+           "FP8 Text/MTP KV payload accounting");
 }
 
 void test_round_layout() {
