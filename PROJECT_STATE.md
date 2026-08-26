@@ -7,11 +7,11 @@ Updated: 2026-08-26 UTC
 - Project: VoidInfer / NInfer native Windows RTX 5090 engine
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `master`
-- State checkpoint commit: `b5420019`; pushed on `origin/phase1/bootstrap-state-20260826`; PR #1 is open against protected `master` (later state-bookkeeping commits may follow this checkpoint)
-- Last-known-good source commit: `b5420019` (`fix(windows): use native benchmark and smoke paths`)
+- State checkpoint commit: `808c7616`; pushed on `origin/phase1/bootstrap-state-20260826`; PR #1 is open against protected `master` (later state-bookkeeping commits may follow this checkpoint)
+- Last-known-good source commit: `808c7616` (`docs(state): checkpoint Windows path fixes`)
 - Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `120a`, tests enabled; build and 89-test CTest run pass; benchmark target also built
 - Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
-- Last accepted pushed commit at this checkpoint: `b5420019` on `origin/phase1/bootstrap-state-20260826`; direct `master` push is blocked by required status check `secret-and-artifact-checks`
+- Last accepted pushed commit at this checkpoint: `808c7616` on `origin/phase1/bootstrap-state-20260826`; direct `master` push is blocked by required status check `secret-and-artifact-checks`
 - Current phase: Phase 1, reproducible native-Windows baseline and audit scaffolding; PR #1 awaits protected-branch CI
 - Active hypothesis: qualify canonical `Neroued/ninfer` `dev` context/resource implementation before designing a competing prefix cache
 
@@ -73,7 +73,7 @@ Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM12
 
 1. Build the Phase 1 baseline matrix against the local Qwen3.8 NVFP4 artifact; classify all results as local measurements.
 2. Separate text-only from vision-enabled serving smoke and add a real Qwen3.8 integration test.
-4. Integrate canonical `dev` only in an isolated experiment worktree, beginning with the coupled StateImage + paged-KV + Engine/resource cutover; preserve a rollback point.
-5. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before exact baseline and quality gates exist.
+3. Integrate canonical `dev` only in an isolated experiment worktree, beginning with the coupled StateImage + paged-KV + Engine/resource cutover; preserve a rollback point.
+4. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before exact baseline and quality gates exist.
 
 The Picot launcher and harness now use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration.
