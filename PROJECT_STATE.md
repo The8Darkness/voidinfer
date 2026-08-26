@@ -7,11 +7,11 @@ Updated: 2026-08-26 UTC
 - Project: VoidInfer / NInfer native Windows RTX 5090 engine
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `master`
-- HEAD: `e92e7fc7`; pushed on `origin/phase1/bootstrap-state-20260826`; PR #1 is open against protected `master`
-- Last-known-good source commit: `e92e7fc7` (`docs(state): record qualified local smoke and benchmark`)
+- HEAD: `2d6e3a35`; pushed on `origin/phase1/bootstrap-state-20260826`; PR #1 is open against protected `master`
+- Last-known-good source commit: `2d6e3a35` (`docs(state): track bootstrap pull request`)
 - Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `120a`, tests enabled; build and 89-test CTest run pass; benchmark target also built
 - Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
-- Last accepted pushed commit: `e92e7fc7` on `origin/phase1/bootstrap-state-20260826`; direct `master` push is blocked by required status check `secret-and-artifact-checks`
+- Last accepted pushed commit: `2d6e3a35` on `origin/phase1/bootstrap-state-20260826`; direct `master` push is blocked by required status check `secret-and-artifact-checks`
 - Current phase: Phase 1, reproducible native-Windows baseline and audit scaffolding; PR #1 awaits protected-branch CI
 - Active hypothesis: qualify canonical `Neroued/ninfer` `dev` context/resource implementation before designing a competing prefix cache
 
