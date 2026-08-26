@@ -25,9 +25,13 @@ class TestFailure(RuntimeError):
 
 
 def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            address = sock.getsockname()
+    except OSError as error:
+        raise TestFailure(f"could not allocate a local test port: {error}") from error
+    return address[1]
 
 
 def request_json(base_url: str, method: str, path: str, payload: Any | None = None) -> dict[str, Any]:
@@ -36,9 +40,9 @@ def request_json(base_url: str, method: str, path: str, payload: Any | None = No
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
+    request = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)  # noqa: S310
     try:
-        with urllib.request.urlopen(request, timeout=300) as response:
+        with urllib.request.urlopen(request, timeout=300) as response:  # noqa: S310
             value = json.loads(response.read())
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
@@ -81,9 +85,10 @@ def chat_choice(response: dict[str, Any]) -> dict[str, Any]:
 
 def chat_prompt_tokens(response: dict[str, Any]) -> int:
     usage = response.get("usage")
-    if not isinstance(usage, dict) or not isinstance(usage.get("prompt_tokens"), int):
+    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+    if not isinstance(prompt_tokens, int):
         raise TestFailure("Chat Completions response does not contain prompt token usage")
-    return int(usage["prompt_tokens"])
+    return prompt_tokens
 
 
 def response_payload(model: str, input_text: str, preserve: bool | None) -> dict[str, Any]:
@@ -103,7 +108,10 @@ def read_events(path: Path) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if line:
-            value = json.loads(line)
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise TestFailure(f"request log contains invalid JSON: {error}") from error
             if isinstance(value, dict):
                 events.append(value)
     return events
@@ -125,9 +133,11 @@ def require(condition: bool, message: str) -> None:
 def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: str) -> dict[str, Any]:
     models = request_json(base_url, "GET", "/v1/models")
     entries = models.get("data")
-    require(isinstance(entries, list) and len(entries) == 1, "server did not expose one model")
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        raise TestFailure("server did not expose one model")
     model = entries[0].get("id")
-    require(isinstance(model, str) and model, "server model id is invalid")
+    if not isinstance(model, str) or not model:
+        raise TestFailure("server model id is invalid")
 
     chat_payloads = [
         chat_payload(model, fixture, "first_messages"),
@@ -178,7 +188,8 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         response_payload(model, responses_fixture["parent_input"], True),
     )
     parent_id = parent.get("id")
-    require(isinstance(parent_id, str) and parent_id, "Responses parent id is invalid")
+    if not isinstance(parent_id, str) or not parent_id:
+        raise TestFailure("Responses parent id is invalid")
 
     inherited_payload = response_payload(
         model, responses_fixture["inherited_child_input"], None
@@ -223,10 +234,10 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     require(
         len(chat_start) == 7
         and all(
-            item.get("request", {}).get("preserve_thinking") is False
+            not item.get("request", {}).get("preserve_thinking")
             for item in chat_start[:6]
         )
-        and chat_start[6].get("request", {}).get("preserve_thinking") is True,
+        and chat_start[6].get("request", {}).get("preserve_thinking"),
         "Chat requests did not resolve preserve_thinking consistently",
     )
 
@@ -289,8 +300,11 @@ def main() -> None:
         raise SystemExit(f"artifact does not exist: {artifact}")
     if not server_bin.is_file():
         raise SystemExit(f"server binary does not exist: {server_bin}")
-    with fixture_path.open("r", encoding="utf-8") as source:
-        fixture = json.load(source)
+    try:
+        with fixture_path.open("r", encoding="utf-8") as source:
+            fixture = json.load(source)
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"could not read fixture {fixture_path}: {error}") from error
     if fixture.get("schema_version") != 1:
         raise SystemExit("unsupported fixture schema")
 

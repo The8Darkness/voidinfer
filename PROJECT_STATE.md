@@ -7,11 +7,11 @@ Updated: 2026-08-26 UTC
 - Project: VoidInfer / NInfer native Windows RTX 5090 engine
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `master`
-- State checkpoint commit: `fe808d76`; pushed on `origin/phase1/bootstrap-state-20260826`; PR #1 is open against protected `master` (later state-bookkeeping commits may follow this checkpoint)
-- Last-known-good source commit: `fe808d76` (`docs(state): record pushed bootstrap head`)
+- State checkpoint commit: `99c023ac`; pushed on `origin/phase1/bootstrap-state-20260826`; PR #1 is open against protected `master` (later state-bookkeeping commits may follow this checkpoint)
+- Last-known-good source commit: `99c023ac` (`docs(state): checkpoint bootstrap branch`)
 - Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `120a`, tests enabled; build and 89-test CTest run pass; benchmark target also built
 - Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
-- Last accepted pushed commit at this checkpoint: `fe808d76` on `origin/phase1/bootstrap-state-20260826`; direct `master` push is blocked by required status check `secret-and-artifact-checks`
+- Last accepted pushed commit at this checkpoint: `99c023ac` on `origin/phase1/bootstrap-state-20260826`; direct `master` push is blocked by required status check `secret-and-artifact-checks`
 - Current phase: Phase 1, reproducible native-Windows baseline and audit scaffolding; PR #1 awaits protected-branch CI
 - Active hypothesis: qualify canonical `Neroued/ninfer` `dev` context/resource implementation before designing a competing prefix cache
 
@@ -71,8 +71,8 @@ Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM12
 
 ## Current blockers and next steps
 
-1. Add Windows-aware defaults to benchmark/smoke tools and separate text-only from vision-enabled serving smoke.
-2. Build the Phase 1 baseline matrix against the local Qwen3.8 NVFP4 artifact; classify all results as local measurements.
+1. Build the Phase 1 baseline matrix against the local Qwen3.8 NVFP4 artifact; classify all results as local measurements.
+2. Separate text-only from vision-enabled serving smoke and add a real Qwen3.8 integration test.
 3. Add a real Qwen3.8 integration test and enable artifact-backed smoke only when bounded and reproducible.
 4. Integrate canonical `dev` only in an isolated experiment worktree, beginning with the coupled StateImage + paged-KV + Engine/resource cutover; preserve a rollback point.
 5. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before exact baseline and quality gates exist.

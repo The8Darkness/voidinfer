@@ -21,14 +21,17 @@ import csv
 import dataclasses
 import datetime as dt
 import json
+import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"
+BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
+DEFAULT_BENCH = BUILD_DIR / ("bench/Release/ninfer_bench.exe" if os.name == "nt" else "bench/ninfer_bench")
 DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.ninfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
@@ -57,6 +60,13 @@ class BenchCase:
 
 def csv_list(values: Iterable[int]) -> str:
     return ",".join(str(value) for value in values)
+
+
+def case_int(value: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid integer in generated benchmark case: {value!r}") from error
 
 
 def pair_list(values: Iterable[tuple[int, int]]) -> str:
@@ -232,18 +242,21 @@ def max_prompt_in_cases(cases: Sequence[BenchCase]) -> int:
         for flag in ("-p", "--n-prompt"):
             if flag in args:
                 raw = args[args.index(flag) + 1]
-                max_prompt = max(max_prompt, *(int(piece) for piece in raw.split(",")))
+                max_prompt = max(max_prompt, *(case_int(piece) for piece in raw.split(",")))
         for flag in ("-pg", "--prompt-gen"):
             if flag in args:
                 raw = args[args.index(flag) + 1]
                 for pair in raw.split(";"):
                     p, _ = pair.split(",", 1)
-                    max_prompt = max(max_prompt, int(p))
+                    max_prompt = max(max_prompt, case_int(p))
     return max_prompt
 
 
 def load_bench_report(report_path: Path) -> dict[str, Any]:
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read benchmark report {report_path}: {error}") from error
     if not isinstance(report, dict):
         raise ValueError("benchmark report root must be an object")
     identity = (
@@ -412,7 +425,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="write commands but do not execute")
     parser.add_argument("--resume", action="store_true", help="skip cases with an existing valid JSON report")
     parser.add_argument(
-        "--no-build", action="store_true", help="do not build build/bench/ninfer_bench"
+        "--no-build", action="store_true", help="do not build the native ninfer_bench target"
     )
     return parser.parse_args(argv)
 
@@ -497,7 +510,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         build_stdout = log_dir / "build.stdout.txt"
         build_stderr = log_dir / "build.stderr.txt"
         rc = run_command(
-            ["cmake", "--build", "build", "-j", "--target", "ninfer_bench"],
+            [
+                "cmake",
+                "--build",
+                str(BUILD_DIR),
+                *( ["--config", "Release"] if os.name == "nt" else [] ),
+                "--parallel",
+                "--target",
+                "ninfer_bench",
+            ],
             build_stdout,
             build_stderr,
         )

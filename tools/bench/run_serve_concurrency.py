@@ -21,6 +21,8 @@ from typing import Any, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
+SERVE_BINARY = BUILD_DIR / ("apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve")
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -95,7 +97,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve",
         type=Path,
-        default=REPO_ROOT / "build/apps/ninfer-serve",
+        default=SERVE_BINARY,
         help="ninfer-serve executable",
     )
     parser.add_argument(

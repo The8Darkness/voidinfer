@@ -19,6 +19,8 @@ from typing import Any, Iterable, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
+SERVE_BINARY = BUILD_DIR / ("apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve")
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 
 TARGET_MODEL_IDS = {
@@ -271,7 +273,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve",
         type=Path,
-        default=REPO_ROOT / "build/apps/ninfer-serve",
+        default=SERVE_BINARY,
         help="ninfer-serve executable",
     )
     parser.add_argument(
