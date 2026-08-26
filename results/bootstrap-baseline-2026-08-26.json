@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "artifact_type": "voidinfer_bootstrap_baseline",
+  "classification": "LOCAL_BASELINE",
+  "timestamp_utc": "2026-08-26",
+  "repository": {
+    "root": "D:/AI/voidinfer",
+    "branch": "master",
+    "commit": "3e2a28be8db37b203ceebbbdd86723ca2cf0d4a8",
+    "origin": "https://github.com/The8Darkness/voidinfer.git",
+    "working_tree_source_changes": false
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "uuid": "GPU-878c0965-6802-7d0d-e793-0c3d1962559f",
+    "memory_mib": 32607,
+    "driver": "616.56",
+    "cuda": "13.1.80",
+    "architecture": "120a"
+  },
+  "build": {
+    "generator": "Visual Studio 17 2022",
+    "platform": "x64",
+    "cmake": "3.31.6",
+    "msvc": "19.44.35225.0",
+    "vcpkg_triplet": "x64-windows",
+    "apps": true,
+    "tests": true,
+    "benchmarks": false,
+    "status": "passed",
+    "command": "cmake --build build-windows --config Release -j"
+  },
+  "tests": {
+    "status": "passed",
+    "registered": 89,
+    "failed": 0,
+    "skipped": 5,
+    "skipped_names": [
+      "ninfer_qwen3_6_27b_prefix_real_test",
+      "ninfer_qwen3_6_27b_load_plan_test",
+      "ninfer_qwen3_6_35b_a3b_real_test",
+      "ninfer_qwen3_6_35b_a3b_dflash_real_test",
+      "ninfer_qwen3_6_35b_a3b_dflash_load_plan_test"
+    ],
+    "command": "ctest --test-dir build-windows -C Release --output-on-failure"
+  },
+  "artifacts": [
+    {
+      "path": "models/Qwen3.8-27B-NVFP4-Ninfer/qwen3_8_27b_nvfp4.ninfer",
+      "bytes": 21492695040,
+      "sha256": "bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32",
+      "inspect_identity": "qwen3.8-27b/nvfp4"
+    },
+    {
+      "path": "models/Qwen3.8-27B-DSpark-NInfer/qwen3_8_27b_dspark.ninfer",
+      "bytes": 20929108994,
+      "sha256": "a6501d2793c8b822aecd975a3d9f7a552646f58af5549c818dd5d4219236c2ce",
+      "inspect_identity": "qwen3.8-27b/groupwise-int",
+      "compatibility": "unverified"
+    }
+  ],
+  "service": {
+    "model_service_started": false,
+    "help_probe": "passed",
+    "binary": "build-windows/apps/Release/ninfer-serve.exe"
+  },
+  "limitations": [
+    "No Qwen3.8 real-model C++ CTest route is registered yet.",
+    "No local C1/C2/C4/C8, context ceiling, vision, or Picot agent performance measurement is included.",
+    "Five real-model tests are skipped because their required artifacts are absent."
+  ]
+}
