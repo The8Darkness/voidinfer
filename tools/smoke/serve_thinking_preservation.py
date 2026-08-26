@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import tempfile
@@ -12,6 +13,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SERVER_BIN = REPO_ROOT / ("build-windows/apps/Release/ninfer-serve.exe" if os.name == "nt" else "build/apps/ninfer-serve")
+DEFAULT_FIXTURE = REPO_ROOT / "tests/fixtures/serve/qwen3_6_thinking_preservation.json"
 
 
 class TestFailure(RuntimeError):
@@ -266,11 +272,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
-    parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
+    parser.add_argument("--server-bin", type=Path, default=DEFAULT_SERVER_BIN)
     parser.add_argument(
         "--fixture",
         type=Path,
-        default=Path("tests/fixtures/serve/qwen3_6_thinking_preservation.json"),
+        default=DEFAULT_FIXTURE,
     )
     parser.add_argument("--startup-timeout", type=float, default=600.0)
     parser.add_argument("--port", type=int, default=0)
