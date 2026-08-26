@@ -21,12 +21,12 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
 SERVE_BINARY = BUILD_DIR / (
     "apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve"
 )
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
 
@@ -162,6 +162,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def required_int(value: Any, label: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as error:
+        raise corpus.CampaignError(f"{label} is not an integer: {value!r}") from error
+    return result
+
+
+def required_float(value: Any, label: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise corpus.CampaignError(f"{label} is not numeric: {value!r}") from error
+    if not math.isfinite(result):
+        raise corpus.CampaignError(f"{label} is not finite: {value!r}")
+    return result
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.port < 1 or args.port > 65535:
         raise corpus.CampaignError("--port must be in [1, 65535]")
@@ -174,11 +192,11 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.prefill_chunk <= 0 or args.prefill_chunk % 128 != 0:
         raise corpus.CampaignError("--prefill-chunk must be a positive multiple of 128")
     if args.kv_capacity != "auto":
-        if not args.kv_capacity.isdigit() or int(args.kv_capacity) <= 0:
+        if not args.kv_capacity.isdigit() or required_int(args.kv_capacity, "--kv-capacity") <= 0:
             raise corpus.CampaignError(
                 "--kv-capacity must be a positive integer or auto"
             )
-        if int(args.kv_capacity) < args.max_context:
+        if required_int(args.kv_capacity, "--kv-capacity") < args.max_context:
             raise corpus.CampaignError("--kv-capacity must be at least --max-context")
     if len(args.concurrency) != len(set(args.concurrency)):
         raise corpus.CampaignError("duplicate --concurrency value")
@@ -433,7 +451,7 @@ def run_clients(
     result_lock = threading.Lock()
     ordered_dispatch = point.suite == "corpus-makespan"
     dispatch_condition = threading.Condition()
-    next_dispatch_index = 0
+    next_dispatch_index = {"value": 0}
     results: list[ClientResult] = []
     errors: list[Exception] = []
 
@@ -445,7 +463,6 @@ def run_clients(
             dispatch_condition.notify_all()
 
     def worker() -> None:
-        nonlocal next_dispatch_index
         connection = http.client.HTTPConnection(
             "127.0.0.1", port, timeout=corpus.REQUEST_TIMEOUT_SECONDS
         )
@@ -468,15 +485,16 @@ def run_clients(
                     if ordered_dispatch:
                         with dispatch_condition:
                             dispatch_condition.wait_for(
-                                lambda: (
-                                    failed.is_set() or job.index == next_dispatch_index
+                                lambda current_job=job, dispatch=next_dispatch_index: (
+                                    failed.is_set()
+                                    or current_job.index == dispatch["value"]
                                 )
                             )
                             if failed.is_set():
                                 return
                             started_at = time.monotonic()
                             corpus.send_json(connection, payload)
-                            next_dispatch_index += 1
+                            next_dispatch_index["value"] += 1
                             dispatch_condition.notify_all()
                         response = corpus.receive_json(connection)
                     else:
@@ -655,10 +673,22 @@ def steady_metrics(
             f"concurrency {concurrency} produced no complete full-batch decode interval; "
             "increase --decode-tokens"
         )
-    duration = sum(float(event["interval_seconds"]) for event in selected)
-    tokens = sum(int(event["tokens"]["committed_decode"]) for event in selected)
-    rounds = sum(int(event["decode_batch"]["rounds"]) for event in selected)
-    row_rounds = sum(int(event["decode_batch"]["row_rounds"]) for event in selected)
+    duration = sum(
+        required_float(event["interval_seconds"], "interval_seconds")
+        for event in selected
+    )
+    tokens = sum(
+        required_int(event["tokens"]["committed_decode"], "committed_decode")
+        for event in selected
+    )
+    rounds = sum(
+        required_int(event["decode_batch"]["rounds"], "decode rounds")
+        for event in selected
+    )
+    row_rounds = sum(
+        required_int(event["decode_batch"]["row_rounds"], "decode row rounds")
+        for event in selected
+    )
     if duration <= 0.0 or rounds <= 0:
         raise corpus.CampaignError(
             "steady decode interval has no measurable duration or rounds"
@@ -759,9 +789,9 @@ def analyze_point(
             "makespan_seconds": makespan,
             "requests_per_second": len(results) / makespan,
             "computed_prefill_tokens_per_second": (
-                int(done_totals["computed_prefill_tokens"]) / makespan
+                required_int(done_totals["computed_prefill_tokens"], "computed prefill tokens") / makespan
             ),
-            "decode_tokens_per_second": int(done_totals["decode_tokens"]) / makespan,
+            "decode_tokens_per_second": required_int(done_totals["decode_tokens"], "decode tokens") / makespan,
         }
 
     return {
@@ -859,7 +889,7 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
             str(report["sampling_mode"]),
             str(report["suite"]),
         )
-        if int(report["concurrency"]) == 1:
+        if required_int(report["concurrency"], "concurrency") == 1:
             baselines[key] = report
 
     for report in reports:
@@ -874,12 +904,20 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
         if baseline is None:
             continue
         if report["suite"] == "decode-saturation":
-            current = float(report["metrics"]["steady"]["decode_tokens_per_second"])
-            reference = float(baseline["metrics"]["steady"]["decode_tokens_per_second"])
+            current = required_float(
+                report["metrics"]["steady"]["decode_tokens_per_second"],
+                "steady decode tokens per second",
+            )
+            reference = required_float(
+                baseline["metrics"]["steady"]["decode_tokens_per_second"],
+                "baseline steady decode tokens per second",
+            )
             report["speedup_vs_c1"] = current / reference
         else:
-            current = float(report["metrics"]["makespan_seconds"])
-            reference = float(baseline["metrics"]["makespan_seconds"])
+            current = required_float(report["metrics"]["makespan_seconds"], "makespan")
+            reference = required_float(
+                baseline["metrics"]["makespan_seconds"], "baseline makespan"
+            )
             report["speedup_vs_c1"] = reference / current
 
 
@@ -960,7 +998,7 @@ def csv_value(value: Any) -> Any:
 def format_number(value: Any, digits: int = 2) -> str:
     if value is None:
         return "—"
-    return f"{float(value):.{digits}f}"
+    return f"{required_float(value, 'summary value'):.{digits}f}"
 
 
 def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -1001,7 +1039,7 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
 
     sections: list[str] = []
     for (target, weights_id, mode, suite), group in groups.items():
-        group.sort(key=lambda row: int(row["concurrency"]))
+        group.sort(key=lambda row: required_int(row["concurrency"], "concurrency"))
         title = f"## {target} / {weights_id} / {mode} / {suite}"
         if suite == "decode-saturation":
             table = markdown_table(
@@ -1060,6 +1098,56 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
 
 
+def write_campaign_manifest(
+    output_dir: Path,
+    args: argparse.Namespace,
+    artifacts: Sequence[tuple[str, Path]],
+    points: Sequence[Point],
+) -> None:
+    from tools.experiments.provenance import (
+        atomic_write_json,
+        environment_snapshot,
+        file_fingerprint,
+        git_revision,
+    )
+
+    manifest = {
+        "artifact_type": "ninfer_serve_concurrency_campaign",
+        "schema_version": 1,
+        "run_id": output_dir.name,
+        "revision": git_revision(REPO_ROOT),
+        "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "hypothesis": "measure fair multi-agent serving throughput and makespan",
+        "baseline_run_ids": ["bootstrap-baseline-2026-08-26"],
+        "hard_gates": [
+            "all completed requests have matching server log events",
+            "no request errors or unsafe process ownership changes",
+        ],
+        "success_metric": "per-agent latency, makespan, aggregate throughput, and batch occupancy",
+        "max_gpu_hours": 24.0,
+        "rollback": "discard this output and restore the last-known-good service",
+        "owner": "serve-concurrency",
+        "artifact": {
+            "targets": [
+                {"target": target, **file_fingerprint(path)}
+                for target, path in artifacts
+            ]
+        },
+        "corpus": file_fingerprint(corpus.MANIFEST_PATH),
+        "environment": environment_snapshot(REPO_ROOT),
+        "metric_schema": "ninfer_serve_concurrency_bench_point-v2",
+        "commands": [{"phase": "BENCHMARKING", "argv": [sys.executable, *sys.argv]}],
+        "result_paths": [
+            str(output_dir / "summary.json"),
+            str(output_dir / "summary.csv"),
+            str(output_dir / "summary.md"),
+        ],
+        "point_count": len(points),
+        "serve": str(args.serve),
+    }
+    atomic_write_json(output_dir / "manifest.json", manifest)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     validate_args(args)
@@ -1069,10 +1157,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = args.output.expanduser().resolve()
 
     serve = args.serve.expanduser().resolve()
+    args.serve = serve
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        write_campaign_manifest(output_dir, args, artifacts, points)
+    except RuntimeError as error:
+        raise corpus.CampaignError(f"could not write campaign manifest: {error}") from error
     if not args.dry_run:
         if not serve.is_file():
             raise corpus.CampaignError(f"ninfer-serve executable not found: {serve}")
-        if not os.access(serve, os.X_OK):
+        try:
+            executable = os.access(serve, os.X_OK)
+        except OSError as error:
+            raise corpus.CampaignError(
+                f"could not inspect ninfer-serve: {serve}: {error}"
+            ) from error
+        if not executable:
             raise corpus.CampaignError(f"ninfer-serve is not executable: {serve}")
         (output_dir / "server").mkdir(parents=True, exist_ok=True)
         (output_dir / "points").mkdir(parents=True, exist_ok=True)

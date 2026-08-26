@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import datetime as dt
 import http.client
 import json
 import math
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
 SERVE_BINARY = BUILD_DIR / (
     "apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve"
@@ -87,7 +90,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 9
+SERVER_LOG_SCHEMA_VERSION = 10
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -627,15 +630,13 @@ def build_result_record(
         "prefill_seconds": prefill_seconds,
         "decode_seconds": decode_seconds,
         "total_seconds": total_seconds,
-        "prefill_tok_s": safe_ratio(float(prompt_tokens), prefill_seconds),
+        "prefill_tok_s": safe_ratio(prompt_tokens, prefill_seconds),
         "server_ttft_ms": 1000.0 * (prepare_seconds + vision_seconds + prefill_seconds),
-        "decode_tok_s": safe_ratio(float(decode_tokens), decode_seconds),
+        "decode_tok_s": safe_ratio(decode_tokens, decode_seconds),
         "speculative_rounds": speculative_rounds,
         "drafted_tokens": drafted_tokens,
         "accepted_tokens": accepted_tokens,
-        "speculative_acceptance": safe_ratio(
-            float(accepted_tokens), float(drafted_tokens)
-        ),
+        "speculative_acceptance": safe_ratio(accepted_tokens, drafted_tokens),
         "speculative_tokens_per_round": (
             1.0 + accepted_tokens / speculative_rounds
             if speculative_rounds > 0
@@ -855,12 +856,22 @@ def run_block(
             connection.close()
 
 
+def metric_float(value: Any, name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise CampaignError(f"metric {name!r} is not numeric: {value!r}") from error
+    if not math.isfinite(result):
+        raise CampaignError(f"metric {name!r} is not finite: {value!r}")
+    return result
+
+
 def metric_values(records: Iterable[dict[str, Any]], name: str) -> list[float]:
     values: list[float] = []
     for record in records:
         value = record["metrics"].get(name)
         if value is not None:
-            values.append(float(value))
+            values.append(metric_float(value, name))
     return values
 
 
@@ -1050,7 +1061,7 @@ def format_mean_stddev(row: dict[str, Any], prefix: str, digits: int = 1) -> str
     stddev = row.get(f"{prefix}_stddev")
     if mean is None or stddev is None:
         return "—"
-    return f"{float(mean):.{digits}f} ± {float(stddev):.{digits}f}"
+    return f"{metric_float(mean, prefix):.{digits}f} ± {metric_float(stddev, prefix):.{digits}f}"
 
 
 def format_percent_mean_stddev(row: dict[str, Any], prefix: str) -> str:
@@ -1058,7 +1069,7 @@ def format_percent_mean_stddev(row: dict[str, Any], prefix: str) -> str:
     stddev = row.get(f"{prefix}_stddev")
     if mean is None or stddev is None:
         return "—"
-    return f"{100.0 * float(mean):.1f}% ± {100.0 * float(stddev):.1f}%"
+    return f"{100.0 * metric_float(mean, prefix):.1f}% ± {100.0 * metric_float(stddev, prefix):.1f}%"
 
 
 def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -1195,6 +1206,61 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
 
 
+def write_campaign_manifest(
+    output_dir: Path,
+    args: argparse.Namespace,
+    artifacts: Sequence[tuple[str, Path]],
+) -> None:
+    from tools.experiments.provenance import (
+        atomic_write_json,
+        environment_snapshot,
+        file_fingerprint,
+        git_revision,
+    )
+
+    manifest = {
+        "artifact_type": "ninfer_serve_corpus_campaign",
+        "schema_version": 1,
+        "run_id": output_dir.name,
+        "revision": git_revision(REPO_ROOT),
+        "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "hypothesis": "measure serving task-time, repeated prefill, and speculative throughput",
+        "baseline_run_ids": ["bootstrap-baseline-2026-08-26"],
+        "hard_gates": [
+            "server log schema and engine identity match",
+            "no request errors or missing completion records",
+        ],
+        "success_metric": "request wall time, prefill saved, and useful output tokens per verifier",
+        "max_gpu_hours": 24.0,
+        "rollback": "discard this output and restore the last-known-good service",
+        "owner": "serve-corpus",
+        "artifact": {
+            "targets": [
+                {"target": target, **file_fingerprint(path)}
+                for target, path in artifacts
+            ]
+        },
+        "corpus": file_fingerprint(MANIFEST_PATH),
+        "environment": environment_snapshot(REPO_ROOT),
+        "metric_schema": "ninfer_serve_corpus_result-v5;ninfer_serve_request_log-v10",
+        "commands": [
+            {
+                "phase": "BENCHMARKING",
+                "argv": [sys.executable, *sys.argv],
+            }
+        ],
+        "result_paths": [
+            str(output_dir / "run.jsonl"),
+            str(output_dir / "summary.csv"),
+            str(output_dir / "summary.md"),
+        ],
+        "serve": str(args.serve),
+        "sampling": args.sampling,
+        "modes": args.mode or list(DEFAULT_MODES),
+    }
+    atomic_write_json(output_dir / "manifest.json", manifest)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.port < 1 or args.port > 65535:
@@ -1203,9 +1269,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise CampaignError("--device must be nonnegative")
 
     serve = args.serve.expanduser().resolve()
+    args.serve = serve
     if not serve.is_file():
         raise CampaignError(f"ninfer-serve executable not found: {serve}")
-    if not os.access(serve, os.X_OK):
+    try:
+        executable = os.access(serve, os.X_OK)
+    except OSError as error:
+        raise CampaignError(f"could not inspect ninfer-serve: {serve}: {error}") from error
+    if not executable:
         raise CampaignError(f"ninfer-serve is not executable: {serve}")
 
     artifacts = parse_artifacts(args.artifact)
@@ -1219,6 +1290,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     output_dir = args.output.expanduser().resolve()
     (output_dir / "server").mkdir(parents=True, exist_ok=True)
+    try:
+        write_campaign_manifest(output_dir, args, artifacts)
+    except RuntimeError as error:
+        raise CampaignError(f"could not write campaign manifest: {error}") from error
     run_path = output_dir / "run.jsonl"
     records = load_existing_records(run_path, expected_specs)
     print(

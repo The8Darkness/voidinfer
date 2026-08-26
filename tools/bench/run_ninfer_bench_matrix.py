@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
 DEFAULT_BENCH = BUILD_DIR / (
     "bench/Release/ninfer_bench.exe" if os.name == "nt" else "bench/ninfer_bench"
@@ -407,18 +409,44 @@ def write_manifest(
     args: argparse.Namespace,
     cases: Sequence[BenchCase],
     commands: Sequence[dict[str, Any]],
-) -> None:
+) -> dict[str, Any]:
+    from tools.experiments.provenance import (
+        atomic_write_json,
+        environment_snapshot,
+        file_fingerprint,
+        git_revision,
+    )
+
+    revision = git_revision(REPO_ROOT)
+    artifact = file_fingerprint(args.weights)
+    corpus = file_fingerprint(args.corpus)
     manifest = {
         "artifact_type": "ninfer_bench_matrix_run",
-        "schema_version": 3,
+        "schema_version": 4,
+        "run_id": out_dir.name,
+        "revision": revision,
         "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "hypothesis": "measure native benchmark task-time and throughput frontier",
+        "baseline_run_ids": ["bootstrap-baseline-2026-08-26"],
+        "hard_gates": ["every report is schema-valid", "no case exits nonzero"],
+        "success_metric": "median prefill/decode throughput and complete task-time breakdown",
+        "max_gpu_hours": 24.0,
+        "rollback": "discard this output and restore the last-known-good build",
+        "owner": "benchmark-matrix",
+        "metric_schema": "ninfer_bench_report-v11",
+        "environment": environment_snapshot(REPO_ROOT),
+        "result_paths": [
+            str(out_dir / "summary.csv"),
+            str(out_dir / "summary.json"),
+            str(out_dir / "failures.json"),
+        ],
         "preset": args.preset,
         "primary_mtp_draft_tokens": 3,
         "primary_proposal_head": "optimized",
         "repo_root": str(REPO_ROOT),
         "bench": str(args.bench),
-        "artifact": str(args.weights),
-        "corpus": str(args.corpus),
+        "artifact": artifact,
+        "corpus": corpus,
         "corpus_tokens": count_corpus_tokens(args.corpus),
         "dry_run": args.dry_run,
         "resume": args.resume,
@@ -430,9 +458,8 @@ def write_manifest(
             "tg rows use a one-token seed and report G decode tokens after the begin token.",
         ],
     }
-    (out_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    atomic_write_json(out_dir / "manifest.json", manifest)
+    return {"revision": revision, "artifact": artifact, "corpus": corpus}
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -474,6 +501,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="do not build the native ninfer_bench target",
     )
     return parser.parse_args(argv)
+
+
+def expected_case_metadata(
+    record: dict[str, Any], case: BenchCase, provenance: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "suite": case.suite,
+        "case": case.name,
+        "revision": provenance["revision"],
+        "artifact": provenance["artifact"],
+        "corpus": provenance["corpus"],
+        "command": record["command"],
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -538,7 +579,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "case": case.name,
                 "report": str(report_path),
                 "notes": case.notes,
+                "phase": "BENCHMARKING",
+                "argv": command,
                 "command": command,
+                "metadata": str(report_path.with_suffix(".meta.json")),
             }
         )
         commands_sh.append(shell_join(command))
@@ -546,7 +590,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "#!/usr/bin/env bash\nset -euo pipefail\n\n" + "\n\n".join(commands_sh) + "\n"
     )
     (out_dir / "commands.sh").write_text(commands_text, encoding="utf-8")
-    write_manifest(out_dir, args, cases, command_records)
+    provenance = write_manifest(out_dir, args, cases, command_records)
+    from tools.experiments.provenance import atomic_write_json, sha256_file
 
     if args.dry_run:
         print(f"wrote dry-run matrix to {out_dir}")
@@ -591,12 +636,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     for index, record in enumerate(command_records, start=1):
         case = cases[index - 1]
         report_path = Path(record["report"])
-        if args.resume and report_path.is_file():
+        metadata_path = Path(record["metadata"])
+        expected_metadata = expected_case_metadata(record, case, provenance)
+        if args.resume and report_path.is_file() and metadata_path.is_file():
             try:
                 load_bench_report(report_path)
-                print(f"[{index}/{len(cases)}] skip {case.name} (existing report)")
-                continue
-            except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(metadata, dict)
+                    and all(metadata.get(key) == value for key, value in expected_metadata.items())
+                    and metadata.get("report_sha256") == sha256_file(report_path)
+                ):
+                    print(f"[{index}/{len(cases)}] skip {case.name} (matching report)")
+                    continue
+            except (json.JSONDecodeError, OSError, TypeError, ValueError, RuntimeError):
                 pass
 
         stdout_path = log_dir / f"{case.suite}.{case.name}.stdout.txt"
@@ -626,6 +679,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "stdout": str(stdout_path),
                     "stderr": str(stderr_path),
                     "command": record["command"],
+                }
+            )
+            continue
+        try:
+            atomic_write_json(
+                metadata_path,
+                {
+                    **expected_metadata,
+                    "report_sha256": sha256_file(report_path),
+                },
+            )
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            failures.append(
+                {
+                    "suite": case.suite,
+                    "case": case.name,
+                    "returncode": rc,
+                    "error": f"could not write report provenance: {error}",
+                    "report": str(report_path),
                 }
             )
 
