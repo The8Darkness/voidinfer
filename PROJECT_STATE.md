@@ -7,11 +7,11 @@ Updated: 2026-08-26 UTC
 - Project: VoidInfer / NInfer native Windows RTX 5090 engine
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `master`
-- HEAD / origin: `3e2a28be8db37b203ceebbbdd86723ca2cf0d4a8`
-- Last-known-good source commit: `3e2a28be8db37b203ceebbbdd86723ca2cf0d4a8`
+- HEAD / origin: local `9bdcb41d` (pending push); origin remains `3e2a28be8db37b203ceebbbdd86723ca2cf0d4a8` until push
+- Last-known-good source commit: `9bdcb41d` (`chore(bootstrap): record Windows baseline and audit refs`)
 - Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `120a`, tests enabled; build and 89-test CTest run pass; benchmark target also built
 - Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
-- Last accepted pushed commit: `3e2a28be8db37b203ceebbbdd86723ca2cf0d4a8`
+- Last accepted pushed commit: `3e2a28be8db37b203ceebbbdd86723ca2cf0d4a8`; `9bdcb41d` is qualified locally and pending push
 - Current phase: Phase 1, reproducible native-Windows baseline and audit scaffolding
 - Active hypothesis: qualify canonical `Neroued/ninfer` `dev` context/resource implementation before designing a competing prefix cache
 
@@ -77,4 +77,4 @@ Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM12
 4. Integrate canonical `dev` only in an isolated experiment worktree, beginning with the coupled StateImage + paged-KV + Engine/resource cutover; preserve a rollback point.
 5. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before exact baseline and quality gates exist.
 
-The Picot launcher and harness now use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory.
+The Picot launcher and harness now use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration.
