@@ -14,13 +14,15 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
-SERVE_BINARY = BUILD_DIR / ("apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve")
+SERVE_BINARY = BUILD_DIR / (
+    "apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve"
+)
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 
 TARGET_MODEL_IDS = {
@@ -141,7 +143,9 @@ class ServerLogTail:
     def _check_process(self) -> None:
         returncode = self.process.poll()
         if returncode is not None:
-            raise CampaignError(f"ninfer-serve exited unexpectedly with status {returncode}")
+            raise CampaignError(
+                f"ninfer-serve exited unexpectedly with status {returncode}"
+            )
 
     def _read_new(self) -> None:
         if not self.path.exists():
@@ -161,9 +165,13 @@ class ServerLogTail:
             try:
                 event = json.loads(raw_line)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise CampaignError(f"invalid serving JSONL record in {self.path}: {exc}") from exc
+                raise CampaignError(
+                    f"invalid serving JSONL record in {self.path}: {exc}"
+                ) from exc
             if not isinstance(event, dict):
-                raise CampaignError(f"serving JSONL record is not an object in {self.path}")
+                raise CampaignError(
+                    f"serving JSONL record is not an object in {self.path}"
+                )
             self.pending.append(event)
 
     def wait_for(
@@ -180,7 +188,9 @@ class ServerLogTail:
                     return self.pending.pop(index)
             self._check_process()
             if time.monotonic() >= deadline:
-                raise CampaignError(f"timed out waiting for {description} in {self.path}")
+                raise CampaignError(
+                    f"timed out waiting for {description} in {self.path}"
+                )
             time.sleep(0.05)
 
 
@@ -199,7 +209,7 @@ class RunningServer:
         self.process: subprocess.Popen[bytes] | None = None
         self.tail: ServerLogTail | None = None
 
-    def __enter__(self) -> "RunningServer":
+    def __enter__(self) -> RunningServer:
         initial_offset = self.log_path.stat().st_size if self.log_path.exists() else 0
         self.process = subprocess.Popen(self.command, cwd=REPO_ROOT)
         self.tail = ServerLogTail(self.log_path, self.process, initial_offset)
@@ -225,7 +235,9 @@ class RunningServer:
         while True:
             returncode = self.process.poll()
             if returncode is not None:
-                raise CampaignError(f"ninfer-serve exited during startup with status {returncode}")
+                raise CampaignError(
+                    f"ninfer-serve exited during startup with status {returncode}"
+                )
             connection = http.client.HTTPConnection(self.host, self.port, timeout=2.0)
             try:
                 connection.request("GET", "/health", headers={"Connection": "close"})
@@ -261,7 +273,9 @@ class RunningServer:
             if event.get("server_instance_id") != server_instance_id:
                 return False
             if event.get("event") == "request_error":
-                message = event.get("error", {}).get("message", "unknown generation error")
+                message = event.get("error", {}).get(
+                    "message", "unknown generation error"
+                )
                 raise CampaignError(f"serving request failed: {message}")
             return event.get("event") == "request_done"
 
@@ -295,7 +309,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="stochastic",
         help="sampling profile for all requests (default: stochastic)",
     )
-    parser.add_argument("--output", type=Path, required=True, help="campaign output directory")
+    parser.add_argument(
+        "--output", type=Path, required=True, help="campaign output directory"
+    )
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     return parser.parse_args(argv)
@@ -306,10 +322,14 @@ def parse_artifacts(values: Sequence[str]) -> list[tuple[str, Path]]:
     for value in values:
         target, separator, raw_path = value.partition("=")
         if not separator or not target or not raw_path:
-            raise CampaignError(f"invalid --artifact value {value!r}; expected TARGET=PATH")
+            raise CampaignError(
+                f"invalid --artifact value {value!r}; expected TARGET=PATH"
+            )
         if target not in TARGET_MODEL_IDS:
             expected = ", ".join(TARGET_MODEL_IDS)
-            raise CampaignError(f"unsupported artifact target {target!r}; expected {expected}")
+            raise CampaignError(
+                f"unsupported artifact target {target!r}; expected {expected}"
+            )
         if target in parsed:
             raise CampaignError(f"duplicate artifact target: {target}")
         path = Path(raw_path).expanduser().resolve()
@@ -360,7 +380,9 @@ def load_fixtures() -> dict[str, Fixture]:
                 category=category,
             )
         except (KeyError, OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise CampaignError(f"failed to load fixture {name!r} from the examples manifest: {exc}") from exc
+            raise CampaignError(
+                f"failed to load fixture {name!r} from the examples manifest: {exc}"
+            ) from exc
     return fixtures
 
 
@@ -384,7 +406,9 @@ def build_specs(
         for mode_name in mode_names:
             backend, draft_tokens = SPECULATIVE_MODES[mode_name]
             if backend == "dflash" and target != "qwen3_6_35b_a3b":
-                raise CampaignError("DFlash corpus measurements require the 35B-A3B target")
+                raise CampaignError(
+                    "DFlash corpus measurements require the 35B-A3B target"
+                )
             for fixture_name in block_fixture_names(backend):
                 for seed in SEEDS:
                     specs.append(
@@ -415,7 +439,9 @@ def request_payload(model_id: str, fixture: Fixture, seed: int) -> dict[str, Any
 
 
 def send_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> None:
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
     try:
         connection.request(
             "POST",
@@ -450,7 +476,9 @@ def receive_json(connection: http.client.HTTPConnection) -> dict[str, Any]:
     return parsed
 
 
-def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> dict[str, Any]:
+def post_json(
+    connection: http.client.HTTPConnection, payload: dict[str, Any]
+) -> dict[str, Any]:
     send_json(connection, payload)
     return receive_json(connection)
 
@@ -463,10 +491,14 @@ def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
     )
     expected = (SERVER_LOG_ARTIFACT_TYPE, SERVER_LOG_SCHEMA_VERSION, event_name)
     if identity != expected:
-        raise CampaignError(f"unexpected serving log identity {identity!r}; expected {expected!r}")
+        raise CampaignError(
+            f"unexpected serving log identity {identity!r}; expected {expected!r}"
+        )
 
 
-def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> tuple[str, str]:
+def validate_server_start(
+    event: dict[str, Any], spec: RunSpec, device: int
+) -> tuple[str, str]:
     require_server_log_identity(event, "server_start")
     engine = event.get("engine", {})
     actual = {
@@ -508,7 +540,9 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     if not isinstance(weights_id, str) or not weights_id:
         raise CampaignError("server_start has no canonical artifact weights_id")
     if event.get("server", {}).get("public_model_id") != spec.model_id:
-        raise CampaignError("server_start public model id does not match the campaign target")
+        raise CampaignError(
+            "server_start public model id does not match the campaign target"
+        )
     server_instance_id = event.get("server_instance_id")
     if not isinstance(server_instance_id, str) or not server_instance_id:
         raise CampaignError("server_start has no server_instance_id")
@@ -578,7 +612,9 @@ def build_result_record(
         usage.get("prompt_tokens") != prompt_tokens
         or usage.get("completion_tokens") != completion_tokens
     ):
-        raise CampaignError("HTTP response usage does not match request_done token counts")
+        raise CampaignError(
+            "HTTP response usage does not match request_done token counts"
+        )
 
     decode_tokens = max(completion_tokens - 1, 0)
     metrics = {
@@ -597,9 +633,13 @@ def build_result_record(
         "speculative_rounds": speculative_rounds,
         "drafted_tokens": drafted_tokens,
         "accepted_tokens": accepted_tokens,
-        "speculative_acceptance": safe_ratio(float(accepted_tokens), float(drafted_tokens)),
+        "speculative_acceptance": safe_ratio(
+            float(accepted_tokens), float(drafted_tokens)
+        ),
         "speculative_tokens_per_round": (
-            1.0 + accepted_tokens / speculative_rounds if speculative_rounds > 0 else None
+            1.0 + accepted_tokens / speculative_rounds
+            if speculative_rounds > 0
+            else None
         ),
         "fallback_steps": fallback_steps,
     }
@@ -659,9 +699,13 @@ def load_existing_records(
                     )
                 key = record_key(record)
                 if key not in expected_specs:
-                    raise CampaignError(f"{path}:{line_number}: result is outside this campaign")
+                    raise CampaignError(
+                        f"{path}:{line_number}: result is outside this campaign"
+                    )
                 if key in records:
-                    raise CampaignError(f"{path}:{line_number}: duplicate result for {key!r}")
+                    raise CampaignError(
+                        f"{path}:{line_number}: duplicate result for {key!r}"
+                    )
                 spec = expected_specs[key]
                 if Path(record.get("artifact_path", "")).resolve() != spec.artifact:
                     raise CampaignError(
@@ -669,7 +713,9 @@ def load_existing_records(
                     )
                 records[key] = record
     except (OSError, json.JSONDecodeError) as exc:
-        raise CampaignError(f"failed to read existing results from {path}: {exc}") from exc
+        raise CampaignError(
+            f"failed to read existing results from {path}: {exc}"
+        ) from exc
     return records
 
 
@@ -769,7 +815,9 @@ def run_block(
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
         server_start = server.wait_until_ready()
-        server_instance_id, weights_id = validate_server_start(server_start, first, device)
+        server_instance_id, weights_id = validate_server_start(
+            server_start, first, device
+        )
 
         connection = http.client.HTTPConnection(
             "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
@@ -792,7 +840,9 @@ def run_block(
                         f"non-sequential serving request id {request_id}; expected {last_request_id + 1}"
                     )
                 last_request_id = request_id
-                record = build_result_record(spec, weights_id, payload, response, request_done)
+                record = build_result_record(
+                    spec, weights_id, payload, response, request_done
+                )
                 append_record(run_handle, record)
                 records[spec.key] = record
                 completed = completed_before_block + block_index
@@ -814,7 +864,9 @@ def metric_values(records: Iterable[dict[str, Any]], name: str) -> list[float]:
     return values
 
 
-def sample_stats(records: Sequence[dict[str, Any]], name: str) -> tuple[int, float | None, float | None]:
+def sample_stats(
+    records: Sequence[dict[str, Any]], name: str
+) -> tuple[int, float | None, float | None]:
     values = metric_values(records, name)
     if not values:
         return 0, None, None
@@ -1028,10 +1080,13 @@ def mode_display_name(mode_name: str) -> str:
 
 def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     with (output_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+        writer = csv.DictWriter(
+            handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore"
+        )
         writer.writeheader()
         writer.writerows(
-            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
+            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS}
+            for row in rows
         )
 
     sections: list[str] = []
@@ -1039,12 +1094,8 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     for mode_name in mode_names:
         label = mode_display_name(mode_name)
         mode_rows = [row for row in rows if row["speculative_mode"] == mode_name]
-        context_rows = [
-            row for row in mode_rows if row["section"] == "context_profile"
-        ]
-        long_decode_rows = [
-            row for row in mode_rows if row["section"] == "long_decode"
-        ]
+        context_rows = [row for row in mode_rows if row["section"] == "context_profile"]
+        long_decode_rows = [row for row in mode_rows if row["section"] == "long_decode"]
         category_rows = [
             row for row in mode_rows if row["section"] == "scenario_category"
         ]
@@ -1170,7 +1221,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     (output_dir / "server").mkdir(parents=True, exist_ok=True)
     run_path = output_dir / "run.jsonl"
     records = load_existing_records(run_path, expected_specs)
-    print(f"resume state: {len(records)}/{total} formal request(s) complete", flush=True)
+    print(
+        f"resume state: {len(records)}/{total} formal request(s) complete", flush=True
+    )
 
     with run_path.open("a", encoding="utf-8") as run_handle:
         for target, _ in artifacts:
@@ -1200,7 +1253,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     missing = set(expected_specs) - set(records)
     if missing:
-        raise CampaignError(f"campaign ended with {len(missing)} missing formal request(s)")
+        raise CampaignError(
+            f"campaign ended with {len(missing)} missing formal request(s)"
+        )
     target_order = [target for target, _ in artifacts]
     summary_rows = build_summary_rows(records, target_order, mode_names, args.sampling)
     write_summaries(summary_rows, output_dir)

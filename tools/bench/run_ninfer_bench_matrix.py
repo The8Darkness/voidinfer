@@ -31,7 +31,9 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
-DEFAULT_BENCH = BUILD_DIR / ("bench/Release/ninfer_bench.exe" if os.name == "nt" else "bench/ninfer_bench")
+DEFAULT_BENCH = BUILD_DIR / (
+    "bench/Release/ninfer_bench.exe" if os.name == "nt" else "bench/ninfer_bench"
+)
 DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.ninfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
@@ -66,7 +68,9 @@ def case_int(value: str) -> int:
     try:
         return int(value)
     except (TypeError, ValueError) as error:
-        raise ValueError(f"invalid integer in generated benchmark case: {value!r}") from error
+        raise ValueError(
+            f"invalid integer in generated benchmark case: {value!r}"
+        ) from error
 
 
 def pair_list(values: Iterable[tuple[int, int]]) -> str:
@@ -93,10 +97,14 @@ def count_corpus_tokens(path: Path) -> int:
 
 
 def add_repetition_args(
-    base_args: list[str], case: BenchCase, repetitions_override: int | None,
+    base_args: list[str],
+    case: BenchCase,
+    repetitions_override: int | None,
     warmup_override: int | None,
 ) -> list[str]:
-    repetitions = repetitions_override if repetitions_override is not None else case.repetitions
+    repetitions = (
+        repetitions_override if repetitions_override is not None else case.repetitions
+    )
     warmup = warmup_override if warmup_override is not None else case.warmup
     return [*base_args, "-r", str(repetitions), "--warmup", str(warmup)]
 
@@ -104,7 +112,9 @@ def add_repetition_args(
 def build_cases(preset: str) -> list[BenchCase]:
     if preset == "smoke":
         return [
-            BenchCase("prefill_length", "prefill_p128_k0", ("-p", "128", *mtp_args(0)), 1, 0),
+            BenchCase(
+                "prefill_length", "prefill_p128_k0", ("-p", "128", *mtp_args(0)), 1, 0
+            ),
             BenchCase("pure_decode", "tg8_k3_graph", ("-n", "8", *mtp_args(3)), 1, 0),
             BenchCase(
                 "context_decode",
@@ -116,7 +126,9 @@ def build_cases(preset: str) -> list[BenchCase]:
         ]
 
     include_full = preset == "full"
-    prefill_lengths = PREFILL_LENGTHS_CORE + (PREFILL_LENGTHS_FULL_EXTRA if include_full else ())
+    prefill_lengths = PREFILL_LENGTHS_CORE + (
+        PREFILL_LENGTHS_FULL_EXTRA if include_full else ()
+    )
     context_pairs = CONTEXT_CORE + (CONTEXT_FULL_EXTRA if include_full else ())
     sweep_pairs = ((2048, 512),) + (((32768, 256),) if include_full else ())
 
@@ -225,7 +237,9 @@ def build_cases(preset: str) -> list[BenchCase]:
     return cases
 
 
-def filtered_cases(cases: list[BenchCase], suites: Sequence[str], limit: int | None) -> list[BenchCase]:
+def filtered_cases(
+    cases: list[BenchCase], suites: Sequence[str], limit: int | None
+) -> list[BenchCase]:
     selected = cases
     if suites:
         allowed = set(suites)
@@ -242,7 +256,9 @@ def max_prompt_in_cases(cases: Sequence[BenchCase]) -> int:
         for flag in ("-p", "--n-prompt"):
             if flag in args:
                 raw = args[args.index(flag) + 1]
-                max_prompt = max(max_prompt, *(case_int(piece) for piece in raw.split(",")))
+                max_prompt = max(
+                    max_prompt, *(case_int(piece) for piece in raw.split(","))
+                )
         for flag in ("-pg", "--prompt-gen"):
             if flag in args:
                 raw = args[args.index(flag) + 1]
@@ -256,7 +272,9 @@ def load_bench_report(report_path: Path) -> dict[str, Any]:
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"could not read benchmark report {report_path}: {error}") from error
+        raise ValueError(
+            f"could not read benchmark report {report_path}: {error}"
+        ) from error
     if not isinstance(report, dict):
         raise ValueError("benchmark report root must be an object")
     identity = (
@@ -306,9 +324,9 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "proposal_head": config.get("proposal_head"),
             "decode_path": config.get("decode_path"),
             "decode_graph_primed": config.get("decode_graph_prime", {}).get("primed"),
-            "decode_graph_prime_output_tokens": config.get("decode_graph_prime", {}).get(
-                "output_tokens"
-            ),
+            "decode_graph_prime_output_tokens": config.get(
+                "decode_graph_prime", {}
+            ).get("output_tokens"),
             "repetitions": config.get("repetitions"),
             "warmup": config.get("warmup"),
             "load_seconds": load.get("load_seconds"),
@@ -320,10 +338,14 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "weights_capacity_bytes": weights_memory.get("capacity_bytes"),
             "sequence_capacity_bytes": sequence_memory.get("capacity_bytes"),
             "workspace_capacity_bytes": workspace_memory.get("capacity_bytes"),
-            "request_transient_capacity_bytes": request_transient_memory.get("capacity_bytes"),
+            "request_transient_capacity_bytes": request_transient_memory.get(
+                "capacity_bytes"
+            ),
             "cuda_graph_allowance_bytes": memory.get("cuda_graph_allowance_bytes"),
             "workspace_peak_bytes": test.get("workspace_peak_bytes"),
-            "workspace_allocator_peak_bytes": test.get("workspace_allocator_peak_bytes"),
+            "workspace_allocator_peak_bytes": test.get(
+                "workspace_allocator_peak_bytes"
+            ),
             "prefill_tok_s_mean": test.get("prefill_tok_s_mean"),
             "prefill_tok_s_stddev": test.get("prefill_tok_s_stddev"),
             "decode_output_tok_s_mean": test.get("decode_output_tok_s_mean"),
@@ -359,13 +381,16 @@ def write_summary(rows: Sequence[dict[str, Any]], out_dir: Path) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    (out_dir / "summary.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "summary.json").write_text(
+        json.dumps(rows, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def run_command(command: Sequence[str], stdout_path: Path, stderr_path: Path) -> int:
-    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
-        "w", encoding="utf-8"
-    ) as stderr:
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout,
+        stderr_path.open("w", encoding="utf-8") as stderr,
+    ):
         process = subprocess.run(
             list(command),
             cwd=REPO_ROOT,
@@ -405,7 +430,9 @@ def write_manifest(
             "tg rows use a one-token seed and report G decode tokens after the begin token.",
         ],
     }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -413,19 +440,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preset", choices=("smoke", "core", "full"), default="core")
     parser.add_argument("--bench", type=Path, default=DEFAULT_BENCH)
     parser.add_argument(
-        "--weights", type=Path, default=DEFAULT_WEIGHTS, help=".ninfer artifact passed to the bench"
+        "--weights",
+        type=Path,
+        default=DEFAULT_WEIGHTS,
+        help=".ninfer artifact passed to the bench",
     )
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--suite", action="append", default=[], help="suite to run; repeatable")
-    parser.add_argument("--limit", type=int, default=None, help="run only the first N selected cases")
-    parser.add_argument("--repetitions", type=int, default=None, help="override all case repetitions")
-    parser.add_argument("--warmup", type=int, default=None, help="override all case warmup repetitions")
-    parser.add_argument("--dry-run", action="store_true", help="write commands but do not execute")
-    parser.add_argument("--resume", action="store_true", help="skip cases with an existing valid JSON report")
     parser.add_argument(
-        "--no-build", action="store_true", help="do not build the native ninfer_bench target"
+        "--suite", action="append", default=[], help="suite to run; repeatable"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="run only the first N selected cases"
+    )
+    parser.add_argument(
+        "--repetitions", type=int, default=None, help="override all case repetitions"
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=None, help="override all case warmup repetitions"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="write commands but do not execute"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip cases with an existing valid JSON report",
+    )
+    parser.add_argument(
+        "--no-build",
+        action="store_true",
+        help="do not build the native ninfer_bench target",
     )
     return parser.parse_args(argv)
 
@@ -496,7 +542,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
         commands_sh.append(shell_join(command))
-    commands_text = "#!/usr/bin/env bash\nset -euo pipefail\n\n" + "\n\n".join(commands_sh) + "\n"
+    commands_text = (
+        "#!/usr/bin/env bash\nset -euo pipefail\n\n" + "\n\n".join(commands_sh) + "\n"
+    )
     (out_dir / "commands.sh").write_text(commands_text, encoding="utf-8")
     write_manifest(out_dir, args, cases, command_records)
 
@@ -514,7 +562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "cmake",
                 "--build",
                 str(BUILD_DIR),
-                *( ["--config", "Release"] if os.name == "nt" else [] ),
+                *(["--config", "Release"] if os.name == "nt" else []),
                 "--parallel",
                 "--target",
                 "ninfer_bench",
@@ -603,7 +651,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         (out_dir / "failures.json").write_text(
             json.dumps(failures, indent=2) + "\n", encoding="utf-8"
         )
-        print(f"completed with {len(failures)} failure(s); see {out_dir / 'failures.json'}")
+        print(
+            f"completed with {len(failures)} failure(s); see {out_dir / 'failures.json'}"
+        )
         return 1
 
     print(f"completed {len(cases)} cases")

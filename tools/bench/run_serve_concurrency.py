@@ -16,18 +16,19 @@ import shlex
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD_DIR = REPO_ROOT / ("build-windows" if os.name == "nt" else "build")
-SERVE_BINARY = BUILD_DIR / ("apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve")
+SERVE_BINARY = BUILD_DIR / (
+    "apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve"
+)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
-
 
 SUITES = ("decode-saturation", "corpus-makespan")
 STATS_INTERVAL_MS = 1000
@@ -148,11 +149,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
     )
     parser.add_argument("--prefill-chunk", type=int, default=1024)
-    parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
+    parser.add_argument(
+        "--output", type=Path, required=True, help="benchmark output directory"
+    )
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument(
-        "--dry-run", action="store_true", help="print point commands and request counts only"
+        "--dry-run",
+        action="store_true",
+        help="print point commands and request counts only",
     )
     return parser.parse_args(argv)
 
@@ -170,7 +175,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise corpus.CampaignError("--prefill-chunk must be a positive multiple of 128")
     if args.kv_capacity != "auto":
         if not args.kv_capacity.isdigit() or int(args.kv_capacity) <= 0:
-            raise corpus.CampaignError("--kv-capacity must be a positive integer or auto")
+            raise corpus.CampaignError(
+                "--kv-capacity must be a positive integer or auto"
+            )
         if int(args.kv_capacity) < args.max_context:
             raise corpus.CampaignError("--kv-capacity must be at least --max-context")
     if len(args.concurrency) != len(set(args.concurrency)):
@@ -194,7 +201,9 @@ def build_points(
         for mode_name in mode_names:
             backend, draft_tokens = corpus.SPECULATIVE_MODES[mode_name]
             if backend == "dflash" and target != "qwen3_6_35b_a3b":
-                raise corpus.CampaignError("DFlash measurements require the 35B-A3B target")
+                raise corpus.CampaignError(
+                    "DFlash measurements require the 35B-A3B target"
+                )
             for suite in args.suite:
                 for concurrency in args.concurrency:
                     points.append(
@@ -367,11 +376,15 @@ def validate_server_start(
     }
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
-        raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
+        raise corpus.CampaignError(
+            f"server_start Engine configuration mismatch: {actual!r}"
+        )
     if event.get("sampling_defaults", {}).get("greedy") != (
         point.sampling_mode == "greedy"
     ):
-        raise corpus.CampaignError("server_start sampling mode does not match the point")
+        raise corpus.CampaignError(
+            "server_start sampling mode does not match the point"
+        )
     if event.get("artifact", {}).get("target") != point.target:
         raise corpus.CampaignError("loaded artifact target does not match the point")
     if event.get("server", {}).get("public_model_id") != point.model_id:
@@ -455,7 +468,9 @@ def run_clients(
                     if ordered_dispatch:
                         with dispatch_condition:
                             dispatch_condition.wait_for(
-                                lambda: failed.is_set() or job.index == next_dispatch_index
+                                lambda: (
+                                    failed.is_set() or job.index == next_dispatch_index
+                                )
                             )
                             if failed.is_set():
                                 return
@@ -468,7 +483,9 @@ def run_clients(
                         started_at = time.monotonic()
                         response = corpus.post_json(connection, payload)
                     finished_at = time.monotonic()
-                    result = parse_client_response(job, response, started_at, finished_at)
+                    result = parse_client_response(
+                        job, response, started_at, finished_at
+                    )
                 except Exception as exc:
                     record_failure(exc)
                     return
@@ -484,13 +501,17 @@ def run_clients(
     for thread in threads:
         thread.start()
 
-    readiness_errors = [error for error in (ready.get() for _ in threads) if error is not None]
+    readiness_errors = [
+        error for error in (ready.get() for _ in threads) if error is not None
+    ]
     if readiness_errors:
         failed.set()
         start_event.set()
         for thread in threads:
             thread.join()
-        raise corpus.CampaignError(f"failed to connect benchmark clients: {readiness_errors[0]}")
+        raise corpus.CampaignError(
+            f"failed to connect benchmark clients: {readiness_errors[0]}"
+        )
 
     campaign_start = time.monotonic()
     start_event.set()
@@ -507,7 +528,11 @@ def run_clients(
             f"completed {len(results)} client request(s), expected {len(jobs)}"
         )
     campaign_end = max(result.finished_at for result in results)
-    return sorted(results, key=lambda result: result.job.index), campaign_start, campaign_end
+    return (
+        sorted(results, key=lambda result: result.job.index),
+        campaign_start,
+        campaign_end,
+    )
 
 
 def load_server_events(path: Path, server_instance_id: str) -> list[dict[str, Any]]:
@@ -522,11 +547,15 @@ def load_server_events(path: Path, server_instance_id: str) -> list[dict[str, An
                     continue
                 event_name = event.get("event")
                 if not isinstance(event_name, str):
-                    raise corpus.CampaignError(f"{path}:{line_number}: event name is missing")
+                    raise corpus.CampaignError(
+                        f"{path}:{line_number}: event name is missing"
+                    )
                 corpus.require_server_log_identity(event, event_name)
                 events.append(event)
     except (OSError, json.JSONDecodeError) as exc:
-        raise corpus.CampaignError(f"failed to read serving events from {path}: {exc}") from exc
+        raise corpus.CampaignError(
+            f"failed to read serving events from {path}: {exc}"
+        ) from exc
     return events
 
 
@@ -553,7 +582,9 @@ def sum_request_done(events: Sequence[dict[str, Any]]) -> dict[str, int | float 
             accepted_tokens += int(speculative["accepted_tokens"])
             fallback_steps += int(speculative["fallback_steps"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise corpus.CampaignError(f"request_done event is missing metrics: {exc}") from exc
+            raise corpus.CampaignError(
+                f"request_done event is missing metrics: {exc}"
+            ) from exc
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -581,7 +612,9 @@ def sum_throughput(events: Sequence[dict[str, Any]]) -> dict[str, int | float | 
             decode_rounds += int(event["decode_batch"]["rounds"])
             decode_row_rounds += int(event["decode_batch"]["row_rounds"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise corpus.CampaignError(f"throughput event is missing counters: {exc}") from exc
+            raise corpus.CampaignError(
+                f"throughput event is missing counters: {exc}"
+            ) from exc
     return {
         "computed_prefill_tokens": computed_prefill_tokens,
         "committed_decode_tokens": committed_decode_tokens,
@@ -627,7 +660,9 @@ def steady_metrics(
     rounds = sum(int(event["decode_batch"]["rounds"]) for event in selected)
     row_rounds = sum(int(event["decode_batch"]["row_rounds"]) for event in selected)
     if duration <= 0.0 or rounds <= 0:
-        raise corpus.CampaignError("steady decode interval has no measurable duration or rounds")
+        raise corpus.CampaignError(
+            "steady decode interval has no measurable duration or rounds"
+        )
     return {
         "intervals": len(selected),
         "seconds": duration,
@@ -686,14 +721,22 @@ def analyze_point(
     runtime_totals = sum_throughput(throughput)
     client_prompt = sum(result.prompt_tokens for result in results)
     client_completion = sum(result.completion_tokens for result in results)
-    if client_prompt != done_totals["prompt_tokens"] or client_completion != done_totals[
-        "completion_tokens"
-    ]:
+    if (
+        client_prompt != done_totals["prompt_tokens"]
+        or client_completion != done_totals["completion_tokens"]
+    ):
         raise corpus.CampaignError("client usage and request_done token totals differ")
-    if runtime_totals["computed_prefill_tokens"] != done_totals["computed_prefill_tokens"]:
-        raise corpus.CampaignError("throughput and request_done prefill token totals differ")
+    if (
+        runtime_totals["computed_prefill_tokens"]
+        != done_totals["computed_prefill_tokens"]
+    ):
+        raise corpus.CampaignError(
+            "throughput and request_done prefill token totals differ"
+        )
     if runtime_totals["committed_decode_tokens"] != done_totals["decode_tokens"]:
-        raise corpus.CampaignError("throughput and request_done decode token totals differ")
+        raise corpus.CampaignError(
+            "throughput and request_done decode token totals differ"
+        )
 
     makespan = campaign_end - campaign_start
     if makespan <= 0.0:
@@ -770,7 +813,9 @@ def run_point(
 
     with corpus.RunningServer(command, "127.0.0.1", args.port, server_log) as server:
         server_start = server.wait_until_ready()
-        server_instance_id, weights_id = validate_server_start(server_start, point, args)
+        server_instance_id, weights_id = validate_server_start(
+            server_start, point, args
+        )
         results, campaign_start, campaign_end = run_clients(point, jobs, args.port)
 
     events = load_server_events(server_log, server_instance_id)
@@ -884,7 +929,9 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         "speedup_vs_c1": report.get("speedup_vs_c1"),
     }
     if report["suite"] == "decode-saturation":
-        row["average_decode_batch"] = report["metrics"]["steady"]["average_decode_batch"]
+        row["average_decode_batch"] = report["metrics"]["steady"][
+            "average_decode_batch"
+        ]
         row["steady_seconds"] = report["metrics"]["steady"]["seconds"]
         row["steady_decode_tokens_per_second"] = report["metrics"]["steady"][
             "decode_tokens_per_second"
@@ -938,7 +985,8 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
         writer.writerows(
-            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
+            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS}
+            for row in rows
         )
 
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
@@ -1000,9 +1048,7 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
 
     corpus_order_note = ""
     if any(report["suite"] == "corpus-makespan" for report in reports):
-        corpus_order_note = (
-            f" Corpus-makespan uses fixed shuffle seed {CORPUS_ORDER_SEED} and ordered HTTP sends."
-        )
+        corpus_order_note = f" Corpus-makespan uses fixed shuffle seed {CORPUS_ORDER_SEED} and ordered HTTP sends."
     markdown = (
         "# Concurrent serving benchmark\n\n"
         "Saturated decode rates use only complete intervals whose decode batch equals the "
