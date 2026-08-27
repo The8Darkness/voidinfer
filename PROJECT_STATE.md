@@ -8,7 +8,7 @@ Updated: 2026-08-28 UTC
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `handoff/phase2-context-resource-20260827`
 - PR #2: `https://github.com/The8Darkness/voidinfer/pull/2`
-- PR2 source handoff/head: `c3ca3cb9ef6d2ed6d899d57a6c56e5f4cddc3f41`
+- PR2 source handoff/head: `6f45851629bee2b691a324767b6b2965955428f` (docs tip); functional repair commit: `c3ca3cb9ef6d2ed6d899d57a6c56e5f4cddc3f41`
 - Orchestration prompt: `MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md`
 - Canonical integration checkpoint: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`); contains the committed context/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes
 - Handoff documentation commits: `8492f900f8` (`docs(state): record phase2 handoff`), `90e76f3d4c` (GitHub handoff link), and `d4fce7aa1f` (Muse Spark master prompt)
@@ -99,6 +99,6 @@ The Picot launcher and harness use `D:\AI\voidinfer`; the source repository was 
 - Orchestrator session: `voidinfer-6`; harness: `omp`; exact model: `openai-codex/gpt-5.6-luna`.
 - Worker: session `voidinfer-24`, name `PR2 repair retry`; workspace `D:\AI\agent-orchestrator\data\worktrees\voidinfer\voidinfer-24`; ownership: PR #2 repair takeover.
 - Prior qualification, integration, and monitor sessions are exited.
-- PR #2 source/head now: `handoff/phase2-context-resource-20260827` / `c3ca3cb9ef6d2ed6d899d57a6c56e5f4cddc3f41`; required check passing; reviews: none.
+- PR #2 source/head now: `handoff/phase2-context-resource-20260827` / `6f45851629bee2b691a324767b6b2965955428f` (docs tip; functional repair commit: `c3ca3cb9ef6d2ed6d899d57a6c56e5f4cddc3f41`); required check passing; reviews: none.
 - GPU at checkpoint: RTX 5090, 32,607 MiB; about 2.3 GiB desktop/AO use; 0% utilization. No NInfer model, service, build process, or owned service to restore; no active GPU job remains.
 - Windows/WebUI/local workflow authorities and the user's dirty canonical deletion remain untouched. The direct route is qualified; prior code-9 results are superseded invocation diagnostics.
