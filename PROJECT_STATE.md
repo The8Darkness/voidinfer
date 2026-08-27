@@ -6,12 +6,14 @@ Updated: 2026-08-27 UTC
 
 - Project: VoidInfer / NInfer native Windows RTX 5090 engine
 - Canonical checkout: `D:\AI\voidinfer`
-- Branch: `master`
+- Branch: `handoff/phase2-context-resource-20260827`
+- Handoff PR: `https://github.com/The8Darkness/voidinfer/pull/2`
 - State checkpoint commit: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`); this is the committed handoff checkpoint containing the canonical `dev` runtime/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes
+- Handoff documentation commit: `8492f900f8` (`docs(state): record phase2 handoff`)
 - Previous rollback checkpoint: `9a6813a3` (`fix(windows): complete upstream f0 build integration`); keep it available until the refreshed canonical head is separately qualified
 - Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `13.1`, `sm_120a`; `build-windows-phase7` full build and 94-test CTest run pass, with 5 expected artifact skips; benchmark and serve targets built
 - Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
-- Last accepted pushed commit at this checkpoint: `808c7616` on `origin/phase1/bootstrap-state-20260826`; direct `master` push remains subject to required status check `secret-and-artifact-checks`
+- Pushed handoff branch: `origin/handoff/phase2-context-resource-20260827` at `8492f900f8`; direct `master` push was rejected by the required status check `secret-and-artifact-checks`, so review/merge through PR #2
 - Current phase: Phase 2 validation/handoff; the committed context/resource integration is locally qualified on Qwen3.8 NVFP4, while the refreshed canonical head remains a separate next step
 - Active hypothesis: the canonical content-indexed State/KV/resource path is the correct prefix-cache substrate; qualify it on Qwen3.8 before adding persistence, proposer routing, or codecs
 
