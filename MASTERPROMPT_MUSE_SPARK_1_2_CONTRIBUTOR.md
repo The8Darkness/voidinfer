@@ -143,7 +143,8 @@ Start here rather than assuming the old prompt is the live state.
 - GitHub repository: `https://github.com/The8Darkness/voidinfer.git`
 - Current handoff branch: `handoff/phase2-context-resource-20260827`
 - Handoff PR: `https://github.com/The8Darkness/voidinfer/pull/2`
-- Latest pushed branch commit: `1240079f67` (`style(docs): normalize handoff index`)
+- Prompt checkpoint commit: `d4fce7aa1f` (`docs: add muse spark contributor master prompt`)
+- Verify `git HEAD` and `PROJECT_STATE.md` for any later state-only handoff updates.
 - Code checkpoint: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`)
 - State/GitHub documentation checkpoint: `90e76f3d4c` (`docs(state): link github handoff`)
 - Previous rollback checkpoint: `9a6813a3f0` (`fix(windows): complete upstream f0 build integration`)
