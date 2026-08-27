@@ -435,6 +435,10 @@ from one to fifteen.
 
 ## Documentation
 
+- [Current project state and agent handoff](PROJECT_STATE.md)
+- [Known issues and blockers](KNOWN_ISSUES.md)
+- [Experiment log](EXPERIMENTS.md)
+- [Upstream audit](UPSTREAM_AUDIT.md)
 - [Contributing](CONTRIBUTING.md)
 - [Documentation index](docs/README.md)
 - [CLI](docs/cli.md)

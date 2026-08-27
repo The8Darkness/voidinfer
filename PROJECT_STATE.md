@@ -7,12 +7,12 @@ Updated: 2026-08-27 UTC
 - Project: VoidInfer / NInfer native Windows RTX 5090 engine
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `master`
-- State checkpoint commit: `9a6813a3`; the current staged tree contains the canonical `dev` runtime/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes; it has not been committed
-- Last-known-good source commit: `9a6813a3` (`fix(windows): complete upstream f0 build integration`); keep it as rollback until the staged cutover is committed and the refreshed canonical head is separately qualified
+- State checkpoint commit: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`); this is the committed handoff checkpoint containing the canonical `dev` runtime/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes
+- Previous rollback checkpoint: `9a6813a3` (`fix(windows): complete upstream f0 build integration`); keep it available until the refreshed canonical head is separately qualified
 - Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `13.1`, `sm_120a`; `build-windows-phase7` full build and 94-test CTest run pass, with 5 expected artifact skips; benchmark and serve targets built
 - Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
 - Last accepted pushed commit at this checkpoint: `808c7616` on `origin/phase1/bootstrap-state-20260826`; direct `master` push remains subject to required status check `secret-and-artifact-checks`
-- Current phase: Phase 2 validation plus local qualification of the staged canonical context/resource integration
+- Current phase: Phase 2 validation/handoff; the committed context/resource integration is locally qualified on Qwen3.8 NVFP4, while the refreshed canonical head remains a separate next step
 - Active hypothesis: the canonical content-indexed State/KV/resource path is the correct prefix-cache substrate; qualify it on Qwen3.8 before adding persistence, proposer routing, or codecs
 
 ## Local environment
@@ -60,7 +60,7 @@ The Qwen3.8 NVFP4 artifact inspects successfully and `ninfer-serve.exe --help` e
 ## Fetched audit refs (2026-08-27)
 
 - natpate `upstream/master`, `upstream/dev`: `b686696eebd4`
-- Neroued `canonical/master`, `canonical/dev`: `9dbc074005a1`; local staged integration is qualified only through `59febed27ca`
+- Neroued `canonical/master`, `canonical/dev`: `9dbc074005a1`; committed local integration is qualified through `59febed27ca` in `21de38d7a8`
 - headpiece: `c1b0ad34d438`; q27 current master: `9b10e16fc568`
 - SM120 overlay: `351cf46c8910`; vLLM: `75dea9b4ae9e`; vLLM PR #52816: `3406ec1dae99`
 - FlashInfer: `39b484f1ce2f`; PR #4346: deleted from the fetched remote and requires re-audit
@@ -77,3 +77,5 @@ Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM12
 4. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before those refreshed-runtime, exact-quality, and VLM gates exist.
 
 The Picot launcher and harness now use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration.
+
+For the next agent: start with this file, `KNOWN_ISSUES.md`, `EXPERIMENTS.md`, and `UPSTREAM_AUDIT.md`; do not select an unqualified artifact by glob. The immediate next technical step is a separate worktree/branch for the refreshed canonical `9dbc074005a1` pressure-planner/tool/parser/anchor series, followed by the same native build, 94-test CTest run, direct Qwen3.8 resource gate, and focused corpus checks.

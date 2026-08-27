@@ -30,6 +30,10 @@ The executable `--help` output is the exact source for command-line option spell
 - [Tests](../tests/README.md)
 - [Maintainer tools](../tools/README.md)
 - [Capability evaluation](../eval/README.md)
+- [Current project state and agent handoff](../PROJECT_STATE.md)
+- [Known issues and blockers](../KNOWN_ISSUES.md)
+- [Experiment log](../EXPERIMENTS.md)
+- [Upstream audit](../UPSTREAM_AUDIT.md)
 
 ## Maintainer references
 

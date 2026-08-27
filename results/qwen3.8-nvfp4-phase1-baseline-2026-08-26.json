@@ -5,8 +5,8 @@
   "timestamp_utc": "2026-08-27T16:00:00Z",
   "project": "VoidInfer / NInfer native Windows RTX 5090",
   "source": {
-    "base_commit": "9a6813a3",
-    "working_tree": "staged canonical/dev integration plus Windows fixes; not committed",
+    "base_commit": "21de38d7a8",
+    "working_tree": "committed phase-2 handoff checkpoint",
     "build_dir": "build-windows-phase7",
     "configuration": "Visual Studio 17 2022 x64 Release, CUDA 13.1, sm_120a"
   },
