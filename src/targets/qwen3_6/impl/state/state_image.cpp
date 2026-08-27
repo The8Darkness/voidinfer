@@ -19,6 +19,13 @@ std::size_t checked_mul(std::size_t left, std::size_t right, const char* label) 
     return left * right;
 }
 
+std::size_t checked_add(std::size_t left, std::size_t right, const char* label) {
+    if (right > std::numeric_limits<std::size_t>::max() - left) {
+        throw std::overflow_error(label);
+    }
+    return left + right;
+}
+
 std::uint32_t padded_dflash_capacity(std::uint32_t capacity) {
     if (capacity == 0) {
         throw std::invalid_argument("StateImage DFlash capacity must be positive");
@@ -158,6 +165,48 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
 
     out.host = plan_host_state_image(spec);
     return out;
+}
+
+TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
+    std::size_t payload = checked_add(layout.linear_conv.bytes, layout.linear_recurrent.bytes,
+                                      "StateImage transfer payload overflow");
+    payload             = checked_add(payload, layout.continuation_hidden.bytes,
+                                      "StateImage transfer payload overflow");
+    if (layout.dflash_local_k) {
+        if (!layout.spec.dflash_local || !layout.dflash_local_v) {
+            throw std::invalid_argument("StateImage DFlash transfer layout is incomplete");
+        }
+        const std::size_t component_bytes =
+            checked_mul(layout.dflash_local_layer_bytes, layout.spec.dflash_local->layers,
+                        "StateImage transfer payload overflow");
+        payload = checked_add(
+            payload, checked_mul(component_bytes, 2U, "StateImage transfer payload overflow"),
+            "StateImage transfer payload overflow");
+    }
+    const std::uint64_t operations =
+        2ULL * layout.spec.linear.layers + 1ULL +
+        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
+    if (operations > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("StateImage transfer operation count exceeds uint32");
+    }
+    return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
+                        .copy_operations = static_cast<std::uint32_t>(operations)};
+}
+
+TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
+    if (!layout.spec.dflash_local || !layout.dflash_local_k || !layout.dflash_local_v) {
+        throw std::invalid_argument("StateImage has no DFlash local component");
+    }
+    const std::size_t component_bytes =
+        checked_mul(layout.dflash_local_layer_bytes, layout.spec.dflash_local->layers,
+                    "StateImage DFlash transfer payload overflow");
+    const std::uint64_t operations = 2ULL * layout.spec.dflash_local->layers;
+    if (component_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
+        operations > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("StateImage DFlash transfer work exceeds its representation");
+    }
+    return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(2U * component_bytes),
+                        .copy_operations = static_cast<std::uint32_t>(operations)};
 }
 
 HostStatePool::HostStatePool(StateImageHostLayout layout, std::uint32_t capacity)
@@ -308,6 +357,16 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
     CUDA_CHECK(cudaMemcpyAsync(destination_hidden.data, source_hidden.data,
                                destination_hidden.bytes(), cudaMemcpyDeviceToDevice, stream));
     if (dflash_local_) {
+        dflash_local_->copy_slot_from(*dflash_local_, source, destination, stream);
+    }
+}
+
+void StateImageDevicePool::copy_dflash_local(std::int32_t source, std::int32_t destination,
+                                             cudaStream_t stream) {
+    validate_slot(source, slot_count(), "StateImage DFlash copy source is out of range");
+    validate_slot(destination, slot_count(), "StateImage DFlash copy destination is out of range");
+    if (!dflash_local_) { throw std::logic_error("StateImage has no DFlash local component"); }
+    if (source != destination) {
         dflash_local_->copy_slot_from(*dflash_local_, source, destination, stream);
     }
 }

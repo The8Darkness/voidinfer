@@ -5,6 +5,7 @@
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
+#include "runtime/engine/context_cost.h"
 
 #include <chrono>
 #include <cstdint>
@@ -93,6 +94,14 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
+    const runtime::ContextCostIdentity context_cost_identity{
+        .hardware_class = runtime::context_cost_hardware_class(
+            device.props.name, device.props.major, device.props.minor),
+        .model_id   = identity.model_id,
+        .weights_id = identity.weights_id,
+    };
+    runtime::ResolvedContextCost context_cost =
+        runtime::resolve_context_cost(context_cost_identity, options.context_cost.preset_path);
 
     artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
@@ -133,9 +142,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     summary.peak_staging_bytes   = stats.peak_staging_bytes;
     summary.tensor_count         = stats.tensor_count;
     summary.resource_count       = stats.resource_count;
+    summary.context_cost         = context_cost.summary;
     return ConstructedTarget{.active            = ActiveTarget(std::move(instance)),
                              .load              = std::move(summary),
-                             .sampling_defaults = sampling_defaults};
+                             .sampling_defaults = sampling_defaults,
+                             .context_cost      = std::move(context_cost.model)};
 }
 
 } // namespace

@@ -1,19 +1,19 @@
 # VoidInfer project state
 
-Updated: 2026-08-26 UTC
+Updated: 2026-08-27 UTC
 
 ## Canonical state
 
 - Project: VoidInfer / NInfer native Windows RTX 5090 engine
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `master`
-- State checkpoint commit: `808c7616`; pushed on `origin/phase1/bootstrap-state-20260826`; PR #1 is open against protected `master` (later state-bookkeeping commits may follow this checkpoint)
-- Last-known-good source commit: `808c7616` (`docs(state): checkpoint Windows path fixes`)
-- Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `120a`, tests enabled; build and 89-test CTest run pass; benchmark target also built
+- State checkpoint commit: `9a6813a3`; the current staged tree contains the canonical `dev` runtime/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes; it has not been committed
+- Last-known-good source commit: `9a6813a3` (`fix(windows): complete upstream f0 build integration`); keep it as rollback until the staged cutover is committed and the refreshed canonical head is separately qualified
+- Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `13.1`, `sm_120a`; `build-windows-phase7` full build and 94-test CTest run pass, with 5 expected artifact skips; benchmark and serve targets built
 - Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
-- Last accepted pushed commit at this checkpoint: `808c7616` on `origin/phase1/bootstrap-state-20260826`; direct `master` push is blocked by required status check `secret-and-artifact-checks`
-- Current phase: Phase 1, reproducible native-Windows baseline and audit scaffolding; PR #1 awaits protected-branch CI
-- Active hypothesis: qualify canonical `Neroued/ninfer` `dev` context/resource implementation before designing a competing prefix cache
+- Last accepted pushed commit at this checkpoint: `808c7616` on `origin/phase1/bootstrap-state-20260826`; direct `master` push remains subject to required status check `secret-and-artifact-checks`
+- Current phase: Phase 2 validation plus local qualification of the staged canonical context/resource integration
+- Active hypothesis: the canonical content-indexed State/KV/resource path is the correct prefix-cache substrate; qualify it on Qwen3.8 before adding persistence, proposer routing, or codecs
 
 ## Local environment
 
@@ -37,10 +37,10 @@ Metadata inspection reports 1,118 tensors + 6 resources for NVFP4 and 1,165 tens
 
 ## Baseline evidence
 
-Configure (after relocation):
+Configure (after relocation; the recorded qualification build is `build-windows-phase7`):
 
 ```text
-cmake --fresh -S . -B build-windows -G "Visual Studio 17 2022" -A x64
+cmake --fresh -S . -B build-windows-phase7 -G "Visual Studio 17 2022" -A x64
   -DCMAKE_TOOLCHAIN_FILE=C:/BuildTools/VC/vcpkg/scripts/buildsystems/vcpkg.cmake
   -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_CUDA_ARCHITECTURES=120a
   -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=ON
@@ -49,31 +49,31 @@ cmake --fresh -S . -B build-windows -G "Visual Studio 17 2022" -A x64
 Build and test:
 
 ```text
-cmake --build build-windows --config Release -j
-ctest --test-dir build-windows -C Release --output-on-failure
+cmake --build build-windows-phase7 --config Release -j
+ctest --test-dir build-windows-phase7 -C Release --output-on-failure
 ```
 
-Result: `100% tests passed, 0 failed out of 89`; five registered real-model tests skipped because their required artifacts/fixtures are absent. Build succeeds with existing MSVC module-dependency and signed/unsigned comparison warnings; no source changes were made for those warnings. Full evidence is in `results/bootstrap-baseline-2026-08-26.json`.
+Result: `100% tests passed, 0 failed out of 94`; five registered Qwen3.6/35B real-model tests skipped because their required artifacts/fixtures are absent. The same executable's opt-in Qwen3.8 NVFP4 resource-settlement route passes when `NINFER_QWEN3_8_27B_WEIGHTS` is set. Build succeeds with existing MSVC module-dependency and signed/unsigned comparison warnings; no source changes were made for those warnings. Full local evidence is in `results/qwen3.8-nvfp4-phase1-baseline-2026-08-26.json`.
 
-The Qwen3.8 NVFP4 artifact inspects successfully and `ninfer-serve.exe --help` exposes vision, MTP, KV dtype, prefix reuse, Responses, and tool-serving options. A bounded local service run with vision + MTP3 passed `tools/smoke/serve_contract.py` and was stopped cleanly. A one-repetition local benchmark measured prefill 7,091.6 tok/s at 512 tokens, 8,027.7 at 4,096, 7,629.2 at 8,192, and MTP3 decode 91.88 output tok/s with 24.1% draft acceptance; this is a preliminary `LOCAL_MEASUREMENT`, not a stable performance baseline. Raw report: `results/qwen3.8-nvfp4-mtp3-short-baseline.json`.
+The Qwen3.8 NVFP4 artifact inspects successfully and `ninfer-serve.exe --help` exposes vision, MTP, KV dtype, prefix reuse, Responses, and tool-serving options. Separate native service runs passed the text-only and Vision contract smoke; the Qwen3.8 NVFP4 public-Engine gate now covers Host State/KV restore, multimodal reuse, cancellation/eviction, and concurrent MTP settlement and passes. The 43-case C1 core matrix passed, with MTP3 graph decode ranging from 133.97 to 172.33 tok/s over the selected generation lengths and MTP5 from 107.99 to 151.18 tok/s. Separate decode-saturation runs cover C1/C2/C4/C8: MTP0 steady aggregate 80.4/157.5/292.9/538.5 tok/s and MTP3 171.7/329.8/568.2/1046.8 tok/s. The MTP0 corpus completed 20/20 long-context requests at 8k/64k/128k/256k, and the MTP3 corpus completed 75/75 long-decode, code, story, translation, and structured requests; these remain performance/behavior measurements rather than the complete quality/VLM gate. FP8-KV synthetic prefill completed at 252,928 tokens in 102.87 s (2,458.64 tok/s) and 262,144 tokens in 110.42 s (2,373.99 tok/s). Reports: `results/qwen3.8-nvfp4-phase1-baseline-2026-08-26.json` and ignored `profiles/bench/qwen38-*`.
 
-## Fetched audit refs (2026-08-26)
+## Fetched audit refs (2026-08-27)
 
 - natpate `upstream/master`, `upstream/dev`: `b686696eebd4`
-- Neroued `canonical/master`: `feaf4dd0983f`; `canonical/dev`: `59febed27ca`
+- Neroued `canonical/master`, `canonical/dev`: `9dbc074005a1`; local staged integration is qualified only through `59febed27ca`
 - headpiece: `c1b0ad34d438`; q27 current master: `9b10e16fc568`
-- SM120 overlay: `5f2fd9d76544`; vLLM: `0a5ad6f0d42c`; vLLM PR #52816: `3406ec1dae99`
-- FlashInfer: `919a24e5b1d9`; PR #4346: `bce8f44e319`
-- Speculators: `51f8e02f077c`; SGLang: `e7e78940168f`; KVarN: `7586257f1c63`
-- Model Optimizer: `d35bf8919c52`; KVPress: `161705a68f64`; MHA2MLA-VLM: `69a3c6e3116c`; Picot: `6e9fddd453a9`
+- SM120 overlay: `351cf46c8910`; vLLM: `75dea9b4ae9e`; vLLM PR #52816: `3406ec1dae99`
+- FlashInfer: `39b484f1ce2f`; PR #4346: deleted from the fetched remote and requires re-audit
+- Speculators: `973fd49c81d0`; SGLang: `8ad76415e2db`; KVarN: `7586257f1c63`
+- Model Optimizer: `449a39922b5f`; KVPress: `161705a68f64`; MHA2MLA-VLM: `69a3c6e3116c`; Picot: `6e9fddd453a9`
 
 Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM120_DFLASH_AUDIT.md`.
 
 ## Current blockers and next steps
 
-1. Build the Phase 1 baseline matrix against the local Qwen3.8 NVFP4 artifact; classify all results as local measurements.
-2. Separate text-only from vision-enabled serving smoke and add a real Qwen3.8 integration test.
-3. Integrate canonical `dev` only in an isolated experiment worktree, beginning with the coupled StateImage + paged-KV + Engine/resource cutover; preserve a rollback point.
-4. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before exact baseline and quality gates exist.
+1. The current single three-coefficient context-cost transfer roofline rejects two runs on fragmented D2H/D2D/H2D geometries; keep conservative compiled defaults and improve the fit or fixture before publishing a measured preset.
+2. C1/core, separate C2/C4/C8 decode-saturation, MTP0/MTP3 corpus, and 252,928/262,144 FP8-KV capacity baselines exist, but closed-loop agent task time, long-generation quality, and the complete VLM suite remain outstanding.
+3. The staged canonical context/resource cutover through `59febed2` has passed its local Qwen3.8 Host State/KV, media-reuse, cancellation/eviction, and MTP settlement gate; the refreshed canonical `9dbc074005a1` pressure-planner/tool/parser/anchor series still requires a separate integration worktree and Windows qualification.
+4. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before those refreshed-runtime, exact-quality, and VLM gates exist.
 
 The Picot launcher and harness now use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration.

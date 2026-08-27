@@ -122,10 +122,16 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
 }
 
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
-             const std::vector<std::int32_t>& commits, std::uint32_t seed) {
-    const std::vector<std::int32_t> slots = selected_slots(rows);
-    const std::int32_t slot_count         = rows == 1 ? 3 : 11;
-    const std::int32_t outer              = profile.layers * kRecordCapacity;
+             const std::vector<std::int32_t>& commits, std::uint32_t seed,
+             bool distinct_destination = false) {
+    const std::vector<std::int32_t> source_slots = selected_slots(rows);
+    if (distinct_destination && rows != 1) {
+        throw std::logic_error("distinct replay destination case requires one row");
+    }
+    std::vector<std::int32_t> destination_slots = source_slots;
+    if (distinct_destination) { destination_slots[0] = 1; }
+    const std::int32_t slot_count = rows == 1 ? 3 : 11;
+    const std::int32_t outer      = profile.layers * kRecordCapacity;
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
     const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
@@ -248,8 +254,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                                      0.05F);
                 }
             }
-            const Tensor destination = state_pool.conv_slot(static_cast<std::uint32_t>(layer),
-                                                            slots[static_cast<std::size_t>(row)]);
+            const Tensor destination = state_pool.conv_slot(
+                static_cast<std::uint32_t>(layer), source_slots[static_cast<std::size_t>(row)]);
             cuda_check(cudaMemcpy(destination.data, initial.data(), conv_slot_bytes,
                                   cudaMemcpyHostToDevice),
                        "upload initial conv state");
@@ -318,7 +324,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 signed_pattern(seed + 500009U + layer * 227U + row * 43U, 0.01F);
             const std::vector<float> initial_recurrent(recurrent_slot_elements, initial_value);
             const Tensor actual_initial = state_pool.recurrent_slot(
-                static_cast<std::uint32_t>(layer), slots[static_cast<std::size_t>(row)]);
+                static_cast<std::uint32_t>(layer), source_slots[static_cast<std::size_t>(row)]);
             cuda_check(cudaMemcpy(actual_initial.data, initial_recurrent.data(),
                                   recurrent_slot_bytes, cudaMemcpyHostToDevice),
                        "upload initial recurrent state");
@@ -378,10 +384,13 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         from_device<std::uint8_t>(record_storage, record_storage.bytes);
     std::vector<ops::GdnReplayFoldRow> fold_rows(static_cast<std::size_t>(rows));
     for (std::int32_t row = 0; row < rows; ++row) {
-        fold_rows[static_cast<std::size_t>(row)] = {slots[static_cast<std::size_t>(row)],
-                                                    commits[static_cast<std::size_t>(row)]};
+        fold_rows[static_cast<std::size_t>(row)] = {
+            source_slots[static_cast<std::size_t>(row)],
+            destination_slots[static_cast<std::size_t>(row)],
+            commits[static_cast<std::size_t>(row)]};
     }
-    ops::gdn_replay_fold(records, state_pool.all_layers_view(), fold_rows, nullptr);
+    const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
+    fold_plan.execute(fold_rows, nullptr);
     cuda_synchronize();
 
     int failures             = 0;
@@ -394,8 +403,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     std::vector<std::uint16_t> expected_conv_host(conv_slot_elements);
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         for (std::int32_t row = 0; row < rows; ++row) {
-            const Tensor actual_state = state_pool.recurrent_slot(
-                static_cast<std::uint32_t>(layer), slots[static_cast<std::size_t>(row)]);
+            const Tensor actual_state =
+                state_pool.recurrent_slot(static_cast<std::uint32_t>(layer),
+                                          destination_slots[static_cast<std::size_t>(row)]);
             cuda_check(cudaMemcpy(actual_recurrent.data(), actual_state.data, recurrent_slot_bytes,
                                   cudaMemcpyDeviceToHost),
                        "download folded recurrent state");
@@ -416,8 +426,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                                                value_records, gate_records, actual_recurrent);
             }
 
-            const Tensor actual_history = state_pool.conv_slot(
-                static_cast<std::uint32_t>(layer), slots[static_cast<std::size_t>(row)]);
+            const Tensor actual_history =
+                state_pool.conv_slot(static_cast<std::uint32_t>(layer),
+                                     destination_slots[static_cast<std::size_t>(row)]);
             cuda_check(cudaMemcpy(actual_conv.data(), actual_history.data, conv_slot_bytes,
                                   cudaMemcpyDeviceToHost),
                        "download folded conv state");
@@ -431,6 +442,38 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                           << " row=" << row << "\n";
                 return failures + 1;
             }
+            if (distinct_destination) {
+                const float initial_value =
+                    signed_pattern(seed + 500009U + layer * 227U + row * 43U, 0.01F);
+                const Tensor source_state = state_pool.recurrent_slot(
+                    static_cast<std::uint32_t>(layer), source_slots[static_cast<std::size_t>(row)]);
+                const std::vector<float> source_recurrent =
+                    from_device<float>(source_state.data, recurrent_slot_elements);
+                if (!std::all_of(source_recurrent.begin(), source_recurrent.end(),
+                                 [&](float value) { return value == initial_value; })) {
+                    std::cerr << "fold modified recurrent source" << suffix << " layer=" << layer
+                              << " row=" << row << "\n";
+                    return failures + 1;
+                }
+                std::vector<std::uint16_t> initial_conv(conv_slot_elements);
+                for (std::int32_t history = 0; history < 3; ++history) {
+                    for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
+                        initial_conv[static_cast<std::size_t>(history) * profile.conv_channels +
+                                     channel] =
+                            bf16_pattern(seed + 400009U + layer * 223U + row * 41U + history * 13U +
+                                             channel,
+                                         0.05F);
+                    }
+                }
+                const Tensor source_history = state_pool.conv_slot(
+                    static_cast<std::uint32_t>(layer), source_slots[static_cast<std::size_t>(row)]);
+                if (from_device<std::uint16_t>(source_history.data, conv_slot_elements) !=
+                    initial_conv) {
+                    std::cerr << "fold modified convolution source" << suffix << " layer=" << layer
+                              << " row=" << row << "\n";
+                    return failures + 1;
+                }
+            }
         }
     }
 
@@ -438,7 +481,11 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     std::vector<std::uint16_t> inactive_conv(conv_slot_elements);
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         for (std::int32_t slot = 0; slot < slot_count; ++slot) {
-            if (std::find(slots.begin(), slots.end(), slot) != slots.end()) { continue; }
+            if (std::find(source_slots.begin(), source_slots.end(), slot) != source_slots.end() ||
+                std::find(destination_slots.begin(), destination_slots.end(), slot) !=
+                    destination_slots.end()) {
+                continue;
+            }
             const Tensor recurrent =
                 state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), slot);
             cuda_check(cudaMemcpy(inactive_recurrent.data(), recurrent.data, recurrent_slot_bytes,
@@ -495,7 +542,7 @@ int run_record_fold_rounds() {
     constexpr std::int32_t kStateSlots   = 3;
     constexpr std::int32_t kInitialSlot  = 2;
     constexpr std::int32_t kSnapshotBase = 0;
-    const float kScale               = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F);
 
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, kParentRows, kHidden, 1901U));
@@ -537,6 +584,7 @@ int run_record_fold_rounds() {
     DeviceBuffer state_storage(state_builder.finish(256));
     state_storage.fill(0);
     LinearAttentionStatePool state_pool({state_storage.p, state_storage.bytes}, state_layout);
+    const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
 
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * kProfile.value_heads;
@@ -698,8 +746,8 @@ int run_record_fold_rounds() {
             if (failures != 0) { return failures; }
         }
 
-        const std::array fold_rows{ops::GdnReplayFoldRow{kInitialSlot, commit}};
-        ops::gdn_replay_fold(records, state_pool.all_layers_view(), fold_rows, nullptr);
+        const std::array fold_rows{ops::GdnReplayFoldRow{kInitialSlot, kInitialSlot, commit}};
+        fold_plan.execute(fold_rows, nullptr);
         cuda_synchronize();
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
             const Tensor folded_recurrent =
@@ -737,7 +785,7 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U);
+    failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U, true);
     failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
     failures += run_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
     failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);

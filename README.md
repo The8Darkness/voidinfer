@@ -141,15 +141,18 @@ and per-fixture results.
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
 
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
-|---|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
-| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | — | — | 88.38% |
+| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
+|---|---:|---:|---:|---:|---:|
+| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
+| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
+| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
+| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
 
-The Qwen3.8-27B groupwise-int profile has not yet been added to this published evaluation campaign;
-the Qwen3.8-27B NVFP4 profile currently reports GPQA-Diamond only.
+The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8-27B rows used
+temperature 1.0 and presence penalty 0.0. The multimodal columns (ERQA and RealWorldQA) ran with
+`--vision` at a 81,920-token context limit; the text columns used a 262,144-token limit except
+Qwen3.8-27B NVFP4, which needs 252,928 to fit the RTX 5090 after weights.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
@@ -329,10 +332,10 @@ Transformers checkpoint, Safetensors distribution, or GGUF file.
 
 Each artifact is complete, while GPU residency is fixed at process startup. Speculative decoding is
 disabled by default, so MTP/DFlash state and the optimized proposal head are not uploaded.
-Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
-request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
-accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
-available only for the 35B-A3B target and is text-only.
+Vision is also disabled by default, so its weights and Vision-specific unified-workspace extent are
+omitted. Add `--vision` to the CLI or server process that must accept image or video input. Disabled
+capabilities cannot be enabled by a later request. DFlash is available only for the 35B-A3B target
+and is text-only.
 
 ## Run the CLI
 
@@ -394,14 +397,15 @@ state, and function calls) plus Anthropic Messages, token counting, and multimod
 All three registered model IDs support:
 
 - text generation with thinking and non-thinking prompt modes;
+- tokenizer-derived Qwen thinking caps through CLI or a server process default;
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill and CUDA Graph decode;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
-- BF16 and INT8 group-64 KV cache;
+- BF16, INT8 group-64, and row-scaled FP8 E4M3 KV cache;
 - model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
   top-k, top-p, min-p, and presence/frequency-penalty overrides;
-- compatible-prefix reuse;
+- private and shared compatible-prefix reuse with optional Host-backed retained State/KV;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
   usage accounting;
 - prompt-rendered function tools and parsed tool calls.
@@ -418,7 +422,8 @@ from one to fifteen.
   Decode-ready requests are compacted at round boundaries and executed in one batched model
   traversal.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
-  multi-GPU execution, CPU/GPU offload, or distributed serving.
+  active-request swapping, weight offload, multi-GPU execution, or distributed serving. Inactive
+  retained context may use explicitly configured pinned Host State/KV backing.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
   models' native 262,144-token limit. `--kv-capacity N` explicitly sizes the shared Main Text KV
   pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable

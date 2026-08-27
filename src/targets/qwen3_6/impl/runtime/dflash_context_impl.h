@@ -16,7 +16,6 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
         full.max_context() != layout.full.max_context || full.page_pool().plane_count() != 2 ||
         local.num_kv_heads() != DFlashConfig::kv_heads ||
         local.head_dim() != DFlashConfig::head_dim ||
-        local.lane_capacity() != 2 * full.execution_tables().row_count() ||
         full.page_pool().plane(0).dtype != DType::BF16 ||
         full.page_pool().plane(0).ne[0] != DFlashConfig::head_dim ||
         full.page_pool().plane(0).ne[1] != kPagedKVPageSize ||

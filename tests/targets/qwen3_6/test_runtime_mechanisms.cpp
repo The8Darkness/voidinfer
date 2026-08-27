@@ -6,6 +6,7 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -193,12 +194,12 @@ void test_vision_control() {
                                  .token_spans = {{.begin = 3, .count = 1}, {.begin = 5, .count = 1}}},
     };
 
-    const q36::VisionControl control = q36::build_vision_control(prompt);
+    const q36::VisionControlPlan plan = q36::plan_vision_control(prompt);
+    const q36::VisionControl control  = q36::build_vision_control(prompt, plan, 0);
     expect(control.items.size() == 2, "Vision per-item control count");
     expect(control.items[0].patch_begin == 0 && control.items[0].patch_count == 4 &&
                control.items[0].merged_count == 1 && control.items[0].segment_length == 4 &&
                control.items[0].segment_count == 1 &&
-               control.items[0].cu_seqlens == std::vector<std::int32_t>({0, 4}) &&
                control.items[0].scatter_indices == std::vector<std::int32_t>({1}) &&
                control.items[0].position_ids.size() == 8 &&
                control.items[0].position_table_indices.size() == 16 &&
@@ -207,12 +208,18 @@ void test_vision_control() {
     expect(control.items[1].patch_begin == 4 && control.items[1].patch_count == 8 &&
                control.items[1].merged_count == 2 && control.items[1].segment_length == 4 &&
                control.items[1].segment_count == 2 &&
-               control.items[1].cu_seqlens == std::vector<std::int32_t>({0, 4, 8}) &&
                control.items[1].scatter_indices == std::vector<std::int32_t>({3, 5}) &&
                control.items[1].position_ids.size() == 16 &&
                control.items[1].position_table_indices.size() == 32 &&
                control.items[1].position_table_weights.size() == 32,
            "video item control offsets");
+
+    const q36::VisionControl suffix = q36::build_vision_control(prompt, plan, 1);
+    expect(suffix.prepared_item_begin == 1 && suffix.items.size() == 1 &&
+               suffix.items[0].patch_begin == control.items[1].patch_begin &&
+               suffix.items[0].scatter_indices == control.items[1].scatter_indices &&
+               suffix.items[0].position_ids == control.items[1].position_ids,
+           "Vision suffix control contents");
 }
 
 q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
@@ -252,8 +259,11 @@ void test_prefix_identity() {
     q36::PreparedPromptData original    = identity_prompt();
     std::vector<ninfer::TokenId> ledger = original.token_ids;
     q36::detail::ResidentPrefixIdentity resident;
+    q36::detail::PrefixShortlistDigests digests;
     resident.reserve(16);
     resident.assign(original);
+    digests.reserve(16);
+    digests.assign(original);
 
     expect(q36::detail::prefix_matches(original, ledger, resident, original.token_ids.size()),
            "identical multimodal prefix identity");
@@ -273,17 +283,76 @@ void test_prefix_identity() {
                                         changed_position.token_ids.size()),
            "different MRoPE positions must not reuse resident state");
 
+    q36::PreparedPromptData changed_decomposition              = identity_prompt();
+    changed_decomposition.identity.rewrite_execution_frontiers = {1};
+    expect(!q36::detail::prefix_matches(changed_decomposition, ledger, resident,
+                                        changed_decomposition.token_ids.size()),
+           "different GDN execution decomposition must not reuse resident state");
+    changed_decomposition.identity.rewrite_execution_frontiers = {4};
+    expect(q36::detail::prefix_matches(changed_decomposition, ledger, resident, 3),
+           "execution decomposition wholly after the frontier changed prefix identity");
+
+    q36::PreparedPromptData resident_future              = identity_prompt();
+    resident_future.identity.rewrite_execution_frontiers = {1, 4};
+    q36::detail::ResidentPrefixIdentity resident_with_future;
+    resident_with_future.assign(resident_future);
+    q36::PreparedPromptData incoming_future              = identity_prompt();
+    incoming_future.identity.rewrite_execution_frontiers = {1, 3};
+    expect(q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 1),
+           "resident execution decomposition after the frontier changed prefix identity");
+    expect(!q36::detail::prefix_matches(incoming_future, ledger, resident_with_future, 3),
+           "different execution decomposition inside the frontier reused resident state");
+
+    q36::detail::PrefixShortlistDigests future_digest;
+    future_digest.assign(resident_future);
+    q36::detail::PrefixShortlistDigests incoming_digest;
+    incoming_digest.assign(incoming_future);
+    expect(future_digest.at(1) == incoming_digest.at(1),
+           "future execution boundaries changed an earlier content shortlist");
+    expect(future_digest.at(3) != incoming_digest.at(3),
+           "different in-prefix execution boundaries shared a shortlist digest");
+
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);
+    const std::array<ninfer::TokenId, 1> generated{12};
+    digests.append_generated(generated, original.rope_delta);
     append_text_token(original, 12, 4);
+    q36::detail::PrefixShortlistDigests rebuilt;
+    rebuilt.assign(original);
+    expect(digests.at(ledger.size()) == rebuilt.at(ledger.size()),
+           "incremental generated-token shortlist diverged from a full rebuild");
     expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size()),
            "generated multimodal continuation identity");
 
     const q36::PreparedPromptData prompt_only = identity_prompt();
     resident.truncate(prompt_only.token_ids.size());
+    digests.truncate(prompt_only.token_ids.size());
     ledger.resize(prompt_only.token_ids.size());
+    q36::detail::PrefixShortlistDigests prompt_digest;
+    prompt_digest.assign(prompt_only);
+    expect(digests.at(ledger.size()) == prompt_digest.at(ledger.size()),
+           "truncated shortlist did not restore the original frontier digest");
     expect(q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size()),
            "truncated multimodal continuation identity");
+}
+
+void test_rebuild_work_prompt_frontier_boundary() {
+    constexpr std::uint32_t prompt_tokens = 100;
+    constexpr std::uint32_t prefill_chunk = 2048;
+    std::uint32_t tail_begin              = 0;
+    q36::runtime_support::include_rebuild_boundary(tail_begin, prompt_tokens, prompt_tokens);
+    expect(tail_begin == prompt_tokens,
+           "prompt-frontier rebuild boundary was not retained for continuation growth");
+
+    ninfer::runtime::PrefillWork work =
+        ninfer::runtime::make_prefill_work(0, prompt_tokens, 0, 0, prefill_chunk);
+    q36::runtime_support::advance_segmented_rebuild_work(work, tail_begin, prompt_tokens,
+                                                         prompt_tokens + 1, prefill_chunk);
+    const ninfer::runtime::PrefillWork exact =
+        ninfer::runtime::make_prefill_work(0, prompt_tokens + 1, 0, 0, prefill_chunk);
+    expect(work.chunks == 2 && work.tokens == exact.tokens &&
+               work.attention_pairs == exact.attention_pairs,
+           "continuation growth did not preserve the prompt-frontier rebuild split");
 }
 
 } // namespace
@@ -295,6 +364,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_rebuild_work_prompt_frontier_boundary();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

@@ -28,7 +28,10 @@ SERVE_BINARY = BUILD_DIR / (
     "apps/Release/ninfer-serve.exe" if os.name == "nt" else "apps/ninfer-serve"
 )
 
-from tools.bench import run_serve_corpus as corpus  # noqa: E402
+if __package__ in {None, ""}:
+    # Preserve direct-file execution while keeping imports resolvable when run as a package module.
+    __package__ = "tools.bench"
+from . import run_serve_corpus as corpus  # noqa: E402
 
 SUITES = ("decode-saturation", "corpus-makespan")
 STATS_INTERVAL_MS = 1000
@@ -323,7 +326,7 @@ def server_command(
         "--max-concurrency",
         str(point.concurrency),
         "--max-pending-requests",
-        "1",
+        str(point.concurrency),
         "--pending-timeout-ms",
         str(PENDING_TIMEOUT_MS),
         "--prefill-chunk",
@@ -381,7 +384,7 @@ def validate_server_start(
         "max_context": args.max_context,
         "kv_capacity_mode": "auto" if args.kv_capacity == "auto" else "explicit",
         "max_concurrency": point.concurrency,
-        "max_pending_requests": 1,
+        "max_pending_requests": point.concurrency,
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
         "log_stats_interval_ms": STATS_INTERVAL_MS,
@@ -756,17 +759,21 @@ def analyze_point(
         or client_completion != done_totals["completion_tokens"]
     ):
         raise corpus.CampaignError("client usage and request_done token totals differ")
-    if (
-        runtime_totals["computed_prefill_tokens"]
-        != done_totals["computed_prefill_tokens"]
+    # Throughput records are interval snapshots. A campaign can terminate immediately after the
+    # final request, so the last partial interval is legitimately absent from the request log.
+    # Validate the invariant that observed interval counters never exceed the authoritative
+    # request_done totals, while using request_done for complete-campaign totals below.
+    for runtime_key, done_key, label in (
+        ("computed_prefill_tokens", "computed_prefill_tokens", "prefill"),
+        ("committed_decode_tokens", "decode_tokens", "decode"),
     ):
-        raise corpus.CampaignError(
-            "throughput and request_done prefill token totals differ"
-        )
-    if runtime_totals["committed_decode_tokens"] != done_totals["decode_tokens"]:
-        raise corpus.CampaignError(
-            "throughput and request_done decode token totals differ"
-        )
+        runtime_value = required_int(runtime_totals[runtime_key], f"throughput {label} tokens")
+        done_value = required_int(done_totals[done_key], f"request_done {label} tokens")
+        if runtime_value > done_value:
+            raise corpus.CampaignError(
+                f"throughput {label} token total exceeds request_done total: "
+                f"{runtime_value} > {done_value}"
+            )
 
     makespan = campaign_end - campaign_start
     if makespan <= 0.0:
@@ -1104,7 +1111,7 @@ def write_campaign_manifest(
     artifacts: Sequence[tuple[str, Path]],
     points: Sequence[Point],
 ) -> None:
-    from tools.experiments.provenance import (
+    from ..experiments.provenance import (
         atomic_write_json,
         environment_snapshot,
         file_fingerprint,

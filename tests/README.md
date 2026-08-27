@@ -26,16 +26,14 @@ benchmark-report, and external protocol behavior. Repository verification princi
   and the opt-in real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
-- `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
-  activation alignment, rejection, and peak semantics;
 - `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
   `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current protocol translation,
   Responses Item/state/SSE behavior, and incremental tool-call behavior;
 - `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
   preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
-- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
-- `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
-- `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
+- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v13 reports;
+- `test_bench_matrix.py` — schema-v13 report consumption by the Python matrix summarizer;
+- `test_serve_corpus.py` — current serving request-log identity at the measurement consumer;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
   cover mathematical state transitions at their own boundary.
@@ -68,7 +66,7 @@ Enable uniform floating-point error records when establishing or reviewing an Op
 
 ```bash
 NINFER_OP_REPORT_STATS=1 \
-  ctest --test-dir build -V -R '^ninfer_(rmsnorm|gqa_attention)_test$'
+  ctest --test-dir build -V -R '^ninfer_(rmsnorm|softmax_attention)_test$'
 ```
 
 Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,
@@ -116,6 +114,14 @@ NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 ```
 
+The same public-Engine integration executable exercises the Qwen3.8 resource-settlement route when
+provided with the local Qwen3.8 artifact:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=$PWD/models/Qwen3.8-27B-NVFP4-Ninfer/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+```
+
 Run the peer 35B-A3B route independently:
 
 ```bash
@@ -137,7 +143,7 @@ Run the serving contract manually after starting a resident server in another te
 
 ```bash
 ./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
-  --host 127.0.0.1 --port 18080
+  --host 127.0.0.1 --port 18080 --vision
 ```
 
 ```bash

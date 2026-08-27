@@ -1,6 +1,6 @@
 # Upstream audit
 
-Updated: 2026-08-26 UTC. All refs were fetched after relocation; discovery pins are not dependency pins.
+Updated: 2026-08-27 UTC. All refs were re-fetched after relocation; discovery pins are not dependency pins.
 
 ## Foundation decision
 
@@ -11,8 +11,8 @@ Keep `natpate/ninfer-windows` as the Windows foundation. Current local `master` 
 | Remote/ref | Fetched head | Disposition |
 | --- | --- | --- |
 | `upstream/master`, `upstream/dev` | `b686696eebd4` | Windows base; current branches coincide |
-| `canonical/master` | `feaf4dd0983f` | Canonical authority; six commits ahead of local merge base |
-| `canonical/dev` | `59febed27ca2` | 58 commits ahead of canonical master; first architecture integration target |
+| `canonical/master` | `9dbc074005a1` | Canonical authority; now includes the former dev resource cutover and later hardening |
+| `canonical/dev` | `9dbc074005a1` | Refreshed head; current master/dev coincide; local staged tree is qualified only through `59febed27ca2` |
 | `headpiece-reference/main` | `c1b0ad34d438` | Patch donor only; do not adopt snapshot history |
 
 ## Canonical dev map
@@ -32,11 +32,17 @@ The dev series is a coupled runtime cutover, not a safe list of independent cher
 - `fc5c4834`: reclaims transient vision workspace.
 - `e4e6f897` through `59febed2`: harden response ownership, media reuse, prefill boundaries, host timing, and warmup/cache behavior.
 
-Canonical dev is 58 commits ahead of canonical master at the fetched head. Its first Engine/resource commit replaces core lifecycle and public/internal runtime assumptions; partial cherry-picks can produce stale mappings or invalid ownership. The safe first experiment is a branch-level cutover of StateImage + paged-KV + Engine/resource foundations, followed by a build and focused state/KV/runtime tests before prefix scheduling. Reapply local Windows portability as soon as the first compile boundary is reached.
+The 2026-08-27 refresh adds the following post-`59febed2` work: `3e903b704c` pressure-aware materialization planning and the coupled `PressurePlanningSession` cutover; `55222c546a` architecture refresh; `081c6039f9` device binding; `fbd04729c8` sparse-MoE prefill synchronization; `ab82f88603` readiness gating on successful warmup; `79c292bc07` typed tool arguments; `0e4cdf84f0` schema-aware tool arguments; `780d576791` literal control-token provenance; and `9dbc074005` valid long-anchor publication. These commits are not yet integrated into the staged Windows tree.
+
+Canonical dev is now at the same head as canonical master. Its first Engine/resource commit and the later pressure planner replace core lifecycle and public/internal runtime assumptions; partial cherry-picks can produce stale mappings or invalid ownership. The current staged tree remains the last locally qualified slice through `59febed2`; the next refresh must use a dedicated worktree, reapply Windows portability, and rerun the full build/CTest plus Qwen3.8 artifact gates before promotion.
 
 ## Windows preservation ledger
 
 Local Windows work that must survive integration includes the MSVC/TMA fixes, aligned allocation portability in tests, vcpkg/CUDA target selection, media/build handling, README/Windows docs, and integrity CI commits `4acd1611`, `10173f32`, and `3e2a28be`. Canonical dev has no identified Windows-specific integration commit. Never merge dev wholesale without a clean Windows reapplication and CTest run.
+
+## Refresh status
+
+The refs were refreshed on 2026-08-27. The new canonical head is recorded above, but no post-`59febed2` code has been promoted to the working tree because the coupled pressure-planning API conflicts with the staged Windows slice. Keep the refresh as the next isolated integration experiment rather than silently claiming the old qualification covers it.
 
 ## Qualification gates
 

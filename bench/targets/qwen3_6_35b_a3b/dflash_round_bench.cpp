@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -246,13 +247,44 @@ int run(const Options& options) {
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
         auto request_base = program->plan_request(prompt, execution);
-        auto request_plan = program->inspect_admission(prompt, request_base,
-                                                       ninfer::runtime::LaneId{lane}, nullptr);
-        auto started =
-            program->start_request(std::move(request_plan), std::move(prompt), std::nullopt);
+        auto request_plan =
+            program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr,
+                                       nullptr, std::nullopt, false);
+        if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
+        auto resource_plan = program->seal_resource_plan(*request_plan, prompt, {}, {}, {}, {});
+        if (!resource_plan) {
+            throw std::runtime_error("benchmark root resources were not sealed");
+        }
+        const auto reserved =
+            program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
+        if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
+            throw std::runtime_error("benchmark root materialization was not reserved");
+        }
+        std::optional<target::Package::MaterializationResult> published;
+        for (;;) {
+            auto transaction = program->progress_context_transaction({});
+            if (std::holds_alternative<ninfer::runtime::ContextTransactionInProgress>(
+                    transaction)) {
+                continue;
+            }
+            if (!std::holds_alternative<target::Package::MaterializationResult>(transaction)) {
+                program->finalize_context_transaction();
+                throw std::runtime_error("benchmark root returned the wrong transaction result");
+            }
+            published.emplace(
+                std::get<target::Package::MaterializationResult>(std::move(transaction)));
+            break;
+        }
+        if (published->status != ninfer::runtime::ContextTransactionStatus::Published ||
+            !published->published) {
+            program->finalize_context_transaction();
+            throw std::runtime_error("benchmark root materialization was not published");
+        }
+        auto started = std::move(*published->published);
+        program->finalize_context_transaction();
         active_sequences[lane] = started.sequence;
         std::optional<target::Package::PrefillProgress> progress;
-        progress.emplace(std::move(started.progress));
+        progress.emplace(program->advance_prefill(active_sequences[lane]));
         while (!progress->complete) {
             progress.reset();
             progress.emplace(program->advance_prefill(active_sequences[lane]));

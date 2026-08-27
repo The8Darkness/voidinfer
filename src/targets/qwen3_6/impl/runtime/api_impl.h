@@ -17,7 +17,8 @@ SequencePlan<Variant>::SequencePlan(
     std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
-// Explicit bodies keep MSVC from dropping these out-of-line explicit specializations.
+// Explicit bodies instead of `= default`: MSVC does not emit out-of-line defaulted explicit
+// specializations of these moves, while the exact target TU can define the member move directly.
 template <>
 SequencePlan<Variant>::SequencePlan(SequencePlan&& other) noexcept
     : impl_(std::move(other.impl_)) {}
@@ -52,11 +53,6 @@ std::size_t SequencePlan<Variant>::device_reservation_bytes() const noexcept {
 template <>
 std::size_t SequencePlan<Variant>::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
-}
-
-template <>
-std::size_t SequencePlan<Variant>::request_transient_capacity_bytes() const noexcept {
-    return impl_ != nullptr ? impl_->request_transient_capacity_bytes : 0;
 }
 
 template <>
@@ -111,6 +107,25 @@ const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noe
 }
 
 template <>
+const PreparedContextCache& RequestBasePlan<Variant>::context_cache() const noexcept {
+    static const PreparedContextCache empty;
+    return impl_ != nullptr ? impl_->context_cache : empty;
+}
+
+template <>
+std::optional<PrefixShortlistKey>
+RequestBasePlan<Variant>::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
+    if (impl_ == nullptr || frontier == 0 || frontier > impl_->prefix_digests.size()) {
+        return std::nullopt;
+    }
+    return PrefixShortlistKey{
+        .digest       = impl_->prefix_digests.at(frontier),
+        .frontier     = frontier,
+        .identity_tag = impl_->prefix_identity_tag,
+    };
+}
+
+template <>
 AdmissionPlan<Variant>::AdmissionPlan(
     std::unique_ptr<detail::AdmissionPlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -133,6 +148,30 @@ const runtime::RequestPlanSummary& AdmissionPlan<Variant>::summary() const noexc
 }
 
 template <>
+runtime::ClaimDisposition AdmissionPlan<Variant>::source_disposition() const noexcept {
+    return impl_ != nullptr ? impl_->source_disposition
+                            : runtime::ClaimDisposition::ConsumedToActive;
+}
+
+template <>
+bool AdmissionPlan<Variant>::needs_transfer() const noexcept {
+    return impl_ != nullptr && impl_->needs_transfer;
+}
+
+template <>
+runtime::PrefillWork AdmissionPlan<Variant>::remaining_prefill_work() const noexcept {
+    return impl_ != nullptr ? impl_->remaining_prefill_work : runtime::PrefillWork{};
+}
+
+template <>
+std::span<const runtime::ContextTransferRequirement>
+AdmissionPlan<Variant>::transfer_requirements() const noexcept {
+    return impl_ != nullptr
+               ? std::span<const runtime::ContextTransferRequirement>(impl_->transfer_requirements)
+               : std::span<const runtime::ContextTransferRequirement>{};
+}
+
+template <>
 Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -147,41 +186,151 @@ Program<Variant>::plan_request(const PreparedPrompt& prompt,
 }
 
 template <>
-AdmissionPlan<Variant> Program<Variant>::inspect_admission(
+std::optional<AdmissionPlan<Variant>> Program<Variant>::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base, runtime::LaneId destination,
-    const ContinuationHandle<Variant>* source) {
-    return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source);
+    const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
+    return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source,
+                                    shared_source, checkpoint, must_retain_private_source);
 }
 
 template <>
-runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcept {
-    return impl_->admission_capacity();
+std::vector<PressureOption>
+Program<Variant>::inspect_pressure_options(const AdmissionPlan<Variant>& admission,
+                                           const ContinuationHandle<Variant>& continuation) const {
+    return impl_->inspect_pressure_options(admission, continuation);
 }
 
 template <>
-StartResult<Variant>
-Program<Variant>::start_request(AdmissionPlan<Variant>&& plan, PreparedPrompt&& prompt,
-                                std::optional<ContinuationHandle<Variant>>&& source) {
-    return impl_->start_request(std::move(plan), PreparedPromptAccess::take(std::move(prompt)),
-                                std::move(source));
+PressureOption
+Program<Variant>::inspect_eviction_option(const ContinuationHandle<Variant>& continuation) const {
+    return impl_->inspect_eviction_option(continuation);
 }
 
 template <>
-PrefillProgress<Variant> Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence) {
-    return impl_->advance_prefill(sequence);
+std::vector<PressureOption>
+Program<Variant>::inspect_shared_pressure_options(const AdmissionPlan<Variant>& admission,
+                                                  const SharedPrefixHandle<Variant>& shared) const {
+    return impl_->inspect_shared_pressure_options(admission, shared);
+}
+
+template <>
+PressureOption
+Program<Variant>::inspect_shared_eviction_option(const SharedPrefixHandle<Variant>& shared) const {
+    return impl_->inspect_shared_eviction_option(shared);
+}
+
+template <>
+std::optional<ResourcePlan<Variant>> Program<Variant>::seal_resource_plan(
+    const AdmissionPlan<Variant>& admission, const PreparedPrompt& prompt,
+    std::span<const ContinuationHandle<Variant>* const> pressure_owners,
+    std::span<const PressureOption> pressure_options,
+    std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
+    std::span<const PressureOption> shared_pressure_options) {
+    std::optional<AdmissionPlan<Variant>> sealed = impl_->seal_materialization(
+        admission, PreparedPromptAccess::view(prompt), pressure_owners, pressure_options,
+        shared_pressure_owners, shared_pressure_options);
+    if (!sealed) { return std::nullopt; }
+    return ResourcePlan<Variant>(std::move(*sealed), impl_->resource_revision());
+}
+
+template <>
+runtime::ContextTransactionReserveStatus
+Program<Variant>::start_resource_transaction(ResourcePlan<Variant>&& plan, PreparedPrompt&& prompt,
+                                             runtime::CancellationFlagView cancellation) {
+    if (plan.revision_ == 0 || plan.revision_ != impl_->resource_revision()) {
+        return runtime::ContextTransactionReserveStatus::Aborted;
+    }
+    return impl_->reserve_materialization(
+        std::move(plan.admission_), PreparedPromptAccess::take(std::move(prompt)), cancellation);
+}
+
+template <>
+std::optional<PersistentBackfillProof<Variant>> Program<Variant>::prove_persistent_backfill(
+    const RequestBasePlan<Variant>& blocked_head, const ResourcePlan<Variant>& candidate,
+    std::span<const SequenceHandle<Variant>> persistent_borrowers) const {
+    if (candidate.revision_ == 0 || candidate.revision_ != impl_->resource_revision() ||
+        !impl_->persistent_backfill_safe(blocked_head, candidate.admission_,
+                                         persistent_borrowers)) {
+        return std::nullopt;
+    }
+    return PersistentBackfillProof<Variant>(candidate.revision_);
+}
+
+template <>
+ContextTransactionProgress<Variant>
+Program<Variant>::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    return impl_->progress_context_transaction(cancellation);
+}
+
+template <>
+void Program<Variant>::finalize_context_transaction() noexcept {
+    impl_->finalize_context_transaction();
+}
+
+template <>
+bool Program<Variant>::has_context_transaction() const noexcept {
+    return impl_->has_context_transaction();
+}
+
+template <>
+PrefillProgress<Variant>
+Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence,
+                                  runtime::ExecutionTiming* failed_timing) {
+    return impl_->advance_prefill(sequence, failed_timing);
+}
+
+template <>
+CaptureAssessment
+Program<Variant>::inspect_capture(const CaptureOffer<Variant>& offer,
+                                  const SharedPrefixHandle<Variant>* exact_shared,
+                                  const SharedPrefixHandle<Variant>* replacement,
+                                  std::optional<runtime::CheckpointRef> private_replacement) const {
+    return impl_->inspect_capture(offer, exact_shared, replacement, private_replacement);
+}
+
+template <>
+bool Program<Variant>::shared_capture_matches(const CaptureOffer<Variant>& offer,
+                                              const SharedPrefixHandle<Variant>& shared) const {
+    return impl_->shared_capture_matches(offer, shared);
+}
+
+template <>
+void Program<Variant>::skip_capture(CaptureOffer<Variant>&& offer) {
+    impl_->skip_capture(std::move(offer));
+}
+
+template <>
+runtime::ContextTransactionReserveStatus
+Program<Variant>::reserve_active_capture(CaptureOffer<Variant>&& offer,
+                                         const SharedPrefixHandle<Variant>* exact_shared,
+                                         const SharedPrefixHandle<Variant>* replacement,
+                                         std::optional<runtime::CheckpointRef> private_replacement,
+                                         runtime::CancellationFlagView cancellation) {
+    return impl_->reserve_active_capture(std::move(offer), exact_shared, replacement,
+                                         private_replacement, cancellation);
 }
 
 template <>
 PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Variant>> sequences,
-                                               std::span<const runtime::RoundBudget> budgets) {
-    return impl_->decode(sequences, budgets);
+                                               std::span<const runtime::RoundBudget> budgets,
+                                               runtime::ExecutionTiming* failed_timing) {
+    return impl_->decode(sequences, budgets, failed_timing);
+}
+
+template <>
+runtime::ExecutionTiming Program<Variant>::append_forced_tokens(
+    std::span<const SequenceHandle<Variant>> sequences, std::span<const TokenId> row_major_tokens,
+    std::uint32_t row_stride, runtime::ExecutionTiming* failed_timing) {
+    return impl_->append_forced_tokens(sequences, row_major_tokens, row_stride, failed_timing);
 }
 
 template <>
 CommitResult<Variant> Program<Variant>::commit(PendingBatch<Variant>&& pending,
                                                std::span<const runtime::CommitDecision> decisions,
-                                               runtime::CommitObservation observation) {
-    return impl_->commit(std::move(pending), decisions, observation);
+                                               runtime::CommitObservation observation,
+                                               runtime::ExecutionTiming* failed_timing) {
+    return impl_->commit(std::move(pending), decisions, observation, failed_timing);
 }
 
 template <>
@@ -190,9 +339,8 @@ DiscardResult<Variant> Program<Variant>::abort_pending(PendingBatch<Variant>&& p
 }
 
 template <>
-FinishResult<Variant> Program<Variant>::finish(SequenceHandle<Variant> sequence,
-                                               runtime::RetentionDecision decision) noexcept {
-    return impl_->finish(sequence, decision);
+FinishResult<Variant> Program<Variant>::finish(SequenceHandle<Variant> sequence) noexcept {
+    return impl_->finish(sequence);
 }
 
 template <>
@@ -207,8 +355,30 @@ Program<Variant>::release_continuation(ContinuationHandle<Variant>&& continuatio
 }
 
 template <>
+ReleaseResult<Variant>
+Program<Variant>::release_shared_prefix(SharedPrefixHandle<Variant>&& shared) noexcept {
+    return impl_->release_shared_prefix(std::move(shared));
+}
+
+template <>
 void Program<Variant>::fail_all_cleanup() noexcept {
     impl_->fail_all_cleanup();
+}
+
+template <>
+bool Program<Variant>::isolated_request_feasible(
+    const RequestBasePlan<Variant>& base) const noexcept {
+    return impl_->isolated_request_feasible(base);
+}
+
+template <>
+std::uint64_t Program<Variant>::resource_revision() const noexcept {
+    return impl_->resource_revision();
+}
+
+template <>
+PhysicalUsageSnapshot Program<Variant>::physical_usage() const noexcept {
+    return impl_->physical_usage();
 }
 
 template <>

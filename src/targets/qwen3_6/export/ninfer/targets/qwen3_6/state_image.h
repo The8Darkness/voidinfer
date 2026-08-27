@@ -5,6 +5,7 @@
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
+#include "core/transfer_work.h"
 
 #include <cuda_runtime_api.h>
 
@@ -47,6 +48,9 @@ struct StateImageDeviceLayout {
     std::optional<CyclicKVCacheLayout> dflash_local;
     StateImageHostLayout host;
 };
+
+[[nodiscard]] TransferWork state_image_transfer_work(const StateImageHostLayout& layout);
+[[nodiscard]] TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout);
 
 [[nodiscard]] StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
                                                                   const StateImageSpec& spec);
@@ -150,6 +154,8 @@ public:
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
     void zero_all(cudaStream_t stream = nullptr);
     void copy_slot(std::int32_t source, std::int32_t destination, cudaStream_t stream = nullptr);
+    void copy_dflash_local(std::int32_t source, std::int32_t destination,
+                           cudaStream_t stream = nullptr);
     void copy_to_host(std::int32_t source, HostStateImageView destination,
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostStateImageConstView source, std::int32_t destination,

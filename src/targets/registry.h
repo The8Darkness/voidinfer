@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "runtime/engine/context_cost.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
 
@@ -81,6 +82,7 @@ struct ConstructedTarget {
     ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
+    runtime::ContextCostModel context_cost;
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,

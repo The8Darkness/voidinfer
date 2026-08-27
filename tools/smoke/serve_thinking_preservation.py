@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import socket
 import subprocess
 import tempfile
@@ -14,48 +13,30 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SERVER_BIN = REPO_ROOT / (
-    "build-windows/apps/Release/ninfer-serve.exe"
-    if os.name == "nt"
-    else "build/apps/ninfer-serve"
-)
-DEFAULT_FIXTURE = REPO_ROOT / "tests/fixtures/serve/qwen3_6_thinking_preservation.json"
-
 
 class TestFailure(RuntimeError):
     pass
 
 
 def free_port() -> int:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            address = sock.getsockname()
-    except OSError as error:
-        raise TestFailure(f"could not allocate a local test port: {error}") from error
-    return address[1]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
-def request_json(
-    base_url: str, method: str, path: str, payload: Any | None = None
-) -> dict[str, Any]:
+def request_json(base_url: str, method: str, path: str, payload: Any | None = None) -> dict[str, Any]:
     body = None
     headers = {"Accept": "application/json"}
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(
-        base_url + path, data=body, headers=headers, method=method
-    )  # noqa: S310
+    request = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=300) as response:  # noqa: S310
+        with urllib.request.urlopen(request, timeout=300) as response:
             value = json.loads(response.read())
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
-        raise TestFailure(
-            f"{method} {path} returned HTTP {error.code}: {detail}"
-        ) from error
+        raise TestFailure(f"{method} {path} returned HTTP {error.code}: {detail}") from error
     except urllib.error.URLError as error:
         raise TestFailure(f"{method} {path} failed: {error}") from error
     if not isinstance(value, dict):
@@ -63,16 +44,12 @@ def request_json(
     return value
 
 
-def wait_for_server(
-    base_url: str, process: subprocess.Popen[str], timeout: float
-) -> None:
+def wait_for_server(base_url: str, process: subprocess.Popen[str], timeout: float) -> None:
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise TestFailure(
-                f"ninfer-serve exited during startup with code {process.returncode}"
-            )
+            raise TestFailure(f"ninfer-serve exited during startup with code {process.returncode}")
         try:
             if request_json(base_url, "GET", "/health") == {"status": "ok"}:
                 return
@@ -82,9 +59,7 @@ def wait_for_server(
     raise TestFailure(f"ninfer-serve was not healthy after {timeout:g}s: {last_error}")
 
 
-def chat_payload(
-    model: str, fixture: dict[str, Any], messages_key: str
-) -> dict[str, Any]:
+def chat_payload(model: str, fixture: dict[str, Any], messages_key: str) -> dict[str, Any]:
     payload = dict(fixture["chat"]["request"])
     payload["model"] = model
     payload["messages"] = fixture["chat"][messages_key]
@@ -93,28 +68,19 @@ def chat_payload(
 
 def chat_choice(response: dict[str, Any]) -> dict[str, Any]:
     choices = response.get("choices")
-    if (
-        not isinstance(choices, list)
-        or len(choices) != 1
-        or not isinstance(choices[0], dict)
-    ):
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise TestFailure("Chat Completions response does not contain one choice")
     return choices[0]
 
 
 def chat_prompt_tokens(response: dict[str, Any]) -> int:
     usage = response.get("usage")
-    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
-    if not isinstance(prompt_tokens, int):
-        raise TestFailure(
-            "Chat Completions response does not contain prompt token usage"
-        )
-    return prompt_tokens
+    if not isinstance(usage, dict) or not isinstance(usage.get("prompt_tokens"), int):
+        raise TestFailure("Chat Completions response does not contain prompt token usage")
+    return int(usage["prompt_tokens"])
 
 
-def response_payload(
-    model: str, input_text: str, preserve: bool | None
-) -> dict[str, Any]:
+def response_payload(model: str, input_text: str, preserve: bool | None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
         "input": input_text,
@@ -131,25 +97,17 @@ def read_events(path: Path) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if line:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise TestFailure(
-                    f"request log contains invalid JSON: {error}"
-                ) from error
+            value = json.loads(line)
             if isinstance(value, dict):
                 events.append(value)
     return events
 
 
-def protocol_events(
-    events: list[dict[str, Any]], event: str, protocol: str
-) -> list[dict[str, Any]]:
+def protocol_events(events: list[dict[str, Any]], event: str, protocol: str) -> list[dict[str, Any]]:
     return [
         item
         for item in events
-        if item.get("event") == event
-        and item.get("request", {}).get("protocol") == protocol
+        if item.get("event") == event and item.get("request", {}).get("protocol") == protocol
     ]
 
 
@@ -158,20 +116,12 @@ def require(condition: bool, message: str) -> None:
         raise TestFailure(message)
 
 
-def exercise(
-    base_url: str, fixture: dict[str, Any], log_path: Path, backend: str
-) -> dict[str, Any]:
+def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: str) -> dict[str, Any]:
     models = request_json(base_url, "GET", "/v1/models")
     entries = models.get("data")
-    if (
-        not isinstance(entries, list)
-        or len(entries) != 1
-        or not isinstance(entries[0], dict)
-    ):
-        raise TestFailure("server did not expose one model")
+    require(isinstance(entries, list) and len(entries) == 1, "server did not expose one model")
     model = entries[0].get("id")
-    if not isinstance(model, str) or not model:
-        raise TestFailure("server model id is invalid")
+    require(isinstance(model, str) and model, "server model id is invalid")
 
     chat_payloads = [
         chat_payload(model, fixture, "first_messages"),
@@ -222,8 +172,7 @@ def exercise(
         response_payload(model, responses_fixture["parent_input"], True),
     )
     parent_id = parent.get("id")
-    if not isinstance(parent_id, str) or not parent_id:
-        raise TestFailure("Responses parent id is invalid")
+    require(isinstance(parent_id, str) and parent_id, "Responses parent id is invalid")
 
     inherited_payload = response_payload(
         model, responses_fixture["inherited_child_input"], None
@@ -231,29 +180,23 @@ def exercise(
     inherited_payload["previous_response_id"] = parent_id
     request_json(base_url, "POST", "/v1/responses", inherited_payload)
 
-    changed_payload = response_payload(
-        model, responses_fixture["changed_child_input"], False
-    )
+    changed_payload = response_payload(model, responses_fixture["changed_child_input"], False)
     changed_payload["previous_response_id"] = parent_id
     request_json(base_url, "POST", "/v1/responses", changed_payload)
 
     events = read_events(log_path)
     chat_done = protocol_events(events, "request_done", "openai_chat_completions")
-    require(
-        len(chat_done) == 7,
-        f"expected 7 Chat request_done events, found {len(chat_done)}",
-    )
+    require(len(chat_done) == 7, f"expected 7 Chat request_done events, found {len(chat_done)}")
     paths = [item.get("result", {}).get("prefix_reuse_path") for item in chat_done]
     require(
-        paths
-        == [
-            "full_reset",
-            "restore_turn_checkpoint",
-            "restore_turn_checkpoint",
-            "full_reset",
-            "full_reset",
-            "restore_turn_checkpoint",
-            "full_reset",
+        paths == [
+            "root",
+            "private_turn_closure",
+            "private_turn_closure",
+            "root",
+            "root",
+            "private_turn_closure",
+            "root",
         ],
         f"unexpected Chat reuse paths: {paths}",
     )
@@ -267,22 +210,17 @@ def exercise(
     )
     for index in (1, 2):
         speculative = chat_done[index].get("speculative", {})
-        require(
-            speculative.get("backend") == backend,
-            "request used the wrong speculative backend",
-        )
-        require(
-            speculative.get("rounds", 0) > 0, "request did not execute ReplaySSM rounds"
-        )
+        require(speculative.get("backend") == backend, "request used the wrong speculative backend")
+        require(speculative.get("rounds", 0) > 0, "request did not execute ReplaySSM rounds")
 
     chat_start = protocol_events(events, "request_start", "openai_chat_completions")
     require(
         len(chat_start) == 7
         and all(
-            not item.get("request", {}).get("preserve_thinking")
+            item.get("request", {}).get("preserve_thinking") is False
             for item in chat_start[:6]
         )
-        and chat_start[6].get("request", {}).get("preserve_thinking"),
+        and chat_start[6].get("request", {}).get("preserve_thinking") is True,
         "Chat requests did not resolve preserve_thinking consistently",
     )
 
@@ -305,7 +243,8 @@ def exercise(
         item.get("result", {}).get("prefix_reuse_path") for item in responses_done
     ]
     require(
-        response_paths == ["full_reset", "restore_response_checkpoint", "full_reset"],
+        response_paths
+        == ["root", "private_response_replay", "root"],
         f"unexpected Responses reuse paths: {response_paths}",
     )
 
@@ -327,11 +266,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
-    parser.add_argument("--server-bin", type=Path, default=DEFAULT_SERVER_BIN)
+    parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
     parser.add_argument(
         "--fixture",
         type=Path,
-        default=DEFAULT_FIXTURE,
+        default=Path("tests/fixtures/serve/qwen3_6_thinking_preservation.json"),
     )
     parser.add_argument("--startup-timeout", type=float, default=600.0)
     parser.add_argument("--port", type=int, default=0)
@@ -344,19 +283,14 @@ def main() -> None:
         raise SystemExit(f"artifact does not exist: {artifact}")
     if not server_bin.is_file():
         raise SystemExit(f"server binary does not exist: {server_bin}")
-    try:
-        with fixture_path.open("r", encoding="utf-8") as source:
-            fixture = json.load(source)
-    except (OSError, json.JSONDecodeError) as error:
-        raise SystemExit(f"could not read fixture {fixture_path}: {error}") from error
+    with fixture_path.open("r", encoding="utf-8") as source:
+        fixture = json.load(source)
     if fixture.get("schema_version") != 1:
         raise SystemExit("unsupported fixture schema")
 
     port = args.port or free_port()
     base_url = f"http://127.0.0.1:{port}"
-    with tempfile.TemporaryDirectory(
-        prefix=f"ninfer-{args.backend}-thinking-"
-    ) as temporary:
+    with tempfile.TemporaryDirectory(prefix=f"ninfer-{args.backend}-thinking-") as temporary:
         temporary_path = Path(temporary)
         request_log = temporary_path / "requests.jsonl"
         server_log = temporary_path / "server.log"
@@ -401,13 +335,9 @@ def main() -> None:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             except Exception as error:
                 output.flush()
-                tail = server_log.read_text(
-                    encoding="utf-8", errors="replace"
-                ).splitlines()[-80:]
+                tail = server_log.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
                 detail = "\n".join(tail)
-                raise SystemExit(
-                    f"{error}\n\nlast server log lines:\n{detail}"
-                ) from error
+                raise SystemExit(f"{error}\n\nlast server log lines:\n{detail}") from error
             finally:
                 if process.poll() is None:
                     process.terminate()

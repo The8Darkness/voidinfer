@@ -201,8 +201,14 @@ public:
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
+    [[nodiscard]] std::uint32_t
+    contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const;
 
     [[nodiscard]] std::optional<DeviceKVPageReservation> reserve(std::uint32_t pages) noexcept;
+
+    [[nodiscard]] DeviceKVPageReservation make_empty_reservation() noexcept {
+        return DeviceKVPageReservation(*this, 0);
+    }
 
     [[nodiscard]] bool can_resize_reservation(const DeviceKVPageReservation& reservation,
                                               std::uint32_t new_reserved_pages) const noexcept;
@@ -210,10 +216,14 @@ public:
 
     // Grows destination to target_page_count without host allocation or a second capacity check.
     void materialize(DeviceKVPageReservation& reservation, std::uint32_t target_page_count,
-                     std::vector<DeviceKVPageLease>& destination);
+                     std::vector<DeviceKVPageLease>& destination,
+                     std::optional<DeviceKVPageHandle> preferred_predecessor = std::nullopt);
+    // Single-page forms for fixed-capacity logical stores which do not own a growable lease vector.
+    [[nodiscard]] DeviceKVPageLease materialize_one(DeviceKVPageReservation& reservation);
     // Returns trailing leases to the same entitlement instead of releasing their capacity.
     void dematerialize(DeviceKVPageReservation& reservation, std::uint32_t target_page_count,
                        std::vector<DeviceKVPageLease>& source);
+    void dematerialize_one(DeviceKVPageReservation& reservation, DeviceKVPageLease&& page);
 
     void zero_pages(std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr) const;
     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
@@ -232,16 +242,27 @@ private:
 
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
+    void validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
+                                 const char* duplicate_message) const;
+    void consume_free_run(std::size_t run_index, std::int32_t begin, std::uint32_t count) noexcept;
+    void release_free_page(std::int32_t index) noexcept;
     void release_page(std::int32_t index, std::uint32_t generation) noexcept;
     void release_reservation(std::uint32_t pages) noexcept;
 
+    struct FreePageRun {
+        std::int32_t begin  = 0;
+        std::uint32_t count = 0;
+    };
+
     DeviceKVPagePoolSpec spec_;
     std::vector<Tensor> planes_;
-    std::vector<std::int32_t> free_page_ids_;
+    std::vector<FreePageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
     std::vector<bool> page_allocated_;
-    std::uint32_t allocated_pages_ = 0;
-    std::uint32_t reserved_pages_  = 0;
+    mutable std::vector<std::uint32_t> validation_marks_;
+    mutable std::uint32_t validation_stamp_ = 0;
+    std::uint32_t allocated_pages_          = 0;
+    std::uint32_t reserved_pages_           = 0;
 };
 
 struct DeviceKVPageReservationRequest {
