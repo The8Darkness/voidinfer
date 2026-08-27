@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request execution for every backend.
 
+#include "core/device.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -57,9 +59,9 @@ public:
     using ResourceInspection = typename ResourceManagement::Inspection;
     using Clock              = std::chrono::steady_clock;
 
-    EngineCore(Instance& instance, const EngineOptions& options,
+    EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
                ContextMachineCostModel context_cost)
-        : instance_(instance), max_context_(options.max_context),
+        : instance_(instance), device_(device), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
@@ -77,7 +79,24 @@ public:
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        worker_ = std::thread([this] { worker_loop(); });
+        std::promise<void> startup;
+        std::future<void> started = startup.get_future();
+        worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
+            try {
+                device_.bind_to_current_thread();
+                startup.set_value();
+            } catch (...) {
+                startup.set_exception(std::current_exception());
+                return;
+            }
+            worker_loop();
+        });
+        try {
+            started.get();
+        } catch (...) {
+            if (worker_.joinable()) { worker_.join(); }
+            throw;
+        }
     }
 
     ~EngineCore() noexcept {
@@ -1837,6 +1856,7 @@ private:
     }
 
     Instance& instance_;
+    DeviceContext& device_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
