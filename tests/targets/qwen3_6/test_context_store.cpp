@@ -155,6 +155,118 @@ void test_state_store(ninfer::DeviceContext& device) {
            "State Host/Device replica ownership closes without leaked slots");
 }
 
+void test_state_store_failure_paths(ninfer::DeviceContext& device) {
+    q36::StateImageSpec spec{
+        .linear =
+            {
+                .layers         = 1,
+                .conv_channels  = 8,
+                .conv_width     = 3,
+                .value_heads    = 2,
+                .value_head_dim = 4,
+                .key_head_dim   = 4,
+                .slot_count     = 4,
+                .conv_dtype     = ninfer::DType::BF16,
+            },
+        .hidden = 8,
+        .dflash_local =
+            q36::DFlashLocalStateSpec{.layers = 1, .capacity = 8, .kv_heads = 2, .head_dim = 4},
+    };
+
+    ninfer::LayoutBuilder release_builder;
+    const q36::StateImageDeviceLayout release_layout =
+        q36::plan_state_image_device_pool(release_builder, spec);
+    ninfer::DeviceArena release_arena(release_builder.finish(256));
+    q36::StateImageDevicePool release_physical({release_arena.base(), release_arena.capacity()},
+                                                release_layout);
+    q36::HostStatePool release_host(release_layout.host, 1);
+    store::StateImageStore release_images(
+        release_physical, &release_host,
+        static_cast<std::uint32_t>(release_physical.slot_count()) + release_host.capacity());
+
+    const auto release_source = release_images.reserve_reset(device.stream);
+    expect(release_source.has_value(), "release failure source allocation");
+    device.synchronize();
+    release_images.freeze(*release_source);
+    auto release_backup =
+        release_images.begin_device_to_host(*release_source, device.transfer_stream);
+    expect(release_backup.has_value(), "release failure backup allocation");
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    release_images.publish_transfer(std::move(*release_backup), true);
+    expect(release_images.residency(*release_source) == store::StateReplicaResidency::Both,
+           "release failure setup publishes Both residency");
+    expect(release_host.release({.index = 0, .generation = 1}),
+           "release failure setup invalidates the Host replica");
+
+    const auto release_role            = release_images.role(*release_source);
+    const auto release_residency       = release_images.residency(*release_source);
+    const auto release_slot             = release_images.physical_slot(*release_source);
+    const auto release_occupied         = release_images.occupied();
+    const auto release_device_occupied = release_images.device_occupied();
+    const auto release_host_occupied   = release_images.host_occupied();
+    expect(!release_images.release(*release_source),
+           "StateImage release reports a failed Host release");
+    expect(release_images.valid(*release_source) &&
+               release_images.role(*release_source) == release_role &&
+               release_images.residency(*release_source) == release_residency &&
+               release_images.physical_slot(*release_source) == release_slot &&
+               release_images.occupied() == release_occupied &&
+               release_images.device_occupied() == release_device_occupied &&
+               release_images.host_occupied() == release_host_occupied,
+           "failed StateImage release leaves residency, slots, counts, and capability unchanged");
+
+    ninfer::LayoutBuilder publish_builder;
+    const q36::StateImageDeviceLayout publish_layout =
+        q36::plan_state_image_device_pool(publish_builder, spec);
+    ninfer::DeviceArena publish_arena(publish_builder.finish(256));
+    q36::StateImageDevicePool publish_physical(
+        {publish_arena.base(), publish_arena.capacity()}, publish_layout);
+    q36::HostStatePool publish_host(publish_layout.host, 1);
+    store::StateImageStore publish_images(
+        publish_physical, &publish_host,
+        static_cast<std::uint32_t>(publish_physical.slot_count()) + publish_host.capacity());
+
+    const auto publish_source = publish_images.reserve_reset(device.stream);
+    expect(publish_source.has_value(), "publication failure source allocation");
+    device.synchronize();
+    publish_images.freeze(*publish_source);
+    auto publish_backup =
+        publish_images.begin_device_to_host(*publish_source, device.transfer_stream);
+    expect(publish_backup.has_value(), "publication failure backup allocation");
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    publish_images.publish_transfer(std::move(*publish_backup), true);
+    expect(publish_images.drop_device_replica(*publish_source) &&
+               publish_images.residency(*publish_source) == store::StateReplicaResidency::HostOnly,
+           "publication failure setup leaves a Host-only source");
+
+    const auto before_publish_device_occupied = publish_images.device_occupied();
+    auto host_to_device =
+        publish_images.begin_host_to_device(*publish_source, device.transfer_stream);
+    expect(host_to_device.has_value(), "publication failure transfer allocation");
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    expect(publish_host.release({.index = 0, .generation = 1}),
+           "publication failure setup invalidates the Host replica");
+
+    bool publication_failed = false;
+    try {
+        publish_images.publish_transfer(std::move(*host_to_device), false);
+    } catch (const std::logic_error&) {
+        publication_failed = true;
+    }
+    expect(publication_failed, "Host-to-Device publication reports a failed Host release");
+    expect(host_to_device->valid() &&
+               publish_images.residency(*publish_source) == store::StateReplicaResidency::HostOnly &&
+               publish_images.source_pins(*publish_source) == 1 &&
+               publish_images.device_occupied() == before_publish_device_occupied + 1,
+           "failed publication preserves prior state and pending transfer capability");
+
+    publish_images.abort_transfer(std::move(*host_to_device));
+    expect(!host_to_device->valid() && publish_images.source_pins(*publish_source) == 0 &&
+               publish_images.residency(*publish_source) == store::StateReplicaResidency::HostOnly &&
+               publish_images.device_occupied() == before_publish_device_occupied,
+           "aborting failed publication cleans its pending Device slot");
+}
+
 void test_kv_store(ninfer::DeviceContext& device) {
     ninfer::LayoutBuilder builder;
     ninfer::DeviceKVPagePoolSpec page_spec{
@@ -501,6 +613,7 @@ int main() {
     try {
         ninfer::DeviceContext device(0);
         test_state_store(device);
+        test_state_store_failure_paths(device);
         test_kv_store(device);
         device.synchronize();
     } catch (const std::exception& error) {
