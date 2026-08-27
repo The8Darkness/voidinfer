@@ -435,6 +435,7 @@ from one to fifteen.
 
 ## Documentation
 
+- [Muse Spark 1.2 Contributor master prompt](MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md)
 - [Current project state and agent handoff](PROJECT_STATE.md)
 - [Known issues and blockers](KNOWN_ISSUES.md)
 - [Experiment log](EXPERIMENTS.md)

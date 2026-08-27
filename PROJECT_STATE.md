@@ -8,6 +8,7 @@ Updated: 2026-08-27 UTC
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `handoff/phase2-context-resource-20260827`
 - Handoff PR: `https://github.com/The8Darkness/voidinfer/pull/2`
+- Orchestration prompt: `MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md`
 - State checkpoint commit: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`); this is the committed handoff checkpoint containing the canonical `dev` runtime/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes
 - Handoff documentation commit: `8492f900f8` (`docs(state): record phase2 handoff`)
 - Previous rollback checkpoint: `9a6813a3` (`fix(windows): complete upstream f0 build integration`); keep it available until the refreshed canonical head is separately qualified
