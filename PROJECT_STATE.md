@@ -88,3 +88,12 @@ Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM12
 1. Diagnose startup, environment, and artifact compatibility for the direct Qwen3.8 NVFP4 executable, without runtime changes; use the local `build-pr2-retry` failure and inherited `build-windows-phase7` failure to distinguish environment/artifact behavior from a PR2 regression.
 
 The Picot launcher and harness use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration. Windows, WebUI, and local workflow authorities remain preserved, as does the user's dirty prompt deletion.
+
+## AO checkpoint
+
+- Orchestrator session: `voidinfer-6`; harness: `omp`; exact model: `openai-codex/gpt-5.6-luna`.
+- Worker: session `voidinfer-20`, name `AO checkpoint`; workspace `D:\AI\agent-orchestrator\data\worktrees\voidinfer\voidinfer-20`; ownership: PR #2 stale-handoff takeover.
+- Prior qualification, integration, and monitor sessions are exited.
+- PR #2 source/head at checkpoint: `handoff/phase2-context-resource-20260827` / `8b03d8479e`; required check passing; reviews: none.
+- GPU at checkpoint: RTX 5090, 32,607 MiB; about 2.3 GiB desktop/AO use; 0% utilization. No NInfer model, service, build process, or owned service to restore; no active GPU job remains.
+- Windows/WebUI/local workflow authorities and the user's dirty canonical deletion remain untouched. The direct-route blocker remains: diagnose startup/environment/artifact compatibility without runtime changes.
