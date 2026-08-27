@@ -10,11 +10,11 @@ Updated: 2026-08-27 UTC
 - Handoff PR: `https://github.com/The8Darkness/voidinfer/pull/2`
 - Orchestration prompt: `MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md`
 - State checkpoint commit: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`); this is the committed handoff checkpoint containing the canonical `dev` runtime/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes
-- Handoff documentation commit: `8492f900f8` (`docs(state): record phase2 handoff`)
+- Handoff documentation commits: `8492f900f8` (`docs(state): record phase2 handoff`), `90e76f3d4c` (GitHub handoff link), and `d4fce7aa1f` (Muse Spark master prompt)
 - Previous rollback checkpoint: `9a6813a3` (`fix(windows): complete upstream f0 build integration`); keep it available until the refreshed canonical head is separately qualified
 - Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `13.1`, `sm_120a`; `build-windows-phase7` full build and 94-test CTest run pass, with 5 expected artifact skips; benchmark and serve targets built
 - Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
-- Pushed handoff branch: `origin/handoff/phase2-context-resource-20260827` at `8492f900f8`; direct `master` push was rejected by the required status check `secret-and-artifact-checks`, so review/merge through PR #2
+- Pushed handoff branch: `origin/handoff/phase2-context-resource-20260827` includes the prompt checkpoint `d4fce7aa1f`; later state-only commits may advance the branch. Direct `master` push was rejected by the required status check `secret-and-artifact-checks`, so review/merge through PR #2
 - Current phase: Phase 2 validation/handoff; the committed context/resource integration is locally qualified on Qwen3.8 NVFP4, while the refreshed canonical head remains a separate next step
 - Active hypothesis: the canonical content-indexed State/KV/resource path is the correct prefix-cache substrate; qualify it on Qwen3.8 before adding persistence, proposer routing, or codecs
 
@@ -76,7 +76,7 @@ Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM12
 
 1. The current single three-coefficient context-cost transfer roofline rejects two runs on fragmented D2H/D2D/H2D geometries; keep conservative compiled defaults and improve the fit or fixture before publishing a measured preset.
 2. C1/core, separate C2/C4/C8 decode-saturation, MTP0/MTP3 corpus, and 252,928/262,144 FP8-KV capacity baselines exist, but closed-loop agent task time, long-generation quality, and the complete VLM suite remain outstanding.
-3. The staged canonical context/resource cutover through `59febed2` has passed its local Qwen3.8 Host State/KV, media-reuse, cancellation/eviction, and MTP settlement gate; the refreshed canonical `9dbc074005a1` pressure-planner/tool/parser/anchor series still requires a separate integration worktree and Windows qualification.
+3. The committed canonical context/resource cutover through `59febed2` has passed its local Qwen3.8 Host State/KV, media-reuse, cancellation/eviction, and MTP settlement gate; the refreshed canonical `9dbc074005a1` pressure-planner/tool/parser/anchor series still requires a separate integration worktree and Windows qualification.
 4. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before those refreshed-runtime, exact-quality, and VLM gates exist.
 
 The Picot launcher and harness now use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration.
