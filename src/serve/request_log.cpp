@@ -282,6 +282,26 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_per_position", metrics.speculative_accepted_per_position}};
 }
 
+Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
+    return Json{
+        {"predicted_now_ns", diagnostics.predicted_now_ns},
+        {"predicted_future_loss_ns", diagnostics.predicted_future_loss_ns},
+        {"predicted_total_ns", diagnostics.predicted_total_ns},
+        {"targets_evaluated", diagnostics.targets_evaluated},
+        {"projection_work", diagnostics.projection_work},
+        {"planning_elapsed_ns", diagnostics.planning_elapsed_ns},
+        {"search_elapsed_ns", diagnostics.search_elapsed_ns},
+        {"stop_reason", ninfer::materialization_stop_reason_name(diagnostics.stop_reason)},
+        {"model_optimal", diagnostics.model_optimal},
+        {"budget_exhausted", diagnostics.budget_exhausted},
+        {"best_remaining_lower_bound_ns", diagnostics.best_remaining_lower_bound_ns},
+        {"absolute_bound_gap_ns", diagnostics.absolute_bound_gap_ns},
+        {"relative_bound_gap", diagnostics.relative_bound_gap},
+        {"selected_degradation_units", diagnostics.selected_degradation_units},
+        {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+    };
+}
+
 double nanoseconds_to_seconds(std::uint64_t value) noexcept {
     return static_cast<double>(value) * 1.0e-9;
 }
@@ -758,8 +778,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["engine_timing"] = request_engine_timing_json(outcome.metrics.engine_timing);
-    record["speculative"]   = speculative_json(outcome.metrics);
+    record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
+    record["speculative"]     = speculative_json(outcome.metrics);
+    record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();
 }
 
@@ -927,28 +948,36 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"seconds", monotonic_delta(previous.backend_kv_d2d_seconds,
                                                        current.backend_kv_d2d_seconds)}}}}},
         {"pressure",
-         Json{{"partial_spill_pages",
-               monotonic_delta(previous.partial_spill_pages, current.partial_spill_pages)},
-              {"partial_tail_cow_pages",
-               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
-              {"private_degradations", monotonic_delta(previous.private_checkpoint_degradations,
-                                                       current.private_checkpoint_degradations)},
-              {"private_evictions", monotonic_delta(previous.private_checkpoint_evictions,
-                                                    current.private_checkpoint_evictions)},
-              {"shared_degradations", monotonic_delta(previous.shared_checkpoint_degradations,
-                                                      current.shared_checkpoint_degradations)},
-              {"shared_evictions", monotonic_delta(previous.shared_checkpoint_evictions,
-                                                   current.shared_checkpoint_evictions)},
-              {"historical_fork_hits",
-               monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
+         Json{
+             {"spill_pages",
+              monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
+             {"partial_tail_cow_pages",
+              monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
+             {"private_owners_degraded", monotonic_delta(previous.pressure_private_owners_degraded,
+                                                         current.pressure_private_owners_degraded)},
+             {"private_owners_evicted", monotonic_delta(previous.pressure_private_owners_evicted,
+                                                        current.pressure_private_owners_evicted)},
+             {"shared_owners_degraded", monotonic_delta(previous.pressure_shared_owners_degraded,
+                                                        current.pressure_shared_owners_degraded)},
+             {"shared_owners_evicted", monotonic_delta(previous.pressure_shared_owners_evicted,
+                                                       current.pressure_shared_owners_evicted)},
+             {"checkpoints_dropped", monotonic_delta(previous.pressure_checkpoints_dropped,
+                                                     current.pressure_checkpoints_dropped)},
+             {"searches", monotonic_delta(previous.pressure_searches, current.pressure_searches)},
+             {"search_budget_exhaustions",
+              monotonic_delta(previous.pressure_search_budget_exhaustions,
+                              current.pressure_search_budget_exhaustions)},
+             {"maximal_fallback_selections",
+              monotonic_delta(previous.pressure_maximal_fallback_selections,
+                              current.pressure_maximal_fallback_selections)},
+             {"historical_fork_hits",
+              monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
         {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
                            {"host_state_slots", current.host_state_occupied_slots},
                            {"device_main_kv_pages", current.device_main_kv_occupied_pages},
                            {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
                            {"host_kv_bytes", current.host_kv_occupied_bytes},
                            {"shared_active_references", current.shared_active_references}}},
-        {"last_materialization",
-         Json{{"predicted_nanoseconds", current.last_predicted_materialization_ns}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
     return record.dump();

@@ -38,7 +38,7 @@ public:
     using Package            = typename Instance::Package;
     using Program            = typename Package::Program;
     using BasePlan           = typename Package::RequestBasePlan;
-    using Plan               = typename Package::AdmissionPlan;
+    using Plan               = typename Package::AdmissionCandidate;
     using SequenceHandle     = typename Package::SequenceHandle;
     using CaptureOffer       = typename Package::CaptureOffer;
     using PendingBatch       = typename Package::PendingBatch;
@@ -57,7 +57,8 @@ public:
     using ResourceInspection = typename ResourceManagement::Inspection;
     using Clock              = std::chrono::steady_clock;
 
-    EngineCore(Instance& instance, const EngineOptions& options, ContextCostModel context_cost)
+    EngineCore(Instance& instance, const EngineOptions& options,
+               ContextMachineCostModel context_cost)
         : instance_(instance), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
@@ -727,6 +728,7 @@ private:
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
         result.thinking                = request->output.thinking_stats();
+        result.materialization         = request->materialization_diagnostics;
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -1348,10 +1350,11 @@ private:
                     request->sequence.emplace(sequence);
                     request->budget.emplace(std::move(control.budget));
                     request->lane.emplace(control.destination);
-                    request->remaining_service_work = control.summary.service_work_quanta;
-                    request->backfill_epoch         = control.protection_epoch;
-                    request->backfill_class         = control.backfill_class;
-                    request->model_state            = EngineRequestState::Prefill;
+                    request->remaining_service_work      = control.summary.service_work_quanta;
+                    request->backfill_epoch              = control.protection_epoch;
+                    request->backfill_class              = control.backfill_class;
+                    request->materialization_diagnostics = terminal.diagnostics;
+                    request->model_state                 = EngineRequestState::Prefill;
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, Clock::now());
                     request->queue_wait_recorded = true;

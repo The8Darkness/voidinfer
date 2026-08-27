@@ -126,49 +126,70 @@ RequestBasePlan<Variant>::prefix_shortlist_key(std::uint32_t frontier) const noe
 }
 
 template <>
-AdmissionPlan<Variant>::AdmissionPlan(
-    std::unique_ptr<detail::AdmissionPlanImpl<Variant>> impl) noexcept
+PressurePlanningSession<Variant>::PressurePlanningSession(
+    std::unique_ptr<detail::PressurePlanningSessionImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
 template <>
-AdmissionPlan<Variant>::AdmissionPlan(AdmissionPlan&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-template <>
-AdmissionPlan<Variant>& AdmissionPlan<Variant>::operator=(AdmissionPlan&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-template <>
-AdmissionPlan<Variant>::~AdmissionPlan() = default;
+PressurePlanningSession<Variant>::PressurePlanningSession(PressurePlanningSession&&) noexcept =
+    default;
 
 template <>
-const runtime::RequestPlanSummary& AdmissionPlan<Variant>::summary() const noexcept {
-    static const runtime::RequestPlanSummary empty;
-    return impl_ != nullptr ? impl_->summary : empty;
-}
+PressurePlanningSession<Variant>&
+PressurePlanningSession<Variant>::operator=(PressurePlanningSession&&) noexcept = default;
+template <>
+PressurePlanningSession<Variant>::~PressurePlanningSession() = default;
 
 template <>
-runtime::ClaimDisposition AdmissionPlan<Variant>::source_disposition() const noexcept {
-    return impl_ != nullptr ? impl_->source_disposition
-                            : runtime::ClaimDisposition::ConsumedToActive;
+PressureTargetHandle PressurePlanningSession<Variant>::identity_target(
+    const AdmissionCandidate<Variant>& candidate) const {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->identity_target(candidate);
 }
 
 template <>
-bool AdmissionPlan<Variant>::needs_transfer() const noexcept {
-    return impl_ != nullptr && impl_->needs_transfer;
+PressureTargetHandle PressurePlanningSession<Variant>::root_maximal_target(
+    const AdmissionCandidate<Variant>& root_candidate) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->root_maximal_target(root_candidate);
 }
 
 template <>
-runtime::PrefillWork AdmissionPlan<Variant>::remaining_prefill_work() const noexcept {
-    return impl_ != nullptr ? impl_->remaining_prefill_work : runtime::PrefillWork{};
+runtime::PressureTargetAssessment
+PressurePlanningSession<Variant>::assess(PressureTargetHandle target) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->assess(target);
 }
 
 template <>
-std::span<const runtime::ContextTransferRequirement>
-AdmissionPlan<Variant>::transfer_requirements() const noexcept {
-    return impl_ != nullptr
-               ? std::span<const runtime::ContextTransferRequirement>(impl_->transfer_requirements)
-               : std::span<const runtime::ContextTransferRequirement>{};
+PreparedPressureExpansion<Variant>
+PressurePlanningSession<Variant>::prepare_expansion(PressureTargetHandle parent) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->prepare_expansion(parent);
+}
+
+template <>
+PressureExpansionView
+PressurePlanningSession<Variant>::commit_expansion(PreparedPressureExpansion<Variant>&& prepared) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->commit_expansion(std::move(prepared));
+}
+
+template <>
+void PressurePlanningSession<Variant>::discard_expansion(
+    PreparedPressureExpansion<Variant>&& prepared) noexcept {
+    if (impl_ != nullptr) { impl_->discard_expansion(std::move(prepared)); }
+}
+
+template <>
+std::optional<ResourcePlan<Variant>>
+PressurePlanningSession<Variant>::seal(PressureTargetHandle target, const PreparedPrompt& prompt) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    std::optional<AdmissionCandidate<Variant>> sealed =
+        impl_->seal(target, PreparedPromptAccess::view(prompt));
+    if (!sealed) { return std::nullopt; }
+    const bool needs_transfer = sealed->impl_->needs_transfer;
+    return ResourcePlan<Variant>(std::move(*sealed), impl_->resource_revision, needs_transfer);
 }
 
 template <>
@@ -186,52 +207,39 @@ Program<Variant>::plan_request(const PreparedPrompt& prompt,
 }
 
 template <>
-std::optional<AdmissionPlan<Variant>> Program<Variant>::inspect_admission(
+std::optional<AdmissionCandidate<Variant>> Program<Variant>::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan<Variant>& base, runtime::LaneId destination,
     const ContinuationHandle<Variant>* source, const SharedPrefixHandle<Variant>* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+    const runtime::ContextMachineCostModel& machine_cost) {
     return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source,
-                                    shared_source, checkpoint, must_retain_private_source);
+                                    shared_source, checkpoint, must_retain_private_source,
+                                    machine_cost);
 }
 
 template <>
-std::vector<PressureOption>
-Program<Variant>::inspect_pressure_options(const AdmissionPlan<Variant>& admission,
-                                           const ContinuationHandle<Variant>& continuation) const {
-    return impl_->inspect_pressure_options(admission, continuation);
-}
-
-template <>
-PressureOption
-Program<Variant>::inspect_eviction_option(const ContinuationHandle<Variant>& continuation) const {
-    return impl_->inspect_eviction_option(continuation);
-}
-
-template <>
-std::vector<PressureOption>
-Program<Variant>::inspect_shared_pressure_options(const AdmissionPlan<Variant>& admission,
-                                                  const SharedPrefixHandle<Variant>& shared) const {
-    return impl_->inspect_shared_pressure_options(admission, shared);
-}
-
-template <>
-PressureOption
-Program<Variant>::inspect_shared_eviction_option(const SharedPrefixHandle<Variant>& shared) const {
-    return impl_->inspect_shared_eviction_option(shared);
-}
-
-template <>
-std::optional<ResourcePlan<Variant>> Program<Variant>::seal_resource_plan(
-    const AdmissionPlan<Variant>& admission, const PreparedPrompt& prompt,
-    std::span<const ContinuationHandle<Variant>* const> pressure_owners,
-    std::span<const PressureOption> pressure_options,
-    std::span<const SharedPrefixHandle<Variant>* const> shared_pressure_owners,
-    std::span<const PressureOption> shared_pressure_options) {
-    std::optional<AdmissionPlan<Variant>> sealed = impl_->seal_materialization(
-        admission, PreparedPromptAccess::view(prompt), pressure_owners, pressure_options,
-        shared_pressure_owners, shared_pressure_options);
+std::optional<ResourcePlan<Variant>>
+Program<Variant>::seal_identity(const AdmissionCandidate<Variant>& admission,
+                                const PreparedPrompt& prompt) {
+    std::optional<AdmissionCandidate<Variant>> sealed =
+        impl_->seal_materialization(admission, PreparedPromptAccess::view(prompt), {}, {}, {}, {});
     if (!sealed) { return std::nullopt; }
-    return ResourcePlan<Variant>(std::move(*sealed), impl_->resource_revision());
+    const bool needs_transfer = sealed->impl_->needs_transfer;
+    return ResourcePlan<Variant>(std::move(*sealed), impl_->resource_revision(), needs_transfer);
+}
+
+template <>
+PressurePlanningSession<Variant> Program<Variant>::begin_pressure_planning(
+    const runtime::ContextMachineCostModel& machine_cost,
+    std::span<const AdmissionCandidate<Variant>* const> candidates,
+    std::span<const ContinuationHandle<Variant>* const> private_owners,
+    std::span<const std::uint32_t> private_owner_ordinals,
+    std::span<const SharedPrefixHandle<Variant>* const> shared_owners,
+    std::span<const std::uint32_t> shared_owner_ordinals) {
+    return PressurePlanningSession<Variant>(
+        std::make_unique<detail::PressurePlanningSessionImpl<Variant>>(
+            *impl_, machine_cost, candidates, private_owners, private_owner_ordinals, shared_owners,
+            shared_owner_ordinals));
 }
 
 template <>

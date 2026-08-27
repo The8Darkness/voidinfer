@@ -177,6 +177,7 @@ struct RequestRecord {
     GenerationTimings generation_timings;
     RequestHostTiming host_timing;
     SpeculativeStats speculative_stats;
+    MaterializationDiagnostics materialization_diagnostics;
 
     std::mutex mutex;
     std::condition_variable cv;

@@ -173,7 +173,7 @@ ResourceManager只拥有逻辑policy：
 - `Free | Materializing | Active | TerminalPending` lane状态；
 - private/shared checkpoint catalog与SessionIndex；
 - continuation identity、retention class和bounded candidate indexes；
-- source、placement intent、victim action和capture/retention choice；
+- source candidates、cache value、完整pressure target搜索、logical claims和capture/retention choice；
 - Program终态结果的逻辑adoption。
 
 它不维护Device/Host占用账本、per-lane physical charge、page refcount镜像或allocator snapshot。逻辑引用可以
@@ -330,39 +330,32 @@ target facts。
 
 ### 6.2 完整choice
 
-ResourceManager交给Program的规划单位同时固定：
+ResourceManager先用exact source建立`AdmissionCandidate`。Candidate只固定source、destination、prompt和request work，
+不提前固定Move/Fork或victim。压力下比较的是完整逻辑终态：
 
 ```text
-request
-+ source checkpoint or root
-+ destination lane
-+ placement intent
-+ complete victim/degradation set
-+ capture/retention intent
+candidate
++ every eligible owner/checkpoint final outcome
++ every surviving State/Main/Backend replica placement
++ selected-source final disposition
++ logical publication slot and claims
 ```
 
-Program对完整choice的joint post-state与每个有序stage peak进行验证，并在成功时seal一个opaque
-`ResourcePlan`。ResourceManager看不到raw allocations，也不能把独立victim effects相加。
+ResourceManager跨candidates选择完整target并拥有cache-value policy；Program从联合post-state重推Move/Fork/COW、
+引用闭包、replica placement、allocator feasibility和逐stage peak，再seal opaque `ResourcePlan`。ResourceManager不能读取
+raw physical facts或相加owner effects；Program不拥有请求顺序、SessionKey或retention observations。
 
-Canonical degradation chain是：
-
-```text
-preferred source, no pressure
-  -> same source, preserving demotion/degradation
-  -> cheaper valid source
-  -> root, preserving demotion/degradation
-  -> root, release all inactive cache
-```
-
-最后一项是admission完整性回退。若它仍不可行，原因必须是active reservations、输入本身或配置限制，而不是
-cache retention policy。
+搜索预算只影响inactive cache的保留质量，不能改变admission完整性或资源正确性。完整目标空间、目标函数和完备回退见
+[资源调度与上下文缓存架构](resource-scheduling-and-context-cache.md#8-candidate-与-pressure-planning)。
 
 ### 6.3 Start、progress与terminal
 
 ```text
 Scheduler grants request
-  -> ResourceManager prepares logical adoption storage
-  -> Program assesses and seals ResourcePlan
+  -> ResourceManager inspects candidate identities
+  -> optional MaterializationPlanner searches Program complete targets
+  -> ResourceManager prepares one claim per affected owner
+  -> Program reassesses and seals selected ResourcePlan
   -> Program start revalidates resource revision and capabilities
   -> zero or more progress units
   -> Program commit or abort returns one ResourceResult
@@ -370,8 +363,9 @@ Scheduler grants request
   -> Engine installs Active or adopts the stable result
 ```
 
-Pre-start stale rejection无物理副作用，可以重新规划。Start成功后source持续有效到commit/abort，且不能静默
-换candidate。Program commit后的logical adoption已经预分配、noexcept、无新的容量判断。
+Pre-start stale rejection无物理副作用，可以重新规划。Start成功后source与affected owners持续claimed到commit/abort，
+且不能静默换candidate。Selected source只有source claim/result，不同时作为pressure victim；每个affected owner也只有
+一个claim和terminal outcome。Program commit后的logical adoption已经预分配、noexcept、无新的容量判断。
 
 Abort保证target不会半Active，但已安全提交的victim demotion/deletion可以保留；`ResourceResult`必须完整报告
 这些变化。ResourceManager不接收逐copy receipt，也不自行推导physical delta。
