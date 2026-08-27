@@ -8,16 +8,16 @@ Updated: 2026-08-27 UTC
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `handoff/phase2-context-resource-20260827`
 - PR #2: `https://github.com/The8Darkness/voidinfer/pull/2`
-- PR2 source handoff/head: `a6f331d6a28dc0b0100d5e04a7e1d50c3daa482a`
+- PR2 source handoff/head: `23b16be76b23d59c3bda045a162e0a46fde9c7bb`
 - Orchestration prompt: `MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md`
 - Canonical integration checkpoint: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`); contains the committed context/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes
 - Handoff documentation commits: `8492f900f8` (`docs(state): record phase2 handoff`), `90e76f3d4c` (GitHub handoff link), and `d4fce7aa1f` (Muse Spark master prompt)
 - Previous rollback checkpoint: `9a6813a3` (`fix(windows): complete upstream f0 build integration`); keep it available until the refreshed canonical head is separately qualified
 - PR2 local Release configure/build: unique worker directory `build-pr2-retry`, native Visual Studio 17 2022 x64, MSVC `19.44`, CUDA `13.1.80`, `sm_120a`; configure/build passed
 - PR2 exact Release CTest: `94` entries, `100%` passed, `0` failures, `5` expected skips for absent Qwen3.6/35B artifacts
-- Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`); no push or merge was performed for this state update
-- Current phase: Phase 2 validation/handoff; PR2 is not fully qualified because direct Qwen3.8 NVFP4 startup remains blocked/unreproduced
-- Active hypothesis: the canonical content-indexed State/KV/resource path is the correct prefix-cache substrate; diagnose the direct startup gate before adding persistence, proposer routing, or codecs
+- Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`); this state update is committed and pushed to the handoff branch
+- Current phase: Phase 2 validation/handoff; PR2 qualification: Release configure/build passed, exact Release CTest passed, and direct Qwen3.8 NVFP4 route passed
+- Active state: direct Qwen3.8 NVFP4 route is qualified; prior code-9 runs remain retained only as superseded invocation diagnostics
 
 ## Local environment
 
@@ -62,12 +62,16 @@ Result: configure/build passed on native Visual Studio 17 2022 x64 with MSVC `19
 Direct Qwen3.8 NVFP4 route:
 
 ```text
-set NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=D:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-Ninfer\qwen3_8_27b_nvfp4.ninfer
+set NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=D:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-Ninfer\qwen3_8_27b_nvfp4.ninfer&&D:\AI\voidinfer\build-windows-phase7\tests\Release\ninfer_qwen3_6_27b_prefix_real_test.exe
 ```
 
-The direct executable in local `build-pr2-retry` and the inherited `build-windows-phase7` executable both exited with code `9` / CTest `0xc0000409` within about `0.2` seconds, with no output. No service was started. The no-environment control exited with expected skip code `77`. Classify this as blocked/unreproduced environment/artifact behavior, not a proven PR2 regression; no source repair was made. PR2 is not fully qualified.
+Classification: `LOCAL_MEASUREMENT`.
 
-Known evidence paths: `build-pr2-retry/`, `build-windows-phase7/`, `results/qwen3.8-nvfp4-phase1-baseline-2026-08-26.json`, and the canonical artifact path listed above. The worker build directories were cleaned, and raw local logs are not retained.
+The exact direct route used the retained canonical `build-windows-phase7` Release binary, the canonical Qwen3.8-27B NVFP4 artifact, and `NINFER_QWEN3_8_27B_NVFP4_WEIGHTS`. It ran once through `cmd.exe`, exited with code `0` in `15.54` seconds, and produced `4` bytes (`ok` plus newline) on stdout and `0` bytes on stderr. The GPU returned idle with no NInfer process or service. Result paths: `D:\AI\voidinfer\profiles\bench\pr2-route-recheck-20260827\stdout.log` and `D:\AI\voidinfer\profiles\bench\pr2-route-recheck-20260827\stderr.log`.
+
+The earlier local `build-pr2-retry` and inherited `build-windows-phase7` code-9 / CTest `0xc0000409` exits, plus the no-environment control's expected skip code `77`, are retained as superseded invocation diagnostics. They are not current source blockers or evidence against PR2 qualification.
+
+Known evidence paths: `build-pr2-retry/`, `build-windows-phase7/`, `results/qwen3.8-nvfp4-phase1-baseline-2026-08-26.json`, the canonical artifact path listed above, and the two exact route result paths above.
 
 The Qwen3.8 NVFP4 artifact inspects successfully and `ninfer-serve.exe --help` exposes vision, MTP, KV dtype, prefix reuse, Responses, and tool-serving options. Separate native service runs passed the text-only and Vision contract smoke; the Qwen3.8 NVFP4 public-Engine gate now covers Host State/KV restore, multimodal reuse, cancellation/eviction, and concurrent MTP settlement and passes. The 43-case C1 core matrix passed, with MTP3 graph decode ranging from 133.97 to 172.33 tok/s over the selected generation lengths and MTP5 from 107.99 to 151.18 tok/s. Separate decode-saturation runs cover C1/C2/C4/C8: MTP0 steady aggregate 80.4/157.5/292.9/538.5 tok/s and MTP3 171.7/329.8/568.2/1046.8 tok/s. The MTP0 corpus completed 20/20 long-context requests at 8k/64k/128k/256k, and the MTP3 corpus completed 75/75 long-decode, code, story, translation, and structured requests; these remain performance/behavior measurements rather than the complete quality/VLM gate. FP8-KV synthetic prefill completed at 252,928 tokens in 102.87 s (2,458.64 tok/s) and 262,144 tokens in 110.42 s (2,373.99 tok/s). Reports: `results/qwen3.8-nvfp4-phase1-baseline-2026-08-26.json` and ignored `profiles/bench/qwen38-*`.
 
@@ -85,7 +89,7 @@ Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM12
 
 ## Current blockers and next steps
 
-1. Diagnose startup, environment, and artifact compatibility for the direct Qwen3.8 NVFP4 executable, without runtime changes; use the local `build-pr2-retry` failure and inherited `build-windows-phase7` failure to distinguish environment/artifact behavior from a PR2 regression.
+1. None. Release configure/build, exact Release CTest, and the direct Qwen3.8 NVFP4 route passed; prior code-9 results remain superseded invocation diagnostics only.
 
 The Picot launcher and harness use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration. Windows, WebUI, and local workflow authorities remain preserved, as does the user's dirty prompt deletion.
 
@@ -94,6 +98,6 @@ The Picot launcher and harness use `D:\AI\voidinfer`; the source repository was 
 - Orchestrator session: `voidinfer-6`; harness: `omp`; exact model: `openai-codex/gpt-5.6-luna`.
 - Worker: session `voidinfer-20`, name `AO checkpoint`; workspace `D:\AI\agent-orchestrator\data\worktrees\voidinfer\voidinfer-20`; ownership: PR #2 stale-handoff takeover.
 - Prior qualification, integration, and monitor sessions are exited.
-- PR #2 source/head at checkpoint: `handoff/phase2-context-resource-20260827` / `8b03d8479e`; required check passing; reviews: none.
+- PR #2 source/head now: `handoff/phase2-context-resource-20260827` / `23b16be76b23d59c3bda045a162e0a46fde9c7bb`; required check passing; reviews: none.
 - GPU at checkpoint: RTX 5090, 32,607 MiB; about 2.3 GiB desktop/AO use; 0% utilization. No NInfer model, service, build process, or owned service to restore; no active GPU job remains.
-- Windows/WebUI/local workflow authorities and the user's dirty canonical deletion remain untouched. The direct-route blocker remains: diagnose startup/environment/artifact compatibility without runtime changes.
+- Windows/WebUI/local workflow authorities and the user's dirty canonical deletion remain untouched. The direct route is qualified; prior code-9 results are superseded invocation diagnostics.
