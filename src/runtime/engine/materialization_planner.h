@@ -171,14 +171,16 @@ public:
             pressure.private_owner_ordinals, pressure.shared_owners,
             pressure.shared_owner_ordinals);
 
+        bool has_incumbent = false;
         Incumbent incumbent;
         if (identity_best) {
             incumbent = *identity_best;
             incumbent.target =
                 session.identity_target(*candidates[incumbent.candidate_index].candidate);
+            has_incumbent = true;
         } else {
-            std::optional<Incumbent> pressure_best;
-            const auto assess_maximal = [&](std::uint32_t candidate_index) {
+            const auto consider_maximal = [&](std::uint32_t candidate_index,
+                                              std::optional<Incumbent>& pressure_best) {
                 PressureTargetHandle target =
                     session.root_maximal_target(*candidates[candidate_index].candidate);
                 PressureTargetAssessment assessment = session.assess(target);
@@ -200,17 +202,23 @@ public:
                         pressure.checkpoint_policy, *goal);
                 }
             };
+            std::optional<Incumbent> pressure_best;
             for (std::uint32_t candidate_index = 0;
                  candidate_index < static_cast<std::uint32_t>(candidates.size());
                  ++candidate_index) {
-                assess_maximal(candidate_index);
+                consider_maximal(candidate_index, pressure_best);
             }
-            if (!pressure_best) { return std::nullopt; }
-            incumbent = std::move(*pressure_best);
+            if (pressure_best) {
+                incumbent      = std::move(*pressure_best);
+                has_incumbent = true;
+            }
         }
 
         for (const IdentityRoot& root : roots) {
-            if (!root.expandable || root.lower_bound_ns > incumbent.cost.total_ns) { continue; }
+            if (!root.expandable ||
+                (has_incumbent && root.lower_bound_ns > incumbent.cost.total_ns)) {
+                continue;
+            }
             QueueEntry entry;
             entry.target = session.identity_target(*candidates[root.candidate_index].candidate);
             entry.candidate_index   = root.candidate_index;
@@ -229,7 +237,8 @@ public:
 
         const Clock::time_point search_started = Clock::now();
         const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
+            has_incumbent ? std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U)
+                          : std::numeric_limits<std::uint64_t>::max();
         std::uint64_t maximum_expansion_ns    = 0;
         std::uint32_t optional_targets        = 0;
         MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
@@ -244,7 +253,7 @@ public:
                 break;
             }
             const QueueEntry& next = queue_.front();
-            if (next.lower_bound_ns > incumbent.cost.total_ns) {
+            if (has_incumbent && next.lower_bound_ns > incumbent.cost.total_ns) {
                 stop_reason   = MaterializationStopReason::ModelOptimal;
                 model_optimal = true;
                 break;
@@ -256,17 +265,18 @@ public:
                 break;
             }
             const std::uint64_t elapsed = elapsed_ns(search_started, Clock::now());
-            if (elapsed >= search_budget_ns) {
+            if (has_incumbent && elapsed >= search_budget_ns) {
                 stop_reason      = MaterializationStopReason::TimeBudget;
                 model_optimal    = false;
                 budget_exhausted = true;
                 break;
             }
             const std::uint64_t possible_improvement =
-                incumbent.cost.total_ns > next.lower_bound_ns
+                has_incumbent && incumbent.cost.total_ns > next.lower_bound_ns
                     ? incumbent.cost.total_ns - next.lower_bound_ns
                     : 0;
-            if (maximum_expansion_ns != 0 && maximum_expansion_ns > possible_improvement) {
+            if (has_incumbent && maximum_expansion_ns != 0 &&
+                maximum_expansion_ns > possible_improvement) {
                 stop_reason   = MaterializationStopReason::ValueOfNextExpansion;
                 model_optimal = false;
                 break;
@@ -302,12 +312,14 @@ public:
                     goal = logical_goal(assessment.candidate_ordinal, assessment.source_disposition,
                                         assessment.owner_outcomes);
                 }
-                if (goal && cost.less(incumbent.cost)) {
+                if (goal && (!has_incumbent || cost.less(incumbent.cost))) {
                     incumbent =
                         make_incumbent(child, assessment, candidates[assessment.candidate_ordinal],
                                        pressure.owner_policy, pressure.checkpoint_policy, *goal);
+                    has_incumbent = true;
                 }
-                if (assessment.expandable && cost.lower_bound_ns <= incumbent.cost.total_ns) {
+                if (assessment.expandable &&
+                    (!has_incumbent || cost.lower_bound_ns <= incumbent.cost.total_ns)) {
                     queue_push(QueueEntry{
                         .target                    = child,
                         .candidate_index           = assessment.candidate_ordinal,
@@ -334,6 +346,8 @@ public:
             maximum_expansion_ns =
                 std::max(maximum_expansion_ns, elapsed_ns(expansion_started, Clock::now()));
         }
+
+        if (!has_incumbent) { return std::nullopt; }
 
         const std::uint64_t search_elapsed_ns        = elapsed_ns(search_started, Clock::now());
         PressureTargetAssessment selected_assessment = session.assess(incumbent.target);

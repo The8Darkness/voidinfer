@@ -592,7 +592,8 @@ public:
         const bool has_eviction =
             std::any_of(decisions.begin(), decisions.end(),
                         [](const auto& decision) { return decision.evicts_continuation; });
-        if (required_action_id && !has_eviction &&
+        if (required_action_id &&
+            (require_required_action_even_with_eviction || !has_eviction) &&
             std::none_of(decisions.begin(), decisions.end(), [&](const auto& decision) {
                 return decision.id == *required_action_id;
             })) {
@@ -780,6 +781,7 @@ public:
     void invalidate_resources() noexcept { advance_revision(); }
 
     std::size_t required_pressure_actions           = 0;
+    bool require_required_action_even_with_eviction = false;
     std::vector<std::size_t> required_pressure_actions_by_candidate;
     std::uint32_t private_pressure_alternatives     = 1;
     std::uint64_t pressure_action_immediate_ns      = 100'000'000;
@@ -1317,6 +1319,8 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
             .checkpoint_policy      = {},
         };
     };
+    auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                               pressure_inputs, logical_goal, Planner::Clock::now());
     require(result && result->candidate_index == 1 &&
                 result->diagnostics.targets_evaluated >= 5 &&
                 program.pressure_planning_sessions == 1,
@@ -1324,13 +1328,13 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
 }
 
 void test_infeasible_root_keeps_cached_prefix_search() {
-    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
-
     FakeProgram program;
     program.required_pressure_actions               = 3;
     program.required_pressure_actions_by_candidate = {3, 1};
-    program.pressure_action_immediate_ns            = 0;
-    program.pressure_action_degradation_units      = 0;
+    program.required_action_id                     = 1'008;
+    program.require_required_action_even_with_eviction = true;
+    program.pressure_action_immediate_ns           = 0;
+    program.pressure_action_degradation_units     = 0;
 
     FakeAdmissionCandidate root;
     root.identity.machine.minimum_request_ns = 1'000;
