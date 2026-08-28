@@ -172,6 +172,7 @@ public:
             pressure.shared_owner_ordinals);
 
         bool has_incumbent = false;
+        std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
         Incumbent incumbent;
         if (identity_best) {
             incumbent = *identity_best;

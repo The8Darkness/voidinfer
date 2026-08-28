@@ -62,6 +62,21 @@ int main() {
         failures += check(alternate_case_rejected,
                           "request log accepted an alternate-case model artifact path");
     }
+    {
+        const std::filesystem::path directory =
+            std::filesystem::temp_directory_path() / "ninfer-request-log-missing-case-test";
+        const std::filesystem::path artifact = directory / "Missing-Artifact.NINFER";
+        const std::filesystem::path alternate = directory / "missing-artifact.ninfer";
+        std::filesystem::remove_all(directory);
+        std::filesystem::create_directories(directory);
+        bool missing_alternate_case_rejected = false;
+        try {
+            JsonlRequestLog unsafe(alternate.string(), artifact.string());
+        } catch (const std::invalid_argument&) { missing_alternate_case_rejected = true; }
+        failures += check(missing_alternate_case_rejected,
+                          "request log accepted alternate-case missing artifact path");
+        std::filesystem::remove_all(directory);
+    }
 #endif
 
     ServeOptions options;

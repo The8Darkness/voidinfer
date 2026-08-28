@@ -1449,6 +1449,75 @@ void test_future_loss_weights_cache_observations() {
             "future recovery loss ignored checkpoint hit observations");
 }
 
+void test_future_loss_hit_cap_and_epoch_boundary() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+
+    const auto run = [](std::uint64_t selected_hit_count, std::uint64_t last_hit_epoch,
+                        std::uint64_t latest_hit_epoch) {
+        FakeProgram program;
+        program.required_pressure_actions    = 1;
+        program.require_evictions            = true;
+        program.pressure_action_immediate_ns = 0;
+
+        FakeAdmissionCandidate candidate;
+        candidate.identity.machine.minimum_request_ns = 1'000;
+        candidate.identity.machine.immediate_ns       = 1'000;
+        candidate.identity.physical_status =
+            ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+        candidate.identity.expandable        = true;
+        candidate.identity.assessment_digest = 42;
+        const std::array<Planner::CandidateInput, 1> candidates{
+            Planner::CandidateInput{.candidate = &candidate, .stable_ordinal = 0},
+        };
+
+        FakeContinuationHandle owner{9, 0};
+        const std::array<const FakeContinuationHandle*, 1> private_owners{&owner};
+        const std::array<std::uint32_t, 1> private_ordinals{0};
+        const std::array<ninfer::runtime::MaterializationOwnerPolicy, 1> owner_policy{
+            ninfer::runtime::MaterializationOwnerPolicy{
+                .ordinal        = 0,
+                .last_hit_epoch = latest_hit_epoch,
+            },
+        };
+        const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 1> checkpoint_policy{
+            ninfer::runtime::MaterializationCheckpointPolicy{
+                .owner_ordinal      = 0,
+                .checkpoint         = CheckpointRef{
+                    .kind = CheckpointKind::SessionEndpoint, .frontier = 16, .ordinal = 0},
+                .retention_class    = RetentionClass::RecentPrivate,
+                .selected_hit_count = selected_hit_count,
+                .last_hit_epoch     = last_hit_epoch,
+            },
+        };
+        const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+            return Planner::PressureInputs{
+                .private_owners         = private_owners,
+                .private_owner_ordinals = private_ordinals,
+                .owner_policy           = owner_policy,
+                .checkpoint_policy      = checkpoint_policy,
+            };
+        };
+        const auto logical_goal = [](std::uint32_t, ClaimDisposition,
+                                     std::span<const ninfer::runtime::PressureOwnerOutcome>)
+            -> std::optional<Planner::LogicalGoal> {
+            return Planner::LogicalGoal{.publication_slot = 0};
+        };
+
+        Planner planner;
+        auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                                   pressure_inputs, logical_goal, Planner::Clock::now());
+        require(result.has_value(), "future-loss cap scenario produced no plan");
+        return result->diagnostics.predicted_future_loss_ns;
+    };
+
+    const std::uint64_t capped_recent = run(15, 10, 25);
+    const std::uint64_t saturated_recent = run(std::numeric_limits<std::uint64_t>::max(), 10, 25);
+    const std::uint64_t epoch_boundary = run(15, 10, 26);
+    require(capped_recent == 6'500 && saturated_recent == capped_recent &&
+                epoch_boundary == 6'400,
+            "future-loss hit cap or epoch boundary changed the recovery weight");
+}
+
 void test_feasible_identity_expands_when_pressure_can_remove_copy() {
     using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
 
@@ -2036,6 +2105,8 @@ int main() {
              test_infeasible_root_keeps_cached_prefix_search);
     run_test("future loss weights cache observations",
              test_future_loss_weights_cache_observations);
+    run_test("future loss hit cap and epoch boundary",
+             test_future_loss_hit_cap_and_epoch_boundary);
     run_test("feasible identity pressure improvement",
              test_feasible_identity_expands_when_pressure_can_remove_copy);
     run_test("dominating identity fast path",
