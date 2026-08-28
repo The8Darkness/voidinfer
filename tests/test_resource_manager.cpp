@@ -1328,6 +1328,7 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
 }
 
 void test_infeasible_root_keeps_cached_prefix_search() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
     FakeProgram program;
     program.required_pressure_actions               = 3;
     program.required_pressure_actions_by_candidate = {3, 1};
@@ -1398,6 +1399,7 @@ void test_future_loss_weights_cache_observations() {
     FakeProgram program;
     program.required_pressure_actions    = 1;
     program.pressure_action_immediate_ns = 0;
+    program.require_evictions            = true;
 
     FakeAdmissionCandidate candidate;
     candidate.identity.machine.minimum_request_ns = 1'000;

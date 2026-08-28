@@ -352,6 +352,7 @@ public:
 
         const std::uint64_t search_elapsed_ns        = elapsed_ns(search_started, Clock::now());
         PressureTargetAssessment selected_assessment = session.assess(incumbent.target);
+        ++targets_evaluated;
         planning_saturating_add(projection_work, selected_assessment.projection_work);
         const FoldedCost selected_cost =
             fold_assessment(candidates[incumbent.candidate_index], selected_assessment,
