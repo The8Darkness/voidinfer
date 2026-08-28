@@ -5,15 +5,15 @@
 VoidInfer is the public project name for this Windows-focused fork of NInfer. NInfer-windows is a
 Windows 11 port of [Neroued/ninfer](https://github.com/Neroued/ninfer), a from-scratch C++/CUDA inference
 engine for explicitly registered Qwen checkpoints on a single NVIDIA GeForce RTX 5090.
-It runs text, image, and video prompts through a local CLI, OpenAI-/Anthropic-compatible HTTP APIs, 
-or the included llama.cpp webui. It builds and runs natively on Windows 11 x64. Fork changes should 
+It runs text, image, and video prompts through a local CLI, OpenAI-/Anthropic-compatible HTTP APIs,
+or the included llama.cpp webui. It builds and runs natively on Windows 11 x64. Fork changes should
 also build/run on 64-bit Linux but nothing has been tested there.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
 
 | Model | Weights | NInfer artifact | Size | SHA-256 |
-|---|---|---|---:|---|
+| --- | --- | --- | ---: | --- |
 | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
 | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 18,324,064,000 bytes (17.07 GiB) | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
 | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes (16.96 GiB) | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
@@ -82,7 +82,7 @@ the configured concurrency. MTP acceptance is aggregated over the complete reque
 concurrency cell reports `decode tok/s / MTP acceptance`; profiles should be read independently.
 
 | Model profile | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept | C8 / C1 |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | Qwen3.6-27B `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% | 2.88× |
 | Qwen3.6-27B `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% | 5.67× |
 | Qwen3.6-35B-A3B `groupwise-int` | 593.0 / 67.2% | 877.7 / 68.2% | 1,166.0 / 69.8% | 1,313.8 / 67.3% | 2.22× |
@@ -141,15 +141,18 @@ and per-fixture results.
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
 
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
-|---|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
-| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | — | — | 88.38% |
+| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
+| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
+| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
+| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
 
-The Qwen3.8-27B groupwise-int profile has not yet been added to this published evaluation campaign;
-the Qwen3.8-27B NVFP4 profile currently reports GPQA-Diamond only.
+The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8-27B rows used
+temperature 1.0 and presence penalty 0.0. The multimodal columns (ERQA and RealWorldQA) ran with
+`--vision` at a 81,920-token context limit; the text columns used a 262,144-token limit except
+Qwen3.8-27B NVFP4, which needs 252,928 to fit the RTX 5090 after weights.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
@@ -329,10 +332,10 @@ Transformers checkpoint, Safetensors distribution, or GGUF file.
 
 Each artifact is complete, while GPU residency is fixed at process startup. Speculative decoding is
 disabled by default, so MTP/DFlash state and the optimized proposal head are not uploaded.
-Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
-request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
-accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
-available only for the 35B-A3B target and is text-only.
+Vision is also disabled by default, so its weights and Vision-specific unified-workspace extent are
+omitted. Add `--vision` to the CLI or server process that must accept image or video input. Disabled
+capabilities cannot be enabled by a later request. DFlash is available only for the 35B-A3B target
+and is text-only.
 
 ## Run the CLI
 
@@ -394,14 +397,15 @@ state, and function calls) plus Anthropic Messages, token counting, and multimod
 All three registered model IDs support:
 
 - text generation with thinking and non-thinking prompt modes;
+- tokenizer-derived Qwen thinking caps through CLI or a server process default;
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill and CUDA Graph decode;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
-- BF16 and INT8 group-64 KV cache;
+- BF16, INT8 group-64, and row-scaled FP8 E4M3 KV cache;
 - model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
   top-k, top-p, min-p, and presence/frequency-penalty overrides;
-- compatible-prefix reuse;
+- private and shared compatible-prefix reuse with optional Host-backed retained State/KV;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
   usage accounting;
 - prompt-rendered function tools and parsed tool calls.
@@ -418,7 +422,8 @@ from one to fifteen.
   Decode-ready requests are compacted at round boundaries and executed in one batched model
   traversal.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
-  multi-GPU execution, CPU/GPU offload, or distributed serving.
+  active-request swapping, weight offload, multi-GPU execution, or distributed serving. Inactive
+  retained context may use explicitly configured pinned Host State/KV backing.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
   models' native 262,144-token limit. `--kv-capacity N` explicitly sizes the shared Main Text KV
   pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable
@@ -430,6 +435,11 @@ from one to fifteen.
 
 ## Documentation
 
+- [Muse Spark 1.2 Contributor master prompt](MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md)
+- [Current project state and agent handoff](PROJECT_STATE.md)
+- [Known issues and blockers](KNOWN_ISSUES.md)
+- [Experiment log](EXPERIMENTS.md)
+- [Upstream audit](UPSTREAM_AUDIT.md)
 - [Contributing](CONTRIBUTING.md)
 - [Documentation index](docs/README.md)
 - [CLI](docs/cli.md)

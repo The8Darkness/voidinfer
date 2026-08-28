@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "artifact_type": "ninfer_local_baseline_summary",
+  "classification": "LOCAL_MEASUREMENT",
+  "timestamp_utc": "2026-08-27T16:00:00Z",
+  "project": "VoidInfer / NInfer native Windows RTX 5090",
+  "source": {
+    "base_commit": "21de38d7a8",
+    "working_tree": "committed phase-2 handoff checkpoint",
+    "build_dir": "build-windows-phase7",
+    "configuration": "Visual Studio 17 2022 x64 Release, CUDA 13.1, sm_120a"
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "driver": "616.56",
+    "cuda_toolkit": "13.1.80"
+  },
+  "artifact": {
+    "path": "models/Qwen3.8-27B-NVFP4-Ninfer/qwen3_8_27b_nvfp4.ninfer",
+    "bytes": 21492695040,
+    "sha256": "bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32",
+    "model_id": "qwen3_8_27b",
+    "weights_id": "nvfp4"
+  },
+  "verification": {
+    "build": "cmake --build build-windows-phase7 --config Release -j",
+    "ctest": {
+      "command": "ctest --test-dir build-windows-phase7 -C Release --output-on-failure",
+      "passed": 89,
+      "skipped": 5,
+      "failed": 0,
+      "skipped_tests": [
+        "qwen3_6_27b_prefix_real_test (no Qwen3.6 artifact in default environment)",
+        "qwen3_6_27b_load_plan_test",
+        "qwen3_6_35b_a3b_real_test",
+        "qwen3_6_35b_a3b_dflash_real_test",
+        "qwen3_6_35b_a3b_dflash_load_plan_test"
+      ]
+    },
+    "qwen38_resource_route": {
+      "command": "set NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=<artifact> && build-windows-phase7\\tests\\Release\\ninfer_qwen3_6_27b_prefix_real_test.exe",
+      "passed": true,
+      "scope": "real Qwen3.8 NVFP4 Engine resource-settlement route; direct executable invocation avoids the Windows CTest environment not inheriting the variable"
+    },
+    "python": {
+      "command": "PYTHONPATH=eval python -m pytest -q tests/test_bench_matrix.py tests/test_serve_corpus.py eval/tests/test_evalscope_backend.py",
+      "passed": 14,
+      "failed": 0
+    }
+  },
+  "benchmarks": {
+    "core_matrix": {
+      "command": "tools/bench/run_ninfer_bench_matrix.py --preset core --no-build --bench build-windows-phase7/bench/Release/ninfer_bench.exe --weights <artifact>",
+      "cases": 43,
+      "report": "profiles/bench/qwen38-nvfp4-core-20260826/summary.csv",
+      "selected_prefill_tok_s": {
+        "128": 4830.256254,
+        "4096": 9338.030642,
+        "8192": 7820.06058,
+        "16384": 7517.377598
+      },
+      "selected_c1_mtp3_graph_decode_tok_s": {
+        "16": 133.9723824,
+        "64": 152.5671158,
+        "128": 162.8118716,
+        "512": 146.3124593,
+        "2048": 172.3337068
+      },
+      "selected_c1_mtp5_graph_decode_tok_s": {
+        "16": 108.4222441,
+        "64": 113.6682243,
+        "128": 107.992907,
+        "512": 112.8900842,
+        "2048": 151.1783838
+      },
+      "note": "Single-request C1 benchmark; not an aggregate C2/C4/C8 claim."
+    },
+    "long_prefill_fp8": [
+      {
+        "tokens": 252928,
+        "prefill_tok_s": 2458.639656,
+        "prefill_seconds": 102.8731475,
+        "kv_payload_bytes": 8352694272,
+        "report": "profiles/bench/qwen38-nvfp4-252928-fp8-20260826.json"
+      },
+      {
+        "tokens": 262144,
+        "prefill_tok_s": 2373.991119,
+        "prefill_seconds": 110.423328,
+        "kv_payload_bytes": 8657043456,
+        "report": "profiles/bench/qwen38-nvfp4-262144-fp8-20260826.json"
+      }
+    ],
+    "serving": [
+      {
+        "profile": "text-only",
+        "command": "tools/smoke/serve_contract.py --model qwen3.8-27b --skip-media",
+        "passed": true,
+        "report": "profiles/bench/qwen38-nvfp4-text-smoke-20260826"
+      },
+      {
+        "profile": "vision-enabled",
+        "command": "tools/smoke/serve_contract.py --model qwen3.8-27b",
+        "passed": true,
+        "report": "profiles/bench/qwen38-nvfp4-vision-smoke-20260826"
+      }
+    ],
+    "concurrent_decode": {
+      "classification": "LOCAL_MEASUREMENT",
+      "command": "tools/bench/run_serve_concurrency.py --suite decode-saturation --sampling greedy --decode-tokens 1024",
+      "kv_capacity_tokens": {"C1": 4096, "C2": 8192, "C4": 16384, "C8": 32768},
+      "steady_decode_tokens_per_second": {
+        "mtp0": {"C1": 80.4, "C2": 157.4560545, "C4": 292.8690203, "C8": 538.5062421},
+        "mtp3": {"C1": 171.7, "C2": 329.7509079, "C4": 568.1626944, "C8": 1046.8478188}
+      },
+      "reports": [
+        "profiles/bench/qwen38-concurrency-20260827-c1",
+        "profiles/bench/qwen38-concurrency-20260827-c2",
+        "profiles/bench/qwen38-concurrency-20260827-c4",
+        "profiles/bench/qwen38-concurrency-20260827-c8"
+      ],
+      "note": "Decode-saturation reports use complete full-batch throughput intervals; C1-C8 are separate startups because shared KV capacity is sized per active-request count."
+    },
+    "serving_corpus": {
+      "classification": "LOCAL_MEASUREMENT",
+      "mtp0": {
+        "requests": 20,
+        "report": "profiles/bench/qwen38-serve-corpus-20260827-mtp0/summary.csv",
+        "context_profile": {
+          "7680": {"prefill_tok_s": 8930.8471, "ttft_ms": 863.8439, "decode_tok_s": 76.0897},
+          "64512": {"prefill_tok_s": 4878.4708, "ttft_ms": 13317.5651, "decode_tok_s": 63.6328},
+          "130048": {"prefill_tok_s": 3365.8223, "ttft_ms": 38704.2211, "decode_tok_s": 63.7586},
+          "260096": {"prefill_tok_s": 2170.2442, "ttft_ms": 119957.8220, "decode_tok_s": 56.0052}
+        }
+      },
+      "mtp3": {
+        "requests": 75,
+        "report": "profiles/bench/qwen38-serve-corpus-20260827/summary.csv",
+        "long_decode_decode_tok_s": {"aime26_01": 227.2297, "aime26_15": 144.5321, "aime26_30": 150.7278},
+        "scenario_decode_tok_s": {"code": 184.7440, "story": 138.5377, "translation": 186.3522, "structured": 205.8773},
+        "scenario_speculative_tokens_per_round": {"code": 3.3288, "story": 2.4901, "translation": 3.3453, "structured": 3.7555}
+      },
+      "note": "The corpus validates request/log counters and behavior under fixed greedy fixtures; it is not a full task-success, answer-quality, or VLM score suite."
+    },
+    "context_cost_transfer": {
+      "accepted": false,
+      "reports": [
+        "profiles/bench/qwen38-context-cost-transfer-20260826.json",
+        "profiles/bench/qwen38-context-cost-transfer-20260826-rerun.json"
+      ],
+      "reason": "single three-coefficient roofline is not stable across the current fragmented D2H/D2D/H2D geometries; compiled conservative defaults remain active",
+      "held_out_p95_relative_error": {
+        "first_run": {"d2d": 0.3365359603, "d2h": 0.4500173489, "h2d": 0.3408737639},
+        "rerun": {"d2d": 0.3466133146, "d2h": 0.3654795067, "h2d": 0.3340767111}
+      }
+    }
+  },
+  "limitations": [
+    "Concurrent decode uses a short fixed wave and does not establish closed-loop agent task completion time or full C2/C4/C8 quality coverage.",
+    "Long-context corpus is repeated synthetic token IDs and is a capacity/prefill measurement, not a quality result.",
+    "No Qwen3.8 DFlash2 artifact is locally verified.",
+    "Five default real-model tests remain skipped because Qwen3.6/35B artifacts are absent."
+  ]
+}

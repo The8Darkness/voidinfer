@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,17 +36,33 @@ def request(base_url: str, method: str, path: str, payload: Any | None = None) -
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
+    url = urllib.parse.urlsplit(base_url + path)
+    hostname = url.hostname
+    if url.scheme not in {"http", "https"} or not url.netloc or hostname is None:
+        raise ContractError(f"unsupported server URL: {base_url!r}")
+    connection_type = (
+        http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    )
+    connection = connection_type(hostname, port=url.port, timeout=300)
+    target = url.path or "/"
+    if url.query:
+        target += f"?{url.query}"
     try:
-        with urllib.request.urlopen(req, timeout=300) as response:
-            return Response(
-                status=response.status,
-                content_type=response.headers.get_content_type(),
-                body=response.read(),
-            )
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise ContractError(f"{method} {path} returned HTTP {error.code}: {detail}") from error
+        connection.request(method, target, body=body, headers=headers)
+        response = connection.getresponse()
+        result = Response(
+            status=response.status,
+            content_type=response.headers.get_content_type(),
+            body=response.read(),
+        )
+    except OSError as error:
+        raise ContractError(f"{method} {path} failed: {error}") from error
+    finally:
+        connection.close()
+    if result.status >= 400:
+        detail = result.body.decode("utf-8", errors="replace")
+        raise ContractError(f"{method} {path} returned HTTP {result.status}: {detail}")
+    return result
 
 
 def json_response(
@@ -73,7 +89,7 @@ def wait_for_health(base_url: str, timeout: float) -> None:
         try:
             if json_response(base_url, "GET", "/health") == {"status": "ok"}:
                 return
-        except (ContractError, urllib.error.URLError) as error:
+        except ContractError as error:
             last_error = error
         time.sleep(0.25)
     raise ContractError(f"server did not become healthy within {timeout:g}s: {last_error}")
@@ -323,7 +339,7 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     return terminal_content, terminal_reasoning, terminal
 
 
-def exercise(base_url: str, model: str) -> dict[str, Any]:
+def exercise(base_url: str, model: str, *, include_media: bool = True) -> dict[str, Any]:
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
     if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:
@@ -456,21 +472,25 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         if deleted != {"id": response_id, "object": "response.deleted", "deleted": True}:
             raise ContractError("Responses delete returned the wrong object")
 
-    image_messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": _IMAGE_DATA_URI}},
-                {"type": "text", "text": "What is visible? Answer briefly."},
-            ],
-        }
-    ]
-    image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
-    image_prompt_tokens, _ = require_usage(
-        image_response.get("usage"), "prompt_tokens", "completion_tokens"
-    )
-    if image_prompt_tokens <= input_tokens:
-        raise ContractError("image request did not expand the prompt through the Vision frontend")
+    image_prompt_tokens: int | None = None
+    if include_media:
+        image_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": _IMAGE_DATA_URI}},
+                    {"type": "text", "text": "What is visible? Answer briefly."},
+                ],
+            }
+        ]
+        image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
+        image_prompt_tokens, _ = require_usage(
+            image_response.get("usage"), "prompt_tokens", "completion_tokens"
+        )
+        if image_prompt_tokens <= input_tokens:
+            raise ContractError(
+                "image request did not expand the prompt through the Vision frontend"
+            )
 
     anthropic = json_response(base_url, "POST", "/v1/messages", anthropic_prompt)
     if anthropic.get("type") != "message" or anthropic.get("role") != "assistant":
@@ -503,12 +523,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:18080")
     parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--skip-media",
+        action="store_true",
+        help="exercise text/protocol endpoints without sending an image request",
+    )
     parser.add_argument("--health-timeout", type=float, default=300.0)
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     wait_for_health(base_url, args.health_timeout)
-    print(json.dumps(exercise(base_url, args.model), ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            exercise(base_url, args.model, include_media=not args.skip_media),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
