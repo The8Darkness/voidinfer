@@ -172,25 +172,41 @@ public:
             pressure.shared_owner_ordinals);
 
         Incumbent incumbent;
-        std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
         if (identity_best) {
             incumbent = *identity_best;
             incumbent.target =
                 session.identity_target(*candidates[incumbent.candidate_index].candidate);
         } else {
-            PressureTargetHandle root_maximal =
-                session.root_maximal_target(*candidates[root_candidate_index].candidate);
-            PressureTargetAssessment assessment = session.assess(root_maximal);
-            ++targets_evaluated;
-            planning_saturating_add(projection_work, assessment.projection_work);
-            std::optional<LogicalGoal> goal;
-            if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
-                goal = logical_goal(root_candidate_index, assessment.source_disposition,
-                                    assessment.owner_outcomes);
+            std::optional<Incumbent> pressure_best;
+            const auto assess_maximal = [&](std::uint32_t candidate_index) {
+                PressureTargetHandle target =
+                    session.root_maximal_target(*candidates[candidate_index].candidate);
+                PressureTargetAssessment assessment = session.assess(target);
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                if (assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
+                    return;
+                }
+                const std::optional<LogicalGoal> goal =
+                    logical_goal(candidate_index, assessment.source_disposition,
+                                 assessment.owner_outcomes);
+                if (!goal) { return; }
+                const FoldedCost cost =
+                    fold_assessment(candidates[candidate_index], assessment,
+                                    pressure.owner_policy, pressure.checkpoint_policy);
+                if (!pressure_best || cost.less(pressure_best->cost)) {
+                    pressure_best = make_incumbent(
+                        target, assessment, candidates[candidate_index], pressure.owner_policy,
+                        pressure.checkpoint_policy, *goal);
+                }
+            };
+            for (std::uint32_t candidate_index = 0;
+                 candidate_index < static_cast<std::uint32_t>(candidates.size());
+                 ++candidate_index) {
+                assess_maximal(candidate_index);
             }
-            if (!goal) { return std::nullopt; }
-            incumbent = make_incumbent(root_maximal, assessment, candidates[root_candidate_index],
-                                       pressure.owner_policy, pressure.checkpoint_policy, *goal);
+            if (!pressure_best) { return std::nullopt; }
+            incumbent = std::move(*pressure_best);
         }
 
         for (const IdentityRoot& root : roots) {
@@ -250,7 +266,7 @@ public:
                 incumbent.cost.total_ns > next.lower_bound_ns
                     ? incumbent.cost.total_ns - next.lower_bound_ns
                     : 0;
-            if (maximum_expansion_ns != 0 && maximum_expansion_ns >= possible_improvement) {
+            if (maximum_expansion_ns != 0 && maximum_expansion_ns > possible_improvement) {
                 stop_reason   = MaterializationStopReason::ValueOfNextExpansion;
                 model_optimal = false;
                 break;
@@ -264,7 +280,7 @@ public:
                 session.discard_expansion(std::move(prepared));
                 interrupted_lower_bound = parent.lower_bound_ns;
                 stop_reason             = MaterializationStopReason::ExpansionCapacity;
-                model_optimal           = false;
+                model_optimal            = false;
                 budget_exhausted        = true;
                 break;
             }
@@ -478,6 +494,45 @@ private:
         return 64;
     }
 
+    // Cache-value observations raise the recovery-loss weight without letting unbounded hit
+    // history dominate the retention class.  Epochs are ranked relative to the current policy
+    // snapshot, so a recent hit is more valuable than an equally popular stale checkpoint.
+    [[nodiscard]] static std::uint64_t
+    future_loss_weight(RetentionClass retention, std::uint64_t selected_hit_count,
+                       std::uint64_t last_hit_epoch, std::uint64_t latest_hit_epoch) noexcept {
+        constexpr std::uint64_t kHitBonusCap   = 15;
+        constexpr std::uint64_t kRecencyWindow = 16;
+        const std::uint64_t hit_factor =
+            1 + std::min(selected_hit_count, kHitBonusCap);
+        const std::uint64_t base = retention_weight(retention);
+        std::uint64_t weight =
+            base > std::numeric_limits<std::uint64_t>::max() / hit_factor
+                ? std::numeric_limits<std::uint64_t>::max()
+                : base * hit_factor;
+        if (last_hit_epoch != 0 && latest_hit_epoch >= last_hit_epoch) {
+            const std::uint64_t age = latest_hit_epoch - last_hit_epoch;
+            if (age < kRecencyWindow) {
+                planning_saturating_add(weight, kRecencyWindow - age);
+            }
+        }
+        return weight;
+    }
+
+    [[nodiscard]] static std::uint64_t
+    latest_policy_hit_epoch(std::span<const MaterializationOwnerPolicy> owner_policies,
+                            std::span<const MaterializationCheckpointPolicy> checkpoint_policies)
+        noexcept {
+        std::uint64_t latest = 0;
+        for (const auto& policy : owner_policies) {
+            latest = std::max(latest, policy.last_hit_epoch);
+        }
+        for (const auto& policy : checkpoint_policies) {
+            latest = std::max(latest, policy.last_hit_epoch);
+        }
+        return latest;
+    }
+
+
     [[nodiscard]] static const MaterializationOwnerPolicy*
     owner_policy_for(std::span<const MaterializationOwnerPolicy> policies,
                      std::uint32_t ordinal) noexcept {
@@ -572,6 +627,8 @@ private:
                 found->target_ns   = std::max(found->target_ns, impact.target_recovery_ns);
             }
         }
+        const std::uint64_t latest_hit_epoch =
+            latest_policy_hit_epoch(owner_policies, checkpoint_policies);
         for (const CombinedImpact& impact : impact_scratch_) {
             if (impact.target_ns <= impact.baseline_ns) { continue; }
             const MaterializationCheckpointPolicy* policy =
@@ -583,19 +640,21 @@ private:
             }
             const RetentionClass retention =
                 policy != nullptr ? policy->retention_class : owner->retention_class;
-            const std::uint64_t delta  = impact.target_ns - impact.baseline_ns;
-            const std::uint64_t weight = retention_weight(retention);
+            const std::uint64_t selected_hits =
+                policy != nullptr ? policy->selected_hit_count : owner->selected_hit_count;
+            const std::uint64_t last_hit_epoch =
+                policy != nullptr ? policy->last_hit_epoch : owner->last_hit_epoch;
+            const std::uint64_t delta = impact.target_ns - impact.baseline_ns;
+            const std::uint64_t weight =
+                future_loss_weight(retention, selected_hits, last_hit_epoch, latest_hit_epoch);
             const std::uint64_t weighted =
                 delta > std::numeric_limits<std::uint64_t>::max() / weight
                     ? std::numeric_limits<std::uint64_t>::max()
                     : delta * weight;
             planning_saturating_add(cost.future_loss_ns, weighted);
-            planning_saturating_add(cost.affected_selected_hits, policy != nullptr
-                                                                     ? policy->selected_hit_count
-                                                                     : owner->selected_hit_count);
+            planning_saturating_add(cost.affected_selected_hits, selected_hits);
             cost.newest_affected_hit_epoch =
-                std::max(cost.newest_affected_hit_epoch,
-                         policy != nullptr ? policy->last_hit_epoch : owner->last_hit_epoch);
+                std::max(cost.newest_affected_hit_epoch, last_hit_epoch);
         }
         cost.total_ns = cost.now_ns;
         planning_saturating_add(cost.total_ns, cost.future_loss_ns);

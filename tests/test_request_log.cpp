@@ -42,6 +42,28 @@ int main() {
     failures += check(protected_artifact_rejected,
                       "request log accepted the model artifact as its output path");
 
+#ifdef _WIN32
+    {
+        const std::filesystem::path directory =
+            std::filesystem::temp_directory_path() / "ninfer-request-log-case-test";
+        const std::filesystem::path artifact = directory / "Model-Artifact.NINFER";
+        const std::filesystem::path alternate = directory / "model-artifact.ninfer";
+        std::filesystem::remove_all(directory);
+        std::filesystem::create_directories(directory);
+        {
+            std::ofstream artifact_file(artifact);
+            artifact_file << "artifact";
+        }
+        bool alternate_case_rejected = false;
+        try {
+            JsonlRequestLog unsafe(alternate.string(), artifact.string());
+        } catch (const std::invalid_argument&) { alternate_case_rejected = true; }
+        std::filesystem::remove_all(directory);
+        failures += check(alternate_case_rejected,
+                          "request log accepted an alternate-case model artifact path");
+    }
+#endif
+
     ServeOptions options;
     options.artifact_path                  = "/models/qwen3_6_27b.ninfer";
     options.host                           = "127.0.0.1";

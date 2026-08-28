@@ -7,6 +7,7 @@
 #include <iostream>
 #include <optional>
 #include <span>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -581,8 +582,13 @@ public:
                             std::span<const std::uint32_t> shared_owner_ordinals);
 
     [[nodiscard]] bool
-    target_feasible(std::span<const FakeTargetDecision> decisions) const noexcept {
-        if (decisions.size() < required_pressure_actions) { return false; }
+    target_feasible(std::span<const FakeTargetDecision> decisions,
+                    std::uint32_t candidate_index) const noexcept {
+        const std::size_t required =
+            candidate_index < required_pressure_actions_by_candidate.size()
+                ? required_pressure_actions_by_candidate[candidate_index]
+                : required_pressure_actions;
+        if (decisions.size() < required) { return false; }
         const bool has_eviction =
             std::any_of(decisions.begin(), decisions.end(),
                         [](const auto& decision) { return decision.evicts_continuation; });
@@ -598,6 +604,11 @@ public:
             return false;
         }
         return true;
+    }
+
+    [[nodiscard]] bool
+    target_feasible(std::span<const FakeTargetDecision> decisions) const noexcept {
+        return target_feasible(decisions, std::numeric_limits<std::uint32_t>::max());
     }
 
     [[nodiscard]] ContextTransactionReserveStatus
@@ -769,6 +780,7 @@ public:
     void invalidate_resources() noexcept { advance_revision(); }
 
     std::size_t required_pressure_actions           = 0;
+    std::vector<std::size_t> required_pressure_actions_by_candidate;
     std::uint32_t private_pressure_alternatives     = 1;
     std::uint64_t pressure_action_immediate_ns      = 100'000'000;
     std::uint32_t pressure_action_degradation_units = 1;
@@ -1045,7 +1057,7 @@ FakePressurePlanningSession::assess(FakePressureTargetHandle handle) {
         digest ^= target.candidate_index;
     }
     return ninfer::runtime::PressureTargetAssessment{
-        .physical_status       = program_->target_feasible(selected)
+        .physical_status       = program_->target_feasible(selected, target.candidate_index)
                                      ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
                                      : ninfer::runtime::MaterializationPhysicalStatus::Infeasible,
         .source_disposition    = candidate.disposition,
@@ -1305,11 +1317,132 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
             .checkpoint_policy      = {},
         };
     };
+    require(result && result->candidate_index == 1 &&
+                result->diagnostics.targets_evaluated >= 5 &&
+                program.pressure_planning_sessions == 1,
+            "equal lower bound bypassed the pressure target that wins the stable tie-break");
+}
+
+void test_infeasible_root_keeps_cached_prefix_search() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+
+    FakeProgram program;
+    program.required_pressure_actions               = 3;
+    program.required_pressure_actions_by_candidate = {3, 1};
+    program.pressure_action_immediate_ns            = 0;
+    program.pressure_action_degradation_units      = 0;
+
+    FakeAdmissionCandidate root;
+    root.identity.machine.minimum_request_ns = 1'000;
+    root.identity.machine.immediate_ns       = 1'000;
+    root.identity.physical_status =
+        ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    root.identity.expandable        = true;
+    root.identity.assessment_digest = 31;
+
+    FakeAdmissionCandidate cached;
+    cached.value.reusable_prompt_tokens = 16;
+    cached.value.prefix_reuse_path      = PrefixReusePath::PrivateEndpoint;
+    cached.private_source_id             = 7;
+    cached.disposition                   = ClaimDisposition::Retained;
+    cached.identity.machine.minimum_request_ns = 1'000;
+    cached.identity.machine.immediate_ns       = 1'000;
+    cached.identity.physical_status =
+        ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    cached.identity.expandable        = true;
+    cached.identity.assessment_digest = 32;
+
+    const std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate = &root, .stable_ordinal = 0},
+        Planner::CandidateInput{.candidate = &cached, .stable_ordinal = 1},
+    };
+    FakeContinuationHandle source_owner{7, 0};
+    FakeContinuationHandle victim_owner{8, 0};
+    const std::array<const FakeContinuationHandle*, 2> private_owners{
+        &source_owner, &victim_owner};
+    const std::array<std::uint32_t, 2> private_ordinals{0, 1};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 2> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.ordinal = 0},
+        ninfer::runtime::MaterializationOwnerPolicy{.ordinal = 1},
+    };
+
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners         = private_owners,
+            .private_owner_ordinals = private_ordinals,
+            .owner_policy           = owner_policy,
+        };
+    };
+    const auto logical_goal = [](std::uint32_t, ClaimDisposition,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+
+    Planner planner;
     auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
                                pressure_inputs, logical_goal, Planner::Clock::now());
+    require(result && result->candidate_index == 1 &&
+                result->diagnostics.targets_evaluated >= 4 &&
+                program.pressure_planning_sessions == 1,
+            "infeasible full-prompt root aborted a feasible cached-prefix pressure search");
+}
 
-    require(result && result->candidate_index == 1 && program.pressure_planning_sessions == 1,
-            "equal lower bound bypassed the pressure target that wins the stable tie-break");
+void test_future_loss_weights_cache_observations() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+
+    FakeProgram program;
+    program.required_pressure_actions    = 1;
+    program.pressure_action_immediate_ns = 0;
+
+    FakeAdmissionCandidate candidate;
+    candidate.identity.machine.minimum_request_ns = 1'000;
+    candidate.identity.machine.immediate_ns       = 1'000;
+    candidate.identity.physical_status =
+        ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    candidate.identity.expandable        = true;
+    candidate.identity.assessment_digest = 41;
+    const std::array<Planner::CandidateInput, 1> candidates{
+        Planner::CandidateInput{.candidate = &candidate, .stable_ordinal = 0},
+    };
+
+    FakeContinuationHandle owner{9, 0};
+    const std::array<const FakeContinuationHandle*, 1> private_owners{&owner};
+    const std::array<std::uint32_t, 1> private_ordinals{0};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 1> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.ordinal = 0},
+    };
+    const CheckpointRef checkpoint{
+        .kind = CheckpointKind::SessionEndpoint, .frontier = 16, .ordinal = 0};
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 1> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner_ordinal      = 0,
+            .checkpoint         = checkpoint,
+            .retention_class    = RetentionClass::RecentPrivate,
+            .selected_hit_count = 2,
+            .last_hit_epoch     = 10,
+        },
+    };
+
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners         = private_owners,
+            .private_owner_ordinals = private_ordinals,
+            .owner_policy           = owner_policy,
+            .checkpoint_policy      = checkpoint_policy,
+        };
+    };
+    const auto logical_goal = [](std::uint32_t, ClaimDisposition,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+
+    Planner planner;
+    auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                               pressure_inputs, logical_goal, Planner::Clock::now());
+    require(result && result->diagnostics.predicted_future_loss_ns == 2'800,
+            "future recovery loss ignored checkpoint hit observations");
 }
 
 void test_feasible_identity_expands_when_pressure_can_remove_copy() {
@@ -1895,6 +2028,10 @@ void test_shortlist_collision_requires_program_exact_verification() {
 int main() {
     run_test("equal lower-bound tie-break",
              test_equal_lower_bound_does_not_short_circuit_tie_break);
+    run_test("infeasible root keeps cached-prefix search",
+             test_infeasible_root_keeps_cached_prefix_search);
+    run_test("future loss weights cache observations",
+             test_future_loss_weights_cache_observations);
     run_test("feasible identity pressure improvement",
              test_feasible_identity_expands_when_pressure_can_remove_copy);
     run_test("dominating identity fast path",

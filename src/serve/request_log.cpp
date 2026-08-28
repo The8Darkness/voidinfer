@@ -13,6 +13,11 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+
+#ifdef _WIN32
+#include <cwchar>
+#endif
+
 #include <utility>
 
 #ifdef _WIN32
@@ -56,6 +61,25 @@ std::filesystem::path normalized_absolute_path(const std::string& value) {
     error.clear();
     path = std::filesystem::absolute(value, error);
     return error ? std::filesystem::path(value).lexically_normal() : path.lexically_normal();
+}
+
+bool protected_paths_match(const std::string& output_path,
+                           const std::string& protected_path) {
+    const std::filesystem::path output   = normalized_absolute_path(output_path);
+    const std::filesystem::path artifact = normalized_absolute_path(protected_path);
+    std::error_code output_error;
+    std::error_code artifact_error;
+    const bool output_exists   = std::filesystem::exists(output, output_error);
+    const bool artifact_exists = std::filesystem::exists(artifact, artifact_error);
+    if (!output_error && !artifact_error && output_exists && artifact_exists) {
+        std::error_code equivalent_error;
+        if (std::filesystem::equivalent(output, artifact, equivalent_error)) { return true; }
+    }
+#ifdef _WIN32
+    return ::_wcsicmp(output.native().c_str(), artifact.native().c_str()) == 0;
+#else
+    return output == artifact;
+#endif
 }
 
 std::string cuda_version_string(int version) {
@@ -1012,7 +1036,7 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
     : path_(path) {
     if (path_.empty()) { return; }
     if (!protected_artifact_path.empty() &&
-        normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
+        protected_paths_match(path_, protected_artifact_path)) {
         throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
     }
     server_instance_id_ = new_server_instance_id();
