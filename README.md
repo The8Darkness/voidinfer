@@ -62,6 +62,7 @@ measurable resource/runtime gate. Negative candidates remain documented as rejec
 | Resource pressure | Bounded continuation search when an incumbent plan exists, reducing pressure-resume planning work without changing the selected contract | The real Qwen3.8 pressure/resume route passes |
 | State and KV ownership | Canonical State/KV resource contracts, device binding, sparse-MoE scan reuse, and successful-warmup readiness gating | Public Engine/resource and readiness tests pass; these are correctness/admission improvements, not unsubstantiated tok/s claims |
 | Measurement discipline | Targeted Nsight Compute kernel inspection and Nsight Systems end-to-end traces on the RTX 5090 | Nsight Systems 2026.4.1 traces are available; Nsight Compute 2026.2.1 is installed, but hardware-counter access is blocked in the current Windows session by `ERR_NVGPUCTRPERM` |
+| Hierarchical VeriCache (experimental) | Opt-in NVFP4 DFlash2 L0 with a protected recent-token BF16 sidecar, nested KV/GDN transactions, adaptive fallback horizon, and truthful host-tier accounting | Focused append/attention/state tests pass; the post-specialization DFlash round is 26.9 ms without the sidecar and 28.4 ms with 64 protected recent tokens at context 2,048, with the same measured acceptance. Independent host L1/L2 output verification is not claimed yet |
 
 The main implementation points are [src/ops/linear/fp8/](src/ops/linear/fp8/),
 [include/ninfer/ops/causal_conv1d_silu.h](include/ninfer/ops/causal_conv1d_silu.h),
@@ -82,6 +83,40 @@ The locally present artifact with a DSpark-oriented filename identifies itself a
 Qwen3.8 `groupwise-int` profile, so it is not treated as a DSpark or DFlash2 validation artifact.
 An E2E DFlash2/DSpark claim remains gated on a correctly converted artifact, quality/parity checks,
 and a real Qwen3.8 serving measurement.
+
+### Hierarchical VeriCache research track
+
+The isolated experimental branch
+[`exp/hierarchical-vericache-20260830`](https://github.com/The8Darkness/voidinfer/tree/exp/hierarchical-vericache-20260830)
+keeps the stable cache route unchanged unless `EngineOptions::hierarchical_vericache.enabled` is
+set. Its current control plane models L0 VRAM compressed speculation, L1 pinned NVFP4/FP8 mirrors,
+L2 host FP16 KV plus protected GDN state, and an L3 cold manifest that is never allowed into the
+frequent verifier path. DFlash2's exact target remains the correctness fallback while host-tier
+consumers are developed; compression therefore affects proposal acceptance, not final greedy output.
+
+Implemented in this track:
+
+- direct NVFP4 local attention consumption without a dequantized KV tensor;
+- an opt-in BF16 sidecar for protected recent local-KV tokens, with append, copy, and attention
+  coverage and compile-time removal of its branch when disabled;
+- nested speculative transactions covering DFlash/MTP KV frontiers and Qwen3.8 GDN state;
+- adaptive 24–64 L0→L1 and 256–2,048 L1→L2 horizon controls, with exact-target fallback metrics
+  kept separate from real host-verifier counters;
+- reuse of the existing pinned StateImage, host FP16 KV extent store, prefix/state DAG, and COW
+  ownership machinery for tier accounting and future asynchronous promotion.
+
+The first physical RTX 5090 comparison at context 2,048, DFlash2 `k=7`, batch 1, no CUDA Graph,
+and three measured rounds was:
+
+| L0 configuration | GPU round | Wall round | Published tok/s | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| NVFP4, no protected sidecar | 26.93 ms | 26.93 ms | 123.8 | 33.3% |
+| NVFP4 + 64 recent BF16 tokens | 28.42 ms | 28.43 ms | 117.2 | 33.3% |
+
+These are research measurements, not multiplicative claims. The host-tier counters remain zero in
+this round benchmark because no host checkpoint is materialized; L1/L2 output verification,
+NVFP4/FP8 host mirrors, NVMe persistence, greedy equality, sampling-quality, vision, and 262K/
+multi-agent workload matrices remain gated on their dedicated benchmark paths.
 
 Rejected experiments include FP8 KV, fixed MTP5, proposal-head and graph-boundary variants,
 several NVFP4/FP8 schedule changes, and alternate vocabulary-GEMM crossovers. They either lost

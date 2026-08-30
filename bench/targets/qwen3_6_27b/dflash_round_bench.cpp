@@ -438,6 +438,14 @@ int run(const Options& options) {
               << '\n';
     std::cout << "vericache_l0_l1_checks," << vericache_stats.vericache_l0_l1_checks << '\n';
     std::cout << "vericache_l1_l2_checks," << vericache_stats.vericache_l1_l2_checks << '\n';
+    std::cout << "vericache_exact_target_checks," << vericache_stats.vericache_exact_target_checks
+              << '\n';
+    std::cout << "vericache_exact_target_proposed_tokens,"
+              << vericache_stats.vericache_exact_target_proposed_tokens << '\n';
+    std::cout << "vericache_exact_target_accepted_tokens,"
+              << vericache_stats.vericache_exact_target_accepted_tokens << '\n';
+    std::cout << "vericache_exact_target_disagreements,"
+              << vericache_stats.vericache_exact_target_disagreements << '\n';
     std::cout << "vericache_speculative_rounds," << vericache_stats.vericache_speculative_rounds
               << '\n';
     std::cout << "vericache_speculative_rollbacks,"

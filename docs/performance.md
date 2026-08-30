@@ -1,5 +1,29 @@
 # Single-GPU serving performance
 
+## Hierarchical VeriCache experiment
+
+The isolated branch `exp/hierarchical-vericache-20260830` is an opt-in research path for the
+Qwen3.8-27B DFlash2/NVFP4 profile. It treats compressed L0 errors as speculative rejection effects
+and retains the exact target as the correctness fallback. The current implementation has nested
+KV/GDN transactions, adaptive L0→L1 (24–64) and L1→L2 (256–2,048) controls, direct NVFP4 attention,
+and a protected recent-token sidecar. Existing pinned StateImage and host FP16 KV stores are used
+for truthful L1/L2 residency accounting; they are not yet an independent host output verifier.
+
+RTX 5090 smoke comparison, batch 1, context 2,048, DFlash2 `k=7`, no CUDA Graph, three measured
+rounds:
+
+| L0 configuration | GPU round | Wall round | Published tok/s | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| NVFP4, no protected sidecar | 26.93 ms | 26.93 ms | 123.8 | 33.3% |
+| NVFP4 + 64 recent BF16 tokens | 28.42 ms | 28.43 ms | 117.2 | 33.3% |
+
+The protected sidecar is retained for quality protection despite its measured overhead; it is not
+represented as a speedup. In this smoke path exact-target fallback recorded 4 checks, 28 proposed
+tokens, 7 accepted draft tokens, and 4 disagreements, adapting the tentative L0→L1 horizon to 24.
+L1/L2 verifier counters and L3 bytes were zero because the benchmark did not materialize a host
+checkpoint. Full C1/C2/C4/C8, 8K–262K, coding/reasoning/tool/JSON/retrieval/vision, persistence,
+greedy-equality, sampling-quality, PCIe-overlap, and multi-agent prefix-reuse results are pending.
+
 Tested Git revisions:
 
 - Qwen3.8-27B NVFP4 MTP0 context-length serving:

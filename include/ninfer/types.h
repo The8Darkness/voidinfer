@@ -788,6 +788,12 @@ struct RuntimeStats {
     std::uint64_t vericache_l1_l2_proposed_tokens       = 0;
     std::uint64_t vericache_l1_l2_accepted_tokens       = 0;
     std::uint64_t vericache_l1_l2_disagreements         = 0;
+    // The current DFlash/MTP route still verifies against the exact target on the GPU. Keep that
+    // path separate from L0/L1 and L1/L2 host-tier verification until those consumers are attached.
+    std::uint64_t vericache_exact_target_checks          = 0;
+    std::uint64_t vericache_exact_target_proposed_tokens = 0;
+    std::uint64_t vericache_exact_target_accepted_tokens = 0;
+    std::uint64_t vericache_exact_target_disagreements   = 0;
     std::uint64_t vericache_speculative_rounds          = 0;
     std::uint64_t vericache_speculative_rollbacks       = 0;
     std::uint64_t vericache_nested_commits              = 0;

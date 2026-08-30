@@ -172,23 +172,30 @@ void sliding_window_attention_nvfp4_launch(
     }
     const dim3 grid(static_cast<unsigned>(q.ne[2] * q.ne[1]),
                     static_cast<unsigned>(q.ne[3]), 1);
-    sliding_window_attention_nvfp4_kernel<<<grid, 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data),
-        static_cast<const __nv_bfloat16*>(query_k.data),
-        static_cast<const __nv_bfloat16*>(query_v.data),
-        static_cast<const std::int32_t*>(positions.data),
-        static_cast<const std::int32_t*>(valid_columns.data),
-        static_cast<const std::int32_t*>(lanes.data),
-        static_cast<const std::uint8_t*>(context.k.data),
-        static_cast<const std::uint8_t*>(context.v.data),
-        static_cast<const std::uint8_t*>(context.k_scale.data),
-        static_cast<const std::uint8_t*>(context.v_scale.data),
-        static_cast<const __nv_bfloat16*>(context.protected_k.data),
-        static_cast<const __nv_bfloat16*>(context.protected_v.data),
-        static_cast<int>(context.padded_capacity), max_context, window,
-        static_cast<int>(context.protected_capacity),
-        static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
-        static_cast<__nv_bfloat16*>(out.data));
+    const auto launch = [&]<bool HasProtected>() {
+        sliding_window_attention_nvfp4_kernel<HasProtected><<<grid, 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data),
+            static_cast<const __nv_bfloat16*>(query_k.data),
+            static_cast<const __nv_bfloat16*>(query_v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<const std::int32_t*>(lanes.data),
+            static_cast<const std::uint8_t*>(context.k.data),
+            static_cast<const std::uint8_t*>(context.v.data),
+            static_cast<const std::uint8_t*>(context.k_scale.data),
+            static_cast<const std::uint8_t*>(context.v_scale.data),
+            static_cast<const __nv_bfloat16*>(context.protected_k.data),
+            static_cast<const __nv_bfloat16*>(context.protected_v.data),
+            static_cast<int>(context.padded_capacity), max_context, window,
+            static_cast<int>(context.protected_capacity),
+            static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
+            static_cast<__nv_bfloat16*>(out.data));
+    };
+    if (context.protected_capacity != 0) {
+        launch.template operator()<true>();
+    } else {
+        launch.template operator()<false>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

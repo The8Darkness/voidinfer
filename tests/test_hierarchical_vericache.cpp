@@ -23,9 +23,11 @@ void test_adaptive_windows() {
     assert(controller.l0_to_l1_horizon() == 8);
     controller.observe_l0_to_l1(8, 0, true, true);
     assert(controller.l0_to_l1_horizon() == 6);
+    controller.observe_exact_target_fallback(6, 2, true, true);
+    assert(controller.l0_to_l1_horizon() == 4);
     for (int i = 0; i < 4; ++i) { controller.observe_l0_to_l1(6, 6, false, false); }
-    assert(controller.l0_to_l1_horizon() == 7);
-    assert(controller.next_l0_to_l1_boundary(100) == 107);
+    assert(controller.l0_to_l1_horizon() == 5);
+    assert(controller.next_l0_to_l1_boundary(100) == 105);
     assert(controller.next_l1_to_l2_boundary(100) == 612);
 
     RuntimeStats stats;
@@ -33,6 +35,10 @@ void test_adaptive_windows() {
     assert(stats.hierarchical_vericache_enabled);
     assert(stats.vericache_l0_l1_checks == 5);
     assert(stats.vericache_l0_l1_disagreements == 1);
+    assert(stats.vericache_exact_target_checks == 1);
+    assert(stats.vericache_exact_target_proposed_tokens == 6);
+    assert(stats.vericache_exact_target_accepted_tokens == 2);
+    assert(stats.vericache_exact_target_disagreements == 1);
 }
 
 void test_protection_ledger() {

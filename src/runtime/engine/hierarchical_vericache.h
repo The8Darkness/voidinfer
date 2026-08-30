@@ -374,6 +374,18 @@ public:
         l1_l2_transfer_seconds_ += transfer_seconds;
     }
 
+    // DFlash2 currently verifies every proposed block against the exact target on the GPU. Keep
+    // that path visible as a fallback rather than mislabeling it as host-tier verification, while
+    // still feeding observed disagreement into the L0-to-L1 horizon controller.
+    void observe_exact_target_fallback(std::uint32_t proposed, std::uint32_t accepted,
+                                       bool disagreement, bool rollback) noexcept {
+        observe_window(l0_l1_, proposed, accepted, disagreement, rollback);
+        ++exact_target_checks_;
+        exact_target_proposed_ += proposed;
+        exact_target_accepted_ += std::min(proposed, accepted);
+        exact_target_disagreements_ += disagreement ? 1U : 0U;
+    }
+
     void record_speculative_round() noexcept { ++speculative_rounds_; }
     void record_speculative_rollback() noexcept { ++speculative_rollbacks_; }
     void record_transactions(std::uint64_t commits, std::uint64_t rollbacks,
@@ -407,6 +419,10 @@ public:
         stats.vericache_l1_l2_proposed_tokens = l1_l2_proposed_;
         stats.vericache_l1_l2_accepted_tokens = l1_l2_accepted_;
         stats.vericache_l1_l2_disagreements = l1_l2_disagreements_;
+        stats.vericache_exact_target_checks = exact_target_checks_;
+        stats.vericache_exact_target_proposed_tokens = exact_target_proposed_;
+        stats.vericache_exact_target_accepted_tokens = exact_target_accepted_;
+        stats.vericache_exact_target_disagreements = exact_target_disagreements_;
         stats.vericache_speculative_rounds = speculative_rounds_;
         stats.vericache_speculative_rollbacks = speculative_rollbacks_;
         stats.vericache_nested_commits = nested_commits_;
@@ -471,6 +487,10 @@ private:
     std::uint64_t l1_l2_disagreements_ = 0;
     std::uint64_t l1_l2_transfer_bytes_ = 0;
     double l1_l2_transfer_seconds_ = 0.0;
+    std::uint64_t exact_target_checks_ = 0;
+    std::uint64_t exact_target_proposed_ = 0;
+    std::uint64_t exact_target_accepted_ = 0;
+    std::uint64_t exact_target_disagreements_ = 0;
     std::uint64_t speculative_rounds_ = 0;
     std::uint64_t speculative_rollbacks_ = 0;
     std::uint64_t nested_commits_ = 0;

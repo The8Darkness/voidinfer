@@ -23,6 +23,13 @@ The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, 
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
 have a private prefill/decode loop and does not call target implementation interfaces.
 
+The Qwen3.8-27B experimental DFlash2 round executable
+`ninfer_qwen3_6_27b_dflash_round_bench` additionally exposes the opt-in Hierarchical VeriCache
+research path. It reports direct-NVFP4 L0 timing, protected-recent sidecar configuration, nested
+KV/GDN transaction activity, exact-target fallback acceptance, and occupied host-tier bytes. The
+current host L1/L2 values are intentionally zero unless the run materializes host checkpoints;
+they must not be interpreted as an independent verifier result.
+
 The matrix contains three independently measured test kinds:
 
 - `pp{P}` prepares `P` tokens and requests one output token. This is the smallest request that runs

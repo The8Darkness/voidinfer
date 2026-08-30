@@ -8385,6 +8385,33 @@ qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept 
 
 void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) const noexcept {
     hierarchical_vericache.populate(out);
+    if (!hierarchical_vericache.enabled()) { return; }
+
+    // Reuse the existing pinned StateImage and host KV stores for truthful tier accounting. The
+    // compressed DFlash portion of a host StateImage is the L1 NVFP4 mirror; its remaining
+    // payload is high-precision GDN/continuation state for L2. Host KV pages are authoritative
+    // L2 attention storage. L3 remains zero until a cold-store writer is attached.
+    std::size_t l1_bytes = 0;
+    std::size_t l2_bytes = 0;
+    if (host_state_images != nullptr) {
+        const auto& layout = host_state_images->layout();
+        std::size_t local_bytes = 0;
+        const auto add_optional = [&local_bytes](const auto& region) {
+            if (region) { local_bytes += region->bytes; }
+        };
+        add_optional(layout.dflash_local_k);
+        add_optional(layout.dflash_local_v);
+        add_optional(layout.dflash_local_k_scale);
+        add_optional(layout.dflash_local_v_scale);
+        add_optional(layout.dflash_local_protected_k);
+        add_optional(layout.dflash_local_protected_v);
+        const std::size_t occupied = host_state_images->occupied();
+        l1_bytes = local_bytes * occupied;
+        l2_bytes = (layout.image_bytes - local_bytes) * occupied;
+    }
+    if (host_kv_arena != nullptr) { l2_bytes += host_kv_arena->occupied_bytes(); }
+    out.vericache_l1_bytes = l1_bytes;
+    out.vericache_l2_bytes = l2_bytes;
 }
 
 void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence,
@@ -10744,6 +10771,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+            }
+            if (hierarchical_vericache.enabled() && extent != 0) {
+                const bool disagreement = accepted_i < static_cast<std::int32_t>(extent);
+                hierarchical_vericache.observe_exact_target_fallback(
+                    extent, static_cast<std::uint32_t>(accepted_i), disagreement, disagreement);
             }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{

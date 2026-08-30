@@ -9,7 +9,7 @@ and run the CLI or HTTP server.
 | --- | --- |
 | [CLI](cli.md) | text, chat history, image/video input, output streams, sampling, MTP, and runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, and authentication |
-| [Performance](performance.md) | Qwen3.8-27B throughput, context, MTP measurements, and reproduction commands |
+| [Performance](performance.md) | Qwen3.8-27B throughput, context, MTP, DFlash2, and Hierarchical VeriCache measurements |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
@@ -39,6 +39,11 @@ single-GPU optimization target.
 - [Op development](maintainer/op-development.md) — correctness, ownership, and performance gates.
 - [ReplaySSM GDN reference](maintainer/replayssm-gdn.md) — Qwen3.8 GDN execution details.
 - [Linear benchmark contract](maintainer/linear-benchmark.md) — registered kernel benchmark suites.
+
+The isolated `exp/hierarchical-vericache-20260830` branch is the active research track for
+hierarchical L0/L1/L2/L3 KV residency. Its measurements and explicit unimplemented gates are kept
+in [Performance](performance.md); no host-tier speedup or quality claim is made until an
+independent verifier is benchmarked.
 
 The source tree contains compatibility code for older registered targets, but those targets are not
 part of the public Qwen3.8-27B result set documented here.
