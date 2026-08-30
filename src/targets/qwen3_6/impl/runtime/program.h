@@ -633,7 +633,13 @@ public:
     struct HierarchicalHostSnapshot {
         std::optional<StateImageHandle> state;
         std::optional<StateImageTransfer> transfer;
+        // Host-KV extents owned by this hierarchical checkpoint.  Older, already-published
+        // extents can be reused by later checkpoints; only newly copied extents are appended.
+        std::vector<HostKVExtentCapability> text_kv_extents;
+        std::vector<HostKVExtentCapability> backend_kv_extents;
         std::uint32_t frontier = 0;
+        std::uint32_t backend_frontier = 0;
+        std::uint64_t pending_host_kv_bytes = 0;
     };
     std::array<HierarchicalHostSnapshot, kMaximumConcurrency> hierarchical_host_snapshots;
     std::optional<GdnReplayRecords> replay_records;
@@ -1063,6 +1069,8 @@ private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void reap_hierarchical_host_snapshots();
     void discard_hierarchical_host_snapshot(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool snapshot_hierarchical_host_kv(SequenceState& sequence,
+                                                     HierarchicalHostSnapshot& snapshot);
     void maybe_snapshot_hierarchical_host_tier(SequenceState& sequence);
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;

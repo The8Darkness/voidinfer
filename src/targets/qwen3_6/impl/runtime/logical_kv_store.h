@@ -256,6 +256,14 @@ public:
 
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
 
+    [[nodiscard]] std::uint32_t host_resident_count() const noexcept {
+        std::uint32_t count = 0;
+        for (const Page& page : pages_) {
+            count += page.host_replica.has_value() ? 1U : 0U;
+        }
+        return count;
+    }
+
     [[nodiscard]] LogicalKVPageHandle materialize(DeviceKVPageReservation& reservation) {
         if (free_count_ == 0) {
             throw std::logic_error("logical KV descriptors exhausted before physical capacity");

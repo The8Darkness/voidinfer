@@ -6,13 +6,34 @@ The isolated branch `exp/hierarchical-vericache-20260830` is an opt-in research 
 Qwen3.8-27B DFlash2/NVFP4 profile. It treats compressed L0 errors as speculative rejection effects
 and retains the exact target as the correctness fallback. The current implementation has nested
 KV/GDN transactions, adaptive L0→L1 (24–64) and L1→L2 (256–2,048) controls, direct NVFP4 attention,
-and a protected recent-token sidecar. Existing pinned StateImage and host FP16 KV stores are used
-for truthful L1/L2 residency accounting; they are not yet an independent host output verifier.
+a protected recent-token sidecar, and a typed host-KV/StateImage checkpoint path shared by MTP and
+DFlash. Existing pinned StateImage and host KV stores are used for truthful L1/L2 residency and
+transfer accounting; they are not yet an independent host output verifier.
 
-The latest matched RTX 5090 comparison uses batch 1, context 2,048, DFlash2 `k=7`, no CUDA Graph,
-three warmup rounds, and eight measured rounds. The published rate is licensed tokens divided by
-wall time for this fixed round harness; acceptance can therefore dominate it even when the GPU
-round is faster:
+The latest repeated-boundary stress run uses the Qwen3.8-27B NVFP4 DFlash2 artifact on the physical
+RTX 5090, batch 1, context 512, `k=7`, optimized proposal head, no CUDA Graph, one warmup round,
+and 400 measured rounds. The `l1=256` row intentionally forces three host checkpoint boundaries
+within this short run. Published throughput is licensed tokens divided by wall time, so it is
+acceptance-sensitive and must not be read as a kernel-only speedup:
+
+| Configuration | GPU round | Wall round | Published tok/s | Draft acceptance | L0/L1/L2/L3 bytes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| VeriCache-NVFP4 control, hierarchy disabled | 22.9920 ms | 23.0041 ms | 78.2470 | 320/2,800 (11.43%) | 0/0/0/0 |
+| Hierarchy enabled, no host snapshot | 22.7066 ms | 22.7177 ms | 73.6212 | 269/2,800 (9.61%) | 26,869,760/0/0/0 |
+| Hierarchy + host snapshot, L1→L2 fixed at 256 | 22.6889 ms | 22.6995 ms | 70.1556 | 237/2,800 (8.46%) | 26,869,760/17,367,040/221,063,168/0 |
+
+The host row materialized three checkpoints and measured 502,167,552 StateImage bytes plus
+71,565,312 KV bytes across 33 KV pages; synchronized KV D2H time was 1.94 ms in aggregate. The
+GPU round was 1.32% below the control, but the measured acceptance was lower, so the combined
+published rate was 10.3% below the control. This is not a multiplicative claim: repeated runs
+show acceptance sensitivity, and the current host path still performs synchronous COW/transfer
+work at its boundaries. The experiment remains a research milestone, not a winning end-to-end
+configuration.
+
+For historical comparison, an earlier short RTX 5090 run used batch 1, context 2,048, DFlash2
+`k=7`, no CUDA Graph, three warmup rounds, and eight measured rounds. The published rate is
+licensed tokens divided by wall time for this fixed round harness; acceptance can therefore
+dominate it even when the GPU round is faster:
 
 | L0 configuration | GPU round | Wall round | Published tok/s | Draft acceptance | Tier bytes (L0/L1/L2/L3) |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -30,7 +51,9 @@ the adaptive L0→L1 horizon contracted to 24. The host-snapshot row materialize
 StateImage promotion (167,389,184 bytes total) and preserved the same observed acceptance as its
 anchor-only counterpart, but it did not independently verify host-tier logits. Real L0→L1/L1→L2
 verification, NVFP4/FP8 output equality, NVMe persistence, greedy/sampling quality, vision, and
-262K/multi-agent workload matrices remain pending.
+262K/multi-agent workload matrices remain pending. The MTP benchmark now has matching
+VeriCache/hierarchy flags, but its direct-package Qwen3.8 probe stalled after allocating the
+model and was terminated without a performance result; no MTP claim is made from that probe.
 
 Tested Git revisions:
 

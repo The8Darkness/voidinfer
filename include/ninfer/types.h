@@ -808,6 +808,10 @@ struct RuntimeStats {
     double vericache_gdn_state_restore_seconds          = 0.0;
     std::uint64_t vericache_host_tier_snapshots         = 0;
     std::uint64_t vericache_host_tier_snapshot_bytes    = 0;
+    std::uint64_t vericache_host_state_d2h_bytes        = 0;
+    std::uint64_t vericache_host_kv_d2h_pages           = 0;
+    std::uint64_t vericache_host_kv_d2h_bytes           = 0;
+    double vericache_host_kv_d2h_seconds                = 0.0;
     std::size_t vericache_l0_bytes                      = 0;
     std::size_t vericache_l1_bytes                      = 0;
     std::size_t vericache_l2_bytes                      = 0;

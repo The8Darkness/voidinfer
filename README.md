@@ -105,8 +105,22 @@ Implemented in this track:
 - reuse of the existing pinned StateImage, host FP16 KV extent store, prefix/state DAG, and COW
   ownership machinery for tier accounting and future asynchronous promotion.
 
-The latest matched physical RTX 5090 comparison at context 2,048, DFlash2 `k=7`, batch 1, no CUDA
-Graph, and eight measured rounds was:
+The latest repeated-boundary physical RTX 5090 stress comparison uses context 512, DFlash2 `k=7`,
+batch 1, optimized proposal head, no CUDA Graph, one warmup round, and 400 measured rounds:
+
+| L0/L1 configuration | GPU round | Wall round | Published tok/s | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| VeriCache-NVFP4 control, hierarchy disabled | 22.9920 ms | 23.0041 ms | 78.2470 | 320/2,800 (11.43%) |
+| Hierarchy enabled, no host snapshot | 22.7066 ms | 22.7177 ms | 73.6212 | 269/2,800 (9.61%) |
+| Hierarchy + host snapshot, L1→L2 fixed at 256 | 22.6889 ms | 22.6995 ms | 70.1556 | 237/2,800 (8.46%) |
+
+The host row completed three checkpoints with `L0/L1/L2/L3 =
+26,869,760/17,367,040/221,063,168/0` bytes, 502,167,552 StateImage D2H bytes, and 71,565,312
+KV D2H bytes across 33 pages. The slightly faster GPU round did not translate into a win because
+acceptance was lower; this remains an experimental checkpoint/residency result, not a speed claim.
+
+An earlier short comparison at context 2,048, DFlash2 `k=7`, batch 1, no CUDA Graph, and eight
+measured rounds was:
 
 | L0 configuration | GPU round | Wall round | Published tok/s | Draft acceptance |
 | --- | ---: | ---: | ---: | ---: |
@@ -120,7 +134,8 @@ These are research measurements, not multiplicative claims. The host-snapshot ro
 host image is currently a residency/checkpoint mechanism, not an independent verifier; L0→L1 and
 L1→L2 verifier counters remain zero. NVFP4/FP8 host mirrors, NVMe persistence, greedy equality,
 sampling quality, vision, and 262K/multi-agent workload matrices remain gated on their dedicated
-benchmark paths.
+benchmark paths. The native MTP probe now exposes the same hierarchy and transfer telemetry, but
+its direct-package Qwen3.8 startup stalled after model allocation and produced no accepted result.
 
 Rejected experiments include FP8 KV, fixed MTP5, proposal-head and graph-boundary variants,
 several NVFP4/FP8 schedule changes, and alternate vocabulary-GEMM crossovers. They either lost

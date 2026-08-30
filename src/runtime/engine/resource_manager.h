@@ -696,7 +696,11 @@ public:
     }
 
     void populate_runtime_stats(Program& program, RuntimeStats& out) const noexcept {
-        program.populate_hierarchical_vericache_stats(out);
+        if constexpr (requires(Program& candidate, RuntimeStats& stats) {
+                          candidate.populate_hierarchical_vericache_stats(stats);
+                      }) {
+            program.populate_hierarchical_vericache_stats(out);
+        }
         out.state_moves                        = context_stats_.state_moves;
         out.state_forks                        = context_stats_.state_forks;
         out.state_restores                     = context_stats_.state_restores;

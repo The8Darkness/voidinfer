@@ -405,6 +405,21 @@ public:
         host_tier_snapshot_bytes_ += bytes;
     }
 
+    // These counters describe the prototype's actual host transfers.  StateImage promotion is
+    // asynchronous, so its byte count is exact while its completion latency remains in the
+    // normal transfer timing stream.  Host KV copies currently synchronize the transfer stream;
+    // retain their measured duration so a future overlapped implementation has an honest A/B.
+    void record_host_state_transfer(std::uint64_t bytes) noexcept {
+        host_state_d2h_bytes_ += bytes;
+    }
+
+    void record_host_kv_transfer(std::uint32_t pages, std::uint64_t bytes,
+                                 double seconds) noexcept {
+        host_kv_d2h_pages_ += pages;
+        host_kv_d2h_bytes_ += bytes;
+        host_kv_d2h_seconds_ += seconds;
+    }
+
     void set_tier_bytes(std::size_t l0, std::size_t l1, std::size_t l2, std::size_t l3) noexcept {
         l0_bytes_ = l0;
         l1_bytes_ = l1;
@@ -438,6 +453,10 @@ public:
         stats.vericache_gdn_state_restore_seconds = gdn_state_restore_seconds_;
         stats.vericache_host_tier_snapshots = host_tier_snapshots_;
         stats.vericache_host_tier_snapshot_bytes = host_tier_snapshot_bytes_;
+        stats.vericache_host_state_d2h_bytes = host_state_d2h_bytes_;
+        stats.vericache_host_kv_d2h_pages = host_kv_d2h_pages_;
+        stats.vericache_host_kv_d2h_bytes = host_kv_d2h_bytes_;
+        stats.vericache_host_kv_d2h_seconds = host_kv_d2h_seconds_;
         stats.vericache_l0_bytes = l0_bytes_;
         stats.vericache_l1_bytes = l1_bytes_;
         stats.vericache_l2_bytes = l2_bytes_;
@@ -508,6 +527,10 @@ private:
     double gdn_state_restore_seconds_ = 0.0;
     std::uint64_t host_tier_snapshots_ = 0;
     std::uint64_t host_tier_snapshot_bytes_ = 0;
+    std::uint64_t host_state_d2h_bytes_ = 0;
+    std::uint64_t host_kv_d2h_pages_ = 0;
+    std::uint64_t host_kv_d2h_bytes_ = 0;
+    double host_kv_d2h_seconds_ = 0.0;
     std::size_t l0_bytes_ = 0;
     std::size_t l1_bytes_ = 0;
     std::size_t l2_bytes_ = 0;

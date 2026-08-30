@@ -987,13 +987,334 @@ void ProgramImplCore::discard_hierarchical_host_snapshot(std::uint32_t lane) noe
     if (snapshot.state && state_store) {
         (void)state_store->release(*snapshot.state);
     }
+    if (host_kv_extents) {
+        for (const HostKVExtentCapability capability : snapshot.text_kv_extents) {
+            if (host_kv_extents->valid(capability)) { (void)host_kv_extents->release(capability); }
+        }
+        for (const HostKVExtentCapability capability : snapshot.backend_kv_extents) {
+            if (host_kv_extents->valid(capability)) { (void)host_kv_extents->release(capability); }
+        }
+        (void)host_kv_extents->release_unreferenced();
+    }
+    snapshot.text_kv_extents.clear();
+    snapshot.backend_kv_extents.clear();
     snapshot.state.reset();
-    snapshot.frontier = 0;
+    snapshot.frontier            = 0;
+    snapshot.backend_frontier   = 0;
+    snapshot.pending_host_kv_bytes = 0;
+}
+
+bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
+                                                    HierarchicalHostSnapshot& snapshot) {
+    if (!host_kv_arena || !host_kv_extents || !sequence.kv || !text_kv_addresses ||
+        !text_kv_pages) {
+        return false;
+    }
+
+    const std::uint32_t frontier         = sequence.execution_frontier;
+    const std::uint32_t backend_frontier = backend_kv_valid(sequence);
+    if (frontier == 0 || !text_kv_addresses->active(sequence.kv->text) ||
+        text_kv_addresses->committed_frontier(sequence.kv->text) < frontier) {
+        return false;
+    }
+    if (sequence.kv->backend &&
+        (!backend_kv_addresses || !backend_kv_pages || backend_frontier == 0 ||
+         !backend_kv_addresses->active(*sequence.kv->backend) ||
+         backend_kv_addresses->committed_frontier(*sequence.kv->backend) < backend_frontier)) {
+        return false;
+    }
+    if (frontier == snapshot.frontier && backend_frontier == snapshot.backend_frontier) {
+        return true;
+    }
+
+    const auto collect_missing = [](LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                    KVAddressSpaceHandle address, std::uint32_t tokens,
+                                    std::vector<LogicalKVPageHandle>& missing) {
+        const std::uint32_t required = kv_pages_for_frontier(tokens);
+        if (required > addresses.mapped_pages(address)) { return false; }
+        missing.clear();
+        missing.reserve(required);
+        for (std::uint32_t page = 0; page < required; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (pages.host_resident(logical)) {
+                // A stale Host duplicate must never become an authoritative checkpoint. The
+                // normal context manager removes these before a writer can mutate the page.
+                if (!pages.host_replica_current(logical)) { return false; }
+            } else {
+                missing.push_back(logical);
+            }
+        }
+        return true;
+    };
+
+    std::vector<LogicalKVPageHandle> missing_text;
+    std::vector<LogicalKVPageHandle> missing_backend;
+    if (!collect_missing(*text_kv_pages, *text_kv_addresses, sequence.kv->text, frontier,
+                         missing_text)) {
+        return false;
+    }
+    if (sequence.kv->backend &&
+        !collect_missing(*backend_kv_pages, *backend_kv_addresses, *sequence.kv->backend,
+                         backend_frontier, missing_backend)) {
+        return false;
+    }
+
+    // If all pages are already current pinned Host replicas, no KV address rotation is needed.
+    // This is the common fast path after the first checkpoint and also lets the existing context
+    // cache satisfy a hierarchical checkpoint without duplicating its pages.
+    if (missing_text.empty() && missing_backend.empty()) { return true; }
+
+    const SequenceKVBundle old_bundle = *sequence.kv;
+    const std::uint32_t old_text_entitlement =
+        text_kv_addresses->entitlement(old_bundle.text);
+    const std::optional<std::uint32_t> old_backend_entitlement =
+        old_bundle.backend ? std::optional<std::uint32_t>(
+                                 backend_kv_addresses->entitlement(*old_bundle.backend))
+                           : std::nullopt;
+    const std::optional<KVAddressSpaceHandle> text_destination =
+        text_kv_addresses->create_inactive();
+    if (!text_destination) { return false; }
+    const std::optional<KVAddressSpaceHandle> backend_destination =
+        old_bundle.backend ? backend_kv_addresses->create_inactive() : std::nullopt;
+    if (old_bundle.backend && !backend_destination) {
+        (void)text_kv_addresses->release(*text_destination);
+        return false;
+    }
+
+    const auto collect_source_pages = [](LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                         KVAddressSpaceHandle address, std::uint32_t tokens,
+                                         std::vector<LogicalKVPageHandle>& out) {
+        const std::uint32_t required = kv_pages_for_frontier(tokens);
+        if (required > addresses.mapped_pages(address)) { return false; }
+        out.clear();
+        out.reserve(required);
+        for (std::uint32_t page = 0; page < required; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (!pages.valid(logical)) { return false; }
+            out.push_back(logical);
+        }
+        return true;
+    };
+    std::vector<LogicalKVPageHandle> old_text_pages;
+    std::vector<LogicalKVPageHandle> old_backend_pages;
+    if (!collect_source_pages(*text_kv_pages, *text_kv_addresses, old_bundle.text, frontier,
+                              old_text_pages) ||
+        (old_bundle.backend &&
+         !collect_source_pages(*backend_kv_pages, *backend_kv_addresses, *old_bundle.backend,
+                               backend_frontier, old_backend_pages))) {
+        (void)text_kv_addresses->release(*text_destination);
+        if (backend_destination) { (void)backend_kv_addresses->release(*backend_destination); }
+        return false;
+    }
+
+    std::optional<KVPrefixForkReservation> text_fork;
+    std::optional<KVPrefixForkReservation> backend_fork;
+    bool text_committed   = false;
+    bool backend_committed = false;
+    const char* stage      = "source preparation";
+
+    const auto restore_original = [&]() {
+        if (backend_committed && backend_destination &&
+            backend_kv_addresses->active(*backend_destination)) {
+            backend_kv_addresses->deactivate(*backend_destination);
+        }
+        if (text_committed && text_kv_addresses->active(*text_destination)) {
+            text_kv_addresses->deactivate(*text_destination);
+        }
+        if (backend_destination && backend_kv_addresses->valid(*backend_destination)) {
+            (void)backend_kv_addresses->release(*backend_destination);
+        }
+        if (text_kv_addresses->valid(*text_destination)) {
+            (void)text_kv_addresses->release(*text_destination);
+        }
+        sequence.kv = old_bundle;
+        if (!text_kv_addresses->active(old_bundle.text)) {
+            text_kv_addresses->activate(old_bundle.text, old_text_entitlement,
+                                         static_cast<std::int32_t>(sequence.lane));
+        }
+        if (old_bundle.backend && !backend_kv_addresses->active(*old_bundle.backend)) {
+            backend_kv_addresses->activate(*old_bundle.backend, *old_backend_entitlement,
+                                            static_cast<std::int32_t>(sequence.lane));
+        }
+        bind_sequence_kv(sequence);
+    };
+    const auto fork_entitlement = [](LogicalKVPageStore& pages, std::uint32_t frontier,
+                                     std::uint32_t requested) {
+        const std::uint32_t full_pages = frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t free_pages = pages.physical_pool().available_pages();
+        return std::min(requested, full_pages + free_pages);
+    };
+
+    try {
+        // This first prototype intentionally closes the producer stream before rotating the
+        // active KV address. It avoids a producer/transfer wait cycle while the Host verifier
+        // path is still synchronous; a later overlap pass can replace this with one-way events.
+        stage = "source stream wait";
+        device.synchronize();
+        stage = "source deactivation";
+        unbind_sequence_kv(sequence);
+        if (text_kv_addresses->active(old_bundle.text) ||
+            (old_bundle.backend && backend_kv_addresses->active(*old_bundle.backend))) {
+            throw std::logic_error("hierarchical KV source remained active after unbind");
+        }
+
+        stage = "Text prefix fork preparation";
+        const std::uint32_t text_fork_entitlement =
+            fork_entitlement(*text_kv_pages, frontier, old_text_entitlement);
+        text_fork.emplace(text_kv_addresses->prepare_prefix_fork(
+            old_bundle.text, *text_destination, frontier, text_fork_entitlement,
+            static_cast<std::int32_t>(sequence.lane)));
+        if (old_bundle.backend) {
+            stage = "Backend prefix fork preparation";
+            const std::uint32_t backend_fork_entitlement =
+                fork_entitlement(*backend_kv_pages, backend_frontier, *old_backend_entitlement);
+            backend_fork.emplace(backend_kv_addresses->prepare_prefix_fork(
+                *old_bundle.backend, *backend_destination, backend_frontier,
+                backend_fork_entitlement, static_cast<std::int32_t>(sequence.lane)));
+        }
+        stage = "prefix fork tail copy";
+        if (text_fork->needs_tail_copy()) {
+            text_kv_pages->physical_pool().copy_page(
+                text_kv_addresses->prefix_fork_tail_source(*text_fork),
+                text_kv_addresses->prefix_fork_tail_destination(*text_fork),
+                device.transfer_stream);
+        }
+        if (backend_fork && backend_fork->needs_tail_copy()) {
+            backend_kv_pages->physical_pool().copy_page(
+                backend_kv_addresses->prefix_fork_tail_source(*backend_fork),
+                backend_kv_addresses->prefix_fork_tail_destination(*backend_fork),
+                device.transfer_stream);
+        }
+        stage = "prefix fork transfer wait";
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+
+        stage = "Text prefix fork commit";
+        text_kv_addresses->commit_prefix_fork(std::move(*text_fork), device.stream);
+        text_fork.reset();
+        text_committed = true;
+        if (backend_fork) {
+            stage = "Backend prefix fork commit";
+            backend_kv_addresses->commit_prefix_fork(std::move(*backend_fork), device.stream);
+            backend_fork.reset();
+            backend_committed = true;
+        }
+
+        SequenceKVBundle next_bundle{.text = *text_destination};
+        if (backend_destination) { next_bundle.backend = *backend_destination; }
+        stage = "new KV bundle binding";
+        sequence.kv = next_bundle;
+        bind_sequence_kv(sequence);
+    } catch (const std::exception& error) {
+        if (backend_fork) { backend_kv_addresses->abort_prefix_fork(*backend_fork); }
+        if (text_fork) { text_kv_addresses->abort_prefix_fork(*text_fork); }
+        try {
+            restore_original();
+        } catch (...) { std::terminate(); }
+        throw std::runtime_error(std::string("hierarchical KV snapshot failed at ") + stage +
+                                 ": " + error.what());
+    }
+
+    const std::size_t text_extent_begin    = snapshot.text_kv_extents.size();
+    const std::size_t backend_extent_begin = snapshot.backend_kv_extents.size();
+    std::uint64_t copied_bytes             = 0;
+    const auto copy_missing = [&](LogicalKVPageStore& pages, std::vector<LogicalKVPageHandle>& missing,
+                                  std::vector<HostKVExtentCapability>& owned) {
+        if (missing.empty()) { return true; }
+        std::optional<HostKVExtentReservation> reservation =
+            host_kv_extents->prepare(pages, std::span<const LogicalKVPageHandle>(missing));
+        if (!reservation) { return false; }
+        const std::uint32_t page_count = host_kv_extents->page_count(*reservation);
+        const HostKVPageLayout layout = host_kv_extents->page_layout(pages);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(layout.page_stride) * page_count;
+        std::vector<DeviceKVPageHandle> sources = host_kv_extents->device_sources(*reservation);
+        const auto transfer_started = Clock::now();
+        pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reservation),
+                                           device.transfer_stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        hierarchical_vericache.record_host_kv_transfer(
+            page_count, bytes, std::chrono::duration<double>(Clock::now() - transfer_started).count());
+        const HostKVExtentCapability capability =
+            host_kv_extents->publish(std::move(*reservation));
+        owned.push_back(capability);
+        if (bytes > std::numeric_limits<std::uint64_t>::max() - copied_bytes) {
+            copied_bytes = std::numeric_limits<std::uint64_t>::max();
+        } else {
+            copied_bytes += bytes;
+        }
+        return true;
+    };
+
+    bool host_ready = false;
+    try {
+        const bool text_ready =
+            copy_missing(*text_kv_pages, missing_text, snapshot.text_kv_extents);
+        const bool backend_ready =
+            !old_bundle.backend ||
+            copy_missing(*backend_kv_pages, missing_backend, snapshot.backend_kv_extents);
+        host_ready = text_ready && backend_ready;
+    } catch (...) {
+        host_ready = false;
+    }
+
+    if (!host_ready) {
+        while (snapshot.text_kv_extents.size() > text_extent_begin) {
+            const HostKVExtentCapability capability = snapshot.text_kv_extents.back();
+            snapshot.text_kv_extents.pop_back();
+            if (host_kv_extents->valid(capability)) { (void)host_kv_extents->release(capability); }
+        }
+        while (snapshot.backend_kv_extents.size() > backend_extent_begin) {
+            const HostKVExtentCapability capability = snapshot.backend_kv_extents.back();
+            snapshot.backend_kv_extents.pop_back();
+            if (host_kv_extents->valid(capability)) { (void)host_kv_extents->release(capability); }
+        }
+        if (!text_kv_addresses->release(old_bundle.text)) {
+            throw std::logic_error("hierarchical Text KV source release failed");
+        }
+        if (old_bundle.backend && !backend_kv_addresses->release(*old_bundle.backend)) {
+            throw std::logic_error("hierarchical Backend KV source release failed");
+        }
+        for (const LogicalKVPageHandle page : old_text_pages) {
+            if (text_kv_pages->can_drop_device_replica(page)) {
+                (void)text_kv_pages->drop_device_replica(page);
+            }
+        }
+        for (const LogicalKVPageHandle page : old_backend_pages) {
+            if (backend_kv_pages->can_drop_device_replica(page)) {
+                (void)backend_kv_pages->drop_device_replica(page);
+            }
+        }
+        (void)host_kv_extents->release_unreferenced();
+        return false;
+    }
+
+    if (!text_kv_addresses->release(old_bundle.text)) {
+        throw std::logic_error("hierarchical Text KV source release failed");
+    }
+    if (old_bundle.backend && !backend_kv_addresses->release(*old_bundle.backend)) {
+        throw std::logic_error("hierarchical Backend KV source release failed");
+    }
+    for (const LogicalKVPageHandle page : old_text_pages) {
+        if (text_kv_pages->can_drop_device_replica(page)) {
+            (void)text_kv_pages->drop_device_replica(page);
+        }
+    }
+    for (const LogicalKVPageHandle page : old_backend_pages) {
+        if (backend_kv_pages->can_drop_device_replica(page)) {
+            (void)backend_kv_pages->drop_device_replica(page);
+        }
+    }
+    (void)host_kv_extents->release_unreferenced();
+    if (copied_bytes > std::numeric_limits<std::uint64_t>::max() - snapshot.pending_host_kv_bytes) {
+        snapshot.pending_host_kv_bytes = std::numeric_limits<std::uint64_t>::max();
+    } else {
+        snapshot.pending_host_kv_bytes += copied_bytes;
+    }
+    return true;
 }
 
 void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& sequence) {
     if (!hierarchical_vericache.enabled() ||
-        !hierarchical_vericache_options.enable_host_tier_snapshots || !dflash ||
+        !hierarchical_vericache_options.enable_host_tier_snapshots ||
         host_state_images == nullptr || state_store == nullptr || sequence.lane >= max_concurrency ||
         sequence.execution_frontier <
             hierarchical_vericache.next_l1_to_l2_boundary(
@@ -1004,14 +1325,11 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
     reap_hierarchical_host_snapshots();
     auto& snapshot = hierarchical_host_snapshots[sequence.lane];
     if (snapshot.transfer) { return; }
-    if (snapshot.state) {
-        (void)state_store->release(*snapshot.state);
-        snapshot.state.reset();
-    }
 
     // The active StateImage is mutable, while Device-to-Host transfers intentionally accept only
     // immutable images. Copying into a spare device image makes the host snapshot a real nested
-    // checkpoint and keeps the running DFlash/GDN state independent from asynchronous D2H DMA.
+    // checkpoint and keeps the running MTP/DFlash/GDN state independent from asynchronous D2H
+    // DMA.
     const StateImageSelectors selectors = state_selectors(sequence);
     const std::optional<StateImageHandle> destination =
         state_store->reserve_reset(device.transfer_stream);
@@ -1022,6 +1340,10 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
         }
     };
     try {
+        if (!snapshot_hierarchical_host_kv(sequence, snapshot)) {
+            release_destination();
+            return;
+        }
         state_images->copy_slot(selectors.destination, state_store->physical_slot(*destination),
                                 device.transfer_stream);
         state_store->freeze(*destination);
@@ -1031,12 +1353,22 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
             release_destination();
             return;
         }
+        if (snapshot.state) { (void)state_store->release(*snapshot.state); }
         snapshot.state = *destination;
-        snapshot.frontier = sequence.execution_frontier;
+        snapshot.frontier          = sequence.execution_frontier;
+        snapshot.backend_frontier  = backend_kv_valid(sequence);
         snapshot.transfer.emplace(std::move(*transfer));
         hierarchical_snapshot_completion_.record(device.transfer_stream);
-        hierarchical_vericache.record_host_tier_snapshot(
-            static_cast<std::uint64_t>(state_images->host_layout().image_bytes));
+        const std::uint64_t state_bytes =
+            static_cast<std::uint64_t>(state_images->host_layout().image_bytes);
+        hierarchical_vericache.record_host_state_transfer(state_bytes);
+        const std::uint64_t kv_bytes = snapshot.pending_host_kv_bytes;
+        const std::uint64_t total_bytes =
+            kv_bytes > std::numeric_limits<std::uint64_t>::max() - state_bytes
+                ? std::numeric_limits<std::uint64_t>::max()
+                : state_bytes + kv_bytes;
+        hierarchical_vericache.record_host_tier_snapshot(total_bytes);
+        snapshot.pending_host_kv_bytes = 0;
     } catch (...) {
         if (snapshot.transfer) {
             state_store->abort_transfer(std::move(*snapshot.transfer));
@@ -8500,7 +8832,17 @@ void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) c
         l1_bytes = local_bytes * occupied;
         l2_bytes = (layout.image_bytes - local_bytes) * occupied;
     }
-    if (host_kv_arena != nullptr) { l2_bytes += host_kv_arena->occupied_bytes(); }
+    // The target text KV uses the authoritative BF16 geometry in VeriCache mode, while the
+    // speculative MTP/DFlash backend uses the compressed U8/NVFP4 geometry.  Count them by owner
+    // rather than treating the shared arena as one undifferentiated tier.
+    if (text_kv_pages != nullptr) {
+        l2_bytes += static_cast<std::size_t>(text_kv_pages->host_resident_count()) *
+                    text_host_kv_page_stride;
+    }
+    if (backend_kv_pages != nullptr) {
+        l1_bytes += static_cast<std::size_t>(backend_kv_pages->host_resident_count()) *
+                    backend_host_kv_page_stride;
+    }
     out.vericache_l1_bytes = l1_bytes;
     out.vericache_l2_bytes = l2_bytes;
 }
@@ -10686,6 +11028,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+            }
+            if (hierarchical_vericache.enabled() && pcur != 0) {
+                const bool disagreement = accepted_i < static_cast<std::int32_t>(pcur);
+                hierarchical_vericache.observe_exact_target_fallback(
+                    pcur, static_cast<std::uint32_t>(accepted_i), disagreement, disagreement);
             }
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,

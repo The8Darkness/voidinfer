@@ -39,6 +39,17 @@ void test_adaptive_windows() {
     assert(stats.vericache_exact_target_proposed_tokens == 6);
     assert(stats.vericache_exact_target_accepted_tokens == 2);
     assert(stats.vericache_exact_target_disagreements == 1);
+
+    controller.record_host_state_transfer(4096);
+    controller.record_host_kv_transfer(3, 768, 0.25);
+    controller.record_host_tier_snapshot(4864);
+    controller.populate(stats);
+    assert(stats.vericache_host_state_d2h_bytes == 4096);
+    assert(stats.vericache_host_kv_d2h_pages == 3);
+    assert(stats.vericache_host_kv_d2h_bytes == 768);
+    assert(stats.vericache_host_kv_d2h_seconds == 0.25);
+    assert(stats.vericache_host_tier_snapshots == 1);
+    assert(stats.vericache_host_tier_snapshot_bytes == 4864);
 }
 
 void test_protection_ledger() {
