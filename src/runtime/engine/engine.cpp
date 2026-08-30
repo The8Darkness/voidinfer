@@ -4,6 +4,7 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/hierarchical_vericache.h"
 #include "targets/registry.h"
 
 #include <limits>
@@ -21,6 +22,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
+    options.hierarchical_vericache = runtime::normalize_hierarchical_vericache_options(
+        std::move(options.hierarchical_vericache));
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     if (!cache.enabled) {

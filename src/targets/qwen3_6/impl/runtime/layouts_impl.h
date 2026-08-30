@@ -755,6 +755,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     }
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
+    impl->hierarchical_vericache = inputs.hierarchical_vericache;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -828,6 +829,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .use_cuda_graph      = options.use_cuda_graph,
         .device              = options.device,
         .context_cache       = options.context_cache,
+        .hierarchical_vericache = options.hierarchical_vericache,
         .kv_storage          = options.kv_cache,
         .mtp_kv_dtype        = mtp_profile.dtype,
         .mtp_kv_quant_group  = mtp_profile.quant_group,

@@ -78,6 +78,7 @@ struct SequencePlanningInputs {
     bool use_cuda_graph = true;
     int device          = 0;
     ContextCacheOptions context_cache;
+    HierarchicalVeriCacheOptions hierarchical_vericache;
     KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
     DType mtp_kv_dtype = DType::BF16;
     std::int32_t mtp_kv_quant_group = 0;
@@ -105,6 +106,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     ContextCacheOptions context_cache;
+    HierarchicalVeriCacheOptions hierarchical_vericache;
     KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
     DType mtp_kv_dtype = DType::BF16;
     std::int32_t mtp_kv_quant_group = 0;

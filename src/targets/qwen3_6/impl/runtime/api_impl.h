@@ -395,6 +395,11 @@ MemorySummary Program<Variant>::memory_summary() const noexcept {
 }
 
 template <>
+void Program<Variant>::populate_hierarchical_vericache_stats(RuntimeStats& out) const noexcept {
+    impl_->populate_hierarchical_vericache_stats(out);
+}
+
+template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
 }

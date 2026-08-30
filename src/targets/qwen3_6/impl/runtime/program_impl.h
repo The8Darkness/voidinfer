@@ -699,6 +699,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
+      hierarchical_vericache_options(plan.hierarchical_vericache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
@@ -709,6 +710,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
+      hierarchical_vericache(plan.hierarchical_vericache),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
@@ -944,6 +946,62 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+}
+
+void ProgramImplCore::begin_hierarchical_speculation(
+    std::uint32_t lane, runtime::HierarchicalVeriCacheFrontier base,
+    runtime::HierarchicalVeriCacheFrontier proposed) {
+    if (!hierarchical_vericache.enabled()) { return; }
+    if (lane >= max_concurrency) { throw std::out_of_range("VeriCache lane is out of range"); }
+    auto& transaction = hierarchical_transactions[lane];
+    if (transaction.active()) {
+        throw std::logic_error("VeriCache lane already has an open transaction");
+    }
+    const auto parent = transaction.begin(runtime::HierarchicalVeriCacheTransactionKind::L0Speculation,
+                                          base, proposed);
+    try {
+        (void)transaction.begin(runtime::HierarchicalVeriCacheTransactionKind::GdnRecurrentState,
+                                base, proposed);
+    } catch (...) {
+        (void)transaction.rollback(parent);
+        throw;
+    }
+    hierarchical_vericache.record_speculative_round();
+}
+
+void ProgramImplCore::commit_hierarchical_speculation(
+    std::uint32_t lane, runtime::HierarchicalVeriCacheFrontier final_frontier) noexcept {
+    if (!hierarchical_vericache.enabled() || lane >= max_concurrency) { return; }
+    auto& transaction = hierarchical_transactions[lane];
+    if (!transaction.active()) { return; }
+    bool rejected_tail = false;
+    if (const auto* frame = transaction.top_frame()) {
+        rejected_tail = final_frontier.kv < frame->proposed.kv ||
+                        final_frontier.gdn < frame->proposed.gdn;
+    }
+    while (transaction.active()) {
+        const auto token = transaction.top_token();
+        if (!transaction.commit(token, final_frontier)) {
+            (void)transaction.rollback(token);
+        }
+    }
+    hierarchical_vericache.record_transactions(
+        transaction.commits(), transaction.rollbacks() + transaction.partial_rollbacks(),
+        transaction.max_depth());
+    if (rejected_tail) { hierarchical_vericache.record_speculative_rollback(); }
+    transaction.reset();
+}
+
+void ProgramImplCore::rollback_hierarchical_speculation(std::uint32_t lane) noexcept {
+    if (!hierarchical_vericache.enabled() || lane >= max_concurrency) { return; }
+    auto& transaction = hierarchical_transactions[lane];
+    if (!transaction.active()) { return; }
+    transaction.rollback_all();
+    hierarchical_vericache.record_transactions(
+        transaction.commits(), transaction.rollbacks() + transaction.partial_rollbacks(),
+        transaction.max_depth());
+    hierarchical_vericache.record_speculative_rollback();
+    transaction.reset();
 }
 
 void ProgramImplCore::start_context_transfer_timer(runtime::ContextResourceClass resource) {
@@ -8315,6 +8373,10 @@ qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept 
     };
 }
 
+void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) const noexcept {
+    hierarchical_vericache.populate(out);
+}
+
 void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                      MaterializationTransaction& transaction) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
@@ -8987,12 +9049,17 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             SequenceState& sequence = active_sequence(lanes[row]);
             RequestControl& request = requests[lanes[row]];
             if (cancelled[row]) {
+                rollback_hierarchical_speculation(lanes[row]);
                 clear_lane(sequence, request);
                 continue;
             }
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
+            commit_hierarchical_speculation(
+                lanes[row],
+                runtime::HierarchicalVeriCacheFrontier{.kv = pending.base_E + committed,
+                                                        .gdn = pending.base_E + committed});
             settle_state_fork(sequence);
             const TokenId* token_base =
                 speculative_backend == SpeculativeBackend::Mtp
@@ -9056,6 +9123,7 @@ void ProgramImplCore::clear_execution_failure_lanes(std::span<const std::uint32_
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    rollback_hierarchical_speculation(sequence.lane);
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
@@ -10405,6 +10473,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t extent =
                 std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
+            begin_hierarchical_speculation(
+                lanes[row],
+                runtime::HierarchicalVeriCacheFrontier{.kv = frontier, .gdn = frontier},
+                runtime::HierarchicalVeriCacheFrontier{.kv = frontier + extent + 1U,
+                                                        .gdn = frontier + extent + 1U});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -10588,6 +10661,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     : 0U;
             const std::uint32_t extent =
                 std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+            begin_hierarchical_speculation(
+                lanes[row],
+                runtime::HierarchicalVeriCacheFrontier{.kv = frontier, .gdn = frontier},
+                runtime::HierarchicalVeriCacheFrontier{.kv = frontier + extent + 1U,
+                                                        .gdn = frontier + extent + 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");

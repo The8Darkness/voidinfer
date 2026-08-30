@@ -717,6 +717,7 @@ public:
     [[nodiscard]] std::uint64_t resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    void populate_hierarchical_vericache_stats(RuntimeStats& out) const noexcept;
     void reset_memory_peaks() noexcept;
 
 private:

@@ -88,6 +88,9 @@ ninfer_add_test(ninfer_state_store_test
 ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES test_gdn_replay_records.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_hierarchical_vericache_test
+  SOURCES test_hierarchical_vericache.cpp
+  LIBRARIES ninfer_core)
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test

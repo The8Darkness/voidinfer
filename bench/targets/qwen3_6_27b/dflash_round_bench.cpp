@@ -43,6 +43,7 @@ struct Options {
     ninfer::ProposalHead proposal  = ninfer::ProposalHead::Full;
     ninfer::KvCacheStorage kv_cache = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool use_cuda_graph            = false;
+    bool hierarchical_vericache    = false;
 };
 
 void print_usage(const char* executable) {
@@ -52,6 +53,7 @@ void print_usage(const char* executable) {
                  " [--batch <1..8>]"
                  " [--proposal-head full|optimized]"
                  " [--kv-dtype fp8-e4m3-row256|vericache-nvfp4]"
+                 " [--hierarchical-vericache]"
                  " [--cuda-graph|--no-cuda-graph]\n";
 }
 
@@ -111,6 +113,8 @@ Options parse_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (argument == "--cuda-graph") {
             options.use_cuda_graph = true;
+        } else if (argument == "--hierarchical-vericache") {
+            options.hierarchical_vericache = true;
         } else if (argument == "-h" || argument == "--help") {
             print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_6_27b_dflash_round_bench");
             std::exit(0);
@@ -227,6 +231,7 @@ int run(const Options& options) {
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
     engine.max_concurrency           = options.batch_size;
+    engine.hierarchical_vericache.enabled = options.hierarchical_vericache;
     // The direct target facade does not run Engine::normalize_engine_options().
     // Keep the benchmark's startup capacities identical to the production defaults.
     engine.context_cache.device_state_slots            = options.batch_size;
@@ -394,6 +399,8 @@ int run(const Options& options) {
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
               << '\n';
     std::cout << "cuda_graph," << (options.use_cuda_graph ? "true" : "false") << '\n';
+    std::cout << "hierarchical_vericache," << (options.hierarchical_vericache ? "true" : "false")
+              << '\n';
     std::cout << "warmup," << options.warmup << '\n';
     std::cout << "repetitions," << options.repetitions << '\n';
     std::cout << "steady_round_gpu_mean_ms," << mean_gpu_ms << '\n';
@@ -413,6 +420,23 @@ int run(const Options& options) {
         std::cout << ',' << accepted_per_position[position];
     }
     std::cout << '\n';
+    ninfer::RuntimeStats vericache_stats;
+    program->populate_hierarchical_vericache_stats(vericache_stats);
+    std::cout << "vericache_l0_to_l1_horizon," << vericache_stats.vericache_l0_to_l1_horizon
+              << '\n';
+    std::cout << "vericache_l1_to_l2_horizon," << vericache_stats.vericache_l1_to_l2_horizon
+              << '\n';
+    std::cout << "vericache_l0_l1_checks," << vericache_stats.vericache_l0_l1_checks << '\n';
+    std::cout << "vericache_l1_l2_checks," << vericache_stats.vericache_l1_l2_checks << '\n';
+    std::cout << "vericache_speculative_rounds," << vericache_stats.vericache_speculative_rounds
+              << '\n';
+    std::cout << "vericache_speculative_rollbacks,"
+              << vericache_stats.vericache_speculative_rollbacks << '\n';
+    std::cout << "vericache_nested_commits," << vericache_stats.vericache_nested_commits << '\n';
+    std::cout << "vericache_nested_rollbacks," << vericache_stats.vericache_nested_rollbacks
+              << '\n';
+    std::cout << "vericache_max_nested_depth," << vericache_stats.vericache_max_nested_depth
+              << '\n';
     return 0;
 }
 

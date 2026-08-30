@@ -101,6 +101,36 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_cache_markers_per_request;
 };
 
+// Experimental hierarchical VeriCache control. The default keeps the stable cache route
+// unchanged. When enabled, compressed L0 execution remains speculative until an attached
+// verifier commits it; this option does not authorize an approximate result to bypass the exact
+// target. The horizon values are initial values and are adapted inside their corresponding
+// min/max bounds using observed disagreement and rollback.
+struct HierarchicalVeriCacheOptions {
+    bool enabled = false;
+
+    std::uint32_t l0_to_l1_horizon     = 32;
+    std::uint32_t l0_to_l1_min_horizon = 24;
+    std::uint32_t l0_to_l1_max_horizon = 64;
+
+    std::uint32_t l1_to_l2_horizon     = 512;
+    std::uint32_t l1_to_l2_min_horizon = 256;
+    std::uint32_t l1_to_l2_max_horizon = 2048;
+
+    // These are default protection classes. Prompt-derived vision/system/tool ranges are added
+    // by the runtime when their exact token spans are known.
+    std::uint32_t protected_recent_tokens = 64;
+    std::uint32_t protected_sink_tokens   = 4;
+    std::uint32_t protected_pivot_tokens  = 4;
+
+    // Keep the first hierarchical implementation conservative. Packed 2/3-bit L0 and direct
+    // low-bit attention are research switches and remain off until their exact numerical route
+    // has an independent oracle and end-to-end evidence.
+    bool allow_2bit_l0              = false;
+    bool direct_low_bit_attention   = false;
+    std::filesystem::path cold_store_path;
+};
+
 struct ContextCostOptions {
     // Empty selects generic defaults plus any matching values compiled into the binary. A
     // nonempty runtime preset independently overrides its matching machine transfer and
@@ -126,6 +156,7 @@ struct EngineOptions {
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
+    HierarchicalVeriCacheOptions hierarchical_vericache;
     ContextCostOptions context_cost;
     LoadProgress load_progress;
 };
@@ -742,6 +773,33 @@ struct RuntimeStats {
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;
+
+    // Hierarchical VeriCache observations. L0/L1/L2 counters are zero until that verifier stage
+    // is actually attached; the current DFlash/MTP exact-target fallback is reported separately
+    // as speculative transaction activity.
+    bool hierarchical_vericache_enabled                = false;
+    std::uint32_t vericache_l0_to_l1_horizon            = 0;
+    std::uint32_t vericache_l1_to_l2_horizon            = 0;
+    std::uint64_t vericache_l0_l1_checks                = 0;
+    std::uint64_t vericache_l0_l1_proposed_tokens       = 0;
+    std::uint64_t vericache_l0_l1_accepted_tokens       = 0;
+    std::uint64_t vericache_l0_l1_disagreements         = 0;
+    std::uint64_t vericache_l1_l2_checks                = 0;
+    std::uint64_t vericache_l1_l2_proposed_tokens       = 0;
+    std::uint64_t vericache_l1_l2_accepted_tokens       = 0;
+    std::uint64_t vericache_l1_l2_disagreements         = 0;
+    std::uint64_t vericache_speculative_rounds          = 0;
+    std::uint64_t vericache_speculative_rollbacks       = 0;
+    std::uint64_t vericache_nested_commits              = 0;
+    std::uint64_t vericache_nested_rollbacks            = 0;
+    std::uint32_t vericache_max_nested_depth            = 0;
+    std::uint64_t vericache_gdn_state_restores          = 0;
+    std::uint64_t vericache_gdn_state_restore_bytes     = 0;
+    double vericache_gdn_state_restore_seconds          = 0.0;
+    std::size_t vericache_l0_bytes                      = 0;
+    std::size_t vericache_l1_bytes                      = 0;
+    std::size_t vericache_l2_bytes                      = 0;
+    std::size_t vericache_l3_bytes                      = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

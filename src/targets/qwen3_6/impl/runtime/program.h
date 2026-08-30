@@ -6,6 +6,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "runtime/engine/context_cost.h"
+#include "runtime/engine/hierarchical_vericache.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -580,6 +581,8 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
+    void populate_hierarchical_vericache_stats(RuntimeStats& out) const noexcept;
+
     void reset_memory_peaks() noexcept;
 
     friend struct qwen3_6::detail::PressurePlanningSessionImpl<Variant>;
@@ -590,6 +593,7 @@ public:
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
+    const HierarchicalVeriCacheOptions hierarchical_vericache_options;
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
@@ -606,6 +610,10 @@ public:
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
+
+    runtime::AdaptiveHierarchicalVeriCacheController hierarchical_vericache;
+    std::array<runtime::NestedHierarchicalVeriCacheTransaction, kMaximumConcurrency>
+        hierarchical_transactions;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
@@ -665,6 +673,13 @@ private:
     std::uint64_t resource_revision_            = 1;
     std::uint32_t pressure_planning_generation_ = 0;
     bool pressure_planning_active_              = false;
+
+    void begin_hierarchical_speculation(std::uint32_t lane,
+                                        runtime::HierarchicalVeriCacheFrontier base,
+                                        runtime::HierarchicalVeriCacheFrontier proposed);
+    void commit_hierarchical_speculation(
+        std::uint32_t lane, runtime::HierarchicalVeriCacheFrontier final_frontier) noexcept;
+    void rollback_hierarchical_speculation(std::uint32_t lane) noexcept;
 
     struct MaterializationSourceProtection {
         struct StateOwnershipCandidate {
