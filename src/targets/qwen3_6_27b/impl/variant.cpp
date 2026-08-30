@@ -37,6 +37,35 @@ graph_profiles_through(std::uint32_t max_frontier,
     return out;
 }
 
+std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
+                                                        std::uint32_t draft_window) {
+    if (draft_window == 0 || capacity == 0) { return {}; }
+    const std::uint32_t block        = draft_window + 1;
+    const std::uint32_t max_frontier = capacity - 1;
+    std::vector<std::uint32_t> ends{
+        96U, 127U, 511U, 1023U, 2047U, 4095U, 8191U, 16383U, 32767U, 65536U, 131072U,
+        196608U,
+    };
+    const auto add_target_boundary = [&](std::uint32_t visible_end) {
+        if (visible_end >= block) { ends.push_back(visible_end - block); }
+    };
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
+        add_target_boundary(visible_end);
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return graph_profiles_through(max_frontier, ends);
+}
+
+bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
+                                        std::uint32_t max_visible_keys) {
+    const std::uint32_t tokens = draft_window + 1;
+    if (tokens <= 6) { return false; }
+    if (batch_size > 1) { return true; }
+    const std::uint32_t prompt_visible_limit = tokens <= 12 ? 512U : 1024U;
+    return max_visible_keys > prompt_visible_limit;
+}
+
 void validate_token_interval(std::int32_t first, std::int32_t last) {
     if (first <= 0 || last < first) {
         throw std::invalid_argument("invalid target leaf token interval");
@@ -150,9 +179,19 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     return graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
-                                                                  std::uint32_t) {
-    return {};
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+                                                                  std::uint32_t draft_window,
+                                                                  std::uint32_t batch_size) {
+    std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
+    for (GraphExecutionProfile& profile : profiles) {
+        const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
+        const bool split_swa = profile.max > 96U;
+        const bool chunked_target =
+            dflash_target_uses_chunked_small_t(draft_window, batch_size, target_max);
+        profile.topology_class = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
+    }
+    return profiles;
 }
 
 void Variant::attention_projection(const Tensor& hidden,
@@ -344,6 +383,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseIntDflash2:
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
@@ -361,6 +401,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseIntDflash2:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::query_size,
                                                         ops::LinearPolicy::A16Only, first, last);
@@ -384,6 +425,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseIntDflash2:
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
@@ -402,6 +444,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseIntDflash2:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
@@ -427,6 +470,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseIntDflash2:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
@@ -453,6 +497,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseIntDflash2:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::value_dim,
                                                         ops::LinearPolicy::A16Only, first, last);
@@ -480,6 +525,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseIntDflash2:
         return post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
                                           ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:

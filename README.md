@@ -57,6 +57,8 @@ measurable resource/runtime gate. Negative candidates remain documented as rejec
 | --- | --- | --- |
 | GDN prefill | Direct fused causal-convolution/SwiGLU split into Q/K/V/Z consumers, avoiding packed-QKV extraction copies | The focused causal-convolution test passes; the prefill microbench is about 33.6 µs versus 60.22 µs for the legacy copy path |
 | FP8 output projection | Dedicated large-token A16 GEMM route with a shared FP8 codec and `T >= 42` dispatch; small-token decode keeps its tuned route | Generic large-token measurements are about 1.13 ms for T=42–60; the crossover was retained only after end-to-end comparison |
+| DFlash2 selector | 512-thread warp-shuffle reduction with packed survivor keys for the deterministic top-16 selector | Focused correctness passes, including same-thread lower-ID ties and guard regions; `248,320 x 8` synthetic selector work is about 327.7 µs versus 565–570 µs for the prior 128-thread path (about 42% lower) |
+| DFlash2 QKV | Direct three-output W8G32 row-split GEMM writes Q/K/V without materializing and copying a packed QKV tensor | Exact focused comparison passes; repeated `T=8` microbench samples show about 19–21% lower latency than packed-QKV-plus-copy |
 | Resource pressure | Bounded continuation search when an incumbent plan exists, reducing pressure-resume planning work without changing the selected contract | The real Qwen3.8 pressure/resume route passes |
 | State and KV ownership | Canonical State/KV resource contracts, device binding, sparse-MoE scan reuse, and successful-warmup readiness gating | Public Engine/resource and readiness tests pass; these are correctness/admission improvements, not unsubstantiated tok/s claims |
 | Measurement discipline | Targeted Nsight Compute kernel inspection and Nsight Systems end-to-end traces on the RTX 5090 | Nsight Systems 2026.4.1 traces are available; Nsight Compute 2026.2.1 is installed, but hardware-counter access is blocked in the current Windows session by `ERR_NVGPUCTRPERM` |
@@ -67,6 +69,19 @@ The main implementation points are [src/ops/linear/fp8/](src/ops/linear/fp8/),
 and the Qwen3.8 runtime under [src/targets/qwen3_6/](src/targets/qwen3_6/). The shared target
 directory name is retained by the current source layout; the registered artifact and benchmark
 identity are Qwen3.8-27B.
+
+### DFlash2 and DSpark checkpoint
+
+The current source tree contains a Qwen3.8-shaped DFlash2 path with five draft layers, target feature
+layers `[5, 19, 33, 47, 61]`, block size 8 (`k=7`), rank 256, top-16 selection, and grouped two-tap
+causal convolutions. The direct-QKV and selector changes above are source-level, focused-op validated
+optimizations. They are not yet an end-to-end DFlash2 serving result: no separate local DFlash2
+`.ninfer` artifact and no local base checkpoint for reproducing one are available in this checkout.
+
+The locally present artifact with a DSpark-oriented filename identifies itself as the regular
+Qwen3.8 `groupwise-int` profile, so it is not treated as a DSpark or DFlash2 validation artifact.
+An E2E DFlash2/DSpark claim remains gated on a correctly converted artifact, quality/parity checks,
+and a real Qwen3.8 serving measurement.
 
 Rejected experiments include FP8 KV, fixed MTP5, proposal-head and graph-boundary variants,
 several NVFP4/FP8 schedule changes, and alternate vocabulary-GEMM crossovers. They either lost
@@ -79,7 +94,9 @@ record.
 The current native validation set includes:
 
 - Release build with MSVC 19.44, CUDA 13.1.80, and `sm_120a`;
-- 94 configured CTest entries: 89 passed and 5 expected skips for absent non-Qwen3.8 artifacts;
+- 95 configured CTest entries: 90 passed and 5 expected skips for absent non-Qwen3.8 artifacts;
+- DFlash2 focused operator coverage for dynamic convolution, direct QKV, predecessor IDs, lattice
+  construction, top-16 selection, and selector-path tracing;
 - Qwen3.8 NVFP4 text and Vision serving smoke checks;
 - real pressure-resume and concurrent MTP settlement checks;
 - synthetic FP8-KV prefill at 252,928 and 262,144 logical context tokens without OOM;
