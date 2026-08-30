@@ -1,22 +1,24 @@
 # VoidInfer project state
 
-Updated: 2026-08-27 UTC
+Updated: 2026-08-28 UTC
 
 ## Canonical state
 
 - Project: VoidInfer / NInfer native Windows RTX 5090 engine
 - Canonical checkout: `D:\AI\voidinfer`
 - Branch: `handoff/phase2-context-resource-20260827`
-- Handoff PR: `https://github.com/The8Darkness/voidinfer/pull/2`
+- PR #2: `https://github.com/The8Darkness/voidinfer/pull/2`
+- PR2 source handoff/head: `6f45851629bee2b691a324767b6b2965955428f` (docs tip); functional repair commit: `c3ca3cb9ef6d2ed6d899d57a6c56e5f4cddc3f41`
 - Orchestration prompt: `MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md`
-- State checkpoint commit: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`); this is the committed handoff checkpoint containing the canonical `dev` runtime/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes
+- Canonical integration checkpoint: `21de38d7a8` (`feat(runtime): integrate canonical context resource runtime`); contains the committed context/resource cutover through `59febed2`, Windows fixes, qualification tests, and benchmark-harness fixes
 - Handoff documentation commits: `8492f900f8` (`docs(state): record phase2 handoff`), `90e76f3d4c` (GitHub handoff link), and `d4fce7aa1f` (Muse Spark master prompt)
 - Previous rollback checkpoint: `9a6813a3` (`fix(windows): complete upstream f0 build integration`); keep it available until the refreshed canonical head is separately qualified
-- Last-known-good build: native Visual Studio 17 2022 x64, Release, CUDA `13.1`, `sm_120a`; `build-windows-phase7` full build and 94-test CTest run pass, with 5 expected artifact skips; benchmark and serve targets built
-- Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`)
-- Pushed handoff branch: `origin/handoff/phase2-context-resource-20260827` includes the prompt checkpoint `d4fce7aa1f`; later state-only commits may advance the branch. Direct `master` push was rejected by the required status check `secret-and-artifact-checks`, so review/merge through PR #2
-- Current phase: Phase 2 validation/handoff; the committed context/resource integration is locally qualified on Qwen3.8 NVFP4, while the refreshed canonical head remains a separate next step
-- Active hypothesis: the canonical content-indexed State/KV/resource path is the correct prefix-cache substrate; qualify it on Qwen3.8 before adding persistence, proposer routing, or codecs
+- PR2 local Release configure/build: unique worker directory `build-pr2-retry`, native Visual Studio 17 2022 x64, MSVC `19.44`, CUDA `13.1.80`, `sm_120a`; configure/build passed
+- PR2 exact Release CTest: `94` entries, `100%` passed, `0` failures, `5` expected skips for absent Qwen3.6/35B artifacts
+- PR2 focused repair tests: `ninfer_tool_call_parser_test.exe` passed with `ok`; `ninfer_qwen3_6_context_store_test` passed `1/1` with `0` failures in `0.10` seconds; result log: `D:\AI\agent-orchestrator\data\worktrees\voidinfer\voidinfer-24\build-pr2-repair-retry\context-store-test.log`
+- Configured push remote: `origin` (`https://github.com/The8Darkness/voidinfer.git`); this state update is committed and pushed to the handoff branch
+- Current phase: Phase 2 validation/handoff; PR2 qualification: Release configure/build passed, exact Release CTest passed, and direct Qwen3.8 NVFP4 route passed
+- Active state: direct Qwen3.8 NVFP4 route is qualified; prior code-9 runs remain retained only as superseded invocation diagnostics
 
 ## Local environment
 
@@ -33,30 +35,44 @@ Updated: 2026-08-27 UTC
 
 | Artifact | Bytes | SHA-256 | Classification |
 | --- | ---: | --- | --- |
-| `models/Qwen3.8-27B-NVFP4-Ninfer/qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` | Qwen3.8 target, NVFP4; local artifact |
+| `D:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-Ninfer\qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` | Qwen3.8 target, NVFP4; canonical direct-route artifact; exact binding variable `NINFER_QWEN3_8_27B_NVFP4_WEIGHTS` |
 | `models/Qwen3.8-27B-DSpark-NInfer/qwen3_8_27b_dspark.ninfer` | 20,929,108,994 | `a6501d2793c8b822aecd975a3d9f7a552646f58af5549c818dd5d4219236c2ce` | Identity reports `qwen3.8-27b/groupwise-int`; compatibility with DSpark remains unverified |
 
 Metadata inspection reports 1,118 tensors + 6 resources for NVFP4 and 1,165 tensors + 6 resources for the DSpark-named artifact. No Qwen3.6, 35B, tokenizer-only, or separate DFlash2 artifact is present locally.
 
 ## Baseline evidence
 
-Configure (after relocation; the recorded qualification build is `build-windows-phase7`):
+Release configure (unique PR2 worker directory `build-pr2-retry`):
 
 ```text
-cmake --fresh -S . -B build-windows-phase7 -G "Visual Studio 17 2022" -A x64
+cmake --fresh -S . -B build-pr2-retry -G "Visual Studio 17 2022" -A x64
   -DCMAKE_TOOLCHAIN_FILE=C:/BuildTools/VC/vcpkg/scripts/buildsystems/vcpkg.cmake
   -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_CUDA_ARCHITECTURES=120a
   -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=ON
 ```
 
-Build and test:
+Release build and exact CTest:
 
 ```text
-cmake --build build-windows-phase7 --config Release -j
-ctest --test-dir build-windows-phase7 -C Release --output-on-failure
+cmake --build build-pr2-retry --config Release -j
+ctest --test-dir build-pr2-retry -C Release --output-on-failure
 ```
 
-Result: `100% tests passed, 0 failed out of 94`; five registered Qwen3.6/35B real-model tests skipped because their required artifacts/fixtures are absent. The same executable's opt-in Qwen3.8 NVFP4 resource-settlement route passes when `NINFER_QWEN3_8_27B_WEIGHTS` is set. Build succeeds with existing MSVC module-dependency and signed/unsigned comparison warnings; no source changes were made for those warnings. Full local evidence is in `results/qwen3.8-nvfp4-phase1-baseline-2026-08-26.json`.
+Result: configure/build passed on native Visual Studio 17 2022 x64 with MSVC `19.44`, CUDA `13.1.80`, and `sm_120a`. The exact `94`-entry Release CTest passed `100%`, with `0` failures and `5` expected skips for absent Qwen3.6/35B artifacts.
+
+Direct Qwen3.8 NVFP4 route:
+
+```text
+set NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=D:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-Ninfer\qwen3_8_27b_nvfp4.ninfer&&D:\AI\voidinfer\build-windows-phase7\tests\Release\ninfer_qwen3_6_27b_prefix_real_test.exe
+```
+
+Classification: `LOCAL_MEASUREMENT`.
+
+The exact direct route used the retained canonical `build-windows-phase7` Release binary, the canonical Qwen3.8-27B NVFP4 artifact, and `NINFER_QWEN3_8_27B_NVFP4_WEIGHTS`. It ran once through `cmd.exe`, exited with code `0` in `15.54` seconds, and produced `4` bytes (`ok` plus newline) on stdout and `0` bytes on stderr. The GPU returned idle with no NInfer process or service. Result paths: `D:\AI\voidinfer\profiles\bench\pr2-route-recheck-20260827\stdout.log` and `D:\AI\voidinfer\profiles\bench\pr2-route-recheck-20260827\stderr.log`.
+
+The earlier local `build-pr2-retry` and inherited `build-windows-phase7` code-9 / CTest `0xc0000409` exits, plus the no-environment control's expected skip code `77`, are retained as superseded invocation diagnostics. They are not current source blockers or evidence against PR2 qualification.
+
+Known evidence paths: `build-pr2-retry/`, `build-windows-phase7/`, `results/qwen3.8-nvfp4-phase1-baseline-2026-08-26.json`, the canonical artifact path listed above, and the two exact route result paths above.
 
 The Qwen3.8 NVFP4 artifact inspects successfully and `ninfer-serve.exe --help` exposes vision, MTP, KV dtype, prefix reuse, Responses, and tool-serving options. Separate native service runs passed the text-only and Vision contract smoke; the Qwen3.8 NVFP4 public-Engine gate now covers Host State/KV restore, multimodal reuse, cancellation/eviction, and concurrent MTP settlement and passes. The 43-case C1 core matrix passed, with MTP3 graph decode ranging from 133.97 to 172.33 tok/s over the selected generation lengths and MTP5 from 107.99 to 151.18 tok/s. Separate decode-saturation runs cover C1/C2/C4/C8: MTP0 steady aggregate 80.4/157.5/292.9/538.5 tok/s and MTP3 171.7/329.8/568.2/1046.8 tok/s. The MTP0 corpus completed 20/20 long-context requests at 8k/64k/128k/256k, and the MTP3 corpus completed 75/75 long-decode, code, story, translation, and structured requests; these remain performance/behavior measurements rather than the complete quality/VLM gate. FP8-KV synthetic prefill completed at 252,928 tokens in 102.87 s (2,458.64 tok/s) and 262,144 tokens in 110.42 s (2,373.99 tok/s). Reports: `results/qwen3.8-nvfp4-phase1-baseline-2026-08-26.json` and ignored `profiles/bench/qwen38-*`.
 
@@ -74,11 +90,19 @@ Detailed provenance and dispositions: `UPSTREAM_AUDIT.md`, `Q27_AUDIT.md`, `SM12
 
 ## Current blockers and next steps
 
-1. The current single three-coefficient context-cost transfer roofline rejects two runs on fragmented D2H/D2D/H2D geometries; keep conservative compiled defaults and improve the fit or fixture before publishing a measured preset.
-2. C1/core, separate C2/C4/C8 decode-saturation, MTP0/MTP3 corpus, and 252,928/262,144 FP8-KV capacity baselines exist, but closed-loop agent task time, long-generation quality, and the complete VLM suite remain outstanding.
-3. The committed canonical context/resource cutover through `59febed2` has passed its local Qwen3.8 Host State/KV, media-reuse, cancellation/eviction, and MTP settlement gate; the refreshed canonical `9dbc074005a1` pressure-planner/tool/parser/anchor series still requires a separate integration worktree and Windows qualification.
-4. Do not start DFlash2, NVFP4-KV, WHT, VeriCache, or broad scheduler work before those refreshed-runtime, exact-quality, and VLM gates exist.
+1. None. Release configure/build, exact Release CTest, and the direct Qwen3.8 NVFP4 route passed; prior code-9 results remain superseded invocation diagnostics only.
 
-The Picot launcher and harness now use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration.
+The Picot launcher and harness use `D:\AI\voidinfer`; the source repository was relocated from the obsolete `D:\AI\Pi\engine` path without overwriting the existing `models` directory. The launcher/harness edits are outside this git checkout and remain local configuration. Windows, WebUI, and local workflow authorities remain preserved, as does the user's dirty prompt deletion.
 
-For the next agent: start with this file, `KNOWN_ISSUES.md`, `EXPERIMENTS.md`, and `UPSTREAM_AUDIT.md`; do not select an unqualified artifact by glob. The immediate next technical step is a separate worktree/branch for the refreshed canonical `9dbc074005a1` pressure-planner/tool/parser/anchor series, followed by the same native build, 94-test CTest run, direct Qwen3.8 resource gate, and focused corpus checks.
+## AO checkpoint
+
+- Orchestrator session: `voidinfer-6`; harness: `omp`; exact model: `openai-codex/gpt-5.6-luna`.
+- Worker: session `voidinfer-24`, name `PR2 repair retry`; workspace `D:\AI\agent-orchestrator\data\worktrees\voidinfer\voidinfer-24`; ownership: PR #2 repair takeover.
+- Prior qualification, integration, and monitor sessions are exited.
+- PR #2 source/head now: `handoff/phase2-context-resource-20260827` / `6f45851629bee2b691a324767b6b2965955428f` (docs tip; functional repair commit: `c3ca3cb9ef6d2ed6d899d57a6c56e5f4cddc3f41`); required check passing; reviews: none.
+- GPU at checkpoint: RTX 5090, 32,607 MiB; about 2.3 GiB desktop/AO use; 0% utilization. No NInfer model, service, build process, or owned service to restore; no active GPU job remains.
+- Windows/WebUI/local workflow authorities and the user's dirty canonical deletion remain untouched. The direct route is qualified; prior code-9 results are superseded invocation diagnostics.
+- Planner integration checkpoint (2026-08-28): canonical planner provenance is `3e903b704ce40eb74cf3b1c8e16261978536e547` (parent `59febed27ca2beec156c056ad9a0a74537d03ac0`); accepted local chain is `da5b4e5b49`, `a2aa655244`, `47bf869d7f`, `59f2dcb045`, and `1fda1961c2`. PR #2 source/head after integration is `handoff/phase2-context-resource-20260827` / `1fda1961c208689a83b22e2c260618ee58b2855a`. AO session `voidinfer-31` qualified the absolute CMake/vcpkg build of `ninfer_resource_manager_test` and `ninfer_request_log_test`; exact CTest `2/2` passed, `0` failures, total `0.04s`; result build: `D:\AI\agent-orchestrator\data\worktrees\voidinfer\voidinfer-31\build-planner-compile-repair-v2`. No GPU/model/service run occurred for this planner slice. Direct-route and PR2 baseline evidence above remain preserved. Next ordered action: separately qualify adjacent canonical fixes `123bf1a11c`, `1d13c21336`, `fbd04729c8`, and `ab82f88603`.
+- Device lifecycle checkpoint (2026-08-28): canonical provenance `1d13c21336f66b200028a0ce4e029c2b58a3d61b`; accepted candidate `d16cb2deb06c3bb012349686d7a517b123e842b5` (parent `78a4933af1bba7c57a549389bcb107fb22cb3bae`), reviewer `voidinfer-36`: ACCEPT, no findings. `build-device-v1` exact configured build of `ninfer_device_test` and `ninfer_engine` succeeded; exact Debug CTest `-R ^ninfer_device_test$` passed `1/1` in `0.15s`. Runtime evidence is limited to GPU/device 0. Planner and warmup evidence remain preserved; no empty warmup marker was added. Reverse-apply showed `123bf1a11c` is already present in `78a4933af1bba7c57a549389bcb107fb22cb3bae`, so it is not a new diff. Next ordered action: sparse-MoE sync `fbd04729c8`.
+- Sparse-MoE synchronization checkpoint (2026-08-28): canonical provenance `fbd04729c8356263e53c6d16b437ec752037a684`; accepted candidate `2a07d0ad1a6cd73287d1c1c1c3e0a297c265ca50` (parent `323cfc295895ffdb0a9cea79bb7123d514e17d4f`), reviewer `voidinfer-42`: ACCEPT, no findings. `build-moe-sync-v1` Release verification passed; exact CTest `1/1` passed in `1.66s`. GPU pre/post: RTX 5090, driver `616.56`, `32,607 MiB` total, `2,328 MiB` used, `0%` utilization pre and `7%` post. Planner/device/warmup evidence remains preserved; warmup `123` remains a no-op already present in the accepted parent and adds no diff. Next ordered action: `ab82f88603`.
+- Readiness-after-warmup integration checkpoint (2026-08-28): canonical readiness provenance `ab82f8860356959d10a3ebd98f70f916b853b0fb`; accepted candidate `affe93be0481e75bf7043dd7c2925e3fe08911df` (parent `93357743d000c70488325fb2e3c325893b7b4d74`), integrated on the handoff branch without changing the verified remote source. The patch is exactly `apps/serve/main.cpp`, `src/serve/generation_service.cpp`, and `src/serve/generation_service.h`; it preserves the current CLI parser/WebUI setup, gates attachment/listening and therefore readiness/traffic on successful synchronous warmup, uses an unbounded startup deadline, and leaves normal scheduling, cache participation, and OpenAI/Anthropic translation paths unchanged. `build-readiness-v1` was configured for Visual Studio 17 2022 x64 with the vcpkg manifest and CUDA `sm_120a`; `ninfer-serve` plus eight tests built successfully, and exact Release CTest passed `8/8`, `0` failures in `0.09s`. Evidence path: `D:\AI\agent-orchestrator\data\worktrees\voidinfer\voidinfer-44\build-readiness-v1`. No GPU, model, service, or benchmark run occurred. Next ordered serving slices after runtime gates: `79c292bc07`, then `780d576791`, then `9dbc074005`.

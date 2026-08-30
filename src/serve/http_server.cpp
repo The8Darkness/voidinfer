@@ -126,16 +126,23 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.backend_kv_d2h_pages != report.previous.backend_kv_d2h_pages ||
            report.current.backend_kv_h2d_pages != report.previous.backend_kv_h2d_pages ||
            report.current.backend_kv_d2d_pages != report.previous.backend_kv_d2d_pages ||
-           report.current.partial_spill_pages != report.previous.partial_spill_pages ||
+           report.current.pressure_spill_pages != report.previous.pressure_spill_pages ||
            report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
-           report.current.private_checkpoint_degradations !=
-               report.previous.private_checkpoint_degradations ||
-           report.current.private_checkpoint_evictions !=
-               report.previous.private_checkpoint_evictions ||
-           report.current.shared_checkpoint_degradations !=
-               report.previous.shared_checkpoint_degradations ||
-           report.current.shared_checkpoint_evictions !=
-               report.previous.shared_checkpoint_evictions ||
+           report.current.pressure_private_owners_degraded !=
+               report.previous.pressure_private_owners_degraded ||
+           report.current.pressure_private_owners_evicted !=
+               report.previous.pressure_private_owners_evicted ||
+           report.current.pressure_shared_owners_degraded !=
+               report.previous.pressure_shared_owners_degraded ||
+           report.current.pressure_shared_owners_evicted !=
+               report.previous.pressure_shared_owners_evicted ||
+           report.current.pressure_checkpoints_dropped !=
+               report.previous.pressure_checkpoints_dropped ||
+           report.current.pressure_searches != report.previous.pressure_searches ||
+           report.current.pressure_search_budget_exhaustions !=
+               report.previous.pressure_search_budget_exhaustions ||
+           report.current.pressure_maximal_fallback_selections !=
+               report.previous.pressure_maximal_fallback_selections ||
            report.current.historical_fork_hits != report.previous.historical_fork_hits ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||

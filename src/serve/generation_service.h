@@ -40,6 +40,7 @@ struct GenerationMetrics {
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
+    ninfer::MaterializationDiagnostics materialization;
 };
 
 struct GenerationOutcome {
@@ -126,11 +127,18 @@ private:
         ReadWrite,
     };
 
+    enum class DeadlinePolicy : std::uint8_t {
+        ClientPendingTimeout,
+        UnboundedStartup,
+    };
+
     [[nodiscard]] PreparedRequest prepare_impl(const GenerationRequest& req,
                                                std::function<bool()> is_cancelled,
                                                ContextCacheHints context_cache,
-                                               CacheParticipation cache_participation) const;
-    [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
+                                               CacheParticipation cache_participation,
+                                               DeadlinePolicy deadline_policy) const;
+    [[nodiscard]] std::shared_ptr<RequestLifetime>
+    acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;

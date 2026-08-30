@@ -159,8 +159,8 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
 
     constexpr std::string_view kToolOpen = "<tool_call>";
     std::string visible;
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        const char byte = text[index];
+    for (std::size_t index = 0; index < text.size();) {
+        const char byte = text[index++];
         if (marker_prefix_bytes_ != 0) {
             if (byte == kToolOpen[marker_prefix_bytes_]) {
                 ++marker_prefix_bytes_;
@@ -168,7 +168,7 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
                     tool_region_ = std::move(trailing_whitespace_);
                     trailing_whitespace_.clear();
                     tool_region_.append(kToolOpen);
-                    tool_region_.append(text.substr(index + 1));
+                    tool_region_.append(text.substr(index));
                     marker_prefix_bytes_ = 0;
                     saw_tool_marker_     = true;
                     break;
@@ -179,6 +179,9 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
             trailing_whitespace_.clear();
             visible.append(kToolOpen.substr(0, marker_prefix_bytes_));
             marker_prefix_bytes_ = 0;
+            // Replay the mismatching byte through the ordinary byte path below.
+            --index;
+            continue;
         }
 
         if (byte == kToolOpen.front()) {

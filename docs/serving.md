@@ -578,7 +578,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v16 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v17 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -589,9 +589,17 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | target/weights identity and artifact, resolved Engine and context-cache capacities, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, request-owned materialization cost/search/bound diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
-| `throughput` | interval token/decode/context-cache counter deltas, authoritative worker Host-work deltas, current scheduler and resource gauges, last materialization decision, and decode-round batch statistics |
+| `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
+
+`request_done.materialization` is the immutable decision committed for that request. It reports predicted immediate,
+future-loss and total nanoseconds; evaluated targets and projection work; planning/search nanoseconds; stop reason;
+model-optimal and budget-exhausted flags; the best remaining lower bound and absolute/relative gap; selected degradation
+units; and whether the selected target was the maximal root fallback. Stop reasons are `no_pressure`, `model_optimal`,
+`queue_exhausted`, `target_budget`, `expansion_capacity`, `time_budget`, and `value_of_next_expansion`.
+`model_optimal` is relative to the configured machine/cache-value model, semantic target graph, and canonical stage
+contract—not a claim that observed TTFT is globally optimal. Aborted planning attempts are not published.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
@@ -629,11 +637,12 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 `avg_decode_batch` is decode row-rounds divided by decode rounds during the same interval. The
 `running`, `prefilling`, `decode_ready`, `waiting`, `materializing`, `capture_pending`, and
 `terminal_pending` fields are the Engine scheduler snapshot at the end of the interval. The JSONL
-`context_cache` object reports
-selection, capture, transfer, COW/spill, degradation, eviction, and historical-fork counters as
-interval deltas; `occupancy`, `last_selection`, and `last_materialization` are end-of-interval
-gauges. `last_materialization.predicted_nanoseconds` is always produced by the startup-selected
-numerical model.
+`context_cache` object reports selection, capture, transfer, COW, pressure spill, private/shared
+owner degradation and eviction, checkpoint drop, pressure search, budget exhaustion, maximal fallback, and historical-fork
+counters as interval deltas; `occupancy` and `last_selection` are end-of-interval gauges. Materialization predictions are
+request-owned and appear only on the corresponding `request_done` event.
+`pressure.searches` counts plans accepted into Program resource transactions, including a transaction that later ends in
+request-local abort; committed victim counters likewise report the resulting stable cache changes.
 
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five

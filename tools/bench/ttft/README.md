@@ -233,6 +233,17 @@ python3 tools/bench/run_serve_ttft_campaign.py --campaign resource --samples 5
 
 `smoke` runs the short baseline, `resource` runs the six Device/Host/eviction/catalog comparisons,
 and `full` runs all 50 audited cases. `resource` is the default and `--samples` defaults to one.
+Repeat `--case NAME` instead of `--campaign` to run a focused subset through the same managed
+lifecycle, for example:
+
+```bash
+python3 tools/bench/run_serve_ttft_campaign.py \
+  --case session-hot-continuation \
+  --case resume-after-interference-device \
+  --case shared-sequential \
+  --samples 3
+```
+
 The controller uses Qwen3.8-27B NVFP4 with FP8 KV, starts and stops a fresh Serve for every sample,
 shows the runner's live progress, retains the RAM artifact across campaigns until reboot or source
 replacement, and writes beneath:
@@ -243,18 +254,22 @@ profiles/bench/ttft/qwen3_8_27b_nvfp4-fp8/<timestamp>-<campaign>/
   raw/<profile>/<case>/sample-NNN.json
   progress/<profile>/<case>/sample-NNN.log
   serve/<profile>/<case>/sample-NNN.log
+  request-log/<profile>/<case>/sample-NNN.jsonl
+  summary.md
   summary.json
   summary.csv
   failures.json                         # only when a run fails
 ```
 
-The raw JSON is the measurement authority. Progress is operational output, and Serve logs are
-separate diagnostics that the runner and summarizer never consume. `summary.json` and
-`summary.csv` are produced automatically. `manifest.json` records both the source artifact and the
-actual tmpfs path used by Serve.
+The raw JSON is the external TTFT measurement authority. Progress and text Serve logs are
+operational diagnostics; the structured request log records internal timings for diagnosis and
+does not replace the external measurement. Complete, failed, and interrupted
+campaigns automatically produce the same summary bundle. `summary.md` is the human report;
+`summary.json` is the complete machine-readable aggregate; `summary.csv` contains typed TTFT,
+comparison, symmetric-order, rejection, and optional cross-campaign rows. `manifest.json` records
+both the source artifact and the actual tmpfs path used by Serve.
 
-For one-case protocol or graph diagnosis, start the matching Serve profile manually and invoke the
-low-level runner directly:
+The low-level runner remains available when a separately managed Serve process is intentional:
 
 ```bash
 python3 tools/bench/run_serve_ttft.py \
@@ -276,20 +291,24 @@ has no new public event. Stage lines use elapsed monotonic time and include TTFT
 when that value becomes observable. The final JSON remains the only content written to `stdout`, so
 progress can be displayed interactively or redirected independently without changing report input.
 
-To re-aggregate an existing set of raw run files manually:
+To re-aggregate one complete or partial campaign manually:
 
 ```bash
-python3 tools/bench/summarize_serve_ttft.py profiles/bench/ttft \
-  --output-json profiles/bench/ttft/summary.json \
-  --output-csv profiles/bench/ttft/summary.csv
+python3 tools/bench/summarize_serve_ttft.py \
+  profiles/bench/ttft/qwen3_8_27b_nvfp4-fp8/<campaign>
 ```
 
-Successful constructed TTFT is grouped by public model, case, profile label, and request role. The
-summary reports raw samples, min, median, max, and only predefined median deltas. For explicitly
-declared symmetric barrier roles it also reports per-run order statistics (fastest, second, and so
-on) plus which arbitrary role occupied each rank; it does not pretend role B is semantically
-different from role C. Rejections are a separate table. It does not report QPS, throughput, P95,
-or inferred internal cache actions.
+Add `--baseline <campaign>` for matching observations against an explicit prior campaign. The
+summarizer reads only runs declared by the campaign manifest, reports missing, invalid, and
+unconstructed samples, and links each issue back to raw/progress/Serve/request diagnostics.
+
+Successful constructed TTFT is grouped by public model, architecture category, case, profile, and
+request role. Each group reports raw samples, min, median, max, median absolute deviation, and
+relative span. Declared comparisons use `subject - baseline`, so a positive delta means the subject
+is slower; roles inside one case are paired per run, while cross-case comparisons use independent
+group medians. Symmetric barrier roles are ranked inside each run without assigning semantic
+meaning to arbitrary role names. The report does not publish QPS, throughput, P95, or inferred
+internal cache actions.
 
 ## Deliberately absent cases
 

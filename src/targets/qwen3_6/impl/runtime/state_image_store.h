@@ -544,14 +544,15 @@ public:
             source.transfer_id        = 0;
             break;
         case StateTransferDirection::HostToDevice:
-            source.device_slot = source.pending_device_slot;
-            source.pending_device_slot.reset();
             if (!keep_source_replica) {
-                if (host_ == nullptr || !host_->release(*source.host_slot)) {
+                if (host_ == nullptr || !source.host_slot ||
+                    !host_->release(*source.host_slot)) {
                     throw std::logic_error("StateImage Host replica release failed at publication");
                 }
                 source.host_slot.reset();
             }
+            source.device_slot = source.pending_device_slot;
+            source.pending_device_slot.reset();
             --source.source_pins;
             source.destination_pinned = false;
             source.transfer_id        = 0;
@@ -604,13 +605,13 @@ public:
             object.destination_pinned || has_pending_replica(object)) {
             return false;
         }
-        if (object.device_slot) {
-            return_device_slot(*object.device_slot);
-            object.device_slot.reset();
-        }
         if (object.host_slot) {
             if (host_ == nullptr || !host_->release(*object.host_slot)) { return false; }
             object.host_slot.reset();
+        }
+        if (object.device_slot) {
+            return_device_slot(*object.device_slot);
+            object.device_slot.reset();
         }
         object.role          = StateImageRole::Free;
         object.content_epoch = 0;

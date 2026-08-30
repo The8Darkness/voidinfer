@@ -1,7 +1,6 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
-#include "serve/console_log.h"
 #include "serve/tool_call_parser.h"
 #include "serve/translate.h"
 
@@ -256,7 +255,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
 
-std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() const {
+std::shared_ptr<RequestLifetime>
+GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
     const auto started = Clock::now();
     {
         std::lock_guard lock(request_capacity_->mutex);
@@ -267,9 +267,11 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
         ++request_capacity_->active;
     }
     try {
-        return std::make_shared<RequestLifetime>(
-            request_capacity_, started,
-            started + std::chrono::milliseconds(options_.pending_timeout_ms));
+        const Clock::time_point deadline =
+            deadline_policy == DeadlinePolicy::UnboundedStartup
+                ? Clock::time_point::max()
+                : started + std::chrono::milliseconds(options_.pending_timeout_ms);
+        return std::make_shared<RequestLifetime>(request_capacity_, started, deadline);
     } catch (...) {
         std::lock_guard lock(request_capacity_->mutex);
         --request_capacity_->active;
@@ -282,13 +284,15 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            ContextCacheHints context_cache) const {
     return prepare_impl(request, std::move(is_cancelled), std::move(context_cache),
                         options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
-                                                    : CacheParticipation::Disabled);
+                                                    : CacheParticipation::Disabled,
+                        DeadlinePolicy::ClientPendingTimeout);
 }
 
 PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
                                                 std::function<bool()> is_cancelled,
                                                 ContextCacheHints context_cache,
-                                                CacheParticipation cache_participation) const {
+                                                CacheParticipation cache_participation,
+                                                DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
     prepared.include_usage        = request.include_usage;
     prepared.tool_capable         = request.uses_tools() || request.has_tool_history();
@@ -306,7 +310,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    prepared.lifetime = acquire_request_lifetime();
+    prepared.lifetime = acquire_request_lifetime(deadline_policy);
 
     try {
         const auto acquisition_started = Clock::now();
@@ -420,6 +424,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.engine_timing               = result.engine_timing;
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
+    outcome.metrics.materialization             = result.materialization;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;
@@ -444,24 +449,20 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 }
 
 void GenerationService::warmup() {
-    try {
-        GenerationRequest request;
-        ChatTurn turn;
-        turn.role = ChatRole::User;
-        ContentPart content;
-        content.kind     = ContentKind::Text;
-        content.text     = "hi";
-        content.type_raw = "text";
-        turn.content.push_back(std::move(content));
-        request.messages.push_back(std::move(turn));
-        request.max_tokens       = 4;
-        request.max_tokens_set   = true;
-        PreparedRequest prepared = prepare_impl(request, {}, {}, CacheParticipation::Disabled);
-        run(prepared, nullptr);
-    } catch (const std::exception& exception) {
-        write_console_log(ConsoleLogLevel::Warning,
-                          std::string("warmup failed (continuing): ") + exception.what());
-    }
+    GenerationRequest request;
+    ChatTurn turn;
+    turn.role = ChatRole::User;
+    ContentPart content;
+    content.kind     = ContentKind::Text;
+    content.text     = "hi";
+    content.type_raw = "text";
+    turn.content.push_back(std::move(content));
+    request.messages.push_back(std::move(turn));
+    request.max_tokens       = 4;
+    request.max_tokens_set   = true;
+    PreparedRequest prepared = prepare_impl(request, {}, {}, CacheParticipation::Disabled,
+                                            DeadlinePolicy::UnboundedStartup);
+    run(prepared, nullptr);
 }
 
 } // namespace ninfer::serve

@@ -4,7 +4,7 @@ All numbers must be classified as `PUBLISHED_EXTERNAL_RESULT`, `LOCAL_BASELINE`,
 
 | ID | Hypothesis | Status | Owner | Gate / rollback |
 | --- | --- | --- | --- | --- |
-| `E000` | Native Windows build can be reproduced from the relocated checkout with local dependencies | accepted | integrator | CMake Release build + 89-test CTest; rollback is source commit `3e2a28be` |
+| `E000` | Native Windows build can be reproduced from the relocated checkout with local dependencies | accepted | integrator | CMake Release build + exact 94-entry CTest (`0` failures, `5` expected skips); rollback is source commit `3e2a28be` |
 | `E001` | Correct root/scaffolding and artifact hashes make subsequent measurements restartable | accepted | integrator | `PROJECT_STATE.md` + baseline JSON + clean git state |
 | `E002` | Windows-aware serving/benchmark defaults remove path-only smoke failures without changing runtime semantics | accepted | Windows/benchmark | Python compile/import checks, benchmark unit test, and native Windows binary-path resolution passed; Linux paths remain unchanged |
 | `E003` | Canonical dev StateImage/paged-KV/Engine cutover can be integrated as one reviewable Windows worktree | accepted locally | upstream/runtime | staged integration tree builds; 94-test CTest passes with 5 expected skips; Qwen3.8 NVFP4 resource-settlement route passes; retain `9a6813a3` as rollback until review/commit |

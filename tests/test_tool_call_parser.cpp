@@ -131,6 +131,35 @@ int test_incremental_filter_valid_tool() {
     return failures;
 }
 
+int test_incremental_filter_marker_mismatch_reprocesses_byte() {
+    ninfer::serve::ToolCallStreamFilter ordinary;
+    std::string ordinary_restored;
+    ordinary_restored += ordinary.feed("<tool_");
+    ordinary_restored += ordinary.feed("X");
+    ordinary_restored += ordinary.finish(false);
+
+    ninfer::serve::ToolCallStreamFilter partial;
+    std::string partial_restored;
+    partial_restored += partial.feed("<tool_");
+    partial_restored += partial.feed("<tool_");
+    partial_restored += partial.finish(false);
+
+    ninfer::serve::ToolCallStreamFilter fresh_marker;
+    std::string visible;
+    visible += fresh_marker.feed("<tool_");
+    visible += fresh_marker.feed("<tool_call>\n<function=weather>");
+    visible += fresh_marker.feed("\n</function>\n</tool_call>");
+    visible += fresh_marker.finish(true);
+
+    int failures = 0;
+    failures += check(ordinary_restored == "<tool_X",
+                      "partial marker mismatch dropped the current byte");
+    failures += check(partial_restored == "<tool_<tool_",
+                      "mismatching '<' did not begin a fresh marker");
+    failures += check(visible == "<tool_", "fresh marker after mismatch was not recognized");
+    return failures;
+}
+
 int test_incremental_filter_fallback() {
     const std::string original = "prefix  \n<tool_call>\n<function=broken>";
     ninfer::serve::ToolCallStreamFilter malformed;
@@ -170,6 +199,7 @@ int main() {
     failures += test_suffix_after_tool_falls_back_to_text();
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
+    failures += test_incremental_filter_marker_mismatch_reprocesses_byte();
     failures += test_incremental_filter_fallback();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

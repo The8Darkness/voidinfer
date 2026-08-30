@@ -747,6 +747,12 @@ Admission不是一个per-request delta check，而是Program对完整choice的�
 destination、全部victims和有序copy/release stages。每个stage都必须满足pool capacity；copy-before-release
 不能用最终净值掩盖瞬时峰值。
 
+Pressure planner向KV Store提交完整最终placement，不提交逐页greedy actions。KV降级边界按physical page表示，
+不得拆分一页。
+
+全部checkpoint/owner outcomes联合应用后，Program才重建logical references、last-reference releases、replica
+placement和COW。单独不释放page的owner变化不能在联合计算前被过滤。
+
 Last-reference reclaim也只从完整post-state得到。删除一个alias通常不释放page；多个victims共同删除最后一批
 references时，每个physical replica只释放一次。ResourceManager不得相加per-owner release credits。
 
@@ -769,6 +775,9 @@ State一致的完整bundle，要么释放整个active bundle。
 
 KV Store不自行选择victim。ResourceManager提供逻辑choice，Program seal并执行唯一ResourceTransaction；
 ResourceManager最终只采用`ResourceResult`中的catalog/lane终态。
+
+Executor在第一次mutation前依据plan的resource revision和当前真实allocator整体revalidate；执行时不能另选
+placement或stage顺序。
 
 ---
 

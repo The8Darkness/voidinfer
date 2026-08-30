@@ -508,6 +508,62 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
+// Why pressure planning stopped for the materialization decision committed to one request.
+// "ModelOptimal" is relative to the configured target graph, canonical transaction order, and
+// numerical cost model; it is not a claim about globally optimal observed TTFT.
+enum class MaterializationStopReason : std::uint8_t {
+    NoPressure,
+    ModelOptimal,
+    QueueExhausted,
+    TargetBudget,
+    ExpansionCapacity,
+    TimeBudget,
+    ValueOfNextExpansion,
+};
+
+[[nodiscard]] inline constexpr const char*
+materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
+    switch (reason) {
+    case MaterializationStopReason::NoPressure:
+        return "no_pressure";
+    case MaterializationStopReason::ModelOptimal:
+        return "model_optimal";
+    case MaterializationStopReason::QueueExhausted:
+        return "queue_exhausted";
+    case MaterializationStopReason::TargetBudget:
+        return "target_budget";
+    case MaterializationStopReason::ExpansionCapacity:
+        return "expansion_capacity";
+    case MaterializationStopReason::TimeBudget:
+        return "time_budget";
+    case MaterializationStopReason::ValueOfNextExpansion:
+        return "value_of_next_expansion";
+    }
+    return "no_pressure";
+}
+
+struct MaterializationDiagnostics {
+    std::uint64_t predicted_now_ns              = 0;
+    std::uint64_t predicted_future_loss_ns      = 0;
+    std::uint64_t predicted_total_ns            = 0;
+    std::uint32_t targets_evaluated             = 0;
+    std::uint64_t projection_work               = 0;
+    std::uint64_t planning_elapsed_ns           = 0;
+    std::uint64_t search_elapsed_ns             = 0;
+    MaterializationStopReason stop_reason       = MaterializationStopReason::NoPressure;
+    bool model_optimal                          = true;
+    bool budget_exhausted                       = false;
+    std::uint64_t best_remaining_lower_bound_ns = 0;
+    std::uint64_t absolute_bound_gap_ns         = 0;
+    double relative_bound_gap                   = 0.0;
+    std::uint32_t selected_degradation_units    = 0;
+    bool selected_maximal_fallback              = false;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationDiagnostics&,
+               const MaterializationDiagnostics&) noexcept = default;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -517,6 +573,7 @@ struct GenerationResult {
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
+    MaterializationDiagnostics materialization;
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
@@ -660,21 +717,24 @@ struct RuntimeStats {
     double backend_kv_h2d_seconds      = 0.0;
     double backend_kv_d2d_seconds      = 0.0;
 
-    std::uint64_t partial_spill_pages               = 0;
-    std::uint64_t partial_tail_cow_pages            = 0;
-    std::uint32_t device_state_occupied_slots       = 0;
-    std::uint32_t host_state_occupied_slots         = 0;
-    std::uint32_t device_main_kv_occupied_pages     = 0;
-    std::uint32_t device_backend_kv_occupied_pages  = 0;
-    std::size_t host_kv_occupied_bytes              = 0;
-    std::uint64_t private_checkpoint_degradations   = 0;
-    std::uint64_t private_checkpoint_evictions      = 0;
-    std::uint64_t shared_checkpoint_degradations    = 0;
-    std::uint64_t shared_checkpoint_evictions       = 0;
-    std::uint32_t shared_active_references          = 0;
-    std::uint64_t historical_fork_hits              = 0;
-    std::uint64_t last_predicted_materialization_ns = 0;
-    double actual_context_transfer_seconds          = 0.0;
+    std::uint64_t pressure_spill_pages                 = 0;
+    std::uint64_t partial_tail_cow_pages               = 0;
+    std::uint32_t device_state_occupied_slots          = 0;
+    std::uint32_t host_state_occupied_slots            = 0;
+    std::uint32_t device_main_kv_occupied_pages        = 0;
+    std::uint32_t device_backend_kv_occupied_pages     = 0;
+    std::size_t host_kv_occupied_bytes                 = 0;
+    std::uint64_t pressure_private_owners_degraded     = 0;
+    std::uint64_t pressure_private_owners_evicted      = 0;
+    std::uint64_t pressure_shared_owners_degraded      = 0;
+    std::uint64_t pressure_shared_owners_evicted       = 0;
+    std::uint64_t pressure_checkpoints_dropped         = 0;
+    std::uint64_t pressure_searches                    = 0;
+    std::uint64_t pressure_search_budget_exhaustions   = 0;
+    std::uint64_t pressure_maximal_fallback_selections = 0;
+    std::uint32_t shared_active_references             = 0;
+    std::uint64_t historical_fork_hits                 = 0;
+    double actual_context_transfer_seconds             = 0.0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

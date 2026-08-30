@@ -413,7 +413,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     return RequestBasePlan(std::move(base));
 }
 
-std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
+std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
     const SequenceState* source, const SharedPrefixState* shared_source,
     std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
@@ -425,7 +425,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
     if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
     const RequestBasePlanImpl& base = *base_plan.impl_;
 
-    auto plan                         = std::make_unique<AdmissionPlanImpl>();
+    auto plan                         = std::make_unique<AdmissionCandidateImpl>();
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
@@ -1044,7 +1044,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
             .final_removed            = removed,
             .final_added              = added,
         };
-        return AdmissionPlan(std::move(plan));
+        return AdmissionCandidate(std::move(plan));
     }
     detail::PhysicalDeviceResources exclusive_active = active;
     detail::PhysicalResources shared_replica_additions;
@@ -1192,7 +1192,7 @@ std::optional<AdmissionPlan> ProgramImplCore::inspect_lane(
         .final_removed            = source_resources,
         .final_added              = final_added,
     };
-    return AdmissionPlan(std::move(plan));
+    return AdmissionCandidate(std::move(plan));
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

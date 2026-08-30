@@ -55,7 +55,7 @@ ResourceManager 只拥有逻辑 policy：
 - private/shared catalog 的逻辑可见性和预留 publication slot；
 - SessionIndex、ContentPrefixIndex 和 retention observations；
 - exact candidate shortlist；
-- source disposition、logical degradation action 顺序和成本比较；
+- source candidate、retention value、完整目标搜索、logical claims 和成本比较；
 - Program 返回的 opaque handles 与稳定终态结果的采用。
 
 ResourceManager 不保存物理占用账本，不保存 per-lane State/KV resource vector，不从 owner delta 推导容量，
@@ -86,7 +86,7 @@ Scheduler
         ▼
 ResourceManager
     枚举 exact candidates
-    排序 logical degradation actions
+    由 MaterializationPlanner 搜索完整逻辑终态
         │
         ▼
 Program
@@ -615,84 +615,89 @@ root/full reset
 ContentPrefixIndex 只生成 shortlist。相同 checkpoint 经多个 index/marker 命中时先按 capability identity 去重，
 再由 Program exact verify。Root 永远存在且只出现一次。
 
-### 8.2 完整 choice 是唯一规划单位
+### 8.2 Candidate、target 与完整 choice
 
-一个 plan 的输入必须同时固定：
+`AdmissionCandidate` 只固定 root 或 exact source、destination lane、prompt identity 和 request work。它不提前固定
+Move/Fork、victim、replica placement 或物理 stages；这些结论都可能因最终引用闭包而改变。
+
+Pressure planner 搜索的节点是完整终态 `target`，不是动作 delta。一个 target 同时确定：
 
 ```text
-source checkpoint or root
-source disposition: Move or Fork
-logical degradation actions
-replica placement actions
-destination lane/state/KV reservations
-optional catalog publication slot
+每个 eligible owner retained 或 evicted
+每个 surviving checkpoint 及其 State/Main/Backend coverage
+每个 surviving replica 的 Device/Host placement
+selected source retained 或 consumed-to-active
+所有零引用对象的自动释放
 ```
 
-Program 在同一个 hypothetical post-state 中联合决定：
+完整 choice 是 `(candidate, target, logical publication)`。ResourceManager 所属的 `MaterializationPlanner` 拥有
+目标函数、跨 candidate 搜索、publication slot 和 logical claims；Program 的调用期 `PressurePlanningSession` 是唯一
+physical oracle，负责 target legality、引用闭包、Move/Fork/COW、allocator feasibility、逐 stage peak、恢复成本和 seal。
+Opaque target handle 不能离开该 session。
 
-- Move/Fork；
-- last-reference release；
-- State/KV Device/Host placement；
-- partial-tail COW；
-- Host/Device allocator feasibility；
-- ordered physical stages；
-- active completion reservation；
-- terminal logical outcomes。
+Eligible owner 是未被 active reference 或 transaction pin 占用、且不是本 candidate selected source 的 catalog
+owner。Selected source 在一次 materialization 中只走 source claim/result，不同时成为 pressure victim；其他 owner
+的降级仍可能移除与 selected source 共享的引用，Program 必须据此重推 source 的 Move/Fork/COW。
 
-Program内部可以保存候选的阶段需求，但该值不越过Program边界。ResourceManager不能读取它，也不能把多个
-owner的局部释放量相加后自行判定可行性。
+等价完整 target 只评估一次，并始终从当前稳定状态直接投影到最终状态。ResourceManager 不读取 raw page、extent、
+refcount、release delta 或 stage peak，也不能把多个 owner 的局部效果相加。
 
-候选在当前稳定状态中的初始缺口由Program逐维计算：
+### 8.3 目标空间与语义断点
+
+Target 只沿单调降级方向扩展：checkpoint 删除、replica rank 下降、Device-only State/KV 转为 Host-only，以及
+完整 owner eviction。Selected source owner、active references 和 transaction pins 不进入 victim choices；selected
+source 所需 coverage 即使被其他 owner alias 也始终受保护。结构合法但当前物理不可行的 target 仍可继续扩展。
+
+Successor 使用真实 residual deficit、surviving checkpoint frontier、physical page/Host extent 边界和完整 suffix
+定义语义断点，不能依赖固定的逐页 action chain 才到达合法终态。Physical page 不可拆分。即使一个 owner 变化单独看
+不释放 allocation，也不能在联合 post-state 计算前以“零收益”过滤。
+
+Program 对每个 target 联合应用全部 owner/checkpoint outcomes，重建 references，再推导 source disposition、
+last-reference releases、replica placement、COW、active completion reservation 和 ordered stage peaks。Assessment 与
+seal 使用同一物理投影；seal 前必须在当前 resource revision 下重新验证等价终态和成本。事务执行合同见 §9。
+
+### 8.4 搜索、下界与完备回退
+
+对 candidate \(c\) 和完整 target \(T\)，规划目标固定为：
 
 \[
-Deficit_r(c)=\max\bigl(0, Used_r(S_0)+PeakAdditional_r(c)-Capacity_r\bigr)
+J(c,T)=Now(c,T)+FutureLoss_c(T)
 \]
 
-`PeakAdditional`已经包含候选自己的source disposition与阶段顺序。Pressure option只针对这个真实缺口生成；
-不能用“所有维度都短缺”之类的哨兵替代，否则Host缺口会错误阻止Device到Host降级。
+\[
+FutureLoss_c(T)=\sum_{q\in Q_c}w_q\max(0,R(q,S_T)-R(q,I_c))
+\]
 
-### 8.3 Canonical degradation sequence
+其中 \(I_c\) 是 candidate 不做 optional pressure degradation 的语义终态，\(R\) 是 Program 依据真实
+State/Main/Backend placement 与 exact Text/Vision prefill work 得出的最小恢复成本。合法的 selected-source
+`ConsumedToActive` 是 ownership transfer，不是 eviction；未随 lineage 转移而被删除或降级的 source checkpoints
+仍计入损失。\(w_q\) 由 retention class 和 cache-value observations 决定；具体权重是 policy 调优值，不是架构合同。
 
-Correctness不要求求解任意victim子集的全局最优组合。Program为每个owner返回有界、自包含的保留型
-alternatives，例如：
+搜索采用跨全部 exact candidates 的 best-first branch-and-bound，不把 edge cost 当作 target cost。合法下界为：
 
-```text
-release redundant Device replica
-move cold suffix/State to Host
-drop one low-value anchor or endpoint suffix
-```
+\[
+LB(c,T)=MinimumRequestCost(c)+FutureLoss_c(T)
+\]
 
-每个alternative描述该owner的一份完整目标状态，不是供ResourceManager相加的delta。ResourceManager按以下稳定
-policy key排序这些alternatives，并把完整owner eviction固定放在该owner最后：
+`MinimumRequestCost` 包含该 source 缺失 replica 的必需 H2D 恢复和不能被 ownership 重推导消除的 copy；只排除
+完整 victim set 可能把 private consumed-source Fork/COW 改写成 Move 的 D2D work，以及可被后续终态取消的
+pressure work。
 
-```text
-RetentionClass: Disposable < RecentPrivate < LiveSession < SharedStable
-estimated future recovery loss
-shared fan-out
-last successful hit
-stable owner/checkpoint ordinal
-```
+可行 identity 只有在其完整成本支配全部 expandable identity 的下界时才可直接 seal。若仍有可能被完整 victim set
+消除的 Fork/COW 或 transfer 成本，该 identity 即使物理可行也必须保留为可展开根。Queue 最小下界严格大于
+incumbent 完整成本时才能证明 model-optimal；相等成本仍须保留稳定 tie-break 的比较机会。
 
-Protected source、active references和open transaction pins不进入序列。ResourceManager每次推进一个owner的下一
-alternative；同一owner的新alternative替换其旧alternative，然后让Program从真实当前状态重新seal完整choice。
-因此Program逐个联合评估：
+没有可行 identity 时，预算外先精确评估 `root + release all unprotected inactive cache`。它是不做 preserving copy
+的 correctness incumbent，保证搜索预算只影响缓存保留质量，不影响本来可在当前 active reservations 下运行的请求
+ready。
 
-1. no pressure；
-2. canonical sequence产生的完整selected-action states；
-3. maximal safe release：保留 selected source/protected objects，删除其余全部可释放 inactive cache。
+搜索图有固定上限。一次 expansion 的 children 必须原子加入或全部丢弃，不能因容量不足保留与生成顺序相关的前缀。
+Budget 只在完整 expansion 边界检查，不能截断 identity 检查或上述 correctness assessment；停止后使用当前
+incumbent。
 
-即使单个action的standalone release为零，Program也必须从完整post-state重新计算，不能由ResourceManager跳过。
-中间states用于提高保留价值，不承担admission correctness。
+### 8.5 结果与停止
 
-### 8.4 完备回退
-
-每次 request planning 都额外检查：
-
-```text
-root + release all unprotected inactive cache
-```
-
-因此 cache policy 不会永久阻止一个本来能在空 Engine中运行的 request：
+完备回退把结果分成四类：
 
 - request 的 isolated root completion requirement 已超过总/per-sequence容量：`PermanentlyInfeasible`；
 - isolated root可行，但当前被active reservations、lane或open transaction阻塞：`TemporarilyBlocked`；
@@ -702,42 +707,10 @@ root + release all unprotected inactive cache
 不对同一未变化的稳定状态重复轮询 `TemporarilyBlocked`；lane释放、resource revision变化、head protection变化或
 open transaction结束后重新检查。
 
-### 8.5 成本
-
-每个可行 plan 的比较成本为：
-
-\[
-Cost(c,V)=
-T_{state\ restore}
-+T_{KV\ restore}
-+T_{remaining\ prefill}
-+T_{transition}
-+Loss(V)
-\]
-
-对每个受影响 checkpoint \(i\)：
-
-\[
-Loss_i=
-w_i\cdot
-\max(0,
-FutureRecoveryCost_i(after)-FutureRecoveryCost_i(before))
-\]
-
-`after` 必须来自联合 post-state：仍有效时使用其最佳 surviving replica path；被删除时使用 surviving fallback
-加重建成本。\(w_i\) 来自 retention class、fan-out、hit/recency observations。权重和机器时间系数属于 policy
-与离线校准，不参与资源正确性。
-
-比较先使用预测 nanoseconds；精确相同时依次偏好：
-
-```text
-fewer destroyed SharedStable/LiveSession checkpoints
-fewer transferred bytes/operations
-more reused prompt tokens
-stable candidate/action ordinal
-```
-
-不宣称 canonical chain 上的 minimum 是任意 victim subset 的全局 optimum。
+最终比较先使用 \(J\)；相等时用cache value、不可逆损失、physical work、prefix reuse和稳定ordinal组成确定性
+tie-break。
+`model_optimal` 只表示在当前语义断点图、canonical stages 与启动时机器成本模型下已经证明最优，不表示真实 TTFT
+的全局数学最优。
 
 ---
 
@@ -808,6 +781,9 @@ session/publication replacement result
 terminal sequence released
 ```
 
+结果中的 summary 是 Program 已发布稳定终态的绝对值，不是增量。ResourceManager采用它时不能再次叠加本次
+publication、claim或reference变化。
+
 它不携带供 ResourceManager重建物理占用的delta。Program可同时提供只读physical usage diagnostics，但该值不参与
 ResourceManager correctness。
 
@@ -826,7 +802,8 @@ noexcept。若Program outcome与预留logical alternatives不一致，进入Engi
 
 已经完成并用于capacity preparation的合法 victim demotion/eviction不要求回滚；在transaction期间相应catalog
 entries保持claimed/hidden，最终由一次 `ResourceResult`明确哪些变化已提交。由于没有ResourceManager物理镜像，
-不存在逐progress同步或回放physical delta。
+不存在逐progress同步或回放physical delta。每个 victim acknowledgement 必须显式区分“已提交压力变化”和“仅解除
+未修改的 claim”；后者不推进 owner revision，也不计入 degradation 统计。
 
 CUDA状态不可信、Program内部引用/allocator invariant失败或physical publication后无法adopt时进入Engine-wide
 cleanup/failure，不能伪装成cache miss。
@@ -925,43 +902,21 @@ active unlock bucket表。
 
 ## 13. Retention 与 pressure
 
-RetentionClass只有：
+RetentionClass 的价值顺序为：
 
 ```text
-SharedStable
-LiveSession
-RecentPrivate
-Disposable
+SharedStable > LiveSession > RecentPrivate > Disposable
 ```
 
 Active、selected source、transaction victim dependency和pending terminal是临时protected状态，不是第五种
-retention class。
+retention class。这一顺序只提供 §8 目标函数中的cache value，不规定固定的逐出动作链。
 
-典型pressure顺序为：
+合法pressure target可以组合以下降级：
 
-### Device State
-
-1. 释放已有Host replica的低价值Device duplicate；
-2. 将cold checkpoint state下沉Host；
-3. 删除被替换或Disposable checkpoint；
-4. 删除低价值anchor/rewrite；
-5. optional capture放弃。
-
-### Device KV
-
-1. 释放zero-reference pages；
-2. 释放已有Host replica的低价值Device duplicate；
-3. 下沉private endpoint在rewrite之后的suffix；
-4. 下沉cold private pages；
-5. 最后处理高fan-out shared pages。
-
-### Host State/KV
-
-1. 删除zero-reference或Device已有完整替代的duplicate；
-2. 删除被替换/Disposable objects；
-3. 删除低价值anchor/private suffix；
-4. 删除接近surviving fallback的checkpoint；
-5. 最后删除LiveSession或SharedStable。
+- 删除已有完整替代的redundant replica；
+- 将Device State/KV降为Host-only；
+- 删除checkpoint或不再有价值的suffix coverage；
+- 逐出完整inactive owner。
 
 若释放replica会使checkpoint失去最后一份完整State或required KV coverage，同一logical action必须删除该checkpoint，
 或先发布满足要求的replacement。
@@ -992,45 +947,16 @@ pressure plan。
 | Finish无法保留checkpoint | release sequence，lane必须有限步回到Free |
 | 同Session请求乱序finish | 只允许较新的publication_order更新binding |
 | 只有KV没有State | 不是hit，回退到更早checkpoint或root |
-| Cache占满导致admission失败 | 检查root+release-all-inactive；不把cache policy错误解释成永久不可行 |
 
 ---
 
-## 15. 概念接口
+## 15. 边界协议
 
-以下接口描述模块边界，不规定具体C++类型名：
+§8 的candidate inspection、target assessment和seal在`start`前都无物理副作用。`ResourcePlan`是Program-owned opaque
+value，不向ResourceManager暴露allocation、page、slot或allocator内部结构。
 
-```cpp
-RequestBasePlan describe_request(...);
-CandidateMatch inspect_checkpoint(...);
-ResourceAssessment assess(...);
-ResourcePlan seal(...);
-
-StartResult start(ResourcePlan&&, PreparedLogicalAdoption&&);
-ProgressResult progress(RunningTransaction&);
-ResourceResult commit(RunningTransaction&&);
-ResourceResult abort(RunningTransaction&&);
-
-TerminalResult finish_or_discard(SequenceHandle&&);
-```
-
-`inspect_checkpoint`、`assess`和`seal`无副作用。`ResourcePlan`是不透明的Program-owned value，
-不得向ResourceManager暴露raw allocation id、page id、slot id或allocator内部结构。
-
-`start`先验证plan引用的resource revision、source和victim assumptions；失效必须在任何物理修改前返回。成功后，
-Program独占`RunningTransaction`，ResourceManager只保留逻辑lane状态和预分配的adoption storage。
-
-`progress`推进有界物理工作，不生成供ResourceManager重放的physical receipt。`commit`或`abort`只返回一个稳定的
-`ResourceResult`，其中包含ResourceManager必须采用的逻辑终态：
-
-- source/target checkpoint的保留或发布；
-- 已提交victim degradation或deletion；
-- lane下一状态；
-- terminal/capture处理结果；
-- 诊断所需的plan与成本摘要。
-
-ResourceManager对终态的采用必须noexcept、无分配、无容量判断；相应catalog slot、victim result storage和lane transition
-storage在`start`前已经准备完毕。
+`start`后的唯一`RunningTransaction`及其progress/commit/abort归Program所有，并只返回一个稳定`ResourceResult`。
+ResourceManager在`start`前准备好全部logical adoption storage；commit后的采用必须noexcept、无分配、无容量判断。
 
 ---
 
@@ -1089,10 +1015,10 @@ KV transfer只搬运选定checkpoint缺失的pages。
 Resource planning只发生在admission、resume、capture和finish边界。Program可为这些边界维护O(1) counters
 和可重建索引，但它们必须由真实stores同步更新，不能成为第二权威。所有bounded storage按启动配置一次分配。
 
-现有统一估算形式保留：
+统一机器估算形式为：
 
 ```text
-transfer =
+transfer(copy_phase, direction) =
     max(batch_ns + copies * operation_ns,
         bytes * ns_per_byte)
 
@@ -1110,6 +1036,10 @@ attention\_pairs = B S + \frac{S(S+1)}{2}
 \]
 
 其中\(B\)是复用prefix tokens，\(S\)是待prefill suffix tokens。
+
+同一 copy phase、direction 中能够共同提交的 transfer work 先合并；串行 phases 的预测时间相加。Checkpoint 的 future
+recovery 使用同一机器模型和 exact interval `PrefillWork`，但 retention 权重由独立的 cache-value policy 提供，机器
+时间与policy value不得混入同一模型。
 
 模型参数是启动时不可变的实现配置。编译内置default profile是权威默认值；可选preset只有在目标、量化、硬件和相关运行
 配置完全匹配时才能替换它。成本模型影响choice排序，不改变可行性判定。
@@ -1147,7 +1077,11 @@ Program按真实配置构造所有固定上限storage。若配置无法安全表
 ## 19. 可观测性
 
 诊断数据从Program的物理权威和ResourceManager的逻辑权威分别导出；不得为了观测建立第二份可写physical ledger。
-边界事件至少能够说明：
+`RuntimeStats`只保存单调累计的全局counter，不保存“最后一次materialization”的decision gauge。每次成功
+materialization的immutable diagnostics随所属request传递；aborted attempt丢弃。Serve日志的具体字段由
+[Serving](../serving.md#structured-request-log)定义。
+
+边界事件还应能够说明：
 
 - 被选request、candidate、ready/degraded状态；
 - sealed plan、各stage peak、pressure actions与成本摘要；

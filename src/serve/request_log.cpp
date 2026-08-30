@@ -13,6 +13,11 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+
+#ifdef _WIN32
+#include <cwchar>
+#endif
+
 #include <utility>
 
 #ifdef _WIN32
@@ -56,6 +61,25 @@ std::filesystem::path normalized_absolute_path(const std::string& value) {
     error.clear();
     path = std::filesystem::absolute(value, error);
     return error ? std::filesystem::path(value).lexically_normal() : path.lexically_normal();
+}
+
+bool protected_paths_match(const std::string& output_path,
+                           const std::string& protected_path) {
+    const std::filesystem::path output   = normalized_absolute_path(output_path);
+    const std::filesystem::path artifact = normalized_absolute_path(protected_path);
+    std::error_code output_error;
+    std::error_code artifact_error;
+    const bool output_exists   = std::filesystem::exists(output, output_error);
+    const bool artifact_exists = std::filesystem::exists(artifact, artifact_error);
+    if (!output_error && !artifact_error && output_exists && artifact_exists) {
+        std::error_code equivalent_error;
+        if (std::filesystem::equivalent(output, artifact, equivalent_error)) { return true; }
+    }
+#ifdef _WIN32
+    return ::_wcsicmp(output.native().c_str(), artifact.native().c_str()) == 0;
+#else
+    return output == artifact;
+#endif
 }
 
 std::string cuda_version_string(int version) {
@@ -280,6 +304,26 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
                 {"accepted_per_position", metrics.speculative_accepted_per_position}};
+}
+
+Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
+    return Json{
+        {"predicted_now_ns", diagnostics.predicted_now_ns},
+        {"predicted_future_loss_ns", diagnostics.predicted_future_loss_ns},
+        {"predicted_total_ns", diagnostics.predicted_total_ns},
+        {"targets_evaluated", diagnostics.targets_evaluated},
+        {"projection_work", diagnostics.projection_work},
+        {"planning_elapsed_ns", diagnostics.planning_elapsed_ns},
+        {"search_elapsed_ns", diagnostics.search_elapsed_ns},
+        {"stop_reason", ninfer::materialization_stop_reason_name(diagnostics.stop_reason)},
+        {"model_optimal", diagnostics.model_optimal},
+        {"budget_exhausted", diagnostics.budget_exhausted},
+        {"best_remaining_lower_bound_ns", diagnostics.best_remaining_lower_bound_ns},
+        {"absolute_bound_gap_ns", diagnostics.absolute_bound_gap_ns},
+        {"relative_bound_gap", diagnostics.relative_bound_gap},
+        {"selected_degradation_units", diagnostics.selected_degradation_units},
+        {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+    };
 }
 
 double nanoseconds_to_seconds(std::uint64_t value) noexcept {
@@ -758,8 +802,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["engine_timing"] = request_engine_timing_json(outcome.metrics.engine_timing);
-    record["speculative"]   = speculative_json(outcome.metrics);
+    record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
+    record["speculative"]     = speculative_json(outcome.metrics);
+    record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();
 }
 
@@ -927,28 +972,36 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"seconds", monotonic_delta(previous.backend_kv_d2d_seconds,
                                                        current.backend_kv_d2d_seconds)}}}}},
         {"pressure",
-         Json{{"partial_spill_pages",
-               monotonic_delta(previous.partial_spill_pages, current.partial_spill_pages)},
-              {"partial_tail_cow_pages",
-               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
-              {"private_degradations", monotonic_delta(previous.private_checkpoint_degradations,
-                                                       current.private_checkpoint_degradations)},
-              {"private_evictions", monotonic_delta(previous.private_checkpoint_evictions,
-                                                    current.private_checkpoint_evictions)},
-              {"shared_degradations", monotonic_delta(previous.shared_checkpoint_degradations,
-                                                      current.shared_checkpoint_degradations)},
-              {"shared_evictions", monotonic_delta(previous.shared_checkpoint_evictions,
-                                                   current.shared_checkpoint_evictions)},
-              {"historical_fork_hits",
-               monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
+         Json{
+             {"spill_pages",
+              monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
+             {"partial_tail_cow_pages",
+              monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
+             {"private_owners_degraded", monotonic_delta(previous.pressure_private_owners_degraded,
+                                                         current.pressure_private_owners_degraded)},
+             {"private_owners_evicted", monotonic_delta(previous.pressure_private_owners_evicted,
+                                                        current.pressure_private_owners_evicted)},
+             {"shared_owners_degraded", monotonic_delta(previous.pressure_shared_owners_degraded,
+                                                        current.pressure_shared_owners_degraded)},
+             {"shared_owners_evicted", monotonic_delta(previous.pressure_shared_owners_evicted,
+                                                       current.pressure_shared_owners_evicted)},
+             {"checkpoints_dropped", monotonic_delta(previous.pressure_checkpoints_dropped,
+                                                     current.pressure_checkpoints_dropped)},
+             {"searches", monotonic_delta(previous.pressure_searches, current.pressure_searches)},
+             {"search_budget_exhaustions",
+              monotonic_delta(previous.pressure_search_budget_exhaustions,
+                              current.pressure_search_budget_exhaustions)},
+             {"maximal_fallback_selections",
+              monotonic_delta(previous.pressure_maximal_fallback_selections,
+                              current.pressure_maximal_fallback_selections)},
+             {"historical_fork_hits",
+              monotonic_delta(previous.historical_fork_hits, current.historical_fork_hits)}}},
         {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
                            {"host_state_slots", current.host_state_occupied_slots},
                            {"device_main_kv_pages", current.device_main_kv_occupied_pages},
                            {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
                            {"host_kv_bytes", current.host_kv_occupied_bytes},
                            {"shared_active_references", current.shared_active_references}}},
-        {"last_materialization",
-         Json{{"predicted_nanoseconds", current.last_predicted_materialization_ns}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
     return record.dump();
@@ -983,7 +1036,7 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
     : path_(path) {
     if (path_.empty()) { return; }
     if (!protected_artifact_path.empty() &&
-        normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
+        protected_paths_match(path_, protected_artifact_path)) {
         throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
     }
     server_instance_id_ = new_server_instance_id();
