@@ -1,68 +1,44 @@
-# NInfer documentation
+# Qwen3.8-27B documentation
 
-Start with the [project README](../README.md) to build NInfer, download a published artifact, and
-run the CLI or HTTP server.
+Start with the [project README](../README.md) to build VoidInfer, download a Qwen3.8-27B artifact,
+and run the CLI or HTTP server.
 
 ## User guides
 
 | Document | Purpose |
 | --- | --- |
-| [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
-| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
-| [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
+| [CLI](cli.md) | text, chat history, image/video input, output streams, sampling, MTP, and runtime options |
+| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, and authentication |
+| [Performance](performance.md) | Qwen3.8-27B throughput, context, MTP measurements, and reproduction commands |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
 
-## Model artifacts
+## Qwen3.8-27B artifacts
 
-| Model | Weights | Download | Versioned model card source |
-| --- | --- | --- | --- |
-| Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
-| Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
-| Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
-| Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
-| Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
+| Profile | Download | Versioned model card |
+| --- | --- | --- |
+| `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
+| `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
 
-## Repository-local guides
+Both profiles resolve the registered `qwen3_8_27b` target. The NVFP4 profile is the current
+single-GPU optimization target.
 
-- [Benchmarks](../bench/README.md)
-- [Tests](../tests/README.md)
-- [Maintainer tools](../tools/README.md)
-- [Capability evaluation](../eval/README.md)
-- [Muse Spark 1.2 Contributor master prompt](../MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md)
-- [Current project state and agent handoff](../PROJECT_STATE.md)
-- [Known issues and blockers](../KNOWN_ISSUES.md)
-- [Experiment log](../EXPERIMENTS.md)
-- [Upstream audit](../UPSTREAM_AUDIT.md)
+## Optimization and validation records
 
-## Maintainer references
+- [Experiment registry](../EXPERIMENTS.md) — accepted, rejected, and pending optimization claims.
+- [Current project state](../PROJECT_STATE.md) — hardware, artifact identity, baseline evidence,
+  and milestone history.
+- [Qwen3.8-27B artifact contract](maintainer/qwen3.8-27b-artifact.md) — storage formats,
+  tensor inventory, and source mapping.
+- [Engine architecture](maintainer/engine-architecture.md) — execution ownership and request
+  lifecycle.
+- [Resource and context-cache contract](maintainer/resource-scheduling-and-context-cache.md) —
+  materialization, continuation, checkpoint, and cache ownership.
+- [Paged KV cache](maintainer/paged-kv-cache.md) — page layout, dtype contracts, and capacity.
+- [Op development](maintainer/op-development.md) — correctness, ownership, and performance gates.
+- [ReplaySSM GDN reference](maintainer/replayssm-gdn.md) — Qwen3.8 GDN execution details.
+- [Linear benchmark contract](maintainer/linear-benchmark.md) — registered kernel benchmark suites.
 
-The active references under [`maintainer/`](maintainer/) record current architecture, model,
-artifact, and maintenance contracts. These files are not additional user workflows or installed
-API documentation.
-
-Runtime and Op references:
-
-- [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
-- [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
-- [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
-- [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
-- [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
-- [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
-
-`engine-architecture.md` is the sole top-level Engine architecture reference.
-`resource-scheduling-and-context-cache.md` is its narrower authority for resource selection,
-materialization, checkpoint ownership, and replica policy. The remaining files define physical
-storage, model, artifact, Op, or measurement contracts rather than parallel architecture variants.
-
-Artifact and model references:
-
-- [NInfer artifact container](maintainer/artifact-container.md)
-- [Persistent tensor numeric formats](maintainer/tensor-formats.md)
-- [Persistent storage layouts](maintainer/storage-layouts.md)
-- [Qwen3.6-27B model semantics](maintainer/qwen3.6-27b-model.md)
-- [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
-- [Qwen3.8-27B artifact contracts, including the NVFP4 target](maintainer/qwen3.8-27b-artifact.md)
-- [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
-- [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
+The source tree contains compatibility code for older registered targets, but those targets are not
+part of the public Qwen3.8-27B result set documented here.
