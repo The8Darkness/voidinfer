@@ -532,12 +532,13 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                        state.execution.model.dflash->selector_predecessor_codebook, predecessor,
                        state.execution.device.stream);
 
-        Tensor lattice = state.execution.work.alloc(DType::FP32, {Config::hidden, columns});
+        Tensor lattice = state.execution.work.alloc(
+            DType::FP32, {ops::kDFlash2SelectorPackedWidth, columns});
         ops::dflash2_selector_lattice(
             selector_hidden, successor.view({Config::selector_rank, Config::selector_top_k,
                                               columns}),
             predecessor.view({Config::selector_rank, Config::selector_top_k, columns}),
-            candidates, unary, Config::hidden, Config::block_size, lattice,
+            candidates, unary, ops::kDFlash2SelectorPackedWidth, Config::block_size, lattice,
             state.execution.device.stream);
         ops::dflash2_trace_path(lattice, Config::block_size, drafts,
                                 state.execution.device.stream);

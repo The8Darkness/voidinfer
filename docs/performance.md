@@ -53,6 +53,26 @@ to its lower acceptance in this pair. It is therefore retained as infrastructure
 claim. The host output verifier, low-bit direct verifier, NVMe persistence, and long-context
 quality gates remain separate research work.
 
+### E019: DFlash2 selector working-set follow-up
+
+The DFlash2 selector lattice carries only 16 candidate IDs and a 16×16 predecessor-conditioned
+score matrix. The production caller now allocates the semantic width of 272 FP32 values per token
+instead of the drafter hidden width of 5,120, and the sequential path trace launches one participating
+thread instead of a 32-thread CTA. The public op still accepts larger padded widths for compatibility.
+The exact-width selector and trace cases pass with guard checks.
+
+The physical RTX 5090 comparison used the same Qwen3.8-27B NVFP4 DFlash2 artifact, context 512,
+`k=7`, optimized proposal head, CUDA Graphs, one warmup round, and 200 measured rounds:
+
+| Configuration | GPU round | Wall round | Published tok/s | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| VeriCache-NVFP4 control, hierarchy disabled | 21.7685 ms | 21.7784 ms | 79.4367 | 146/1,400 (10.43%) |
+| Hierarchy + host snapshot, trimmed selector working set | 21.7017 ms | 21.7124 ms | 96.0281 | 217/1,400 (15.50%) |
+
+The hierarchy row is 0.31% lower in round GPU time, but the published-rate difference is dominated
+by acceptance variation. The change is retained for the measured memory/launch reduction, not as an
+independent end-to-end speedup claim.
+
 For historical comparison, an earlier short RTX 5090 run used batch 1, context 2,048, DFlash2
 `k=7`, no CUDA Graph, three warmup rounds, and eight measured rounds. The published rate is
 licensed tokens divided by wall time for this fixed round harness; acceptance can therefore

@@ -12,6 +12,11 @@ namespace ninfer::ops {
 // candidates per draft position, 256-dimensional codebooks.
 inline constexpr std::int32_t kDFlash2SelectorTopK = 16;
 inline constexpr std::int32_t kDFlash2SelectorRank = 256;
+// The packed lattice has no semantic payload beyond candidate ids and the
+// predecessor/successor score matrix.  Keeping this width explicit lets the
+// caller avoid allocating hidden-width padding that the trace never reads.
+inline constexpr std::int32_t kDFlash2SelectorPackedWidth =
+    kDFlash2SelectorTopK + kDFlash2SelectorTopK * kDFlash2SelectorTopK;
 
 /**
  * Op: DFlash2 candidate selection (top-16 of the draft logits).
@@ -48,8 +53,9 @@ void dflash2_select_candidates(const Tensor& logits, Tensor& out_ids, Tensor& ou
  *                                               (c - top_k) / top_k
  *   row[c, t], c >= top_k + top_k^2           : zero padding
  *
- * `packed_width` must be at least top_k + top_k*top_k (272); the 27B caller
- * uses the hidden size (5120).
+ * `packed_width` must be at least top_k + top_k*top_k (272). The optimized
+ * 27B caller uses exactly that semantic width; larger widths remain accepted
+ * for compatibility and are treated as zero padding.
  *
  * Per draft token t (block position b = t % block_tokens; rows for b == 0
  * are zero-filled — the first block slot is the committed anchor token):

@@ -1247,9 +1247,6 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
         // The producer event is the only dependency needed by the transfer stream. Keeping the
         // wait stream-scoped avoids a device-wide barrier and leaves later decode work free to
         // overlap the host DMA once the COW destination is safe to write.
-        stage = "source stream event";
-        hierarchical_snapshot_source_ready_.record(device.stream);
-        hierarchical_snapshot_source_ready_.wait(device.transfer_stream);
         stage = "source deactivation";
         unbind_sequence_kv(sequence);
         if (text_kv_addresses->active(old_bundle.text) ||

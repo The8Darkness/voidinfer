@@ -526,7 +526,7 @@ int run_selector_lattice_case() {
     constexpr std::int32_t top_k        = kDFlash2SelectorTopK;
     constexpr std::int32_t block_tokens = 4;
     constexpr std::int32_t tokens       = block_tokens;
-    constexpr std::int32_t packed_width = top_k + top_k * top_k + 28;
+    constexpr std::int32_t packed_width = kDFlash2SelectorPackedWidth;
 
     std::vector<float> hidden(static_cast<std::size_t>(rank) * tokens, 1.0f);
     std::vector<float> successor(static_cast<std::size_t>(rank) * top_k * tokens);
@@ -614,7 +614,7 @@ int run_trace_path_case() {
     constexpr std::int32_t block_tokens = 4;
     constexpr std::int32_t batch        = 2;
     constexpr std::int32_t tokens       = block_tokens * batch;
-    constexpr std::int32_t packed_width = top_k + top_k * top_k + 28;
+    constexpr std::int32_t packed_width = kDFlash2SelectorPackedWidth;
 
     std::vector<float> lattice(static_cast<std::size_t>(packed_width) * tokens, -1000.0f);
     const std::int32_t chosen[batch][block_tokens - 1] = {{5, 2, 9}, {3, 14, 1}};

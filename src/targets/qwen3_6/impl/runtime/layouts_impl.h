@@ -7,6 +7,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/dflash2_selector_lattice.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -595,7 +596,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     matrix(layout, DType::I32, DFlashConfig::selector_top_k, tokens);
                     matrix(layout, DType::BF16, DFlashConfig::selector_rank,
                            DFlashConfig::selector_top_k * tokens);
-                    matrix(layout, DType::FP32, DFlashConfig::hidden, tokens);
+                    matrix(layout, DType::FP32, ops::kDFlash2SelectorPackedWidth, tokens);
                 } else {
                     matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
                     {

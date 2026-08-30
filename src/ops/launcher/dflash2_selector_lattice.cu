@@ -306,7 +306,10 @@ void dflash2_selector_lattice_launch(const Tensor& hidden_pos, const Tensor& suc
 void dflash2_trace_path_launch(const Tensor& lattice, std::int32_t block_tokens, Tensor& out,
                                cudaStream_t stream) {
     const std::int32_t batch = lattice.ne[1] / block_tokens;
-    dflash2_trace_path_kernel<<<batch, 32, 0, stream>>>(
+    // The path is intentionally sequential per block position and only lane
+    // zero participates. A one-thread CTA removes 31 inactive lanes and keeps
+    // the same deterministic path selection.
+    dflash2_trace_path_kernel<<<batch, 1, 0, stream>>>(
         static_cast<const float*>(lattice.data), lattice.ne[0], block_tokens, batch,
         static_cast<std::int32_t*>(out.data));
 }
