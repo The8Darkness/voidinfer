@@ -11,6 +11,13 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream);
 
+// NVFP4 attention owns an offset-aware append because its verifier can append a chunk from a
+// full-width staging tensor before running the direct packed-cache attention kernel.
+void kv_cache_append_nvfp4_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        std::int32_t column_begin, std::int32_t width,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream);
+
 struct KVCacheAppendPrefixPlan {
     std::int32_t tokens;
     std::int32_t min_count;

@@ -70,9 +70,11 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, profile.code_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, profile.code_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -89,7 +91,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != profile.scale_dtype ||
+        cache.v_scale_pages.dtype != profile.scale_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
@@ -126,9 +129,11 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, profile.code_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, profile.code_leading_extent, kPagedKVPageSize, kv_heads,
+                  physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -145,7 +150,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != profile.scale_dtype ||
+        cache.v_scale_pages.dtype != profile.scale_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
@@ -367,6 +373,11 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             "causal_softmax_attention workspace: invalid profile or interval");
     }
 
+    // The packed NVFP4 route has no partial-reduction workspace.  Keeping this explicit also
+    // prevents the generic small-T planner from trying to instantiate BF16/FP8 reducers for U8
+    // code pages.
+    if (cache_dtype == DType::U8) { return 0; }
+
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits =
             detail::causal_attention_split_capacity(q_heads, width, cache_dtype, envelope);
@@ -417,6 +428,12 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
 
+    if (cache.dtype == DType::U8) {
+        detail::causal_attention_nvfp4_launch(
+            q, k, v, positions, valid_columns, kv_table_rows, scale, cache, out, stream);
+        return;
+    }
+
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, envelope);
@@ -446,6 +463,11 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "causal_softmax_attention_cached";
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
+
+    if (cache.dtype == DType::U8) {
+        detail::causal_attention_nvfp4_cached_launch(q, positions, scale, cache, out, stream);
+        return;
+    }
 
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =

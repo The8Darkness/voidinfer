@@ -32,7 +32,7 @@ struct PlannedPool {
     std::size_t bytes = 0;
 };
 
-PlannedPool plan_pool(bool dflash, std::int32_t slots = 4) {
+PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool nvfp4 = false) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -48,8 +48,14 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4) {
         .hidden = 7,
     };
     if (dflash) {
-        spec.dflash_local =
-            q36::DFlashLocalStateSpec{.layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
+        spec.dflash_local = q36::DFlashLocalStateSpec{
+            .layers = 2,
+            .capacity = 17,
+            .kv_heads = 2,
+            .head_dim = nvfp4 ? 32 : 4,
+            .dtype = nvfp4 ? ninfer::DType::U8 : ninfer::DType::BF16,
+            .quant_group = nvfp4 ? 16 : 0,
+        };
     }
     ninfer::LayoutBuilder builder;
     q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
@@ -84,6 +90,12 @@ void fill_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned char
             const auto view = local->layer_view(layer);
             set_bytes(view.k.slice(3, slot, 1), static_cast<unsigned char>(base + 0x30 + layer));
             set_bytes(view.v.slice(3, slot, 1), static_cast<unsigned char>(base + 0x40 + layer));
+            if (view.dtype == ninfer::DType::U8) {
+                set_bytes(view.k_scale.slice(3, slot, 1),
+                          static_cast<unsigned char>(base + 0x50 + layer));
+                set_bytes(view.v_scale.slice(3, slot, 1),
+                          static_cast<unsigned char>(base + 0x60 + layer));
+            }
         }
     }
 }
@@ -105,6 +117,12 @@ void expect_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned ch
                          label);
             expect_bytes(view.v.slice(3, slot, 1), static_cast<unsigned char>(base + 0x40 + layer),
                          label);
+            if (view.dtype == ninfer::DType::U8) {
+                expect_bytes(view.k_scale.slice(3, slot, 1),
+                             static_cast<unsigned char>(base + 0x50 + layer), label);
+                expect_bytes(view.v_scale.slice(3, slot, 1),
+                             static_cast<unsigned char>(base + 0x60 + layer), label);
+            }
         }
     }
 }
@@ -120,12 +138,16 @@ void expect_zero_slot(q36::StateImageDevicePool& pool, std::int32_t slot, std::s
             const auto view = local->layer_view(layer);
             expect_bytes(view.k.slice(3, slot, 1), 0, label);
             expect_bytes(view.v.slice(3, slot, 1), 0, label);
+            if (view.dtype == ninfer::DType::U8) {
+                expect_bytes(view.k_scale.slice(3, slot, 1), 0, label);
+                expect_bytes(view.v_scale.slice(3, slot, 1), 0, label);
+            }
         }
     }
 }
 
-void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device) {
-    PlannedPool planned = plan_pool(dflash, 2);
+void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool nvfp4 = false) {
+    PlannedPool planned = plan_pool(dflash, 2, nvfp4);
     ninfer::DeviceArena arena(planned.bytes);
     q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, planned.layout);
     fill_slot(pool, 0, dflash ? 0x19 : 0x25);
@@ -202,6 +224,7 @@ int main() {
 
     test_host_roundtrip(false, device);
     test_host_roundtrip(true, device);
+    test_host_roundtrip(true, device, true);
 
     return failures == 0 ? 0 : 1;
 }

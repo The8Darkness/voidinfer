@@ -1,6 +1,7 @@
 #include "ops/softmax_attention/sliding_window/launch.h"
 
 #include "core/device.h"
+#include "ops/softmax_attention/sliding_window/nvfp4.cuh"
 #include "ops/softmax_attention/sliding_window/kernel.cuh"
 
 #include <algorithm>
@@ -159,6 +160,32 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     });
+}
+
+void sliding_window_attention_nvfp4_launch(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& lanes, float scale,
+    const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
+    Tensor& out, cudaStream_t stream) {
+    if (max_context < 0 || window < 2 || (window & (window - 1)) != 0) {
+        throw std::invalid_argument("sliding_window_attention NVFP4 launch has invalid bounds");
+    }
+    const dim3 grid(static_cast<unsigned>(q.ne[2] * q.ne[1]),
+                    static_cast<unsigned>(q.ne[3]), 1);
+    sliding_window_attention_nvfp4_kernel<<<grid, 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data),
+        static_cast<const __nv_bfloat16*>(query_k.data),
+        static_cast<const __nv_bfloat16*>(query_v.data),
+        static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<const std::int32_t*>(lanes.data),
+        static_cast<const std::uint8_t*>(context.k.data),
+        static_cast<const std::uint8_t*>(context.v.data),
+        static_cast<const std::uint8_t*>(context.k_scale.data),
+        static_cast<const std::uint8_t*>(context.v_scale.data),
+        static_cast<int>(context.padded_capacity), max_context, window, q.ne[2], scale,
+        static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

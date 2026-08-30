@@ -125,9 +125,10 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 }
 
 std::uint32_t capture_identity_tag(SpeculativeBackend backend, ProposalHead proposal,
-                                   DType dtype) noexcept {
+                                   DType dtype, KvCacheStorage storage) noexcept {
     return static_cast<std::uint32_t>(backend) | (static_cast<std::uint32_t>(proposal) << 8U) |
-           (static_cast<std::uint32_t>(dtype) << 16U);
+           (static_cast<std::uint32_t>(dtype) << 16U) |
+           (static_cast<std::uint32_t>(storage) << 24U);
 }
 
 runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
@@ -322,7 +323,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     if (base->summary.publish_continuation) {
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
-            capture_identity_tag(speculative_backend, proposal_head, kv_dtype);
+            capture_identity_tag(speculative_backend, proposal_head, kv_dtype, kv_storage);
     }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,

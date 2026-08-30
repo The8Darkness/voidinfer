@@ -25,6 +25,12 @@ struct CyclicKVCacheLayerView {
     std::int32_t num_kv_heads     = 0;
     std::int32_t head_dim         = 0;
     std::int32_t lane_capacity    = 0;
+    // Quantized cyclic caches expose one scale plane per K/V stream.  They remain empty for
+    // BF16, so existing callers can keep constructing the view with only K/V tensors.
+    Tensor k_scale;
+    Tensor v_scale;
+    DType dtype              = DType::BF16;
+    std::int32_t quant_group = 0;
 };
 
 struct CyclicKVCacheSlotView {
@@ -35,6 +41,12 @@ struct CyclicKVCacheSlotView {
     std::ptrdiff_t k_layer_pitch_bytes = 0;
     std::ptrdiff_t v_layer_pitch_bytes = 0;
     std::uint32_t layers               = 0;
+    Tensor k_scale_layer0;
+    Tensor v_scale_layer0;
+    std::size_t k_scale_layer_bytes          = 0;
+    std::size_t v_scale_layer_bytes          = 0;
+    std::ptrdiff_t k_scale_layer_pitch_bytes = 0;
+    std::ptrdiff_t v_scale_layer_pitch_bytes = 0;
 };
 
 struct CyclicKVCacheLayout {
@@ -45,13 +57,18 @@ struct CyclicKVCacheLayout {
     std::int32_t lane_capacity    = 0;
     std::vector<TensorRegion> k;
     std::vector<TensorRegion> v;
+    std::vector<TensorRegion> k_scale;
+    std::vector<TensorRegion> v_scale;
+    DType dtype              = DType::BF16;
+    std::int32_t quant_group = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
 };
 
 [[nodiscard]] CyclicKVCacheLayout
 plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
-                     std::int32_t num_kv_heads, std::int32_t head_dim, std::int32_t lane_capacity);
+                     std::int32_t num_kv_heads, std::int32_t head_dim, std::int32_t lane_capacity,
+                     DType dtype = DType::BF16, std::int32_t quant_group = 0);
 
 class CyclicKVCache {
 public:
@@ -74,6 +91,10 @@ public:
 
     [[nodiscard]] std::int32_t lane_capacity() const noexcept { return lane_capacity_; }
 
+    [[nodiscard]] DType dtype() const noexcept { return dtype_; }
+
+    [[nodiscard]] std::int32_t quant_group() const noexcept { return quant_group_; }
+
     [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
     [[nodiscard]] CyclicKVCacheSlotView slot_view(std::int32_t slot) const;
 
@@ -89,6 +110,12 @@ private:
     std::int32_t num_kv_heads_     = 0;
     std::int32_t head_dim_         = 0;
     std::int32_t lane_capacity_    = 0;
+    std::int32_t code_head_dim_    = 0;
+    std::int32_t scale_extent_     = 0;
+    DType dtype_                   = DType::BF16;
+    std::int32_t quant_group_      = 0;
+    std::vector<Tensor> k_scale_;
+    std::vector<Tensor> v_scale_;
 };
 
 } // namespace ninfer

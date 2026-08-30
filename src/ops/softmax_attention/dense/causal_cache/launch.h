@@ -79,4 +79,15 @@ void causal_attention_prompt_fp8_attention_launch(const Tensor& q, const Tensor&
                                                   float scale, const PagedKVLayerView& cache,
                                                   Tensor& out, cudaStream_t stream);
 
+// NVFP4 is a packed draft-cache route. It bypasses the tensor-core partial reducers and uses a
+// direct warp kernel after the current K/V chunk has been encoded into the packed page store.
+void causal_attention_nvfp4_launch(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& table_rows, float scale,
+    PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream);
+
+void causal_attention_nvfp4_cached_launch(const Tensor& q, const Tensor& positions, float scale,
+                                          const PagedKVLayerView& cache, Tensor& out,
+                                          cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

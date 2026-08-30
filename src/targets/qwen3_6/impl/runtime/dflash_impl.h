@@ -167,8 +167,9 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 value = attn_roots.value.view({Config::head_dim, Config::kv_heads, layer_columns});
                 Tensor query_flat = query_raw.view({Config::query_size, layer_columns});
                 Tensor key_flat = key_raw.view({Config::kv_size, layer_columns});
+                Tensor value_flat = value.view({Config::kv_size, layer_columns});
                 ops::dflash2_qkv_proj(layer_context, weight.query_key_value, query_flat, key_flat,
-                                      value, state.execution.device.stream);
+                                      value_flat, state.execution.device.stream);
                 key = attn_roots.key.view({Config::head_dim, Config::kv_heads, layer_columns});
                 ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
                              state.execution.device.stream);
@@ -376,21 +377,18 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         ops::prepare_masked_block(anchors, frontiers, valid_columns, Config::mask_token, ids,
                                   positions, state.execution.device.stream);
 
-        Tensor input = state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
-        ops::embedding(ids.view({columns}), state.execution.model.token_embedding, input,
-                       state.execution.device.stream);
         Tensor residual = state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
-        const std::size_t hidden_bytes =
-            static_cast<std::size_t>(Config::hidden) * static_cast<std::size_t>(columns) *
-            dtype_size(DType::BF16);
-        CUDA_CHECK(cudaMemcpyAsync(residual.data, input.data, hidden_bytes, cudaMemcpyDeviceToDevice,
-                                   state.execution.device.stream));
+        // Keep the embedding directly in the residual buffer. Each DFlash2
+        // sublayer updates that buffer in place, so the proposal path does
+        // not need an intermediate embedding copy or a second residual
+        // buffer for the attention branch.
+        ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
+                       state.execution.device.stream);
 
         for (int layer = 0; layer < Config::layers; ++layer) {
             auto layer_scope = state.execution.work.scope();
             const auto& weight =
                 state.execution.model.dflash->layers.at(static_cast<std::size_t>(layer));
-            Tensor ffn_input = state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
 
             {
                 auto attention_scope = state.execution.work.scope();
@@ -417,8 +415,9 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                     roots.value.view({Config::head_dim, Config::kv_heads, columns});
                 Tensor query_flat = query_raw.view({Config::query_size, columns});
                 Tensor key_flat = key_raw.view({Config::kv_size, columns});
+                Tensor value_flat = value.view({Config::kv_size, columns});
                 ops::dflash2_qkv_proj(
-                    noise_conv, weight.query_key_value, query_flat, key_flat, value,
+                    noise_conv, weight.query_key_value, query_flat, key_flat, value_flat,
                     state.execution.device.stream);
 
                 Tensor query =
@@ -458,16 +457,13 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 ops::dflash2_dynamic_conv(attention_out, attention_dynamic,
                                           weight.attention_conv_base, 1, Config::block_size,
                                           attention_out_conv, state.execution.device.stream);
-                CUDA_CHECK(cudaMemcpyAsync(ffn_input.data, attention_out_conv.data, hidden_bytes,
-                                           cudaMemcpyDeviceToDevice,
-                                           state.execution.device.stream));
-                ops::residual_add(residual, ffn_input, state.execution.device.stream);
+                ops::residual_add(attention_out_conv, residual, state.execution.device.stream);
             }
 
             {
                 auto mlp_scope = state.execution.work.scope();
                 auto roots = workspace_recipe::dflash_mlp<Config>(state.execution.work, columns);
-                ops::rmsnorm(ffn_input, weight.post_attention_norm, Config::rms_epsilon, false,
+                ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon, false,
                              roots.hidden, state.execution.device.stream);
                 Tensor mlp_dynamic = state.execution.work.alloc(
                     DType::BF16, {Config::conv_projection_rows, columns});
@@ -493,10 +489,7 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 ops::dflash2_dynamic_conv(mlp_out, mlp_dynamic, weight.mlp_conv_base, 1,
                                           Config::block_size, mlp_out_conv,
                                           state.execution.device.stream);
-                CUDA_CHECK(cudaMemcpyAsync(residual.data, mlp_out_conv.data, hidden_bytes,
-                                           cudaMemcpyDeviceToDevice,
-                                           state.execution.device.stream));
-                ops::residual_add(ffn_input, residual, state.execution.device.stream);
+                ops::residual_add(mlp_out_conv, residual, state.execution.device.stream);
             }
         }
 

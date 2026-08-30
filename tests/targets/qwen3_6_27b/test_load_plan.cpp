@@ -36,6 +36,14 @@ ninfer::targets::qwen3_6::StartupFeatures all_features() {
     };
 }
 
+ninfer::targets::qwen3_6::StartupFeatures dflash_features() {
+    return {
+        .vision        = false,
+        .speculative   = ninfer::SpeculativeBackend::DFlash,
+        .proposal_head = ninfer::ProposalHead::Full,
+    };
+}
+
 bool valid_divisors(const WeightPlan& weight) {
     if (weight.format != NumericFormat::NVFP4) { return false; }
     const float weight_divisor = std::bit_cast<float>(weight.weight_scale_divisor_bits);
@@ -162,6 +170,49 @@ int verify_nvfp4(const std::filesystem::path& path) {
     return 0;
 }
 
+int verify_nvfp4_dflash2(const std::filesystem::path& path) {
+    ninfer::artifact::Reader reader(path);
+    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen38Nvfp4Dflash2) {
+        std::cerr << "DFlash2 identity resolved to the wrong profile\n";
+        return 1;
+    }
+    if (reader.objects().size() != 1190) {
+        std::cerr << "DFlash2 artifact object count changed: " << reader.objects().size() << '\n';
+        return 1;
+    }
+
+    ninfer::artifact::Binder binder(reader);
+    const ArtifactLoadPlan plan =
+        bind_artifact(binder, WeightsProfile::Qwen38Nvfp4Dflash2, dflash_features());
+    if (plan.materialization.object_count != reader.objects().size() ||
+        plan.materialization.device_objects.empty() || plan.materialization.host_objects.size() != 6 ||
+        plan.materialization.device_capacity_bytes == 0) {
+        std::cerr << "DFlash2 materialization plan is incomplete: objects="
+                  << plan.materialization.object_count
+                  << " device=" << plan.materialization.device_objects.size()
+                  << " host=" << plan.materialization.host_objects.size() << '\n';
+        return 1;
+    }
+
+    const auto& dflash = plan.bindings.dflash;
+    if (dflash.feature_projection.index == 0 || dflash.final_norm.index == 0 ||
+        dflash.selector_predecessor_codebook.index == 0 ||
+        dflash.selector_successor_codebook.index == 0 ||
+        dflash.selector_hidden_projection.index == 0) {
+        std::cerr << "DFlash2 top-level bindings are incomplete\n";
+        return 1;
+    }
+    for (const auto& layer : dflash.layers) {
+        if (layer.query_key_value.index == 0 || layer.attention_output.index == 0 ||
+            layer.attention_conv_base.index == 0 || layer.attention_conv_projection.index == 0 ||
+            layer.mlp_conv_base.index == 0 || layer.mlp_conv_projection.index == 0) {
+            std::cerr << "DFlash2 layer bindings are incomplete\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int verify_rejection() {
     try {
         (void)Package::resolve_weights({"qwen3.6-27b", "unknown"});
@@ -238,15 +289,25 @@ int main() {
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =
         artifact_path("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS", "qwen3_6_27b_nvfp4.ninfer");
-    if (!std::filesystem::is_regular_file(groupwise) || !std::filesystem::is_regular_file(nvfp4)) {
-        std::cerr << "skip: both real 27B artifacts are required: groupwise=" << groupwise
-                  << " nvfp4=" << nvfp4 << '\n';
+    const std::filesystem::path nvfp4_dflash2 = artifact_path(
+        "NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS", "qwen3_8_27b_nvfp4_dflash2.ninfer");
+    const bool have_legacy_artifacts = std::filesystem::is_regular_file(groupwise) &&
+                                       std::filesystem::is_regular_file(nvfp4);
+    const bool have_dflash2_artifact = std::filesystem::is_regular_file(nvfp4_dflash2);
+    if (!have_legacy_artifacts && !have_dflash2_artifact) {
+        std::cerr << "skip: no real 27B artifact is available: groupwise=" << groupwise
+                  << " nvfp4=" << nvfp4 << " dflash2=" << nvfp4_dflash2 << '\n';
         return 77;
     }
     if (const int result = verify_vision_workspace_planning(); result != 0) { return result; }
     if (const int result = verify_rejection(); result != 0) { return result; }
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
-    if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
-    if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }
+    if (have_legacy_artifacts) {
+        if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
+        if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }
+    }
+    if (have_dflash2_artifact) {
+        if (const int result = verify_nvfp4_dflash2(nvfp4_dflash2); result != 0) { return result; }
+    }
     return 0;
 }

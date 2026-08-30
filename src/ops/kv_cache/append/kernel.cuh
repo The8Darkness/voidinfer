@@ -5,6 +5,7 @@
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
+#include "ops/kv_cache/nvfp4_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -262,6 +263,117 @@ __launch_bounds__(256) __global__
     }
 }
 
+template <typename Geometry>
+__device__ __forceinline__ void kv_cache_append_full_nvfp4_row(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token,
+    int kv_head, int physical_page, int page_off, int lane) {
+    constexpr unsigned FullMask = 0xffffffffU;
+    constexpr int ValuesPerLane = kKVCacheNvfp4HeadDim / 32;
+    const int group             = lane >> 1;
+    const int group_lane        = lane & 1;
+    const int d_base            = group * kKVCacheNvfp4Group + group_lane * ValuesPerLane;
+    float k_values[ValuesPerLane];
+    float v_values[ValuesPerLane];
+    float k_absmax = 0.0F;
+    float v_absmax = 0.0F;
+#pragma unroll
+    for (int i = 0; i < ValuesPerLane; ++i) {
+        const int d = d_base + i;
+        k_values[i] = __bfloat162float(k[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+        v_values[i] = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+        k_absmax   = fmaxf(k_absmax, fabsf(k_values[i]));
+        v_absmax   = fmaxf(v_absmax, fabsf(v_values[i]));
+    }
+    // Two lanes own one sixteen-value group. Restrict the reduction to that pair so neighboring
+    // groups can be quantized independently without a second synchronization point.
+    k_absmax = fmaxf(k_absmax, __shfl_xor_sync(FullMask, k_absmax, 1));
+    v_absmax = fmaxf(v_absmax, __shfl_xor_sync(FullMask, v_absmax, 1));
+    const KVCacheNvfp4QuantParams k_quant = kv_cache_nvfp4_quant_params(k_absmax);
+    const KVCacheNvfp4QuantParams v_quant = kv_cache_nvfp4_quant_params(v_absmax);
+
+#pragma unroll
+    for (int pair = 0; pair < ValuesPerLane / 2; ++pair) {
+        const int d = d_base + 2 * pair;
+        cache_k[kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head, d >> 1, page_off)] =
+            kv_cache_nvfp4_quantize_pair(k_values[2 * pair], k_values[2 * pair + 1],
+                                         k_quant.inverse_scale);
+        cache_v[kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head, d >> 1, page_off)] =
+            kv_cache_nvfp4_quantize_pair(v_values[2 * pair], v_values[2 * pair + 1],
+                                         v_quant.inverse_scale);
+    }
+    if (group_lane == 0) {
+        scale_k[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, group, page_off)] =
+            k_quant.scale;
+        scale_v[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, group, page_off)] =
+            v_quant.scale;
+    }
+}
+
+template <typename Geometry, typename Metadata>
+__launch_bounds__(256) __global__
+    void kv_cache_append_full_nvfp4_kernel(const __nv_bfloat16* __restrict__ k,
+                                           const __nv_bfloat16* __restrict__ v,
+                                           const std::int32_t* __restrict__ positions,
+                                           Metadata metadata, std::uint8_t* __restrict__ cache_k,
+                                           std::uint8_t* __restrict__ cache_v,
+                                           std::uint8_t* __restrict__ scale_k,
+                                           std::uint8_t* __restrict__ scale_v,
+                                           std::int32_t width) {
+    constexpr int Warps         = 8;
+    constexpr unsigned FullMask = 0xffffffffU;
+    const int tokens            = metadata.valid_tokens(width);
+    const int warp              = static_cast<int>(threadIdx.x) >> 5;
+    const int lane              = static_cast<int>(threadIdx.x) & 31;
+    const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
+    const int units             = tokens * Geometry::KVHeads;
+    if (unit >= units) return;
+
+    const int kv_head               = unit % Geometry::KVHeads;
+    const int token                 = unit / Geometry::KVHeads;
+    const int position              = positions[0] + token;
+    const std::int32_t* block_table = metadata.block_table();
+    int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    kv_cache_append_full_nvfp4_row<Geometry>(
+        k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, physical_page,
+        position & kPagedKVPageMask, lane);
+}
+
+template <typename Geometry, bool Masked>
+__launch_bounds__(32) __global__ void kv_cache_append_nvfp4_batch_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ valid_columns,
+    const std::int32_t* __restrict__ table_rows, std::uint8_t* __restrict__ cache_k,
+    std::uint8_t* __restrict__ cache_v, std::uint8_t* __restrict__ scale_k,
+    std::uint8_t* __restrict__ scale_v, const std::int32_t* __restrict__ block_tables,
+    std::int32_t table_stride, std::int32_t logical_pages, std::int32_t full_width,
+    std::int32_t column_begin, std::int32_t width) {
+    const int kv_head = static_cast<int>(blockIdx.x);
+    const int token   = static_cast<int>(blockIdx.y);
+    const int batch   = static_cast<int>(blockIdx.z);
+    const int lane    = static_cast<int>(threadIdx.x);
+    int valid_tokens  = width;
+    if constexpr (Masked) {
+        const int remaining = valid_columns[batch] - column_begin;
+        valid_tokens        = remaining <= 0 ? 0 : min(remaining, width);
+    }
+    if (kv_head >= Geometry::KVHeads || token >= valid_tokens) return;
+
+    const std::int64_t batch_column = static_cast<std::int64_t>(batch) * full_width +
+                                      column_begin;
+    const int position               = positions[batch_column + token];
+    const std::int32_t* block_table =
+        block_tables + static_cast<std::int64_t>(table_rows[batch]) * table_stride;
+    const int physical_page = paged_kv_physical_page(block_table, position);
+    const std::int64_t input_offset =
+        static_cast<std::int64_t>(kKVCacheNvfp4HeadDim) * Geometry::KVHeads * batch_column;
+    kv_cache_append_full_nvfp4_row<Geometry>(
+        k + input_offset, v + input_offset, cache_k, cache_v, scale_k, scale_v, token, kv_head,
+        physical_page, position & kPagedKVPageMask, lane);
+}
+
 template <typename Geometry, typename Metadata>
 __launch_bounds__(256) __global__
     void kv_cache_append_full_i8_page_kernel(const __nv_bfloat16* __restrict__ k,
@@ -335,7 +447,6 @@ __launch_bounds__(256) __global__
 
 inline constexpr int kKVCacheAppendPrefixHeadDim = 128;
 inline constexpr int kKVCacheAppendPrefixHeads   = 8;
-inline constexpr int kKVCacheAppendPrefixWindow  = 4096;
 inline constexpr int kKVCacheAppendPrefixPage    = 64;
 
 __device__ __forceinline__ void kv_cache_append_prefix_copy_cyclic_unit(
@@ -394,7 +505,7 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int32_t* __restrict__ lanes, __nv_bfloat16* __restrict__ cache_k,
     __nv_bfloat16* __restrict__ cache_v, int min_count, int max_count, int width,
-    int padded_capacity) {
+    int window, int padded_capacity) {
     constexpr int UnitsPerToken  = kKVCacheAppendPrefixHeads * 8;
     constexpr int TokensPerBlock = 256 / UnitsPerToken;
     static_assert(TokensPerBlock * UnitsPerToken == 256);
@@ -419,9 +530,86 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
     const int token         = static_cast<int>(blockIdx.x) * TokensPerBlock + local_token;
     if (token >= count) return;
     const int position = positions[token];
-    const int slot     = position & (kKVCacheAppendPrefixWindow - 1);
+    const int slot     = position & (window - 1);
     kv_cache_append_prefix_copy_cyclic_unit(k, v, cache_k, cache_v, token, unit_in_token, slot,
                                             padded_capacity);
+}
+
+__device__ __forceinline__ void kv_cache_append_prefix_cyclic_nvfp4_row(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token,
+    int kv_head, int lane_id, int slot, int padded_capacity, int lane) {
+    constexpr unsigned FullMask   = 0xffffffffU;
+    constexpr int ValuesPerLane   = kCyclicKVCacheNvfp4Group / 2;
+    // A warp has 32 lanes while a 128-wide head has eight 16-value groups. Reuse the second
+    // half of the warp for the first half; the duplicate stores are intentional and keep the
+    // pairwise shuffle mask warp-uniform.
+    const int group               = (lane & 15) >> 1;
+    const int group_lane          = lane & 1;
+    const int d_base              = group * kCyclicKVCacheNvfp4Group + group_lane * ValuesPerLane;
+    const std::int64_t src_base   = static_cast<std::int64_t>(kCyclicKVCacheNvfp4HeadDim) *
+                                  (kv_head + kCyclicKVCacheNvfp4KVHeads * token);
+    float k_values[ValuesPerLane];
+    float v_values[ValuesPerLane];
+    float k_absmax = 0.0F;
+    float v_absmax = 0.0F;
+#pragma unroll
+    for (int i = 0; i < ValuesPerLane; ++i) {
+        const int d = d_base + i;
+        k_values[i] = __bfloat162float(k[src_base + d]);
+        v_values[i] = __bfloat162float(v[src_base + d]);
+        k_absmax    = fmaxf(k_absmax, fabsf(k_values[i]));
+        v_absmax    = fmaxf(v_absmax, fabsf(v_values[i]));
+    }
+    k_absmax = fmaxf(k_absmax, __shfl_xor_sync(FullMask, k_absmax, 1));
+    v_absmax = fmaxf(v_absmax, __shfl_xor_sync(FullMask, v_absmax, 1));
+    const KVCacheNvfp4QuantParams k_quant = kv_cache_nvfp4_quant_params(k_absmax);
+    const KVCacheNvfp4QuantParams v_quant = kv_cache_nvfp4_quant_params(v_absmax);
+#pragma unroll
+    for (int pair = 0; pair < ValuesPerLane / 2; ++pair) {
+        const int d = d_base + 2 * pair;
+        cache_k[cyclic_nvfp4_code_index(slot, kv_head, lane_id, padded_capacity, d >> 1)] =
+            kv_cache_nvfp4_quantize_pair(k_values[2 * pair], k_values[2 * pair + 1],
+                                         k_quant.inverse_scale);
+        cache_v[cyclic_nvfp4_code_index(slot, kv_head, lane_id, padded_capacity, d >> 1)] =
+            kv_cache_nvfp4_quantize_pair(v_values[2 * pair], v_values[2 * pair + 1],
+                                         v_quant.inverse_scale);
+    }
+    if (group_lane == 0) {
+        scale_k[cyclic_nvfp4_scale_index(slot, kv_head, lane_id, padded_capacity, group)] =
+            k_quant.scale;
+        scale_v[cyclic_nvfp4_scale_index(slot, kv_head, lane_id, padded_capacity, group)] =
+            v_quant.scale;
+    }
+}
+
+__global__ void kv_cache_append_prefix_cyclic_nvfp4_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
+    const std::int32_t* __restrict__ lanes, std::uint8_t* __restrict__ cache_k,
+    std::uint8_t* __restrict__ cache_v, std::uint8_t* __restrict__ scale_k,
+    std::uint8_t* __restrict__ scale_v, int min_count, int max_count, int width, int window,
+    int padded_capacity) {
+    constexpr int Warps = 8;
+    const int batch      = static_cast<int>(blockIdx.y);
+    const int count      = counts[batch];
+    if (count < min_count || count > max_count) return;
+    const int token = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (token >= count || kv_head >= kCyclicKVCacheNvfp4KVHeads ||
+        static_cast<int>(blockDim.x) != Warps * 32) {
+        return;
+    }
+    constexpr std::int64_t ElementsPerToken =
+        kCyclicKVCacheNvfp4HeadDim * kCyclicKVCacheNvfp4KVHeads;
+    const std::int64_t batch_offset = ElementsPerToken * static_cast<std::int64_t>(width) * batch;
+    const int position = positions[static_cast<std::int64_t>(width) * batch + token];
+    const int slot     = position & (window - 1);
+    kv_cache_append_prefix_cyclic_nvfp4_row(
+        k + batch_offset, v + batch_offset, cache_k, cache_v, scale_k, scale_v, token, kv_head,
+        lanes[batch], slot, padded_capacity, lane);
 }
 
 __global__ void kv_cache_append_prefix_paged_kernel(

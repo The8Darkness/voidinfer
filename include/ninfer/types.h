@@ -30,6 +30,13 @@ enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
     Fp8E4M3Row256,
+    // Packed E2M1 values with one positive E4M3 scale per 16-value group. This is an
+    // explicitly lossy draft-cache format; exact VeriCache promotion/verification owns the
+    // authoritative fallback rather than treating the packed cache as lossless.
+    Nvfp4,
+    // Exact target KV plus an NVFP4 MTP draft tier. The target cache remains BF16 and is the
+    // authoritative representation; its existing host context tier may evict and restore pages.
+    VeriCacheNvfp4,
 };
 
 enum class KvCapacityMode : std::uint8_t {

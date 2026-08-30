@@ -71,6 +71,27 @@ int main() {
     failures += check(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256,
                       "--kv-dtype fp8 did not select row-scaled E4M3 KV");
 
+    const ServeOptions vericache = parse({"ninfer-serve", "model.ninfer", "--kv-dtype",
+                                          "vericache-nvfp4", "--spec", "mtp",
+                                          "--draft-tokens", "4"});
+    failures += check(vericache.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 &&
+                          vericache.speculative.backend == ninfer::SpeculativeBackend::Mtp,
+                      "--kv-dtype vericache-nvfp4 did not select the hybrid profile");
+    bool vericache_without_mtp_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "vericache-nvfp4"});
+    } catch (const std::invalid_argument&) { vericache_without_mtp_rejected = true; }
+    failures += check(vericache_without_mtp_rejected,
+                      "VeriCache NVFP4 was accepted without an MTP draft tier");
+
+    const ServeOptions vericache_dflash = parse({"ninfer-serve", "model.ninfer", "--kv-dtype",
+                                                 "vericache-nvfp4", "--spec", "dflash",
+                                                 "--draft-tokens", "15"});
+    failures += check(vericache_dflash.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 &&
+                          vericache_dflash.speculative.backend ==
+                              ninfer::SpeculativeBackend::DFlash,
+                      "--kv-dtype vericache-nvfp4 did not select DFlash hybrid profile");
+
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
     failures +=

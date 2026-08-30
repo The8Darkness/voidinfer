@@ -13,7 +13,6 @@ namespace {
 
 constexpr std::int32_t kHeadDim       = 128;
 constexpr std::int32_t kKVHeads       = 8;
-constexpr std::uint32_t kWindow       = 4096;
 constexpr std::int32_t kFullHeadDim   = 256;
 constexpr const char* kAppendOp       = "kv_cache_append";
 constexpr const char* kPrefixAppendOp = "kv_cache_append_prefix";
@@ -55,9 +54,9 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
     if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache code dtype");
     }
-    require_shape(cache.k_pages, kFullHeadDim, kPagedKVPageSize, kv_heads, physical_pages,
+    require_shape(cache.k_pages, profile.code_leading_extent, kPagedKVPageSize, kv_heads, physical_pages,
                   kAppendOp, "cache k pages");
-    require_shape(cache.v_pages, kFullHeadDim, kPagedKVPageSize, kv_heads, physical_pages,
+    require_shape(cache.v_pages, profile.code_leading_extent, kPagedKVPageSize, kv_heads, physical_pages,
                   kAppendOp, "cache v pages");
     require_contiguous_nonnull(cache.k_pages, kAppendOp, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, kAppendOp, "cache v pages");
@@ -74,7 +73,8 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != profile.scale_dtype ||
+        cache.v_scale_pages.dtype != profile.scale_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
@@ -152,23 +152,43 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
 
 void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
                            KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity != kWindow ||
-        cache.padded_capacity < cache.capacity ||
+    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity < 2 ||
+        (cache.capacity & (cache.capacity - 1)) != 0 || cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         envelope.max_count > cache.capacity) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache");
     }
     const auto padded = static_cast<std::int32_t>(cache.padded_capacity);
-    if (cache.k.dtype != DType::BF16 || cache.v.dtype != DType::BF16 || cache.k.ne[0] != kHeadDim ||
-        cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.v.ne[0] != kHeadDim ||
-        cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
+    const bool nvfp4  = cache.dtype == DType::U8;
+    const std::int32_t code_extent = nvfp4 ? kHeadDim / 2 : kHeadDim;
+    const std::int32_t scale_extent = nvfp4 ? kHeadDim / 16 : 0;
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::U8) ||
+        (nvfp4 ? cache.quant_group != 16 : cache.quant_group != 0) ||
+        cache.k.dtype != cache.dtype || cache.v.dtype != cache.dtype ||
+        cache.k.ne[0] != code_extent || cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads ||
+        cache.v.ne[0] != code_extent || cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
         cache.v.ne[3] != cache.lane_capacity || cache.lane_capacity <= 0 ||
         cache.k.ne[3] != cache.lane_capacity) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache tensors");
     }
     require_vector_aligned(cache.k, "cache k");
     require_vector_aligned(cache.v, "cache v");
+    if (!nvfp4) {
+        if (cache.k_scale.data != nullptr || cache.v_scale.data != nullptr) {
+            throw std::invalid_argument("kv_cache_append_prefix: BF16 cyclic cache must not have scales");
+        }
+        return;
+    }
+    if (cache.k_scale.dtype != DType::FP8_E4M3FN || cache.v_scale.dtype != DType::FP8_E4M3FN ||
+        cache.k_scale.ne[0] != scale_extent || cache.k_scale.ne[1] != padded ||
+        cache.k_scale.ne[2] != kKVHeads || cache.k_scale.ne[3] != cache.lane_capacity ||
+        cache.v_scale.ne[0] != scale_extent || cache.v_scale.ne[1] != padded ||
+        cache.v_scale.ne[2] != kKVHeads || cache.v_scale.ne[3] != cache.lane_capacity) {
+        throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic NVFP4 scales");
+    }
+    require_vector_aligned(cache.k_scale, "cache k scales");
+    require_vector_aligned(cache.v_scale, "cache v scales");
 }
 
 } // namespace

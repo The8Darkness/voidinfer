@@ -455,7 +455,7 @@ int run_predecessor_ids_case() {
 }
 
 int run_select_candidates_case() {
-    constexpr std::int32_t vocab  = 257;
+    constexpr std::int32_t vocab  = 248320;
     constexpr std::int32_t tokens = 3;
     constexpr std::int32_t top_k  = kDFlash2SelectorTopK;
 

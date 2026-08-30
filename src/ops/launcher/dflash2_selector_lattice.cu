@@ -7,6 +7,7 @@
 
 #include "ops/launcher/dflash2_selector_lattice.h"
 
+#include "core/device.h"
 #include "ninfer/ops/dflash2_selector_lattice.h"
 
 #include <cuda_bf16.h>
@@ -21,13 +22,15 @@ namespace {
 //
 // One block per token column; every thread keeps a private sorted top-16
 // (value desc, lower id first) while scanning the vocab with a grid-stride
-// loop.  The per-thread lists are already sorted runs, so the final merge is
-// a small k-way merge instead of repeatedly reducing and eliminating the
-// current winner across the whole block.
+// loop. Each warp merges its 32 private runs through shuffles and publishes
+// only 16 winners. A single final lane then merges the 16 warp runs. This
+// keeps the candidate contract unchanged while avoiding the old 512-entry
+// per-thread shared pool and its 16 full-block elimination barriers.
 // ---------------------------------------------------------------------------
 
 constexpr std::int32_t kSelThreads = 512;
 static_assert(kSelThreads % 32 == 0);
+constexpr std::int32_t kSelWarps = kSelThreads / 32;
 
 // Monotonic float -> uint32 (negative < positive, NaN top, -inf bottom); the
 // key keeps this order in the high 32 bits (so the descending sort ranks
@@ -51,10 +54,9 @@ __device__ float sel_key_value(unsigned long long key) {
     return __uint_as_float(u);
 }
 
-__global__ void dflash2_select_candidates_kernel(const __nv_bfloat16* __restrict__ logits,
-                                                 std::int32_t vocab, std::int32_t tokens,
-                                                 std::int32_t* __restrict__ out_ids,
-                                                 float* __restrict__ out_values) {
+__launch_bounds__(kSelThreads, 1) __global__ void dflash2_select_candidates_kernel(
+    const __nv_bfloat16* __restrict__ logits, std::int32_t vocab, std::int32_t tokens,
+    std::int32_t* __restrict__ out_ids, float* __restrict__ out_values) {
     constexpr std::int32_t k = kDFlash2SelectorTopK;
     (void)tokens;
 
@@ -93,78 +95,66 @@ __global__ void dflash2_select_candidates_kernel(const __nv_bfloat16* __restrict
         my_id[slot] = id;
     }
 
-    // Block pool: the per-thread runs merged (keys carry the total order, so
-    // a max-elimination picks the winners in order).
-    __shared__ unsigned long long pool_keys[kSelThreads * k];
+    // Merge the 32 private runs inside each warp. All lanes execute the
+    // shuffles; lane zero owns the small merged run in a 16-entry shared slice.
+    // Keys make the merge order identical to the final output order while
+    // avoiding a second per-thread register array.
+    __shared__ unsigned long long warp_keys[kSelWarps * k];
+    std::int32_t warp_n = 0;
+    const unsigned lane = threadIdx.x & 31u;
+    const std::int32_t warp_base = static_cast<std::int32_t>(threadIdx.x >> 5) * k;
+    if (lane == 0) {
+#pragma unroll
+        for (std::int32_t i = 0; i < k; ++i) { warp_keys[warp_base + i] = 0; }
+    }
 #pragma unroll
     for (std::int32_t i = 0; i < k; ++i) {
-        const std::int32_t base = threadIdx.x * k + i;
-        if (i < n_real) {
-            pool_keys[base] = sel_key(my_val[i], my_id[i]);
-        } else {
-            pool_keys[base] = 0;  // sentinel slot: not a live candidate
+        for (std::int32_t source = 0; source < 32; ++source) {
+            const float value = __shfl_sync(0xffffffffu, my_val[i], source);
+            const std::int32_t id = __shfl_sync(0xffffffffu, my_id[i], source);
+            if (lane == 0 && (value != __uint_as_float(0xff800000u) || id != 0)) {
+                const unsigned long long candidate = sel_key(value, id);
+                if (candidate > warp_keys[warp_base + k - 1]) {
+                    std::int32_t slot = k - 1;
+                    while (slot > 0 && candidate > warp_keys[warp_base + slot - 1]) {
+                        warp_keys[warp_base + slot] = warp_keys[warp_base + slot - 1];
+                        --slot;
+                    }
+                    if (slot == warp_n) { ++warp_n; }
+                    warp_keys[warp_base + slot] = candidate;
+                }
+            }
         }
     }
+
     __syncthreads();
 
-    __shared__ unsigned long long warp_keys[kSelThreads / 32];
-    __shared__ unsigned long long winner_key;
-
-    // 16 rounds of max over the live pool; a warp-shuffle reduction avoids the
-    // seven shared-memory reduction barriers the old block tree needed for
-    // every winner. Each thread owns pool entries [threadIdx.x*k,
-    // (threadIdx.x+1)*k), so elimination remains race-free and local.
-    for (std::int32_t winner = 0; winner < k; ++winner) {
-        unsigned long long best_key = 0;
-        const std::int32_t base = threadIdx.x * k;
+    // The final run contains only 16*16 entries, so one lane can select the
+    // ordered winners without any further block-wide synchronization.
+    if (threadIdx.x == 0) {
+        constexpr std::int32_t kWarpCandidates = kSelWarps * k;
+        for (std::int32_t winner = 0; winner < k; ++winner) {
+            unsigned long long best_key = 0;
+            std::int32_t best_index = -1;
 #pragma unroll
-        for (std::int32_t i = 0; i < k; ++i) {
-            const unsigned long long key = pool_keys[base + i];
-            if (key > best_key) {
-                best_key = key;
+            for (std::int32_t i = 0; i < kWarpCandidates; ++i) {
+                const unsigned long long candidate = warp_keys[i];
+                if (candidate > best_key) {
+                    best_key   = candidate;
+                    best_index = i;
+                }
             }
-        }
-        for (unsigned mask = 16u; mask > 0u; mask >>= 1u) {
-            const unsigned long long other = __shfl_xor_sync(0xffffffffu, best_key, mask);
-            if (other > best_key) { best_key = other; }
-        }
-        if ((threadIdx.x & 31) == 0) {
-            warp_keys[threadIdx.x >> 5] = best_key;
-        }
-        __syncthreads();
-
-        if (threadIdx.x < 32) {
-            best_key = threadIdx.x < (kSelThreads / 32) ? warp_keys[threadIdx.x] : 0;
-            for (unsigned mask = 16u; mask > 0u; mask >>= 1u) {
-                const unsigned long long other = __shfl_xor_sync(0xffffffffu, best_key, mask);
-                if (other > best_key) { best_key = other; }
-            }
-            if (threadIdx.x == 0) {
-                winner_key = best_key;
-            }
-        }
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            if (winner_key != 0) {
+            if (best_index >= 0) {
                 out_ids[static_cast<std::int64_t>(t) * k + winner] = static_cast<std::int32_t>(
-                    0x7fffffffu - static_cast<unsigned>(winner_key));
+                    0x7fffffffu - static_cast<unsigned>(best_key));
                 out_values[static_cast<std::int64_t>(t) * k + winner] =
-                    sel_key_value(winner_key);
+                    sel_key_value(best_key);
+                warp_keys[best_index] = 0;
             } else {
                 out_ids[static_cast<std::int64_t>(t) * k + winner] = 0;
                 out_values[static_cast<std::int64_t>(t) * k + winner] = 0.0f;
             }
         }
-        __syncthreads();
-
-        // Parallel elimination: the owner thread zeroes the winner's key.
-        const std::int32_t zbase = threadIdx.x * k;
-#pragma unroll
-        for (std::int32_t i = 0; i < k; ++i) {
-            if (pool_keys[zbase + i] == winner_key) { pool_keys[zbase + i] = 0; }
-        }
-        __syncthreads();
     }
 }
 
@@ -288,6 +278,7 @@ void dflash2_select_candidates_launch(const Tensor& logits, Tensor& out_ids, Ten
     dflash2_select_candidates_kernel<<<tokens, kSelThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), vocab, tokens,
         static_cast<std::int32_t*>(out_ids.data), static_cast<float*>(out_values.data));
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void dflash2_selector_lattice_launch(const Tensor& hidden_pos, const Tensor& successor,

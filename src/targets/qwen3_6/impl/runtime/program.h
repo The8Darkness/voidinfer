@@ -595,8 +595,11 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
+    const KvCacheStorage kv_storage;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
+    const DType mtp_kv_dtype;
+    const std::int32_t mtp_kv_quant_group;
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;

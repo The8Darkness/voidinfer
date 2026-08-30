@@ -17,7 +17,7 @@ void expect(bool condition, std::string_view message) {
     std::cerr << "FAIL: " << message << '\n';
 }
 
-q36::StateImageDeviceLayout plan(bool dflash) {
+q36::StateImageDeviceLayout plan(bool dflash, bool nvfp4 = false) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -33,8 +33,14 @@ q36::StateImageDeviceLayout plan(bool dflash) {
         .hidden = 7,
     };
     if (dflash) {
-        spec.dflash_local =
-            q36::DFlashLocalStateSpec{.layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
+        spec.dflash_local = q36::DFlashLocalStateSpec{
+            .layers = 2,
+            .capacity = 17,
+            .kv_heads = 2,
+            .head_dim = nvfp4 ? 32 : 4,
+            .dtype = nvfp4 ? ninfer::DType::U8 : ninfer::DType::BF16,
+            .quant_group = nvfp4 ? 16 : 0,
+        };
     }
     ninfer::LayoutBuilder builder;
     return q36::plan_state_image_device_pool(builder, spec);
@@ -64,6 +70,23 @@ int main() {
                full_work.copy_operations ==
                    common_work.copy_operations + local_work.copy_operations,
            "full DFlash StateImage work is not common plus local state");
+
+    const q36::StateImageDeviceLayout nvfp4 = plan(true, true);
+    expect(nvfp4.dflash_local && nvfp4.dflash_local->dtype == ninfer::DType::U8 &&
+               nvfp4.dflash_local->quant_group == 16 &&
+               nvfp4.dflash_local->k.size() == 2 && nvfp4.dflash_local->k_scale.size() == 2 &&
+               nvfp4.dflash_local->v_scale.size() == 2,
+           "DFlash NVFP4 device layout carries packed code and scale planes");
+    const auto nvfp4_work = q36::dflash_local_transfer_work(nvfp4.host);
+    const std::uint64_t nvfp4_bytes =
+        2ULL * (nvfp4.host.dflash_local_layer_bytes +
+                nvfp4.host.dflash_local_scale_layer_bytes) *
+        nvfp4.host.spec.dflash_local->layers;
+    expect(nvfp4.host.dflash_local_k_scale && nvfp4.host.dflash_local_v_scale &&
+               nvfp4_work.payload_bytes == nvfp4_bytes &&
+               nvfp4_work.copy_operations == 4 *
+                                                   nvfp4.host.spec.dflash_local->layers,
+           "DFlash NVFP4 transfer work includes both scale planes");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

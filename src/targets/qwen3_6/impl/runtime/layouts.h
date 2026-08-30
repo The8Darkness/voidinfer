@@ -78,6 +78,10 @@ struct SequencePlanningInputs {
     bool use_cuda_graph = true;
     int device          = 0;
     ContextCacheOptions context_cache;
+    KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
+    DType mtp_kv_dtype = DType::BF16;
+    std::int32_t mtp_kv_quant_group = 0;
+    bool mtp_kv_profile_explicit = false;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -101,6 +105,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     ContextCacheOptions context_cache;
+    KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
+    DType mtp_kv_dtype = DType::BF16;
+    std::int32_t mtp_kv_quant_group = 0;
+    bool mtp_kv_profile_explicit = false;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

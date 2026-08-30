@@ -18,6 +18,21 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
+    if (cache.dtype == DType::U8) {
+        constexpr int FillWarps       = kBlock / 32;
+        const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
+        const int fill_grid =
+            static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+        kv_cache_append_full_nvfp4_kernel<Geometry, Metadata><<<fill_grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(positions.data), metadata,
+            static_cast<std::uint8_t*>(cache_k.data), static_cast<std::uint8_t*>(cache_v.data),
+            static_cast<std::uint8_t*>(cache.k_scale_pages.data),
+            static_cast<std::uint8_t*>(cache.v_scale_pages.data), tokens);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (cache.dtype == DType::FP8_E4M3FN) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
@@ -131,6 +146,23 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     validate_plan(k, plan);
     if (plan.max_count == 0) return;
+    if (cache.dtype == DType::U8) {
+        const dim3 grid(static_cast<unsigned>(plan.max_count), k.ne[3], 1);
+        kv_cache_append_prefix_cyclic_nvfp4_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(counts.data),
+            static_cast<const std::int32_t*>(lanes.data),
+            static_cast<std::uint8_t*>(cache.k.data),
+            static_cast<std::uint8_t*>(cache.v.data),
+            static_cast<std::uint8_t*>(cache.k_scale.data),
+            static_cast<std::uint8_t*>(cache.v_scale.data),
+            plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
+            static_cast<int>(cache.padded_capacity));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k.data);
     auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v.data);
     const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);
@@ -143,7 +175,7 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     const dim3 grid(1 + (plan.max_count - 1) / 4, k.ne[3], 1);
     kv_cache_append_prefix_cyclic_kernel<<<grid, kBlock, 0, stream>>>(
         input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
-        plan.tokens, padded);
+        plan.tokens, static_cast<int>(cache.capacity), padded);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -182,6 +214,48 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
     } else {
         launch.template operator()<true>();
     }
+}
+
+void kv_cache_append_nvfp4_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        std::int32_t column_begin, std::int32_t width,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (width <= 0 || column_begin < 0 || column_begin + width > k.ne[2] ||
+        k.ne[3] != cache.block_tables.ne[1]) {
+        throw std::invalid_argument("NVFP4 batch append has an invalid offset or batch");
+    }
+    const auto launch = [&]<int KVHeads, bool Masked>() {
+        using Geometry = KVCacheAppendFullGeometry<KVHeads>;
+        kv_cache_append_nvfp4_batch_kernel<Geometry, Masked>
+            <<<dim3(KVHeads, static_cast<unsigned>(width), static_cast<unsigned>(k.ne[3])),
+                   32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+                static_cast<const std::int32_t*>(table_rows.data),
+                static_cast<std::uint8_t*>(cache.k_pages.data),
+                static_cast<std::uint8_t*>(cache.v_pages.data),
+                static_cast<std::uint8_t*>(cache.k_scale_pages.data),
+                static_cast<std::uint8_t*>(cache.v_scale_pages.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
+                cache.block_tables.ne[0], k.ne[2], column_begin, width);
+    };
+    const bool masked = valid_columns.data != nullptr;
+    if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
+        if (masked) {
+            launch.template operator()<KVCacheAppendD256Kv4::KVHeads, true>();
+        } else {
+            launch.template operator()<KVCacheAppendD256Kv4::KVHeads, false>();
+        }
+    } else {
+        if (masked) {
+            launch.template operator()<KVCacheAppendD256Kv2::KVHeads, true>();
+        } else {
+            launch.template operator()<KVCacheAppendD256Kv2::KVHeads, false>();
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 KVCacheAppendPrefixPlan

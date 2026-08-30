@@ -50,6 +50,8 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
+    if (value == "nvfp4") { return KvCacheStorage::Nvfp4; }
+    if (value == "vericache-nvfp4") { return KvCacheStorage::VeriCacheNvfp4; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -76,7 +78,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-long-anchors-per-continuation N] [--max-cache-markers-per-request N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|vericache-nvfp4] "
+           "[--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -368,6 +371,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.kv_cache == KvCacheStorage::VeriCacheNvfp4 &&
+        options.speculative.backend != SpeculativeBackend::Mtp &&
+        options.speculative.backend != SpeculativeBackend::DFlash) {
+        throw std::invalid_argument(
+            "--kv-dtype vericache-nvfp4 requires --spec mtp|dflash --draft-tokens N");
+    }
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }

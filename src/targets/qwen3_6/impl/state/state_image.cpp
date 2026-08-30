@@ -52,7 +52,8 @@ bool same_dflash_spec(const std::optional<DFlashLocalStateSpec>& left,
     if (left.has_value() != right.has_value()) { return false; }
     if (!left) { return true; }
     return left->layers == right->layers && left->capacity == right->capacity &&
-           left->kv_heads == right->kv_heads && left->head_dim == right->head_dim;
+           left->kv_heads == right->kv_heads && left->head_dim == right->head_dim &&
+           left->dtype == right->dtype && left->quant_group == right->quant_group;
 }
 
 bool same_region(const LayoutRegion& left, const LayoutRegion& right) noexcept {
@@ -78,6 +79,9 @@ bool same_host_layout(const StateImageHostLayout& left,
            same_optional_region(left.dflash_local_k, right.dflash_local_k) &&
            same_optional_region(left.dflash_local_v, right.dflash_local_v) &&
            left.dflash_local_layer_bytes == right.dflash_local_layer_bytes &&
+           same_optional_region(left.dflash_local_k_scale, right.dflash_local_k_scale) &&
+           same_optional_region(left.dflash_local_v_scale, right.dflash_local_v_scale) &&
+           left.dflash_local_scale_layer_bytes == right.dflash_local_scale_layer_bytes &&
            left.image_bytes == right.image_bytes;
 }
 
@@ -90,7 +94,15 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
         throw std::invalid_argument("StateImage host geometry is invalid");
     }
     if (spec.dflash_local && (spec.dflash_local->layers == 0 || spec.dflash_local->kv_heads <= 0 ||
-                              spec.dflash_local->head_dim <= 0)) {
+                              spec.dflash_local->head_dim <= 0 ||
+                              (spec.dflash_local->dtype != DType::BF16 &&
+                               spec.dflash_local->dtype != DType::U8) ||
+                              (spec.dflash_local->dtype == DType::BF16 &&
+                               spec.dflash_local->quant_group != 0) ||
+                              (spec.dflash_local->dtype == DType::U8 &&
+                               (spec.dflash_local->quant_group != 16 ||
+                                spec.dflash_local->head_dim % 2 != 0 ||
+                                spec.dflash_local->head_dim % spec.dflash_local->quant_group != 0)))) {
         throw std::invalid_argument("StateImage host DFlash geometry is invalid");
     }
 
@@ -115,11 +127,12 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     host.continuation_hidden = builder.add(hidden_slot.bytes(), kStateImageAlignment,
                                            "StateImage host continuation hidden");
     if (spec.dflash_local) {
+        const auto& dflash = *spec.dflash_local;
+        const auto padded = static_cast<std::int32_t>(padded_dflash_capacity(dflash.capacity));
+        const auto code_head_dim = dflash.dtype == DType::U8 ? dflash.head_dim / 2
+                                                              : dflash.head_dim;
         const Tensor local_slot(
-            nullptr, DType::BF16,
-            {spec.dflash_local->head_dim,
-             static_cast<std::int32_t>(padded_dflash_capacity(spec.dflash_local->capacity)),
-             spec.dflash_local->kv_heads});
+            nullptr, dflash.dtype, {code_head_dim, padded, dflash.kv_heads});
         host.dflash_local_layer_bytes = local_slot.bytes();
         const std::size_t component_bytes =
             checked_mul(host.dflash_local_layer_bytes, spec.dflash_local->layers,
@@ -128,6 +141,18 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local K");
         host.dflash_local_v =
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local V");
+        if (dflash.dtype == DType::U8) {
+            const Tensor scale_slot(nullptr, DType::FP8_E4M3FN,
+                                    {dflash.head_dim / dflash.quant_group, padded, dflash.kv_heads});
+            host.dflash_local_scale_layer_bytes = scale_slot.bytes();
+            const std::size_t scale_component_bytes =
+                checked_mul(host.dflash_local_scale_layer_bytes, dflash.layers,
+                            "StateImage host DFlash local scale bytes overflow");
+            host.dflash_local_k_scale = builder.add(
+                scale_component_bytes, kStateImageAlignment, "StateImage host DFlash local K scales");
+            host.dflash_local_v_scale = builder.add(
+                scale_component_bytes, kStateImageAlignment, "StateImage host DFlash local V scales");
+        }
     }
     host.image_bytes = builder.finish(kStateImageAlignment, "StateImage host image");
     return host;
@@ -160,7 +185,8 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
         const DFlashLocalStateSpec& dflash = *spec.dflash_local;
         out.dflash_local =
             plan_cyclic_kv_cache(builder, dflash.layers, dflash.capacity, dflash.kv_heads,
-                                 dflash.head_dim, spec.linear.slot_count);
+                                 dflash.head_dim, spec.linear.slot_count, dflash.dtype,
+                                 dflash.quant_group);
     }
 
     out.host = plan_host_state_image(spec);
@@ -182,10 +208,25 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
         payload = checked_add(
             payload, checked_mul(component_bytes, 2U, "StateImage transfer payload overflow"),
             "StateImage transfer payload overflow");
+        if (layout.dflash_local_k_scale) {
+            if (!layout.spec.dflash_local || !layout.dflash_local_v_scale) {
+                throw std::invalid_argument("StateImage DFlash scale layout is incomplete");
+            }
+            const std::size_t scale_component_bytes =
+                checked_mul(layout.dflash_local_scale_layer_bytes,
+                            layout.spec.dflash_local->layers,
+                            "StateImage transfer scale payload overflow");
+            payload = checked_add(
+                payload,
+                checked_mul(scale_component_bytes, 2U,
+                            "StateImage transfer scale payload overflow"),
+                "StateImage transfer payload overflow");
+        }
     }
     const std::uint64_t operations =
         2ULL * layout.spec.linear.layers + 1ULL +
-        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
+        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL) +
+        (layout.dflash_local_k_scale ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
     if (operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage transfer operation count exceeds uint32");
     }
@@ -200,12 +241,32 @@ TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
     const std::size_t component_bytes =
         checked_mul(layout.dflash_local_layer_bytes, layout.spec.dflash_local->layers,
                     "StateImage DFlash transfer payload overflow");
-    const std::uint64_t operations = 2ULL * layout.spec.dflash_local->layers;
+    std::size_t payload = component_bytes;
+    std::uint64_t operations = 2ULL * layout.spec.dflash_local->layers;
     if (component_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
         operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage DFlash transfer work exceeds its representation");
     }
-    return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(2U * component_bytes),
+    payload *= 2U;
+    if (layout.dflash_local_k_scale) {
+        if (!layout.dflash_local_v_scale) {
+            throw std::invalid_argument("StateImage DFlash scale layout is incomplete");
+        }
+        const std::size_t scale_component_bytes =
+            checked_mul(layout.dflash_local_scale_layer_bytes,
+                        layout.spec.dflash_local->layers,
+                        "StateImage DFlash scale payload overflow");
+        payload = checked_add(
+            payload,
+            checked_mul(scale_component_bytes, 2U,
+                        "StateImage DFlash transfer scale payload overflow"),
+            "StateImage DFlash transfer work exceeds its representation");
+        operations += 2ULL * layout.spec.dflash_local->layers;
+    }
+    if (operations > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("StateImage DFlash transfer operation count exceeds uint32");
+    }
+    return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
                         .copy_operations = static_cast<std::uint32_t>(operations)};
 }
 
@@ -283,6 +344,8 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
             .capacity = layout.dflash_local->capacity,
             .kv_heads = layout.dflash_local->num_kv_heads,
             .head_dim = layout.dflash_local->head_dim,
+            .dtype = layout.dflash_local->dtype,
+            .quant_group = layout.dflash_local->quant_group,
         };
     }
     if (!same_host_layout(host_layout_, plan_host_state_image(device_spec))) {
@@ -330,6 +393,12 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
             const Tensor v                    = view.v.slice(3, slot, 1);
             CUDA_CHECK(cudaMemsetAsync(k.data, 0, k.bytes(), stream));
             CUDA_CHECK(cudaMemsetAsync(v.data, 0, v.bytes(), stream));
+            if (view.dtype == DType::U8) {
+                CUDA_CHECK(cudaMemsetAsync(view.k_scale.slice(3, slot, 1).data, 0,
+                                           view.k_scale.slice(3, slot, 1).bytes(), stream));
+                CUDA_CHECK(cudaMemsetAsync(view.v_scale.slice(3, slot, 1).data, 0,
+                                           view.v_scale.slice(3, slot, 1).bytes(), stream));
+            }
         }
     }
 }
@@ -342,6 +411,10 @@ void StateImageDevicePool::zero_all(cudaStream_t stream) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
             CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), stream));
             CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), stream));
+            if (view.dtype == DType::U8) {
+                CUDA_CHECK(cudaMemsetAsync(view.k_scale.data, 0, view.k_scale.bytes(), stream));
+                CUDA_CHECK(cudaMemsetAsync(view.v_scale.data, 0, view.v_scale.bytes(), stream));
+            }
         }
     }
 }
@@ -411,6 +484,18 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                 byte_offset(destination.data, host_layout_.dflash_local_v->offset +
                                                   layer * host_layout_.dflash_local_layer_bytes),
                 v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
+            if (view.dtype == DType::U8) {
+                const Tensor k_scale = view.k_scale.slice(3, source, 1);
+                const Tensor v_scale = view.v_scale.slice(3, source, 1);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    byte_offset(destination.data, host_layout_.dflash_local_k_scale->offset +
+                                                      layer * host_layout_.dflash_local_scale_layer_bytes),
+                    k_scale.data, k_scale.bytes(), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    byte_offset(destination.data, host_layout_.dflash_local_v_scale->offset +
+                                                      layer * host_layout_.dflash_local_scale_layer_bytes),
+                    v_scale.data, v_scale.bytes(), cudaMemcpyDeviceToHost, stream));
+            }
         }
     }
 }
@@ -453,6 +538,20 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                 byte_offset(source.data, host_layout_.dflash_local_v->offset +
                                              layer * host_layout_.dflash_local_layer_bytes),
                 v.bytes(), cudaMemcpyHostToDevice, stream));
+            if (view.dtype == DType::U8) {
+                const Tensor k_scale = view.k_scale.slice(3, destination, 1);
+                const Tensor v_scale = view.v_scale.slice(3, destination, 1);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    k_scale.data,
+                    byte_offset(source.data, host_layout_.dflash_local_k_scale->offset +
+                                                 layer * host_layout_.dflash_local_scale_layer_bytes),
+                    k_scale.bytes(), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    v_scale.data,
+                    byte_offset(source.data, host_layout_.dflash_local_v_scale->offset +
+                                                 layer * host_layout_.dflash_local_scale_layer_bytes),
+                    v_scale.bytes(), cudaMemcpyHostToDevice, stream));
+            }
         }
     }
 }

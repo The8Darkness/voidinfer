@@ -72,8 +72,19 @@ TargetKVCacheProfile target_kv_cache_profile(KvCacheStorage storage) {
         return {DType::I8, qwen3_6::kKvInt8QuantGroup};
     case KvCacheStorage::Fp8E4M3Row256:
         return {DType::FP8_E4M3FN, qwen3_6::kKvFp8QuantGroup};
+    case KvCacheStorage::Nvfp4:
+        return {DType::U8, qwen3_6::kKvNvfp4QuantGroup};
+    case KvCacheStorage::VeriCacheNvfp4:
+        return {DType::BF16, 0};
     }
     throw std::invalid_argument("unknown KV-cache storage profile");
+}
+
+TargetKVCacheProfile mtp_kv_cache_profile(KvCacheStorage storage) {
+    if (storage == KvCacheStorage::VeriCacheNvfp4) {
+        return {DType::U8, qwen3_6::kKvNvfp4QuantGroup};
+    }
+    return target_kv_cache_profile(storage);
 }
 
 template <class ProfileAllowance>
@@ -140,6 +151,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     .mtp_kv_dtype               = plan.mtp_kv_dtype,
+                     .mtp_kv_quant_group         = plan.mtp_kv_quant_group,
+                     .mtp_kv_profile_explicit    = plan.mtp_kv_profile_explicit,
                  });
     qwen3_6::StateImageSpec state_image_spec{
         .linear =
@@ -157,11 +171,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     };
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
+            const bool dflash_nvfp4 = plan.kv_storage == KvCacheStorage::VeriCacheNvfp4;
             state_image_spec.dflash_local = qwen3_6::DFlashLocalStateSpec{
                 .layers   = DFlashConfig::local_layers,
                 .capacity = DFlashConfig::local_capacity,
                 .kv_heads = DFlashConfig::kv_heads,
                 .head_dim = DFlashConfig::head_dim,
+                .dtype = dflash_nvfp4 ? DType::U8 : DType::BF16,
+                .quant_group = dflash_nvfp4 ? qwen3_6::kKvNvfp4QuantGroup : 0,
             };
         }
     }
@@ -353,7 +370,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_dtype, envelope, 1, tokens, tokens));
+                            plan.mtp_kv_dtype, envelope, 1, tokens, tokens));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
     };
@@ -389,7 +406,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_dtype, text_envelope, 1, 1, 1));
+                            plan.mtp_kv_dtype, text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
@@ -464,7 +481,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout,
                         ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_dtype, text_envelope, batch, width, width));
+                            plan.mtp_kv_dtype, text_envelope, batch, width, width));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
             };
@@ -684,6 +701,17 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
+    if (options.kv_cache == KvCacheStorage::VeriCacheNvfp4) {
+        if (options.speculative.backend != SpeculativeBackend::Mtp &&
+            options.speculative.backend != SpeculativeBackend::DFlash) {
+            throw std::invalid_argument(
+                "vericache-nvfp4 requires --spec mtp or --spec dflash; the exact target cache and compressed "
+                "draft tier are separate");
+        }
+        if (TextConfig::head_dim != 256) {
+            throw std::invalid_argument("vericache-nvfp4 requires a 256-wide attention head");
+        }
+    }
     if (device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
     }
@@ -705,6 +733,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
+    impl->kv_storage          = inputs.kv_storage;
+    impl->kv_dtype            = inputs.kv_dtype;
+    impl->kv_quant_group      = inputs.kv_quant_group;
+    impl->mtp_kv_dtype        = inputs.mtp_kv_profile_explicit ? inputs.mtp_kv_dtype
+                                                                 : inputs.kv_dtype;
+    impl->mtp_kv_quant_group  = inputs.mtp_kv_profile_explicit ? inputs.mtp_kv_quant_group
+                                                                : inputs.kv_quant_group;
+    impl->mtp_kv_profile_explicit = inputs.mtp_kv_profile_explicit;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
@@ -719,8 +755,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     }
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
-    impl->kv_dtype            = inputs.kv_dtype;
-    impl->kv_quant_group      = inputs.kv_quant_group;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -778,6 +812,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
     validate_target_options(device, options);
     const TargetKVCacheProfile kv_profile = target_kv_cache_profile(options.kv_cache);
+    const TargetKVCacheProfile mtp_profile = mtp_kv_cache_profile(options.kv_cache);
 
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
@@ -793,6 +828,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .use_cuda_graph      = options.use_cuda_graph,
         .device              = options.device,
         .context_cache       = options.context_cache,
+        .kv_storage          = options.kv_cache,
+        .mtp_kv_dtype        = mtp_profile.dtype,
+        .mtp_kv_quant_group  = mtp_profile.quant_group,
+        .mtp_kv_profile_explicit = options.kv_cache == KvCacheStorage::VeriCacheNvfp4,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

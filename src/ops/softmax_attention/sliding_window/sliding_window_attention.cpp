@@ -57,13 +57,39 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
         throw std::overflow_error(std::string(op) + ": padded capacity exceeds int32");
     }
     const auto padded = static_cast<std::int32_t>(context.padded_capacity);
-    if (context.k.dtype != DType::BF16 || context.v.dtype != DType::BF16) {
-        throw std::invalid_argument(std::string(op) + ": context K/V must be BF16");
+    if (context.dtype == DType::BF16) {
+        if (context.quant_group != 0 || context.k_scale.data != nullptr ||
+            context.v_scale.data != nullptr || context.k.dtype != DType::BF16 ||
+            context.v.dtype != DType::BF16) {
+            throw std::invalid_argument(std::string(op) + ": invalid BF16 context profile");
+        }
+        require_shape(context.k, kHeadDim, padded, kKVHeads, context.lane_capacity, op,
+                      "context k");
+        require_shape(context.v, kHeadDim, padded, kKVHeads, context.lane_capacity, op,
+                      "context v");
+    } else if (context.dtype == DType::U8) {
+        if (context.quant_group != 16 || context.k.dtype != DType::U8 ||
+            context.v.dtype != DType::U8 || context.k_scale.dtype != DType::FP8_E4M3FN ||
+            context.v_scale.dtype != DType::FP8_E4M3FN) {
+            throw std::invalid_argument(std::string(op) + ": invalid NVFP4 context profile");
+        }
+        require_shape(context.k, kHeadDim / 2, padded, kKVHeads, context.lane_capacity, op,
+                      "context k");
+        require_shape(context.v, kHeadDim / 2, padded, kKVHeads, context.lane_capacity, op,
+                      "context v");
+        require_shape(context.k_scale, kHeadDim / 16, padded, kKVHeads, context.lane_capacity,
+                      op, "context k scales");
+        require_shape(context.v_scale, kHeadDim / 16, padded, kKVHeads, context.lane_capacity,
+                      op, "context v scales");
+    } else {
+        throw std::invalid_argument(std::string(op) + ": unsupported context K/V profile");
     }
-    require_shape(context.k, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context k");
-    require_shape(context.v, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context v");
     require_contiguous_nonnull(context.k, op, "context k");
     require_contiguous_nonnull(context.v, op, "context v");
+    if (context.dtype == DType::U8) {
+        require_contiguous_nonnull(context.k_scale, op, "context k scales");
+        require_contiguous_nonnull(context.v_scale, op, "context v scales");
+    }
 }
 
 struct PartialWorkspace {
@@ -151,6 +177,14 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     }
     if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1e-7f) {
         throw std::invalid_argument("sliding_window_attention: scale must be 1/sqrt(128)");
+    }
+
+    if (context.dtype == DType::U8) {
+        detail::sliding_window_attention_nvfp4_launch(
+            q, query_k, query_v, positions, valid_columns, lanes, scale, context,
+            static_cast<std::int32_t>(envelope.max_context), static_cast<std::int32_t>(window), out,
+            stream);
+        return;
     }
 
     auto scope               = workspace.scope();

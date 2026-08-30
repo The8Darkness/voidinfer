@@ -11,18 +11,25 @@ inline constexpr std::int32_t kD256KVCacheHeadDim = 256;
 
 struct D256KVCacheProfile {
     DType code_dtype;
+    DType scale_dtype;
     std::int32_t quant_group;
     std::int32_t scale_leading_extent;
+    std::int32_t code_leading_extent;
 };
 
 inline D256KVCacheProfile d256_kv_cache_profile(DType dtype) {
     switch (dtype) {
     case DType::BF16:
-        return {DType::BF16, 0, 0};
+        return {DType::BF16, DType::BF16, 0, 0, kD256KVCacheHeadDim};
     case DType::I8:
-        return {DType::I8, 64, 4};
+        return {DType::I8, DType::FP16, 64, 4, kD256KVCacheHeadDim};
     case DType::FP8_E4M3FN:
-        return {DType::FP8_E4M3FN, 256, 1};
+        return {DType::FP8_E4M3FN, DType::FP16, 256, 1, kD256KVCacheHeadDim};
+    case DType::U8:
+        // DType::U8 is the storage type for packed NVFP4 code bytes. The public enum selects
+        // this profile; ordinary U8 tensors are not accepted by the KV append/attention APIs.
+        return {DType::U8, DType::FP8_E4M3FN, 16, kD256KVCacheHeadDim / 16,
+                kD256KVCacheHeadDim / 2};
     default:
         throw std::invalid_argument("unsupported D256 KV-cache dtype");
     }
