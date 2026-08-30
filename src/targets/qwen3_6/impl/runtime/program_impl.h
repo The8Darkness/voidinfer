@@ -730,7 +730,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
-      hierarchical_snapshot_completion_(device_in),
+      hierarchical_snapshot_source_ready_(device_in), hierarchical_snapshot_tail_ready_(device_in),
+      hierarchical_snapshot_state_ready_(device_in), hierarchical_snapshot_completion_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
@@ -962,28 +963,99 @@ ProgramImplCore::~ProgramImplCore() noexcept {
 void ProgramImplCore::reap_hierarchical_host_snapshots() {
     bool pending = false;
     for (const auto& snapshot : hierarchical_host_snapshots) {
-        pending = pending || snapshot.transfer.has_value();
+        pending = pending || snapshot.transfer.has_value() ||
+                  !snapshot.pending_text_kv_extents.empty() ||
+                  !snapshot.pending_backend_kv_extents.empty() ||
+                  snapshot.superseded_text_address.has_value() ||
+                  snapshot.superseded_backend_address.has_value();
     }
     if (!pending || !hierarchical_snapshot_completion_.ready()) { return; }
     for (auto& snapshot : hierarchical_host_snapshots) {
-        if (!snapshot.transfer) { continue; }
-        state_store->publish_transfer(std::move(*snapshot.transfer), false);
-        snapshot.transfer.reset();
+        if (!snapshot.transfer && snapshot.pending_text_kv_extents.empty() &&
+            snapshot.pending_backend_kv_extents.empty() &&
+            !snapshot.superseded_text_address && !snapshot.superseded_backend_address) {
+            continue;
+        }
+
+        if (host_kv_extents) {
+            for (auto& reservation : snapshot.pending_text_kv_extents) {
+                snapshot.text_kv_extents.push_back(host_kv_extents->publish(std::move(reservation)));
+            }
+            for (auto& reservation : snapshot.pending_backend_kv_extents) {
+                snapshot.backend_kv_extents.push_back(
+                    host_kv_extents->publish(std::move(reservation)));
+            }
+        }
+        snapshot.pending_text_kv_extents.clear();
+        snapshot.pending_backend_kv_extents.clear();
+
+        if (snapshot.superseded_backend_address && backend_kv_addresses &&
+            backend_kv_addresses->valid(*snapshot.superseded_backend_address)) {
+            if (!backend_kv_addresses->release(*snapshot.superseded_backend_address)) {
+                throw std::logic_error("hierarchical Backend KV superseded address release failed");
+            }
+        }
+        if (snapshot.superseded_text_address && text_kv_addresses &&
+            text_kv_addresses->valid(*snapshot.superseded_text_address)) {
+            if (!text_kv_addresses->release(*snapshot.superseded_text_address)) {
+                throw std::logic_error("hierarchical Text KV superseded address release failed");
+            }
+        }
+        for (const LogicalKVPageHandle page : snapshot.superseded_text_pages) {
+            if (text_kv_pages && text_kv_pages->valid(page)) {
+                (void)text_kv_pages->drop_device_replica(page);
+            }
+        }
+        for (const LogicalKVPageHandle page : snapshot.superseded_backend_pages) {
+            if (backend_kv_pages && backend_kv_pages->valid(page)) {
+                (void)backend_kv_pages->drop_device_replica(page);
+            }
+        }
+        if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+
+        if (snapshot.pending_host_kv_pages != 0 || snapshot.pending_host_kv_bytes != 0) {
+            const double seconds =
+                std::chrono::duration<double>(Clock::now() - snapshot.host_kv_transfer_started)
+                    .count();
+            hierarchical_vericache.record_host_kv_transfer(
+                snapshot.pending_host_kv_pages, snapshot.pending_host_kv_bytes, seconds);
+        }
+        snapshot.pending_host_kv_pages = 0;
+        snapshot.pending_host_kv_bytes = 0;
+        snapshot.superseded_text_address.reset();
+        snapshot.superseded_backend_address.reset();
+        snapshot.superseded_text_pages.clear();
+        snapshot.superseded_backend_pages.clear();
+
+        if (snapshot.transfer) {
+            state_store->publish_transfer(std::move(*snapshot.transfer), false);
+            snapshot.transfer.reset();
+        }
     }
 }
 
 void ProgramImplCore::discard_hierarchical_host_snapshot(std::uint32_t lane) noexcept {
     if (lane >= max_concurrency) { return; }
     auto& snapshot = hierarchical_host_snapshots[lane];
-    if (snapshot.transfer) {
+    const bool has_async_work =
+        snapshot.transfer.has_value() || !snapshot.pending_text_kv_extents.empty() ||
+        !snapshot.pending_backend_kv_extents.empty() || snapshot.superseded_text_address.has_value() ||
+        snapshot.superseded_backend_address.has_value();
+    if (has_async_work) {
         // The transfer owns a pinned destination. Synchronizing here is restricted to cleanup
         // paths; the normal decode path only polls the completion event.
         if (device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);
         }
+    }
+    if (snapshot.transfer) {
         if (state_store) { state_store->abort_transfer(std::move(*snapshot.transfer)); }
         snapshot.transfer.reset();
     }
+    // Reservations are deliberately cleared only after the transfer stream has drained: their
+    // destructors unpin the source pages that back the asynchronous host DMA.
+    snapshot.pending_text_kv_extents.clear();
+    snapshot.pending_backend_kv_extents.clear();
     if (snapshot.state && state_store) {
         (void)state_store->release(*snapshot.state);
     }
@@ -996,12 +1068,37 @@ void ProgramImplCore::discard_hierarchical_host_snapshot(std::uint32_t lane) noe
         }
         (void)host_kv_extents->release_unreferenced();
     }
+    if (snapshot.superseded_backend_address && backend_kv_addresses &&
+        backend_kv_addresses->valid(*snapshot.superseded_backend_address)) {
+        (void)backend_kv_addresses->release(*snapshot.superseded_backend_address);
+    }
+    if (snapshot.superseded_text_address && text_kv_addresses &&
+        text_kv_addresses->valid(*snapshot.superseded_text_address)) {
+        (void)text_kv_addresses->release(*snapshot.superseded_text_address);
+    }
+    for (const LogicalKVPageHandle page : snapshot.superseded_text_pages) {
+        if (text_kv_pages && text_kv_pages->valid(page)) {
+            (void)text_kv_pages->drop_device_replica(page);
+        }
+    }
+    for (const LogicalKVPageHandle page : snapshot.superseded_backend_pages) {
+        if (backend_kv_pages && backend_kv_pages->valid(page)) {
+            (void)backend_kv_pages->drop_device_replica(page);
+        }
+    }
+    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     snapshot.text_kv_extents.clear();
     snapshot.backend_kv_extents.clear();
     snapshot.state.reset();
-    snapshot.frontier            = 0;
-    snapshot.backend_frontier   = 0;
+    snapshot.superseded_text_address.reset();
+    snapshot.superseded_backend_address.reset();
+    snapshot.superseded_text_pages.clear();
+    snapshot.superseded_backend_pages.clear();
+    snapshot.frontier              = 0;
+    snapshot.backend_frontier      = 0;
     snapshot.pending_host_kv_bytes = 0;
+    snapshot.pending_host_kv_pages = 0;
+    snapshot.host_kv_transfer_started = {};
 }
 
 bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
@@ -1145,12 +1242,14 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
         return std::min(requested, full_pages + free_pages);
     };
 
+    bool tail_copy_submitted = false;
     try {
-        // This first prototype intentionally closes the producer stream before rotating the
-        // active KV address. It avoids a producer/transfer wait cycle while the Host verifier
-        // path is still synchronous; a later overlap pass can replace this with one-way events.
-        stage = "source stream wait";
-        device.synchronize();
+        // The producer event is the only dependency needed by the transfer stream. Keeping the
+        // wait stream-scoped avoids a device-wide barrier and leaves later decode work free to
+        // overlap the host DMA once the COW destination is safe to write.
+        stage = "source stream event";
+        hierarchical_snapshot_source_ready_.record(device.stream);
+        hierarchical_snapshot_source_ready_.wait(device.transfer_stream);
         stage = "source deactivation";
         unbind_sequence_kv(sequence);
         if (text_kv_addresses->active(old_bundle.text) ||
@@ -1178,15 +1277,20 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
                 text_kv_addresses->prefix_fork_tail_source(*text_fork),
                 text_kv_addresses->prefix_fork_tail_destination(*text_fork),
                 device.transfer_stream);
+            tail_copy_submitted = true;
         }
         if (backend_fork && backend_fork->needs_tail_copy()) {
             backend_kv_pages->physical_pool().copy_page(
                 backend_kv_addresses->prefix_fork_tail_source(*backend_fork),
                 backend_kv_addresses->prefix_fork_tail_destination(*backend_fork),
                 device.transfer_stream);
+            tail_copy_submitted = true;
         }
-        stage = "prefix fork transfer wait";
-        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        if (tail_copy_submitted) {
+            stage = "prefix fork producer wait";
+            hierarchical_snapshot_tail_ready_.record(device.transfer_stream);
+            hierarchical_snapshot_tail_ready_.wait(device.stream);
+        }
 
         stage = "Text prefix fork commit";
         text_kv_addresses->commit_prefix_fork(std::move(*text_fork), device.stream);
@@ -1205,6 +1309,9 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
         sequence.kv = next_bundle;
         bind_sequence_kv(sequence);
     } catch (const std::exception& error) {
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
         if (backend_fork) { backend_kv_addresses->abort_prefix_fork(*backend_fork); }
         if (text_fork) { text_kv_addresses->abort_prefix_fork(*text_fork); }
         try {
@@ -1214,11 +1321,12 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
                                  ": " + error.what());
     }
 
-    const std::size_t text_extent_begin    = snapshot.text_kv_extents.size();
-    const std::size_t backend_extent_begin = snapshot.backend_kv_extents.size();
+    const std::size_t pending_text_begin    = snapshot.pending_text_kv_extents.size();
+    const std::size_t pending_backend_begin = snapshot.pending_backend_kv_extents.size();
     std::uint64_t copied_bytes             = 0;
+    std::uint32_t copied_pages             = 0;
     const auto copy_missing = [&](LogicalKVPageStore& pages, std::vector<LogicalKVPageHandle>& missing,
-                                  std::vector<HostKVExtentCapability>& owned) {
+                                  std::vector<HostKVExtentReservation>& pending) {
         if (missing.empty()) { return true; }
         std::optional<HostKVExtentReservation> reservation =
             host_kv_extents->prepare(pages, std::span<const LogicalKVPageHandle>(missing));
@@ -1227,15 +1335,18 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
         const HostKVPageLayout layout = host_kv_extents->page_layout(pages);
         const std::uint64_t bytes = static_cast<std::uint64_t>(layout.page_stride) * page_count;
         std::vector<DeviceKVPageHandle> sources = host_kv_extents->device_sources(*reservation);
-        const auto transfer_started = Clock::now();
         pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reservation),
                                            device.transfer_stream);
-        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-        hierarchical_vericache.record_host_kv_transfer(
-            page_count, bytes, std::chrono::duration<double>(Clock::now() - transfer_started).count());
-        const HostKVExtentCapability capability =
-            host_kv_extents->publish(std::move(*reservation));
-        owned.push_back(capability);
+        // Keep the reservation alive until the completion event. Publishing here would expose a
+        // partially copied Host extent to a future verifier and would unpin the source page while
+        // the asynchronous DMA is still reading it.
+        pending.push_back(std::move(*reservation));
+        if (snapshot.pending_host_kv_pages == 0 && copied_pages == 0) {
+            snapshot.host_kv_transfer_started = Clock::now();
+        }
+        copied_pages = copied_pages > std::numeric_limits<std::uint32_t>::max() - page_count
+                           ? std::numeric_limits<std::uint32_t>::max()
+                           : copied_pages + page_count;
         if (bytes > std::numeric_limits<std::uint64_t>::max() - copied_bytes) {
             copied_bytes = std::numeric_limits<std::uint64_t>::max();
         } else {
@@ -1247,25 +1358,26 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
     bool host_ready = false;
     try {
         const bool text_ready =
-            copy_missing(*text_kv_pages, missing_text, snapshot.text_kv_extents);
+            copy_missing(*text_kv_pages, missing_text, snapshot.pending_text_kv_extents);
         const bool backend_ready =
             !old_bundle.backend ||
-            copy_missing(*backend_kv_pages, missing_backend, snapshot.backend_kv_extents);
+            copy_missing(*backend_kv_pages, missing_backend, snapshot.pending_backend_kv_extents);
         host_ready = text_ready && backend_ready;
     } catch (...) {
         host_ready = false;
     }
 
     if (!host_ready) {
-        while (snapshot.text_kv_extents.size() > text_extent_begin) {
-            const HostKVExtentCapability capability = snapshot.text_kv_extents.back();
-            snapshot.text_kv_extents.pop_back();
-            if (host_kv_extents->valid(capability)) { (void)host_kv_extents->release(capability); }
+        // A failed enqueue may have left one or both DMA batches in flight. Drain the transfer
+        // stream before the reservation destructors unpin their source pages.
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
         }
-        while (snapshot.backend_kv_extents.size() > backend_extent_begin) {
-            const HostKVExtentCapability capability = snapshot.backend_kv_extents.back();
-            snapshot.backend_kv_extents.pop_back();
-            if (host_kv_extents->valid(capability)) { (void)host_kv_extents->release(capability); }
+        while (snapshot.pending_text_kv_extents.size() > pending_text_begin) {
+            snapshot.pending_text_kv_extents.pop_back();
+        }
+        while (snapshot.pending_backend_kv_extents.size() > pending_backend_begin) {
+            snapshot.pending_backend_kv_extents.pop_back();
         }
         if (!text_kv_addresses->release(old_bundle.text)) {
             throw std::logic_error("hierarchical Text KV source release failed");
@@ -1284,47 +1396,46 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
             }
         }
         (void)host_kv_extents->release_unreferenced();
+        snapshot.pending_host_kv_bytes = 0;
+        snapshot.pending_host_kv_pages = 0;
+        snapshot.host_kv_transfer_started = {};
         return false;
     }
 
-    if (!text_kv_addresses->release(old_bundle.text)) {
-        throw std::logic_error("hierarchical Text KV source release failed");
-    }
-    if (old_bundle.backend && !backend_kv_addresses->release(*old_bundle.backend)) {
-        throw std::logic_error("hierarchical Backend KV source release failed");
-    }
-    for (const LogicalKVPageHandle page : old_text_pages) {
-        if (text_kv_pages->can_drop_device_replica(page)) {
-            (void)text_kv_pages->drop_device_replica(page);
-        }
-    }
-    for (const LogicalKVPageHandle page : old_backend_pages) {
-        if (backend_kv_pages->can_drop_device_replica(page)) {
-            (void)backend_kv_pages->drop_device_replica(page);
-        }
-    }
-    (void)host_kv_extents->release_unreferenced();
     if (copied_bytes > std::numeric_limits<std::uint64_t>::max() - snapshot.pending_host_kv_bytes) {
         snapshot.pending_host_kv_bytes = std::numeric_limits<std::uint64_t>::max();
     } else {
         snapshot.pending_host_kv_bytes += copied_bytes;
     }
+    snapshot.pending_host_kv_pages =
+        copied_pages > std::numeric_limits<std::uint32_t>::max() - snapshot.pending_host_kv_pages
+            ? std::numeric_limits<std::uint32_t>::max()
+            : snapshot.pending_host_kv_pages + copied_pages;
+    snapshot.superseded_text_address = old_bundle.text;
+    snapshot.superseded_backend_address = old_bundle.backend;
+    snapshot.superseded_text_pages    = std::move(old_text_pages);
+    snapshot.superseded_backend_pages = std::move(old_backend_pages);
     return true;
 }
 
 void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& sequence) {
     if (!hierarchical_vericache.enabled() ||
         !hierarchical_vericache_options.enable_host_tier_snapshots ||
-        host_state_images == nullptr || state_store == nullptr || sequence.lane >= max_concurrency ||
-        sequence.execution_frontier <
-            hierarchical_vericache.next_l1_to_l2_boundary(
-                hierarchical_host_snapshots[sequence.lane].frontier)) {
+        host_state_images == nullptr || state_store == nullptr || sequence.lane >= max_concurrency) {
         return;
     }
 
     reap_hierarchical_host_snapshots();
     auto& snapshot = hierarchical_host_snapshots[sequence.lane];
-    if (snapshot.transfer) { return; }
+    if (sequence.execution_frontier <
+        hierarchical_vericache.next_l1_to_l2_boundary(snapshot.frontier)) {
+        return;
+    }
+    if (snapshot.transfer || !snapshot.pending_text_kv_extents.empty() ||
+        !snapshot.pending_backend_kv_extents.empty() || snapshot.superseded_text_address ||
+        snapshot.superseded_backend_address) {
+        return;
+    }
 
     // The active StateImage is mutable, while Device-to-Host transfers intentionally accept only
     // immutable images. Copying into a spare device image makes the host snapshot a real nested
@@ -1340,12 +1451,19 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
         }
     };
     try {
+        hierarchical_snapshot_source_ready_.record(device.stream);
+        hierarchical_snapshot_source_ready_.wait(device.transfer_stream);
         if (!snapshot_hierarchical_host_kv(sequence, snapshot)) {
             release_destination();
             return;
         }
         state_images->copy_slot(selectors.destination, state_store->physical_slot(*destination),
                                 device.transfer_stream);
+        // The active recurrent state may be mutated as soon as this function returns. Wait only
+        // for the device-to-device checkpoint copy on the worker stream; the following D2H transfer
+        // remains overlapped with later decode work.
+        hierarchical_snapshot_state_ready_.record(device.transfer_stream);
+        hierarchical_snapshot_state_ready_.wait(device.stream);
         state_store->freeze(*destination);
         std::optional<StateImageTransfer> transfer =
             state_store->begin_device_to_host(*destination, device.transfer_stream);
@@ -1368,12 +1486,43 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
                 ? std::numeric_limits<std::uint64_t>::max()
                 : state_bytes + kv_bytes;
         hierarchical_vericache.record_host_tier_snapshot(total_bytes);
-        snapshot.pending_host_kv_bytes = 0;
     } catch (...) {
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
         if (snapshot.transfer) {
             state_store->abort_transfer(std::move(*snapshot.transfer));
             snapshot.transfer.reset();
         }
+        snapshot.pending_text_kv_extents.clear();
+        snapshot.pending_backend_kv_extents.clear();
+        if (snapshot.superseded_backend_address && backend_kv_addresses &&
+            backend_kv_addresses->valid(*snapshot.superseded_backend_address)) {
+            (void)backend_kv_addresses->release(*snapshot.superseded_backend_address);
+        }
+        if (snapshot.superseded_text_address && text_kv_addresses &&
+            text_kv_addresses->valid(*snapshot.superseded_text_address)) {
+            (void)text_kv_addresses->release(*snapshot.superseded_text_address);
+        }
+        for (const LogicalKVPageHandle page : snapshot.superseded_text_pages) {
+            if (text_kv_pages && text_kv_pages->valid(page)) {
+                (void)text_kv_pages->drop_device_replica(page);
+            }
+        }
+        for (const LogicalKVPageHandle page : snapshot.superseded_backend_pages) {
+            if (backend_kv_pages && backend_kv_pages->valid(page)) {
+                (void)backend_kv_pages->drop_device_replica(page);
+            }
+        }
+        if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+        snapshot.superseded_text_address.reset();
+        snapshot.superseded_backend_address.reset();
+        snapshot.superseded_text_pages.clear();
+        snapshot.superseded_backend_pages.clear();
+        snapshot.pending_host_kv_bytes = 0;
+        snapshot.pending_host_kv_pages = 0;
+        snapshot.host_kv_transfer_started = {};
+        if (snapshot.state && *snapshot.state == *destination) { snapshot.state.reset(); }
         release_destination();
         throw;
     }
@@ -1470,6 +1619,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
     std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
     const runtime::ContextMachineCostModel& machine_cost) {
+    // Host-tier promotion is intentionally nonblocking on the request path. Poll here as well as
+    // at the next snapshot boundary so a workload that stops generating still releases its
+    // superseded KV descriptors and host reservations before the next admission.
+    reap_hierarchical_host_snapshots();
     const std::uint32_t lane = destination.value;
     if (lane >= max_concurrency) { throw std::out_of_range("admission lane is out of range"); }
     if (requests[lane].lifecycle != Lifecycle::Empty ||

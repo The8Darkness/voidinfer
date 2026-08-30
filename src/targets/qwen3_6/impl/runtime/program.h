@@ -23,6 +23,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <array>
 #include <memory>
@@ -637,9 +638,23 @@ public:
         // extents can be reused by later checkpoints; only newly copied extents are appended.
         std::vector<HostKVExtentCapability> text_kv_extents;
         std::vector<HostKVExtentCapability> backend_kv_extents;
+        // Reservations keep the source logical pages pinned until the asynchronous D2H DMA has
+        // completed. They must not be published early: a Host verifier may only observe a fully
+        // copied extent.
+        std::vector<HostKVExtentReservation> pending_text_kv_extents;
+        std::vector<HostKVExtentReservation> pending_backend_kv_extents;
+        // Prefix-forking replaces the active address space before the host DMA is complete. Keep
+        // the superseded descriptors alive until publication so a failed transfer can unwind
+        // without leaking their device replicas.
+        std::optional<KVAddressSpaceHandle> superseded_text_address;
+        std::optional<KVAddressSpaceHandle> superseded_backend_address;
+        std::vector<LogicalKVPageHandle> superseded_text_pages;
+        std::vector<LogicalKVPageHandle> superseded_backend_pages;
         std::uint32_t frontier = 0;
         std::uint32_t backend_frontier = 0;
         std::uint64_t pending_host_kv_bytes = 0;
+        std::uint32_t pending_host_kv_pages = 0;
+        std::chrono::steady_clock::time_point host_kv_transfer_started{};
     };
     std::array<HierarchicalHostSnapshot, kMaximumConcurrency> hierarchical_host_snapshots;
     std::optional<GdnReplayRecords> replay_records;
@@ -836,6 +851,9 @@ private:
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
+    CudaCompletionEvent hierarchical_snapshot_source_ready_;
+    CudaCompletionEvent hierarchical_snapshot_tail_ready_;
+    CudaCompletionEvent hierarchical_snapshot_state_ready_;
     CudaCompletionEvent hierarchical_snapshot_completion_;
     std::vector<TokenId> materialization_ledger_;
     qwen3_6::detail::ResidentPrefixIdentity materialization_identity_;

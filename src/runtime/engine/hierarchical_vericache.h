@@ -405,10 +405,9 @@ public:
         host_tier_snapshot_bytes_ += bytes;
     }
 
-    // These counters describe the prototype's actual host transfers.  StateImage promotion is
-    // asynchronous, so its byte count is exact while its completion latency remains in the
-    // normal transfer timing stream.  Host KV copies currently synchronize the transfer stream;
-    // retain their measured duration so a future overlapped implementation has an honest A/B.
+    // These counters describe the prototype's actual host transfers. Both StateImage and Host KV
+    // promotion are enqueued asynchronously; bytes are accounted at submission while latency is
+    // recorded only after the shared completion event makes the copied data publishable.
     void record_host_state_transfer(std::uint64_t bytes) noexcept {
         host_state_d2h_bytes_ += bytes;
     }

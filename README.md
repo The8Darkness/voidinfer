@@ -67,7 +67,7 @@ measurable resource/runtime gate. Negative candidates remain documented as rejec
 | Resource pressure | Bounded continuation search when an incumbent plan exists, reducing pressure-resume planning work without changing the selected contract | The real Qwen3.8 pressure/resume route passes |
 | State and KV ownership | Canonical State/KV resource contracts, device binding, sparse-MoE scan reuse, and successful-warmup readiness gating | Public Engine/resource and readiness tests pass; these are correctness/admission improvements, not unsubstantiated tok/s claims |
 | Measurement discipline | Targeted Nsight Compute kernel inspection and Nsight Systems end-to-end traces on the RTX 5090 | Nsight Systems 2026.4.1 traces are available; Nsight Compute 2026.2.1 is installed, but hardware-counter access is blocked in the current Windows session by `ERR_NVGPUCTRPERM` |
-| Hierarchical VeriCache (research default on the isolated branch) | NVFP4 DFlash2 L0 with protected recent/anchor BF16 sidecar, nested KV/GDN transactions, adaptive fallback horizon, and asynchronous host-tier snapshots | Focused append/attention/state tests pass; the latest matched 400-round 5090 stress run measured 22.69 ms GPU round with host snapshots versus 22.99 ms control, but acceptance reduced published throughput to 70.16 versus 78.25 tok/s. No end-to-end speedup or independent host L1/L2 output verification is claimed |
+| Hierarchical VeriCache (research default on the isolated branch) | NVFP4 DFlash2 L0 with protected recent/anchor BF16 sidecar, nested KV/GDN transactions, adaptive fallback horizon, and event-ordered asynchronous host-tier snapshots | Focused append/attention/state tests pass; a matched two-lane 5090 run measured 23.6491 ms GPU round with async host snapshots versus 23.6857 ms control. Acceptance reduced published throughput to 182.992 versus 186.502 tok/s, so no end-to-end speedup or independent host L1/L2 output verification is claimed |
 
 The main implementation points are [src/ops/linear/fp8/](src/ops/linear/fp8/),
 [include/ninfer/ops/causal_conv1d_silu.h](include/ninfer/ops/causal_conv1d_silu.h),
@@ -109,7 +109,7 @@ Implemented in this track:
 - adaptive 24–64 L0→L1 and 256–2,048 L1→L2 horizon controls, with exact-target fallback metrics
   kept separate from real host-verifier counters;
 - reuse of the existing pinned StateImage, host FP16 KV extent store, prefix/state DAG, and COW
-  ownership machinery for tier accounting and future asynchronous promotion.
+  ownership machinery for tier accounting and event-ordered asynchronous promotion.
 
 The default server profile is VeriCache-NVFP4, DFlash2 `k=7`, and the optimized proposal head;
 implicit vision requests route to MTP so BF16 vision remains protected. A real default-profile

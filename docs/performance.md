@@ -29,12 +29,29 @@ rows remain reproducible.
 | Hierarchy + host snapshot, L1→L2 fixed at 256 | 22.6889 ms | 22.6995 ms | 70.1556 | 237/2,800 (8.46%) | 26,869,760/17,367,040/221,063,168/0 |
 
 The host row materialized three checkpoints and measured 502,167,552 StateImage bytes plus
-71,565,312 KV bytes across 33 KV pages; synchronized KV D2H time was 1.94 ms in aggregate. The
-GPU round was 1.32% below the control, but the measured acceptance was lower, so the combined
-published rate was 10.3% below the control. This is not a multiplicative claim: repeated runs
-show acceptance sensitivity, and the current host path still performs synchronous COW/transfer
-work at its boundaries. The experiment remains a research milestone, not a winning end-to-end
-configuration.
+71,565,312 KV bytes across 33 KV pages; synchronized KV D2H time was 1.94 ms in aggregate at
+that revision. The GPU round was 1.32% below the control, but the measured acceptance was lower,
+so the combined published rate was 10.3% below the control. This is not a multiplicative claim:
+repeated runs show acceptance sensitivity. The row is retained as a pre-overlap reference; the
+follow-up below changes only the host-promotion synchronization/ownership path.
+
+### E018: event-ordered host promotion follow-up
+
+The follow-up uses the same physical RTX 5090, DFlash2 `k=7`, optimized proposal head, no CUDA
+Graph, context 512, one warmup round, and 100 measured rounds, but exercises two concurrent lanes.
+Host KV extents remain reserved and invisible until the transfer completion event; superseded KV
+descriptors are released only after DMA drains. This validates overlap and cleanup, not an
+independent host-tier output verifier:
+
+| Configuration | GPU round | Wall round | Published tok/s | Draft acceptance | Host transfer telemetry |
+| --- | ---: | ---: | ---: | ---: | --- |
+| VeriCache-NVFP4 control, hierarchy disabled | 23.6857 ms | 23.6995 ms | 186.502 | 242/1,400 (17.29%) | none |
+| Hierarchy + async host snapshot | 23.6491 ms | 23.6622 ms | 182.992 | 233/1,400 (16.64%) | 334,778,368 StateImage D2H + 71,303,168 KV D2H bytes / 32 pages; KV DMA 0.148862 s |
+
+The async row is 0.15% lower in GPU round time but 1.88% lower in aggregate published tok/s due
+to its lower acceptance in this pair. It is therefore retained as infrastructure with no speedup
+claim. The host output verifier, low-bit direct verifier, NVMe persistence, and long-context
+quality gates remain separate research work.
 
 For historical comparison, an earlier short RTX 5090 run used batch 1, context 2,048, DFlash2
 `k=7`, no CUDA Graph, three warmup rounds, and eight measured rounds. The published rate is
