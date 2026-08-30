@@ -773,11 +773,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     if constexpr (Variant::DFlashConfig::is_v2) {
         if (impl->speculative_backend == SpeculativeBackend::DFlash) {
-            // The block selector has a sequential device trace dependency. Keep
-            // the proposal/trace/verify transaction eager until a graph-safe
-            // selector path is available.
+            // DFlash2's selector trace is now a deterministic device-side
+            // single-lane operation, so the complete proposal/trace/verify
+            // transaction can be captured in the existing graph profiles.
             impl->draft_window   = Variant::DFlashConfig::block_size - 1U;
-            impl->use_cuda_graph = false;
         }
     }
     impl->device              = inputs.device;

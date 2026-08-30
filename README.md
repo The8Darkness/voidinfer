@@ -63,7 +63,8 @@ measurable resource/runtime gate. Negative candidates remain documented as rejec
 | GDN prefill | Direct fused causal-convolution/SwiGLU split into Q/K/V/Z consumers, avoiding packed-QKV extraction copies | The focused causal-convolution test passes; the prefill microbench is about 33.6 µs versus 60.22 µs for the legacy copy path |
 | FP8 output projection | Dedicated large-token A16 GEMM route with a shared FP8 codec and `T >= 42` dispatch; small-token decode keeps its tuned route | Generic large-token measurements are about 1.13 ms for T=42–60; the crossover was retained only after end-to-end comparison |
 | DFlash2 selector | 512-thread warp-shuffle reduction with packed survivor keys for the deterministic top-16 selector | Focused correctness passes, including same-thread lower-ID ties and guard regions; `248,320 x 8` synthetic selector work is about 327.7 µs versus 565–570 µs for the prior 128-thread path (about 42% lower) |
-| DFlash2 selector working set | Semantic 272-float lattice allocation and single-lane deterministic path trace in the production DFlash2 round | Exact-width selector/path tests pass with guards; the lattice temporary is 94.7% smaller per token than the former 5,120-float hidden-width allocation. A matched RTX 5090 graph pair was round-latency neutral within run variance, so no standalone tok/s gain is claimed |
+| DFlash2 selector working set | Semantic 272-float lattice allocation and single-lane deterministic path trace in the production DFlash2 round | Exact-width selector/path tests pass with guards; the lattice temporary is 94.7% smaller per token than the former 5,120-float hidden-width allocation. A matched RTX 5090 eager pair was round-latency neutral within run variance, so no standalone tok/s gain is claimed |
+| DFlash2 CUDA Graphs | Capture the DFlash2 proposal/selector/verify transaction now that selector tracing is deterministic on-device | Focused DFlash2 and hierarchy tests pass. Matched RTX 5090 A/B runs at C=1 and C=2 reduced steady GPU round latency by 7.98% and 7.65%; published throughput improved 8.68% and 9.04% with near-matched acceptance |
 | DFlash2 QKV | Direct three-output W8G32 row-split GEMM writes Q/K/V without materializing and copying a packed QKV tensor | Exact focused comparison passes; repeated `T=8` microbench samples show about 19–21% lower latency than packed-QKV-plus-copy |
 | Resource pressure | Bounded continuation search when an incumbent plan exists, reducing pressure-resume planning work without changing the selected contract | The real Qwen3.8 pressure/resume route passes |
 | State and KV ownership | Canonical State/KV resource contracts, device binding, sparse-MoE scan reuse, and successful-warmup readiness gating | Public Engine/resource and readiness tests pass; these are correctness/admission improvements, not unsubstantiated tok/s claims |
@@ -113,10 +114,11 @@ Implemented in this track:
   ownership machinery for tier accounting and event-ordered asynchronous promotion.
 
 The default server profile is VeriCache-NVFP4, DFlash2 `k=7`, and the optimized proposal head;
-implicit vision requests route to MTP so BF16 vision remains protected. A real default-profile
-startup/API smoke on the RTX 5090 loaded the DFlash2 artifact in 49.2 s, reported the
-`qwen3.8-27b/nvfp4-dflash2` cost profile, returned `/health`=`ok`, and completed one Chat
-Completions request. This is a serving-path smoke, not a quality or throughput qualification.
+implicit vision requests route to MTP so BF16 vision remains protected, and DFlash2 CUDA Graphs
+are enabled for the graph-safe selector path. A real default-profile startup/API smoke on the RTX
+5090 loaded the DFlash2 artifact in 51.19 s, reported the
+`qwen3.8-27b/nvfp4-dflash2` cost profile, returned `/health`=`ok`, and completed the full text
+serving contract. This is a serving-path smoke, not a quality or throughput qualification.
 
 The latest repeated-boundary physical RTX 5090 stress comparison uses context 512, DFlash2 `k=7`,
 batch 1, optimized proposal head, no CUDA Graph, one warmup round, and 400 measured rounds:
@@ -244,12 +246,13 @@ Run the HTTP server:
 & .\\build-windows\\apps\\Release\\ninfer-serve.exe `
   .\\models\\qwen3_8_27b_nvfp4.ninfer `
   --host 127.0.0.1 --port 8080 `
-  --max-context 16384 `
-  --spec mtp --draft-tokens 3 --lm-head-draft
+  --max-context 16384
 ~~~
 
-Add `--vision` at startup for image or video requests. GPU residency and enabled capabilities are
-fixed when the process starts.
+The server defaults to hierarchical VeriCache-NVFP4 with DFlash2 `k=7`, optimized proposal
+selection, host snapshots, and CUDA Graphs. Add `--vision` at startup for image or video requests;
+implicit vision requests use the BF16-protected MTP route. GPU residency and enabled capabilities
+are fixed when the process starts.
 
 ## Documentation
 

@@ -73,6 +73,30 @@ The hierarchy row is 0.31% lower in round GPU time, but the published-rate diffe
 by acceptance variation. The change is retained for the measured memory/launch reduction, not as an
 independent end-to-end speedup claim.
 
+### E020: graph-safe DFlash2 capture
+
+The selector trace now runs as a deterministic single-lane device operation, which removes the
+last graph-safety reason for forcing DFlash2 eager. The existing graph profiles capture the full
+proposal/selector/verify transaction; focused DFlash2 and hierarchical correctness tests pass.
+The following physical RTX 5090 A/B runs use the Qwen3.8-27B NVFP4 DFlash2 artifact, context 512,
+`k=7`, optimized proposal head, VeriCache-NVFP4, host snapshots, one warmup round, and 100 measured
+rounds. The graph and eager rows were run with identical workload and hierarchy settings:
+
+| Batch | Graph mode | GPU round | Wall round | Published tok/s | Draft acceptance |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | enabled | 19.6386 ms | 19.6470 ms | 102.306 | 101/700 (14.43%) |
+| 1 | eager control | 21.3438 ms | 21.3524 ms | 94.1346 | 101/700 (14.43%) |
+| 2 | enabled | 21.8301 ms | 21.8393 ms | 201.013 | 239/1,400 (17.07%) |
+| 2 | eager control | 23.6388 ms | 23.6489 ms | 184.364 | 236/1,400 (16.86%) |
+
+Graph mode lowers steady GPU round latency by 7.98% at C=1 and 7.65% at C=2. Published
+throughput rises 8.68% and 9.04%, respectively; because the C=2 acceptance differs by three
+tokens, the round-latency result is the cleaner attribution. The default-serving smoke also
+passed the full text HTTP contract after graph capture, reporting DFlash2 `k=7`, hierarchical
+VeriCache, host snapshots, and the `nvfp4-dflash2` cost profile. L0→L1/L1→L2 host-verifier counters
+remain zero; these results validate graph execution around the existing exact-target verifier,
+not authoritative host-tier output equality.
+
 For historical comparison, an earlier short RTX 5090 run used batch 1, context 2,048, DFlash2
 `k=7`, no CUDA Graph, three warmup rounds, and eight measured rounds. The published rate is
 licensed tokens divided by wall time for this fixed round harness; acceptance can therefore
