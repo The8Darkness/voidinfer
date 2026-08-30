@@ -606,7 +606,8 @@ __global__ void kv_cache_append_prefix_cyclic_nvfp4_kernel(
     std::uint8_t* __restrict__ cache_v, std::uint8_t* __restrict__ scale_k,
     std::uint8_t* __restrict__ scale_v, __nv_bfloat16* __restrict__ protected_k,
     __nv_bfloat16* __restrict__ protected_v, int min_count, int max_count, int width, int window,
-    int padded_capacity, int protected_capacity, int protected_padded_capacity) {
+    int padded_capacity, int protected_capacity, int protected_anchor_capacity,
+    int protected_padded_capacity) {
     constexpr int Warps = 8;
     const int batch      = static_cast<int>(blockIdx.y);
     const int count      = counts[batch];
@@ -623,11 +624,22 @@ __global__ void kv_cache_append_prefix_cyclic_nvfp4_kernel(
     const std::int64_t batch_offset = ElementsPerToken * static_cast<std::int64_t>(width) * batch;
     const int position = positions[static_cast<std::int64_t>(width) * batch + token];
     const int slot     = position & (window - 1);
-    const int protected_slot = protected_capacity == 0 ? 0 : position & (protected_capacity - 1);
+    const bool anchor_protected =
+        protected_anchor_capacity != 0 && position < protected_anchor_capacity;
+    const bool recent_protected = protected_capacity != 0;
+    const int protected_slot =
+        anchor_protected
+            ? position
+            : protected_anchor_capacity +
+                  (recent_protected ? position & (protected_capacity - 1) : 0);
+    __nv_bfloat16* protected_k_for_token =
+        (anchor_protected || recent_protected) ? protected_k : nullptr;
+    __nv_bfloat16* protected_v_for_token =
+        (anchor_protected || recent_protected) ? protected_v : nullptr;
     kv_cache_append_prefix_cyclic_nvfp4_row(
         k + batch_offset, v + batch_offset, cache_k, cache_v, scale_k, scale_v, token,
-        protected_k, protected_v, kv_head, lanes[batch], slot, padded_capacity, protected_slot,
-        protected_padded_capacity, lane);
+        protected_k_for_token, protected_v_for_token, kv_head, lanes[batch], slot, padded_capacity,
+        protected_slot, protected_padded_capacity, lane);
 }
 
 __global__ void kv_cache_append_prefix_paged_kernel(

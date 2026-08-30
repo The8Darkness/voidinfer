@@ -44,7 +44,10 @@ struct Options {
     ninfer::KvCacheStorage kv_cache = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool use_cuda_graph            = false;
     bool hierarchical_vericache    = false;
+    bool host_tier_snapshots       = false;
     std::uint32_t protected_recent_tokens = 64;
+    std::uint32_t protected_sink_tokens   = 4;
+    std::uint32_t protected_pivot_tokens  = 4;
 };
 
 void print_usage(const char* executable) {
@@ -55,7 +58,10 @@ void print_usage(const char* executable) {
                  " [--proposal-head full|optimized]"
                  " [--kv-dtype fp8-e4m3-row256|vericache-nvfp4]"
                  " [--hierarchical-vericache]"
+                 " [--vericache-host-snapshots]"
                  " [--vericache-protected-recent <0..2048>]"
+                 " [--vericache-protected-sinks <0..2048>]"
+                 " [--vericache-protected-pivots <0..2048>]"
                  " [--cuda-graph|--no-cuda-graph]\n";
 }
 
@@ -117,9 +123,18 @@ Options parse_options(int argc, char** argv) {
             options.use_cuda_graph = true;
         } else if (argument == "--hierarchical-vericache") {
             options.hierarchical_vericache = true;
+        } else if (argument == "--vericache-host-snapshots") {
+            options.hierarchical_vericache = true;
+            options.host_tier_snapshots = true;
         } else if (argument == "--vericache-protected-recent") {
             options.protected_recent_tokens =
                 parse_u32(value("--vericache-protected-recent"), "vericache-protected-recent");
+        } else if (argument == "--vericache-protected-sinks") {
+            options.protected_sink_tokens =
+                parse_u32(value("--vericache-protected-sinks"), "vericache-protected-sinks");
+        } else if (argument == "--vericache-protected-pivots") {
+            options.protected_pivot_tokens =
+                parse_u32(value("--vericache-protected-pivots"), "vericache-protected-pivots");
         } else if (argument == "-h" || argument == "--help") {
             print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_6_27b_dflash_round_bench");
             std::exit(0);
@@ -143,6 +158,12 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.protected_recent_tokens > 2048) {
         throw std::invalid_argument("--vericache-protected-recent must be in [0,2048]");
+    }
+    if (options.protected_sink_tokens > 2048) {
+        throw std::invalid_argument("--vericache-protected-sinks must be in [0,2048]");
+    }
+    if (options.protected_pivot_tokens > 2048) {
+        throw std::invalid_argument("--vericache-protected-pivots must be in [0,2048]");
     }
     return options;
 }
@@ -241,6 +262,9 @@ int run(const Options& options) {
     engine.max_concurrency           = options.batch_size;
     engine.hierarchical_vericache.enabled = options.hierarchical_vericache;
     engine.hierarchical_vericache.protected_recent_tokens = options.protected_recent_tokens;
+    engine.hierarchical_vericache.protected_sink_tokens = options.protected_sink_tokens;
+    engine.hierarchical_vericache.protected_pivot_tokens = options.protected_pivot_tokens;
+    engine.hierarchical_vericache.enable_host_tier_snapshots = options.host_tier_snapshots;
     // The direct target facade does not run Engine::normalize_engine_options().
     // Keep the benchmark's startup capacities identical to the production defaults.
     engine.context_cache.device_state_slots            = options.batch_size;
@@ -380,12 +404,6 @@ int run(const Options& options) {
                                                before[lane].accepted_per_position[position];
         }
     }
-    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
-        const auto aborted = program->abort(active_sequences[lane]);
-        if (aborted.status != ninfer::runtime::ConsumeStatus::Consumed) {
-            throw std::runtime_error("benchmark could not release an active sequence");
-        }
-    }
     const double mean_gpu_ms  = mean(gpu_ms);
     const double mean_wall_ms = mean(wall_ms);
     const double mean_licensed_per_batch =
@@ -410,7 +428,11 @@ int run(const Options& options) {
     std::cout << "cuda_graph," << (options.use_cuda_graph ? "true" : "false") << '\n';
     std::cout << "hierarchical_vericache," << (options.hierarchical_vericache ? "true" : "false")
               << '\n';
+    std::cout << "vericache_host_tier_snapshots_enabled,"
+              << (options.host_tier_snapshots ? "true" : "false") << '\n';
     std::cout << "vericache_protected_recent_tokens," << options.protected_recent_tokens << '\n';
+    std::cout << "vericache_protected_sink_tokens," << options.protected_sink_tokens << '\n';
+    std::cout << "vericache_protected_pivot_tokens," << options.protected_pivot_tokens << '\n';
     std::cout << "warmup," << options.warmup << '\n';
     std::cout << "repetitions," << options.repetitions << '\n';
     std::cout << "steady_round_gpu_mean_ms," << mean_gpu_ms << '\n';
@@ -455,10 +477,20 @@ int run(const Options& options) {
               << '\n';
     std::cout << "vericache_max_nested_depth," << vericache_stats.vericache_max_nested_depth
               << '\n';
+    std::cout << "vericache_host_tier_snapshots," << vericache_stats.vericache_host_tier_snapshots
+              << '\n';
+    std::cout << "vericache_host_tier_snapshot_bytes,"
+              << vericache_stats.vericache_host_tier_snapshot_bytes << '\n';
     std::cout << "vericache_l0_bytes," << vericache_stats.vericache_l0_bytes << '\n';
     std::cout << "vericache_l1_bytes," << vericache_stats.vericache_l1_bytes << '\n';
     std::cout << "vericache_l2_bytes," << vericache_stats.vericache_l2_bytes << '\n';
     std::cout << "vericache_l3_bytes," << vericache_stats.vericache_l3_bytes << '\n';
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        const auto aborted = program->abort(active_sequences[lane]);
+        if (aborted.status != ninfer::runtime::ConsumeStatus::Consumed) {
+            throw std::runtime_error("benchmark could not release an active sequence");
+        }
+    }
     return 0;
 }
 

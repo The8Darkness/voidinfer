@@ -836,6 +836,7 @@ int cyclic_nvfp4_case() {
     constexpr int tokens = 3;
     constexpr int window = 128;
     constexpr int protected_capacity = 8;
+    constexpr int protected_anchor_capacity = 2;
     constexpr int protected_padded_capacity = 16;
     constexpr int code_extent = kHeadDim / 2;
     constexpr int scale_extent = kHeadDim / 16;
@@ -855,7 +856,7 @@ int cyclic_nvfp4_case() {
             }
         }
     }
-    const std::vector<std::int32_t> positions{5, 6, 7};
+    const std::vector<std::int32_t> positions{0, 1, 8};
     DeviceBuffer d_k = to_device(host_k);
     DeviceBuffer d_v = to_device(host_v);
     DeviceBuffer d_positions = to_device(positions);
@@ -896,6 +897,7 @@ int cyclic_nvfp4_case() {
         .protected_v = Tensor(protected_v.data(), DType::BF16,
                               {kHeadDim, protected_padded_capacity, kKVHeads, 1}),
         .protected_capacity = protected_capacity,
+        .protected_anchor_capacity = protected_anchor_capacity,
         .protected_padded_capacity = protected_padded_capacity,
         .dtype = DType::U8,
         .quant_group = 16,
@@ -912,9 +914,13 @@ int cyclic_nvfp4_case() {
         std::vector<std::uint16_t>(protected_count, static_cast<std::uint16_t>(0xabab));
     auto expected_protected_v =
         std::vector<std::uint16_t>(protected_count, static_cast<std::uint16_t>(0xcdcd));
-    for (const int position : positions) {
+    for (std::size_t token = 0; token < positions.size(); ++token) {
+        const int position = positions[token];
         const int slot = position & (window - 1);
-        const int protected_slot = position & (protected_capacity - 1);
+        const int protected_slot = position < protected_anchor_capacity
+                                       ? position
+                                       : protected_anchor_capacity +
+                                             (position & (protected_capacity - 1));
         for (int head = 0; head < kKVHeads; ++head) {
             for (int pair = 0; pair < 8; ++pair) {
                 expected_k[static_cast<std::size_t>(pair) +
@@ -932,8 +938,8 @@ int cyclic_nvfp4_case() {
                 const std::size_t protected_dst = static_cast<std::size_t>(d) +
                     static_cast<std::size_t>(kHeadDim) *
                         (protected_slot + protected_padded_capacity * head);
-                expected_protected_k[protected_dst] = host_k[input_index(d, head, position - 5)];
-                expected_protected_v[protected_dst] = host_v[input_index(d, head, position - 5)];
+                expected_protected_k[protected_dst] = host_k[input_index(d, head, token)];
+                expected_protected_v[protected_dst] = host_v[input_index(d, head, token)];
             }
         }
     }

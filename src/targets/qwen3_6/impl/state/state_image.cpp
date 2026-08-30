@@ -39,14 +39,16 @@ std::uint32_t padded_dflash_capacity(std::uint32_t capacity) {
     return static_cast<std::uint32_t>(padded);
 }
 
-std::uint32_t padded_protected_dflash_capacity(std::uint32_t capacity) {
-    if (capacity == 0 || (capacity & (capacity - 1U)) != 0U) {
-        throw std::invalid_argument(
-            "StateImage protected DFlash capacity must be a power of two");
+std::uint32_t padded_protected_dflash_capacity(std::uint32_t recent_capacity,
+                                               std::uint32_t anchor_capacity) {
+    if (recent_capacity == 0 && anchor_capacity == 0) { return 0; }
+    if (recent_capacity != 0 && (recent_capacity & (recent_capacity - 1U)) != 0U) {
+        throw std::invalid_argument("StateImage protected DFlash recent capacity must be a power of two");
     }
     constexpr std::uint64_t alignment = 16;
     const std::uint64_t padded =
-        (static_cast<std::uint64_t>(capacity) + alignment - 1U) & ~(alignment - 1U);
+        (static_cast<std::uint64_t>(recent_capacity) + anchor_capacity + alignment - 1U) &
+        ~(alignment - 1U);
     if (padded > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("StateImage protected DFlash padded capacity exceeds int32");
     }
@@ -67,6 +69,7 @@ bool same_dflash_spec(const std::optional<DFlashLocalStateSpec>& left,
     if (!left) { return true; }
     return left->layers == right->layers && left->capacity == right->capacity &&
            left->protected_capacity == right->protected_capacity &&
+           left->protected_anchor_capacity == right->protected_anchor_capacity &&
            left->kv_heads == right->kv_heads && left->head_dim == right->head_dim &&
            left->dtype == right->dtype && left->quant_group == right->quant_group;
 }
@@ -103,6 +106,11 @@ bool same_host_layout(const StateImageHostLayout& left,
                                 right.dflash_local_protected_v) &&
            left.dflash_local_protected_layer_bytes ==
                right.dflash_local_protected_layer_bytes &&
+           left.dflash_local_protected_capacity == right.dflash_local_protected_capacity &&
+           left.dflash_local_protected_anchor_capacity ==
+               right.dflash_local_protected_anchor_capacity &&
+           left.dflash_local_protected_padded_capacity ==
+               right.dflash_local_protected_padded_capacity &&
            left.image_bytes == right.image_bytes;
 }
 
@@ -124,11 +132,18 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
                                (spec.dflash_local->quant_group != 16 ||
                                 spec.dflash_local->head_dim % 2 != 0 ||
                                 spec.dflash_local->head_dim % spec.dflash_local->quant_group != 0)) ||
-                              (spec.dflash_local->protected_capacity != 0 &&
+                              ((spec.dflash_local->protected_capacity != 0 ||
+                                spec.dflash_local->protected_anchor_capacity != 0) &&
                                (spec.dflash_local->dtype != DType::U8 ||
                                 spec.dflash_local->protected_capacity > spec.dflash_local->capacity ||
-                                (spec.dflash_local->protected_capacity &
-                                 (spec.dflash_local->protected_capacity - 1U)) != 0U)))) {
+                                (spec.dflash_local->protected_capacity != 0 &&
+                                 (spec.dflash_local->protected_capacity &
+                                  (spec.dflash_local->protected_capacity - 1U)) != 0U) ||
+                                spec.dflash_local->protected_anchor_capacity >
+                                    spec.dflash_local->capacity ||
+                                spec.dflash_local->protected_anchor_capacity >
+                                    spec.dflash_local->capacity -
+                                        spec.dflash_local->protected_capacity)))) {
         throw std::invalid_argument("StateImage host DFlash geometry is invalid");
     }
 
@@ -179,9 +194,9 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
             host.dflash_local_v_scale = builder.add(
                 scale_component_bytes, kStateImageAlignment, "StateImage host DFlash local V scales");
         }
-        if (dflash.protected_capacity != 0) {
-            const auto protected_padded = static_cast<std::int32_t>(
-                padded_protected_dflash_capacity(dflash.protected_capacity));
+        if (dflash.protected_capacity != 0 || dflash.protected_anchor_capacity != 0) {
+            const auto protected_padded = static_cast<std::int32_t>(padded_protected_dflash_capacity(
+                dflash.protected_capacity, dflash.protected_anchor_capacity));
             const Tensor protected_slot(
                 nullptr, DType::BF16, {dflash.head_dim, protected_padded, dflash.kv_heads});
             host.dflash_local_protected_layer_bytes = protected_slot.bytes();
@@ -194,6 +209,10 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
             host.dflash_local_protected_v = builder.add(
                 protected_component_bytes, kStateImageAlignment,
                 "StateImage host DFlash local protected V");
+            host.dflash_local_protected_capacity = dflash.protected_capacity;
+            host.dflash_local_protected_anchor_capacity = dflash.protected_anchor_capacity;
+            host.dflash_local_protected_padded_capacity =
+                static_cast<std::uint32_t>(protected_padded);
         }
     }
     host.image_bytes = builder.finish(kStateImageAlignment, "StateImage host image");
@@ -228,7 +247,8 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
         out.dflash_local =
             plan_cyclic_kv_cache(builder, dflash.layers, dflash.capacity, dflash.kv_heads,
                                  dflash.head_dim, spec.linear.slot_count, dflash.dtype,
-                                 dflash.quant_group, dflash.protected_capacity);
+                                 dflash.quant_group, dflash.protected_capacity,
+                                 dflash.protected_anchor_capacity);
     }
 
     out.host = plan_host_state_image(spec);
@@ -413,6 +433,7 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
             .layers             = static_cast<std::uint32_t>(layout.dflash_local->k.size()),
             .capacity           = layout.dflash_local->capacity,
             .protected_capacity = layout.dflash_local->protected_capacity,
+            .protected_anchor_capacity = layout.dflash_local->protected_anchor_capacity,
             .kv_heads            = layout.dflash_local->num_kv_heads,
             .head_dim            = layout.dflash_local->head_dim,
             .dtype               = layout.dflash_local->dtype,
@@ -470,7 +491,7 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
                 CUDA_CHECK(cudaMemsetAsync(view.v_scale.slice(3, slot, 1).data, 0,
                                            view.v_scale.slice(3, slot, 1).bytes(), stream));
             }
-            if (view.protected_capacity != 0) {
+            if (view.protected_capacity != 0 || view.protected_anchor_capacity != 0) {
                 CUDA_CHECK(cudaMemsetAsync(view.protected_k.slice(3, slot, 1).data, 0,
                                            view.protected_k.slice(3, slot, 1).bytes(), stream));
                 CUDA_CHECK(cudaMemsetAsync(view.protected_v.slice(3, slot, 1).data, 0,
@@ -492,7 +513,7 @@ void StateImageDevicePool::zero_all(cudaStream_t stream) {
                 CUDA_CHECK(cudaMemsetAsync(view.k_scale.data, 0, view.k_scale.bytes(), stream));
                 CUDA_CHECK(cudaMemsetAsync(view.v_scale.data, 0, view.v_scale.bytes(), stream));
             }
-            if (view.protected_capacity != 0) {
+            if (view.protected_capacity != 0 || view.protected_anchor_capacity != 0) {
                 CUDA_CHECK(cudaMemsetAsync(view.protected_k.data, 0, view.protected_k.bytes(),
                                            stream));
                 CUDA_CHECK(cudaMemsetAsync(view.protected_v.data, 0, view.protected_v.bytes(),
@@ -579,7 +600,7 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                                                       layer * host_layout_.dflash_local_scale_layer_bytes),
                     v_scale.data, v_scale.bytes(), cudaMemcpyDeviceToHost, stream));
             }
-            if (view.protected_capacity != 0) {
+            if (view.protected_capacity != 0 || view.protected_anchor_capacity != 0) {
                 const Tensor protected_k = view.protected_k.slice(3, source, 1);
                 const Tensor protected_v = view.protected_v.slice(3, source, 1);
                 CUDA_CHECK(cudaMemcpyAsync(
@@ -649,7 +670,7 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                                                  layer * host_layout_.dflash_local_scale_layer_bytes),
                     v_scale.bytes(), cudaMemcpyHostToDevice, stream));
             }
-            if (view.protected_capacity != 0) {
+            if (view.protected_capacity != 0 || view.protected_anchor_capacity != 0) {
                 const Tensor protected_k = view.protected_k.slice(3, destination, 1);
                 const Tensor protected_v = view.protected_v.slice(3, destination, 1);
                 CUDA_CHECK(cudaMemcpyAsync(

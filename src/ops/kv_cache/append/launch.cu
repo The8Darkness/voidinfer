@@ -162,6 +162,7 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
             static_cast<__nv_bfloat16*>(cache.protected_v.data),
             plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
             static_cast<int>(cache.padded_capacity), static_cast<int>(cache.protected_capacity),
+            static_cast<int>(cache.protected_anchor_capacity),
             static_cast<int>(cache.protected_padded_capacity));
         CUDA_CHECK(cudaGetLastError());
         return;

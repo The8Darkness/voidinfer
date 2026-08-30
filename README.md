@@ -62,7 +62,7 @@ measurable resource/runtime gate. Negative candidates remain documented as rejec
 | Resource pressure | Bounded continuation search when an incumbent plan exists, reducing pressure-resume planning work without changing the selected contract | The real Qwen3.8 pressure/resume route passes |
 | State and KV ownership | Canonical State/KV resource contracts, device binding, sparse-MoE scan reuse, and successful-warmup readiness gating | Public Engine/resource and readiness tests pass; these are correctness/admission improvements, not unsubstantiated tok/s claims |
 | Measurement discipline | Targeted Nsight Compute kernel inspection and Nsight Systems end-to-end traces on the RTX 5090 | Nsight Systems 2026.4.1 traces are available; Nsight Compute 2026.2.1 is installed, but hardware-counter access is blocked in the current Windows session by `ERR_NVGPUCTRPERM` |
-| Hierarchical VeriCache (experimental) | Opt-in NVFP4 DFlash2 L0 with a protected recent-token BF16 sidecar, nested KV/GDN transactions, adaptive fallback horizon, and truthful host-tier accounting | Focused append/attention/state tests pass; the post-specialization DFlash round is 26.9 ms without the sidecar and 28.4 ms with 64 protected recent tokens at context 2,048, with the same measured acceptance. Independent host L1/L2 output verification is not claimed yet |
+| Hierarchical VeriCache (experimental) | Opt-in NVFP4 DFlash2 L0 with protected recent/anchor BF16 sidecar, nested KV/GDN transactions, adaptive fallback horizon, and asynchronous host-tier snapshots | Focused append/attention/state tests pass; the latest matched 8-round 5090 run measured 27.63 ms with 64 recent + 8 anchor tokens versus 28.33 ms control, but acceptance was 10/56 versus 11/56, so no end-to-end speedup is claimed. Independent host L1/L2 output verification is not claimed yet |
 
 The main implementation points are [src/ops/linear/fp8/](src/ops/linear/fp8/),
 [include/ninfer/ops/causal_conv1d_silu.h](include/ninfer/ops/causal_conv1d_silu.h),
@@ -105,18 +105,22 @@ Implemented in this track:
 - reuse of the existing pinned StateImage, host FP16 KV extent store, prefix/state DAG, and COW
   ownership machinery for tier accounting and future asynchronous promotion.
 
-The first physical RTX 5090 comparison at context 2,048, DFlash2 `k=7`, batch 1, no CUDA Graph,
-and three measured rounds was:
+The latest matched physical RTX 5090 comparison at context 2,048, DFlash2 `k=7`, batch 1, no CUDA
+Graph, and eight measured rounds was:
 
 | L0 configuration | GPU round | Wall round | Published tok/s | Draft acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| NVFP4, no protected sidecar | 26.93 ms | 26.93 ms | 123.8 | 33.3% |
-| NVFP4 + 64 recent BF16 tokens | 28.42 ms | 28.43 ms | 117.2 | 33.3% |
+| NVFP4 control, hierarchy disabled | 28.3265 ms | 28.3390 ms | 83.8067 | 11/56 (19.64%) |
+| NVFP4 + 64 recent BF16 + 8 anchors | 27.6280 ms | 27.6389 ms | 81.4069 | 10/56 (17.86%) |
+| Same hierarchy + async host snapshot | 27.5497 ms | 27.6001 ms | 81.5213 | 10/56 (17.86%) |
+| NVFP4 + 64 recent BF16, no anchors | 26.0720 ms | 26.0851 ms | 91.0481 | 11/56 (19.64%) |
 
-These are research measurements, not multiplicative claims. The host-tier counters remain zero in
-this round benchmark because no host checkpoint is materialized; L1/L2 output verification,
-NVFP4/FP8 host mirrors, NVMe persistence, greedy equality, sampling-quality, vision, and 262K/
-multi-agent workload matrices remain gated on their dedicated benchmark paths.
+These are research measurements, not multiplicative claims. The host-snapshot row reports
+`L0/L1/L2/L3 = 26,869,760/13,434,880/153,954,304/0` bytes and one asynchronous promotion. The
+host image is currently a residency/checkpoint mechanism, not an independent verifier; L0→L1 and
+L1→L2 verifier counters remain zero. NVFP4/FP8 host mirrors, NVMe persistence, greedy equality,
+sampling quality, vision, and 262K/multi-agent workload matrices remain gated on their dedicated
+benchmark paths.
 
 Rejected experiments include FP8 KV, fixed MTP5, proposal-head and graph-boundary variants,
 several NVFP4/FP8 schedule changes, and alternate vocabulary-GEMM crossovers. They either lost

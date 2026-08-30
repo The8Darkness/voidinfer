@@ -9,20 +9,28 @@ KV/GDN transactions, adaptive L0→L1 (24–64) and L1→L2 (256–2,048) contro
 and a protected recent-token sidecar. Existing pinned StateImage and host FP16 KV stores are used
 for truthful L1/L2 residency accounting; they are not yet an independent host output verifier.
 
-RTX 5090 smoke comparison, batch 1, context 2,048, DFlash2 `k=7`, no CUDA Graph, three measured
-rounds:
+The latest matched RTX 5090 comparison uses batch 1, context 2,048, DFlash2 `k=7`, no CUDA Graph,
+three warmup rounds, and eight measured rounds. The published rate is licensed tokens divided by
+wall time for this fixed round harness; acceptance can therefore dominate it even when the GPU
+round is faster:
 
-| L0 configuration | GPU round | Wall round | Published tok/s | Draft acceptance |
-| --- | ---: | ---: | ---: | ---: |
-| NVFP4, no protected sidecar | 26.93 ms | 26.93 ms | 123.8 | 33.3% |
-| NVFP4 + 64 recent BF16 tokens | 28.42 ms | 28.43 ms | 117.2 | 33.3% |
+| L0 configuration | GPU round | Wall round | Published tok/s | Draft acceptance | Tier bytes (L0/L1/L2/L3) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| NVFP4 control, hierarchy disabled | 28.3265 ms | 28.3390 ms | 83.8067 | 11/56 (19.64%) | not reported |
+| NVFP4 + 64 recent BF16 + 8 anchor tokens | 27.6280 ms | 27.6389 ms | 81.4069 | 10/56 (17.86%) | 26,869,760/0/0/0 |
+| Same hierarchy + async host snapshot | 27.5497 ms | 27.6001 ms | 81.5213 | 10/56 (17.86%) | 26,869,760/13,434,880/153,954,304/0 |
+| NVFP4 + 64 recent BF16, no anchors | 26.0720 ms | 26.0851 ms | 91.0481 | 11/56 (19.64%) | 26,214,400/0/0/0 |
 
-The protected sidecar is retained for quality protection despite its measured overhead; it is not
-represented as a speedup. In this smoke path exact-target fallback recorded 4 checks, 28 proposed
-tokens, 7 accepted draft tokens, and 4 disagreements, adapting the tentative L0→L1 horizon to 24.
-L1/L2 verifier counters and L3 bytes were zero because the benchmark did not materialize a host
-checkpoint. Full C1/C2/C4/C8, 8K–262K, coding/reasoning/tool/JSON/retrieval/vision, persistence,
-greedy-equality, sampling-quality, PCIe-overlap, and multi-agent prefix-reuse results are pending.
+The protected sidecar remains an opt-in quality-protection mechanism, not a claimed speedup. The
+anchor configuration reduced GPU round time versus that control, but accepted one fewer draft
+token in this run and therefore published fewer tokens per second. The no-anchor row is a useful
+isolating measurement, not a replacement for the required sink/pivot quality tests. Exact-target
+fallback recorded 11 checks, 77 proposed tokens, 15 accepted draft tokens, and 11 disagreements;
+the adaptive L0→L1 horizon contracted to 24. The host-snapshot row materialized one asynchronous
+StateImage promotion (167,389,184 bytes total) and preserved the same observed acceptance as its
+anchor-only counterpart, but it did not independently verify host-tier logits. Real L0→L1/L1→L2
+verification, NVFP4/FP8 output equality, NVMe persistence, greedy/sampling quality, vision, and
+262K/multi-agent workload matrices remain pending.
 
 Tested Git revisions:
 

@@ -630,6 +630,12 @@ public:
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_6::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
+    struct HierarchicalHostSnapshot {
+        std::optional<StateImageHandle> state;
+        std::optional<StateImageTransfer> transfer;
+        std::uint32_t frontier = 0;
+    };
+    std::array<HierarchicalHostSnapshot, kMaximumConcurrency> hierarchical_host_snapshots;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
@@ -824,6 +830,7 @@ private:
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
+    CudaCompletionEvent hierarchical_snapshot_completion_;
     std::vector<TokenId> materialization_ledger_;
     qwen3_6::detail::ResidentPrefixIdentity materialization_identity_;
     qwen3_6::detail::PrefixShortlistDigests materialization_prefix_digests_;
@@ -1054,6 +1061,9 @@ private:
     void release_continuation_slot(std::uint32_t index) noexcept;
     void clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
+    void reap_hierarchical_host_snapshots();
+    void discard_hierarchical_host_snapshot(std::uint32_t lane) noexcept;
+    void maybe_snapshot_hierarchical_host_tier(SequenceState& sequence);
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
     [[nodiscard]] std::uint32_t state_footprint(const SequenceState& sequence) const noexcept;

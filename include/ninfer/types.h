@@ -128,6 +128,10 @@ struct HierarchicalVeriCacheOptions {
     // has an independent oracle and end-to-end evidence.
     bool allow_2bit_l0              = false;
     bool direct_low_bit_attention   = false;
+    // Opt-in asynchronous StateImage promotion. This materializes the existing compressed
+    // DFlash mirror plus authoritative GDN/recurrent state in pinned host memory at the adaptive
+    // L1->L2 boundary; it never replaces the exact GPU target or enters the hot verification path.
+    bool enable_host_tier_snapshots = false;
     std::filesystem::path cold_store_path;
 };
 
@@ -802,6 +806,8 @@ struct RuntimeStats {
     std::uint64_t vericache_gdn_state_restores          = 0;
     std::uint64_t vericache_gdn_state_restore_bytes     = 0;
     double vericache_gdn_state_restore_seconds          = 0.0;
+    std::uint64_t vericache_host_tier_snapshots         = 0;
+    std::uint64_t vericache_host_tier_snapshot_bytes    = 0;
     std::size_t vericache_l0_bytes                      = 0;
     std::size_t vericache_l1_bytes                      = 0;
     std::size_t vericache_l2_bytes                      = 0;

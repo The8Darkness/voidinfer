@@ -55,7 +55,8 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t l
                                          std::uint32_t capacity, std::int32_t num_kv_heads,
                                          std::int32_t head_dim, std::int32_t lane_capacity,
                                          DType dtype, std::int32_t quant_group,
-                                         std::uint32_t protected_capacity) {
+                                         std::uint32_t protected_capacity,
+                                         std::uint32_t protected_anchor_capacity) {
     if (layers == 0 || capacity == 0 ||
         capacity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         num_kv_heads <= 0 || head_dim <= 0 || lane_capacity <= 0) {
@@ -69,11 +70,14 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t l
                                 head_dim % quant_group != 0))) {
         throw std::invalid_argument("Cyclic KV quantization profile is invalid");
     }
-    if (protected_capacity != 0 &&
+    if ((protected_capacity != 0 || protected_anchor_capacity != 0) &&
         (dtype != DType::U8 || protected_capacity > capacity ||
-         (protected_capacity & (protected_capacity - 1U)) != 0U)) {
+         (protected_capacity != 0 &&
+          (protected_capacity & (protected_capacity - 1U)) != 0U) ||
+         protected_anchor_capacity > capacity ||
+         protected_anchor_capacity > capacity - protected_capacity)) {
         throw std::invalid_argument(
-            "Cyclic KV protected sidecar requires a power-of-two NVFP4 subcapacity");
+            "Cyclic KV protected sidecar requires a bounded NVFP4 recent/anchor capacity");
     }
 
     CyclicKVCacheLayout layout;
@@ -85,15 +89,18 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t l
     layout.dtype           = dtype;
     layout.quant_group     = quant_group;
     layout.protected_capacity = protected_capacity;
+    layout.protected_anchor_capacity = protected_anchor_capacity;
     layout.protected_padded_capacity =
-        protected_capacity == 0 ? 0 : align_up_u32(protected_capacity, 16);
+        protected_capacity == 0 && protected_anchor_capacity == 0
+            ? 0
+            : align_up_u32(protected_capacity + protected_anchor_capacity, 16);
     layout.k.reserve(layers);
     layout.v.reserve(layers);
     if (dtype == DType::U8) {
         layout.k_scale.reserve(layers);
         layout.v_scale.reserve(layers);
     }
-    if (protected_capacity != 0) {
+    if (protected_capacity != 0 || protected_anchor_capacity != 0) {
         layout.protected_k.reserve(layers);
         layout.protected_v.reserve(layers);
     }
@@ -116,7 +123,7 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t l
                 DType::FP8_E4M3FN, {scale_extent, padded, num_kv_heads, lane_capacity},
                 kArenaAlign, prefix + " V scales"));
         }
-        if (protected_capacity != 0) {
+        if (protected_capacity != 0 || protected_anchor_capacity != 0) {
             layout.protected_k.push_back(builder.add_tensor(
                 DType::BF16,
                 {head_dim, static_cast<std::int32_t>(layout.protected_padded_capacity),
@@ -148,6 +155,7 @@ CyclicKVCache::CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layo
       num_kv_heads_(layout.num_kv_heads), head_dim_(layout.head_dim),
       lane_capacity_(layout.lane_capacity), dtype_(layout.dtype), quant_group_(layout.quant_group),
       protected_capacity_(layout.protected_capacity),
+      protected_anchor_capacity_(layout.protected_anchor_capacity),
       protected_padded_capacity_(layout.protected_padded_capacity) {
     if (layout.k.empty() || layout.v.size() != layout.k.size() || capacity_ == 0 ||
         padded_capacity_ < capacity_ || num_kv_heads_ <= 0 || head_dim_ <= 0 ||
@@ -169,14 +177,18 @@ CyclicKVCache::CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layo
     if (dtype_ == DType::BF16 && (!layout.k_scale.empty() || !layout.v_scale.empty())) {
         throw std::invalid_argument("Cyclic KV BF16 layout must not have scale planes");
     }
-    if (protected_capacity_ != 0 &&
+    if ((protected_capacity_ != 0 || protected_anchor_capacity_ != 0) &&
         (dtype_ != DType::U8 || protected_capacity_ > capacity_ ||
-         (protected_capacity_ & (protected_capacity_ - 1U)) != 0U ||
-         protected_padded_capacity_ < protected_capacity_ || layout.protected_k.size() != layout.k.size() ||
+         (protected_capacity_ != 0 &&
+          (protected_capacity_ & (protected_capacity_ - 1U)) != 0U) ||
+         protected_anchor_capacity_ > capacity_ ||
+         protected_anchor_capacity_ > capacity_ - protected_capacity_ ||
+         protected_padded_capacity_ < protected_capacity_ + protected_anchor_capacity_ ||
+         layout.protected_k.size() != layout.k.size() ||
          layout.protected_v.size() != layout.k.size())) {
         throw std::invalid_argument("Cyclic KV protected sidecar layout is invalid");
     }
-    if (protected_capacity_ == 0 &&
+    if (protected_capacity_ == 0 && protected_anchor_capacity_ == 0 &&
         (protected_padded_capacity_ != 0 || !layout.protected_k.empty() ||
          !layout.protected_v.empty())) {
         throw std::invalid_argument("Cyclic KV has an unexpected protected sidecar");
@@ -212,7 +224,7 @@ CyclicKVCache::CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layo
             k_scale_.push_back(layout.k_scale[layer].bind(backing));
             v_scale_.push_back(layout.v_scale[layer].bind(backing));
         }
-        if (protected_capacity_ != 0) {
+        if (protected_capacity_ != 0 || protected_anchor_capacity_ != 0) {
             if (layout.protected_k[layer].dtype != DType::BF16 ||
                 layout.protected_v[layer].dtype != DType::BF16 ||
                 layout.protected_k[layer].shape != expected_protected_shape ||
@@ -241,9 +253,14 @@ CyclicKVCacheLayerView CyclicKVCache::layer_view(std::uint32_t layer) const {
         .lane_capacity   = lane_capacity_,
         .k_scale         = dtype_ == DType::U8 ? k_scale_[layer] : Tensor{},
         .v_scale         = dtype_ == DType::U8 ? v_scale_[layer] : Tensor{},
-        .protected_k     = protected_capacity_ != 0 ? protected_k_[layer] : Tensor{},
-        .protected_v     = protected_capacity_ != 0 ? protected_v_[layer] : Tensor{},
+        .protected_k     = protected_capacity_ != 0 || protected_anchor_capacity_ != 0
+                               ? protected_k_[layer]
+                               : Tensor{},
+        .protected_v     = protected_capacity_ != 0 || protected_anchor_capacity_ != 0
+                               ? protected_v_[layer]
+                               : Tensor{},
         .protected_capacity = protected_capacity_,
+        .protected_anchor_capacity = protected_anchor_capacity_,
         .protected_padded_capacity = protected_padded_capacity_,
         .dtype           = dtype_,
         .quant_group     = quant_group_,
@@ -276,7 +293,7 @@ CyclicKVCacheSlotView CyclicKVCache::slot_view(std::int32_t slot) const {
     }
     Tensor protected_k;
     Tensor protected_v;
-    if (protected_capacity_ != 0) {
+    if (protected_capacity_ != 0 || protected_anchor_capacity_ != 0) {
         protected_k = protected_k_.front()
                           .slice(3, slot, 1)
                           .view({head_dim_, static_cast<std::int32_t>(protected_padded_capacity_),
@@ -306,6 +323,9 @@ CyclicKVCacheSlotView CyclicKVCache::slot_view(std::int32_t slot) const {
         .protected_v_layer_bytes = protected_v.bytes(),
         .protected_k_layer_pitch_bytes = optional_layer_pitch(protected_k_, "protected K"),
         .protected_v_layer_pitch_bytes = optional_layer_pitch(protected_v_, "protected V"),
+        .protected_capacity = protected_capacity_,
+        .protected_anchor_capacity = protected_anchor_capacity_,
+        .protected_padded_capacity = protected_padded_capacity_,
     };
 }
 
@@ -315,6 +335,7 @@ void CyclicKVCache::copy_slot_from(const CyclicKVCache& source, std::int32_t sou
         source.padded_capacity_ != padded_capacity_ || source.num_kv_heads_ != num_kv_heads_ ||
         source.head_dim_ != head_dim_ || source.dtype_ != dtype_ ||
         source.quant_group_ != quant_group_ || source.protected_capacity_ != protected_capacity_ ||
+        source.protected_anchor_capacity_ != protected_anchor_capacity_ ||
         source.protected_padded_capacity_ != protected_padded_capacity_) {
         throw std::invalid_argument("Cyclic KV copy requires identical component geometry");
     }
@@ -346,7 +367,7 @@ void CyclicKVCache::copy_slot_from(const CyclicKVCache& source, std::int32_t sou
                                        destination_v_scale.bytes(), cudaMemcpyDeviceToDevice,
                                        stream));
         }
-        if (protected_capacity_ != 0) {
+        if (protected_capacity_ != 0 || protected_anchor_capacity_ != 0) {
             Tensor destination_protected_k = protected_k_[layer].slice(3, destination_slot, 1);
             Tensor destination_protected_v = protected_v_[layer].slice(3, destination_slot, 1);
             Tensor source_protected_k = source.protected_k_[layer].slice(3, source_slot, 1);

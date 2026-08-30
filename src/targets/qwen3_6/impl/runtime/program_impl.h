@@ -730,6 +730,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
+      hierarchical_snapshot_completion_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
@@ -956,6 +957,94 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+}
+
+void ProgramImplCore::reap_hierarchical_host_snapshots() {
+    bool pending = false;
+    for (const auto& snapshot : hierarchical_host_snapshots) {
+        pending = pending || snapshot.transfer.has_value();
+    }
+    if (!pending || !hierarchical_snapshot_completion_.ready()) { return; }
+    for (auto& snapshot : hierarchical_host_snapshots) {
+        if (!snapshot.transfer) { continue; }
+        state_store->publish_transfer(std::move(*snapshot.transfer), false);
+        snapshot.transfer.reset();
+    }
+}
+
+void ProgramImplCore::discard_hierarchical_host_snapshot(std::uint32_t lane) noexcept {
+    if (lane >= max_concurrency) { return; }
+    auto& snapshot = hierarchical_host_snapshots[lane];
+    if (snapshot.transfer) {
+        // The transfer owns a pinned destination. Synchronizing here is restricted to cleanup
+        // paths; the normal decode path only polls the completion event.
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        if (state_store) { state_store->abort_transfer(std::move(*snapshot.transfer)); }
+        snapshot.transfer.reset();
+    }
+    if (snapshot.state && state_store) {
+        (void)state_store->release(*snapshot.state);
+    }
+    snapshot.state.reset();
+    snapshot.frontier = 0;
+}
+
+void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& sequence) {
+    if (!hierarchical_vericache.enabled() ||
+        !hierarchical_vericache_options.enable_host_tier_snapshots || !dflash ||
+        host_state_images == nullptr || state_store == nullptr || sequence.lane >= max_concurrency ||
+        sequence.execution_frontier <
+            hierarchical_vericache.next_l1_to_l2_boundary(
+                hierarchical_host_snapshots[sequence.lane].frontier)) {
+        return;
+    }
+
+    reap_hierarchical_host_snapshots();
+    auto& snapshot = hierarchical_host_snapshots[sequence.lane];
+    if (snapshot.transfer) { return; }
+    if (snapshot.state) {
+        (void)state_store->release(*snapshot.state);
+        snapshot.state.reset();
+    }
+
+    // The active StateImage is mutable, while Device-to-Host transfers intentionally accept only
+    // immutable images. Copying into a spare device image makes the host snapshot a real nested
+    // checkpoint and keeps the running DFlash/GDN state independent from asynchronous D2H DMA.
+    const StateImageSelectors selectors = state_selectors(sequence);
+    const std::optional<StateImageHandle> destination =
+        state_store->reserve_reset(device.transfer_stream);
+    if (!destination) { return; }
+    const auto release_destination = [&]() noexcept {
+        if (state_store && state_store->valid(*destination)) {
+            (void)state_store->release(*destination);
+        }
+    };
+    try {
+        state_images->copy_slot(selectors.destination, state_store->physical_slot(*destination),
+                                device.transfer_stream);
+        state_store->freeze(*destination);
+        std::optional<StateImageTransfer> transfer =
+            state_store->begin_device_to_host(*destination, device.transfer_stream);
+        if (!transfer) {
+            release_destination();
+            return;
+        }
+        snapshot.state = *destination;
+        snapshot.frontier = sequence.execution_frontier;
+        snapshot.transfer.emplace(std::move(*transfer));
+        hierarchical_snapshot_completion_.record(device.transfer_stream);
+        hierarchical_vericache.record_host_tier_snapshot(
+            static_cast<std::uint64_t>(state_images->host_layout().image_bytes));
+    } catch (...) {
+        if (snapshot.transfer) {
+            state_store->abort_transfer(std::move(*snapshot.transfer));
+            snapshot.transfer.reset();
+        }
+        release_destination();
+        throw;
+    }
 }
 
 void ProgramImplCore::begin_hierarchical_speculation(
@@ -7936,6 +8025,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 throw std::logic_error("forced-token commit did not establish a valid frontier");
             }
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            maybe_snapshot_hierarchical_host_tier(sequence);
             request.timings.decode_seconds +=
                 std::chrono::duration<double>(Clock::now() - started).count();
         }
@@ -8159,6 +8249,7 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
         populate_continuation_summary(state, out.summary);
         out.summary.active_references = 0;
     } catch (...) { return out; }
+    discard_hierarchical_host_snapshot(lane);
     release_active_shared_references(state);
     release_sequence_growth_entitlement(state);
     unbind_sequence_kv(state);
@@ -9131,6 +9222,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 
             commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            maybe_snapshot_hierarchical_host_tier(sequence);
             if (terminal[row]) {
                 request.lifecycle = Lifecycle::Finishable;
             } else {
@@ -9161,6 +9253,7 @@ void ProgramImplCore::clear_execution_failure_lanes(std::span<const std::uint32_
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     rollback_hierarchical_speculation(sequence.lane);
+    discard_hierarchical_host_snapshot(sequence.lane);
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
@@ -10871,6 +10964,7 @@ ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, Reques
         settle_state_fork(sequence);
     }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+    maybe_snapshot_hierarchical_host_tier(sequence);
     if (terminal) { sequence.mtp_draft_count = 0; }
     request.lifecycle = terminal ? Lifecycle::Finishable : Lifecycle::Active;
     request.pending   = {};

@@ -65,8 +65,8 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
     const std::uint8_t* __restrict__ context_v_scale,
     const __nv_bfloat16* __restrict__ protected_k,
     const __nv_bfloat16* __restrict__ protected_v, int padded_context, int max_context,
-    int window, int protected_capacity, int protected_padded_capacity, int tokens, float scale,
-    __nv_bfloat16* __restrict__ out) {
+    int window, int protected_capacity, int protected_anchor_capacity,
+    int protected_padded_capacity, int tokens, float scale, __nv_bfloat16* __restrict__ out) {
     constexpr int D              = kCyclicKVCacheNvfp4HeadDim;
     constexpr int QHeads         = 32;
     constexpr int KVHeads        = kCyclicKVCacheNvfp4KVHeads;
@@ -129,36 +129,69 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
     float accumulator[4] = {0.0F, 0.0F, 0.0F, 0.0F};
     float normalizer      = 0.0F;
     float running_max     = -CUDART_INF_F;
-    int packed_context_count = context_count;
     if constexpr (HasProtected) {
-        const int protected_begin = max(0, length - protected_capacity);
-        packed_context_count       = min(context_count, max(0, protected_begin - context_start));
-    }
-    for (int key = 0; key < packed_context_count; ++key) {
-        const int context_position = context_start + key;
-        const int slot             = context_position & (window - 1);
-        const std::int64_t slot_offset =
-            static_cast<std::int64_t>(CodeExtent) *
-            (slot + static_cast<std::int64_t>(padded_context) * kv_head);
-        const std::int64_t scale_offset =
-            static_cast<std::int64_t>(ScaleExtent) *
-            (slot + static_cast<std::int64_t>(padded_context) * kv_head);
-        sliding_window_nvfp4_accumulate<true>(
-            lane, q_values, scale, normalizer, running_max, accumulator, nullptr, nullptr,
-            lane_k + slot_offset, lane_v + slot_offset, lane_k_scale + scale_offset,
-            lane_v_scale + scale_offset);
-    }
-    if constexpr (HasProtected) {
-        for (int key = packed_context_count; key < context_count; ++key) {
-            const int context_position = context_start + key;
-            const int protected_slot   = context_position & (protected_capacity - 1);
+        // The sidecar has two disjoint regions: fixed prefix anchors followed by the recent
+        // cyclic ring.  Partition the active window explicitly so an anchor that is still inside
+        // the window is never accidentally consumed from its quantized overwrite slot.
+        const int anchor_end  = min(length, protected_anchor_capacity);
+        const int recent_begin = protected_capacity == 0 ? length : max(0, length - protected_capacity);
+        for (int context_position = context_start;
+             context_position < min(anchor_end, length); ++context_position) {
             const std::int64_t protected_offset =
                 static_cast<std::int64_t>(D) *
-                (protected_slot + static_cast<std::int64_t>(protected_padded_capacity) * kv_head);
+                (context_position +
+                 static_cast<std::int64_t>(protected_padded_capacity) * kv_head);
             sliding_window_nvfp4_accumulate<false>(
                 lane, q_values, scale, normalizer, running_max, accumulator,
                 lane_protected_k + protected_offset, lane_protected_v + protected_offset, nullptr,
                 nullptr, nullptr, nullptr);
+        }
+        const int packed_begin = max(context_start, anchor_end);
+        const int packed_end   = min(length, recent_begin);
+        for (int context_position = packed_begin; context_position < packed_end;
+             ++context_position) {
+            const int slot = context_position & (window - 1);
+            const std::int64_t slot_offset =
+                static_cast<std::int64_t>(CodeExtent) *
+                (slot + static_cast<std::int64_t>(padded_context) * kv_head);
+            const std::int64_t scale_offset =
+                static_cast<std::int64_t>(ScaleExtent) *
+                (slot + static_cast<std::int64_t>(padded_context) * kv_head);
+            sliding_window_nvfp4_accumulate<true>(
+                lane, q_values, scale, normalizer, running_max, accumulator, nullptr, nullptr,
+                lane_k + slot_offset, lane_v + slot_offset, lane_k_scale + scale_offset,
+                lane_v_scale + scale_offset);
+        }
+        if (protected_capacity != 0) {
+            const int recent_begin_in_window = max(context_start, max(recent_begin, anchor_end));
+            for (int context_position = recent_begin_in_window; context_position < length;
+                 ++context_position) {
+                const int protected_slot =
+                    protected_anchor_capacity + (context_position & (protected_capacity - 1));
+                const std::int64_t protected_offset =
+                    static_cast<std::int64_t>(D) *
+                    (protected_slot +
+                     static_cast<std::int64_t>(protected_padded_capacity) * kv_head);
+                sliding_window_nvfp4_accumulate<false>(
+                    lane, q_values, scale, normalizer, running_max, accumulator,
+                    lane_protected_k + protected_offset, lane_protected_v + protected_offset,
+                    nullptr, nullptr, nullptr, nullptr);
+            }
+        }
+    } else {
+        for (int key = 0; key < context_count; ++key) {
+            const int context_position = context_start + key;
+            const int slot             = context_position & (window - 1);
+            const std::int64_t slot_offset =
+                static_cast<std::int64_t>(CodeExtent) *
+                (slot + static_cast<std::int64_t>(padded_context) * kv_head);
+            const std::int64_t scale_offset =
+                static_cast<std::int64_t>(ScaleExtent) *
+                (slot + static_cast<std::int64_t>(padded_context) * kv_head);
+            sliding_window_nvfp4_accumulate<true>(
+                lane, q_values, scale, normalizer, running_max, accumulator, nullptr, nullptr,
+                lane_k + slot_offset, lane_v + slot_offset, lane_k_scale + scale_offset,
+                lane_v_scale + scale_offset);
         }
     }
     for (int query_token = 0; query_token < valid; ++query_token) {

@@ -60,6 +60,7 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
     if (context.dtype == DType::BF16) {
         if (context.quant_group != 0 || context.k_scale.data != nullptr ||
             context.v_scale.data != nullptr || context.protected_capacity != 0 ||
+            context.protected_anchor_capacity != 0 ||
             context.protected_padded_capacity != 0 || context.protected_k.data != nullptr ||
             context.protected_v.data != nullptr || context.k.dtype != DType::BF16 ||
             context.v.dtype != DType::BF16) {
@@ -83,10 +84,14 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
                       op, "context k scales");
         require_shape(context.v_scale, kHeadDim / 16, padded, kKVHeads, context.lane_capacity,
                       op, "context v scales");
-        if (context.protected_capacity != 0) {
+        if (context.protected_capacity != 0 || context.protected_anchor_capacity != 0) {
             if (context.protected_capacity > context.capacity ||
-                (context.protected_capacity & (context.protected_capacity - 1U)) != 0U ||
-                context.protected_padded_capacity < context.protected_capacity ||
+                (context.protected_capacity != 0 &&
+                 (context.protected_capacity & (context.protected_capacity - 1U)) != 0U) ||
+                context.protected_anchor_capacity > context.capacity ||
+                context.protected_anchor_capacity > context.capacity - context.protected_capacity ||
+                context.protected_padded_capacity <
+                    context.protected_capacity + context.protected_anchor_capacity ||
                 context.protected_k.dtype != DType::BF16 ||
                 context.protected_v.dtype != DType::BF16) {
                 throw std::invalid_argument(std::string(op) +
@@ -111,7 +116,7 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
     if (context.dtype == DType::U8) {
         require_contiguous_nonnull(context.k_scale, op, "context k scales");
         require_contiguous_nonnull(context.v_scale, op, "context v scales");
-        if (context.protected_capacity != 0) {
+        if (context.protected_capacity != 0 || context.protected_anchor_capacity != 0) {
             require_contiguous_nonnull(context.protected_k, op, "context protected k");
             require_contiguous_nonnull(context.protected_v, op, "context protected v");
         }

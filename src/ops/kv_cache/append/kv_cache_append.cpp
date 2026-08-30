@@ -189,10 +189,14 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
     }
     require_vector_aligned(cache.k_scale, "cache k scales");
     require_vector_aligned(cache.v_scale, "cache v scales");
-    if (cache.protected_capacity != 0) {
+    if (cache.protected_capacity != 0 || cache.protected_anchor_capacity != 0) {
         if (cache.protected_capacity > cache.capacity ||
-            (cache.protected_capacity & (cache.protected_capacity - 1U)) != 0U ||
-            cache.protected_padded_capacity < cache.protected_capacity ||
+            (cache.protected_capacity != 0 &&
+             (cache.protected_capacity & (cache.protected_capacity - 1U)) != 0U) ||
+            cache.protected_anchor_capacity > cache.capacity ||
+            cache.protected_anchor_capacity > cache.capacity - cache.protected_capacity ||
+            cache.protected_padded_capacity <
+                cache.protected_capacity + cache.protected_anchor_capacity ||
             cache.protected_padded_capacity >
                 static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
             cache.protected_k.dtype != DType::BF16 || cache.protected_v.dtype != DType::BF16 ||

@@ -188,10 +188,11 @@ void sliding_window_attention_nvfp4_launch(
             static_cast<const __nv_bfloat16*>(context.protected_v.data),
             static_cast<int>(context.padded_capacity), max_context, window,
             static_cast<int>(context.protected_capacity),
+            static_cast<int>(context.protected_anchor_capacity),
             static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
             static_cast<__nv_bfloat16*>(out.data));
     };
-    if (context.protected_capacity != 0) {
+    if (context.protected_capacity != 0 || context.protected_anchor_capacity != 0) {
         launch.template operator()<true>();
     } else {
         launch.template operator()<false>();

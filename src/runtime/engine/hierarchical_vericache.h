@@ -400,6 +400,11 @@ public:
         gdn_state_restore_seconds_ += seconds;
     }
 
+    void record_host_tier_snapshot(std::uint64_t bytes) noexcept {
+        ++host_tier_snapshots_;
+        host_tier_snapshot_bytes_ += bytes;
+    }
+
     void set_tier_bytes(std::size_t l0, std::size_t l1, std::size_t l2, std::size_t l3) noexcept {
         l0_bytes_ = l0;
         l1_bytes_ = l1;
@@ -431,6 +436,8 @@ public:
         stats.vericache_gdn_state_restores = gdn_state_restores_;
         stats.vericache_gdn_state_restore_bytes = gdn_state_restore_bytes_;
         stats.vericache_gdn_state_restore_seconds = gdn_state_restore_seconds_;
+        stats.vericache_host_tier_snapshots = host_tier_snapshots_;
+        stats.vericache_host_tier_snapshot_bytes = host_tier_snapshot_bytes_;
         stats.vericache_l0_bytes = l0_bytes_;
         stats.vericache_l1_bytes = l1_bytes_;
         stats.vericache_l2_bytes = l2_bytes_;
@@ -499,6 +506,8 @@ private:
     std::uint64_t gdn_state_restores_ = 0;
     std::uint64_t gdn_state_restore_bytes_ = 0;
     double gdn_state_restore_seconds_ = 0.0;
+    std::uint64_t host_tier_snapshots_ = 0;
+    std::uint64_t host_tier_snapshot_bytes_ = 0;
     std::size_t l0_bytes_ = 0;
     std::size_t l1_bytes_ = 0;
     std::size_t l2_bytes_ = 0;

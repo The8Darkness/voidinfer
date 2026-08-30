@@ -33,7 +33,11 @@ struct CyclicKVCacheLayerView {
     // packed NVFP4 cache and is deliberately empty for the default/stable cache profile.
     Tensor protected_k;
     Tensor protected_v;
+    // protected_capacity is the power-of-two recent-token ring. The optional prefix anchor
+    // region occupies slots [0, protected_anchor_capacity) in the same BF16 sidecar; recent
+    // slots start immediately after it.
     std::uint32_t protected_capacity        = 0;
+    std::uint32_t protected_anchor_capacity = 0;
     std::uint32_t protected_padded_capacity = 0;
     DType dtype              = DType::BF16;
     std::int32_t quant_group = 0;
@@ -59,6 +63,9 @@ struct CyclicKVCacheSlotView {
     std::size_t protected_v_layer_bytes          = 0;
     std::ptrdiff_t protected_k_layer_pitch_bytes = 0;
     std::ptrdiff_t protected_v_layer_pitch_bytes = 0;
+    std::uint32_t protected_capacity              = 0;
+    std::uint32_t protected_anchor_capacity      = 0;
+    std::uint32_t protected_padded_capacity      = 0;
 };
 
 struct CyclicKVCacheLayout {
@@ -74,6 +81,7 @@ struct CyclicKVCacheLayout {
     std::vector<TensorRegion> protected_k;
     std::vector<TensorRegion> protected_v;
     std::uint32_t protected_capacity        = 0;
+    std::uint32_t protected_anchor_capacity = 0;
     std::uint32_t protected_padded_capacity = 0;
     DType dtype              = DType::BF16;
     std::int32_t quant_group = 0;
@@ -85,7 +93,8 @@ struct CyclicKVCacheLayout {
 plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                      std::int32_t num_kv_heads, std::int32_t head_dim, std::int32_t lane_capacity,
                      DType dtype = DType::BF16, std::int32_t quant_group = 0,
-                     std::uint32_t protected_capacity = 0);
+                     std::uint32_t protected_capacity = 0,
+                     std::uint32_t protected_anchor_capacity = 0);
 
 class CyclicKVCache {
 public:
@@ -120,6 +129,10 @@ public:
         return protected_padded_capacity_;
     }
 
+    [[nodiscard]] std::uint32_t protected_anchor_capacity() const noexcept {
+        return protected_anchor_capacity_;
+    }
+
     [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
     [[nodiscard]] CyclicKVCacheSlotView slot_view(std::int32_t slot) const;
 
@@ -140,6 +153,7 @@ private:
     DType dtype_                   = DType::BF16;
     std::int32_t quant_group_      = 0;
     std::uint32_t protected_capacity_        = 0;
+    std::uint32_t protected_anchor_capacity_ = 0;
     std::uint32_t protected_padded_capacity_ = 0;
     std::vector<Tensor> k_scale_;
     std::vector<Tensor> v_scale_;

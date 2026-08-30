@@ -173,22 +173,34 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         if (plan.features.dflash()) {
             const bool dflash_nvfp4 = plan.kv_storage == KvCacheStorage::VeriCacheNvfp4;
             std::uint32_t protected_recent = 0;
+            std::uint32_t protected_anchor = 0;
             if (dflash_nvfp4 && plan.hierarchical_vericache.enabled &&
-                plan.hierarchical_vericache.protected_recent_tokens != 0) {
+                (plan.hierarchical_vericache.protected_recent_tokens != 0 ||
+                 plan.hierarchical_vericache.protected_sink_tokens != 0 ||
+                 plan.hierarchical_vericache.protected_pivot_tokens != 0)) {
+                const std::uint64_t anchor_request =
+                    static_cast<std::uint64_t>(plan.hierarchical_vericache.protected_sink_tokens) +
+                    plan.hierarchical_vericache.protected_pivot_tokens;
+                protected_anchor = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    DFlashConfig::local_capacity, anchor_request));
+                const std::uint32_t recent_capacity_limit =
+                    static_cast<std::uint32_t>(DFlashConfig::local_capacity) - protected_anchor;
                 const std::uint32_t requested = std::min(
-                    plan.hierarchical_vericache.protected_recent_tokens,
-                    static_cast<std::uint32_t>(DFlashConfig::local_capacity));
+                    plan.hierarchical_vericache.protected_recent_tokens, recent_capacity_limit);
                 // The cyclic sidecar uses a mask for zero-overhead slot selection.  Keep the
                 // largest supported power of two so a user-supplied non-power-of-two request is
                 // conservative rather than allocating more state than requested.
                 std::uint32_t power_of_two = 1;
-                while (power_of_two <= requested / 2U) { power_of_two <<= 1U; }
-                protected_recent = power_of_two;
+                if (requested != 0) {
+                    while (power_of_two <= requested / 2U) { power_of_two <<= 1U; }
+                    protected_recent = power_of_two;
+                }
             }
             state_image_spec.dflash_local = qwen3_6::DFlashLocalStateSpec{
                 .layers             = DFlashConfig::local_layers,
                 .capacity           = DFlashConfig::local_capacity,
                 .protected_capacity = protected_recent,
+                .protected_anchor_capacity = protected_anchor,
                 .kv_heads            = DFlashConfig::kv_heads,
                 .head_dim            = DFlashConfig::head_dim,
                 .dtype               = dflash_nvfp4 ? DType::U8 : DType::BF16,
