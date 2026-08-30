@@ -638,6 +638,15 @@ std::string format_throughput(const ThroughputReport& report) {
     out << " boundary=" << std::setprecision(2)
         << nanoseconds_to_seconds(host.engine_boundary_ns) * 1000.0
         << "ms maintenance=" << nanoseconds_to_seconds(host.engine_maintenance_ns) * 1000.0 << "ms";
+    if (report.current.hierarchical_vericache_enabled) {
+        out << " vericache=l0->l1@" << report.current.vericache_l0_to_l1_horizon
+            << " l1->l2@" << report.current.vericache_l1_to_l2_horizon
+            << " exact-checks=" << monotonic_delta(report.previous.vericache_exact_target_checks,
+                                                     report.current.vericache_exact_target_checks)
+            << " host-snapshots="
+            << monotonic_delta(report.previous.vericache_host_tier_snapshots,
+                               report.current.vericache_host_tier_snapshots);
+    }
     return out.str();
 }
 
@@ -706,6 +715,28 @@ std::string format_server_start_json(
          product::speculative_backend_name(engine_options.speculative.backend)},
         {"speculative_draft_window", engine_options.speculative.draft_tokens},
         {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
+        {"hierarchical_vericache",
+         Json{{"enabled", engine_options.hierarchical_vericache.enabled},
+              {"l0_to_l1_horizon", engine_options.hierarchical_vericache.l0_to_l1_horizon},
+              {"l0_to_l1_min_horizon",
+               engine_options.hierarchical_vericache.l0_to_l1_min_horizon},
+              {"l0_to_l1_max_horizon",
+               engine_options.hierarchical_vericache.l0_to_l1_max_horizon},
+              {"l1_to_l2_horizon", engine_options.hierarchical_vericache.l1_to_l2_horizon},
+              {"l1_to_l2_min_horizon",
+               engine_options.hierarchical_vericache.l1_to_l2_min_horizon},
+              {"l1_to_l2_max_horizon",
+               engine_options.hierarchical_vericache.l1_to_l2_max_horizon},
+              {"protected_recent_tokens",
+               engine_options.hierarchical_vericache.protected_recent_tokens},
+              {"protected_sink_tokens",
+               engine_options.hierarchical_vericache.protected_sink_tokens},
+              {"protected_pivot_tokens",
+               engine_options.hierarchical_vericache.protected_pivot_tokens},
+              {"host_tier_snapshots",
+               engine_options.hierarchical_vericache.enable_host_tier_snapshots},
+              {"cold_store_path",
+               engine_options.hierarchical_vericache.cold_store_path.string()}}},
         {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
                                                       context_cost.transfer_source)},
                               {"prefill_source", ninfer::context_cost_preset_source_name(
@@ -1008,6 +1039,82 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    const auto vericache_delta = [](std::uint64_t before, std::uint64_t after) {
+        return monotonic_delta(before, after);
+    };
+    const auto vericache_stage = [&vericache_delta](std::uint64_t checks,
+                                                     std::uint64_t proposed,
+                                                     std::uint64_t accepted,
+                                                     std::uint64_t disagreements,
+                                                     const ninfer::RuntimeStats& before) {
+        return Json{{"checks", vericache_delta(before.vericache_l0_l1_checks, checks)},
+                    {"proposed_tokens", vericache_delta(before.vericache_l0_l1_proposed_tokens,
+                                                         proposed)},
+                    {"accepted_tokens", vericache_delta(before.vericache_l0_l1_accepted_tokens,
+                                                         accepted)},
+                    {"disagreements", vericache_delta(before.vericache_l0_l1_disagreements,
+                                                       disagreements)}};
+    };
+    record["hierarchical_vericache"] = Json{
+        {"enabled", current.hierarchical_vericache_enabled},
+        {"horizons", Json{{"l0_to_l1", current.vericache_l0_to_l1_horizon},
+                           {"l1_to_l2", current.vericache_l1_to_l2_horizon}}},
+        {"l0_to_l1",
+         vericache_stage(current.vericache_l0_l1_checks, current.vericache_l0_l1_proposed_tokens,
+                         current.vericache_l0_l1_accepted_tokens,
+                         current.vericache_l0_l1_disagreements, previous)},
+        {"l1_to_l2",
+         Json{{"checks", vericache_delta(previous.vericache_l1_l2_checks,
+                                          current.vericache_l1_l2_checks)},
+              {"proposed_tokens", vericache_delta(previous.vericache_l1_l2_proposed_tokens,
+                                                   current.vericache_l1_l2_proposed_tokens)},
+              {"accepted_tokens", vericache_delta(previous.vericache_l1_l2_accepted_tokens,
+                                                   current.vericache_l1_l2_accepted_tokens)},
+              {"disagreements", vericache_delta(previous.vericache_l1_l2_disagreements,
+                                                 current.vericache_l1_l2_disagreements)}}},
+        {"exact_target_fallback",
+         Json{{"checks", vericache_delta(previous.vericache_exact_target_checks,
+                                          current.vericache_exact_target_checks)},
+              {"proposed_tokens", vericache_delta(previous.vericache_exact_target_proposed_tokens,
+                                                   current.vericache_exact_target_proposed_tokens)},
+              {"accepted_tokens", vericache_delta(previous.vericache_exact_target_accepted_tokens,
+                                                   current.vericache_exact_target_accepted_tokens)},
+              {"disagreements", vericache_delta(previous.vericache_exact_target_disagreements,
+                                                 current.vericache_exact_target_disagreements)}}},
+        {"transactions",
+         Json{{"speculative_rounds", vericache_delta(previous.vericache_speculative_rounds,
+                                                      current.vericache_speculative_rounds)},
+              {"rollbacks", vericache_delta(previous.vericache_speculative_rollbacks,
+                                             current.vericache_speculative_rollbacks)},
+              {"nested_commits", vericache_delta(previous.vericache_nested_commits,
+                                                  current.vericache_nested_commits)},
+              {"nested_rollbacks", vericache_delta(previous.vericache_nested_rollbacks,
+                                                    current.vericache_nested_rollbacks)},
+              {"max_nested_depth", current.vericache_max_nested_depth}}},
+        {"gdn_state",
+         Json{{"restores", vericache_delta(previous.vericache_gdn_state_restores,
+                                            current.vericache_gdn_state_restores)},
+              {"restore_bytes", vericache_delta(previous.vericache_gdn_state_restore_bytes,
+                                                 current.vericache_gdn_state_restore_bytes)},
+              {"restore_seconds", current.vericache_gdn_state_restore_seconds -
+                                       previous.vericache_gdn_state_restore_seconds}}},
+        {"host_tier",
+         Json{{"snapshots", vericache_delta(previous.vericache_host_tier_snapshots,
+                                             current.vericache_host_tier_snapshots)},
+              {"snapshot_bytes", vericache_delta(previous.vericache_host_tier_snapshot_bytes,
+                                                  current.vericache_host_tier_snapshot_bytes)},
+              {"state_d2h_bytes", vericache_delta(previous.vericache_host_state_d2h_bytes,
+                                                   current.vericache_host_state_d2h_bytes)},
+              {"kv_d2h_pages", vericache_delta(previous.vericache_host_kv_d2h_pages,
+                                                current.vericache_host_kv_d2h_pages)},
+              {"kv_d2h_bytes", vericache_delta(previous.vericache_host_kv_d2h_bytes,
+                                                 current.vericache_host_kv_d2h_bytes)},
+              {"kv_d2h_seconds", current.vericache_host_kv_d2h_seconds -
+                                      previous.vericache_host_kv_d2h_seconds}}},
+        {"tier_bytes", Json{{"l0_vram", current.vericache_l0_bytes},
+                             {"l1_pinned", current.vericache_l1_bytes},
+                             {"l2_host", current.vericache_l2_bytes},
+                             {"l3_nvme", current.vericache_l3_bytes}}}};
     return record.dump();
 }
 

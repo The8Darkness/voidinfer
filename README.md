@@ -44,6 +44,11 @@ there is no separate runtime model flag.
 | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
 | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 bytes | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` |
 
+The local DFlash2 benchmark artifact is `models/Qwen3.8-27B-NVFP4-DFlash2-NInfer/` with
+`qwen3_8_27b_nvfp4.ninfer` (23,719,496,192 bytes). It resolves the `nvfp4-dflash2` profile and
+is used for isolated research-serving measurements; it is not presented as a new public download
+until its artifact and quality gates are complete.
+
 The NVFP4 profile is mixed by design: Text MLP layers 0–55 use NVFP4, while the embedding,
 attention and GDN projections, output head, and Text MLP layers 56–63 use row-scaled FP8. The
 registered MTP and Vision objects remain in the artifact.
@@ -62,7 +67,7 @@ measurable resource/runtime gate. Negative candidates remain documented as rejec
 | Resource pressure | Bounded continuation search when an incumbent plan exists, reducing pressure-resume planning work without changing the selected contract | The real Qwen3.8 pressure/resume route passes |
 | State and KV ownership | Canonical State/KV resource contracts, device binding, sparse-MoE scan reuse, and successful-warmup readiness gating | Public Engine/resource and readiness tests pass; these are correctness/admission improvements, not unsubstantiated tok/s claims |
 | Measurement discipline | Targeted Nsight Compute kernel inspection and Nsight Systems end-to-end traces on the RTX 5090 | Nsight Systems 2026.4.1 traces are available; Nsight Compute 2026.2.1 is installed, but hardware-counter access is blocked in the current Windows session by `ERR_NVGPUCTRPERM` |
-| Hierarchical VeriCache (experimental) | Opt-in NVFP4 DFlash2 L0 with protected recent/anchor BF16 sidecar, nested KV/GDN transactions, adaptive fallback horizon, and asynchronous host-tier snapshots | Focused append/attention/state tests pass; the latest matched 8-round 5090 run measured 27.63 ms with 64 recent + 8 anchor tokens versus 28.33 ms control, but acceptance was 10/56 versus 11/56, so no end-to-end speedup is claimed. Independent host L1/L2 output verification is not claimed yet |
+| Hierarchical VeriCache (research default on the isolated branch) | NVFP4 DFlash2 L0 with protected recent/anchor BF16 sidecar, nested KV/GDN transactions, adaptive fallback horizon, and asynchronous host-tier snapshots | Focused append/attention/state tests pass; the latest matched 400-round 5090 stress run measured 22.69 ms GPU round with host snapshots versus 22.99 ms control, but acceptance reduced published throughput to 70.16 versus 78.25 tok/s. No end-to-end speedup or independent host L1/L2 output verification is claimed |
 
 The main implementation points are [src/ops/linear/fp8/](src/ops/linear/fp8/),
 [include/ninfer/ops/causal_conv1d_silu.h](include/ninfer/ops/causal_conv1d_silu.h),
@@ -76,8 +81,8 @@ identity are Qwen3.8-27B.
 The current source tree contains a Qwen3.8-shaped DFlash2 path with five draft layers, target feature
 layers `[5, 19, 33, 47, 61]`, block size 8 (`k=7`), rank 256, top-16 selection, and grouped two-tap
 causal convolutions. The direct-QKV and selector changes above are source-level, focused-op validated
-optimizations. They are not yet an end-to-end DFlash2 serving result: no separate local DFlash2
-`.ninfer` artifact and no local base checkpoint for reproducing one are available in this checkout.
+optimizations. The local DFlash2 `.ninfer` artifact now loads and serves through the experimental
+branch, but its complete C1/C2/C4/C8, quality, tool, and vision qualification is still pending.
 
 The locally present artifact with a DSpark-oriented filename identifies itself as the regular
 Qwen3.8 `groupwise-int` profile, so it is not treated as a DSpark or DFlash2 validation artifact.
@@ -88,8 +93,9 @@ and a real Qwen3.8 serving measurement.
 
 The isolated experimental branch
 [`exp/hierarchical-vericache-20260830`](https://github.com/The8Darkness/voidinfer/tree/exp/hierarchical-vericache-20260830)
-keeps the stable cache route unchanged unless `EngineOptions::hierarchical_vericache.enabled` is
-set. Its current control plane models L0 VRAM compressed speculation, L1 pinned NVFP4/FP8 mirrors,
+uses hierarchical VeriCache and DFlash2 as the default `ninfer-serve` profile. The underlying
+`EngineOptions::hierarchical_vericache` API remains opt-in, and `--no-spec` plus
+`--no-hierarchical-vericache` restore the stable fallback. Its current control plane models L0 VRAM compressed speculation, L1 pinned NVFP4/FP8 mirrors,
 L2 host FP16 KV plus protected GDN state, and an L3 cold manifest that is never allowed into the
 frequent verifier path. DFlash2's exact target remains the correctness fallback while host-tier
 consumers are developed; compression therefore affects proposal acceptance, not final greedy output.
@@ -104,6 +110,12 @@ Implemented in this track:
   kept separate from real host-verifier counters;
 - reuse of the existing pinned StateImage, host FP16 KV extent store, prefix/state DAG, and COW
   ownership machinery for tier accounting and future asynchronous promotion.
+
+The default server profile is VeriCache-NVFP4, DFlash2 `k=7`, and the optimized proposal head;
+implicit vision requests route to MTP so BF16 vision remains protected. A real default-profile
+startup/API smoke on the RTX 5090 loaded the DFlash2 artifact in 49.2 s, reported the
+`qwen3.8-27b/nvfp4-dflash2` cost profile, returned `/health`=`ok`, and completed one Chat
+Completions request. This is a serving-path smoke, not a quality or throughput qualification.
 
 The latest repeated-boundary physical RTX 5090 stress comparison uses context 512, DFlash2 `k=7`,
 batch 1, optimized proposal head, no CUDA Graph, one warmup round, and 400 measured rounds:

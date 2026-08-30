@@ -1,42 +1,41 @@
 # HTTP serving
 
-`build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
+`build/apps/ninfer-serve` loads one registered Qwen3.8 artifact and exposes OpenAI- and
+Anthropic-compatible HTTP endpoints over one resident NInfer Engine. On the hierarchical research
+branch, the default server profile is VeriCache-NVFP4 + DFlash2 `k=7` with the optimized proposal
+head and hierarchical host snapshots.
 
 ## Start the server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build/apps/ninfer-serve models/Qwen3.8-27B-NVFP4-DFlash2-NInfer/qwen3_8_27b.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 16384 \
   --kv-capacity 32768 \
-  --max-concurrency 2 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+  --max-concurrency 2
 ```
 
-For the 35B-A3B artifact, select its artifact path; the public model ID follows the container
-identity automatically:
+The default profile can be restored explicitly, which is useful in scripts:
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_35b_a3b.ninfer \
-  --max-context 16384 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
+./build/apps/ninfer-serve models/Qwen3.8-27B-NVFP4-DFlash2-NInfer/qwen3_8_27b.ninfer \
+  --hierarchical-vericache --vericache-host-snapshots \
+  --spec dflash --draft-tokens 7 --lm-head-draft
 ```
+
+For a stable non-speculative comparison, use `--no-spec --no-hierarchical-vericache`.
 
 When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
 `identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not
 select or alter the artifact.
 
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
-allocated, and media
-requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
-server must accept image or video input. Speculative residency is likewise frozen by
-`--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
-`--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
-cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
+allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
+`--vision` when the server must accept image or video input. Because DFlash2 multimodal execution
+is not yet qualified here, an implicit default DFlash2 selection is routed to the protected MTP
+path when `--vision` is present; an explicitly requested `--spec dflash --vision` combination is
+rejected. A later request cannot enable a capability omitted at startup.
 
 ## Endpoints
 
@@ -512,10 +511,18 @@ curl http://127.0.0.1:8080/v1/models \
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|fp8` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
-| `--lm-head-draft` | optimized proposal head | off |
+| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|vericache-nvfp4` | KV-cache storage | `vericache-nvfp4` |
+| `--spec mtp\|dflash` | speculative backend | `dflash` |
+| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | `7` |
+| `--lm-head-draft` | optimized proposal head | on |
+| `--no-spec` | restore BF16/non-speculative stable route and disable hierarchy | off |
+| `--hierarchical-vericache` / `--no-hierarchical-vericache` | enable/disable L0/L1/L2 research path | on |
+| `--vericache-host-snapshots` / `--no-vericache-host-snapshots` | enable/disable host-tier promotion | on / off |
+| `--vericache-l0-horizon N` | initial L0→L1 horizon, `24..64` | `32` |
+| `--vericache-l1-horizon N` | initial L1→L2 horizon, `256..2048` | `512` |
+| `--vericache-protected-recent N` | recent-token protection, `0..2048` | `64` |
+| `--vericache-protected-sinks N` | sink-token protection, `0..2048` | `4` |
+| `--vericache-protected-pivots N` | pivot-token protection, `0..2048` | `4` |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |

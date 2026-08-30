@@ -41,9 +41,23 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
-    KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
-    SpeculativeOptions speculative;
+    // The experimental Qwen3.8 serving profile is the default on this research branch. Use
+    // --no-spec/--no-hierarchical-vericache to return to the stable non-speculative route.
+    KvCacheStorage kv_cache = KvCacheStorage::VeriCacheNvfp4;
+    SpeculativeOptions speculative{
+        .backend = SpeculativeBackend::DFlash,
+        .draft_tokens = 7,
+        .proposal_head = ProposalHead::Optimized,
+    };
     ContextCacheOptions context_cache;
+    // The upstream Engine API remains opt-in, but this research server enables the hierarchy by
+    // default. The Engine normalizes these values once at construction.
+    HierarchicalVeriCacheOptions hierarchical_vericache = [] {
+        HierarchicalVeriCacheOptions value;
+        value.enabled                    = true;
+        value.enable_host_tier_snapshots = true;
+        return value;
+    }();
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;

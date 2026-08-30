@@ -2,9 +2,11 @@
 
 ## Hierarchical VeriCache experiment
 
-The isolated branch `exp/hierarchical-vericache-20260830` is an opt-in research path for the
-Qwen3.8-27B DFlash2/NVFP4 profile. It treats compressed L0 errors as speculative rejection effects
-and retains the exact target as the correctness fallback. The current implementation has nested
+The isolated branch `exp/hierarchical-vericache-20260830` makes the hierarchical VeriCache path the
+default `ninfer-serve` profile for Qwen3.8-27B DFlash2/NVFP4. The underlying Engine option remains
+available as an opt-in API, and `--no-spec --no-hierarchical-vericache` restores the stable
+fallback. It treats compressed L0 errors as speculative rejection effects and retains the exact
+target as the correctness fallback. The current implementation has nested
 KV/GDN transactions, adaptive L0→L1 (24–64) and L1→L2 (256–2,048) controls, direct NVFP4 attention,
 a protected recent-token sidecar, and a typed host-KV/StateImage checkpoint path shared by MTP and
 DFlash. Existing pinned StateImage and host KV stores are used for truthful L1/L2 residency and
@@ -15,6 +17,10 @@ RTX 5090, batch 1, context 512, `k=7`, optimized proposal head, no CUDA Graph, o
 and 400 measured rounds. The `l1=256` row intentionally forces three host checkpoint boundaries
 within this short run. Published throughput is licensed tokens divided by wall time, so it is
 acceptance-sensitive and must not be read as a kernel-only speedup:
+
+The server default is VeriCache-NVFP4 + DFlash2 `k=7` + optimized proposal head with host-tier
+snapshots enabled. The direct round harnesses still pass explicit flags so control and experimental
+rows remain reproducible.
 
 | Configuration | GPU round | Wall round | Published tok/s | Draft acceptance | L0/L1/L2/L3 bytes |
 | --- | ---: | ---: | ---: | ---: | --- |
