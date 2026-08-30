@@ -97,6 +97,27 @@ VeriCache, host snapshots, and the `nvfp4-dflash2` cost profile. L0→L1/L1→L2
 remain zero; these results validate graph execution around the existing exact-target verifier,
 not authoritative host-tier output equality.
 
+### E021: immutable hierarchical host-checkpoint manifest
+
+The host-promotion path now retains the inactive COW KV address spaces that identify the exact
+checkpoint prefix, records the frozen StateImage content epoch, and validates that the two are
+published together only when every required page has a current host replica with sufficient
+committed coverage. The first manifest is reaped and validated before the next one replaces it;
+this makes host-tier ownership explicit without pretending that host storage is already an
+independent logits verifier.
+
+The guarded physical RTX 5090 stress run used the Qwen3.8-27B NVFP4 DFlash2 artifact, context
+1,024, C=1, graph mode, `k=7`, optimized proposal head, VeriCache-NVFP4, host snapshots, one
+warmup round, and 300 measured rounds:
+
+| GPU round | Wall round | Published tok/s | Draft acceptance | Host checkpoints | Host transfer telemetry |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 22.1042 ms | 22.1153 ms | 89.9829 | 297/2,100 (14.14%) | 2 | 334,778,368 StateImage D2H bytes + 111,149,056 KV D2H bytes / 49 pages |
+
+The run crossed the replacement boundary without an ownership, stale-replica, or GDN-epoch
+failure. It is a structural correctness/residency milestone; L0→L1/L1→L2 host-verifier counters
+remain zero and no independent host-tier output-equality or end-to-end speedup claim is made.
+
 For historical comparison, an earlier short RTX 5090 run used batch 1, context 2,048, DFlash2
 `k=7`, no CUDA Graph, three warmup rounds, and eight measured rounds. The published rate is
 licensed tokens divided by wall time for this fixed round harness; acceptance can therefore

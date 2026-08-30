@@ -634,6 +634,11 @@ public:
     struct HierarchicalHostSnapshot {
         std::optional<StateImageHandle> state;
         std::optional<StateImageTransfer> transfer;
+        // The inactive KV address spaces are the immutable logical manifest for this checkpoint.
+        // Keeping them alive is what prevents a Host extent from being reclaimed merely because
+        // the serving sequence has moved on to its copy-on-write successor.
+        std::optional<KVAddressSpaceHandle> text_kv_checkpoint;
+        std::optional<KVAddressSpaceHandle> backend_kv_checkpoint;
         // Host-KV extents owned by this hierarchical checkpoint.  Older, already-published
         // extents can be reused by later checkpoints; only newly copied extents are appended.
         std::vector<HostKVExtentCapability> text_kv_extents;
@@ -652,6 +657,7 @@ public:
         std::vector<LogicalKVPageHandle> superseded_backend_pages;
         std::uint32_t frontier = 0;
         std::uint32_t backend_frontier = 0;
+        std::uint64_t state_content_epoch = 0;
         std::uint64_t pending_host_kv_bytes = 0;
         std::uint32_t pending_host_kv_pages = 0;
         std::chrono::steady_clock::time_point host_kv_transfer_started{};
@@ -1087,6 +1093,8 @@ private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void reap_hierarchical_host_snapshots();
     void discard_hierarchical_host_snapshot(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool validate_hierarchical_host_snapshot(
+        const HierarchicalHostSnapshot& snapshot) const noexcept;
     [[nodiscard]] bool snapshot_hierarchical_host_kv(SequenceState& sequence,
                                                      HierarchicalHostSnapshot& snapshot);
     void maybe_snapshot_hierarchical_host_tier(SequenceState& sequence);

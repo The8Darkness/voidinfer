@@ -960,6 +960,76 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
+bool ProgramImplCore::validate_hierarchical_host_snapshot(
+    const HierarchicalHostSnapshot& snapshot) const noexcept {
+    try {
+        if (snapshot.frontier == 0 || snapshot.transfer ||
+            !snapshot.pending_text_kv_extents.empty() ||
+            !snapshot.pending_backend_kv_extents.empty() || snapshot.superseded_text_address ||
+            snapshot.superseded_backend_address || !snapshot.superseded_text_pages.empty() ||
+            !snapshot.superseded_backend_pages.empty() || !snapshot.state ||
+            !snapshot.text_kv_checkpoint || !state_store || !text_kv_addresses ||
+            !text_kv_pages || !host_kv_extents ||
+            !state_store->valid(*snapshot.state) ||
+            state_store->role(*snapshot.state) != StateImageRole::CheckpointImmutable ||
+            state_store->residency(*snapshot.state) != StateReplicaResidency::HostOnly ||
+            snapshot.state_content_epoch == 0 ||
+            state_store->content_epoch(*snapshot.state) != snapshot.state_content_epoch) {
+            return false;
+        }
+
+        const auto contains_extent = [](const std::vector<HostKVExtentCapability>& extents,
+                                        HostKVExtentCapability extent) {
+            return std::find(extents.begin(), extents.end(), extent) != extents.end();
+        };
+        const auto validate_kv = [&](const KVAddressSpaceStore& addresses,
+                                     const LogicalKVPageStore& pages,
+                                     std::optional<KVAddressSpaceHandle> address,
+                                     std::uint32_t frontier,
+                                     const std::vector<HostKVExtentCapability>& extents) {
+            if (frontier == 0 || !address || !addresses.valid(*address) ||
+                addresses.active(*address) ||
+                addresses.committed_frontier(*address) != frontier ||
+                addresses.mapped_pages(*address) != kv_pages_for_frontier(frontier)) {
+                return false;
+            }
+            const std::uint32_t required_pages = kv_pages_for_frontier(frontier);
+            for (std::uint32_t page = 0; page < required_pages; ++page) {
+                const LogicalKVPageHandle logical = addresses.logical_page(*address, page);
+                const std::uint32_t begin = page * static_cast<std::uint32_t>(kPagedKVPageSize);
+                const std::uint32_t required =
+                    std::min(static_cast<std::uint32_t>(kPagedKVPageSize), frontier - begin);
+                if (!pages.valid(logical) || !pages.host_replica_current(logical) ||
+                    pages.committed_columns(logical) < required) {
+                    return false;
+                }
+                const HostKVPageReplica replica = pages.host_replica(logical);
+                if (!host_kv_extents->valid(replica.extent) ||
+                    !contains_extent(extents, replica.extent)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (!validate_kv(*text_kv_addresses, *text_kv_pages, snapshot.text_kv_checkpoint,
+                         snapshot.frontier, snapshot.text_kv_extents)) {
+            return false;
+        }
+        if (snapshot.backend_frontier == 0) {
+            return !snapshot.backend_kv_checkpoint;
+        }
+        return backend_kv_addresses && backend_kv_pages && snapshot.backend_kv_checkpoint &&
+               validate_kv(*backend_kv_addresses, *backend_kv_pages,
+                           snapshot.backend_kv_checkpoint, snapshot.backend_frontier,
+                           snapshot.backend_kv_extents);
+    } catch (...) {
+        // This is a diagnostic/invariant gate. A stale manifest must never turn an admission or
+        // cleanup path into an exception; the caller will leave the checkpoint unpublished.
+        return false;
+    }
+}
+
 void ProgramImplCore::reap_hierarchical_host_snapshots() {
     bool pending = false;
     for (const auto& snapshot : hierarchical_host_snapshots) {
@@ -989,18 +1059,34 @@ void ProgramImplCore::reap_hierarchical_host_snapshots() {
         snapshot.pending_text_kv_extents.clear();
         snapshot.pending_backend_kv_extents.clear();
 
-        if (snapshot.superseded_backend_address && backend_kv_addresses &&
-            backend_kv_addresses->valid(*snapshot.superseded_backend_address)) {
-            if (!backend_kv_addresses->release(*snapshot.superseded_backend_address)) {
-                throw std::logic_error("hierarchical Backend KV superseded address release failed");
+        const auto publish_checkpoint_address = [](KVAddressSpaceStore& addresses,
+                                                   std::optional<KVAddressSpaceHandle>& current,
+                                                   std::optional<KVAddressSpaceHandle>& incoming,
+                                                   const char* label) {
+            if (!incoming) { return; }
+            if (current && *current != *incoming && addresses.valid(*current) &&
+                !addresses.release(*current)) {
+                throw std::logic_error(std::string("hierarchical ") + label +
+                                       " checkpoint release failed");
             }
-        }
-        if (snapshot.superseded_text_address && text_kv_addresses &&
-            text_kv_addresses->valid(*snapshot.superseded_text_address)) {
-            if (!text_kv_addresses->release(*snapshot.superseded_text_address)) {
-                throw std::logic_error("hierarchical Text KV superseded address release failed");
+            current = *incoming;
+            incoming.reset();
+        };
+        if (snapshot.superseded_text_address) {
+            if (!text_kv_addresses) {
+                throw std::logic_error("hierarchical Text KV checkpoint store disappeared");
             }
+            publish_checkpoint_address(*text_kv_addresses, snapshot.text_kv_checkpoint,
+                                       snapshot.superseded_text_address, "Text KV");
         }
+        if (snapshot.superseded_backend_address) {
+            if (!backend_kv_addresses) {
+                throw std::logic_error("hierarchical Backend KV checkpoint store disappeared");
+            }
+            publish_checkpoint_address(*backend_kv_addresses, snapshot.backend_kv_checkpoint,
+                                       snapshot.superseded_backend_address, "Backend KV");
+        }
+
         for (const LogicalKVPageHandle page : snapshot.superseded_text_pages) {
             if (text_kv_pages && text_kv_pages->valid(page)) {
                 (void)text_kv_pages->drop_device_replica(page);
@@ -1031,6 +1117,9 @@ void ProgramImplCore::reap_hierarchical_host_snapshots() {
             state_store->publish_transfer(std::move(*snapshot.transfer), false);
             snapshot.transfer.reset();
         }
+        if (!validate_hierarchical_host_snapshot(snapshot)) {
+            throw std::logic_error("hierarchical host checkpoint manifest failed validation");
+        }
     }
 }
 
@@ -1058,6 +1147,14 @@ void ProgramImplCore::discard_hierarchical_host_snapshot(std::uint32_t lane) noe
     snapshot.pending_backend_kv_extents.clear();
     if (snapshot.state && state_store) {
         (void)state_store->release(*snapshot.state);
+    }
+    if (snapshot.backend_kv_checkpoint && backend_kv_addresses &&
+        backend_kv_addresses->valid(*snapshot.backend_kv_checkpoint)) {
+        (void)backend_kv_addresses->release(*snapshot.backend_kv_checkpoint);
+    }
+    if (snapshot.text_kv_checkpoint && text_kv_addresses &&
+        text_kv_addresses->valid(*snapshot.text_kv_checkpoint)) {
+        (void)text_kv_addresses->release(*snapshot.text_kv_checkpoint);
     }
     if (host_kv_extents) {
         for (const HostKVExtentCapability capability : snapshot.text_kv_extents) {
@@ -1090,12 +1187,15 @@ void ProgramImplCore::discard_hierarchical_host_snapshot(std::uint32_t lane) noe
     snapshot.text_kv_extents.clear();
     snapshot.backend_kv_extents.clear();
     snapshot.state.reset();
+    snapshot.text_kv_checkpoint.reset();
+    snapshot.backend_kv_checkpoint.reset();
     snapshot.superseded_text_address.reset();
     snapshot.superseded_backend_address.reset();
     snapshot.superseded_text_pages.clear();
     snapshot.superseded_backend_pages.clear();
     snapshot.frontier              = 0;
     snapshot.backend_frontier      = 0;
+    snapshot.state_content_epoch   = 0;
     snapshot.pending_host_kv_bytes = 0;
     snapshot.pending_host_kv_pages = 0;
     snapshot.host_kv_transfer_started = {};
@@ -1155,11 +1255,6 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
                          backend_frontier, missing_backend)) {
         return false;
     }
-
-    // If all pages are already current pinned Host replicas, no KV address rotation is needed.
-    // This is the common fast path after the first checkpoint and also lets the existing context
-    // cache satisfy a hierarchical checkpoint without duplicating its pages.
-    if (missing_text.empty() && missing_backend.empty()) { return true; }
 
     const SequenceKVBundle old_bundle = *sequence.kv;
     const std::uint32_t old_text_entitlement =
@@ -1399,6 +1494,30 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
         return false;
     }
 
+    // Existing Host replicas may have been produced by the ordinary context manager rather than
+    // by this checkpoint. Record their capabilities in the manifest only after the new COW
+    // address spaces and any asynchronous copies have been successfully staged.
+    const auto retain_existing_extents =
+        [&](LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+            KVAddressSpaceHandle address, std::uint32_t tokens,
+            std::vector<HostKVExtentCapability>& extents) {
+            const std::uint32_t required = kv_pages_for_frontier(tokens);
+            for (std::uint32_t page = 0; page < required; ++page) {
+                const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                if (!pages.host_resident(logical)) { continue; }
+                const HostKVExtentCapability capability = pages.host_replica(logical).extent;
+                if (std::find(extents.begin(), extents.end(), capability) == extents.end()) {
+                    extents.push_back(capability);
+                }
+            }
+        };
+    retain_existing_extents(*text_kv_pages, *text_kv_addresses, *text_destination, frontier,
+                            snapshot.text_kv_extents);
+    if (old_bundle.backend) {
+        retain_existing_extents(*backend_kv_pages, *backend_kv_addresses, *backend_destination,
+                                backend_frontier, snapshot.backend_kv_extents);
+    }
+
     if (copied_bytes > std::numeric_limits<std::uint64_t>::max() - snapshot.pending_host_kv_bytes) {
         snapshot.pending_host_kv_bytes = std::numeric_limits<std::uint64_t>::max();
     } else {
@@ -1462,6 +1581,7 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
         hierarchical_snapshot_state_ready_.record(device.transfer_stream);
         hierarchical_snapshot_state_ready_.wait(device.stream);
         state_store->freeze(*destination);
+        const std::uint64_t state_content_epoch = state_store->content_epoch(*destination);
         std::optional<StateImageTransfer> transfer =
             state_store->begin_device_to_host(*destination, device.transfer_stream);
         if (!transfer) {
@@ -1469,7 +1589,8 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
             return;
         }
         if (snapshot.state) { (void)state_store->release(*snapshot.state); }
-        snapshot.state = *destination;
+        snapshot.state               = *destination;
+        snapshot.state_content_epoch = state_content_epoch;
         snapshot.frontier          = sequence.execution_frontier;
         snapshot.backend_frontier  = backend_kv_valid(sequence);
         snapshot.transfer.emplace(std::move(*transfer));
@@ -1519,7 +1640,10 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
         snapshot.pending_host_kv_bytes = 0;
         snapshot.pending_host_kv_pages = 0;
         snapshot.host_kv_transfer_started = {};
-        if (snapshot.state && *snapshot.state == *destination) { snapshot.state.reset(); }
+        if (snapshot.state && *snapshot.state == *destination) {
+            snapshot.state.reset();
+            snapshot.state_content_epoch = 0;
+        }
         release_destination();
         throw;
     }
