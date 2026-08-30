@@ -835,11 +835,15 @@ int batch_selector_case(bool cyclic) {
 int cyclic_nvfp4_case() {
     constexpr int tokens = 3;
     constexpr int window = 128;
+    constexpr int protected_capacity = 8;
+    constexpr int protected_padded_capacity = 16;
     constexpr int code_extent = kHeadDim / 2;
     constexpr int scale_extent = kHeadDim / 16;
     const std::size_t input_count = static_cast<std::size_t>(kHeadDim) * kKVHeads * tokens;
     const std::size_t code_count = static_cast<std::size_t>(code_extent) * window * kKVHeads;
     const std::size_t scale_count = static_cast<std::size_t>(scale_extent) * window * kKVHeads;
+    const std::size_t protected_count = static_cast<std::size_t>(kHeadDim) *
+                                        protected_padded_capacity * kKVHeads;
 
     std::vector<std::uint16_t> host_k(input_count, 0);
     std::vector<std::uint16_t> host_v(input_count, 0);
@@ -861,10 +865,14 @@ int cyclic_nvfp4_case() {
     GuardedDeviceBuffer cache_v(code_count);
     GuardedDeviceBuffer cache_k_scale(scale_count);
     GuardedDeviceBuffer cache_v_scale(scale_count);
+    GuardedDeviceBuffer protected_k(protected_count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer protected_v(protected_count * sizeof(std::uint16_t));
     cache_k.fill(0);
     cache_v.fill(0);
     cache_k_scale.fill(0);
     cache_v_scale.fill(0);
+    protected_k.fill(0xab);
+    protected_v.fill(0xcd);
 
     const Tensor k(d_k.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
     const Tensor v(d_v.p, DType::BF16, {kHeadDim, kKVHeads, tokens, 1});
@@ -883,6 +891,12 @@ int cyclic_nvfp4_case() {
                           {scale_extent, window, kKVHeads, 1}),
         .v_scale = Tensor(cache_v_scale.data(), DType::FP8_E4M3FN,
                           {scale_extent, window, kKVHeads, 1}),
+        .protected_k = Tensor(protected_k.data(), DType::BF16,
+                              {kHeadDim, protected_padded_capacity, kKVHeads, 1}),
+        .protected_v = Tensor(protected_v.data(), DType::BF16,
+                              {kHeadDim, protected_padded_capacity, kKVHeads, 1}),
+        .protected_capacity = protected_capacity,
+        .protected_padded_capacity = protected_padded_capacity,
         .dtype = DType::U8,
         .quant_group = 16,
     };
@@ -894,8 +908,13 @@ int cyclic_nvfp4_case() {
     auto expected_v = std::vector<std::uint8_t>(code_count, 0);
     auto expected_k_scale = std::vector<std::uint8_t>(scale_count, 0);
     auto expected_v_scale = std::vector<std::uint8_t>(scale_count, 0);
+    auto expected_protected_k =
+        std::vector<std::uint16_t>(protected_count, static_cast<std::uint16_t>(0xabab));
+    auto expected_protected_v =
+        std::vector<std::uint16_t>(protected_count, static_cast<std::uint16_t>(0xcdcd));
     for (const int position : positions) {
         const int slot = position & (window - 1);
+        const int protected_slot = position & (protected_capacity - 1);
         for (int head = 0; head < kKVHeads; ++head) {
             for (int pair = 0; pair < 8; ++pair) {
                 expected_k[static_cast<std::size_t>(pair) +
@@ -909,6 +928,13 @@ int cyclic_nvfp4_case() {
                 0x30;
             expected_v_scale[static_cast<std::size_t>(scale_extent) * (slot + window * head)] =
                 0x28;
+            for (int d = 0; d < kHeadDim; ++d) {
+                const std::size_t protected_dst = static_cast<std::size_t>(d) +
+                    static_cast<std::size_t>(kHeadDim) *
+                        (protected_slot + protected_padded_capacity * head);
+                expected_protected_k[protected_dst] = host_k[input_index(d, head, position - 5)];
+                expected_protected_v[protected_dst] = host_v[input_index(d, head, position - 5)];
+            }
         }
     }
     int failures = verify_exact("kv_cache_append_prefix cyclic NVFP4 K",
@@ -921,10 +947,18 @@ int cyclic_nvfp4_case() {
     failures += verify_exact("kv_cache_append_prefix cyclic NVFP4 V scales",
                              from_device<std::uint8_t>(cache_v_scale.data(), scale_count),
                              expected_v_scale);
+    failures += verify_exact("kv_cache_append_prefix cyclic NVFP4 protected K",
+                             from_device<std::uint16_t>(protected_k.data(), protected_count),
+                             expected_protected_k);
+    failures += verify_exact("kv_cache_append_prefix cyclic NVFP4 protected V",
+                             from_device<std::uint16_t>(protected_v.data(), protected_count),
+                             expected_protected_v);
     failures += cache_k.verify_guards("cyclic NVFP4 K guards");
     failures += cache_v.verify_guards("cyclic NVFP4 V guards");
     failures += cache_k_scale.verify_guards("cyclic NVFP4 K scale guards");
     failures += cache_v_scale.verify_guards("cyclic NVFP4 V scale guards");
+    failures += protected_k.verify_guards("cyclic NVFP4 protected K guards");
+    failures += protected_v.verify_guards("cyclic NVFP4 protected V guards");
     return failures;
 }
 

@@ -17,7 +17,7 @@ void expect(bool condition, std::string_view message) {
     std::cerr << "FAIL: " << message << '\n';
 }
 
-q36::StateImageDeviceLayout plan(bool dflash, bool nvfp4 = false) {
+q36::StateImageDeviceLayout plan(bool dflash, bool nvfp4 = false, bool protected_recent = false) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -36,6 +36,7 @@ q36::StateImageDeviceLayout plan(bool dflash, bool nvfp4 = false) {
         spec.dflash_local = q36::DFlashLocalStateSpec{
             .layers = 2,
             .capacity = 17,
+            .protected_capacity = protected_recent ? 8U : 0U,
             .kv_heads = 2,
             .head_dim = nvfp4 ? 32 : 4,
             .dtype = nvfp4 ? ninfer::DType::U8 : ninfer::DType::BF16,
@@ -87,6 +88,26 @@ int main() {
                nvfp4_work.copy_operations == 4 *
                                                    nvfp4.host.spec.dflash_local->layers,
            "DFlash NVFP4 transfer work includes both scale planes");
+
+    const q36::StateImageDeviceLayout protected_nvfp4 = plan(true, true, true);
+    expect(protected_nvfp4.dflash_local &&
+               protected_nvfp4.dflash_local->protected_capacity == 8 &&
+               protected_nvfp4.dflash_local->protected_padded_capacity == 16 &&
+               protected_nvfp4.dflash_local->protected_k.size() == 2 &&
+               protected_nvfp4.dflash_local->protected_v.size() == 2 &&
+               protected_nvfp4.host.dflash_local_protected_k &&
+               protected_nvfp4.host.dflash_local_protected_v,
+           "DFlash NVFP4 layout carries the protected BF16 recent-token sidecar");
+    const auto protected_work = q36::dflash_local_transfer_work(protected_nvfp4.host);
+    const std::uint64_t protected_bytes =
+        2ULL * (protected_nvfp4.host.dflash_local_protected_layer_bytes +
+                nvfp4.host.dflash_local_layer_bytes +
+                nvfp4.host.dflash_local_scale_layer_bytes) *
+        protected_nvfp4.host.spec.dflash_local->layers;
+    expect(protected_work.payload_bytes == protected_bytes &&
+               protected_work.copy_operations == 6 *
+                                                   protected_nvfp4.host.spec.dflash_local->layers,
+           "protected DFlash transfer work includes sidecar K/V copies");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

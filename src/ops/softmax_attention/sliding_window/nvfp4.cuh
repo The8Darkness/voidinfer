@@ -20,8 +20,11 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
     const std::uint8_t* __restrict__ context_k, const std::uint8_t* __restrict__ context_v,
     const std::uint8_t* __restrict__ context_k_scale,
-    const std::uint8_t* __restrict__ context_v_scale, int padded_context, int max_context,
-    int window, int tokens, float scale, __nv_bfloat16* __restrict__ out) {
+    const std::uint8_t* __restrict__ context_v_scale,
+    const __nv_bfloat16* __restrict__ protected_k,
+    const __nv_bfloat16* __restrict__ protected_v, int padded_context, int max_context,
+    int window, int protected_capacity, int protected_padded_capacity, int tokens, float scale,
+    __nv_bfloat16* __restrict__ out) {
     constexpr unsigned FullMask = 0xffffffffU;
     constexpr int D              = kCyclicKVCacheNvfp4HeadDim;
     constexpr int QHeads         = 32;
@@ -73,6 +76,12 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
     const std::uint8_t* lane_v = context_v + code_lane_stride * state_lane;
     const std::uint8_t* lane_k_scale = context_k_scale + scale_lane_stride * state_lane;
     const std::uint8_t* lane_v_scale = context_v_scale + scale_lane_stride * state_lane;
+    const std::int64_t protected_lane_stride =
+        static_cast<std::int64_t>(D) * protected_padded_capacity * KVHeads;
+    const __nv_bfloat16* lane_protected_k =
+        protected_k == nullptr ? nullptr : protected_k + protected_lane_stride * state_lane;
+    const __nv_bfloat16* lane_protected_v =
+        protected_v == nullptr ? nullptr : protected_v + protected_lane_stride * state_lane;
     const __nv_bfloat16* query_k_batch = query_k + kv_batch_stride * batch;
     const __nv_bfloat16* query_v_batch = query_v + kv_batch_stride * batch;
 
@@ -89,17 +98,35 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
         const std::uint8_t* value_codes;
         const std::uint8_t* key_scales;
         const std::uint8_t* value_scales;
+        const __nv_bfloat16* protected_key_row = nullptr;
+        const __nv_bfloat16* protected_value_row = nullptr;
         const __nv_bfloat16* query_key_row = nullptr;
         const __nv_bfloat16* query_value_row = nullptr;
         if (from_context) {
-            const std::int64_t slot_offset = static_cast<std::int64_t>(CodeExtent) *
-                                             (slot + static_cast<std::int64_t>(padded_context) * kv_head);
-            const std::int64_t scale_offset = static_cast<std::int64_t>(ScaleExtent) *
-                                              (slot + static_cast<std::int64_t>(padded_context) * kv_head);
-            key_codes   = lane_k + slot_offset;
-            value_codes = lane_v + slot_offset;
-            key_scales  = lane_k_scale + scale_offset;
-            value_scales = lane_v_scale + scale_offset;
+            const bool use_protected =
+                lane_protected_k != nullptr && protected_capacity != 0 &&
+                context_position >= max(0, length - protected_capacity);
+            if (use_protected) {
+                const int protected_slot = context_position & (protected_capacity - 1);
+                const std::int64_t protected_offset =
+                    static_cast<std::int64_t>(D) *
+                    (protected_slot + static_cast<std::int64_t>(protected_padded_capacity) *
+                                         kv_head);
+                protected_key_row   = lane_protected_k + protected_offset;
+                protected_value_row = lane_protected_v + protected_offset;
+                key_codes = value_codes = key_scales = value_scales = nullptr;
+            } else {
+                const std::int64_t slot_offset =
+                    static_cast<std::int64_t>(CodeExtent) *
+                    (slot + static_cast<std::int64_t>(padded_context) * kv_head);
+                const std::int64_t scale_offset =
+                    static_cast<std::int64_t>(ScaleExtent) *
+                    (slot + static_cast<std::int64_t>(padded_context) * kv_head);
+                key_codes    = lane_k + slot_offset;
+                value_codes  = lane_v + slot_offset;
+                key_scales   = lane_k_scale + scale_offset;
+                value_scales = lane_v_scale + scale_offset;
+            }
         } else {
             query_key_row = query_k_batch +
                             static_cast<std::int64_t>(D) * (kv_head + KVHeads * query_token);
@@ -111,9 +138,11 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
 #pragma unroll
         for (int item = 0; item < 4; ++item) {
             const int d = lane + item * 32;
-            const float key_value = from_context
-                                        ? kv_cache_nvfp4_decode_value(key_codes, key_scales, d)
-                                        : __bfloat162float(query_key_row[d]);
+            const float key_value = protected_key_row != nullptr
+                                        ? __bfloat162float(protected_key_row[d])
+                                        : from_context
+                                              ? kv_cache_nvfp4_decode_value(key_codes, key_scales, d)
+                                              : __bfloat162float(query_key_row[d]);
             dot = fmaf(q_values[item], key_value, dot);
         }
         dot = warp_sum<32>(dot, FullMask) * scale;
@@ -126,9 +155,11 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
 #pragma unroll
         for (int item = 0; item < 4; ++item) {
             const int d = lane + item * 32;
-            const float value = from_context
-                                    ? kv_cache_nvfp4_decode_value(value_codes, value_scales, d)
-                                    : __bfloat162float(query_value_row[d]);
+            const float value = protected_value_row != nullptr
+                                    ? __bfloat162float(protected_value_row[d])
+                                    : from_context
+                                          ? kv_cache_nvfp4_decode_value(value_codes, value_scales, d)
+                                          : __bfloat162float(query_value_row[d]);
             accumulator[item] = accumulator[item] * old_weight + value * new_weight;
         }
         running_max = next_max;

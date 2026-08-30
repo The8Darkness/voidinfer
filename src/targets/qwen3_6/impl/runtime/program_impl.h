@@ -824,6 +824,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
+    if (hierarchical_vericache.enabled()) {
+        const std::size_t l0_bytes =
+            plan.persistent.state_images.dflash_local
+                ? plan.persistent.state_images.dflash_local->payload_bytes()
+                : 0U;
+        // The resident DFlash local cache is the currently implemented L0.  Keep L1/L2/L3 at
+        // zero until a real host verifier/persistence path is attached; reporting an inferred
+        // number here would make benchmark telemetry misleading.
+        hierarchical_vericache.set_tier_bytes(l0_bytes, 0U, 0U, 0U);
+    }
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
         backend_host_kv_page_stride =
             plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;

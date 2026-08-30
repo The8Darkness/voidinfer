@@ -172,13 +172,27 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             const bool dflash_nvfp4 = plan.kv_storage == KvCacheStorage::VeriCacheNvfp4;
+            std::uint32_t protected_recent = 0;
+            if (dflash_nvfp4 && plan.hierarchical_vericache.enabled &&
+                plan.hierarchical_vericache.protected_recent_tokens != 0) {
+                const std::uint32_t requested = std::min(
+                    plan.hierarchical_vericache.protected_recent_tokens,
+                    static_cast<std::uint32_t>(DFlashConfig::local_capacity));
+                // The cyclic sidecar uses a mask for zero-overhead slot selection.  Keep the
+                // largest supported power of two so a user-supplied non-power-of-two request is
+                // conservative rather than allocating more state than requested.
+                std::uint32_t power_of_two = 1;
+                while (power_of_two <= requested / 2U) { power_of_two <<= 1U; }
+                protected_recent = power_of_two;
+            }
             state_image_spec.dflash_local = qwen3_6::DFlashLocalStateSpec{
-                .layers   = DFlashConfig::local_layers,
-                .capacity = DFlashConfig::local_capacity,
-                .kv_heads = DFlashConfig::kv_heads,
-                .head_dim = DFlashConfig::head_dim,
-                .dtype = dflash_nvfp4 ? DType::U8 : DType::BF16,
-                .quant_group = dflash_nvfp4 ? qwen3_6::kKvNvfp4QuantGroup : 0,
+                .layers             = DFlashConfig::local_layers,
+                .capacity           = DFlashConfig::local_capacity,
+                .protected_capacity = protected_recent,
+                .kv_heads            = DFlashConfig::kv_heads,
+                .head_dim            = DFlashConfig::head_dim,
+                .dtype               = dflash_nvfp4 ? DType::U8 : DType::BF16,
+                .quant_group         = dflash_nvfp4 ? qwen3_6::kKvNvfp4QuantGroup : 0,
             };
         }
     }

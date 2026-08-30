@@ -44,6 +44,7 @@ struct Options {
     ninfer::KvCacheStorage kv_cache = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool use_cuda_graph            = false;
     bool hierarchical_vericache    = false;
+    std::uint32_t protected_recent_tokens = 64;
 };
 
 void print_usage(const char* executable) {
@@ -54,6 +55,7 @@ void print_usage(const char* executable) {
                  " [--proposal-head full|optimized]"
                  " [--kv-dtype fp8-e4m3-row256|vericache-nvfp4]"
                  " [--hierarchical-vericache]"
+                 " [--vericache-protected-recent <0..2048>]"
                  " [--cuda-graph|--no-cuda-graph]\n";
 }
 
@@ -115,6 +117,9 @@ Options parse_options(int argc, char** argv) {
             options.use_cuda_graph = true;
         } else if (argument == "--hierarchical-vericache") {
             options.hierarchical_vericache = true;
+        } else if (argument == "--vericache-protected-recent") {
+            options.protected_recent_tokens =
+                parse_u32(value("--vericache-protected-recent"), "vericache-protected-recent");
         } else if (argument == "-h" || argument == "--help") {
             print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_6_27b_dflash_round_bench");
             std::exit(0);
@@ -135,6 +140,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
         throw std::invalid_argument("--batch must be in [1,8]");
+    }
+    if (options.protected_recent_tokens > 2048) {
+        throw std::invalid_argument("--vericache-protected-recent must be in [0,2048]");
     }
     return options;
 }
@@ -232,6 +240,7 @@ int run(const Options& options) {
     engine.use_cuda_graph            = options.use_cuda_graph;
     engine.max_concurrency           = options.batch_size;
     engine.hierarchical_vericache.enabled = options.hierarchical_vericache;
+    engine.hierarchical_vericache.protected_recent_tokens = options.protected_recent_tokens;
     // The direct target facade does not run Engine::normalize_engine_options().
     // Keep the benchmark's startup capacities identical to the production defaults.
     engine.context_cache.device_state_slots            = options.batch_size;
@@ -401,6 +410,7 @@ int run(const Options& options) {
     std::cout << "cuda_graph," << (options.use_cuda_graph ? "true" : "false") << '\n';
     std::cout << "hierarchical_vericache," << (options.hierarchical_vericache ? "true" : "false")
               << '\n';
+    std::cout << "vericache_protected_recent_tokens," << options.protected_recent_tokens << '\n';
     std::cout << "warmup," << options.warmup << '\n';
     std::cout << "repetitions," << options.repetitions << '\n';
     std::cout << "steady_round_gpu_mean_ms," << mean_gpu_ms << '\n';
@@ -437,6 +447,10 @@ int run(const Options& options) {
               << '\n';
     std::cout << "vericache_max_nested_depth," << vericache_stats.vericache_max_nested_depth
               << '\n';
+    std::cout << "vericache_l0_bytes," << vericache_stats.vericache_l0_bytes << '\n';
+    std::cout << "vericache_l1_bytes," << vericache_stats.vericache_l1_bytes << '\n';
+    std::cout << "vericache_l2_bytes," << vericache_stats.vericache_l2_bytes << '\n';
+    std::cout << "vericache_l3_bytes," << vericache_stats.vericache_l3_bytes << '\n';
     return 0;
 }
 

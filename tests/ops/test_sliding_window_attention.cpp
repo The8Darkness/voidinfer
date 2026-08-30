@@ -412,6 +412,92 @@ int run_nvfp4_case() {
     return failures;
 }
 
+int run_nvfp4_protected_recent_case() {
+    constexpr int window                  = 128;
+    constexpr int protected_capacity      = 8;
+    constexpr int protected_padded        = 16;
+    constexpr int tokens                  = 1;
+    constexpr int code_extent             = kD / 2;
+    constexpr int scale_extent            = kD / 16;
+    const std::size_t q_count = static_cast<std::size_t>(kD) * kQHeads * tokens;
+    const std::size_t kv_count = static_cast<std::size_t>(kD) * kKVHeads * tokens;
+    const std::size_t code_count = static_cast<std::size_t>(code_extent) * window * kKVHeads;
+    const std::size_t scale_count = static_cast<std::size_t>(scale_extent) * window * kKVHeads;
+    const std::size_t protected_count =
+        static_cast<std::size_t>(kD) * protected_padded * kKVHeads;
+
+    const std::vector<std::uint16_t> zeros(q_count, 0);
+    const std::vector<std::uint16_t> query_zeros(kv_count, 0);
+    const std::vector<std::uint8_t> context_codes(code_count, 0);
+    const std::vector<std::uint8_t> context_scales(scale_count, 0);
+    std::vector<std::uint16_t> protected_k(protected_count, 0);
+    std::vector<std::uint16_t> protected_v(protected_count, 0);
+    for (int head = 0; head < kKVHeads; ++head) {
+        for (int slot = 0; slot < 2; ++slot) {
+            for (int d = 0; d < kD; ++d) {
+                protected_v[static_cast<std::size_t>(d) +
+                            static_cast<std::size_t>(kD) *
+                                (slot + protected_padded * head)] = f32_to_bf16(2.0F);
+            }
+        }
+    }
+
+    DeviceBuffer d_q = to_device(zeros);
+    DeviceBuffer d_query_k = to_device(query_zeros);
+    DeviceBuffer d_query_v = to_device(query_zeros);
+    DeviceBuffer d_context_k = to_device(context_codes);
+    DeviceBuffer d_context_v = to_device(context_codes);
+    DeviceBuffer d_context_k_scale = to_device(context_scales);
+    DeviceBuffer d_context_v_scale = to_device(context_scales);
+    DeviceBuffer d_protected_k = to_device(protected_k);
+    DeviceBuffer d_protected_v = to_device(protected_v);
+    DeviceBuffer d_positions = to_device_i32({2});
+    DeviceBuffer d_valid = to_device<std::int32_t>({1});
+    DeviceBuffer d_lane = to_device<std::int32_t>({0});
+    GuardedDeviceBuffer d_out(q_count * sizeof(std::uint16_t));
+    d_out.fill(0x7f);
+
+    Tensor q(d_q.p, DType::BF16, {kD, kQHeads, tokens, 1});
+    Tensor query_k(d_query_k.p, DType::BF16, {kD, kKVHeads, tokens, 1});
+    Tensor query_v(d_query_v.p, DType::BF16, {kD, kKVHeads, tokens, 1});
+    Tensor positions(d_positions.p, DType::I32, {tokens, 1});
+    Tensor valid(d_valid.p, DType::I32, {1});
+    Tensor lane(d_lane.p, DType::I32, {1});
+    Tensor out(d_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
+    CyclicKVCacheLayerView context{
+        .k = Tensor(d_context_k.p, DType::U8, {code_extent, window, kKVHeads, 1}),
+        .v = Tensor(d_context_v.p, DType::U8, {code_extent, window, kKVHeads, 1}),
+        .capacity = window,
+        .padded_capacity = window,
+        .num_kv_heads = kKVHeads,
+        .head_dim = kD,
+        .lane_capacity = 1,
+        .k_scale = Tensor(d_context_k_scale.p, DType::FP8_E4M3FN,
+                          {scale_extent, window, kKVHeads, 1}),
+        .v_scale = Tensor(d_context_v_scale.p, DType::FP8_E4M3FN,
+                          {scale_extent, window, kKVHeads, 1}),
+        .protected_k = Tensor(d_protected_k.p, DType::BF16,
+                              {kD, protected_padded, kKVHeads, 1}),
+        .protected_v = Tensor(d_protected_v.p, DType::BF16,
+                              {kD, protected_padded, kKVHeads, 1}),
+        .protected_capacity = protected_capacity,
+        .protected_padded_capacity = protected_padded,
+        .dtype = DType::U8,
+        .quant_group = 16,
+    };
+    DeviceArena workspace(1);
+    ops::sliding_window_attention(q, query_k, query_v, positions, valid, lane, kGeometry, window,
+                                  kScale, context, {0, 2}, workspace, out, nullptr);
+    cuda_synchronize();
+
+    const std::vector<double> expected(q_count, 4.0 / 3.0);
+    int failures = verify_reduction("sliding_window_attention NVFP4 protected recent",
+                                    from_device_bf16(d_out.data(), q_count), expected,
+                                    kSlidingWindowBf16Criterion);
+    failures += d_out.verify_guards("sliding_window_attention NVFP4 protected output guards");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -449,6 +535,7 @@ int main() {
     failures += run_case(8, 4096, InputProfile::Random, 4096, 0);
     failures += run_batch_case();
     failures += run_nvfp4_case();
+    failures += run_nvfp4_protected_recent_case();
 
     if (failures != 0) {
         std::cerr << "sliding_window_attention failures=" << failures << '\n';

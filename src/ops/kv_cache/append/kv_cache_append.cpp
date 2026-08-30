@@ -189,6 +189,29 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
     }
     require_vector_aligned(cache.k_scale, "cache k scales");
     require_vector_aligned(cache.v_scale, "cache v scales");
+    if (cache.protected_capacity != 0) {
+        if (cache.protected_capacity > cache.capacity ||
+            (cache.protected_capacity & (cache.protected_capacity - 1U)) != 0U ||
+            cache.protected_padded_capacity < cache.protected_capacity ||
+            cache.protected_padded_capacity >
+                static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
+            cache.protected_k.dtype != DType::BF16 || cache.protected_v.dtype != DType::BF16 ||
+            cache.protected_k.ne[0] != kHeadDim ||
+            cache.protected_k.ne[1] != static_cast<std::int32_t>(cache.protected_padded_capacity) ||
+            cache.protected_k.ne[2] != kKVHeads ||
+            cache.protected_k.ne[3] != cache.lane_capacity ||
+            cache.protected_v.ne[0] != kHeadDim ||
+            cache.protected_v.ne[1] != static_cast<std::int32_t>(cache.protected_padded_capacity) ||
+            cache.protected_v.ne[2] != kKVHeads ||
+            cache.protected_v.ne[3] != cache.lane_capacity) {
+            throw std::invalid_argument("kv_cache_append: invalid protected cyclic sidecar");
+        }
+        require_vector_aligned(cache.protected_k, "cache protected k");
+        require_vector_aligned(cache.protected_v, "cache protected v");
+    } else if (cache.protected_padded_capacity != 0 || cache.protected_k.data != nullptr ||
+               cache.protected_v.data != nullptr) {
+        throw std::invalid_argument("kv_cache_append: unexpected protected cyclic sidecar");
+    }
 }
 
 } // namespace

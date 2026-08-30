@@ -539,7 +539,9 @@ __device__ __forceinline__ void kv_cache_append_prefix_cyclic_nvfp4_row(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token,
-    int kv_head, int lane_id, int slot, int padded_capacity, int lane) {
+    __nv_bfloat16* __restrict__ protected_k, __nv_bfloat16* __restrict__ protected_v,
+    int kv_head, int lane_id, int slot, int padded_capacity, int protected_slot,
+    int protected_padded_capacity, int lane) {
     constexpr unsigned FullMask   = 0xffffffffU;
     constexpr int ValuesPerLane   = kCyclicKVCacheNvfp4Group / 2;
     // A warp has 32 lanes while a 128-wide head has eight 16-value groups. Reuse the second
@@ -582,6 +584,19 @@ __device__ __forceinline__ void kv_cache_append_prefix_cyclic_nvfp4_row(
         scale_v[cyclic_nvfp4_scale_index(slot, kv_head, lane_id, padded_capacity, group)] =
             v_quant.scale;
     }
+    if (protected_k != nullptr && lane < 16) {
+        const std::int64_t protected_base =
+            static_cast<std::int64_t>(kCyclicKVCacheNvfp4HeadDim) *
+            (protected_slot + static_cast<std::int64_t>(protected_padded_capacity) *
+                                  (kv_head + kCyclicKVCacheNvfp4KVHeads * lane_id));
+        // The first 16 lanes cover the complete 128-wide head once.  Keep the sidecar BF16 so
+        // recent/high-sensitivity keys can be consumed without quantization error.
+#pragma unroll
+        for (int i = 0; i < ValuesPerLane; ++i) {
+            protected_k[protected_base + d_base + i] = k[src_base + d_base + i];
+            protected_v[protected_base + d_base + i] = v[src_base + d_base + i];
+        }
+    }
 }
 
 __global__ void kv_cache_append_prefix_cyclic_nvfp4_kernel(
@@ -589,8 +604,9 @@ __global__ void kv_cache_append_prefix_cyclic_nvfp4_kernel(
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int32_t* __restrict__ lanes, std::uint8_t* __restrict__ cache_k,
     std::uint8_t* __restrict__ cache_v, std::uint8_t* __restrict__ scale_k,
-    std::uint8_t* __restrict__ scale_v, int min_count, int max_count, int width, int window,
-    int padded_capacity) {
+    std::uint8_t* __restrict__ scale_v, __nv_bfloat16* __restrict__ protected_k,
+    __nv_bfloat16* __restrict__ protected_v, int min_count, int max_count, int width, int window,
+    int padded_capacity, int protected_capacity, int protected_padded_capacity) {
     constexpr int Warps = 8;
     const int batch      = static_cast<int>(blockIdx.y);
     const int count      = counts[batch];
@@ -607,9 +623,11 @@ __global__ void kv_cache_append_prefix_cyclic_nvfp4_kernel(
     const std::int64_t batch_offset = ElementsPerToken * static_cast<std::int64_t>(width) * batch;
     const int position = positions[static_cast<std::int64_t>(width) * batch + token];
     const int slot     = position & (window - 1);
+    const int protected_slot = protected_capacity == 0 ? 0 : position & (protected_capacity - 1);
     kv_cache_append_prefix_cyclic_nvfp4_row(
-        k + batch_offset, v + batch_offset, cache_k, cache_v, scale_k, scale_v, token, kv_head,
-        lanes[batch], slot, padded_capacity, lane);
+        k + batch_offset, v + batch_offset, cache_k, cache_v, scale_k, scale_v, token,
+        protected_k, protected_v, kv_head, lanes[batch], slot, padded_capacity, protected_slot,
+        protected_padded_capacity, lane);
 }
 
 __global__ void kv_cache_append_prefix_paged_kernel(

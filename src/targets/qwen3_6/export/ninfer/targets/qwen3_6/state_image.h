@@ -17,10 +17,11 @@
 namespace ninfer::targets::qwen3_6 {
 
 struct DFlashLocalStateSpec {
-    std::uint32_t layers   = 0;
-    std::uint32_t capacity = 0;
-    std::int32_t kv_heads  = 0;
-    std::int32_t head_dim  = 0;
+    std::uint32_t layers             = 0;
+    std::uint32_t capacity           = 0;
+    std::uint32_t protected_capacity = 0;
+    std::int32_t kv_heads            = 0;
+    std::int32_t head_dim            = 0;
     DType dtype              = DType::BF16;
     std::int32_t quant_group = 0;
 };
@@ -44,6 +45,9 @@ struct StateImageHostLayout {
     std::optional<LayoutRegion> dflash_local_k_scale;
     std::optional<LayoutRegion> dflash_local_v_scale;
     std::size_t dflash_local_scale_layer_bytes = 0;
+    std::optional<LayoutRegion> dflash_local_protected_k;
+    std::optional<LayoutRegion> dflash_local_protected_v;
+    std::size_t dflash_local_protected_layer_bytes = 0;
     std::size_t image_bytes              = 0;
 };
 

@@ -183,7 +183,11 @@ void sliding_window_attention_nvfp4_launch(
         static_cast<const std::uint8_t*>(context.v.data),
         static_cast<const std::uint8_t*>(context.k_scale.data),
         static_cast<const std::uint8_t*>(context.v_scale.data),
-        static_cast<int>(context.padded_capacity), max_context, window, q.ne[2], scale,
+        static_cast<const __nv_bfloat16*>(context.protected_k.data),
+        static_cast<const __nv_bfloat16*>(context.protected_v.data),
+        static_cast<int>(context.padded_capacity), max_context, window,
+        static_cast<int>(context.protected_capacity),
+        static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
         static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }

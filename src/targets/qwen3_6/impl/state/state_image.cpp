@@ -39,6 +39,20 @@ std::uint32_t padded_dflash_capacity(std::uint32_t capacity) {
     return static_cast<std::uint32_t>(padded);
 }
 
+std::uint32_t padded_protected_dflash_capacity(std::uint32_t capacity) {
+    if (capacity == 0 || (capacity & (capacity - 1U)) != 0U) {
+        throw std::invalid_argument(
+            "StateImage protected DFlash capacity must be a power of two");
+    }
+    constexpr std::uint64_t alignment = 16;
+    const std::uint64_t padded =
+        (static_cast<std::uint64_t>(capacity) + alignment - 1U) & ~(alignment - 1U);
+    if (padded > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("StateImage protected DFlash padded capacity exceeds int32");
+    }
+    return static_cast<std::uint32_t>(padded);
+}
+
 bool same_linear_spec(const LinearAttentionStatePoolSpec& left,
                       const LinearAttentionStatePoolSpec& right) noexcept {
     return left.layers == right.layers && left.conv_channels == right.conv_channels &&
@@ -52,6 +66,7 @@ bool same_dflash_spec(const std::optional<DFlashLocalStateSpec>& left,
     if (left.has_value() != right.has_value()) { return false; }
     if (!left) { return true; }
     return left->layers == right->layers && left->capacity == right->capacity &&
+           left->protected_capacity == right->protected_capacity &&
            left->kv_heads == right->kv_heads && left->head_dim == right->head_dim &&
            left->dtype == right->dtype && left->quant_group == right->quant_group;
 }
@@ -82,6 +97,12 @@ bool same_host_layout(const StateImageHostLayout& left,
            same_optional_region(left.dflash_local_k_scale, right.dflash_local_k_scale) &&
            same_optional_region(left.dflash_local_v_scale, right.dflash_local_v_scale) &&
            left.dflash_local_scale_layer_bytes == right.dflash_local_scale_layer_bytes &&
+           same_optional_region(left.dflash_local_protected_k,
+                                right.dflash_local_protected_k) &&
+           same_optional_region(left.dflash_local_protected_v,
+                                right.dflash_local_protected_v) &&
+           left.dflash_local_protected_layer_bytes ==
+               right.dflash_local_protected_layer_bytes &&
            left.image_bytes == right.image_bytes;
 }
 
@@ -102,7 +123,12 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
                               (spec.dflash_local->dtype == DType::U8 &&
                                (spec.dflash_local->quant_group != 16 ||
                                 spec.dflash_local->head_dim % 2 != 0 ||
-                                spec.dflash_local->head_dim % spec.dflash_local->quant_group != 0)))) {
+                                spec.dflash_local->head_dim % spec.dflash_local->quant_group != 0)) ||
+                              (spec.dflash_local->protected_capacity != 0 &&
+                               (spec.dflash_local->dtype != DType::U8 ||
+                                spec.dflash_local->protected_capacity > spec.dflash_local->capacity ||
+                                (spec.dflash_local->protected_capacity &
+                                 (spec.dflash_local->protected_capacity - 1U)) != 0U)))) {
         throw std::invalid_argument("StateImage host DFlash geometry is invalid");
     }
 
@@ -153,6 +179,22 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
             host.dflash_local_v_scale = builder.add(
                 scale_component_bytes, kStateImageAlignment, "StateImage host DFlash local V scales");
         }
+        if (dflash.protected_capacity != 0) {
+            const auto protected_padded = static_cast<std::int32_t>(
+                padded_protected_dflash_capacity(dflash.protected_capacity));
+            const Tensor protected_slot(
+                nullptr, DType::BF16, {dflash.head_dim, protected_padded, dflash.kv_heads});
+            host.dflash_local_protected_layer_bytes = protected_slot.bytes();
+            const std::size_t protected_component_bytes = checked_mul(
+                host.dflash_local_protected_layer_bytes, dflash.layers,
+                "StateImage host protected DFlash local bytes overflow");
+            host.dflash_local_protected_k = builder.add(
+                protected_component_bytes, kStateImageAlignment,
+                "StateImage host DFlash local protected K");
+            host.dflash_local_protected_v = builder.add(
+                protected_component_bytes, kStateImageAlignment,
+                "StateImage host DFlash local protected V");
+        }
     }
     host.image_bytes = builder.finish(kStateImageAlignment, "StateImage host image");
     return host;
@@ -186,7 +228,7 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
         out.dflash_local =
             plan_cyclic_kv_cache(builder, dflash.layers, dflash.capacity, dflash.kv_heads,
                                  dflash.head_dim, spec.linear.slot_count, dflash.dtype,
-                                 dflash.quant_group);
+                                 dflash.quant_group, dflash.protected_capacity);
     }
 
     out.host = plan_host_state_image(spec);
@@ -222,11 +264,25 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
                             "StateImage transfer scale payload overflow"),
                 "StateImage transfer payload overflow");
         }
+        if (layout.dflash_local_protected_k) {
+            if (!layout.dflash_local_protected_v) {
+                throw std::invalid_argument("StateImage protected DFlash layout is incomplete");
+            }
+            const std::size_t protected_component_bytes = checked_mul(
+                layout.dflash_local_protected_layer_bytes, layout.spec.dflash_local->layers,
+                "StateImage protected DFlash transfer payload overflow");
+            payload = checked_add(
+                payload,
+                checked_mul(protected_component_bytes, 2U,
+                            "StateImage protected DFlash transfer payload overflow"),
+                "StateImage transfer payload overflow");
+        }
     }
     const std::uint64_t operations =
         2ULL * layout.spec.linear.layers + 1ULL +
         (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL) +
-        (layout.dflash_local_k_scale ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
+        (layout.dflash_local_k_scale ? 2ULL * layout.spec.dflash_local->layers : 0ULL) +
+        (layout.dflash_local_protected_k ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
     if (operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage transfer operation count exceeds uint32");
     }
@@ -260,6 +316,20 @@ TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
             payload,
             checked_mul(scale_component_bytes, 2U,
                         "StateImage DFlash transfer scale payload overflow"),
+            "StateImage DFlash transfer work exceeds its representation");
+        operations += 2ULL * layout.spec.dflash_local->layers;
+    }
+    if (layout.dflash_local_protected_k) {
+        if (!layout.dflash_local_protected_v) {
+            throw std::invalid_argument("StateImage protected DFlash layout is incomplete");
+        }
+        const std::size_t protected_component_bytes = checked_mul(
+            layout.dflash_local_protected_layer_bytes, layout.spec.dflash_local->layers,
+            "StateImage protected DFlash transfer payload overflow");
+        payload = checked_add(
+            payload,
+            checked_mul(protected_component_bytes, 2U,
+                        "StateImage protected DFlash transfer payload overflow"),
             "StateImage DFlash transfer work exceeds its representation");
         operations += 2ULL * layout.spec.dflash_local->layers;
     }
@@ -340,12 +410,13 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
     StateImageSpec device_spec{.linear = layout.linear.spec, .hidden = continuation_hidden_.ne[0]};
     if (layout.dflash_local) {
         device_spec.dflash_local = DFlashLocalStateSpec{
-            .layers   = static_cast<std::uint32_t>(layout.dflash_local->k.size()),
-            .capacity = layout.dflash_local->capacity,
-            .kv_heads = layout.dflash_local->num_kv_heads,
-            .head_dim = layout.dflash_local->head_dim,
-            .dtype = layout.dflash_local->dtype,
-            .quant_group = layout.dflash_local->quant_group,
+            .layers             = static_cast<std::uint32_t>(layout.dflash_local->k.size()),
+            .capacity           = layout.dflash_local->capacity,
+            .protected_capacity = layout.dflash_local->protected_capacity,
+            .kv_heads            = layout.dflash_local->num_kv_heads,
+            .head_dim            = layout.dflash_local->head_dim,
+            .dtype               = layout.dflash_local->dtype,
+            .quant_group         = layout.dflash_local->quant_group,
         };
     }
     if (!same_host_layout(host_layout_, plan_host_state_image(device_spec))) {
@@ -399,6 +470,12 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
                 CUDA_CHECK(cudaMemsetAsync(view.v_scale.slice(3, slot, 1).data, 0,
                                            view.v_scale.slice(3, slot, 1).bytes(), stream));
             }
+            if (view.protected_capacity != 0) {
+                CUDA_CHECK(cudaMemsetAsync(view.protected_k.slice(3, slot, 1).data, 0,
+                                           view.protected_k.slice(3, slot, 1).bytes(), stream));
+                CUDA_CHECK(cudaMemsetAsync(view.protected_v.slice(3, slot, 1).data, 0,
+                                           view.protected_v.slice(3, slot, 1).bytes(), stream));
+            }
         }
     }
 }
@@ -414,6 +491,12 @@ void StateImageDevicePool::zero_all(cudaStream_t stream) {
             if (view.dtype == DType::U8) {
                 CUDA_CHECK(cudaMemsetAsync(view.k_scale.data, 0, view.k_scale.bytes(), stream));
                 CUDA_CHECK(cudaMemsetAsync(view.v_scale.data, 0, view.v_scale.bytes(), stream));
+            }
+            if (view.protected_capacity != 0) {
+                CUDA_CHECK(cudaMemsetAsync(view.protected_k.data, 0, view.protected_k.bytes(),
+                                           stream));
+                CUDA_CHECK(cudaMemsetAsync(view.protected_v.data, 0, view.protected_v.bytes(),
+                                           stream));
             }
         }
     }
@@ -496,6 +579,20 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                                                       layer * host_layout_.dflash_local_scale_layer_bytes),
                     v_scale.data, v_scale.bytes(), cudaMemcpyDeviceToHost, stream));
             }
+            if (view.protected_capacity != 0) {
+                const Tensor protected_k = view.protected_k.slice(3, source, 1);
+                const Tensor protected_v = view.protected_v.slice(3, source, 1);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    byte_offset(destination.data,
+                                host_layout_.dflash_local_protected_k->offset +
+                                    layer * host_layout_.dflash_local_protected_layer_bytes),
+                    protected_k.data, protected_k.bytes(), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    byte_offset(destination.data,
+                                host_layout_.dflash_local_protected_v->offset +
+                                    layer * host_layout_.dflash_local_protected_layer_bytes),
+                    protected_v.data, protected_v.bytes(), cudaMemcpyDeviceToHost, stream));
+            }
         }
     }
 }
@@ -551,6 +648,22 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                     byte_offset(source.data, host_layout_.dflash_local_v_scale->offset +
                                                  layer * host_layout_.dflash_local_scale_layer_bytes),
                     v_scale.bytes(), cudaMemcpyHostToDevice, stream));
+            }
+            if (view.protected_capacity != 0) {
+                const Tensor protected_k = view.protected_k.slice(3, destination, 1);
+                const Tensor protected_v = view.protected_v.slice(3, destination, 1);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    protected_k.data,
+                    byte_offset(source.data,
+                                host_layout_.dflash_local_protected_k->offset +
+                                    layer * host_layout_.dflash_local_protected_layer_bytes),
+                    protected_k.bytes(), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    protected_v.data,
+                    byte_offset(source.data,
+                                host_layout_.dflash_local_protected_v->offset +
+                                    layer * host_layout_.dflash_local_protected_layer_bytes),
+                    protected_v.bytes(), cudaMemcpyHostToDevice, stream));
             }
         }
     }
