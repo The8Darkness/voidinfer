@@ -409,6 +409,17 @@ public:
         l1_l2_transfer_seconds_ += transfer_seconds;
     }
 
+    // Record the exact target check separately when a live L0->L1 verifier supplied the
+    // candidate prefix. This preserves the target-equivalence counters without feeding the
+    // fallback controller twice or relabeling the Q4 pass as a host-side logit verifier.
+    void record_exact_target(std::uint32_t proposed, std::uint32_t accepted,
+                             bool disagreement) noexcept {
+        ++exact_target_checks_;
+        exact_target_proposed_ += proposed;
+        exact_target_accepted_ += std::min(proposed, accepted);
+        exact_target_disagreements_ += disagreement ? 1U : 0U;
+    }
+
     // DFlash2 currently verifies every proposed block against the exact target on the GPU. Keep
     // that path visible as a fallback rather than mislabeling it as host-tier verification, while
     // still feeding observed disagreement into the L0-to-L1 horizon controller.

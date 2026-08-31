@@ -234,6 +234,8 @@ int main() {
         server.at("engine").at("hierarchical_vericache").at("enabled") == true &&
             server.at("engine").at("hierarchical_vericache").at("l0_to_l1_horizon") == 48 &&
             server.at("engine").at("hierarchical_vericache").at("l1_to_l2_horizon") == 1024 &&
+            server.at("engine").at("hierarchical_vericache").at("l1_live_verifier_primary") ==
+                true &&
             server.at("engine").at("hierarchical_vericache").at("host_tier_snapshots") == true &&
             server.at("engine").at("hierarchical_vericache").at("protected_recent_tokens") == 128,
         "hierarchical VeriCache startup provenance missing");

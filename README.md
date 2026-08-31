@@ -13,8 +13,8 @@ serves the local Qwen3.8-27B NVFP4 DFlash2 artifact with:
 
 - DFlash2 `k=7` (`--spec dflash --draft-tokens 7`);
 - the optimized private proposal head (`--lm-head-draft`);
-- hierarchical VeriCache with OSCAR-Q2 L0, an independently written OSCAR-Q4 host mirror, and
-  an authoritative 16-bit host state;
+- hierarchical VeriCache with OSCAR-Q2 L0, a live OSCAR-Q4 DFlash2 verifier/proposal backed by an
+  independently written pinned host mirror, and an authoritative FP16 host KV state;
 - exact target verification and nested KV/GDN rollback on every speculative round;
 - BF16-protected vision/non-DFlash execution when multimodal input is requested.
 
@@ -33,19 +33,20 @@ The names below describe the implementation that exists today, not the eventual 
 | Tier | Current representation | Current role |
 | --- | --- | --- |
 | L0 VRAM | DFlash2 local KV is packed `U8` OSCAR-Q2 with independently fitted affine BF16 scale/zero metadata. Recent/sink/pivot anchors use the protected BF16 sidecar. | Fast speculative proposal/attention path. Compression disagreement becomes rejection/rollback; the exact target remains authoritative. |
-| L1 pinned system RAM | Independently written packed `U8` OSCAR-Q4 DFlash mirror with its own affine BF16 metadata and protected sidecars. It is produced from the BF16 append rows, not by re-quantizing Q2. | Intermediate storage/attention mirror. It is not yet a live host-logit verifier. |
-| L2 system RAM | Full authoritative 16-bit target KV and protected Qwen3.8 GDN state. The current target implementation uses BF16 for this device/host representation; an FP16 byte-format conversion is still a separate task. | Correctness and restore tier for host checkpoints. |
+| L1 pinned system RAM | Independently written packed `U8` OSCAR-Q4 DFlash mirror with its own affine BF16 metadata and protected sidecars. It is produced from the BF16 append rows, not by re-quantizing Q2. The same Q4 representation is kept as a device shadow for live verification. | Live higher-fidelity DFlash2 proposal/verifier; pinned copy supports promotion/restore without a PCIe transfer on every token. |
+| L2 system RAM | Full authoritative target KV stored as FP16 host records plus protected high-precision Qwen3.8 GDN state. The target’s active device KV is BF16 for current kernel compatibility and is converted to FP16 only in the host L2 copy. | Correctness and restore tier for host checkpoints. |
 | L3 NVMe | No active cold writer in the current serving path; measured L3 bytes are zero. | Reserved for future cold persistence and never used in frequent verification. |
 
-Important: selecting `VeriCache-NVFP4` does **not** make the exact target/main attention KV low-bit.
-The active hierarchy is OSCAR-Q2 for DFlash2 local KV, OSCAR-Q4 for the pinned host mirror, and the
-full 16-bit target/GDN state for L2. The host mirror is currently a checkpoint/attention-storage
-path; live Q2→Q4 and Q4→L2 logit verification are not attached yet.
+Important: selecting `VeriCache-NVFP4` does **not** make the exact target/main attention KV
+low-bit. In the default serving mode the active path is OSCAR-Q4-first: Q2 remains resident and
+dual-written for fallback, while Q4 is the live DFlash2 verifier/proposal and the exact target
+settles the round. L2 host KV is FP16; the device target cache is BF16 until promotion. The
+optional benchmark `--vericache-q2-filter` enables the two-pass Q2→Q4 comparison path.
 
-The latest 32,768-token Q2 run with host snapshots reported `L0/L1/L2/L3` payload bytes of
-`15,073,280 / 146,997,248 / 2,301,437,952 / 0`, plus `25,559,040` bytes for the temporary
-independent Q4 source shadow in VRAM. It completed with 166,733,824 StateImage D2H bytes and
-2,281,701,376 KV D2H bytes.
+At context 512, the default Q2/Q4 run reports `L0/L1/L2/L3` live payload bytes of
+`15,073,280 / 14,876,672 / 187,508,736 / 0`, plus `25,559,040` bytes for the independent Q4
+device shadow. The host StateImage snapshot is `202,385,408` bytes and the target KV host copy is
+FP16. These are resident bytes for this small probe, not the 800K aggregate target.
 
 ## RTX 5090 context comparison
 
@@ -68,12 +69,15 @@ OSCAR hierarchy.
 columns are therefore an engineering comparison, not a multiplicative speedup claim: they use
 different execution units, and the DFlash2 values are one-round acceptance-sensitive samples.
 
-The latest matched OSCAR-Q2/Q4 host-snapshot probe at 32K measured 5,702.34 prefill tok/s, 34.504
-published tok/s, and 1/7 accepted DFlash2 draft tokens. The Q4 control measured 5,847.05 prefill
-tok/s and the same 34.504 published tok/s. Both completed without OOM or rollback failure. Both
-recorded zero live L0→L1 and L1→L2 logit checks: these are storage/transaction plumbing results,
-not end-to-end hierarchical verifier quality. The 800K aggregate plan and 262K single-stream
-confidence target remain benchmark work, not current capacity claims.
+The matched context-512 CUDA-Graph probe now measures `184.052` published tok/s at `18.473` ms per
+round with Q4-first serving and `12/35` accepted draft tokens. The retained two-pass Q2→Q4 control
+measures `157.033` tok/s at `21.652` ms with the same `12/35` final acceptance, while recording
+`22/49` Q2→Q4 common-prefix acceptance and `13/49` Q4→target acceptance across its checks. The
+historical optimized NVFP4/Q4-style run was `190.540` tok/s at `18.894` ms with `13/35` accepted;
+the remaining gap is acceptance variance and current Q4 calibration, not FP16 host conversion.
+The Q4-first path is about 17% faster than the two-pass path because it does not execute a discarded
+Q2 DFlash2 pass. The 800K aggregate plan and 262K single-stream confidence target remain benchmark
+work, not current capacity claims.
 
 ## Quality and correctness results
 
@@ -107,7 +111,7 @@ than being misreported as wins.
 | DFlash2 proposal working set | The production selector lattice uses 272 semantic floats per token instead of a 5,120-float hidden-width temporary; focused guard tests pass. |
 | DFlash2 CUDA Graphs | The proposal/selector/verify transaction is graph-safe. Matched context-512 samples reduced steady GPU round latency by 7.98% at C=1 and 7.65% at C=2. |
 | NVFP4 attention | Direct packed-byte consumption and pair decoding avoid a dequantized KV tensor; scalar-order fallback remains available through `NINFER_NVFP4_PAIR=0`. |
-| OSCAR-Q2/Q4 hierarchy | Independent BF16-source dual-write, fused rotated Q2/Q4 append, protected sidecars, nested KV/GDN transactions, immutable COW manifests, asynchronous host transfer ordering, and independent host-snapshot cadence are implemented and tested. |
+| OSCAR-Q2/Q4 hierarchy | Independent BF16-source dual-write, fused rotated Q2/Q4 append, live Q4-first serving, FP16 host L2 conversion, protected sidecars, nested KV/GDN transactions, immutable COW manifests, asynchronous host transfer ordering, and independent host-snapshot cadence are implemented and tested. |
 | Boundary fix | Non-page-aligned host-prefix forks now use the ceiling page count, allowing the partial tail to be copied instead of being rejected as an invalid entitlement. |
 
 The local DFlash2 artifact is intentionally an experimental artifact until its full artifact,
@@ -147,6 +151,10 @@ Run the optimized local DFlash2 artifact:
 ```
 
 The optimized artifact is local to the experimental branch and is not yet a public download.
+
+For the research comparison that deliberately runs both low-bit proposal passes, add
+`--vericache-q2-filter`; normal serving leaves this off so the live Q4 verifier is not followed by
+a redundant Q2 pass.
 
 ## Requirements
 

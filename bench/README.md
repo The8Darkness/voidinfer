@@ -24,17 +24,19 @@ The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, 
 have a private prefill/decode loop and does not call target implementation interfaces.
 
 The Qwen3.8-27B experimental DFlash2 round executable
-`ninfer_qwen3_6_27b_dflash_round_bench` additionally exposes the opt-in Hierarchical VeriCache
-research path. It reports direct-NVFP4 L0 timing, protected-recent sidecar configuration, nested
-KV/GDN transaction activity, exact-target fallback acceptance, and occupied host-tier bytes. The
-current host L1/L2 values are intentionally zero unless the run materializes host checkpoints;
-they must not be interpreted as an independent verifier result.
+`ninfer_qwen3_6_27b_dflash_round_bench` exposes the OSCAR-Q2/Q4 Hierarchical VeriCache path. The
+default run keeps Q2 in VRAM, dual-writes an independently calibrated Q4 shadow, serves with the
+live Q4 verifier/proposal, and promotes authoritative target KV to FP16 host records. It reports
+protected sidecars, nested KV/GDN transaction activity, exact-target acceptance, host-transfer
+activity, and occupied tier bytes.
 
 The DFlash2 round harness accepts `--vericache-l1-horizon 256..2048` for the verifier controller
 and `--vericache-host-snapshot-horizon 0|256..2048` for asynchronous host persistence. A value of
-`0` follows the adaptive verifier horizon; a nonzero value is independent. The serving default is
-2048 for the current checkpoint-only host path. Host snapshots remain a persistence/checkpoint
-mechanism until an independent host-tier logit verifier is implemented and measured.
+`0` follows the adaptive verifier horizon; a nonzero value is independent. The benchmark-only
+`--vericache-q2-filter` flag forces the two-pass Q2→Q4 comparison path; normal serving leaves it
+off so a discarded Q2 proposal pass does not reduce accepted tokens per second. The live verifier
+is device-side Q4 because PCIe-backed CPU attention is not viable on the per-token hot path; pinned
+RAM is the L1 mirror and FP16 L2 restore source.
 
 Packed NVFP4 attention uses pair decoding by default. `NINFER_NVFP4_PAIR=2` selects the
 scalar-order-preserving pair route used by DFlash2 local attention, `NINFER_NVFP4_PAIR=1` selects

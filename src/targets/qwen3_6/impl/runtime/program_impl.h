@@ -789,8 +789,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
-    text_host_kv_page_stride =
-        plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
+    const HostKVPageLayout text_host_layout =
+        hierarchical_vericache.enabled()
+            ? plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry(), DType::FP16)
+            : plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry());
+    text_host_kv_page_stride = text_host_layout.page_stride;
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
@@ -825,6 +828,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         }
         dflash.emplace(backing, *plan.persistent.dflash, *local,
                        state_images->dflash_local_q4_shadow());
+        dflash->q4_primary = hierarchical_vericache.enabled() &&
+                             hierarchical_vericache_options.l1_live_verifier_primary &&
+                             dflash->local_q4_shadow != nullptr;
     }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
@@ -834,9 +840,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             plan.persistent.state_images.dflash_local
                 ? plan.persistent.state_images.dflash_local->payload_bytes()
                 : 0U;
-        // The resident DFlash local cache is the currently implemented L0.  Keep L1/L2/L3 at
-        // zero until a real host verifier/persistence path is attached; reporting an inferred
-        // number here would make benchmark telemetry misleading.
+        // The resident DFlash local cache is the L0 allocation. Host L1/L2 occupancy is dynamic
+        // and is derived from the pinned stores when runtime statistics are populated; do not
+        // infer it from the device reservation before any page/state has been promoted.
         hierarchical_vericache.set_tier_bytes(l0_bytes, 0U, 0U, 0U);
     }
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
@@ -850,7 +856,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     if (plan.context_cache.host_kv_capacity_bytes != 0) {
         std::vector<HostKVPageLayout> layouts;
-        layouts.push_back(plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()));
+        layouts.push_back(text_host_layout);
         if (const qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
             HostKVPageLayout backend_layout =
                 plan_host_kv_page_layout(backend->page_pool().geometry());
@@ -9133,7 +9139,9 @@ void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) c
     // Reuse the existing pinned StateImage and host KV stores for truthful tier accounting. The
     // compressed DFlash portion of a host StateImage is the L1 OSCAR-Q4 mirror; its remaining
     // payload is high-precision GDN/continuation state for L2. Host KV pages are authoritative
-    // L2 attention storage. L3 remains zero until a cold-store writer is attached.
+    // L2 attention storage and are encoded as FP16 in hierarchical mode. The active target-side
+    // device cache remains BF16 for kernel compatibility before it is promoted to host L2. L3
+    // remains zero until a cold-store writer is attached.
     if (state_images != nullptr) {
         if (const CyclicKVCache* q4_shadow = state_images->dflash_local_q4_shadow()) {
             out.vericache_l0_q4_shadow_bytes = q4_shadow->payload_bytes();
@@ -9157,9 +9165,9 @@ void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) c
         l1_bytes = local_bytes * occupied;
         l2_bytes = (layout.image_bytes - local_bytes) * occupied;
     }
-    // The target text KV uses the authoritative BF16 geometry in VeriCache mode, while the
-    // speculative MTP/DFlash backend uses the compressed U8/OSCAR geometry. Count them by owner
-    // rather than treating the shared arena as one undifferentiated tier.
+    // The target text KV uses BF16 on the device but FP16 records in the hierarchical host arena,
+    // while the speculative MTP/DFlash backend uses the compressed U8/OSCAR geometry. Count them
+    // by owner rather than treating the shared arena as one undifferentiated tier.
     if (text_kv_pages != nullptr) {
         l2_bytes += static_cast<std::size_t>(text_kv_pages->host_resident_count()) *
                     text_host_kv_page_stride;
@@ -11422,6 +11430,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     }
 
     const std::uint32_t width           = draft_window + 1U;
+    const bool live_q4_verifier         = dflash->local_q4_shadow != nullptr;
+    const bool q4_primary               = live_q4_verifier && dflash->q4_primary;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -11551,6 +11561,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     capacity) {
                 throw std::runtime_error("DFlash batch returned invalid row metadata");
             }
+            const std::int32_t l0_l1_accepted_i =
+                live_q4_verifier && !q4_primary ? dflash_host_egress->l0_l1_accepted[row]
+                                  : static_cast<std::int32_t>(extent);
+            if (l0_l1_accepted_i < 0 || l0_l1_accepted_i > static_cast<std::int32_t>(extent)) {
+                throw std::runtime_error("DFlash live verifier returned invalid prefix metadata");
+            }
             const std::span<const TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() +
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
@@ -11567,9 +11583,26 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 }
             }
             if (hierarchical_vericache.enabled() && extent != 0) {
-                const bool disagreement = accepted_i < static_cast<std::int32_t>(extent);
-                hierarchical_vericache.observe_exact_target_fallback(
-                    extent, static_cast<std::uint32_t>(accepted_i), disagreement, disagreement);
+                if (live_q4_verifier) {
+                    const std::uint32_t l1_accepted =
+                        static_cast<std::uint32_t>(l0_l1_accepted_i);
+                    const bool l0_l1_disagreement = l1_accepted < extent;
+                    const bool l1_l2_disagreement =
+                        accepted_i < static_cast<std::int32_t>(l1_accepted);
+                    if (!q4_primary) {
+                        hierarchical_vericache.observe_l0_to_l1(
+                            extent, l1_accepted, l0_l1_disagreement, l0_l1_disagreement);
+                    }
+                    hierarchical_vericache.observe_l1_to_l2(
+                        extent, static_cast<std::uint32_t>(accepted_i),
+                        l1_l2_disagreement, l1_l2_disagreement);
+                    hierarchical_vericache.record_exact_target(
+                        extent, static_cast<std::uint32_t>(accepted_i), l1_l2_disagreement);
+                } else {
+                    const bool disagreement = accepted_i < static_cast<std::int32_t>(extent);
+                    hierarchical_vericache.observe_exact_target_fallback(
+                        extent, static_cast<std::uint32_t>(accepted_i), disagreement, disagreement);
+                }
             }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{

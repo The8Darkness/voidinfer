@@ -51,6 +51,20 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
                                     cudaStream_t stream);
 
 /**
+ * Intersect two greedy proposal streams before target verification.
+ *
+ * For each row, writes the longest common prefix of `left` and `right` that is within
+ * `current_extents` to `verified_extents`, and writes that prefix length plus one to
+ * `valid_columns`. The extra valid column is the target correction/bonus column. All tensors
+ * are contiguous I32; left/right are [K,B], current_extents/verified_extents/valid_columns are
+ * [B]. The operation is used by the hierarchical OSCAR-Q2 -> OSCAR-Q4 verifier and has no
+ * workspace or state side effects.
+ */
+void speculative_common_prefix(const Tensor& left, const Tensor& right,
+                               const Tensor& current_extents, Tensor& verified_extents,
+                               Tensor& valid_columns, cudaStream_t stream);
+
+/**
  * Op: speculative_accept_greedy_drafts
  *
  * Algorithm:

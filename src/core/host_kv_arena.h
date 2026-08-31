@@ -23,6 +23,10 @@ struct HostKVPlaneLayout {
 
 struct HostKVPageLayout {
     KVPageGeometry geometry;
+    // Empty means the host representation uses the source/device dtype for every plane. A
+    // populated vector describes the actual host storage dtype per plane; the hierarchy uses this
+    // to keep target BF16 device KV as FP16 in the authoritative host tier.
+    std::vector<DType> storage_dtypes;
     std::vector<HostKVPlaneLayout> planes;
     std::size_t page_stride = 0;
 
@@ -30,6 +34,8 @@ struct HostKVPageLayout {
 };
 
 [[nodiscard]] HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry);
+[[nodiscard]] HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry,
+                                                         DType storage_dtype);
 
 [[nodiscard]] TransferWork plan_host_kv_transfer_work(const HostKVPageLayout& layout,
                                                       std::uint32_t pages,

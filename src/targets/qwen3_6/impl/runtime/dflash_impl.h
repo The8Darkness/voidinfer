@@ -225,13 +225,16 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
 template <class V>
 requires(V::DFlashConfig::is_v2)
 void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& frame,
-                           std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes);
+                           std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes,
+                           bool use_q4_verifier_cache);
 
 template <class V>
 void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& frame,
-                        std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
+                        std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes,
+                        bool use_q4_verifier_cache = false) {
     if constexpr (V::DFlashConfig::is_v2) {
-        propose_batch_v2_impl<V>(state, frame, batch_size, k, envelopes);
+        propose_batch_v2_impl<V>(state, frame, batch_size, k, envelopes,
+                                 use_q4_verifier_cache);
     } else if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash proposal is unavailable for this target");
     } else {
@@ -294,7 +297,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         state_destinations,
                         {Config::head_dim, Config::query_heads, Config::kv_heads},
                         Config::local_capacity, Config::attention_scale,
-                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                        use_q4_verifier_cache
+                            ? dflash_state(state).local_q4_layer(static_cast<std::uint32_t>(layer))
+                            : dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
                         envelopes.local, state.execution.work, attention_batch,
                         state.execution.device.stream);
                 } else {
@@ -365,7 +370,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
 template <class V>
 requires(V::DFlashConfig::is_v2)
 void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& frame,
-                           std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
+                           std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes,
+                           bool use_q4_verifier_cache) {
     using Config = typename V::DFlashConfig;
         static_assert(Config::block_size >= 2);
         static_assert(Config::selector_rank == ops::kDFlash2SelectorRank);
@@ -455,7 +461,9 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                     state_destinations,
                     {Config::head_dim, Config::query_heads, Config::kv_heads},
                     Config::local_capacity, Config::attention_scale,
-                    dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                    use_q4_verifier_cache
+                        ? dflash_state(state).local_q4_layer(static_cast<std::uint32_t>(layer))
+                        : dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
                     envelopes.local, state.execution.work, attention_batch,
                     state.execution.device.stream);
 
@@ -648,6 +656,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor append_positions   = frame.append_positions.slice(1, 0, batch_size);
         Tensor append_counts      = frame.append_counts.slice(0, 0, batch_size);
         Tensor drafts             = frame.draft_tokens.slice(1, 0, batch_size);
+        Tensor q2_l1_accepted     = frame.q2_l1_accepted.slice(0, 0, batch_size);
         Tensor verify_ids         = frame.verify_ids.slice(1, 0, batch_size);
         Tensor target_positions   = frame.proposal_positions.slice(1, 0, batch_size);
         Tensor target_tokens      = frame.target_argmax.slice(1, 0, batch_size);
@@ -657,6 +666,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size);
         Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
+        const bool live_q4_verifier = dflash_state(state).local_q4_shadow != nullptr;
+        const bool q4_primary       = live_q4_verifier && dflash_state(state).q4_primary;
 
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
@@ -667,7 +678,32 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
                                      state_destinations, dflash_rows, envelopes.append);
 
-        propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
+        if (q4_primary) {
+            // Q4 is the live verifier/serving proposal. Keep Q2 resident and independently
+            // dual-written for fallback, but do not spend another full DFlash2 pass generating a
+            // proposal that the higher-fidelity Q4 pass would immediately replace.
+            propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes, true);
+            CUDA_CHECK(cudaMemcpyAsync(q2_l1_accepted.data, extents.data,
+                                       static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToDevice, state.execution.device.stream));
+        } else {
+            propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
+        }
+        if (live_q4_verifier && !q4_primary) {
+            // Preserve the Q2 proposal in a dedicated contiguous round-state slot while the Q4
+            // verifier reruns the DFlash attention stack over the independently written Q4 cache.
+            // append_positions has width k+1 and cannot be sliced on dim 0 without leaving a
+            // width-sized batch stride.
+            Tensor q2_drafts = frame.q2_drafts.slice(1, 0, batch_size);
+            CUDA_CHECK(cudaMemcpyAsync(q2_drafts.data, drafts.data, drafts.bytes(),
+                                       cudaMemcpyDeviceToDevice, state.execution.device.stream));
+            propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes, true);
+            // The Q4 pass is a refinement, not merely a veto. Record the common Q2->Q4 prefix for
+            // acceptance telemetry, but send the complete Q4 proposal to the authoritative target
+            // so a Q2 disagreement can be replaced by the higher-fidelity candidate.
+            ops::speculative_common_prefix(q2_drafts, drafts, extents, q2_l1_accepted,
+                                           append_counts, state.execution.device.stream);
+        }
         ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
                                             state.execution.device.stream);
 
@@ -706,6 +742,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        if (live_q4_verifier) {
+            CUDA_CHECK(cudaMemcpyAsync(state.host_egress.l0_l1_accepted.data(),
+                                       q2_l1_accepted.data,
+                                       static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, state.execution.device.stream));
+        }
     };
 }
 

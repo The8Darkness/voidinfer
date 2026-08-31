@@ -12,9 +12,12 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 struct DFlashPersistentState {
     CyclicKVCache& local;
-    // Independently written OSCAR-Q4 source shadow for the pinned host verifier. It is optional
-    // so legacy/non-hierarchical DFlash keeps its original footprint and append path.
+    // Independently written OSCAR-Q4 source shadow for the live L1 verifier and pinned host
+    // mirror. It is optional so legacy/non-hierarchical DFlash keeps its original footprint.
     CyclicKVCache* local_q4_shadow = nullptr;
+    // Prefer the Q4 shadow as the live DFlash proposal when the hierarchy is serving. Q2 stays
+    // resident for fallback and can be re-enabled as a two-pass comparison by the plan.
+    bool q4_primary = false;
     qwen3_6::PagedKVCache full;
     Tensor prefill_features;
     Tensor prefill_positions;

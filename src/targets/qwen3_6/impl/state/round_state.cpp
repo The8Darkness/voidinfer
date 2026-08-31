@@ -190,7 +190,11 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash append positions");
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
         decode.draft_tokens =
-            add_tensor(builder, DType::I32, {columns - 1, batch}, "DFlash proposal draft tokens");
+        add_tensor(builder, DType::I32, {columns - 1, batch}, "DFlash proposal draft tokens");
+        decode.q2_drafts = add_tensor(builder, DType::I32, {columns - 1, batch},
+                                      "DFlash Q2 verifier draft scratch");
+        decode.q2_l1_accepted =
+            add_tensor(builder, DType::I32, {batch}, "DFlash Q2 to Q4 accepted prefix");
         decode.verify_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash target verify ids");
         decode.target_argmax =
@@ -343,6 +347,8 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     append_positions           = layout.append_positions.bind(backing);
     append_counts              = layout.append_counts.bind(backing);
     draft_tokens               = layout.draft_tokens.bind(backing);
+    q2_drafts                  = layout.q2_drafts.bind(backing);
+    q2_l1_accepted              = layout.q2_l1_accepted.bind(backing);
     verify_ids                 = layout.verify_ids.bind(backing);
     target_argmax              = layout.target_argmax.bind(backing);
     target_logits              = layout.target_logits.bind(backing);

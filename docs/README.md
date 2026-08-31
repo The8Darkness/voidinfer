@@ -34,5 +34,7 @@ download.
 - [HTTP serving](serving.md) — runtime flags and endpoint behavior.
 
 The isolated `exp/hierarchical-vericache-20260830` branch is the active Qwen3.8 NVFP4 research track
-for OSCAR-Q2 L0, OSCAR-Q4 L1, 16-bit L2/L3 residency. Live host-tier logit verification, NVMe
-persistence, and the full quality matrix remain explicitly open until measured.
+for OSCAR-Q2 L0, live OSCAR-Q4 L1, FP16 host L2, and future L3 residency. The live verifier is the
+device-side Q4 shadow; pinned RAM is the promoted L1 mirror and FP16 L2 restore source. Host-side
+logit verification, NVMe persistence, and the full quality matrix remain explicitly open until
+measured.

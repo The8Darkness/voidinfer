@@ -52,6 +52,7 @@ struct Options {
     std::uint32_t protected_sink_tokens   = 4;
     std::uint32_t protected_pivot_tokens  = 4;
     std::uint8_t l0_bits                  = 2;
+    bool q2_filter                        = false;
 };
 
 void print_usage(const char* executable) {
@@ -67,6 +68,7 @@ void print_usage(const char* executable) {
                   " [--vericache-l1-horizon <256..2048>]"
                   " [--vericache-host-snapshot-horizon <256..2048>]"
                  " [--vericache-l0-bits 2|4]"
+                 " [--vericache-q2-filter]"
                  " [--vericache-protected-recent <0..2048>]"
                  " [--vericache-protected-sinks <0..2048>]"
                  " [--vericache-protected-pivots <0..2048>]"
@@ -149,6 +151,8 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--vericache-l0-bits must be 2 or 4");
             }
             options.l0_bits = static_cast<std::uint8_t>(bits);
+        } else if (argument == "--vericache-q2-filter") {
+            options.q2_filter = true;
         } else if (argument == "--vericache-protected-recent") {
             options.protected_recent_tokens =
                 parse_u32(value("--vericache-protected-recent"), "vericache-protected-recent");
@@ -305,6 +309,7 @@ int run(const Options& options) {
     engine.hierarchical_vericache.l1_to_l2_max_horizon = options.l1_to_l2_horizon;
     engine.hierarchical_vericache.host_snapshot_horizon = options.host_snapshot_horizon;
     engine.hierarchical_vericache.l0_bits = options.l0_bits;
+    engine.hierarchical_vericache.l1_live_verifier_primary = !options.q2_filter;
     // The direct target facade does not run Engine::normalize_engine_options().
     // Keep the benchmark's startup capacities identical to the production defaults.
     engine.context_cache.device_state_slots            = options.batch_size;
@@ -476,9 +481,14 @@ int run(const Options& options) {
               << (oscar_hierarchy ? "oscar-q" + std::to_string(options.l0_bits) : "n/a")
               << '\n';
     std::cout << "vericache_l1_format,"
-              << (oscar_hierarchy ? "oscar-q4-pinned-host" : "n/a") << '\n';
+              << (oscar_hierarchy ? "oscar-q4-live-verifier" : "n/a") << '\n';
     std::cout << "vericache_l2_format,"
-              << (oscar_hierarchy ? "bf16-authoritative-host" : "n/a") << '\n';
+              << (oscar_hierarchy ? "fp16-authoritative-host" : "n/a") << '\n';
+    std::cout << "vericache_l1_storage,"
+              << (oscar_hierarchy ? "device-q4-shadow+pinned-host-mirror" : "n/a") << '\n';
+    std::cout << "vericache_l1_live_verifier," << (oscar_hierarchy ? "true" : "false") << '\n';
+    std::cout << "vericache_l1_primary," << (oscar_hierarchy && !options.q2_filter ? "true" : "false")
+              << '\n';
     std::cout << "vericache_l1_live_logit_verifier,false\n";
     std::cout << "vericache_l0_to_q4_source,"
               << (oscar_hierarchy
@@ -534,7 +544,19 @@ int run(const Options& options) {
     std::cout << "vericache_l1_to_l2_horizon," << vericache_stats.vericache_l1_to_l2_horizon
               << '\n';
     std::cout << "vericache_l0_l1_checks," << vericache_stats.vericache_l0_l1_checks << '\n';
+    std::cout << "vericache_l0_l1_proposed_tokens,"
+              << vericache_stats.vericache_l0_l1_proposed_tokens << '\n';
+    std::cout << "vericache_l0_l1_accepted_tokens,"
+              << vericache_stats.vericache_l0_l1_accepted_tokens << '\n';
+    std::cout << "vericache_l0_l1_disagreements,"
+              << vericache_stats.vericache_l0_l1_disagreements << '\n';
     std::cout << "vericache_l1_l2_checks," << vericache_stats.vericache_l1_l2_checks << '\n';
+    std::cout << "vericache_l1_l2_proposed_tokens,"
+              << vericache_stats.vericache_l1_l2_proposed_tokens << '\n';
+    std::cout << "vericache_l1_l2_accepted_tokens,"
+              << vericache_stats.vericache_l1_l2_accepted_tokens << '\n';
+    std::cout << "vericache_l1_l2_disagreements,"
+              << vericache_stats.vericache_l1_l2_disagreements << '\n';
     std::cout << "vericache_exact_target_checks," << vericache_stats.vericache_exact_target_checks
               << '\n';
     std::cout << "vericache_exact_target_proposed_tokens,"

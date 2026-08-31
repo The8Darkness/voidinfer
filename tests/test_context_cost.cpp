@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -175,6 +176,26 @@ void test_kv_physical_work() {
     expect(ninfer::plan_device_kv_copy_work(page_major, 3) ==
                ninfer::TransferWork{.payload_bytes = 3 * page_payload, .copy_operations = 6},
            "PageMajor Device KV work does not count one copy per plane and page");
+
+    const ninfer::HostKVPageLayout page_major_fp16 =
+        ninfer::plan_host_kv_page_layout(page_major.geometry, ninfer::DType::FP16);
+    expect(page_major_fp16.storage_dtypes.size() == page_major.geometry.planes.size() &&
+               std::all_of(page_major_fp16.storage_dtypes.begin(),
+                           page_major_fp16.storage_dtypes.end(),
+                           [](ninfer::DType dtype) { return dtype == ninfer::DType::FP16; }) &&
+               page_major_fp16.page_stride == page_major.page_stride &&
+               page_major_fp16.planes == page_major.planes,
+           "BF16 Host KV geometry did not produce an equivalent FP16 authoritative layout");
+    const ninfer::KVPageGeometry int8_geometry{
+        .page_tokens        = 3,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {{ninfer::DType::I8, 8, 2, 256}},
+    };
+    expect_throw(
+        [&] {
+            (void)ninfer::plan_host_kv_page_layout(int8_geometry, ninfer::DType::FP16);
+        },
+        "non-BF16 Host KV plane accepted an unsupported FP16 conversion");
 
     const ninfer::HostKVPageLayout head_major = ninfer::plan_host_kv_page_layout({
         .page_tokens        = 3,

@@ -4,12 +4,14 @@
 #include "core/host_kv_arena.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace ninfer {
 namespace {
@@ -50,6 +52,153 @@ void validate_geometry(const KVPageGeometry& geometry) {
 void increment_generation(std::uint32_t& generation) noexcept {
     ++generation;
     if (generation == 0) { ++generation; }
+}
+
+std::uint32_t float_bits(float value) noexcept {
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float bits_float(std::uint32_t bits) noexcept {
+    float value = 0.0F;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+std::uint16_t float_to_fp16_bits(float value) noexcept {
+    const std::uint32_t bits      = float_bits(value);
+    const std::uint16_t sign      = static_cast<std::uint16_t>((bits >> 16U) & 0x8000U);
+    const std::uint32_t exponent = (bits >> 23U) & 0xffU;
+    std::uint32_t mantissa       = bits & 0x7fffffU;
+    if (exponent == 0xffU) {
+        if (mantissa == 0) { return static_cast<std::uint16_t>(sign | 0x7c00U); }
+        mantissa >>= 13U;
+        return static_cast<std::uint16_t>(sign | 0x7c00U | (mantissa == 0 ? 1U : mantissa));
+    }
+
+    int half_exponent = static_cast<int>(exponent) - 127 + 15;
+    if (half_exponent <= 0) {
+        if (half_exponent < -10) { return sign; }
+        mantissa |= 0x800000U;
+        const int shift = 14 - half_exponent;
+        std::uint32_t half_mantissa = mantissa >> shift;
+        const std::uint32_t remainder = mantissa & ((1U << shift) - 1U);
+        const std::uint32_t halfway   = 1U << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (half_mantissa & 1U) != 0)) {
+            ++half_mantissa;
+        }
+        return static_cast<std::uint16_t>(sign | half_mantissa);
+    }
+    if (half_exponent >= 31) { return static_cast<std::uint16_t>(sign | 0x7c00U); }
+
+    std::uint32_t half_mantissa = mantissa >> 13U;
+    const std::uint32_t remainder = mantissa & 0x1fffU;
+    if (remainder > 0x1000U || (remainder == 0x1000U && (half_mantissa & 1U) != 0)) {
+        ++half_mantissa;
+        if (half_mantissa == 0x400U) {
+            half_mantissa = 0;
+            ++half_exponent;
+            if (half_exponent >= 31) { return static_cast<std::uint16_t>(sign | 0x7c00U); }
+        }
+    }
+    return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(half_exponent) << 10U) |
+                                       half_mantissa);
+}
+
+float fp16_bits_to_float(std::uint16_t value) noexcept {
+    const std::uint32_t sign     = (static_cast<std::uint32_t>(value & 0x8000U) << 16U);
+    std::uint32_t exponent       = (value >> 10U) & 0x1fU;
+    std::uint32_t mantissa       = value & 0x3ffU;
+    std::uint32_t float_exponent = 0;
+    if (exponent == 0) {
+        if (mantissa == 0) { return bits_float(sign); }
+        int unbiased = -14;
+        while ((mantissa & 0x400U) == 0) {
+            mantissa <<= 1U;
+            --unbiased;
+        }
+        mantissa &= 0x3ffU;
+        float_exponent = static_cast<std::uint32_t>(unbiased + 127);
+    } else if (exponent == 0x1fU) {
+        float_exponent = 0xffU;
+    } else {
+        float_exponent = exponent - 15U + 127U;
+    }
+    return bits_float(sign | (float_exponent << 23U) | (mantissa << 13U));
+}
+
+std::uint16_t bf16_to_fp16(std::uint16_t value) noexcept {
+    return float_to_fp16_bits(bits_float(static_cast<std::uint32_t>(value) << 16U));
+}
+
+std::uint16_t fp16_to_bf16(std::uint16_t value) noexcept {
+    const std::uint32_t bits = float_bits(fp16_bits_to_float(value));
+    const std::uint32_t bias = 0x7fffU + ((bits >> 16U) & 1U);
+    return static_cast<std::uint16_t>((bits + bias) >> 16U);
+}
+
+bool host_uses_fp16_for_bf16(const HostKVPageLayout& host,
+                             const std::vector<Tensor>& device_planes) {
+    if (host.storage_dtypes.empty()) { return false; }
+    if (host.storage_dtypes.size() != device_planes.size() ||
+        host.planes.size() != device_planes.size()) {
+        throw std::invalid_argument("Paged KV host storage dtype inventory is inconsistent");
+    }
+    bool converts = false;
+    for (std::size_t index = 0; index < device_planes.size(); ++index) {
+        const DType source = device_planes[index].dtype;
+        const DType target = host.storage_dtypes[index];
+        if (source == target) { continue; }
+        if (source != DType::BF16 || target != DType::FP16) {
+            throw std::invalid_argument(
+                "Paged KV only supports BF16-to-FP16 host storage conversion");
+        }
+        converts = true;
+    }
+    return converts;
+}
+
+void convert_host_records_bf16_to_fp16(std::byte* records, std::uint32_t pages,
+                                       const HostKVPageLayout& host,
+                                       const std::vector<Tensor>& device_planes) {
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        for (std::size_t index = 0; index < device_planes.size(); ++index) {
+            if (device_planes[index].dtype != DType::BF16 ||
+                host.storage_dtypes[index] != DType::FP16) {
+                continue;
+            }
+            const HostKVPlaneLayout& plane = host.planes[index];
+            auto* values = reinterpret_cast<std::uint16_t*>(
+                records + static_cast<std::size_t>(page) * host.page_stride + plane.offset);
+            const std::size_t count = plane.page_payload_bytes / sizeof(std::uint16_t);
+            for (std::size_t element = 0; element < count; ++element) {
+                values[element] = bf16_to_fp16(values[element]);
+            }
+        }
+    }
+}
+
+void convert_host_records_fp16_to_bf16(std::byte* records, std::uint32_t pages,
+                                       const HostKVPageLayout& host,
+                                       const std::vector<Tensor>& device_planes) {
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        for (std::size_t index = 0; index < device_planes.size(); ++index) {
+            if (device_planes[index].dtype != DType::BF16 ||
+                host.storage_dtypes[index] != DType::FP16) {
+                continue;
+            }
+            const HostKVPlaneLayout& plane = host.planes[index];
+            auto* values = reinterpret_cast<std::uint16_t*>(
+                records + static_cast<std::size_t>(page) * host.page_stride + plane.offset);
+            const std::size_t count = plane.page_payload_bytes / sizeof(std::uint16_t);
+            for (std::size_t element = 0; element < count; ++element) {
+                values[element] = fp16_to_bf16(values[element]);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -569,6 +718,7 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
     for (DeviceKVPageHandle page : source) { (void)physical_index(page); }
 
     const HostKVPageLayout& host = destination.layout();
+    const bool convert_bf16_to_fp16 = host_uses_fp16_for_bf16(host, planes_);
     std::size_t begin            = 0;
     while (begin < source.size()) {
         std::size_t end = begin + 1;
@@ -599,6 +749,14 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
         }
         begin = end;
     }
+    if (convert_bf16_to_fp16) {
+        // The destination is the canonical pinned host record. Wait for the raw DMA before
+        // converting in place; this keeps the conversion bounded by the destination allocation
+        // and avoids a second context-sized staging buffer.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        convert_host_records_bf16_to_fp16(destination.data(),
+                                          static_cast<std::uint32_t>(source.size()), host, planes_);
+    }
 }
 
 void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
@@ -611,6 +769,64 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
     validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
 
     const HostKVPageLayout& host = source.layout();
+    const bool convert_fp16_to_bf16 = host_uses_fp16_for_bf16(host, planes_);
+    if (convert_fp16_to_bf16) {
+        // H2D restores are infrequent relative to decode. Convert bounded chunks into a temporary
+        // canonical record and use synchronous copies so the staging storage can be reused safely
+        // without extending the Host KV allocation lifetime.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        constexpr std::size_t kConversionChunkBytes = 8U * 1024U * 1024U;
+        const std::size_t pages_per_chunk =
+            std::max<std::size_t>(1U, kConversionChunkBytes / host.page_stride);
+        std::vector<std::byte> staging;
+        std::size_t begin = 0;
+        while (begin < destination.size()) {
+            std::size_t end = begin + 1;
+            while (end < destination.size() &&
+                   destination[end].index_ == destination[end - 1].index_ + 1) {
+                ++end;
+            }
+            for (std::size_t chunk_begin = begin; chunk_begin < end;
+                 chunk_begin += pages_per_chunk) {
+                const std::size_t count = std::min(pages_per_chunk, end - chunk_begin);
+                if (count > std::numeric_limits<std::size_t>::max() / host.page_stride) {
+                    throw std::overflow_error("Paged KV FP16 restore staging size overflow");
+                }
+                const std::size_t bytes = count * host.page_stride;
+                staging.resize(bytes);
+                std::memcpy(staging.data(),
+                            source.data() + chunk_begin * host.page_stride, bytes);
+                convert_host_records_fp16_to_bf16(staging.data(),
+                                                  static_cast<std::uint32_t>(count), host, planes_);
+                const std::int32_t first = destination[chunk_begin].index_;
+                for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+                    const Tensor& plane                 = planes_[plane_index];
+                    const HostKVPlaneLayout& host_plane = host.planes[plane_index];
+                    const auto* host_base = staging.data() + host_plane.offset;
+                    auto* device_base     = static_cast<unsigned char*>(plane.data);
+                    if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
+                        CUDA_CHECK(cudaMemcpy2D(
+                            device_base + static_cast<std::int64_t>(first) * plane.nb[3],
+                            plane.nb[3], host_base, host.page_stride,
+                            host_plane.page_payload_bytes, count, cudaMemcpyHostToDevice));
+                    } else {
+                        for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+                            CUDA_CHECK(cudaMemcpy2D(
+                                device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
+                                    static_cast<std::int64_t>(first) * plane.nb[2],
+                                plane.nb[2],
+                                host_base + static_cast<std::size_t>(head) *
+                                                host_plane.head_payload_bytes,
+                                host.page_stride, host_plane.head_payload_bytes, count,
+                                cudaMemcpyHostToDevice));
+                        }
+                    }
+                }
+            }
+            begin = end;
+        }
+        return;
+    }
     std::size_t begin            = 0;
     while (begin < destination.size()) {
         std::size_t end = begin + 1;

@@ -735,6 +735,8 @@ std::string format_server_start_json(
                engine_options.hierarchical_vericache.protected_sink_tokens},
               {"protected_pivot_tokens",
                engine_options.hierarchical_vericache.protected_pivot_tokens},
+              {"l1_live_verifier_primary",
+               engine_options.hierarchical_vericache.l1_live_verifier_primary},
               {"host_tier_snapshots",
                engine_options.hierarchical_vericache.enable_host_tier_snapshots},
               {"cold_store_path",

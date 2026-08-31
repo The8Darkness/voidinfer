@@ -47,6 +47,18 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
+void speculative_common_prefix_launch(const Tensor& left, const Tensor& right,
+                                      const Tensor& current_extents, Tensor& verified_extents,
+                                      Tensor& valid_columns, cudaStream_t stream) {
+    constexpr int kBlock = 32;
+    speculative_common_prefix_kernel<<<left.ne[1], kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(left.data), static_cast<const std::int32_t*>(right.data),
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(verified_extents.data),
+        static_cast<std::int32_t*>(valid_columns.data), left.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
                                              const Tensor& drafts, const Tensor& current_extents,
                                              Tensor& lengths, Tensor& anchors,

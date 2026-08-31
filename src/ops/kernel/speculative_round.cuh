@@ -36,6 +36,23 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
     }
 }
 
+__global__ void speculative_common_prefix_kernel(const std::int32_t* left,
+                                                 const std::int32_t* right,
+                                                 const std::int32_t* current_extents,
+                                                 std::int32_t* verified_extents,
+                                                 std::int32_t* valid_columns, std::int32_t k) {
+    if (threadIdx.x != 0) { return; }
+    const int row = static_cast<int>(blockIdx.x);
+    int extent    = current_extents[row];
+    extent        = extent < 0 ? 0 : (extent > k ? k : extent);
+    const std::int32_t* left_row  = left + row * k;
+    const std::int32_t* right_row = right + row * k;
+    int common = 0;
+    while (common < extent && left_row[common] == right_row[common]) { ++common; }
+    verified_extents[row] = common;
+    valid_columns[row]    = common + 1;
+}
+
 template <typename T>
 __device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offset) {
     return ptr == nullptr

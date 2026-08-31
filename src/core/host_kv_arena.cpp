@@ -44,25 +44,41 @@ void increment_generation(std::uint32_t& generation) noexcept {
 
 } // namespace
 
-HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry) {
+namespace {
+
+HostKVPageLayout plan_host_kv_page_layout_impl(const KVPageGeometry& geometry,
+                                               std::span<const DType> storage_dtypes) {
     if (geometry.page_tokens == 0 || geometry.planes.empty()) {
         throw std::invalid_argument("Host KV page geometry is empty");
+    }
+    if (!storage_dtypes.empty() && storage_dtypes.size() != geometry.planes.size()) {
+        throw std::invalid_argument("Host KV storage dtype inventory is inconsistent");
     }
 
     HostKVPageLayout out;
     out.geometry = geometry;
+    if (!storage_dtypes.empty()) {
+        out.storage_dtypes.assign(storage_dtypes.begin(), storage_dtypes.end());
+    }
     out.planes.reserve(geometry.planes.size());
     std::size_t cursor = 0;
-    for (const KVPlaneGeometry& plane : geometry.planes) {
+    for (std::size_t index = 0; index < geometry.planes.size(); ++index) {
+        const KVPlaneGeometry& plane = geometry.planes[index];
         if (plane.leading_extent <= 0 || plane.head_extent <= 0) {
             throw std::invalid_argument("Host KV plane geometry must be positive");
+        }
+        const DType storage_dtype = storage_dtypes.empty() ? plane.dtype : storage_dtypes[index];
+        if (storage_dtype != plane.dtype &&
+            !(plane.dtype == DType::BF16 && storage_dtype == DType::FP16)) {
+            throw std::invalid_argument(
+                "Host KV only supports BF16-to-FP16 authoritative storage conversion");
         }
         // Device slab alignment is not part of the canonical packed Host representation.
         cursor = align_up(cursor, kHostKVAlignment, "Host KV plane");
         const std::size_t head_bytes =
             checked_mul(checked_mul(static_cast<std::size_t>(plane.leading_extent),
                                     geometry.page_tokens, "Host KV head payload overflow"),
-                        dtype_size(plane.dtype), "Host KV head payload overflow");
+                        dtype_size(storage_dtype), "Host KV head payload overflow");
         const std::size_t page_bytes =
             checked_mul(head_bytes, static_cast<std::size_t>(plane.head_extent),
                         "Host KV plane payload overflow");
@@ -75,6 +91,17 @@ HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry) {
     }
     out.page_stride = align_up(cursor, kHostKVAlignment, "Host KV page record");
     return out;
+}
+
+} // namespace
+
+HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry) {
+    return plan_host_kv_page_layout_impl(geometry, {});
+}
+
+HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry, DType storage_dtype) {
+    const std::vector<DType> storage_dtypes(geometry.planes.size(), storage_dtype);
+    return plan_host_kv_page_layout_impl(geometry, storage_dtypes);
 }
 
 TransferWork plan_host_kv_transfer_work(const HostKVPageLayout& layout, std::uint32_t pages,
@@ -213,12 +240,14 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
     : capacity_bytes_(capacity_bytes),
       layouts_(supported_layouts.begin(), supported_layouts.end()) {
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
-        const HostKVPageLayout planned = plan_host_kv_page_layout(layouts_[index].geometry);
+        const HostKVPageLayout planned =
+            plan_host_kv_page_layout_impl(layouts_[index].geometry,
+                                          layouts_[index].storage_dtypes);
         if (planned != layouts_[index]) {
             throw std::invalid_argument("Host KV arena received an inconsistent page layout");
         }
         for (std::size_t previous = 0; previous < index; ++previous) {
-            if (layouts_[previous] == layouts_[index]) {
+            if (layouts_[previous].geometry == layouts_[index].geometry) {
                 throw std::invalid_argument("Host KV arena contains a duplicate page layout");
             }
         }
@@ -248,7 +277,13 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
 
 std::optional<std::uint32_t>
 HostKVArena::find_layout(const HostKVPageLayout& layout) const noexcept {
-    const auto it = std::find(layouts_.begin(), layouts_.end(), layout);
+    const auto it = std::find_if(layouts_.begin(), layouts_.end(), [&](const HostKVPageLayout& candidate) {
+        // Storage dtype is an implementation detail of the arena's canonical layout. Callers
+        // written before the FP16 host-tier extension still pass the source-dtype plan; accept
+        // that equivalent geometry and return the arena-owned layout for the actual copy format.
+        return candidate.geometry == layout.geometry && candidate.planes == layout.planes &&
+               candidate.page_stride == layout.page_stride;
+    });
     if (it == layouts_.end()) { return std::nullopt; }
     return static_cast<std::uint32_t>(it - layouts_.begin());
 }

@@ -89,6 +89,9 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    // Host-visible result of the live OSCAR-Q2 -> OSCAR-Q4 prefix intersection. It is copied
+    // after the normal target egress so the target's licensed-token ABI remains unchanged.
+    std::array<std::int32_t, kMaximumConcurrency> l0_l1_accepted{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -137,6 +140,8 @@ struct DFlashDecodeStateLayout {
     TensorRegion append_positions;
     TensorRegion append_counts;
     TensorRegion draft_tokens;
+    TensorRegion q2_drafts;
+    TensorRegion q2_l1_accepted;
     TensorRegion verify_ids;
     TensorRegion target_argmax;
     TensorRegion target_logits;
@@ -268,6 +273,8 @@ struct DFlashDecodeState {
     Tensor append_positions;
     Tensor append_counts;
     Tensor draft_tokens;
+    Tensor q2_drafts;
+    Tensor q2_l1_accepted;
     Tensor verify_ids;
     Tensor target_argmax;
     Tensor target_logits;

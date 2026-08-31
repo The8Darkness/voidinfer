@@ -10,35 +10,36 @@ The hierarchy is experimental and remains separate from the stable fallback.
 | Tier | Representation | Status |
 | --- | --- | --- |
 | L0 VRAM | OSCAR-Q2 packed U8 with affine BF16 scale/zero metadata; protected recent/sink/pivot rows stay in BF16 sidecars. | Active DFlash2 speculative KV and direct OSCAR attention path. |
-| L1 pinned RAM | Independently written OSCAR-Q4 packed U8 with independently fitted metadata and protected sidecars. | Active host snapshot/attention mirror; not yet a live host-logit verifier. |
-| L2 RAM | Full 16-bit authoritative target KV plus GDN state. The current Qwen target path stores this as BF16; FP16 byte-format conversion is still open. | Authoritative restore/checkpoint tier. |
+| L1 pinned RAM | Independently written OSCAR-Q4 packed U8 with independently fitted metadata and protected sidecars. The source is also kept as a device Q4 shadow. | Live Q4 DFlash2 verifier/proposal; pinned mirror is used for promotion/restore. |
+| L2 RAM | Full authoritative target KV stored as FP16 host records plus protected GDN state. The active target device cache remains BF16 for kernel compatibility. | Authoritative restore/checkpoint tier. |
 | L3 NVMe | No active writer; current measured bytes are zero. | Reserved for cold persistence. |
 
 The Q4 mirror is dual-written from the BF16 append rows in one fused rotated kernel. It is not
 reconstructed from lossy Q2 codes. Q3 is not a serving or benchmark target.
 
-The current implementation has not connected the host mirror to a second target-model logit pass.
-Consequently, `L0→L1` and `L1→L2` live acceptance counters are zero in the results below; exact
-target DFlash2 verification and nested KV/GDN rollback remain active. This distinction is important:
-the current measurements validate the storage and transaction path, not a completed hierarchical
-quality claim.
+The live serving decision uses the device Q4 shadow, not CPU attention over pinned RAM. The default
+Q4-first route avoids a discarded Q2 DFlash2 pass; `--vericache-q2-filter` retains the explicit
+two-pass Q2→Q4 comparison and reports its common-prefix acceptance. In both routes the exact target
+model remains authoritative and nested KV/GDN rollback is active. This distinction matters: the
+current measurements validate a live device-side Q4 verifier plus host FP16 promotion, not a claim
+that PCIe-backed host attention is on the per-token hot path.
 
-## Matched 32K OSCAR controls
+## Matched context-512 serving controls
 
-Both rows used the same local Qwen3.8-27B DFlash2 artifact, DFlash2 `k=7`, full proposal head,
-1,024-token prefill chunks, one warmup, one measured repetition, no CUDA Graph, batch 1, protected
-recent=64/sinks=4/pivots=4, and host snapshots enabled. The Q2 row is the default hierarchy; Q4 is a
-storage/throughput control.
+Both rows used the same local Qwen3.8-27B DFlash2 artifact, DFlash2 `k=7`, optimized proposal head,
+1,024-token prefill chunks, two warmups, five measured repetitions, CUDA Graphs, batch 1, protected
+recent=64/sinks=4/pivots=4, and host snapshots enabled. The Q4-first row is the serving default;
+the two-pass row is the explicit Q2→Q4 research control.
 
-| L0 | Prefill tok/s | Round wall ms | Published tok/s | Accepted draft | L0 bytes | Extra Q4 shadow bytes | L1 Q4 bytes | L2 bytes | Snapshot |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| OSCAR-Q2 | 5,702.34 | 57.9637 | 34.5044 | 1/7 (14.29%) | 15,073,280 | 25,559,040 | 146,997,248 | 2,301,437,952 | passed |
-| OSCAR-Q4 control | 5,847.05 | 57.9637 | 34.5044 | 1/7 (14.29%) | 25,559,040 | 0 | 146,997,248 | 2,301,437,952 | passed |
+| Mode | Prefill tok/s | Round wall ms | Published tok/s | Accepted draft | Q2→Q4 accepted | Q4→target accepted | L0 bytes | Q4 shadow bytes | L2 FP16 bytes | Snapshot |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Q4-first default | 8,128.65 | 18.4731 | 184.052 | 12/35 (34.29%) | n/a | 13/49 | 15,073,280 | 25,559,040 | 187,508,736 | passed |
+| Q2→Q4 two-pass (`--vericache-q2-filter`) | 8,146.02 | 21.6515 | 157.033 | 12/35 (34.29%) | 22/49 | 13/49 | 15,073,280 | 25,559,040 | 187,508,736 | passed |
 
-The one-round acceptance sample is not a stable throughput estimate. Both rows recorded two exact
-target checks, one accepted proposed token, two disagreements, and four nested commits/rollbacks.
-They recorded zero live Q2→Q4 and Q4→L2 logit checks because that verifier consumer is not wired
-yet.
+The rows are short direct probes, not broad task-quality claims. Q4-first deliberately does not
+execute a Q2 proposal pass, so Q2→Q4 acceptance is not applicable; Q4→target is the authoritative
+check. The two-pass row shows why it is retained for research but not selected for serving: it adds
+the Q2 pass without improving final acceptance in this trace.
 
 ## OSCAR codec comparison
 
@@ -80,7 +81,8 @@ references, not multiplicative speedup claims.
 - Qwen3.8 GDN state participates in the state-image fork/restore/copy paths and nested transaction
   accounting.
 - Seeded sampling distribution tests, long-context retrieval, coding/reasoning/tool JSON, multi-agent
-  reuse, vision/OCR, live Q2→Q4 verification, and FP16 host-format validation remain open.
+  reuse, host-side logit verification, and vision/OCR remain open. FP16 host-format conversion is
+  implemented and exercised by the snapshot probe; it is not yet a broad quality qualification.
 - The 800K aggregate residency plan and 262K single-stream confidence target are research targets;
   they are not current supported-capacity claims.
 
@@ -109,4 +111,6 @@ build-windows-hierarchical\bench\ninfer_qwen3_6_27b_dflash_round_bench.exe `
   --vericache-l0-bits 2 --no-cuda-graph
 ```
 
-Use `--vericache-l0-bits 4` for the Q4 L0 control. There is no Q3 control in the active hierarchy.
+Use `--vericache-l0-bits 4` for the single-Q4 L0 control. Add `--vericache-q2-filter` to the
+hierarchical command to force the two-pass Q2→Q4 comparison. There is no Q3 control in the active
+hierarchy.
