@@ -581,7 +581,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             matrix(layout, DType::BF16, DFlashConfig::conv_projection_rows,
                                    tokens);
                             matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
-                            matrix(layout, DType::BF16, 2 * DFlashConfig::intermediate, tokens);
                             matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
                             matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
                         }

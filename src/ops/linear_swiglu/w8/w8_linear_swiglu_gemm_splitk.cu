@@ -20,6 +20,11 @@ constexpr int kFirstExactT  = 2;
 constexpr int kLastExactT   = 48;
 using ProjectionLauncher    = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
+constexpr int kQwenIntermediate = 17408;
+constexpr int kQwenRowsPerCta   = 8;
+constexpr int kQwenFirstT       = 1;
+constexpr int kQwenLastT        = 40;
+
 struct W8SwiGluExactTRows {
     static constexpr int kOutputRowsPerCta = kRowsPerCta;
     int intermediate;
@@ -44,6 +49,15 @@ struct W8SwiGluExactTEpilogue {
             out[static_cast<std::int64_t>(col0 + 1) * rows + row] =
                 __float2bfloat16_rn(silu(projected.y) * projected.w);
         }
+    }
+};
+
+struct W8SwiGluQwenRows {
+    static constexpr int kOutputRowsPerCta = kQwenRowsPerCta;
+
+    __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
+        return output_row0 + (local_row & (kQwenRowsPerCta - 1)) +
+               (local_row >= kQwenRowsPerCta ? kQwenIntermediate : 0);
     }
 };
 
@@ -80,6 +94,33 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kLaunchers =
     make_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
 
+template <int ActiveCols>
+void launch_qwen_active_cols(const Tensor& x, const Weight& w, Tensor& out,
+                             cudaStream_t stream) {
+    using Geometry = W8MtpGateUpProjectionGeometry;
+    using Schedule = typename W8LinearSmallTProductionSchedule<Geometry, ActiveCols>::Type;
+    static_assert((Geometry::kOutputRows / 2) % kQwenRowsPerCta == 0);
+    const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data),
+                                            kQwenIntermediate};
+    const W8SwiGluExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data),
+                                          kQwenIntermediate};
+    const W8SwiGluQwenRows row_policy{};
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                          W8SwiGluExactTEpilogue, W8SwiGluQwenRows, true>
+        <<<kQwenIntermediate / kQwenRowsPerCta, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_qwen_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_qwen_active_cols<kQwenFirstT + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kQwenLaunchers =
+    make_qwen_launchers(std::make_index_sequence<kQwenLastT - kQwenFirstT + 1>{});
+
 } // namespace
 
 void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Tensor& out,
@@ -88,6 +129,15 @@ void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Te
         throw std::invalid_argument("W8 LinearSwiGLU exact split-K requires T=2..48");
     }
     kLaunchers[x.ne[1] - kFirstExactT](x, w, out, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void w8_linear_swiglu_qwen_small_t_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                          cudaStream_t stream) {
+    if (x.ne[1] < kQwenFirstT || x.ne[1] > kQwenLastT) {
+        throw std::invalid_argument("W8 Qwen LinearSwiGLU small-T requires T=1..40");
+    }
+    kQwenLaunchers[x.ne[1] - kQwenFirstT](x, w, out, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

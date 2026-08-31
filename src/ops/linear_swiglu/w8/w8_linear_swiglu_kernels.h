@@ -14,6 +14,10 @@ void w8_linear_swiglu_decode_pair_r16_launch(const Tensor& x, const Weight& w, T
                                              cudaStream_t stream);
 void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Tensor& out,
                                             cudaStream_t stream);
+void w8_linear_swiglu_qwen_small_t_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                          cudaStream_t stream);
+void w8_linear_swiglu_qwen_large_t_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                          cudaStream_t stream);
 void w8_linear_swiglu_mma_r32_c64_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream);
 void w8_linear_swiglu_mma_r32_c32_launch(const Tensor& x, const Weight& w, Tensor& out,

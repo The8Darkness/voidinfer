@@ -474,12 +474,11 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
                 ops::dflash2_dynamic_conv(roots.hidden, mlp_dynamic, weight.mlp_conv_base, 0,
                                           Config::block_size, ffn_conv,
                                           state.execution.device.stream);
-                Tensor gate_up = state.execution.work.alloc(
-                    DType::BF16, {2 * Config::intermediate, columns});
-                ops::linear(ffn_conv, weight.gate_up, gate_up, state.execution.device.stream);
-                ops::silu_mul(gate_up.slice(0, 0, Config::intermediate),
-                              gate_up.slice(0, Config::intermediate, Config::intermediate),
-                              roots.intermediate, state.execution.device.stream);
+                // DFlash2's W8 gate/up projection now uses the Qwen3.8 fused SwiGLU route. This
+                // keeps the gate/up accumulators in registers and avoids materializing the
+                // 34,816 x columns BF16 intermediate before the nonlinearity.
+                ops::linear_swiglu(ffn_conv, weight.gate_up, roots.intermediate,
+                                   state.execution.work, state.execution.device.stream);
                 Tensor mlp_out =
                     state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
                 ops::linear(roots.intermediate, weight.down, mlp_out,

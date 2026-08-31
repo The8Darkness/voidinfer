@@ -170,10 +170,12 @@ void sliding_window_attention_nvfp4_launch(
     if (max_context < 0 || window < 2 || (window & (window - 1)) != 0) {
         throw std::invalid_argument("sliding_window_attention NVFP4 launch has invalid bounds");
     }
-    const dim3 grid(static_cast<unsigned>(q.ne[2] * q.ne[1]),
+    // The NVFP4 path groups the four query heads that share one KV head so their packed K/V row
+    // is decoded once per block instead of once per query-head warp.
+    const dim3 grid(static_cast<unsigned>(q.ne[2] * kCyclicKVCacheNvfp4KVHeads),
                     static_cast<unsigned>(q.ne[3]), 1);
     const auto launch = [&]<bool HasProtected>() {
-        sliding_window_attention_nvfp4_kernel<HasProtected><<<grid, 32, 0, stream>>>(
+        sliding_window_attention_nvfp4_grouped_kernel<HasProtected><<<grid, 128, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const __nv_bfloat16*>(query_k.data),
             static_cast<const __nv_bfloat16*>(query_v.data),

@@ -50,8 +50,11 @@ constexpr bool catalog_is_closed() {
 static_assert(catalog_is_closed(), "W8 LinearSwiGLU routes must be exact and closed");
 
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == 12288 && problem.output_rows == 6144 && problem.k == 2048 &&
-           problem.padded_k == 2048;
+    const bool qwen35b = problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
+                         problem.k == 2048 && problem.padded_k == 2048;
+    const bool qwen38 = problem.gate_up_rows == 34816 && problem.output_rows == 17408 &&
+                        problem.k == 5120 && problem.padded_k == 5120;
+    return qwen35b || qwen38;
 }
 
 } // namespace
@@ -109,6 +112,14 @@ void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor&
     const W8LinearSwiGluPlan resolved = w8_linear_swiglu_resolve_plan(problem);
     if (resolved.schedule != plan.schedule) {
         throw std::invalid_argument("W8 LinearSwiGLU: plan does not match exact problem");
+    }
+    if (problem.gate_up_rows == 34816 && problem.output_rows == 17408 && problem.k == 5120) {
+        if (x.ne[1] <= 40) {
+            w8_linear_swiglu_qwen_small_t_launch(x, w, out, stream);
+        } else {
+            w8_linear_swiglu_qwen_large_t_launch(x, w, out, stream);
+        }
+        return;
     }
     switch (plan.schedule) {
     case W8LinearSwiGluScheduleId::DecodePairR16:
