@@ -186,12 +186,11 @@ int run_dynamic_conv_benchmark() {
     return 0;
 }
 
-int run_qkv_projection_case() {
+int run_qkv_projection_case(std::int32_t columns) {
     constexpr std::int32_t input_rows = 5120;
     constexpr std::int32_t query_rows = 4096;
     constexpr std::int32_t kv_rows = 1024;
     constexpr std::int32_t parent_rows = query_rows + 2 * kv_rows;
-    constexpr std::int32_t columns = 8;
     constexpr std::int32_t groups = input_rows / 32;
 
     std::vector<std::uint8_t> codes(static_cast<std::size_t>(parent_rows) * input_rows);
@@ -262,7 +261,7 @@ int run_qkv_projection_case() {
                     expected_v.begin() + static_cast<std::size_t>(t) * kv_rows);
     }
 
-    const std::string label = "dflash2_qkv_proj";
+    const std::string label = "dflash2_qkv_proj T=" + std::to_string(columns);
     int failures = verify_exact((label + " q").c_str(),
                                 from_device<std::uint16_t>(device_q.data(), expected_q.size()),
                                 expected_q);
@@ -280,7 +279,7 @@ int run_qkv_projection_case() {
     failures += device_k.verify_guards(label + " k");
     failures += device_v.verify_guards(label + " v");
 
-    if (std::getenv("NINFER_DFLASH2_BENCH") != nullptr) {
+    if (std::getenv("NINFER_DFLASH2_BENCH") != nullptr && (columns == 8 || columns == 64)) {
         constexpr int warmup = 20;
         constexpr int repeats = 100;
         constexpr int samples_count = 5;
@@ -681,7 +680,9 @@ int main() {
     int failures = 0;
     failures += run_dynamic_conv_case(0);
     failures += run_dynamic_conv_case(1);
-    failures += run_qkv_projection_case();
+    for (const std::int32_t columns : {1, 8, 16, 48, 49, 64}) {
+        failures += run_qkv_projection_case(columns);
+    }
     failures += run_predecessor_ids_case();
     failures += run_select_candidates_case();
     failures += run_selector_lattice_case();
