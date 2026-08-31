@@ -38,6 +38,24 @@ void dflash2_select_candidates(const Tensor& logits, Tensor& out_ids, Tensor& ou
                                cudaStream_t stream);
 
 /**
+ * Score an existing top-16 candidate list directly against a row-scaled FP8 output head.
+ *
+ * This is the sparse companion to the full vocabulary projection used by the optimized
+ * proposal route: only the selected rows are read, and the result is rounded to the same BF16
+ * representation consumed by the selector. `candidate_ids` are full-vocabulary ids, not ids in a
+ * private proposal vocabulary.
+ *
+ *   out_values[s, t] = BF16(FP8_row(candidate_ids[s, t]) dot hidden[:, t])
+ *
+ * `hidden` is BF16 [K,T], `candidate_ids` is I32 [16,T], `out_values` is FP32 [16,T], and the
+ * FP8 weight must use the validated row-scale layout. The operation performs no full-vocabulary
+ * materialization and requires no workspace.
+ */
+void dflash2_score_fp8_candidates(const Tensor& hidden, const Weight& weight,
+                                  const Tensor& candidate_ids, Tensor& out_values,
+                                  cudaStream_t stream);
+
+/**
  * Op: DFlash2 candidate-selector lattice.
  *
  * The DFlash2 drafter exposes no raw logits to the host. For every draft

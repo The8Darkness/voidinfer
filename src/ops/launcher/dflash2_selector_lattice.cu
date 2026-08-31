@@ -9,6 +9,10 @@
 
 #include "core/device.h"
 #include "ninfer/ops/dflash2_selector_lattice.h"
+#include "ops/common/math.cuh"
+#include "ops/common/memory.cuh"
+#include "ops/common/warp.cuh"
+#include "ops/linear/fp8/fp8_a16_codec.cuh"
 
 #include <cuda_bf16.h>
 
@@ -278,6 +282,59 @@ void dflash2_select_candidates_launch(const Tensor& logits, Tensor& out_ids, Ten
     dflash2_select_candidates_kernel<<<tokens, kSelThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), vocab, tokens,
         static_cast<std::int32_t*>(out_ids.data), static_cast<float*>(out_values.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Sparse target-head rescoring for the optimized proposal route. One warp owns one candidate
+// row; the row is streamed once, so the kernel reads only 16*T*5,120 FP8 bytes instead of the
+// full vocabulary projection. Output is rounded to BF16 before being widened to FP32 so the
+// selector sees the same represented logit precision as the regular output-head projection.
+__global__ void dflash2_score_fp8_candidates_kernel(
+    const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
+    const __nv_bfloat16* __restrict__ row_scales, const std::int32_t* __restrict__ candidate_ids,
+    float* __restrict__ out_values, std::int32_t n, std::int32_t input_rows,
+    std::int32_t tokens) {
+    constexpr std::int32_t k = kDFlash2SelectorTopK;
+    const std::int32_t flat = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t slot = flat % k;
+    const std::int32_t token = flat / k;
+    if (token >= tokens) { return; }
+
+    const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x) & 31;
+    const std::int32_t row = candidate_ids[static_cast<std::int64_t>(token) * k + slot];
+    float sum = 0.0F;
+    if (row >= 0 && row < n) {
+        const auto* codes = weight_codes + static_cast<std::int64_t>(row) * input_rows;
+        const auto* activation = hidden + static_cast<std::int64_t>(token) * input_rows;
+        for (std::int32_t column = lane * 2; column < input_rows; column += 64) {
+            const std::uint16_t packed = load_vec<std::uint16_t>(codes + column);
+            const unsigned weight_bits = fp8_e4m3x2_to_bf16x2_bits(packed);
+            const unsigned activation_bits =
+                load_vec<unsigned>(reinterpret_cast<const unsigned*>(activation + column));
+            const float2 weight_values = bf16x2_bits_to_float2(weight_bits);
+            const float2 activation_values = bf16x2_bits_to_float2(activation_bits);
+            sum = fmaf(weight_values.x, activation_values.x, sum);
+            sum = fmaf(weight_values.y, activation_values.y, sum);
+        }
+    }
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) {
+        const float scaled = row >= 0 && row < n ? sum * __bfloat162float(row_scales[row]) : 0.0F;
+        out_values[static_cast<std::int64_t>(token) * k + slot] =
+            __bfloat162float(__float2bfloat16_rn(scaled));
+    }
+}
+
+void dflash2_score_fp8_candidates_launch(const Tensor& hidden, const Weight& weight,
+                                         const Tensor& candidate_ids, Tensor& out_values,
+                                         cudaStream_t stream) {
+    const std::int32_t tokens = hidden.ne[1];
+    dflash2_score_fp8_candidates_kernel<<<tokens * kDFlash2SelectorTopK, 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(hidden.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const __nv_bfloat16*>(weight.scales),
+        static_cast<const std::int32_t*>(candidate_ids.data), static_cast<float*>(out_values.data),
+        weight.n, weight.k, tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 

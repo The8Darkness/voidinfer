@@ -4,8 +4,10 @@
 #include "ninfer/ops/dflash2_selector_lattice.h"
 #include "ninfer/ops/linear.h"
 #include "ops/op_tester.h"
+#include "quantized_weight.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <numeric>
@@ -453,6 +455,85 @@ int run_predecessor_ids_case() {
     return failures;
 }
 
+int run_fp8_candidate_score_case() {
+    constexpr std::int32_t rows   = 64;
+    constexpr std::int32_t hidden = 64;
+    constexpr std::int32_t tokens = 3;
+
+    const auto host_weight = quantized_weight::make_patterned_weight(
+        QType::FP8_E4M3FN_ROW_BF16S, rows, hidden, 29U);
+    std::vector<std::uint16_t> hidden_bits(static_cast<std::size_t>(hidden) * tokens);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t c = 0; c < hidden; ++c) {
+            hidden_bits[static_cast<std::size_t>(t) * hidden + c] =
+                f32_to_bf16(0.25f + 0.03125f * static_cast<float>((c + 3 * t) % 11));
+        }
+    }
+
+    std::vector<std::int32_t> candidate_ids(
+        static_cast<std::size_t>(kDFlash2SelectorTopK) * tokens);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t s = 0; s < kDFlash2SelectorTopK; ++s) {
+            candidate_ids[static_cast<std::size_t>(t) * kDFlash2SelectorTopK + s] =
+                (7 * s + 11 * t + 3) % rows;
+        }
+    }
+
+    std::vector<float> expected(candidate_ids.size());
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t s = 0; s < kDFlash2SelectorTopK; ++s) {
+            const std::int32_t row =
+                candidate_ids[static_cast<std::size_t>(t) * kDFlash2SelectorTopK + s];
+            float sum = 0.0F;
+            for (std::int32_t c = 0; c < hidden; ++c) {
+                const float w = static_cast<float>(quantized_weight::detail::decode_e4m3fn(
+                    host_weight.payload[static_cast<std::size_t>(row) * hidden + c]));
+                const float x = bf16_to_f32(hidden_bits[static_cast<std::size_t>(t) * hidden + c]);
+                sum = std::fmaf(w, x, sum);
+            }
+            const float scale = bf16_to_f32(quantized_weight::detail::load_u16_le(
+                host_weight.payload,
+                static_cast<std::size_t>(host_weight.scale_plane_offset) +
+                    static_cast<std::size_t>(row) * sizeof(std::uint16_t)));
+            expected[static_cast<std::size_t>(t) * kDFlash2SelectorTopK + s] =
+                bf16_to_f32(f32_to_bf16(sum * scale));
+        }
+    }
+
+    GuardedDeviceBuffer device_weight(host_weight.payload.size());
+    GuardedDeviceBuffer device_hidden(hidden_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_candidates(candidate_ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_out(expected.size() * sizeof(float));
+    device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes());
+    device_hidden.copy_from_host(hidden_bits.data(), device_hidden.bytes());
+    device_candidates.copy_from_host(candidate_ids.data(), device_candidates.bytes());
+    device_out.fill(0xcd);
+
+    const Weight weight = host_weight.device_weight(device_weight.data());
+    Tensor hidden_tensor(device_hidden.data(), DType::BF16, {hidden, tokens});
+    Tensor candidate_tensor(device_candidates.data(), DType::I32,
+                            {kDFlash2SelectorTopK, tokens});
+    Tensor out_tensor(device_out.data(), DType::FP32, {kDFlash2SelectorTopK, tokens});
+    ops::dflash2_score_fp8_candidates(hidden_tensor, weight, candidate_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "dflash2_score_fp8_candidates";
+    const std::vector<float> actual_f = from_device<float>(device_out.data(), expected.size());
+    std::vector<double> actual(actual_f.begin(), actual_f.end());
+    std::vector<double> expected_d(expected.begin(), expected.end());
+    int failures = verify_pointwise(label, actual, expected_d,
+                                    PointwiseCriterion{/*absolute=*/1.0e-3,
+                                                       /*relative=*/1.0e-4});
+    failures += verify_exact((label + " candidates preserved").c_str(),
+                             from_device<std::int32_t>(device_candidates.data(), candidate_ids.size()),
+                             candidate_ids);
+    failures += device_weight.verify_guards(label + " weight");
+    failures += device_hidden.verify_guards(label + " hidden");
+    failures += device_candidates.verify_guards(label + " candidates");
+    failures += device_out.verify_guards(label + " output");
+    return failures;
+}
+
 int run_select_candidates_case() {
     constexpr std::int32_t vocab  = 248320;
     constexpr std::int32_t tokens = 3;
@@ -684,6 +765,7 @@ int main() {
         failures += run_qkv_projection_case(columns);
     }
     failures += run_predecessor_ids_case();
+    failures += run_fp8_candidate_score_case();
     failures += run_select_candidates_case();
     failures += run_selector_lattice_case();
     failures += run_trace_path_case();

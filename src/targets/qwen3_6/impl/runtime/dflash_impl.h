@@ -496,10 +496,29 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
             state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
         ops::rmsnorm(residual, state.execution.model.dflash->final_norm, Config::rms_epsilon,
                      false, proposal_hidden, state.execution.device.stream);
+        // DFlash2's selector only consumes the top-16 proposal candidates. When the caller
+        // selected the optimized proposal profile, reuse the artifact's quantized 131K-row
+        // draft head instead of streaming the full 248K-row target head. The candidate IDs are
+        // remapped to the target vocabulary before selector codebook lookup. On the FP8 target
+        // artifact, rescore just those rows from the target head so the selector keeps the
+        // target-head unary ordering without paying for a full vocabulary projection; target
+        // verification remains authoritative for every accepted token.
+        const OptimizedProposalWeights* private_proposal =
+            state.execution.proposal_head == ProposalHead::Optimized &&
+                    state.execution.model.optimized_proposal.has_value()
+                ? &*state.execution.model.optimized_proposal
+                : nullptr;
+        const std::int32_t proposal_vocab =
+            private_proposal == nullptr ? TextConfig::output_rows : private_proposal->head.n;
         Tensor logits =
-            state.execution.work.alloc(DType::BF16, {TextConfig::output_rows, columns});
-        ops::linear(proposal_hidden, state.execution.model.output_head, logits,
-                    state.execution.device.stream);
+            state.execution.work.alloc(DType::BF16, {proposal_vocab, columns});
+        if (private_proposal == nullptr) {
+            ops::linear(proposal_hidden, state.execution.model.output_head, logits,
+                        state.execution.device.stream);
+        } else {
+            ops::linear(proposal_hidden, private_proposal->head, logits,
+                        state.execution.device.stream);
+        }
 
         Tensor candidates =
             state.execution.work.alloc(DType::I32, {Config::selector_top_k, columns});
@@ -515,6 +534,16 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
 
         const std::int32_t top_k_columns = Config::selector_top_k * columns;
         Tensor candidates_flat = candidates.view({top_k_columns});
+        if (private_proposal != nullptr) {
+            ops::proposal_remap_token_ids(
+                candidates_flat, static_cast<const std::int32_t*>(private_proposal->token_ids.data),
+                private_proposal->head.n, state.execution.device.stream);
+            if (state.execution.model.output_head.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+                ops::dflash2_score_fp8_candidates(proposal_hidden,
+                                                  state.execution.model.output_head, candidates,
+                                                  unary, state.execution.device.stream);
+            }
+        }
         Tensor successor =
             state.execution.work.alloc(DType::BF16, {Config::selector_rank, top_k_columns});
         ops::embedding(candidates_flat,

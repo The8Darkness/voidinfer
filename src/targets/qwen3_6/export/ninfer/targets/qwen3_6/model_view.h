@@ -93,9 +93,9 @@ struct DFlashWeights {
 struct DFlash2LayerWeights : DFlashLayerWeights {
 };
 
-// DFlash2 uses the target output head (there is no private proposal head) and
-// selects candidates with predecessor/successor codebooks and a hidden
-// projection.
+// DFlash2 selects candidates with predecessor/successor codebooks and a hidden projection. The
+// runtime can use either the target output head or the optional private proposal head; optimized
+// proposals remap their ids to the full vocabulary before selector lookup.
 template <std::size_t Layers>
 struct DFlash2Weights {
     Weight feature_projection;

@@ -2,6 +2,7 @@
 #include "ninfer/ops/dflash2_selector_lattice.h"
 
 #include "ops/launcher/dflash2_selector_lattice.h"
+#include "ops/linear/fp8/fp8_format.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -66,6 +67,41 @@ void dflash2_select_candidates(const Tensor& logits, Tensor& out_ids, Tensor& ou
     }
 
     detail::dflash2_select_candidates_launch(logits, out_ids, out_values, stream);
+}
+
+void dflash2_score_fp8_candidates(const Tensor& hidden, const Weight& weight,
+                                  const Tensor& candidate_ids, Tensor& out_values,
+                                  cudaStream_t stream) {
+    const auto geometry = detail::validate_fp8_weight(weight, "dflash2_score_fp8_candidates");
+    (void)geometry;
+    if (hidden.dtype != DType::BF16 || candidate_ids.dtype != DType::I32 ||
+        out_values.dtype != DType::FP32) {
+        throw std::invalid_argument(
+            "dflash2_score_fp8_candidates: hidden must be BF16, candidate_ids I32, out_values "
+            "FP32");
+    }
+    const std::int32_t tokens = hidden.ne[1];
+    if (hidden.ne[0] != weight.k || hidden.ne[2] != 1 || hidden.ne[3] != 1 || tokens <= 0) {
+        throw std::invalid_argument(
+            "dflash2_score_fp8_candidates: hidden must be [weight.k, T] with T > 0");
+    }
+    if (candidate_ids.ne[0] != kSelTopK || candidate_ids.ne[1] != tokens ||
+        candidate_ids.ne[2] != 1 || candidate_ids.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_score_fp8_candidates: candidate_ids must be [16, T]");
+    }
+    if (out_values.ne[0] != kSelTopK || out_values.ne[1] != tokens || out_values.ne[2] != 1 ||
+        out_values.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_score_fp8_candidates: out_values must be [16, T]");
+    }
+    if (!hidden.is_contiguous() || !candidate_ids.is_contiguous() || !out_values.is_contiguous() ||
+        hidden.data == nullptr || candidate_ids.data == nullptr || out_values.data == nullptr) {
+        throw std::invalid_argument(
+            "dflash2_score_fp8_candidates: tensors must be contiguous and non-null");
+    }
+
+    detail::dflash2_score_fp8_candidates_launch(hidden, weight, candidate_ids, out_values, stream);
 }
 
 void dflash2_selector_lattice(const Tensor& hidden_pos, const Tensor& successor,
