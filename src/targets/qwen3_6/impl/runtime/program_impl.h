@@ -1042,6 +1042,33 @@ void ProgramImplCore::reap_hierarchical_host_snapshots() {
                   snapshot.superseded_backend_address.has_value();
     }
     if (!pending || !hierarchical_snapshot_completion_.ready()) { return; }
+    // Host extent reclamation may partition an allocation after an older checkpoint address is
+    // released. Partitioning deliberately changes capability generations for retained runs, so
+    // the manifest must be rebuilt from the newly published checkpoint before validation rather
+    // than retaining stale capability values from the previous snapshot.
+    const auto rebuild_manifest_extents = [](const KVAddressSpaceStore& addresses,
+                                              const LogicalKVPageStore& pages,
+                                              std::optional<KVAddressSpaceHandle> address,
+                                              std::uint32_t frontier,
+                                              std::vector<HostKVExtentCapability>& extents) {
+        extents.clear();
+        if (frontier == 0) { return; }
+        if (!address || !addresses.valid(*address) || addresses.active(*address) ||
+            addresses.committed_frontier(*address) != frontier) {
+            throw std::logic_error("hierarchical checkpoint address changed during reaping");
+        }
+        const std::uint32_t required_pages = kv_pages_for_frontier(frontier);
+        for (std::uint32_t page = 0; page < required_pages; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(*address, page);
+            if (!pages.valid(logical) || !pages.host_resident(logical)) {
+                throw std::logic_error("hierarchical checkpoint lost a Host KV replica");
+            }
+            const HostKVExtentCapability capability = pages.host_replica(logical).extent;
+            if (std::find(extents.begin(), extents.end(), capability) == extents.end()) {
+                extents.push_back(capability);
+            }
+        }
+    };
     for (auto& snapshot : hierarchical_host_snapshots) {
         if (!snapshot.transfer && snapshot.pending_text_kv_extents.empty() &&
             snapshot.pending_backend_kv_extents.empty() &&
@@ -1118,6 +1145,19 @@ void ProgramImplCore::reap_hierarchical_host_snapshots() {
         if (snapshot.transfer) {
             state_store->publish_transfer(std::move(*snapshot.transfer), false);
             snapshot.transfer.reset();
+        }
+        rebuild_manifest_extents(*text_kv_addresses, *text_kv_pages,
+                                 snapshot.text_kv_checkpoint, snapshot.frontier,
+                                 snapshot.text_kv_extents);
+        if (snapshot.backend_frontier == 0) {
+            snapshot.backend_kv_extents.clear();
+        } else if (!backend_kv_addresses || !backend_kv_pages ||
+                   !snapshot.backend_kv_checkpoint) {
+            throw std::logic_error("hierarchical Backend KV checkpoint disappeared");
+        } else {
+            rebuild_manifest_extents(*backend_kv_addresses, *backend_kv_pages,
+                                     snapshot.backend_kv_checkpoint, snapshot.backend_frontier,
+                                     snapshot.backend_kv_extents);
         }
         if (!validate_hierarchical_host_snapshot(snapshot)) {
             throw std::logic_error("hierarchical host checkpoint manifest failed validation");
@@ -1546,7 +1586,7 @@ void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& seque
     reap_hierarchical_host_snapshots();
     auto& snapshot = hierarchical_host_snapshots[sequence.lane];
     if (sequence.execution_frontier <
-        hierarchical_vericache.next_l1_to_l2_boundary(snapshot.frontier)) {
+        hierarchical_vericache.next_host_snapshot_boundary(snapshot.frontier)) {
         return;
     }
     if (snapshot.transfer || !snapshot.pending_text_kv_extents.empty() ||

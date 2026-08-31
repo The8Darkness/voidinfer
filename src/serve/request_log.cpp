@@ -727,6 +727,8 @@ std::string format_server_start_json(
                engine_options.hierarchical_vericache.l1_to_l2_min_horizon},
               {"l1_to_l2_max_horizon",
                engine_options.hierarchical_vericache.l1_to_l2_max_horizon},
+              {"host_snapshot_horizon",
+               engine_options.hierarchical_vericache.host_snapshot_horizon},
               {"protected_recent_tokens",
                engine_options.hierarchical_vericache.protected_recent_tokens},
               {"protected_sink_tokens",

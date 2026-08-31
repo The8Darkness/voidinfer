@@ -42,6 +42,7 @@ struct Options {
     bool hierarchical_vericache    = false;
     bool host_tier_snapshots       = false;
     std::uint32_t l1_to_l2_horizon  = 512;
+    std::uint32_t host_snapshot_horizon = 0;
 };
 
 void print_usage(const char* executable) {
@@ -51,6 +52,7 @@ void print_usage(const char* executable) {
                  " [--kv-dtype bf16|vericache-nvfp4]"
                  " [--hierarchical-vericache] [--vericache-host-snapshots]"
                  " [--vericache-l1-horizon <256..2048>]"
+                 " [--vericache-host-snapshot-horizon <256..2048>]"
                  " [--no-cuda-graph]\n";
 }
 
@@ -102,6 +104,9 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--vericache-l1-horizon") {
             options.l1_to_l2_horizon =
                 static_cast<std::uint32_t>(std::stoul(value("--vericache-l1-horizon")));
+        } else if (argument == "--vericache-host-snapshot-horizon") {
+            options.host_snapshot_horizon = static_cast<std::uint32_t>(
+                std::stoul(value("--vericache-host-snapshot-horizon")));
         } else if (argument == "-h" || argument == "--help") {
             print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_6_27b_mtp_round_bench");
             std::exit(0);
@@ -117,6 +122,11 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.l1_to_l2_horizon < 256 || options.l1_to_l2_horizon > 2048) {
         throw std::invalid_argument("--vericache-l1-horizon must be in [256,2048]");
+    }
+    if (options.host_snapshot_horizon != 0 &&
+        (options.host_snapshot_horizon < 256 || options.host_snapshot_horizon > 2048)) {
+        throw std::invalid_argument(
+            "--vericache-host-snapshot-horizon must be 0 or in [256,2048]");
     }
     return options;
 }
@@ -173,6 +183,7 @@ int run(const Options& options) {
     engine.hierarchical_vericache.l1_to_l2_horizon = options.l1_to_l2_horizon;
     engine.hierarchical_vericache.l1_to_l2_min_horizon = options.l1_to_l2_horizon;
     engine.hierarchical_vericache.l1_to_l2_max_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.host_snapshot_horizon = options.host_snapshot_horizon;
     // The direct package benchmark does not pass through Engine option normalization. Keep
     // no-host controls lightweight, while a short host-snapshot run has one active image and one
     // spare plus enough typed KV space for the boundary-rotation experiment.
@@ -287,6 +298,8 @@ int run(const Options& options) {
     std::cout << "vericache_host_tier_snapshots_enabled,"
               << (options.host_tier_snapshots ? "true" : "false") << '\n';
     std::cout << "vericache_l1_to_l2_horizon_configured," << options.l1_to_l2_horizon << '\n';
+    std::cout << "vericache_host_snapshot_horizon_configured," << options.host_snapshot_horizon
+              << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "proposal_head,"
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")

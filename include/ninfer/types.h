@@ -117,6 +117,12 @@ struct HierarchicalVeriCacheOptions {
     std::uint32_t l1_to_l2_min_horizon = 256;
     std::uint32_t l1_to_l2_max_horizon = 2048;
 
+    // Optional fixed cadence for asynchronous host checkpoints. Zero follows the adaptive
+    // L1-to-L2 verifier horizon; a nonzero value is independent from verifier adaptation and is
+    // clamped to the configured L1-to-L2 bounds. This is a persistence policy, not permission for
+    // an approximate host snapshot to bypass the exact target.
+    std::uint32_t host_snapshot_horizon = 0;
+
     // These are default protection classes. Prompt-derived vision/system/tool ranges are added
     // by the runtime when their exact token spans are known.
     std::uint32_t protected_recent_tokens = 64;

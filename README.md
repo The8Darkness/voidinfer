@@ -77,7 +77,7 @@ measurable resource/runtime gate. Negative candidates remain documented as rejec
 | Resource pressure | Bounded continuation search when an incumbent plan exists, reducing pressure-resume planning work without changing the selected contract | The real Qwen3.8 pressure/resume route passes |
 | State and KV ownership | Canonical State/KV resource contracts, device binding, sparse-MoE scan reuse, and successful-warmup readiness gating | Public Engine/resource and readiness tests pass; these are correctness/admission improvements, not unsubstantiated tok/s claims |
 | Measurement discipline | Targeted Nsight Compute kernel inspection and Nsight Systems end-to-end traces on the RTX 5090 | Nsight Systems 2026.4.1 traces are available; Nsight Compute 2026.2.1 is installed, but hardware-counter access is blocked in the current Windows session by `ERR_NVGPUCTRPERM` |
-| Hierarchical VeriCache (research default on the isolated branch) | NVFP4 DFlash2 L0 with protected recent/anchor BF16 sidecar, nested KV/GDN transactions, adaptive fallback horizon, and event-ordered asynchronous host-tier snapshots | Focused append/attention/state tests pass; a matched two-lane 5090 run measured 23.6491 ms GPU round with async host snapshots versus 23.6857 ms control. Acceptance reduced published throughput to 182.992 versus 186.502 tok/s, so no end-to-end speedup or independent host L1/L2 output verification is claimed |
+| Hierarchical VeriCache (research default on the isolated branch) | NVFP4 DFlash2 L0 with protected recent/anchor BF16 sidecar, nested KV/GDN transactions, adaptive verifier horizons, independently configurable host checkpoints, and event-ordered asynchronous host-tier snapshots | Focused append/attention/state tests pass; serving defaults to a 2048-token checkpoint cadence while the verifier remains adaptive. A 32K/600-round RTX 5090 stress run passed repeated COW snapshots after manifest-capability refresh; fixed-2048 and fixed-512 were acceptance/transfer-neutral in that sample, so no end-to-end speedup or independent host L1/L2 output verification is claimed |
 | NVFP4 pair-decode attention | Make packed-byte pair decoding the default for dense NVFP4 causal attention and stable-order pair decoding the default for DFlash2 local attention; `NINFER_NVFP4_PAIR=0` restores the scalar fallback | Focused dense/sliding correctness passes. Fresh default-vs-scalar RTX 5090 samples at context 512 measured C1 `18.6615`/`18.8937` ms wall and `192.911`/`190.540` tok/s with identical `13/35` acceptance; C8 measured `32.3135`/`32.7918` ms and `736.535`/`731.891` tok/s with `79/280` versus `80/280` accepted drafts. The C8 acceptance fluctuation is recorded, so this is a qualified small serving win rather than a universal multiplier |
 
 The main implementation points are [src/ops/linear/fp8/](src/ops/linear/fp8/),
@@ -129,7 +129,8 @@ Implemented in this track:
 
 The default server profile is VeriCache-NVFP4, DFlash2 `k=7`, and the optimized proposal head;
 implicit vision requests route to MTP so BF16 vision remains protected, and DFlash2 CUDA Graphs
-are enabled for the graph-safe selector path. A real default-profile startup/API smoke on the RTX
+are enabled for the graph-safe selector path. Host checkpoint persistence defaults to a 2048-token
+cadence independently of the adaptive L1→L2 verifier horizon. A real default-profile startup/API smoke on the RTX
 5090 loaded the DFlash2 artifact in 51.19 s, reported the
 `qwen3.8-27b/nvfp4-dflash2` cost profile, returned `/health`=`ok`, and completed the full text
 serving contract. This is a serving-path smoke, not a quality or throughput qualification.

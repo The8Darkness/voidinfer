@@ -56,7 +56,8 @@ int main() {
                           defaults.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4,
                       "DFlash2 VeriCache serving profile is not the default");
     failures += check(defaults.hierarchical_vericache.enabled &&
-                          defaults.hierarchical_vericache.enable_host_tier_snapshots,
+                          defaults.hierarchical_vericache.enable_host_tier_snapshots &&
+                          defaults.hierarchical_vericache.host_snapshot_horizon == 2048,
                       "hierarchical VeriCache is not enabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
@@ -102,12 +103,14 @@ int main() {
     const ServeOptions hierarchical = parse(
         {"ninfer-serve", "model.ninfer", "--hierarchical-vericache",
          "--vericache-host-snapshots", "--vericache-l0-horizon", "48", "--vericache-l1-horizon",
-         "1024", "--vericache-protected-recent", "128", "--vericache-protected-sinks", "8",
+         "1024", "--vericache-host-snapshot-horizon", "1536",
+         "--vericache-protected-recent", "128", "--vericache-protected-sinks", "8",
          "--vericache-protected-pivots", "16"});
     failures += check(hierarchical.hierarchical_vericache.enabled &&
                           hierarchical.hierarchical_vericache.enable_host_tier_snapshots &&
                           hierarchical.hierarchical_vericache.l0_to_l1_horizon == 48 &&
                           hierarchical.hierarchical_vericache.l1_to_l2_horizon == 1024 &&
+                          hierarchical.hierarchical_vericache.host_snapshot_horizon == 1536 &&
                           hierarchical.hierarchical_vericache.protected_recent_tokens == 128 &&
                           hierarchical.hierarchical_vericache.protected_sink_tokens == 8 &&
                           hierarchical.hierarchical_vericache.protected_pivot_tokens == 16,
@@ -131,6 +134,12 @@ int main() {
     } catch (const std::invalid_argument&) { invalid_l1_horizon_rejected = true; }
     failures += check(invalid_l1_horizon_rejected,
                       "out-of-range L1 VeriCache horizon was accepted");
+    bool invalid_host_snapshot_horizon_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vericache-host-snapshot-horizon", "2049"});
+    } catch (const std::invalid_argument&) { invalid_host_snapshot_horizon_rejected = true; }
+    failures += check(invalid_host_snapshot_horizon_rejected,
+                      "out-of-range host snapshot horizon was accepted");
 
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});

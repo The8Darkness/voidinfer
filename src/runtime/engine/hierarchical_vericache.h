@@ -98,6 +98,11 @@ hierarchical_vericache_is_protected(HierarchicalVeriCacheSensitivity sensitivity
     options.l1_to_l2_horizon = validate_window(options.l1_to_l2_min_horizon,
                                                options.l1_to_l2_max_horizon,
                                                options.l1_to_l2_horizon, "L1-to-L2 horizon");
+    if (options.host_snapshot_horizon != 0) {
+        options.host_snapshot_horizon = validate_window(
+            options.l1_to_l2_min_horizon, options.l1_to_l2_max_horizon,
+            options.host_snapshot_horizon, "host snapshot horizon");
+    }
     if (options.protected_recent_tokens == 0 && options.protected_sink_tokens == 0 &&
         options.protected_pivot_tokens == 0 && options.enabled) {
         throw std::invalid_argument("hierarchical VeriCache must protect at least one token class");
@@ -343,11 +348,23 @@ public:
     [[nodiscard]] std::uint32_t l0_to_l1_horizon() const noexcept { return l0_l1_.current; }
     [[nodiscard]] std::uint32_t l1_to_l2_horizon() const noexcept { return l1_l2_.current; }
 
+    // Host snapshots are currently asynchronous persistence/checkpoint transfers. Keep their
+    // cadence independently tunable so a serving profile can reduce repeated StateImage/KV DMA
+    // without changing the horizon used by a future real host-tier logit verifier.
+    [[nodiscard]] std::uint32_t host_snapshot_horizon() const noexcept {
+        return options_.host_snapshot_horizon == 0 ? l1_l2_.current
+                                                    : options_.host_snapshot_horizon;
+    }
+
     [[nodiscard]] std::uint32_t next_l0_to_l1_boundary(std::uint32_t frontier) const noexcept {
         return saturating_add(frontier, l0_l1_.current);
     }
     [[nodiscard]] std::uint32_t next_l1_to_l2_boundary(std::uint32_t frontier) const noexcept {
         return saturating_add(frontier, l1_l2_.current);
+    }
+    [[nodiscard]] std::uint32_t next_host_snapshot_boundary(
+        std::uint32_t frontier) const noexcept {
+        return saturating_add(frontier, host_snapshot_horizon());
     }
 
     void observe_l0_to_l1(std::uint32_t proposed, std::uint32_t accepted, bool disagreement,

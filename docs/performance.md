@@ -766,3 +766,26 @@ larger batches, and was measured as neutral/slightly slower in the matched run b
 
 The fused graph is retained for exactness and lower target-head materialization pressure; no
 throughput multiplier is claimed.
+
+### E031: independent host-checkpoint cadence and COW manifest refresh
+
+The hierarchical controller now separates the cadence of asynchronous host persistence from the
+adaptive L1→L2 verifier horizon. `host_snapshot_horizon=0` follows the current adaptive verifier
+horizon; a nonzero value is an independently bounded persistence cadence. The research server
+defaults this checkpoint-only control to `2048`, while `--vericache-l1-horizon` remains the
+verifier control. Host snapshots are still persistence/checkpoint transfers, not host-logit
+verification.
+
+During repeated COW rotation, Host extent reclamation can partition a retained allocation and
+replace its capability generation. Reaping now rebuilds the checkpoint’s Text/Backend extent
+manifest from the newly published replicas before validation. A physical RTX 5090 32K/C=1,
+DFlash2 `k=7`, optimized-head, VeriCache-NVFP4, CUDA-Graph run with 600 measured rounds passed
+two repeated snapshots at fixed host cadence 2048:
+
+| Host snapshot cadence | GPU round | Wall round | Published tok/s | Draft acceptance | Snapshots | KV D2H |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fixed 512 control | 55.9827 ms | 55.9933 ms | 27.6819 | 330/4,200 (7.86%) | 2 | 1,041 pages / 2,321,547,264 bytes |
+| Fixed 2048 | 55.9164 ms | 55.9287 ms | 27.7139 | 330/4,200 (7.86%) | 2 | 1,041 pages / 2,321,547,264 bytes |
+
+The result is a repeated-checkpoint correctness milestone; asynchronous coalescing made transfer
+totals equal in this long run, so no end-to-end speedup is claimed.

@@ -30,6 +30,12 @@ KV/GDN transaction activity, exact-target fallback acceptance, and occupied host
 current host L1/L2 values are intentionally zero unless the run materializes host checkpoints;
 they must not be interpreted as an independent verifier result.
 
+The DFlash2 round harness accepts `--vericache-l1-horizon 256..2048` for the verifier controller
+and `--vericache-host-snapshot-horizon 0|256..2048` for asynchronous host persistence. A value of
+`0` follows the adaptive verifier horizon; a nonzero value is independent. The serving default is
+2048 for the current checkpoint-only host path. Host snapshots remain a persistence/checkpoint
+mechanism until an independent host-tier logit verifier is implemented and measured.
+
 Packed NVFP4 attention uses pair decoding by default. `NINFER_NVFP4_PAIR=2` selects the
 scalar-order-preserving pair route used by DFlash2 local attention, `NINFER_NVFP4_PAIR=1` selects
 the faster reassociated pair route for experiments, and `NINFER_NVFP4_PAIR=0` restores the scalar

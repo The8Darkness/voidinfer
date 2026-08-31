@@ -46,6 +46,7 @@ struct Options {
     bool hierarchical_vericache    = false;
     bool host_tier_snapshots       = false;
     std::uint32_t l1_to_l2_horizon  = 512;
+    std::uint32_t host_snapshot_horizon = 0;
     std::uint32_t protected_recent_tokens = 64;
     std::uint32_t protected_sink_tokens   = 4;
     std::uint32_t protected_pivot_tokens  = 4;
@@ -61,6 +62,7 @@ void print_usage(const char* executable) {
                  " [--hierarchical-vericache]"
                  " [--vericache-host-snapshots]"
                  " [--vericache-l1-horizon <256..2048>]"
+                 " [--vericache-host-snapshot-horizon <256..2048>]"
                  " [--vericache-protected-recent <0..2048>]"
                  " [--vericache-protected-sinks <0..2048>]"
                  " [--vericache-protected-pivots <0..2048>]"
@@ -131,6 +133,9 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--vericache-l1-horizon") {
             options.l1_to_l2_horizon = parse_u32(value("--vericache-l1-horizon"),
                                                  "vericache-l1-horizon");
+        } else if (argument == "--vericache-host-snapshot-horizon") {
+            options.host_snapshot_horizon = parse_u32(
+                value("--vericache-host-snapshot-horizon"), "vericache-host-snapshot-horizon");
         } else if (argument == "--vericache-protected-recent") {
             options.protected_recent_tokens =
                 parse_u32(value("--vericache-protected-recent"), "vericache-protected-recent");
@@ -166,6 +171,11 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.l1_to_l2_horizon < 256 || options.l1_to_l2_horizon > 2048) {
         throw std::invalid_argument("--vericache-l1-horizon must be in [256,2048]");
+    }
+    if (options.host_snapshot_horizon != 0 &&
+        (options.host_snapshot_horizon < 256 || options.host_snapshot_horizon > 2048)) {
+        throw std::invalid_argument(
+            "--vericache-host-snapshot-horizon must be 0 or in [256,2048]");
     }
     if (options.protected_sink_tokens > 2048) {
         throw std::invalid_argument("--vericache-protected-sinks must be in [0,2048]");
@@ -276,6 +286,7 @@ int run(const Options& options) {
     engine.hierarchical_vericache.l1_to_l2_horizon = options.l1_to_l2_horizon;
     engine.hierarchical_vericache.l1_to_l2_min_horizon = options.l1_to_l2_horizon;
     engine.hierarchical_vericache.l1_to_l2_max_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.host_snapshot_horizon = options.host_snapshot_horizon;
     // The direct target facade does not run Engine::normalize_engine_options().
     // Keep the benchmark's startup capacities identical to the production defaults.
     engine.context_cache.device_state_slots            = options.batch_size;
@@ -442,6 +453,8 @@ int run(const Options& options) {
     std::cout << "vericache_host_tier_snapshots_enabled,"
               << (options.host_tier_snapshots ? "true" : "false") << '\n';
     std::cout << "vericache_l1_to_l2_horizon_configured," << options.l1_to_l2_horizon << '\n';
+    std::cout << "vericache_host_snapshot_horizon_configured," << options.host_snapshot_horizon
+              << '\n';
     std::cout << "vericache_protected_recent_tokens," << options.protected_recent_tokens << '\n';
     std::cout << "vericache_protected_sink_tokens," << options.protected_sink_tokens << '\n';
     std::cout << "vericache_protected_pivot_tokens," << options.protected_pivot_tokens << '\n';

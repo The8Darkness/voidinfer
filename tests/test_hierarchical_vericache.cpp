@@ -18,6 +18,7 @@ void test_adaptive_windows() {
     options.l0_to_l1_min_horizon = 4;
     options.l0_to_l1_max_horizon = 16;
     options.l1_to_l2_horizon = 512;
+    options.host_snapshot_horizon = 2048;
     AdaptiveHierarchicalVeriCacheController controller(options);
 
     assert(controller.l0_to_l1_horizon() == 8);
@@ -29,6 +30,8 @@ void test_adaptive_windows() {
     assert(controller.l0_to_l1_horizon() == 5);
     assert(controller.next_l0_to_l1_boundary(100) == 105);
     assert(controller.next_l1_to_l2_boundary(100) == 612);
+    assert(controller.host_snapshot_horizon() == 2048);
+    assert(controller.next_host_snapshot_boundary(100) == 2148);
 
     RuntimeStats stats;
     controller.populate(stats);

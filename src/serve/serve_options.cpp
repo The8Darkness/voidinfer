@@ -94,6 +94,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--hierarchical-vericache | --no-hierarchical-vericache] "
            "[--vericache-host-snapshots | --no-vericache-host-snapshots] "
            "[--vericache-l0-horizon 24..64] [--vericache-l1-horizon 256..2048] "
+           "[--vericache-host-snapshot-horizon 256..2048] "
            "[--vericache-protected-recent N] [--vericache-protected-sinks N] "
            "[--vericache-protected-pivots N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
@@ -124,8 +125,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --hierarchical-vericache enables the L0/L1/L2 route explicitly and\n"
            "       --no-hierarchical-vericache returns to the stable cache fallback\n"
            "       --vericache-host-snapshots promotes compressed KV plus authoritative GDN state\n"
-           "       at adaptive boundaries; --no-vericache-host-snapshots disables promotion\n"
+           "       at configured host-checkpoint boundaries; --no-vericache-host-snapshots disables promotion\n"
            "       VeriCache horizons default to adaptive L0->L1=24..64 and L1->L2=256..2048\n"
+           "       host snapshot cadence defaults to 2048 on the research server; set it explicitly\n"
+           "       to keep persistence cadence independent from a future host-tier verifier\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=concurrency, anchors=2, markers=4; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -329,6 +332,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.hierarchical_vericache.l1_to_l2_horizon =
                 parse_u32_range(require_value("--vericache-l1-horizon"),
                                 "vericache-l1-horizon", 256, 2048);
+        } else if (arg == "--vericache-host-snapshot-horizon") {
+            options.hierarchical_vericache.host_snapshot_horizon = parse_u32_range(
+                require_value("--vericache-host-snapshot-horizon"),
+                "vericache-host-snapshot-horizon", 256, 2048);
         } else if (arg == "--vericache-protected-recent") {
             options.hierarchical_vericache.protected_recent_tokens = parse_u32_range(
                 require_value("--vericache-protected-recent"), "vericache-protected-recent", 0,
