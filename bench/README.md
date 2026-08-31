@@ -36,6 +36,12 @@ the faster reassociated pair route for experiments, and `NINFER_NVFP4_PAIR=0` re
 fallback. `NINFER_NVFP4_XQA=1` or `2` enables the grouped direct-low-bit XQA prototypes; they are
 not the serving default because the current RTX 5090 measurements are slower than pair decoding.
 
+The Qwen3.8 DFlash2 fused W8 gate/up path keeps its production narrow schedule by default.
+`NINFER_DFLASH2_W8_GATEUP_WARPS=8` selects an eight-warp/two-resident-block small-T candidate,
+`=81` selects the eight-warp/one-resident-block candidate, and `=16` selects a sixteen-warp
+candidate. `NINFER_DFLASH2_W8_GATEUP_LARGE_SCHEDULE=64` selects the opt-in BM64 large-T route;
+these controls are for workload-specific research and are not required for default serving.
+
 The matrix contains three independently measured test kinds:
 
 - `pp{P}` prepares `P` tokens and requests one output token. This is the smallest request that runs

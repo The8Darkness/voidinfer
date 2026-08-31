@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -94,11 +95,58 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kLaunchers =
     make_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
 
+// The Qwen3.8 gate/up research route keeps the latency-oriented production path at
+// four K-warps (with the historical 22..24 exception).  The opt-in eight-warp
+// schedule cuts the K-loop count in half; its one-block-per-SM variant is also
+// available for register/occupancy tuning.
 template <int ActiveCols>
-void launch_qwen_active_cols(const Tensor& x, const Weight& w, Tensor& out,
-                             cudaStream_t stream) {
+void launch_qwen_active_cols_narrow(const Tensor& x, const Weight& w, Tensor& out,
+                                    cudaStream_t stream) {
+    constexpr int kTileCols = ActiveCols <= 8    ? 8
+                              : ActiveCols <= 16 ? 16
+                              : ActiveCols <= 24 ? 24
+                              : ActiveCols <= 32 ? 32
+                                                 : 40;
+    constexpr int kKWarps = ActiveCols >= 22 && ActiveCols <= 24 ? 8 : 4;
+    constexpr auto kScaleAccess =
+        ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    constexpr auto kActivationStage =
+        ActiveCols <= 4 || (ActiveCols >= 9 && ActiveCols <= 15)
+            ? W8SmallTMmaActivationStage::PaddedZero
+            : W8SmallTMmaActivationStage::ActiveOnly;
+    using Schedule = W8SmallTMmaSchedule<kKWarps, kTileCols, 2, kScaleAccess, Cache::ca, Cache::cg,
+                                         kActivationStage>;
     using Geometry = W8MtpGateUpProjectionGeometry;
-    using Schedule = typename W8LinearSmallTProductionSchedule<Geometry, ActiveCols>::Type;
+    static_assert((Geometry::kOutputRows / 2) % kQwenRowsPerCta == 0);
+    const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data),
+                                            kQwenIntermediate};
+    const W8SwiGluExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data),
+                                          kQwenIntermediate};
+    const W8SwiGluQwenRows row_policy{};
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                          W8SwiGluExactTEpilogue, W8SwiGluQwenRows, true>
+        <<<kQwenIntermediate / kQwenRowsPerCta, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
+}
+
+template <int ActiveCols, int KWarps, int MinBlocksPerSm>
+void launch_qwen_active_cols_wide(const Tensor& x, const Weight& w, Tensor& out,
+                                  cudaStream_t stream) {
+    constexpr int kTileCols = ActiveCols <= 8    ? 8
+                              : ActiveCols <= 16 ? 16
+                              : ActiveCols <= 24 ? 24
+                              : ActiveCols <= 32 ? 32
+                                                 : 40;
+    constexpr auto kScaleAccess =
+        ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
+    constexpr auto kActivationStage =
+        ActiveCols <= 4 || (ActiveCols >= 9 && ActiveCols <= 15)
+            ? W8SmallTMmaActivationStage::PaddedZero
+            : W8SmallTMmaActivationStage::ActiveOnly;
+    using Schedule = W8SmallTMmaSchedule<KWarps, kTileCols, MinBlocksPerSm, kScaleAccess,
+                                         Cache::ca, Cache::cg, kActivationStage>;
+    using Geometry = W8MtpGateUpProjectionGeometry;
     static_assert((Geometry::kOutputRows / 2) % kQwenRowsPerCta == 0);
     const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data),
                                             kQwenIntermediate};
@@ -113,13 +161,65 @@ void launch_qwen_active_cols(const Tensor& x, const Weight& w, Tensor& out,
 }
 
 template <std::size_t... Offsets>
-constexpr auto make_qwen_launchers(std::index_sequence<Offsets...>) {
+constexpr auto make_qwen_narrow_launchers(std::index_sequence<Offsets...>) {
     return std::array<ProjectionLauncher, sizeof...(Offsets)>{
-        &launch_qwen_active_cols<kQwenFirstT + static_cast<int>(Offsets)>...};
+        &launch_qwen_active_cols_narrow<kQwenFirstT + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kQwenLaunchers =
-    make_qwen_launchers(std::make_index_sequence<kQwenLastT - kQwenFirstT + 1>{});
+constexpr auto kQwenNarrowLaunchers =
+    make_qwen_narrow_launchers(std::make_index_sequence<kQwenLastT - kQwenFirstT + 1>{});
+
+template <std::size_t... Offsets>
+constexpr auto make_qwen_wide_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_qwen_active_cols_wide<kQwenFirstT + static_cast<int>(Offsets), 8, 2>...};
+}
+
+constexpr auto kQwenWideLaunchers =
+    make_qwen_wide_launchers(std::make_index_sequence<kQwenLastT - kQwenFirstT + 1>{});
+
+template <std::size_t... Offsets>
+constexpr auto make_qwen_wide_minblocks_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_qwen_active_cols_wide<kQwenFirstT + static_cast<int>(Offsets), 8, 1>...};
+}
+
+constexpr auto kQwenWideMinBlocksLaunchers =
+    make_qwen_wide_minblocks_launchers(std::make_index_sequence<kQwenLastT - kQwenFirstT + 1>{});
+
+template <std::size_t... Offsets>
+constexpr auto make_qwen_sixteen_warp_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_qwen_active_cols_wide<kQwenFirstT + static_cast<int>(Offsets), 16, 1>...};
+}
+
+constexpr auto kQwenSixteenWarpLaunchers =
+    make_qwen_sixteen_warp_launchers(std::make_index_sequence<kQwenLastT - kQwenFirstT + 1>{});
+
+enum class QwenGateUpWarpMode : std::uint8_t {
+    Auto,
+    Production,
+    Wide,
+    WideMinBlocks,
+    SixteenWarps,
+};
+
+QwenGateUpWarpMode qwen_gate_up_warp_mode() noexcept {
+    static const QwenGateUpWarpMode mode = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_W8_GATEUP_WARPS");
+        if (value == nullptr || value[0] == '\0') { return QwenGateUpWarpMode::Auto; }
+        if (value[0] == '0' && value[1] == '\0') { return QwenGateUpWarpMode::Production; }
+        if (value[0] == '8' && value[1] == '\0') { return QwenGateUpWarpMode::Wide; }
+        if (value[0] == '8' && value[1] == '1' && value[2] == '\0') {
+            return QwenGateUpWarpMode::WideMinBlocks;
+        }
+        if (value[0] == '1' && value[1] == '6' && value[2] == '\0') {
+            return QwenGateUpWarpMode::SixteenWarps;
+        }
+        return QwenGateUpWarpMode::Auto;
+    }();
+    return mode;
+}
 
 } // namespace
 
@@ -137,7 +237,17 @@ void w8_linear_swiglu_qwen_small_t_launch(const Tensor& x, const Weight& w, Tens
     if (x.ne[1] < kQwenFirstT || x.ne[1] > kQwenLastT) {
         throw std::invalid_argument("W8 Qwen LinearSwiGLU small-T requires T=1..40");
     }
-    kQwenLaunchers[x.ne[1] - kQwenFirstT](x, w, out, stream);
+    const QwenGateUpWarpMode mode = qwen_gate_up_warp_mode();
+    const auto& launchers = mode == QwenGateUpWarpMode::Production
+                                ? kQwenNarrowLaunchers
+                                : mode == QwenGateUpWarpMode::Wide
+                                    ? kQwenWideLaunchers
+                                    : mode == QwenGateUpWarpMode::WideMinBlocks
+                                        ? kQwenWideMinBlocksLaunchers
+                                        : mode == QwenGateUpWarpMode::SixteenWarps
+                                            ? kQwenSixteenWarpLaunchers
+                                        : kQwenNarrowLaunchers;
+    launchers[x.ne[1] - kQwenFirstT](x, w, out, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

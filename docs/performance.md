@@ -720,3 +720,18 @@ rounds, fresh default/scalar samples were:
 The C8 acceptance difference is retained as a qualification signal, so these measurements support
 the default but do not establish a universal end-to-end multiplier. `NINFER_NVFP4_XQA=1/2`
 remains an opt-in research path because its current grouped prototypes are slower on this GPU.
+
+### E028: Qwen3.8 W8 gate-up schedule candidates
+
+The fused Qwen3.8 W8G32 gate/up projection now exposes guarded schedule candidates for the
+DFlash2 proposal path. The production narrow route remains the default. `NINFER_DFLASH2_W8_GATEUP_WARPS=8`
+selects an eight-warp schedule with two resident blocks, `=81` selects the same schedule with one
+resident block, and `=16` selects a sixteen-warp schedule. For larger proposal batches,
+`NINFER_DFLASH2_W8_GATEUP_LARGE_SCHEDULE=64` selects a 32-output-row BM64 route instead of the
+production BM32 route.
+
+All focused Qwen W8 LinearSwiGLU correctness cases pass for the production and candidate routes.
+On physical RTX 5090 DFlash2 rounds, the small-T candidates were mixed and acceptance-sensitive;
+the opt-in BM64 route measured `749.75` tok/s versus `808.09` tok/s for the matched production
+sample at C8. These controls are therefore retained for workload-specific tuning and further
+optimization, but none is promoted to the serving default.

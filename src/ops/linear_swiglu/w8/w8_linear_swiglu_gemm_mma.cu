@@ -4,6 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -53,6 +54,24 @@ void launch_qwen_large(const Tensor& x, const Weight& w, Tensor& out, cudaStream
     w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::SwiGluSplitHalf>
         <<<grid, Schedule::THREADS, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), output, kQwenGateUpRows, kQwenHidden,
+            x.ne[1], kQwenHidden);
+}
+
+template <bool Full>
+void launch_qwen_large_bm64(const Tensor& x, const Weight& w, Tensor& out,
+                            cudaStream_t stream) {
+    // One CTA owns 32 output rows instead of 16. The two-row-warp SwiGLU epilogue uses the
+    // existing shared up-accumulator path, while the 29 KiB schedule remains resident at two
+    // CTAs/SM on SM120. This is intentionally an opt-in C8 research route.
+    using Schedule = W8RowSplitMmaGemmSchedule<64, 64, 32, 16, 2>;
+    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kQwenIntermediate};
+    const dim3 grid(kQwenIntermediate / (Schedule::BM / 2),
+                    static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
+    w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::SwiGluSplitHalf>
+        <<<grid, Schedule::THREADS, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), output, kQwenGateUpRows, kQwenHidden,
             x.ne[1], kQwenHidden);
 }
@@ -148,10 +167,21 @@ void w8_linear_swiglu_qwen_large_t_launch(const Tensor& x, const Weight& w, Tens
     if (x.ne[1] <= 40) {
         throw std::invalid_argument("W8 Qwen LinearSwiGLU large-T requires T>40");
     }
+    const char* schedule_env = std::getenv("NINFER_DFLASH2_W8_GATEUP_LARGE_SCHEDULE");
+    const bool use_bm64 = schedule_env != nullptr && schedule_env[0] == '6' &&
+                          schedule_env[1] == '4' && schedule_env[2] == '\0';
     if ((x.ne[1] % 64) == 0) {
-        launch_qwen_large<true>(x, w, out, stream);
+        if (use_bm64) {
+            launch_qwen_large_bm64<true>(x, w, out, stream);
+        } else {
+            launch_qwen_large<true>(x, w, out, stream);
+        }
     } else {
-        launch_qwen_large<false>(x, w, out, stream);
+        if (use_bm64) {
+            launch_qwen_large_bm64<false>(x, w, out, stream);
+        } else {
+            launch_qwen_large<false>(x, w, out, stream);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
