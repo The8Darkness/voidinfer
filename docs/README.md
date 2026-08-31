@@ -1,49 +1,38 @@
-# Qwen3.8-27B documentation
+# Qwen3.8-27B NVFP4 documentation
 
-Start with the [project README](../README.md) to build VoidInfer, download a Qwen3.8-27B artifact,
-and run the CLI or HTTP server.
+Start with the [project README](../README.md) to build VoidInfer and run the current DFlash2 plus
+hierarchical VeriCache serving profile on an RTX 5090.
 
 ## User guides
 
 | Document | Purpose |
 | --- | --- |
-| [CLI](cli.md) | text, chat history, image/video input, output streams, sampling, MTP, and runtime options |
-| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, and authentication |
-| [Performance](performance.md) | Qwen3.8-27B throughput, context, MTP, DFlash2, and Hierarchical VeriCache measurements |
-| [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
+| [CLI](cli.md) | text generation, chat history, sampling, and runtime options |
+| [HTTP serving](serving.md) | OpenAI/Anthropic-compatible serving and the DFlash2 default |
+| [Performance](performance.md) | NVFP4/DFlash2 context, speed, quality, and tier measurements |
+| [CLI examples](../examples/cli/) | committed text, multimodal, thinking, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
 
-## Qwen3.8-27B artifacts
+## Current artifact
 
-| Profile | Download | Versioned model card |
+| Profile | Download | Model card |
 | --- | --- | --- |
-| `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
-| `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
+| `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [NVFP4 model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
 
-Both profiles resolve the registered `qwen3_8_27b` target. The NVFP4 profile is the current
-single-GPU optimization target.
+The registered artifact is the Qwen3.8-27B NVFP4 base model. The local experimental DFlash2 artifact
+adds the DFlash2 proposal weights and is documented in the project README; it is not yet a public
+download.
 
 ## Optimization and validation records
 
-- [Experiment registry](../EXPERIMENTS.md) — accepted, rejected, and pending optimization claims.
-- [Current project state](../PROJECT_STATE.md) — hardware, artifact identity, baseline evidence,
-  and milestone history.
-- [Qwen3.8-27B artifact contract](maintainer/qwen3.8-27b-artifact.md) — storage formats,
-  tensor inventory, and source mapping.
-- [Engine architecture](maintainer/engine-architecture.md) — execution ownership and request
-  lifecycle.
-- [Resource and context-cache contract](maintainer/resource-scheduling-and-context-cache.md) —
-  materialization, continuation, checkpoint, and cache ownership.
-- [Paged KV cache](maintainer/paged-kv-cache.md) — page layout, dtype contracts, and capacity.
-- [Op development](maintainer/op-development.md) — correctness, ownership, and performance gates.
-- [ReplaySSM GDN reference](maintainer/replayssm-gdn.md) — Qwen3.8 GDN execution details.
-- [Linear benchmark contract](maintainer/linear-benchmark.md) — registered kernel benchmark suites.
+- [Project README](../README.md) — current default, exact KV hierarchy, and published results.
+- [Performance report](performance.md) — reproducible RTX 5090 measurements and open quality gates.
+- [Experiment registry](../EXPERIMENTS.md) — accepted, neutral, rejected, and pending optimization claims.
+- [Current project state](../PROJECT_STATE.md) — hardware, artifact identity, and milestone history.
+- [Qwen3.8-27B artifact contract](maintainer/qwen3.8-27b-artifact.md) — storage format and tensor mapping.
+- [HTTP serving](serving.md) — runtime flags and endpoint behavior.
 
-The isolated `exp/hierarchical-vericache-20260830` branch is the active research track for
-hierarchical L0/L1/L2/L3 KV residency. Its measurements and explicit unimplemented gates are kept
-in [Performance](performance.md); no host-tier speedup or quality claim is made until an
-independent verifier is benchmarked.
-
-The source tree contains compatibility code for older registered targets, but those targets are not
-part of the public Qwen3.8-27B result set documented here.
+The isolated `exp/hierarchical-vericache-20260830` branch is the active NVFP4 research track for
+hierarchical L0/L1/L2/L3 residency. Host-tier verification, NVMe persistence, and the full quality
+matrix remain explicitly open until measured.

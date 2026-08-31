@@ -1374,9 +1374,12 @@ bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
     };
     const auto fork_entitlement = [](LogicalKVPageStore& pages, std::uint32_t frontier,
                                      std::uint32_t requested) {
-        const std::uint32_t full_pages = frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+        // A prefix fork owns the partial tail page too.  Using floor(frontier / page_size)
+        // under-entitles every non-page-aligned checkpoint and makes the host snapshot path
+        // reject an otherwise valid retained prefix before the tail-copy can be submitted.
+        const std::uint32_t required_pages = kv_pages_for_frontier(frontier);
         const std::uint32_t free_pages = pages.physical_pool().available_pages();
-        return std::min(requested, full_pages + free_pages);
+        return std::min(requested, required_pages + free_pages);
     };
 
     bool tail_copy_submitted = false;

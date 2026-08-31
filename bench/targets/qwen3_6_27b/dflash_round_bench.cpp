@@ -40,6 +40,7 @@ struct Options {
     std::uint32_t context_tokens   = 128;
     std::uint32_t draft_tokens     = 7;
     std::uint32_t batch_size       = 1;
+    std::uint32_t prefill_chunk    = 1024;
     ninfer::ProposalHead proposal  = ninfer::ProposalHead::Full;
     ninfer::KvCacheStorage kv_cache = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool use_cuda_graph            = false;
@@ -57,6 +58,7 @@ void print_usage(const char* executable) {
               << " [--artifact <model.ninfer>] [--device <id>] [--context <tokens>]"
                  " [--warmup <n>] [--reps <n>] [--draft-tokens <1..7>]"
                  " [--batch <1..8>]"
+                 " [--prefill-chunk <multiple-of-128>]"
                  " [--proposal-head full|optimized]"
                  " [--kv-dtype fp8-e4m3-row256|vericache-nvfp4]"
                  " [--hierarchical-vericache]"
@@ -102,6 +104,8 @@ Options parse_options(int argc, char** argv) {
             options.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
         } else if (argument == "--batch") {
             options.batch_size = parse_u32(value("--batch"), "batch");
+        } else if (argument == "--prefill-chunk") {
+            options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (argument == "--proposal-head") {
             const std::string_view head(value("--proposal-head"));
             if (head == "full") {
@@ -165,6 +169,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
         throw std::invalid_argument("--batch must be in [1,8]");
+    }
+    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     if (options.protected_recent_tokens > 2048) {
         throw std::invalid_argument("--vericache-protected-recent must be in [0,2048]");
@@ -256,7 +263,8 @@ int run(const Options& options) {
         static_cast<std::uint32_t>(options.warmup + options.repetitions);
     const std::uint64_t block = options.draft_tokens + 1ULL;
     const std::uint64_t per_request_capacity =
-        options.context_tokens + (measured_rounds + 1ULL) * block;
+        options.context_tokens + (measured_rounds + 1ULL) * block +
+        2ULL * options.draft_tokens;
     const std::uint64_t aligned_request_capacity = (per_request_capacity + 63ULL) & ~63ULL;
     const std::uint64_t capacity                 = options.batch_size == 1
                                                        ? per_request_capacity
@@ -271,7 +279,7 @@ int run(const Options& options) {
     engine.max_context   = static_cast<std::uint32_t>(per_request_capacity);
     engine.kv_capacity =
         ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
-    engine.prefill_chunk             = 128;
+    engine.prefill_chunk             = options.prefill_chunk;
     engine.kv_cache                  = options.kv_cache;
     engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
     engine.speculative.draft_tokens  = options.draft_tokens;
@@ -328,6 +336,8 @@ int run(const Options& options) {
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
     std::array<target::Package::SequenceHandle, ninfer::kMaximumConcurrency> active_sequences{};
+    double prefill_seconds = 0.0;
+    std::uint64_t prefill_tokens = 0;
     const auto machine_cost = ninfer::runtime::generic_context_machine_cost_model();
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
@@ -368,6 +378,7 @@ int run(const Options& options) {
         auto started = std::move(*published->published);
         program->finalize_context_transaction();
         active_sequences[lane] = started.sequence;
+        const auto prefill_start = Clock::now();
         std::optional<target::Package::PrefillProgress> progress;
         progress.emplace(program->advance_prefill(active_sequences[lane]));
         while (!progress->complete) {
@@ -377,6 +388,9 @@ int run(const Options& options) {
         if (!progress->pending || progress->pending->tokens().size() != 1) {
             throw std::runtime_error("benchmark seed prefill did not license exactly one token");
         }
+        prefill_seconds +=
+            std::chrono::duration<double>(Clock::now() - prefill_start).count();
+        prefill_tokens += options.context_tokens;
         const std::array<ninfer::runtime::CommitDecision, 1> begin_decision{
             ninfer::runtime::CommitDecision{.accepted_tokens = 1}};
         (void)program->commit(std::move(*progress->pending), begin_decision);
@@ -439,6 +453,7 @@ int run(const Options& options) {
     std::cout << "context_tokens," << options.context_tokens << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "batch_size," << options.batch_size << '\n';
+    std::cout << "prefill_chunk," << options.prefill_chunk << '\n';
     std::cout << "kv_cache,"
               << (options.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4
                       ? "vericache-nvfp4"
@@ -460,6 +475,13 @@ int run(const Options& options) {
     std::cout << "vericache_protected_pivot_tokens," << options.protected_pivot_tokens << '\n';
     std::cout << "warmup," << options.warmup << '\n';
     std::cout << "repetitions," << options.repetitions << '\n';
+    std::cout << "seed_prefill_seconds," << prefill_seconds << '\n';
+    std::cout << "seed_prefill_tokens," << prefill_tokens << '\n';
+    std::cout << "seed_prefill_tokens_per_second,"
+              << (prefill_seconds <= 0.0
+                      ? 0.0
+                      : static_cast<double>(prefill_tokens) / prefill_seconds)
+              << '\n';
     std::cout << "steady_round_gpu_mean_ms," << mean_gpu_ms << '\n';
     std::cout << "steady_round_gpu_min_ms," << *gpu_min << '\n';
     std::cout << "steady_round_gpu_max_ms," << *gpu_max << '\n';
