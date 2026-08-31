@@ -42,6 +42,12 @@ The Qwen3.8 DFlash2 fused W8 gate/up path keeps its production narrow schedule b
 candidate. `NINFER_DFLASH2_W8_GATEUP_LARGE_SCHEDULE=64` selects the opt-in BM64 large-T route;
 these controls are for workload-specific research and are not required for default serving.
 
+For greedy Qwen3.8 target verification, the uncaptured direct path fuses the FP8 vocabulary
+projection with BF16-rounded argmax and uses token-only draft acceptance. Set
+`NINFER_FP8_GREEDY_ARGMAX=0` to force the full-logit reference route for an A/B measurement.
+CUDA Graph capture currently keeps the full-logit route because the fused path's scratch and
+compact reduction need graph-safe integration.
+
 The matrix contains three independently measured test kinds:
 
 - `pp{P}` prepares `P` tokens and requests one output token. This is the smallest request that runs

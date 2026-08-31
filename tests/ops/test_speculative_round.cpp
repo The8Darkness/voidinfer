@@ -274,6 +274,62 @@ int deterministic_sampling_case() {
                                token_counts, expected);
 }
 
+int greedy_accept_from_tokens_case() {
+    constexpr int k       = 5;
+    constexpr int batch   = 2;
+    constexpr int columns = k + 1;
+    const std::vector<std::int32_t> targets{10, 20, 30, 40, 50, 60,
+                                            11, 21, 31, 41, 51, 61};
+    const std::vector<std::int32_t> drafts{10, 20, 30, 99, 50,
+                                           11, 21, 31, 41, 51};
+    const std::vector<std::int32_t> extents{3, 5};
+    const std::vector<std::int32_t> lengths{100, 200};
+    const std::vector<std::int32_t> anchors{-1, -1};
+    const std::vector<std::int32_t> expected_tokens{10, 20, 30, 40, 0, 0,
+                                                    11, 21, 31, 41, 51, 61};
+
+    DeviceBuffer d_targets = to_device(targets);
+    DeviceBuffer d_drafts  = to_device(drafts);
+    DeviceBuffer d_extents = to_device(extents);
+    DeviceBuffer d_lengths = to_device(lengths);
+    DeviceBuffer d_anchors = to_device(anchors);
+    GuardedDeviceBuffer d_licensed(expected_tokens.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_counts(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_accepted(batch * sizeof(std::int32_t));
+    d_licensed.fill(0xcd);
+    d_counts.fill(0xcd);
+    d_accepted.fill(0xcd);
+
+    Tensor target_tensor(d_targets.p, DType::I32, {columns, batch});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor extent_tensor(d_extents.p, DType::I32, {batch});
+    Tensor length_tensor(d_lengths.p, DType::I32, {batch});
+    Tensor anchor_tensor(d_anchors.p, DType::I32, {batch});
+    Tensor licensed_tensor(d_licensed.data(), DType::I32, {columns, batch});
+    Tensor counts_tensor(d_counts.data(), DType::I32, {batch});
+    Tensor accepted_tensor(d_accepted.data(), DType::I32, {batch});
+    ops::speculative_accept_greedy_drafts_from_tokens(
+        target_tensor, draft_tensor, extent_tensor, length_tensor, anchor_tensor, licensed_tensor,
+        counts_tensor, accepted_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact("speculative token-only licensed",
+                                read<std::int32_t>(d_licensed, expected_tokens.size()),
+                                expected_tokens);
+    failures += verify_exact("speculative token-only counts", read<std::int32_t>(d_counts, batch),
+                             {4, 6});
+    failures += verify_exact("speculative token-only accepted",
+                             read<std::int32_t>(d_accepted, batch), {3, 5});
+    failures += verify_exact("speculative token-only lengths",
+                             from_device<std::int32_t>(d_lengths, batch), {104, 206});
+    failures += verify_exact("speculative token-only anchors",
+                             from_device<std::int32_t>(d_anchors, batch), {40, 61});
+    failures += d_licensed.verify_guards("speculative token-only licensed guards");
+    failures += d_counts.verify_guards("speculative token-only count guards");
+    failures += d_accepted.verify_guards("speculative token-only accepted guards");
+    return failures;
+}
+
 int batched_sampling_workspace_stride_case() {
     constexpr int physical_rows = 257;
     constexpr int token_domain  = 257;
@@ -440,6 +496,7 @@ int main() {
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
     failures += deterministic_sampling_case();
+    failures += greedy_accept_from_tokens_case();
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);

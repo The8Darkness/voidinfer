@@ -94,6 +94,16 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Greedy-only acceptance fast path when the target verifier already produced one exact token
+ * id per column. It has the same commit/rollback effects as speculative_accept_greedy_drafts()
+ * but does not require the full target-logit tensor, sampling configuration, or workspace.
+ */
+void speculative_accept_greedy_drafts_from_tokens(
+    const Tensor& target_tokens, const Tensor& drafts, const Tensor& current_extents,
+    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted, cudaStream_t stream);
+
+/**
  * Op: speculative_select_accepted_hidden
  *
  * Math / indexing:

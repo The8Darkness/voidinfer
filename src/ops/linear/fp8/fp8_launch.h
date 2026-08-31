@@ -10,6 +10,9 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
 void launch_fp8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_fp8_vocabulary_a16_small_t(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream);
+void launch_fp8_vocabulary_a16_small_t_argmax(const Tensor& x, const Weight& weight, Tensor& out,
+                                              std::int32_t valid_rows, Tensor& scratch,
+                                              cudaStream_t stream);
 void launch_fp8_vocabulary_a16_gemm(const Tensor& x, const Weight& weight, Tensor& out,
                                     cudaStream_t stream);
 

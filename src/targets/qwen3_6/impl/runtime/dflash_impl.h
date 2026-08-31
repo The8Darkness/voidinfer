@@ -606,14 +606,20 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
 
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
-                              ops::CausalAttentionExecutionEnvelope target_envelope) {
-    return [&state, batch_size, k, envelopes, target_envelope] {
+                              ops::CausalAttentionExecutionEnvelope target_envelope,
+                              bool allow_greedy_target_head) {
+    return [&state, batch_size, k, envelopes, target_envelope, allow_greedy_target_head] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         qwen3_6::DFlashDecodeState& frame = state.frame;
         const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
+        bool all_greedy_target_rows       = allow_greedy_target_head;
+        for (std::int32_t row = 0; row < batch_size; ++row) {
+            all_greedy_target_rows =
+                all_greedy_target_rows && state.host_ingress.sampling[row].temperature <= 0.0F;
+        }
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
@@ -672,6 +678,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                  .target_hidden           = target_hidden,
                                  .target_logits           = target_logits,
                                  .target_tokens           = target_tokens,
+                                 .greedy_target_head      = all_greedy_target_rows,
                                  .drafts                  = drafts,
                                  .current_extents         = extents,
                                  .frontiers               = frontiers,
@@ -718,7 +725,7 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope, false);
     capture_graph(state, definition, body);
 }
 
@@ -726,7 +733,8 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope,
+                                         executable == nullptr);
     run_prepared(state, executable, body);
 }
 

@@ -37,18 +37,26 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
     static_assert((kWarps & 1) == 0);
     constexpr unsigned kMask = 0xffffffffU;
 
-    union SharedStorage {
-        struct {
-            std::uint8_t codes[kRowsPerCta][kGroupK];
-            __nv_bfloat16 activations[kWarps][kTileTokens * kTileK];
-        } staging;
+    struct SharedStorage {
+        union {
+            struct {
+                std::uint8_t codes[kRowsPerCta][kGroupK];
+                __nv_bfloat16 activations[kWarps][kTileTokens * kTileK];
+            } staging;
 
-        float partial[kWarps * kTokenMmas * 32 * 4];
+            float partial[kWarps * kTokenMmas * 32 * 4];
+        };
+
+        float argmax_values[kTileTokens * kRowsPerCta];
     };
 
     __shared__ __align__(16) SharedStorage shared;
     auto& code_shared = shared.staging.codes;
     auto& x_shared    = shared.staging.activations;
+
+    if constexpr (Output::kNeedsBlockReduce) {
+        output.shared_values = shared.argmax_values;
+    }
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -208,17 +216,88 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
                 sum.z += value.z;
                 sum.w += value.w;
             }
-            const int token0 = token_mma * 8 + 2 * lid;
-            if (token0 < ActiveTokens) {
-                output.store(row0 + gid, token0, sum.x * top_scale);
-                output.store(row0 + gid + 8, token0, sum.z * bottom_scale);
+            accumulators[token_mma][0] = sum.x;
+            accumulators[token_mma][1] = sum.y;
+            accumulators[token_mma][2] = sum.z;
+            accumulators[token_mma][3] = sum.w;
+            if constexpr (!Output::kNeedsBlockReduce) {
+                const int token0 = token_mma * 8 + 2 * lid;
+                if (token0 < ActiveTokens) {
+                    output.store(row0 + gid, token0, sum.x * top_scale);
+                    output.store(row0 + gid + 8, token0, sum.z * bottom_scale);
+                }
+                if (token0 + 1 < ActiveTokens) {
+                    output.store(row0 + gid, token0 + 1, sum.y * top_scale);
+                    output.store(row0 + gid + 8, token0 + 1, sum.w * bottom_scale);
+                }
             }
-            if (token0 + 1 < ActiveTokens) {
-                output.store(row0 + gid, token0 + 1, sum.y * top_scale);
-                output.store(row0 + gid + 8, token0 + 1, sum.w * bottom_scale);
+        }
+
+        if constexpr (Output::kNeedsBlockReduce) {
+#pragma unroll
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                const float4 sum = make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
+                                               accumulators[token_mma][2], accumulators[token_mma][3]);
+                const int token0 = token_mma * 8 + 2 * lid;
+                if (token0 < ActiveTokens) {
+                    output.store(row0 + gid, token0, sum.x * top_scale);
+                    output.store(row0 + gid + 8, token0, sum.z * bottom_scale);
+                }
+                if (token0 + 1 < ActiveTokens) {
+                    output.store(row0 + gid, token0 + 1, sum.y * top_scale);
+                    output.store(row0 + gid + 8, token0 + 1, sum.w * bottom_scale);
+                }
             }
         }
     }
+
+    if constexpr (Output::kNeedsBlockReduce) {
+        // All lanes in warp 0 published one unique (row,token) value. The other warps must join
+        // before warp 0 consumes the shared reduction tile.
+        __syncthreads();
+        if (warp == 0) { output.finish(row0, ActiveTokens); }
+    }
+}
+
+// Reduce the one-winner-per-row-CTA tiles emitted by Fp8ArgmaxOutput. The reduction sees the
+// already BF16-rounded values, so it has the same tie and representation semantics as argmax().
+__launch_bounds__(256) __global__ void fp8_vocabulary_argmax_reduce_kernel(
+    const __nv_bfloat16* partial_values, const std::int32_t* partial_indices,
+    std::int32_t* tokens, std::int32_t partial_rows, std::int32_t active_tokens) {
+    const std::int32_t token = static_cast<std::int32_t>(blockIdx.x);
+    if (token >= active_tokens) { return; }
+
+    float best_value        = -CUDART_INF_F;
+    std::int32_t best_index = INT_MAX;
+    const std::int64_t base = static_cast<std::int64_t>(token) * partial_rows;
+    for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < partial_rows;
+         row += blockDim.x) {
+        const float value = __bfloat162float(partial_values[base + row]);
+        const std::int32_t index = partial_indices[base + row];
+        if (value > best_value || (value == best_value && index < best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+
+    __shared__ float values[256];
+    __shared__ std::int32_t indices[256];
+    values[threadIdx.x]  = best_value;
+    indices[threadIdx.x] = best_index;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float other_value        = values[threadIdx.x + stride];
+            const std::int32_t other_index = indices[threadIdx.x + stride];
+            if (other_value > values[threadIdx.x] ||
+                (other_value == values[threadIdx.x] && other_index < indices[threadIdx.x])) {
+                values[threadIdx.x]  = other_value;
+                indices[threadIdx.x] = other_index;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { tokens[token] = indices[0]; }
 }
 
 } // namespace ninfer::ops::detail

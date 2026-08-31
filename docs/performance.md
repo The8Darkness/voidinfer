@@ -735,3 +735,25 @@ On physical RTX 5090 DFlash2 rounds, the small-T candidates were mixed and accep
 the opt-in BM64 route measured `749.75` tok/s versus `808.09` tok/s for the matched production
 sample at C8. These controls are therefore retained for workload-specific tuning and further
 optimization, but none is promoted to the serving default.
+
+### E029: fused greedy FP8 target verification
+
+The Qwen3.8 target verifier now has an exact greedy-only route for the FP8 vocabulary head. Its
+Tensor Core projection rounds each value to BF16 before comparing, reduces one winner per
+vocabulary tile, and writes only the token IDs; the existing target-logit BF16 allocation is reused
+as compact scratch. Greedy DFlash2/MTP acceptance can therefore consume target tokens directly,
+while sampled requests and CUDA Graph capture continue through the full-logit reference path.
+
+Focused `ninfer_linear_fp8_a16_test` and `ninfer_speculative_round_test` runs pass. A physical RTX
+5090 uncaptured C1 comparison with hierarchical VeriCache-NVFP4, optimized DFlash2, and `k=7`
+measured:
+
+| Route | GPU round | Wall round | Licensed tokens/round | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| Full FP8 logits + argmax | 20.4853 ms | 20.4968 ms | 3.25 | 18/56 (32.14%) |
+| Fused FP8 argmax | 20.4424 ms | 20.4536 ms | 2.75 | 14/56 (25.00%) |
+
+The 0.21% GPU difference is below the observed acceptance variance, so this is retained as a
+working-set/launch optimization rather than reported as an end-to-end speedup. The graph path is
+deliberately conservative until the fused scratch/reduction sequence is captured and replayed
+without changing its exact semantics.

@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -43,6 +44,11 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+
+bool fp8_greedy_argmax_enabled() {
+    const char* value = std::getenv("NINFER_FP8_GREEDY_ARGMAX");
+    return value == nullptr || value[0] != '0';
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -691,7 +697,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& linear_state_source_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                           Tap& tap) {
+                                           bool greedy_target_head, Tap& tap) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -739,8 +745,17 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        const bool use_greedy_fp8_head =
+            greedy_target_head && fp8_greedy_argmax_enabled() && columns <= 48 &&
+            lm_head_->qtype == QType::FP8_E4M3FN_ROW_BF16S && lm_head_->n == kCfg.vocab &&
+            lm_head_->k == kCfg.hidden;
+        if (use_greedy_fp8_head) {
+            ops::linear_argmax(flat_hidden, *lm_head_, flat_tokens, kCfg.token_domain, flat_logits,
+                               stream);
+        } else {
+            ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        }
     }
     work_.reset();
 }
@@ -750,11 +765,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
-                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
+                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens,
+                                      bool greedy_target_head) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap);
+                             greedy_target_head, tap);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -763,10 +779,10 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink) {
+                                      DFlashFeatureSink& sink, bool greedy_target_head) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink);
+                             greedy_target_head, sink);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,

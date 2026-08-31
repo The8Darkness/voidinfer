@@ -213,12 +213,14 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
+                             Tensor& logits, Tensor& target_tokens,
+                             bool greedy_target_head = false);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink,
+                             bool greedy_target_head = false);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -253,7 +255,8 @@ private:
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+                                  Tensor& logits, Tensor& target_tokens, bool greedy_target_head,
+                                  Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);

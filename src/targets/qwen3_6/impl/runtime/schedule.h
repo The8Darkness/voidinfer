@@ -113,6 +113,7 @@ struct TargetVerifyFrameView {
     Tensor target_hidden;
     Tensor target_logits;
     Tensor target_tokens;
+    bool greedy_target_head = false;
     Tensor drafts;
     Tensor current_extents;
     Tensor frontiers;
