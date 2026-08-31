@@ -6,10 +6,18 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+int nvfp4_pair_mode() noexcept {
+    const char* value = std::getenv("NINFER_NVFP4_PAIR");
+    if (value == nullptr) return 2;
+    if (value[0] == '2') return 2;
+    return value[0] == '1' ? 1 : 0;
+}
 
 template <int Tokens, class Launch>
 void dispatch_token_case(Launch&& launch) {
@@ -175,7 +183,53 @@ void sliding_window_attention_nvfp4_launch(
     const dim3 grid(static_cast<unsigned>(q.ne[2] * kCyclicKVCacheNvfp4KVHeads),
                     static_cast<unsigned>(q.ne[3]), 1);
     const auto launch = [&]<bool HasProtected>() {
-        sliding_window_attention_nvfp4_grouped_kernel<HasProtected><<<grid, 128, 0, stream>>>(
+        const int pair_mode = nvfp4_pair_mode();
+        if (pair_mode != 0) {
+            const dim3 pair_grid(static_cast<unsigned>(q.ne[2] * kCyclicKVCacheNvfp4KVHeads * 4),
+                                 static_cast<unsigned>(q.ne[3]), 1);
+            if (pair_mode == 2) {
+                sliding_window_attention_nvfp4_kernel<HasProtected, true, true>
+                    <<<pair_grid, 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(query_k.data),
+                    static_cast<const __nv_bfloat16*>(query_v.data),
+                    static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(valid_columns.data),
+                    static_cast<const std::int32_t*>(lanes.data),
+                    static_cast<const std::uint8_t*>(context.k.data),
+                    static_cast<const std::uint8_t*>(context.v.data),
+                    static_cast<const std::uint8_t*>(context.k_scale.data),
+                    static_cast<const std::uint8_t*>(context.v_scale.data),
+                    static_cast<const __nv_bfloat16*>(context.protected_k.data),
+                    static_cast<const __nv_bfloat16*>(context.protected_v.data),
+                    static_cast<int>(context.padded_capacity), max_context, window,
+                    static_cast<int>(context.protected_capacity),
+                    static_cast<int>(context.protected_anchor_capacity),
+                    static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
+                    static_cast<__nv_bfloat16*>(out.data));
+            } else {
+                sliding_window_attention_nvfp4_kernel<HasProtected, true, false>
+                    <<<pair_grid, 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(query_k.data),
+                    static_cast<const __nv_bfloat16*>(query_v.data),
+                    static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(valid_columns.data),
+                    static_cast<const std::int32_t*>(lanes.data),
+                    static_cast<const std::uint8_t*>(context.k.data),
+                    static_cast<const std::uint8_t*>(context.v.data),
+                    static_cast<const std::uint8_t*>(context.k_scale.data),
+                    static_cast<const std::uint8_t*>(context.v_scale.data),
+                    static_cast<const __nv_bfloat16*>(context.protected_k.data),
+                    static_cast<const __nv_bfloat16*>(context.protected_v.data),
+                    static_cast<int>(context.padded_capacity), max_context, window,
+                    static_cast<int>(context.protected_capacity),
+                    static_cast<int>(context.protected_anchor_capacity),
+                    static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
+                    static_cast<__nv_bfloat16*>(out.data));
+            }
+        } else {
+            sliding_window_attention_nvfp4_grouped_kernel<HasProtected><<<grid, 128, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const __nv_bfloat16*>(query_k.data),
             static_cast<const __nv_bfloat16*>(query_v.data),
@@ -193,6 +247,7 @@ void sliding_window_attention_nvfp4_launch(
             static_cast<int>(context.protected_anchor_capacity),
             static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
             static_cast<__nv_bfloat16*>(out.data));
+        }
     };
     if (context.protected_capacity != 0 || context.protected_anchor_capacity != 0) {
         launch.template operator()<true>();

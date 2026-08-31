@@ -30,6 +30,12 @@ KV/GDN transaction activity, exact-target fallback acceptance, and occupied host
 current host L1/L2 values are intentionally zero unless the run materializes host checkpoints;
 they must not be interpreted as an independent verifier result.
 
+Packed NVFP4 attention uses pair decoding by default. `NINFER_NVFP4_PAIR=2` selects the
+scalar-order-preserving pair route used by DFlash2 local attention, `NINFER_NVFP4_PAIR=1` selects
+the faster reassociated pair route for experiments, and `NINFER_NVFP4_PAIR=0` restores the scalar
+fallback. `NINFER_NVFP4_XQA=1` or `2` enables the grouped direct-low-bit XQA prototypes; they are
+not the serving default because the current RTX 5090 measurements are slower than pair decoding.
+
 The matrix contains three independently measured test kinds:
 
 - `pp{P}` prepares `P` tokens and requests one output token. This is the smallest request that runs

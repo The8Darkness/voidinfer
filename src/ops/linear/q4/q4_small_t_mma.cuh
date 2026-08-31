@@ -39,6 +39,34 @@ struct Q4DraftSmallTSchedule {
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
 };
 
+// Experimental wide-K schedule for the Qwen3.8 optimized draft head. The normal schedule walks
+// ten 512-element K groups for the 5,120-wide head. This variant uses sixteen warps, walks five
+// 1,024-element groups, and keeps the same 16-row output tile and accumulation order. Host
+// dispatch selects it only when explicitly requested until physical measurements qualify it.
+struct Q4DraftSmallTWideSchedule {
+    static constexpr int kKWarps            = 16;
+    static constexpr int kMinBlocksPerSm    = 3;
+    static constexpr auto kCodeCache        = Cache::cg;
+    static constexpr int kThreads           = kKWarps * 32;
+    static constexpr int kTileKPerWarp      = 64;
+    static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
+    static constexpr int kRowsPerCta        = 16;
+    static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
+};
+
+// Same wider K tile with the original eight-warp CTA. This keeps the occupancy shape of the
+// shipping kernel while reducing the number of staged K groups from ten to five.
+struct Q4DraftSmallTKWideSchedule {
+    static constexpr int kKWarps            = 8;
+    static constexpr int kMinBlocksPerSm    = 6;
+    static constexpr auto kCodeCache        = Cache::cg;
+    static constexpr int kThreads           = kKWarps * 32;
+    static constexpr int kTileKPerWarp      = 128;
+    static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
+    static constexpr int kRowsPerCta        = 16;
+    static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
+};
+
 __device__ __forceinline__ int q4_small_t_swizzle_64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
@@ -57,14 +85,13 @@ __device__ __forceinline__ unsigned q4_small_t_bf16_pair(std::uint8_t packed) {
 }
 
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4SmallTMmaStoreEpilogue,
-          class RowPolicy = Q4SmallTMmaIdentityRows>
-__launch_bounds__(256, 6) __global__
+          class RowPolicy = Q4SmallTMmaIdentityRows, class Schedule = Q4DraftSmallTSchedule>
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) __global__
     void q4_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,
                                __nv_bfloat16* __restrict__ out, Epilogue epilogue = {},
                                RowPolicy row_policy = {}) {
-    using Schedule              = Q4DraftSmallTSchedule;
     constexpr int kHidden       = Geometry::kInputRows;
     constexpr int kTileK        = Schedule::kTileKPerWarp;
     constexpr int kWarps        = Schedule::kKWarps;
@@ -74,6 +101,8 @@ __launch_bounds__(256, 6) __global__
     constexpr int kCodeRowBytes = kHidden / 2;
     constexpr int kTileCols     = TileCols;
     constexpr int kNt           = kTileCols / 8;
+    constexpr int kScaleTiles   = kTileK / 64;
+    constexpr int kScaleSlots   = kWarps * kScaleTiles;
     static_assert(kTileCols >= 8 && kTileCols <= 32 && (kTileCols % 8) == 0);
     static_assert(ActiveCols >= 2 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
     static_assert((kHidden % kGroupK) == 0);
@@ -83,7 +112,7 @@ __launch_bounds__(256, 6) __global__
         struct {
             std::uint8_t codes[kRowsPerCta][kGroupK / 2];
             __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
-            std::uint16_t scales[kRowsPerCta][kWarps];
+            std::uint16_t scales[kRowsPerCta][kScaleSlots];
         } staging;
 
         float partial[kWarps * kNt * 32 * 4];
@@ -128,10 +157,12 @@ __launch_bounds__(256, 6) __global__
         }
         for (int row = tid; row < kRowsPerCta; row += kWarps * 32) {
             const int weight_row = row_policy.weight_row(row0, row);
-            cp_async<16>(&scale_shared[row][0],
-                         scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
-                                   group_k0 / 64) *
-                                      2);
+            for (int scale = 0; scale < kScaleSlots; scale += 8) {
+                cp_async<16>(&scale_shared[row][scale],
+                             scales + (static_cast<std::int64_t>(weight_row) *
+                                           Geometry::kGroupsPerRow + group_k0 / 64 + scale) *
+                                          2);
+            }
         }
     };
 
@@ -149,35 +180,41 @@ __launch_bounds__(256, 6) __global__
 #pragma unroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0      = group_index * kGroupK;
-        float group_acc[kNt][4] = {};
 
+        for (int scale_tile = 0; scale_tile < kScaleTiles; ++scale_tile) {
+            float tile_acc[kNt][4] = {};
 #pragma unroll
-        for (int ks = 0; ks < 4; ++ks) {
-            const int byte_col = warp_koff / 2 + ks * 8 + lid;
-            const unsigned af0 = q4_small_t_bf16_pair(code_shared[gid][byte_col]);
-            const unsigned af1 = q4_small_t_bf16_pair(code_shared[gid + 8][byte_col]);
-            const unsigned af2 = q4_small_t_bf16_pair(code_shared[gid][byte_col + 4]);
-            const unsigned af3 = q4_small_t_bf16_pair(code_shared[gid + 8][byte_col + 4]);
+            for (int ks = scale_tile * 4; ks < scale_tile * 4 + 4; ++ks) {
+                const int byte_col = warp_koff / 2 + ks * 8 + lid;
+                const unsigned af0 = q4_small_t_bf16_pair(code_shared[gid][byte_col]);
+                const unsigned af1 = q4_small_t_bf16_pair(code_shared[gid + 8][byte_col]);
+                const unsigned af2 = q4_small_t_bf16_pair(code_shared[gid][byte_col + 4]);
+                const unsigned af3 = q4_small_t_bf16_pair(code_shared[gid + 8][byte_col + 4]);
+#pragma unroll
+                for (int nt = 0; nt < kNt; ++nt) {
+                    unsigned bf0, bf1;
+                    const int br = nt * 8 + b_rin;
+                    ldmatrix_x2(
+                        bf0, bf1,
+                        smem_addr(&x_shared[k_split][br * kTileK + q4_small_t_swizzle_64(
+                                                                   br, ks * 16 + b_koff)]));
+                    mma_bf16(tile_acc[nt][0], tile_acc[nt][1], tile_acc[nt][2], tile_acc[nt][3],
+                             af0, af1, af2, af3, bf0, bf1);
+                }
+            }
+
+            const int scale_column = k_split * kScaleTiles + scale_tile;
+            const float top_scale =
+                __half2float(__ushort_as_half(scale_shared[gid][scale_column]));
+            const float bot_scale =
+                __half2float(__ushort_as_half(scale_shared[gid + 8][scale_column]));
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
-                unsigned bf0, bf1;
-                const int br = nt * 8 + b_rin;
-                ldmatrix_x2(bf0, bf1,
-                            smem_addr(&x_shared[k_split][br * kTileK + q4_small_t_swizzle_64(
-                                                                           br, ks * 16 + b_koff)]));
-                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
-                         af0, af1, af2, af3, bf0, bf1);
+                acc[nt][0] = fmaf(tile_acc[nt][0], top_scale, acc[nt][0]);
+                acc[nt][1] = fmaf(tile_acc[nt][1], top_scale, acc[nt][1]);
+                acc[nt][2] = fmaf(tile_acc[nt][2], bot_scale, acc[nt][2]);
+                acc[nt][3] = fmaf(tile_acc[nt][3], bot_scale, acc[nt][3]);
             }
-        }
-
-        const float top_scale = __half2float(__ushort_as_half(scale_shared[gid][k_split]));
-        const float bot_scale = __half2float(__ushort_as_half(scale_shared[gid + 8][k_split]));
-#pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            acc[nt][0] = fmaf(group_acc[nt][0], top_scale, acc[nt][0]);
-            acc[nt][1] = fmaf(group_acc[nt][1], top_scale, acc[nt][1]);
-            acc[nt][2] = fmaf(group_acc[nt][2], bot_scale, acc[nt][2]);
-            acc[nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[nt][3]);
         }
 
         if (group_index + 1 < kGroups) {

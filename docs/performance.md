@@ -699,3 +699,24 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 | Story | 15 | 126.1 ± 10.9 | 37.4% ± 5.8% | 2.12 ± 0.17 |
 | Translation | 15 | 192.3 ± 11.9 | 75.0% ± 6.5% | 3.25 ± 0.19 |
 | Structured | 15 | 219.8 ± 8.6 | 90.8% ± 5.1% | 3.72 ± 0.15 |
+
+### E026: default pairwise NVFP4 attention
+
+The default packed-NVFP4 attention route now decodes two values per packed byte owner. Dense
+causal attention uses the pair route by default, while DFlash2 local attention uses the
+scalar-order-preserving pair route by default; `NINFER_NVFP4_PAIR=0` restores the scalar fallback.
+Both focused correctness suites pass in default and fallback modes. The dense cached operator was
+about 9–10% faster at 8K on the RTX 5090, but the serving result is the deciding gate.
+
+With the Qwen3.8-27B NVFP4 DFlash2 artifact, context 512, `k=7`, optimized proposal head,
+VeriCache-NVFP4, hierarchical host snapshots, CUDA Graphs, one warmup round, and five measured
+rounds, fresh default/scalar samples were:
+
+| Batch | Default wall round | Scalar wall round | Default tok/s | Scalar tok/s | Draft acceptance |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 18.6615 ms | 18.8937 ms | 192.911 | 190.540 | 13/35 vs 13/35 |
+| 8 | 32.3135 ms | 32.7918 ms | 736.535 | 731.891 | 79/280 vs 80/280 |
+
+The C8 acceptance difference is retained as a qualification signal, so these measurements support
+the default but do not establish a universal end-to-end multiplier. `NINFER_NVFP4_XQA=1/2`
+remains an opt-in research path because its current grouped prototypes are slower on this GPU.

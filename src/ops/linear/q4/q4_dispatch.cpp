@@ -1,8 +1,20 @@
 #include "ops/linear/q4/q4_dispatch.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+namespace {
+
+int draft_head_schedule_variant() noexcept {
+    const char* value = std::getenv("NINFER_Q4_DRAFT_HEAD_WIDE");
+    if (value == nullptr) { return 0; }
+    if (value[0] == '2') { return 2; }
+    return value[0] == '1' ? 1 : 0;
+}
+
+} // namespace
 
 Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("q4 linear: unsupported shape or T"); }
@@ -39,7 +51,13 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q4_mma_r64_c128;
         case 131072:
             if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
-            if (t <= 8) { return launch_q4_draft_head_small_t; }
+            if (t <= 8) {
+                switch (draft_head_schedule_variant()) {
+                case 1: return launch_q4_draft_head_small_t_wide;
+                case 2: return launch_q4_draft_head_small_t_k_wide;
+                default: return launch_q4_draft_head_small_t;
+                }
+            }
             return launch_q4_mma_r64_c128;
         default:
             break;

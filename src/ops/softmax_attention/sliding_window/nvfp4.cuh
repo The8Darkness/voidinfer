@@ -11,15 +11,81 @@
 
 namespace ninfer::ops {
 
-template <bool Packed>
+template <bool Packed, bool PairLayout = false>
 __device__ __forceinline__ void sliding_window_nvfp4_accumulate(
     int lane, const float (&q_values)[4], float scale, float& normalizer, float& running_max,
     float (&accumulator)[4], const __nv_bfloat16* key_raw, const __nv_bfloat16* value_raw,
     const std::uint8_t* key_codes, const std::uint8_t* value_codes,
     const std::uint8_t* key_scales, const std::uint8_t* value_scales) {
     constexpr unsigned FullMask = 0xffffffffU;
-    constexpr float Log2E        = 1.4426950408889634074F;
-    float dot                    = 0.0F;
+    constexpr float Log2E       = 1.4426950408889634074F;
+
+    if constexpr (PairLayout) {
+        const int d0 = lane * 2;
+        const int d1 = d0 + 64;
+        float key_values[4];
+        float value_values[4];
+        if constexpr (Packed) {
+            float key_scale0   = 0.0F;
+            float key_scale1   = 0.0F;
+            float value_scale0 = 0.0F;
+            float value_scale1 = 0.0F;
+            if ((lane & 7) == 0) {
+                const int group = lane >> 3;
+                key_scale0     = kv_cache_nvfp4_decode_scale(key_scales[group]);
+                key_scale1     = kv_cache_nvfp4_decode_scale(key_scales[group + 4]);
+                value_scale0   = kv_cache_nvfp4_decode_scale(value_scales[group]);
+                value_scale1   = kv_cache_nvfp4_decode_scale(value_scales[group + 4]);
+            }
+            const int scale_lane = (lane >> 3) * 8;
+            key_scale0 = __shfl_sync(FullMask, key_scale0, scale_lane);
+            key_scale1 = __shfl_sync(FullMask, key_scale1, scale_lane);
+            value_scale0 = __shfl_sync(FullMask, value_scale0, scale_lane);
+            value_scale1 = __shfl_sync(FullMask, value_scale1, scale_lane);
+
+            const float2 key_pair0   = kv_cache_nvfp4_decode_pair(key_codes[lane]);
+            const float2 key_pair1   = kv_cache_nvfp4_decode_pair(key_codes[lane + 32]);
+            const float2 value_pair0 = kv_cache_nvfp4_decode_pair(value_codes[lane]);
+            const float2 value_pair1 = kv_cache_nvfp4_decode_pair(value_codes[lane + 32]);
+            key_values[0] = key_pair0.x * key_scale0;
+            key_values[1] = key_pair0.y * key_scale0;
+            key_values[2] = key_pair1.x * key_scale1;
+            key_values[3] = key_pair1.y * key_scale1;
+            value_values[0] = value_pair0.x * value_scale0;
+            value_values[1] = value_pair0.y * value_scale0;
+            value_values[2] = value_pair1.x * value_scale1;
+            value_values[3] = value_pair1.y * value_scale1;
+        } else {
+            key_values[0] = __bfloat162float(key_raw[d0]);
+            key_values[1] = __bfloat162float(key_raw[d0 + 1]);
+            key_values[2] = __bfloat162float(key_raw[d1]);
+            key_values[3] = __bfloat162float(key_raw[d1 + 1]);
+            value_values[0] = __bfloat162float(value_raw[d0]);
+            value_values[1] = __bfloat162float(value_raw[d0 + 1]);
+            value_values[2] = __bfloat162float(value_raw[d1]);
+            value_values[3] = __bfloat162float(value_raw[d1 + 1]);
+        }
+        float dot = 0.0F;
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            dot = fmaf(q_values[item], key_values[item], dot);
+        }
+        dot = warp_sum<32>(dot, FullMask) * scale;
+        const float next_max = fmaxf(running_max, dot);
+        const float old_weight = running_max == -CUDART_INF_F
+                                      ? 0.0F
+                                      : exp2_approx((running_max - next_max) * Log2E);
+        const float new_weight = exp2_approx((dot - next_max) * Log2E);
+        normalizer             = normalizer * old_weight + new_weight;
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            accumulator[item] = accumulator[item] * old_weight + value_values[item] * new_weight;
+        }
+        running_max = next_max;
+        return;
+    }
+
+    float dot = 0.0F;
 #pragma unroll
     for (int item = 0; item < 4; ++item) {
         const int d = lane + item * 32;
@@ -50,6 +116,116 @@ __device__ __forceinline__ void sliding_window_nvfp4_accumulate(
         accumulator[item] = accumulator[item] * old_weight + value * new_weight;
     }
     running_max = next_max;
+}
+
+// Pair-decode while retaining the scalar fallback's dimension-to-lane order.  The packed bytes
+// are decoded by their owning lane and then transposed with warp shuffles before the dot/value
+// update.  This costs a few shuffles, but keeps greedy decisions stable across the optimized and
+// fallback routes instead of turning a harmless floating-point reordering into a draft mismatch.
+template <bool Packed>
+__device__ __forceinline__ void sliding_window_nvfp4_accumulate_pair_stable(
+    int lane, const float (&q_values)[4], float scale, float& normalizer, float& running_max,
+    float (&accumulator)[4], const __nv_bfloat16* key_raw, const __nv_bfloat16* value_raw,
+    const std::uint8_t* key_codes, const std::uint8_t* value_codes,
+    const std::uint8_t* key_scales, const std::uint8_t* value_scales) {
+    constexpr unsigned FullMask = 0xffffffffU;
+    constexpr float Log2E       = 1.4426950408889634074F;
+    const int d0                = lane * 2;
+    const int d1                = d0 + 64;
+    float key_values[8];
+    float value_values[8];
+    if constexpr (Packed) {
+        float key_scale0   = 0.0F;
+        float key_scale1   = 0.0F;
+        float value_scale0 = 0.0F;
+        float value_scale1 = 0.0F;
+        if ((lane & 7) == 0) {
+            const int group = lane >> 3;
+            key_scale0     = kv_cache_nvfp4_decode_scale(key_scales[group]);
+            key_scale1     = kv_cache_nvfp4_decode_scale(key_scales[group + 4]);
+            value_scale0   = kv_cache_nvfp4_decode_scale(value_scales[group]);
+            value_scale1   = kv_cache_nvfp4_decode_scale(value_scales[group + 4]);
+        }
+        const int scale_lane = (lane >> 3) * 8;
+        key_scale0           = __shfl_sync(FullMask, key_scale0, scale_lane);
+        key_scale1           = __shfl_sync(FullMask, key_scale1, scale_lane);
+        value_scale0         = __shfl_sync(FullMask, value_scale0, scale_lane);
+        value_scale1         = __shfl_sync(FullMask, value_scale1, scale_lane);
+        const float2 key_pair0   = kv_cache_nvfp4_decode_pair(key_codes[lane]);
+        const float2 key_pair1   = kv_cache_nvfp4_decode_pair(key_codes[lane + 32]);
+        const float2 value_pair0 = kv_cache_nvfp4_decode_pair(value_codes[lane]);
+        const float2 value_pair1 = kv_cache_nvfp4_decode_pair(value_codes[lane + 32]);
+        key_values[0] = key_pair0.x * key_scale0;
+        key_values[1] = key_pair0.y * key_scale0;
+        key_values[2] = key_pair1.x * key_scale1;
+        key_values[3] = key_pair1.y * key_scale1;
+        value_values[0] = value_pair0.x * value_scale0;
+        value_values[1] = value_pair0.y * value_scale0;
+        value_values[2] = value_pair1.x * value_scale1;
+        value_values[3] = value_pair1.y * value_scale1;
+    } else {
+        key_values[0] = __bfloat162float(key_raw[d0]);
+        key_values[1] = __bfloat162float(key_raw[d0 + 1]);
+        key_values[2] = __bfloat162float(key_raw[d1]);
+        key_values[3] = __bfloat162float(key_raw[d1 + 1]);
+        value_values[0] = __bfloat162float(value_raw[d0]);
+        value_values[1] = __bfloat162float(value_raw[d0 + 1]);
+        value_values[2] = __bfloat162float(value_raw[d1]);
+        value_values[3] = __bfloat162float(value_raw[d1 + 1]);
+    }
+
+    // The raw fallback path has the same two-segment pair ownership as the packed path.  For each
+    // original scalar lane/item, select the owner lane and its corresponding pair component.
+    float dot = 0.0F;
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int d       = lane + item * 32;
+        const int owner   = (d & 63) >> 1;
+        const int segment = d >> 6;
+        const float key_component0 =
+            __shfl_sync(FullMask, key_values[segment * 2], owner);
+        const float key_component1 =
+            __shfl_sync(FullMask, key_values[segment * 2 + 1], owner);
+        const float key_value = (d & 1) == 0 ? key_component0 : key_component1;
+        dot                   = fmaf(q_values[item], key_value, dot);
+    }
+    dot = warp_sum<32>(dot, FullMask) * scale;
+    const float next_max = fmaxf(running_max, dot);
+    const float old_weight = running_max == -CUDART_INF_F
+                                  ? 0.0F
+                                  : exp2_approx((running_max - next_max) * Log2E);
+    const float new_weight = exp2_approx((dot - next_max) * Log2E);
+    normalizer             = normalizer * old_weight + new_weight;
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int d       = lane + item * 32;
+        const int owner   = (d & 63) >> 1;
+        const int segment = d >> 6;
+        const float value_component0 =
+            __shfl_sync(FullMask, value_values[segment * 2], owner);
+        const float value_component1 =
+            __shfl_sync(FullMask, value_values[segment * 2 + 1], owner);
+        const float value = (d & 1) == 0 ? value_component0 : value_component1;
+        accumulator[item] = accumulator[item] * old_weight + value * new_weight;
+    }
+    running_max = next_max;
+}
+
+template <bool Packed, bool PairLayout, bool StablePair>
+__device__ __forceinline__ void sliding_window_nvfp4_accumulate_dispatch(
+    int lane, const float (&q_values)[4], float scale, float& normalizer, float& running_max,
+    float (&accumulator)[4], const __nv_bfloat16* key_raw, const __nv_bfloat16* value_raw,
+    const std::uint8_t* key_codes, const std::uint8_t* value_codes,
+    const std::uint8_t* key_scales, const std::uint8_t* value_scales) {
+    if constexpr (StablePair) {
+        sliding_window_nvfp4_accumulate_pair_stable<Packed>(
+            lane, q_values, scale, normalizer, running_max, accumulator, key_raw, value_raw,
+            key_codes, value_codes, key_scales, value_scales);
+    } else {
+        sliding_window_nvfp4_accumulate<Packed, PairLayout>(
+            lane, q_values, scale, normalizer, running_max, accumulator, key_raw, value_raw,
+            key_codes, value_codes, key_scales, value_scales);
+    }
 }
 
 template <bool Packed>
@@ -322,7 +498,7 @@ __launch_bounds__(128, 2) __global__ void sliding_window_attention_nvfp4_grouped
 // Correctness-first NVFP4 DFlash2 local attention.  One warp owns one query head/token row;
 // this keeps the packed-cache path independent of the BF16 tensor-core staging contract.  The
 // verifier still consumes the exact target cache, so this route is only an approximate proposer.
-template <bool HasProtected>
+template <bool HasProtected, bool PairLayout = false, bool StablePair = false>
 __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
@@ -365,9 +541,18 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
     }
 
     float q_values[4];
+    if constexpr (PairLayout && !StablePair) {
+        const int d0 = lane * 2;
+        const int d1 = d0 + 64;
+        q_values[0] = __bfloat162float(q_row[d0]);
+        q_values[1] = __bfloat162float(q_row[d0 + 1]);
+        q_values[2] = __bfloat162float(q_row[d1]);
+        q_values[3] = __bfloat162float(q_row[d1 + 1]);
+    } else {
 #pragma unroll
-    for (int item = 0; item < 4; ++item) {
-        q_values[item] = __bfloat162float(q_row[lane + item * 32]);
+        for (int item = 0; item < 4; ++item) {
+            q_values[item] = __bfloat162float(q_row[lane + item * 32]);
+        }
     }
 
     const int context_count = min(length, window - 1);
@@ -408,7 +593,7 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
                 static_cast<std::int64_t>(D) *
                 (context_position +
                  static_cast<std::int64_t>(protected_padded_capacity) * kv_head);
-            sliding_window_nvfp4_accumulate<false>(
+            sliding_window_nvfp4_accumulate_dispatch<false, PairLayout, StablePair>(
                 lane, q_values, scale, normalizer, running_max, accumulator,
                 lane_protected_k + protected_offset, lane_protected_v + protected_offset, nullptr,
                 nullptr, nullptr, nullptr);
@@ -424,7 +609,7 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
             const std::int64_t scale_offset =
                 static_cast<std::int64_t>(ScaleExtent) *
                 (slot + static_cast<std::int64_t>(padded_context) * kv_head);
-            sliding_window_nvfp4_accumulate<true>(
+            sliding_window_nvfp4_accumulate_dispatch<true, PairLayout, StablePair>(
                 lane, q_values, scale, normalizer, running_max, accumulator, nullptr, nullptr,
                 lane_k + slot_offset, lane_v + slot_offset, lane_k_scale + scale_offset,
                 lane_v_scale + scale_offset);
@@ -439,7 +624,7 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
                     static_cast<std::int64_t>(D) *
                     (protected_slot +
                      static_cast<std::int64_t>(protected_padded_capacity) * kv_head);
-                sliding_window_nvfp4_accumulate<false>(
+                sliding_window_nvfp4_accumulate_dispatch<false, PairLayout, StablePair>(
                     lane, q_values, scale, normalizer, running_max, accumulator,
                     lane_protected_k + protected_offset, lane_protected_v + protected_offset,
                     nullptr, nullptr, nullptr, nullptr);
@@ -455,7 +640,7 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
             const std::int64_t scale_offset =
                 static_cast<std::int64_t>(ScaleExtent) *
                 (slot + static_cast<std::int64_t>(padded_context) * kv_head);
-            sliding_window_nvfp4_accumulate<true>(
+            sliding_window_nvfp4_accumulate_dispatch<true, PairLayout, StablePair>(
                 lane, q_values, scale, normalizer, running_max, accumulator, nullptr, nullptr,
                 lane_k + slot_offset, lane_v + slot_offset, lane_k_scale + scale_offset,
                 lane_v_scale + scale_offset);
@@ -466,15 +651,24 @@ __launch_bounds__(32, 4) __global__ void sliding_window_attention_nvfp4_kernel(
             query_k_batch + static_cast<std::int64_t>(D) * (kv_head + KVHeads * query_token);
         const __nv_bfloat16* query_value_row =
             query_v_batch + static_cast<std::int64_t>(D) * (kv_head + KVHeads * query_token);
-        sliding_window_nvfp4_accumulate<false>(
+        sliding_window_nvfp4_accumulate_dispatch<false, PairLayout, StablePair>(
             lane, q_values, scale, normalizer, running_max, accumulator, query_key_row,
             query_value_row, nullptr, nullptr, nullptr, nullptr);
     }
 
+    const float inverse_normalizer = normalizer > 0.0F ? __frcp_rn(normalizer) : 0.0F;
+    if constexpr (PairLayout && !StablePair) {
+        const int d0 = lane * 2;
+        const int d1 = d0 + 64;
+        out_row[d0]     = __float2bfloat16(accumulator[0] * inverse_normalizer);
+        out_row[d0 + 1] = __float2bfloat16(accumulator[1] * inverse_normalizer);
+        out_row[d1]     = __float2bfloat16(accumulator[2] * inverse_normalizer);
+        out_row[d1 + 1] = __float2bfloat16(accumulator[3] * inverse_normalizer);
+    } else {
 #pragma unroll
-    for (int item = 0; item < 4; ++item) {
-        const float value = normalizer > 0.0F ? accumulator[item] * __frcp_rn(normalizer) : 0.0F;
-        out_row[lane + item * 32] = __float2bfloat16(value);
+        for (int item = 0; item < 4; ++item) {
+            out_row[lane + item * 32] = __float2bfloat16(accumulator[item] * inverse_normalizer);
+        }
     }
 }
 
