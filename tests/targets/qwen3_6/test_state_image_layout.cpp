@@ -49,6 +49,45 @@ q36::StateImageDeviceLayout plan(bool dflash, bool nvfp4 = false, bool protected
     return q36::plan_state_image_device_pool(builder, spec);
 }
 
+q36::StateImageDeviceLayout plan_oscar_q4_shadow() {
+    q36::StateImageSpec spec{
+        .linear =
+            {
+                .layers         = 2,
+                .conv_channels  = 5,
+                .conv_width     = 3,
+                .value_heads    = 2,
+                .value_head_dim = 4,
+                .key_head_dim   = 3,
+                .slot_count     = 2,
+                .conv_dtype     = ninfer::DType::BF16,
+            },
+        .hidden = 7,
+        .dflash_local = q36::DFlashLocalStateSpec{
+            .layers        = 2,
+            .capacity      = 128,
+            .kv_heads      = 2,
+            .head_dim      = 128,
+            .dtype         = ninfer::DType::U8,
+            .quant_group   = 128,
+            .quant_bits   = 2,
+            .quantization = ninfer::CyclicKVCacheQuantization::OscarAffine,
+        },
+        .dflash_host_local = q36::DFlashLocalStateSpec{
+            .layers        = 2,
+            .capacity      = 128,
+            .kv_heads      = 2,
+            .head_dim      = 128,
+            .dtype         = ninfer::DType::U8,
+            .quant_group   = 128,
+            .quant_bits   = 4,
+            .quantization = ninfer::CyclicKVCacheQuantization::OscarAffine,
+        },
+    };
+    ninfer::LayoutBuilder builder;
+    return q36::plan_state_image_device_pool(builder, spec);
+}
+
 } // namespace
 
 int main() {
@@ -118,6 +157,18 @@ int main() {
                anchor_nvfp4.dflash_local->protected_padded_capacity == 16 &&
                anchor_nvfp4.host.dflash_local_protected_padded_capacity == 16,
            "DFlash NVFP4 layout supports an anchor-only protected sidecar");
+
+    const q36::StateImageDeviceLayout oscar_shadow = plan_oscar_q4_shadow();
+    expect(oscar_shadow.dflash_local && oscar_shadow.dflash_local_q4_shadow &&
+               oscar_shadow.dflash_local->quantization ==
+                   ninfer::CyclicKVCacheQuantization::OscarAffine &&
+               oscar_shadow.dflash_local->quant_bits == 2 &&
+               oscar_shadow.dflash_local_q4_shadow->quantization ==
+                   ninfer::CyclicKVCacheQuantization::OscarAffine &&
+               oscar_shadow.dflash_local_q4_shadow->quant_bits == 4 &&
+               oscar_shadow.dflash_local_q4_shadow->payload_bytes() >
+                   oscar_shadow.dflash_local->payload_bytes(),
+           "lower-bit OSCAR layout reserves an independent Q4 source shadow");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

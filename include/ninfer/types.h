@@ -129,10 +129,10 @@ struct HierarchicalVeriCacheOptions {
     std::uint32_t protected_sink_tokens   = 4;
     std::uint32_t protected_pivot_tokens  = 4;
 
-    // Keep the first hierarchical implementation conservative. Packed 2/3-bit L0 and direct
-    // low-bit attention are research switches and remain off until their exact numerical route
-    // has an independent oracle and end-to-end evidence.
-    bool allow_2bit_l0              = false;
+    // L0 is the resident speculative DFlash local KV. In the hierarchical OSCAR profile this
+    // defaults to Q2; Q4 remains available as a storage/throughput control. The host mirror is
+    // independently calibrated OSCAR-Q4 and sensitive ranges continue to use the BF16 sidecar.
+    std::uint8_t l0_bits              = 4;
     bool direct_low_bit_attention   = false;
     // Opt-in asynchronous StateImage promotion. This materializes the existing compressed
     // DFlash mirror plus authoritative GDN/recurrent state in pinned host memory at the adaptive
@@ -819,6 +819,9 @@ struct RuntimeStats {
     std::uint64_t vericache_host_kv_d2h_bytes           = 0;
     double vericache_host_kv_d2h_seconds                = 0.0;
     std::size_t vericache_l0_bytes                      = 0;
+    // Temporary device-side source shadow used to produce independent OSCAR-Q4 host snapshots;
+    // it is not part of the resident L0 tier and is zero when Q4 is the resident format.
+    std::size_t vericache_l0_q4_shadow_bytes             = 0;
     std::size_t vericache_l1_bytes                      = 0;
     std::size_t vericache_l2_bytes                      = 0;
     std::size_t vericache_l3_bytes                      = 0;

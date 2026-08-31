@@ -109,6 +109,7 @@ add_library(ninfer_ops STATIC
   ops/softmax_attention/sliding_window/launch.cu
   ops/kv_cache/append/kv_cache_append.cpp
   ops/kv_cache/append/launch.cu
+  ops/kv_cache/oscar_conversion.cu
   # Gated DeltaNet Linear Attention core.
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp

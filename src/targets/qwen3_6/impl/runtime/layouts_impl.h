@@ -197,6 +197,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                     protected_recent = power_of_two;
                 }
             }
+            // The hierarchical DFlash route is the OSCAR experiment: L0 stays in VRAM at Q2 by
+            // default (the option still permits a Q4 storage control), while its independent host
+            // mirror is always a true OSCAR-Q4 layout.  The legacy non-hierarchical route keeps
+            // the existing NVFP4/qgroup16 contract.
+            const bool use_oscar = plan.hierarchical_vericache.enabled;
+            const std::uint8_t l0_bits =
+                use_oscar ? plan.hierarchical_vericache.l0_bits : static_cast<std::uint8_t>(4);
             state_image_spec.dflash_local = qwen3_6::DFlashLocalStateSpec{
                 .layers             = DFlashConfig::local_layers,
                 .capacity           = DFlashConfig::local_capacity,
@@ -205,8 +212,28 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .kv_heads            = DFlashConfig::kv_heads,
                 .head_dim            = DFlashConfig::head_dim,
                 .dtype               = dflash_nvfp4 ? DType::U8 : DType::BF16,
-                .quant_group         = dflash_nvfp4 ? qwen3_6::kKvNvfp4QuantGroup : 0,
+                .quant_group         = dflash_nvfp4
+                                           ? (use_oscar ? 128 : qwen3_6::kKvNvfp4QuantGroup)
+                                           : 0,
+                .quant_bits          = dflash_nvfp4 ? l0_bits : static_cast<std::uint8_t>(0),
+                .quantization        = dflash_nvfp4
+                                           ? (use_oscar
+                                                  ? CyclicKVCacheQuantization::OscarAffine
+                                                  : CyclicKVCacheQuantization::Nvfp4)
+                                           : CyclicKVCacheQuantization::Auto,
             };
+            if (dflash_nvfp4) {
+                // L1 is a separate OSCAR-Q4 mirror when hierarchy is enabled. Lower-bit L0 now
+                // has a source-side Q4 shadow so StateImage promotion can preserve independent
+                // Q4 quantization; L2 remains the BF16 target/GDN state below.
+                auto host_local = *state_image_spec.dflash_local;
+                host_local.quant_bits = 4;
+                host_local.quant_group = use_oscar ? 128 : qwen3_6::kKvNvfp4QuantGroup;
+                host_local.quantization = use_oscar
+                                               ? CyclicKVCacheQuantization::OscarAffine
+                                               : CyclicKVCacheQuantization::Nvfp4;
+                state_image_spec.dflash_host_local = host_local;
+            }
         }
     }
     out.state_images = qwen3_6::plan_state_image_device_pool(builder, state_image_spec);

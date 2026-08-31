@@ -90,4 +90,17 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             CyclicKVCacheLayerView cache, cudaStream_t stream);
 
+/**
+ * Fused append for a lower-bit OSCAR L0 and an independently quantized OSCAR-Q4 source shadow.
+ * The BF16 input rows are loaded and rotated once, then emitted to both cache representations.
+ * The two caches must have identical position/lane/protected geometry; the first cache uses Q2 and
+ * the second uses Q4. This is an implementation optimization for hierarchical snapshots,
+ * not a second live attention consumer.
+ */
+void kv_cache_append_prefix_oscar_dual(
+    const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
+    const Tensor& lanes, KVCacheAppendPrefixExecutionEnvelope envelope,
+    CyclicKVCacheLayerView l0_cache, CyclicKVCacheLayerView q4_shadow_cache,
+    cudaStream_t stream);
+
 } // namespace ninfer::ops

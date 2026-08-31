@@ -198,10 +198,21 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 value.view({Config::head_dim, Config::kv_heads, layer_width, batch});
             Tensor position_batch = layer_positions.view({layer_width, batch});
             if (local_layer) {
-                ops::kv_cache_append_prefix(
-                    key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
-                    dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                    state.execution.device.stream);
+                // L0 remains the fast OSCAR-Q2 representation. When the hierarchy has a Q4
+                // source shadow, append the same BF16 rows directly into it so the later pinned
+                // snapshot is independently quantized rather than promoted from lossy L0 codes.
+                if (dflash_state(state).local_q4_shadow != nullptr) {
+                    ops::kv_cache_append_prefix_oscar_dual(
+                        key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
+                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                        dflash_state(state).local_q4_layer(static_cast<std::uint32_t>(layer)),
+                        state.execution.device.stream);
+                } else {
+                    ops::kv_cache_append_prefix(
+                        key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
+                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                        state.execution.device.stream);
+                }
             } else {
                 ops::kv_cache_append_prefix(
                     key_batch, value_batch, position_batch, commit_counts, table_rows, envelope,

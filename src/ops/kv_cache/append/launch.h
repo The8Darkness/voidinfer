@@ -36,5 +36,10 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
                                    const Tensor& counts, const Tensor& lanes,
                                    CyclicKVCacheLayerView cache,
                                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream);
+void kv_cache_append_prefix_oscar_dual_launch(
+    const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
+    const Tensor& lanes, CyclicKVCacheLayerView l0_cache,
+    CyclicKVCacheLayerView q4_shadow_cache, const KVCacheAppendPrefixPlan& plan,
+    cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

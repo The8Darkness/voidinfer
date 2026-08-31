@@ -1,7 +1,9 @@
 #include "ops/softmax_attention/sliding_window/launch.h"
 
 #include "core/device.h"
+#include "ops/softmax_attention/sliding_window/lowbit.cuh"
 #include "ops/softmax_attention/sliding_window/nvfp4.cuh"
+#include "ops/softmax_attention/sliding_window/oscar.cuh"
 #include "ops/softmax_attention/sliding_window/kernel.cuh"
 
 #include <algorithm>
@@ -253,6 +255,87 @@ void sliding_window_attention_nvfp4_launch(
         launch.template operator()<true>();
     } else {
         launch.template operator()<false>();
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sliding_window_attention_lowbit_launch(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& lanes, float scale,
+    const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
+    Tensor& out, cudaStream_t stream) {
+    if (max_context < 0 || window < 2 || (window & (window - 1)) != 0) {
+        throw std::invalid_argument("sliding_window_attention low-bit launch has invalid bounds");
+    }
+    const dim3 grid(static_cast<unsigned>(q.ne[2] * kCyclicKVCacheNvfp4KVHeads * 4),
+                    static_cast<unsigned>(q.ne[3]), 1);
+    const auto launch = [&]<int Bits>() {
+        sliding_window_attention_lowbit_kernel<Bits><<<grid, 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data),
+            static_cast<const __nv_bfloat16*>(query_k.data),
+            static_cast<const __nv_bfloat16*>(query_v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<const std::int32_t*>(lanes.data),
+            static_cast<const std::uint8_t*>(context.k.data),
+            static_cast<const std::uint8_t*>(context.v.data),
+            static_cast<const std::uint8_t*>(context.k_scale.data),
+            static_cast<const std::uint8_t*>(context.v_scale.data),
+            static_cast<const __nv_bfloat16*>(context.protected_k.data),
+            static_cast<const __nv_bfloat16*>(context.protected_v.data),
+            static_cast<int>(context.padded_capacity), max_context, window,
+            static_cast<int>(context.protected_capacity),
+            static_cast<int>(context.protected_anchor_capacity),
+            static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
+            static_cast<__nv_bfloat16*>(out.data));
+    };
+    if (context.quant_bits == 2) {
+        launch.template operator()<2>();
+    } else if (context.quant_bits == 3) {
+        launch.template operator()<3>();
+    } else {
+        throw std::invalid_argument("sliding_window_attention low-bit launch requires 2 or 3 bits");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sliding_window_attention_oscar_launch(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& lanes, float scale,
+    const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
+    Tensor& out, cudaStream_t stream) {
+    if (max_context < 0 || window < 2 || (window & (window - 1)) != 0) {
+        throw std::invalid_argument("sliding_window_attention OSCAR launch has invalid bounds");
+    }
+    const dim3 grid(static_cast<unsigned>(q.ne[2] * 32), static_cast<unsigned>(q.ne[3]), 1);
+    const auto launch = [&]<int Bits>() {
+        sliding_window_attention_oscar_kernel<Bits><<<grid, 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data),
+            static_cast<const __nv_bfloat16*>(query_k.data),
+            static_cast<const __nv_bfloat16*>(query_v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<const std::int32_t*>(lanes.data),
+            static_cast<const std::uint8_t*>(context.k.data),
+            static_cast<const std::uint8_t*>(context.v.data),
+            static_cast<const __nv_bfloat16*>(context.k_scale.data),
+            static_cast<const __nv_bfloat16*>(context.v_scale.data),
+            static_cast<const __nv_bfloat16*>(context.protected_k.data),
+            static_cast<const __nv_bfloat16*>(context.protected_v.data),
+            static_cast<int>(context.padded_capacity), max_context, window,
+            static_cast<int>(context.protected_capacity),
+            static_cast<int>(context.protected_anchor_capacity),
+            static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
+            static_cast<__nv_bfloat16*>(out.data));
+    };
+    if (context.quant_bits == 2) {
+        launch.template operator()<2>();
+    } else if (context.quant_bits == 3) {
+        launch.template operator()<3>();
+    } else if (context.quant_bits == 4) {
+        launch.template operator()<4>();
+    } else {
+        throw std::invalid_argument("OSCAR attention requires 2, 3, or 4 bits");
     }
     CUDA_CHECK(cudaGetLastError());
 }

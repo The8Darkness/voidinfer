@@ -1,7 +1,7 @@
-# Qwen3.8-27B NVFP4 documentation
+# Qwen3.8-27B OSCAR-Q2/Q4 documentation
 
 Start with the [project README](../README.md) to build VoidInfer and run the current DFlash2 plus
-hierarchical VeriCache serving profile on an RTX 5090.
+OSCAR-Q2/Q4 hierarchical VeriCache serving profile on an RTX 5090.
 
 ## User guides
 
@@ -9,7 +9,7 @@ hierarchical VeriCache serving profile on an RTX 5090.
 | --- | --- |
 | [CLI](cli.md) | text generation, chat history, sampling, and runtime options |
 | [HTTP serving](serving.md) | OpenAI/Anthropic-compatible serving and the DFlash2 default |
-| [Performance](performance.md) | NVFP4/DFlash2 context, speed, quality, and tier measurements |
+| [Performance](performance.md) | OSCAR-Q2/Q4, DFlash2 context, speed, quality, and tier measurements |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
@@ -33,6 +33,6 @@ download.
 - [Qwen3.8-27B artifact contract](maintainer/qwen3.8-27b-artifact.md) — storage format and tensor mapping.
 - [HTTP serving](serving.md) — runtime flags and endpoint behavior.
 
-The isolated `exp/hierarchical-vericache-20260830` branch is the active NVFP4 research track for
-hierarchical L0/L1/L2/L3 residency. Host-tier verification, NVMe persistence, and the full quality
-matrix remain explicitly open until measured.
+The isolated `exp/hierarchical-vericache-20260830` branch is the active Qwen3.8 NVFP4 research track
+for OSCAR-Q2 L0, OSCAR-Q4 L1, 16-bit L2/L3 residency. Live host-tier logit verification, NVMe
+persistence, and the full quality matrix remain explicitly open until measured.

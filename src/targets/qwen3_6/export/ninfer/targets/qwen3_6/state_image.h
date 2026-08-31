@@ -25,12 +25,17 @@ struct DFlashLocalStateSpec {
     std::int32_t head_dim            = 0;
     DType dtype              = DType::BF16;
     std::int32_t quant_group = 0;
+    std::uint8_t quant_bits = 0;
+    CyclicKVCacheQuantization quantization = CyclicKVCacheQuantization::Auto;
 };
 
 struct StateImageSpec {
     LinearAttentionStatePoolSpec linear;
     std::int32_t hidden = 0;
+    // Device DFlash local state (L0). When present, dflash_host_local describes the
+    // independent pinned-host L1 mirror; an absent mirror inherits the device format.
     std::optional<DFlashLocalStateSpec> dflash_local;
+    std::optional<DFlashLocalStateSpec> dflash_host_local;
 };
 
 struct StateImageHostLayout {
@@ -59,6 +64,10 @@ struct StateImageDeviceLayout {
     LinearAttentionStatePoolLayout linear;
     TensorRegion continuation_hidden;
     std::optional<CyclicKVCacheLayout> dflash_local;
+    // Optional source-side OSCAR-Q4 shadow.  It is present only when the active L0 is a
+    // lower-bit OSCAR cache and the host mirror is Q4, allowing D2H snapshots to preserve
+    // information that was not representable in Q2.
+    std::optional<CyclicKVCacheLayout> dflash_local_q4_shadow;
     StateImageHostLayout host;
 };
 
@@ -161,6 +170,8 @@ public:
 
     [[nodiscard]] CyclicKVCache* dflash_local() noexcept;
     [[nodiscard]] const CyclicKVCache* dflash_local() const noexcept;
+    [[nodiscard]] CyclicKVCache* dflash_local_q4_shadow() noexcept;
+    [[nodiscard]] const CyclicKVCache* dflash_local_q4_shadow() const noexcept;
 
     [[nodiscard]] const StateImageHostLayout& host_layout() const noexcept { return host_layout_; }
 
@@ -180,6 +191,7 @@ private:
     LinearAttentionStatePool linear_;
     Tensor continuation_hidden_;
     std::optional<CyclicKVCache> dflash_local_;
+    std::optional<CyclicKVCache> dflash_local_q4_shadow_;
     StateImageHostLayout host_layout_;
 };
 

@@ -823,7 +823,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         if (local == nullptr) {
             throw std::logic_error("DFlash StateImage has no local fixed state");
         }
-        dflash.emplace(backing, *plan.persistent.dflash, *local);
+        dflash.emplace(backing, *plan.persistent.dflash, *local,
+                       state_images->dflash_local_q4_shadow());
     }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
@@ -9130,9 +9131,14 @@ void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) c
     if (!hierarchical_vericache.enabled()) { return; }
 
     // Reuse the existing pinned StateImage and host KV stores for truthful tier accounting. The
-    // compressed DFlash portion of a host StateImage is the L1 NVFP4 mirror; its remaining
+    // compressed DFlash portion of a host StateImage is the L1 OSCAR-Q4 mirror; its remaining
     // payload is high-precision GDN/continuation state for L2. Host KV pages are authoritative
     // L2 attention storage. L3 remains zero until a cold-store writer is attached.
+    if (state_images != nullptr) {
+        if (const CyclicKVCache* q4_shadow = state_images->dflash_local_q4_shadow()) {
+            out.vericache_l0_q4_shadow_bytes = q4_shadow->payload_bytes();
+        }
+    }
     std::size_t l1_bytes = 0;
     std::size_t l2_bytes = 0;
     if (host_state_images != nullptr) {
@@ -9152,7 +9158,7 @@ void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) c
         l2_bytes = (layout.image_bytes - local_bytes) * occupied;
     }
     // The target text KV uses the authoritative BF16 geometry in VeriCache mode, while the
-    // speculative MTP/DFlash backend uses the compressed U8/NVFP4 geometry.  Count them by owner
+    // speculative MTP/DFlash backend uses the compressed U8/OSCAR geometry. Count them by owner
     // rather than treating the shared arena as one undifferentiated tier.
     if (text_kv_pages != nullptr) {
         l2_bytes += static_cast<std::size_t>(text_kv_pages->host_resident_count()) *

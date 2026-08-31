@@ -314,12 +314,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (!kv_dtype_explicit) { options.kv_cache = KvCacheStorage::BFloat16; }
             options.hierarchical_vericache.enabled                    = false;
             options.hierarchical_vericache.enable_host_tier_snapshots = false;
+            options.hierarchical_vericache.l0_bits                    = 4;
             speculative_explicit = true;
         } else if (arg == "--hierarchical-vericache") {
             options.hierarchical_vericache.enabled = true;
         } else if (arg == "--no-hierarchical-vericache") {
             options.hierarchical_vericache.enabled                    = false;
             options.hierarchical_vericache.enable_host_tier_snapshots = false;
+            options.hierarchical_vericache.l0_bits                    = 4;
         } else if (arg == "--vericache-host-snapshots") {
             options.hierarchical_vericache.enable_host_tier_snapshots = true;
         } else if (arg == "--no-vericache-host-snapshots") {

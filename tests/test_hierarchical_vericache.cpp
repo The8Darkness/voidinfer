@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -53,6 +54,15 @@ void test_adaptive_windows() {
     assert(stats.vericache_host_kv_d2h_seconds == 0.25);
     assert(stats.vericache_host_tier_snapshots == 1);
     assert(stats.vericache_host_tier_snapshot_bytes == 4864);
+
+    options.l0_bits = 3;
+    bool rejected_q3 = false;
+    try {
+        (void)normalize_hierarchical_vericache_options(options);
+    } catch (const std::invalid_argument&) {
+        rejected_q3 = true;
+    }
+    assert(rejected_q3);
 }
 
 void test_protection_ledger() {
@@ -84,6 +94,18 @@ void test_protection_ledger() {
     ledger.reencode(1, HierarchicalVeriCacheEncoding::Packed3Bit, 96);
     assert(ledger.bytes(HierarchicalVeriCacheTier::L0Vram) == 160);
     assert(ledger.protected_bytes() == 64);
+
+    // New OSCAR names are appended to the legacy enum values and a normal L1 Q4 segment is
+    // accounted separately from the speculative L0 ledger.
+    assert(static_cast<std::uint8_t>(HierarchicalVeriCacheTier::L3Nvme) == 5);
+    assert(static_cast<std::uint8_t>(HierarchicalVeriCacheEncoding::Fp16) == 5);
+    HierarchicalVeriCacheLedger q4_ledger(options);
+    q4_ledger.append({0, 128, HierarchicalVeriCacheTier::L1PinnedOscarQ4,
+                      HierarchicalVeriCacheEncoding::OscarQ4,
+                      HierarchicalVeriCacheSensitivity::Normal, 256});
+    assert(q4_ledger.bytes(HierarchicalVeriCacheTier::L1PinnedOscarQ4) == 256);
+    assert(hierarchical_vericache_is_host_tier(HierarchicalVeriCacheTier::L1PinnedOscarQ4));
+    assert(q4_ledger.can_reencode(0, HierarchicalVeriCacheEncoding::OscarQ2));
 }
 
 void test_nested_transactions() {

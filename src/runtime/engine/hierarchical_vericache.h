@@ -20,21 +20,29 @@ namespace ninfer::runtime {
 // is the frequent verifier representation, L2 is the authoritative host representation, and L3
 // is cold persistence. A cold record must never be pulled into the frequent verifier path.
 enum class HierarchicalVeriCacheTier : std::uint8_t {
-    L0Vram,
-    L1PinnedNvfp4,
-    L1PinnedFp8,
-    L2HostFp16,
-    L2HostGdnProtected,
-    L3Nvme,
+    L0Vram                  = 0,
+    L1PinnedNvfp4            = 1,
+    L1PinnedFp8              = 2,
+    L2HostFp16               = 3,
+    L2HostGdnProtected       = 4,
+    L3Nvme                    = 5,
+    // Appended to preserve the serialized values of the original experimental ledger. The
+    // physical tier is still L1; this name makes the active host verifier unambiguous.
+    L1PinnedOscarQ4           = 6,
 };
 
 enum class HierarchicalVeriCacheEncoding : std::uint8_t {
-    Packed2Bit,
-    Packed3Bit,
-    Nvfp4,
-    Fp8,
-    BFloat16,
-    Fp16,
+    Packed2Bit = 0,
+    Packed3Bit = 1,
+    Nvfp4      = 2,
+    Fp8        = 3,
+    BFloat16   = 4,
+    Fp16       = 5,
+    // Appended for compatibility with existing manifests. OSCAR encodings carry an affine
+    // BF16 scale/zero pair and are distinct from legacy NVFP4's E4M3 group scales.
+    OscarQ2    = 6,
+    OscarQ3    = 7,
+    OscarQ4    = 8,
 };
 
 enum class HierarchicalVeriCacheSensitivity : std::uint8_t {
@@ -71,13 +79,17 @@ hierarchical_vericache_is_protected(HierarchicalVeriCacheSensitivity sensitivity
 [[nodiscard]] constexpr bool hierarchical_vericache_is_low_bit(
     HierarchicalVeriCacheEncoding encoding) noexcept {
     return encoding == HierarchicalVeriCacheEncoding::Packed2Bit ||
-           encoding == HierarchicalVeriCacheEncoding::Packed3Bit;
+           encoding == HierarchicalVeriCacheEncoding::Packed3Bit ||
+           encoding == HierarchicalVeriCacheEncoding::OscarQ2 ||
+           encoding == HierarchicalVeriCacheEncoding::OscarQ3 ||
+           encoding == HierarchicalVeriCacheEncoding::OscarQ4;
 }
 
 [[nodiscard]] constexpr bool hierarchical_vericache_is_host_tier(
     HierarchicalVeriCacheTier tier) noexcept {
     return tier == HierarchicalVeriCacheTier::L1PinnedNvfp4 ||
            tier == HierarchicalVeriCacheTier::L1PinnedFp8 ||
+           tier == HierarchicalVeriCacheTier::L1PinnedOscarQ4 ||
            tier == HierarchicalVeriCacheTier::L2HostFp16 ||
            tier == HierarchicalVeriCacheTier::L2HostGdnProtected ||
            tier == HierarchicalVeriCacheTier::L3Nvme;
@@ -103,6 +115,12 @@ hierarchical_vericache_is_protected(HierarchicalVeriCacheSensitivity sensitivity
             options.l1_to_l2_min_horizon, options.l1_to_l2_max_horizon,
             options.host_snapshot_horizon, "host snapshot horizon");
     }
+    if (options.l0_bits != 2 && options.l0_bits != 4) {
+        throw std::invalid_argument("L0 OSCAR bit width must be 2 or 4");
+    }
+    if (!options.enabled && options.l0_bits != 4) {
+        throw std::invalid_argument("low-bit L0 requires hierarchical VeriCache");
+    }
     if (options.protected_recent_tokens == 0 && options.protected_sink_tokens == 0 &&
         options.protected_pivot_tokens == 0 && options.enabled) {
         throw std::invalid_argument("hierarchical VeriCache must protect at least one token class");
@@ -111,7 +129,7 @@ hierarchical_vericache_is_protected(HierarchicalVeriCacheSensitivity sensitivity
 }
 
 // A compact segment ledger used by both the future GPU cache route and host persistence. It
-// encodes the safety invariant that sensitive tokens cannot silently be assigned 2/3-bit storage.
+// encodes the safety invariant that sensitive tokens cannot silently be assigned low-bit storage.
 class HierarchicalVeriCacheLedger {
 public:
     explicit HierarchicalVeriCacheLedger(HierarchicalVeriCacheOptions options = {})
@@ -157,7 +175,7 @@ public:
         }
         if (hierarchical_vericache_is_protected(segment.sensitivity) &&
             hierarchical_vericache_is_low_bit(segment.encoding)) {
-            throw std::invalid_argument("protected VeriCache segment cannot use 2/3-bit encoding");
+            throw std::invalid_argument("protected VeriCache segment cannot use low-bit encoding");
         }
         if (!segments_.empty() && segment.begin < segments_.back().end) {
             throw std::invalid_argument("VeriCache segments overlap");

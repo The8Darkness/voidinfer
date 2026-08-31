@@ -56,6 +56,7 @@ struct ServeOptions {
         HierarchicalVeriCacheOptions value;
         value.enabled                    = true;
         value.enable_host_tier_snapshots = true;
+        value.l0_bits                    = 2;
         // The current host tier is an asynchronous persistence/checkpoint path. Keep its
         // measured lower-DMA cadence separate from the future adaptive host verifier.
         value.host_snapshot_horizon      = 2048;

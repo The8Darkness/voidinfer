@@ -148,22 +148,78 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     if (plan.max_count == 0) return;
     if (cache.dtype == DType::U8) {
         const dim3 grid(static_cast<unsigned>(plan.max_count), k.ne[3], 1);
-        kv_cache_append_prefix_cyclic_nvfp4_kernel<<<grid, kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(k.data),
-            static_cast<const __nv_bfloat16*>(v.data),
-            static_cast<const std::int32_t*>(positions.data),
-            static_cast<const std::int32_t*>(counts.data),
-            static_cast<const std::int32_t*>(lanes.data),
-            static_cast<std::uint8_t*>(cache.k.data),
-            static_cast<std::uint8_t*>(cache.v.data),
-            static_cast<std::uint8_t*>(cache.k_scale.data),
-            static_cast<std::uint8_t*>(cache.v_scale.data),
-            static_cast<__nv_bfloat16*>(cache.protected_k.data),
-            static_cast<__nv_bfloat16*>(cache.protected_v.data),
-            plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
-            static_cast<int>(cache.padded_capacity), static_cast<int>(cache.protected_capacity),
-            static_cast<int>(cache.protected_anchor_capacity),
-            static_cast<int>(cache.protected_padded_capacity));
+        if (cache.quantization == CyclicKVCacheQuantization::OscarAffine) {
+            const auto launch_oscar = [&]<int Bits>() {
+                kv_cache_append_prefix_cyclic_oscar_kernel<Bits, false><<<grid, kBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data),
+                    static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(counts.data),
+                    static_cast<const std::int32_t*>(lanes.data),
+                    static_cast<std::uint8_t*>(cache.k.data),
+                    static_cast<std::uint8_t*>(cache.v.data),
+                    static_cast<__nv_bfloat16*>(cache.k_scale.data),
+                    static_cast<__nv_bfloat16*>(cache.v_scale.data),
+                    static_cast<__nv_bfloat16*>(cache.protected_k.data),
+                    static_cast<__nv_bfloat16*>(cache.protected_v.data),
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
+                    static_cast<int>(cache.padded_capacity), static_cast<int>(cache.protected_capacity),
+                    static_cast<int>(cache.protected_anchor_capacity),
+                    static_cast<int>(cache.protected_padded_capacity));
+            };
+            if (cache.quant_bits == 2) {
+                launch_oscar.template operator()<2>();
+            } else if (cache.quant_bits == 3) {
+                launch_oscar.template operator()<3>();
+            } else if (cache.quant_bits == 4) {
+                launch_oscar.template operator()<4>();
+            } else {
+                throw std::invalid_argument("OSCAR cyclic KV launch requires 2, 3, or 4 bits");
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        const auto launch_lowbit = [&]<int Bits>() {
+            kv_cache_append_prefix_cyclic_lowbit_kernel<Bits><<<grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(counts.data),
+                static_cast<const std::int32_t*>(lanes.data),
+                static_cast<std::uint8_t*>(cache.k.data),
+                static_cast<std::uint8_t*>(cache.v.data),
+                static_cast<std::uint8_t*>(cache.k_scale.data),
+                static_cast<std::uint8_t*>(cache.v_scale.data),
+                static_cast<__nv_bfloat16*>(cache.protected_k.data),
+                static_cast<__nv_bfloat16*>(cache.protected_v.data),
+                plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
+                static_cast<int>(cache.padded_capacity), static_cast<int>(cache.protected_capacity),
+                static_cast<int>(cache.protected_anchor_capacity),
+                static_cast<int>(cache.protected_padded_capacity));
+        };
+        if (cache.quant_bits == 2) {
+            launch_lowbit.template operator()<2>();
+        } else if (cache.quant_bits == 3) {
+            launch_lowbit.template operator()<3>();
+        } else {
+            kv_cache_append_prefix_cyclic_nvfp4_kernel<<<grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(counts.data),
+                static_cast<const std::int32_t*>(lanes.data),
+                static_cast<std::uint8_t*>(cache.k.data),
+                static_cast<std::uint8_t*>(cache.v.data),
+                static_cast<std::uint8_t*>(cache.k_scale.data),
+                static_cast<std::uint8_t*>(cache.v_scale.data),
+                static_cast<__nv_bfloat16*>(cache.protected_k.data),
+                static_cast<__nv_bfloat16*>(cache.protected_v.data),
+                plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
+                static_cast<int>(cache.padded_capacity), static_cast<int>(cache.protected_capacity),
+                static_cast<int>(cache.protected_anchor_capacity),
+                static_cast<int>(cache.protected_padded_capacity));
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -180,6 +236,46 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     kv_cache_append_prefix_cyclic_kernel<<<grid, kBlock, 0, stream>>>(
         input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
         plan.tokens, static_cast<int>(cache.capacity), padded);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_cyclic_oscar_dual(const Tensor& k, const Tensor& v, const Tensor& positions,
+                              const Tensor& counts, const Tensor& lanes,
+                              CyclicKVCacheLayerView l0_cache,
+                              CyclicKVCacheLayerView q4_shadow_cache,
+                              const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
+    validate_plan(k, plan);
+    if (plan.max_count == 0) return;
+    const dim3 grid(static_cast<unsigned>(plan.max_count), k.ne[3], 1);
+    const auto launch = [&]<int Bits>() {
+        kv_cache_append_prefix_cyclic_oscar_kernel<Bits, true><<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(counts.data),
+            static_cast<const std::int32_t*>(lanes.data),
+            static_cast<std::uint8_t*>(l0_cache.k.data),
+            static_cast<std::uint8_t*>(l0_cache.v.data),
+            static_cast<__nv_bfloat16*>(l0_cache.k_scale.data),
+            static_cast<__nv_bfloat16*>(l0_cache.v_scale.data),
+            static_cast<__nv_bfloat16*>(l0_cache.protected_k.data),
+            static_cast<__nv_bfloat16*>(l0_cache.protected_v.data),
+            static_cast<std::uint8_t*>(q4_shadow_cache.k.data),
+            static_cast<std::uint8_t*>(q4_shadow_cache.v.data),
+            static_cast<__nv_bfloat16*>(q4_shadow_cache.k_scale.data),
+            static_cast<__nv_bfloat16*>(q4_shadow_cache.v_scale.data),
+            static_cast<__nv_bfloat16*>(q4_shadow_cache.protected_k.data),
+            static_cast<__nv_bfloat16*>(q4_shadow_cache.protected_v.data),
+            plan.min_count, plan.max_count, plan.tokens, static_cast<int>(l0_cache.capacity),
+            static_cast<int>(l0_cache.padded_capacity), static_cast<int>(l0_cache.protected_capacity),
+            static_cast<int>(l0_cache.protected_anchor_capacity),
+            static_cast<int>(l0_cache.protected_padded_capacity));
+    };
+    if (l0_cache.quant_bits == 2) {
+        launch.template operator()<2>();
+    } else {
+        throw std::invalid_argument("OSCAR dual append requires Q2 L0");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -291,6 +387,15 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
                                    CyclicKVCacheLayerView cache,
                                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     launch_cyclic(k, v, positions, counts, lanes, cache, plan, stream);
+}
+
+void kv_cache_append_prefix_oscar_dual_launch(
+    const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
+    const Tensor& lanes, CyclicKVCacheLayerView l0_cache,
+    CyclicKVCacheLayerView q4_shadow_cache, const KVCacheAppendPrefixPlan& plan,
+    cudaStream_t stream) {
+    launch_cyclic_oscar_dual(k, v, positions, counts, lanes, l0_cache, q4_shadow_cache, plan,
+                             stream);
 }
 
 } // namespace ninfer::ops::detail

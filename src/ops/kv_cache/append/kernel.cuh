@@ -5,7 +5,9 @@
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
+#include "ops/kv_cache/low_bit_codec.cuh"
 #include "ops/kv_cache/nvfp4_codec.cuh"
+#include "ops/kv_cache/oscar_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -535,6 +537,360 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
                                             padded_capacity);
 }
 
+template <int Bits, bool Dual>
+__device__ __forceinline__ void kv_cache_append_prefix_cyclic_oscar_row(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    __nv_bfloat16* __restrict__ scale_k, __nv_bfloat16* __restrict__ scale_v, int token,
+    __nv_bfloat16* __restrict__ protected_k, __nv_bfloat16* __restrict__ protected_v, int kv_head,
+    std::uint8_t* __restrict__ q4_cache_k, std::uint8_t* __restrict__ q4_cache_v,
+    __nv_bfloat16* __restrict__ q4_scale_k, __nv_bfloat16* __restrict__ q4_scale_v,
+    __nv_bfloat16* __restrict__ q4_protected_k, __nv_bfloat16* __restrict__ q4_protected_v,
+    int lane_id, int slot, int padded_capacity, int protected_slot, int protected_padded_capacity,
+    int lane) {
+    static_assert(Bits >= 2 && Bits <= 4);
+    constexpr unsigned FullMask = 0xffffffffU;
+    constexpr int D             = kCyclicKVCacheOscarHeadDim;
+    constexpr int Heads         = kCyclicKVCacheOscarKVHeads;
+    constexpr int CodeExtent    = cyclic_oscar_code_extent<Bits>(D);
+    const std::int64_t src_base = static_cast<std::int64_t>(D) *
+                                  (kv_head + static_cast<std::int64_t>(Heads) * token);
+    float k_values[4];
+    float v_values[4];
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int d = lane + item * 32;
+        k_values[item] = __bfloat162float(k[src_base + d]);
+        v_values[item] = __bfloat162float(v[src_base + d]);
+    }
+    normalized_hadamard_d128_inplace(k_values, lane);
+    normalized_hadamard_d128_inplace(v_values, lane);
+    const auto k_quant = cyclic_oscar_quant_params<Bits, false>(k_values, lane);
+    const auto v_quant = cyclic_oscar_quant_params<Bits, true>(v_values, lane);
+    std::uint8_t k_codes[4];
+    std::uint8_t v_codes[4];
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        k_codes[item] = cyclic_oscar_quantize<Bits>(k_values[item], k_quant);
+        v_codes[item] = cyclic_oscar_quantize_value<Bits>(v_values[item], v_quant);
+    }
+
+    OscarAffineQuantParams<4, false> q4_k_quant{};
+    OscarAffineQuantParams<4, true> q4_v_quant{};
+    std::uint8_t q4_k_codes[4]{};
+    std::uint8_t q4_v_codes[4]{};
+    if constexpr (Dual) {
+        q4_k_quant = cyclic_oscar_quant_params<4, false>(k_values, lane);
+        q4_v_quant = cyclic_oscar_quant_params<4, true>(v_values, lane);
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            q4_k_codes[item] = cyclic_oscar_quantize<4>(k_values[item], q4_k_quant);
+            q4_v_codes[item] = cyclic_oscar_quantize_value<4>(v_values[item], q4_v_quant);
+        }
+    }
+
+    // Pack a contiguous symbol stream without byte races. Every lane executes the same shuffles;
+    // lane zero owns the final byte stores. Q2/Q4 compile down to the same fixed-size loop.
+    for (int byte = 0; byte < CodeExtent; ++byte) {
+        std::uint8_t packed_k = 0;
+        std::uint8_t packed_v = 0;
+        int bit_cursor         = 0;
+        while (bit_cursor < 8) {
+            const int global_bit = byte * 8 + bit_cursor;
+            const int dimension  = global_bit / Bits;
+            const int bit_offset = global_bit - dimension * Bits;
+            const int take       = min(Bits - bit_offset, 8 - bit_cursor);
+            const int source_lane = dimension & 31;
+            const int source_item = dimension >> 5;
+            const int k_code = __shfl_sync(FullMask, static_cast<int>(k_codes[source_item]),
+                                           source_lane);
+            const int v_code = __shfl_sync(FullMask, static_cast<int>(v_codes[source_item]),
+                                           source_lane);
+            const int mask = (1 << take) - 1;
+            packed_k |= static_cast<std::uint8_t>(((k_code >> bit_offset) & mask) << bit_cursor);
+            packed_v |= static_cast<std::uint8_t>(((v_code >> bit_offset) & mask) << bit_cursor);
+            bit_cursor += take;
+        }
+        if (lane == 0) {
+            cache_k[cyclic_oscar_code_index<Bits>(slot, kv_head, lane_id, padded_capacity, byte)] =
+                packed_k;
+            cache_v[cyclic_oscar_code_index<Bits>(slot, kv_head, lane_id, padded_capacity, byte)] =
+                packed_v;
+        }
+    }
+    if constexpr (Dual) {
+        constexpr int Q4CodeExtent = cyclic_oscar_code_extent<4>(D);
+#pragma unroll
+        for (int byte = 0; byte < Q4CodeExtent; ++byte) {
+            std::uint8_t packed_k = 0;
+            std::uint8_t packed_v = 0;
+            int bit_cursor         = 0;
+            while (bit_cursor < 8) {
+                const int global_bit = byte * 8 + bit_cursor;
+                const int dimension  = global_bit / 4;
+                const int bit_offset = global_bit - dimension * 4;
+                const int take       = min(4 - bit_offset, 8 - bit_cursor);
+                const int source_lane = dimension & 31;
+                const int source_item = dimension >> 5;
+                const int k_code = __shfl_sync(FullMask, static_cast<int>(q4_k_codes[source_item]),
+                                               source_lane);
+                const int v_code = __shfl_sync(FullMask, static_cast<int>(q4_v_codes[source_item]),
+                                               source_lane);
+                const int mask = (1 << take) - 1;
+                packed_k |= static_cast<std::uint8_t>(((k_code >> bit_offset) & mask) << bit_cursor);
+                packed_v |= static_cast<std::uint8_t>(((v_code >> bit_offset) & mask) << bit_cursor);
+                bit_cursor += take;
+            }
+            if (lane == 0) {
+                q4_cache_k[cyclic_oscar_code_index<4>(slot, kv_head, lane_id, padded_capacity,
+                                                      byte)] = packed_k;
+                q4_cache_v[cyclic_oscar_code_index<4>(slot, kv_head, lane_id, padded_capacity,
+                                                      byte)] = packed_v;
+            }
+        }
+    }
+    if (lane == 0) {
+        const std::int64_t scale_offset =
+            cyclic_oscar_scale_index(slot, kv_head, lane_id, padded_capacity, 0);
+        scale_k[scale_offset]     = __float2bfloat16(k_quant.scale);
+        scale_k[scale_offset + 1] = __float2bfloat16(k_quant.zero);
+        scale_v[scale_offset]     = __float2bfloat16(v_quant.scale);
+        scale_v[scale_offset + 1] = __float2bfloat16(v_quant.zero);
+        if constexpr (Dual) {
+            q4_scale_k[cyclic_oscar_scale_index(slot, kv_head, lane_id, padded_capacity, 0)] =
+                __float2bfloat16(q4_k_quant.scale);
+            q4_scale_k[cyclic_oscar_scale_index(slot, kv_head, lane_id, padded_capacity, 1)] =
+                __float2bfloat16(q4_k_quant.zero);
+            q4_scale_v[cyclic_oscar_scale_index(slot, kv_head, lane_id, padded_capacity, 0)] =
+                __float2bfloat16(q4_v_quant.scale);
+            q4_scale_v[cyclic_oscar_scale_index(slot, kv_head, lane_id, padded_capacity, 1)] =
+                __float2bfloat16(q4_v_quant.zero);
+        }
+    }
+    if (protected_k != nullptr && lane < 32) {
+        const std::int64_t protected_base =
+            static_cast<std::int64_t>(D) *
+            (protected_slot + static_cast<std::int64_t>(protected_padded_capacity) *
+                                  (kv_head + static_cast<std::int64_t>(Heads) * lane_id));
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            protected_k[protected_base + lane + item * 32] = __float2bfloat16(k_values[item]);
+            protected_v[protected_base + lane + item * 32] = __float2bfloat16(v_values[item]);
+        }
+    }
+    if constexpr (Dual) {
+        if (q4_protected_k != nullptr && lane < 32) {
+            const std::int64_t protected_base =
+                static_cast<std::int64_t>(D) *
+                (protected_slot + static_cast<std::int64_t>(protected_padded_capacity) *
+                                      (kv_head + static_cast<std::int64_t>(Heads) * lane_id));
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                q4_protected_k[protected_base + lane + item * 32] = __float2bfloat16(k_values[item]);
+                q4_protected_v[protected_base + lane + item * 32] = __float2bfloat16(v_values[item]);
+            }
+        }
+    }
+}
+
+template <int Bits, bool Dual>
+__global__ void kv_cache_append_prefix_cyclic_oscar_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
+    const std::int32_t* __restrict__ lanes, std::uint8_t* __restrict__ cache_k,
+    std::uint8_t* __restrict__ cache_v, __nv_bfloat16* __restrict__ scale_k,
+    __nv_bfloat16* __restrict__ scale_v, __nv_bfloat16* __restrict__ protected_k,
+    __nv_bfloat16* __restrict__ protected_v, std::uint8_t* __restrict__ q4_cache_k,
+    std::uint8_t* __restrict__ q4_cache_v, __nv_bfloat16* __restrict__ q4_scale_k,
+    __nv_bfloat16* __restrict__ q4_scale_v, __nv_bfloat16* __restrict__ q4_protected_k,
+    __nv_bfloat16* __restrict__ q4_protected_v, int min_count, int max_count, int width,
+    int window, int padded_capacity, int protected_capacity, int protected_anchor_capacity,
+    int protected_padded_capacity) {
+    constexpr int Warps = 8;
+    const int batch       = static_cast<int>(blockIdx.y);
+    const int count       = counts[batch];
+    if (count < min_count || count > max_count) return;
+    const int token       = static_cast<int>(blockIdx.x);
+    const int kv_head     = static_cast<int>(threadIdx.x) >> 5;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    if (token >= count || kv_head >= kCyclicKVCacheOscarKVHeads ||
+        static_cast<int>(blockDim.x) != Warps * 32) {
+        return;
+    }
+    constexpr std::int64_t ElementsPerToken =
+        kCyclicKVCacheOscarHeadDim * kCyclicKVCacheOscarKVHeads;
+    const std::int64_t batch_offset = ElementsPerToken * static_cast<std::int64_t>(width) * batch;
+    const int position = positions[static_cast<std::int64_t>(width) * batch + token];
+    const int slot     = position & (window - 1);
+    const bool anchor_protected =
+        protected_anchor_capacity != 0 && position < protected_anchor_capacity;
+    // Only the suffix that is recent at the end of this append owns the narrow BF16 sidecar.
+    // Writing every token into a smaller recent ring would make a multi-token prefix append race
+    // with itself when positions wrap the sidecar. The cyclic append contract guarantees a
+    // sequential prefix, so the last input position is the append frontier.
+    const int append_frontier = positions[static_cast<std::int64_t>(width) * batch + count - 1];
+    const int recent_begin =
+        protected_capacity == 0
+            ? append_frontier + 1
+            : max(0, append_frontier - static_cast<int>(protected_capacity) + 1);
+    const bool recent_protected = protected_capacity != 0 && position >= recent_begin;
+    const int protected_slot =
+        anchor_protected
+            ? position
+            : protected_anchor_capacity +
+                  (recent_protected ? position & (protected_capacity - 1) : 0);
+    __nv_bfloat16* protected_k_for_token =
+        (anchor_protected || recent_protected) ? protected_k : nullptr;
+    __nv_bfloat16* protected_v_for_token =
+        (anchor_protected || recent_protected) ? protected_v : nullptr;
+    kv_cache_append_prefix_cyclic_oscar_row<Bits, Dual>(
+        k + batch_offset, v + batch_offset, cache_k, cache_v, scale_k, scale_v, token,
+        protected_k_for_token, protected_v_for_token, kv_head, q4_cache_k, q4_cache_v, q4_scale_k,
+        q4_scale_v,
+        (q4_protected_k != nullptr && (anchor_protected || recent_protected))
+            ? q4_protected_k
+            : nullptr,
+        (q4_protected_v != nullptr && (anchor_protected || recent_protected))
+            ? q4_protected_v
+            : nullptr,
+        lanes[batch], slot, padded_capacity, protected_slot, protected_padded_capacity, lane);
+}
+
+template <int Bits>
+__device__ __forceinline__ void kv_cache_append_prefix_cyclic_lowbit_row(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token,
+    __nv_bfloat16* __restrict__ protected_k, __nv_bfloat16* __restrict__ protected_v,
+    int kv_head, int lane_id, int slot, int padded_capacity, int protected_slot,
+    int protected_padded_capacity, int lane) {
+    static_assert(Bits == 2 || Bits == 3);
+    constexpr unsigned FullMask = 0xffffffffU;
+    constexpr int ValuesPerLane = kCyclicKVLowBitQuantGroup / 2;
+    const int logical_lane = lane & 15;
+    const int group = logical_lane >> 1;
+    const int group_lane = logical_lane & 1;
+    const int d_base = group * kCyclicKVLowBitQuantGroup + group_lane * ValuesPerLane;
+    const std::int64_t src_base = static_cast<std::int64_t>(kCyclicKVCacheNvfp4HeadDim) *
+                                  (kv_head + kCyclicKVCacheNvfp4KVHeads * token);
+    float k_values[ValuesPerLane];
+    float v_values[ValuesPerLane];
+    float k_absmax = 0.0F;
+    float v_absmax = 0.0F;
+#pragma unroll
+    for (int i = 0; i < ValuesPerLane; ++i) {
+        const int d = d_base + i;
+        k_values[i] = __bfloat162float(k[src_base + d]);
+        v_values[i] = __bfloat162float(v[src_base + d]);
+        k_absmax = fmaxf(k_absmax, fabsf(k_values[i]));
+        v_absmax = fmaxf(v_absmax, fabsf(v_values[i]));
+    }
+    k_absmax = fmaxf(k_absmax, __shfl_xor_sync(FullMask, k_absmax, 1));
+    v_absmax = fmaxf(v_absmax, __shfl_xor_sync(FullMask, v_absmax, 1));
+    const auto k_quant = cyclic_kv_lowbit_quant_params<Bits>(k_absmax);
+    const auto v_quant = cyclic_kv_lowbit_quant_params<Bits>(v_absmax);
+    std::uint8_t k_codes[ValuesPerLane];
+    std::uint8_t v_codes[ValuesPerLane];
+#pragma unroll
+    for (int i = 0; i < ValuesPerLane; ++i) {
+        k_codes[i] = cyclic_kv_lowbit_quantize<Bits>(k_values[i], k_quant.inverse_scale);
+        v_codes[i] = cyclic_kv_lowbit_quantize<Bits>(v_values[i], v_quant.inverse_scale);
+    }
+
+    // One writer lane owns each 16-value group. It obtains the other half of the group from its
+    // paired lane, then packs complete bytes without read/modify/write races between lanes.
+    if (lane < 16 && group_lane == 0) {
+        constexpr int GroupBytes = cyclic_kv_lowbit_group_bytes<Bits>();
+        constexpr int ValuesPerByte = 8 / Bits;
+        for (int byte = 0; byte < GroupBytes; ++byte) {
+            std::uint8_t packed_k = 0;
+            std::uint8_t packed_v = 0;
+#pragma unroll
+            for (int item = 0; item < ValuesPerByte; ++item) {
+                const int value_index = byte * ValuesPerByte + item;
+                const int local_index = value_index < ValuesPerLane
+                                            ? value_index
+                                            : value_index - ValuesPerLane;
+                const std::uint8_t k_code = value_index < ValuesPerLane
+                                                 ? k_codes[local_index]
+                                                 : __shfl_sync(FullMask, k_codes[local_index], lane + 1);
+                const std::uint8_t v_code = value_index < ValuesPerLane
+                                                 ? v_codes[local_index]
+                                                 : __shfl_sync(FullMask, v_codes[local_index], lane + 1);
+                packed_k |= static_cast<std::uint8_t>(k_code << (item * Bits));
+                packed_v |= static_cast<std::uint8_t>(v_code << (item * Bits));
+            }
+            const int code_byte = group * GroupBytes + byte;
+            cache_k[cyclic_kv_lowbit_code_index<Bits>(slot, kv_head, lane_id, padded_capacity,
+                                                      code_byte)] = packed_k;
+            cache_v[cyclic_kv_lowbit_code_index<Bits>(slot, kv_head, lane_id, padded_capacity,
+                                                      code_byte)] = packed_v;
+        }
+        scale_k[cyclic_kv_lowbit_scale_index<Bits>(slot, kv_head, lane_id, padded_capacity, group)] =
+            k_quant.scale;
+        scale_v[cyclic_kv_lowbit_scale_index<Bits>(slot, kv_head, lane_id, padded_capacity, group)] =
+            v_quant.scale;
+    }
+    if (protected_k != nullptr && lane < 16) {
+        const std::int64_t protected_base =
+            static_cast<std::int64_t>(kCyclicKVCacheNvfp4HeadDim) *
+            (protected_slot + static_cast<std::int64_t>(protected_padded_capacity) *
+                                  (kv_head + kCyclicKVCacheNvfp4KVHeads * lane_id));
+#pragma unroll
+        for (int i = 0; i < ValuesPerLane; ++i) {
+            protected_k[protected_base + d_base + i] = k[src_base + d_base + i];
+            protected_v[protected_base + d_base + i] = v[src_base + d_base + i];
+        }
+    }
+}
+
+template <int Bits>
+__global__ void kv_cache_append_prefix_cyclic_lowbit_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
+    const std::int32_t* __restrict__ lanes, std::uint8_t* __restrict__ cache_k,
+    std::uint8_t* __restrict__ cache_v, std::uint8_t* __restrict__ scale_k,
+    std::uint8_t* __restrict__ scale_v, __nv_bfloat16* __restrict__ protected_k,
+    __nv_bfloat16* __restrict__ protected_v, int min_count, int max_count, int width, int window,
+    int padded_capacity, int protected_capacity, int protected_anchor_capacity,
+    int protected_padded_capacity) {
+    constexpr int Warps = 8;
+    const int batch = static_cast<int>(blockIdx.y);
+    const int count = counts[batch];
+    if (count < min_count || count > max_count) return;
+    const int token = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (token >= count || kv_head >= kCyclicKVCacheNvfp4KVHeads ||
+        static_cast<int>(blockDim.x) != Warps * 32) {
+        return;
+    }
+    constexpr std::int64_t ElementsPerToken =
+        kCyclicKVCacheNvfp4HeadDim * kCyclicKVCacheNvfp4KVHeads;
+    const std::int64_t batch_offset = ElementsPerToken * static_cast<std::int64_t>(width) * batch;
+    const int position = positions[static_cast<std::int64_t>(width) * batch + token];
+    const int slot = position & (window - 1);
+    const bool anchor_protected = protected_anchor_capacity != 0 && position < protected_anchor_capacity;
+    const int append_frontier = positions[static_cast<std::int64_t>(width) * batch + count - 1];
+    const int recent_begin =
+        protected_capacity == 0
+            ? append_frontier + 1
+            : max(0, append_frontier - static_cast<int>(protected_capacity) + 1);
+    const bool recent_protected = protected_capacity != 0 && position >= recent_begin;
+    const int protected_slot = anchor_protected
+                                   ? position
+                                   : protected_anchor_capacity +
+                                         (recent_protected ? position & (protected_capacity - 1) : 0);
+    __nv_bfloat16* protected_k_for_token =
+        (anchor_protected || recent_protected) ? protected_k : nullptr;
+    __nv_bfloat16* protected_v_for_token =
+        (anchor_protected || recent_protected) ? protected_v : nullptr;
+    kv_cache_append_prefix_cyclic_lowbit_row<Bits>(
+        k + batch_offset, v + batch_offset, cache_k, cache_v, scale_k, scale_v, token,
+        protected_k_for_token, protected_v_for_token, kv_head, lanes[batch], slot, padded_capacity,
+        protected_slot, protected_padded_capacity, lane);
+}
+
 __device__ __forceinline__ void kv_cache_append_prefix_cyclic_nvfp4_row(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
@@ -626,7 +982,12 @@ __global__ void kv_cache_append_prefix_cyclic_nvfp4_kernel(
     const int slot     = position & (window - 1);
     const bool anchor_protected =
         protected_anchor_capacity != 0 && position < protected_anchor_capacity;
-    const bool recent_protected = protected_capacity != 0;
+    const int append_frontier = positions[static_cast<std::int64_t>(width) * batch + count - 1];
+    const int recent_begin =
+        protected_capacity == 0
+            ? append_frontier + 1
+            : max(0, append_frontier - static_cast<int>(protected_capacity) + 1);
+    const bool recent_protected = protected_capacity != 0 && position >= recent_begin;
     const int protected_slot =
         anchor_protected
             ? position

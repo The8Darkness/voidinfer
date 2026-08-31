@@ -1,6 +1,7 @@
 #include <ninfer/targets/qwen3_6/state_image.h>
 
 #include "core/device.h"
+#include "ops/kv_cache/oscar_conversion.h"
 
 #include <limits>
 #include <stdexcept>
@@ -71,7 +72,35 @@ bool same_dflash_spec(const std::optional<DFlashLocalStateSpec>& left,
            left->protected_capacity == right->protected_capacity &&
            left->protected_anchor_capacity == right->protected_anchor_capacity &&
            left->kv_heads == right->kv_heads && left->head_dim == right->head_dim &&
-           left->dtype == right->dtype && left->quant_group == right->quant_group;
+           left->dtype == right->dtype && left->quant_group == right->quant_group &&
+           left->quant_bits == right->quant_bits &&
+           left->quantization == right->quantization;
+}
+
+const std::optional<DFlashLocalStateSpec>& host_dflash_spec(const StateImageSpec& spec) noexcept {
+    return spec.dflash_host_local ? spec.dflash_host_local : spec.dflash_local;
+}
+
+DFlashLocalStateSpec normalize_dflash_state_spec(DFlashLocalStateSpec spec) {
+    // StateImageSpec predates the explicit format fields. Preserve the old U8 default for
+    // callers that still omit them, while making the derived format visible in host layouts.
+    if (spec.dtype == DType::U8) {
+        if (spec.quant_bits == 0) { spec.quant_bits = 4; }
+        if (spec.quantization == CyclicKVCacheQuantization::Auto) {
+            spec.quantization = spec.quant_group == 128
+                                    ? CyclicKVCacheQuantization::OscarAffine
+                                    : CyclicKVCacheQuantization::Nvfp4;
+        }
+    }
+    return spec;
+}
+
+StateImageSpec normalize_state_image_spec(StateImageSpec spec) {
+    if (spec.dflash_local) { spec.dflash_local = normalize_dflash_state_spec(*spec.dflash_local); }
+    if (spec.dflash_host_local) {
+        spec.dflash_host_local = normalize_dflash_state_spec(*spec.dflash_host_local);
+    }
+    return spec;
 }
 
 bool same_region(const LayoutRegion& left, const LayoutRegion& right) noexcept {
@@ -88,7 +117,7 @@ bool same_host_layout(const StateImageHostLayout& left,
                       const StateImageHostLayout& right) noexcept {
     return same_linear_spec(left.spec.linear, right.spec.linear) &&
            left.spec.hidden == right.spec.hidden &&
-           same_dflash_spec(left.spec.dflash_local, right.spec.dflash_local) &&
+           same_dflash_spec(host_dflash_spec(left.spec), host_dflash_spec(right.spec)) &&
            same_region(left.linear_conv, right.linear_conv) &&
            left.linear_conv_layer_bytes == right.linear_conv_layer_bytes &&
            same_region(left.linear_recurrent, right.linear_recurrent) &&
@@ -115,76 +144,94 @@ bool same_host_layout(const StateImageHostLayout& left,
 }
 
 StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
-    if (spec.linear.layers == 0 || spec.linear.conv_channels <= 0 || spec.linear.conv_width <= 0 ||
-        spec.linear.value_heads <= 0 || spec.linear.value_head_dim <= 0 ||
-        spec.linear.key_head_dim <= 0 || spec.linear.slot_count <= 0 ||
-        (spec.linear.conv_dtype != DType::BF16 && spec.linear.conv_dtype != DType::FP32) ||
-        spec.hidden <= 0) {
+    const StateImageSpec normalized_spec = normalize_state_image_spec(spec);
+    if (normalized_spec.linear.layers == 0 || normalized_spec.linear.conv_channels <= 0 ||
+        normalized_spec.linear.conv_width <= 0 || normalized_spec.linear.value_heads <= 0 ||
+        normalized_spec.linear.value_head_dim <= 0 || normalized_spec.linear.key_head_dim <= 0 ||
+        normalized_spec.linear.slot_count <= 0 ||
+        (normalized_spec.linear.conv_dtype != DType::BF16 &&
+         normalized_spec.linear.conv_dtype != DType::FP32) ||
+        normalized_spec.hidden <= 0) {
         throw std::invalid_argument("StateImage host geometry is invalid");
     }
-    if (spec.dflash_local && (spec.dflash_local->layers == 0 || spec.dflash_local->kv_heads <= 0 ||
-                              spec.dflash_local->head_dim <= 0 ||
-                              (spec.dflash_local->dtype != DType::BF16 &&
-                               spec.dflash_local->dtype != DType::U8) ||
-                              (spec.dflash_local->dtype == DType::BF16 &&
-                               spec.dflash_local->quant_group != 0) ||
-                              (spec.dflash_local->dtype == DType::U8 &&
-                               (spec.dflash_local->quant_group != 16 ||
-                                spec.dflash_local->head_dim % 2 != 0 ||
-                                spec.dflash_local->head_dim % spec.dflash_local->quant_group != 0)) ||
-                              ((spec.dflash_local->protected_capacity != 0 ||
-                                spec.dflash_local->protected_anchor_capacity != 0) &&
-                               (spec.dflash_local->dtype != DType::U8 ||
-                                spec.dflash_local->protected_capacity > spec.dflash_local->capacity ||
-                                (spec.dflash_local->protected_capacity != 0 &&
-                                 (spec.dflash_local->protected_capacity &
-                                  (spec.dflash_local->protected_capacity - 1U)) != 0U) ||
-                                spec.dflash_local->protected_anchor_capacity >
-                                    spec.dflash_local->capacity ||
-                                spec.dflash_local->protected_anchor_capacity >
-                                    spec.dflash_local->capacity -
-                                        spec.dflash_local->protected_capacity)))) {
+    const auto& host_dflash = host_dflash_spec(normalized_spec);
+    if (host_dflash && (host_dflash->layers == 0 || host_dflash->capacity == 0 ||
+                        host_dflash->kv_heads <= 0 || host_dflash->head_dim <= 0 ||
+                        (host_dflash->dtype != DType::BF16 && host_dflash->dtype != DType::U8) ||
+                        (host_dflash->dtype == DType::BF16 &&
+                         (host_dflash->quant_group != 0 || host_dflash->quant_bits != 0)) ||
+                        (host_dflash->dtype == DType::U8 &&
+                         ((host_dflash->quantization == CyclicKVCacheQuantization::OscarAffine &&
+                           host_dflash->quant_group != 128) ||
+                          (host_dflash->quantization != CyclicKVCacheQuantization::OscarAffine &&
+                           (host_dflash->quantization != CyclicKVCacheQuantization::Auto &&
+                            host_dflash->quantization != CyclicKVCacheQuantization::Nvfp4 ||
+                            host_dflash->quant_group != 16)) ||
+                          (host_dflash->quant_bits != 2 && host_dflash->quant_bits != 3 &&
+                           host_dflash->quant_bits != 4) ||
+                          host_dflash->head_dim % host_dflash->quant_group != 0)) ||
+                        ((host_dflash->protected_capacity != 0 ||
+                          host_dflash->protected_anchor_capacity != 0) &&
+                         (host_dflash->dtype != DType::U8 ||
+                          host_dflash->protected_capacity > host_dflash->capacity ||
+                          (host_dflash->protected_capacity != 0 &&
+                           (host_dflash->protected_capacity &
+                            (host_dflash->protected_capacity - 1U)) != 0U) ||
+                          host_dflash->protected_anchor_capacity > host_dflash->capacity ||
+                          host_dflash->protected_anchor_capacity >
+                              host_dflash->capacity - host_dflash->protected_capacity)))) {
         throw std::invalid_argument("StateImage host DFlash geometry is invalid");
     }
 
     LayoutBuilder builder;
     StateImageHostLayout host;
-    host.spec = spec;
-    const Tensor conv_slot(nullptr, spec.linear.conv_dtype,
-                           {spec.linear.conv_channels, spec.linear.conv_width});
+    host.spec = normalized_spec;
+    const Tensor conv_slot(nullptr, normalized_spec.linear.conv_dtype,
+                           {normalized_spec.linear.conv_channels,
+                            normalized_spec.linear.conv_width});
     const Tensor recurrent_slot(
         nullptr, DType::FP32,
-        {spec.linear.key_head_dim, spec.linear.value_head_dim, spec.linear.value_heads});
-    const Tensor hidden_slot(nullptr, DType::BF16, {spec.hidden});
+        {normalized_spec.linear.key_head_dim, normalized_spec.linear.value_head_dim,
+         normalized_spec.linear.value_heads});
+    const Tensor hidden_slot(nullptr, DType::BF16, {normalized_spec.hidden});
     host.linear_conv_layer_bytes = conv_slot.bytes();
-    host.linear_conv = builder.add(checked_mul(host.linear_conv_layer_bytes, spec.linear.layers,
-                                               "StateImage host convolution bytes overflow"),
+    host.linear_conv = builder.add(
+        checked_mul(host.linear_conv_layer_bytes, normalized_spec.linear.layers,
+                    "StateImage host convolution bytes overflow"),
                                    kStateImageAlignment, "StateImage host convolution");
     host.linear_recurrent_layer_bytes = recurrent_slot.bytes();
     host.linear_recurrent =
-        builder.add(checked_mul(host.linear_recurrent_layer_bytes, spec.linear.layers,
+        builder.add(checked_mul(host.linear_recurrent_layer_bytes, normalized_spec.linear.layers,
                                 "StateImage host recurrent bytes overflow"),
                     kStateImageAlignment, "StateImage host recurrent");
     host.continuation_hidden = builder.add(hidden_slot.bytes(), kStateImageAlignment,
                                            "StateImage host continuation hidden");
-    if (spec.dflash_local) {
-        const auto& dflash = *spec.dflash_local;
+    if (host_dflash) {
+        const auto& dflash = *host_dflash;
         const auto padded = static_cast<std::int32_t>(padded_dflash_capacity(dflash.capacity));
-        const auto code_head_dim = dflash.dtype == DType::U8 ? dflash.head_dim / 2
-                                                              : dflash.head_dim;
+        const auto code_head_dim = dflash.dtype == DType::U8
+                                       ? static_cast<std::int32_t>(
+                                             (static_cast<std::uint64_t>(dflash.head_dim) *
+                                                  dflash.quant_bits +
+                                              7U) /
+                                             8U)
+                                       : dflash.head_dim;
         const Tensor local_slot(
             nullptr, dflash.dtype, {code_head_dim, padded, dflash.kv_heads});
         host.dflash_local_layer_bytes = local_slot.bytes();
         const std::size_t component_bytes =
-            checked_mul(host.dflash_local_layer_bytes, spec.dflash_local->layers,
+            checked_mul(host.dflash_local_layer_bytes, host_dflash->layers,
                         "StateImage host DFlash local bytes overflow");
         host.dflash_local_k =
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local K");
         host.dflash_local_v =
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local V");
         if (dflash.dtype == DType::U8) {
-            const Tensor scale_slot(nullptr, DType::FP8_E4M3FN,
-                                    {dflash.head_dim / dflash.quant_group, padded, dflash.kv_heads});
+            const bool oscar = dflash.quantization == CyclicKVCacheQuantization::OscarAffine;
+            const DType scale_dtype = oscar ? DType::BF16 : DType::FP8_E4M3FN;
+            const std::int32_t scale_extent = oscar ? 2 : dflash.head_dim / dflash.quant_group;
+            const Tensor scale_slot(nullptr, scale_dtype,
+                                    {scale_extent, padded, dflash.kv_heads});
             host.dflash_local_scale_layer_bytes = scale_slot.bytes();
             const std::size_t scale_component_bytes =
                 checked_mul(host.dflash_local_scale_layer_bytes, dflash.layers,
@@ -248,7 +295,24 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
             plan_cyclic_kv_cache(builder, dflash.layers, dflash.capacity, dflash.kv_heads,
                                  dflash.head_dim, spec.linear.slot_count, dflash.dtype,
                                  dflash.quant_group, dflash.protected_capacity,
-                                 dflash.protected_anchor_capacity);
+                                 dflash.protected_anchor_capacity, dflash.quant_bits,
+                                 dflash.quantization);
+        // Keep an independently quantized Q4 source beside lower-bit OSCAR L0. This temporary
+        // device shadow lets asynchronous host snapshots export genuine Q4 rows from the original
+        // BF16 append inputs instead of requantizing information already discarded by Q2.
+        if (spec.dflash_host_local && dflash.dtype == DType::U8 &&
+            dflash.quantization == CyclicKVCacheQuantization::OscarAffine &&
+            dflash.quant_bits == 2 &&
+            spec.dflash_host_local->dtype == DType::U8 &&
+            spec.dflash_host_local->quantization == CyclicKVCacheQuantization::OscarAffine &&
+            spec.dflash_host_local->quant_bits == 4) {
+            const DFlashLocalStateSpec& q4 = *spec.dflash_host_local;
+            out.dflash_local_q4_shadow =
+                plan_cyclic_kv_cache(builder, q4.layers, q4.capacity, q4.kv_heads, q4.head_dim,
+                                     spec.linear.slot_count, q4.dtype, q4.quant_group,
+                                     q4.protected_capacity, q4.protected_anchor_capacity,
+                                     q4.quant_bits, q4.quantization);
+        }
     }
 
     out.host = plan_host_state_image(spec);
@@ -260,23 +324,24 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
                                       "StateImage transfer payload overflow");
     payload             = checked_add(payload, layout.continuation_hidden.bytes,
                                       "StateImage transfer payload overflow");
+    const auto& host_dflash = host_dflash_spec(layout.spec);
     if (layout.dflash_local_k) {
-        if (!layout.spec.dflash_local || !layout.dflash_local_v) {
+        if (!host_dflash || !layout.dflash_local_v) {
             throw std::invalid_argument("StateImage DFlash transfer layout is incomplete");
         }
         const std::size_t component_bytes =
-            checked_mul(layout.dflash_local_layer_bytes, layout.spec.dflash_local->layers,
+            checked_mul(layout.dflash_local_layer_bytes, host_dflash->layers,
                         "StateImage transfer payload overflow");
         payload = checked_add(
             payload, checked_mul(component_bytes, 2U, "StateImage transfer payload overflow"),
             "StateImage transfer payload overflow");
         if (layout.dflash_local_k_scale) {
-            if (!layout.spec.dflash_local || !layout.dflash_local_v_scale) {
+            if (!host_dflash || !layout.dflash_local_v_scale) {
                 throw std::invalid_argument("StateImage DFlash scale layout is incomplete");
             }
             const std::size_t scale_component_bytes =
                 checked_mul(layout.dflash_local_scale_layer_bytes,
-                            layout.spec.dflash_local->layers,
+                            host_dflash->layers,
                             "StateImage transfer scale payload overflow");
             payload = checked_add(
                 payload,
@@ -289,7 +354,7 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
                 throw std::invalid_argument("StateImage protected DFlash layout is incomplete");
             }
             const std::size_t protected_component_bytes = checked_mul(
-                layout.dflash_local_protected_layer_bytes, layout.spec.dflash_local->layers,
+                layout.dflash_local_protected_layer_bytes, host_dflash->layers,
                 "StateImage protected DFlash transfer payload overflow");
             payload = checked_add(
                 payload,
@@ -300,9 +365,9 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
     }
     const std::uint64_t operations =
         2ULL * layout.spec.linear.layers + 1ULL +
-        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL) +
-        (layout.dflash_local_k_scale ? 2ULL * layout.spec.dflash_local->layers : 0ULL) +
-        (layout.dflash_local_protected_k ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
+        (host_dflash ? 2ULL * host_dflash->layers : 0ULL) +
+        (layout.dflash_local_k_scale ? 2ULL * host_dflash->layers : 0ULL) +
+        (layout.dflash_local_protected_k ? 2ULL * host_dflash->layers : 0ULL);
     if (operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage transfer operation count exceeds uint32");
     }
@@ -311,14 +376,15 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
 }
 
 TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
-    if (!layout.spec.dflash_local || !layout.dflash_local_k || !layout.dflash_local_v) {
+    const auto& host_dflash = host_dflash_spec(layout.spec);
+    if (!host_dflash || !layout.dflash_local_k || !layout.dflash_local_v) {
         throw std::invalid_argument("StateImage has no DFlash local component");
     }
     const std::size_t component_bytes =
-        checked_mul(layout.dflash_local_layer_bytes, layout.spec.dflash_local->layers,
+        checked_mul(layout.dflash_local_layer_bytes, host_dflash->layers,
                     "StateImage DFlash transfer payload overflow");
     std::size_t payload = component_bytes;
-    std::uint64_t operations = 2ULL * layout.spec.dflash_local->layers;
+    std::uint64_t operations = 2ULL * host_dflash->layers;
     if (component_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
         operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage DFlash transfer work exceeds its representation");
@@ -330,28 +396,28 @@ TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
         }
         const std::size_t scale_component_bytes =
             checked_mul(layout.dflash_local_scale_layer_bytes,
-                        layout.spec.dflash_local->layers,
+                        host_dflash->layers,
                         "StateImage DFlash scale payload overflow");
         payload = checked_add(
             payload,
             checked_mul(scale_component_bytes, 2U,
                         "StateImage DFlash transfer scale payload overflow"),
             "StateImage DFlash transfer work exceeds its representation");
-        operations += 2ULL * layout.spec.dflash_local->layers;
+        operations += 2ULL * host_dflash->layers;
     }
     if (layout.dflash_local_protected_k) {
         if (!layout.dflash_local_protected_v) {
             throw std::invalid_argument("StateImage protected DFlash layout is incomplete");
         }
         const std::size_t protected_component_bytes = checked_mul(
-            layout.dflash_local_protected_layer_bytes, layout.spec.dflash_local->layers,
+            layout.dflash_local_protected_layer_bytes, host_dflash->layers,
             "StateImage protected DFlash transfer payload overflow");
         payload = checked_add(
             payload,
             checked_mul(protected_component_bytes, 2U,
                         "StateImage protected DFlash transfer payload overflow"),
             "StateImage DFlash transfer work exceeds its representation");
-        operations += 2ULL * layout.spec.dflash_local->layers;
+        operations += 2ULL * host_dflash->layers;
     }
     if (operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage DFlash transfer operation count exceeds uint32");
@@ -424,10 +490,24 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
         continuation_hidden_.ne[1] != linear_.slot_count()) {
         throw std::invalid_argument("StateImage continuation hidden layout is inconsistent");
     }
-    if (layout.dflash_local.has_value() != host_layout_.spec.dflash_local.has_value()) {
+    if (layout.dflash_local.has_value() != host_dflash_spec(host_layout_.spec).has_value()) {
         throw std::invalid_argument("StateImage DFlash layout is inconsistent");
     }
-    StateImageSpec device_spec{.linear = layout.linear.spec, .hidden = continuation_hidden_.ne[0]};
+    const auto& device_dflash = layout.dflash_local;
+    const auto& host_dflash = host_dflash_spec(host_layout_.spec);
+    const bool needs_q4_shadow =
+        device_dflash && host_dflash && device_dflash->dtype == DType::U8 &&
+        device_dflash->quantization == CyclicKVCacheQuantization::OscarAffine &&
+        device_dflash->quant_bits == 2 && host_dflash->dtype == DType::U8 &&
+        host_dflash->quantization == CyclicKVCacheQuantization::OscarAffine &&
+        host_dflash->quant_bits == 4;
+    if (layout.dflash_local_q4_shadow.has_value() != needs_q4_shadow) {
+        throw std::invalid_argument("StateImage OSCAR-Q4 shadow layout is inconsistent");
+    }
+    StateImageSpec device_spec{.linear = layout.linear.spec,
+                               .hidden = continuation_hidden_.ne[0],
+                               .dflash_local = std::nullopt,
+                               .dflash_host_local = host_layout_.spec.dflash_host_local};
     if (layout.dflash_local) {
         device_spec.dflash_local = DFlashLocalStateSpec{
             .layers             = static_cast<std::uint32_t>(layout.dflash_local->k.size()),
@@ -438,6 +518,8 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
             .head_dim            = layout.dflash_local->head_dim,
             .dtype               = layout.dflash_local->dtype,
             .quant_group         = layout.dflash_local->quant_group,
+            .quant_bits          = layout.dflash_local->quant_bits,
+            .quantization        = layout.dflash_local->quantization,
         };
     }
     if (!same_host_layout(host_layout_, plan_host_state_image(device_spec))) {
@@ -448,6 +530,12 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
             throw std::invalid_argument("StateImage components do not share one slot geometry");
         }
         dflash_local_.emplace(backing, *layout.dflash_local);
+    }
+    if (layout.dflash_local_q4_shadow) {
+        if (layout.dflash_local_q4_shadow->lane_capacity != linear_.slot_count()) {
+            throw std::invalid_argument("StateImage OSCAR-Q4 shadow slot geometry is invalid");
+        }
+        dflash_local_q4_shadow_.emplace(backing, *layout.dflash_local_q4_shadow);
     }
 }
 
@@ -473,14 +561,22 @@ const CyclicKVCache* StateImageDevicePool::dflash_local() const noexcept {
     return dflash_local_ ? &*dflash_local_ : nullptr;
 }
 
+CyclicKVCache* StateImageDevicePool::dflash_local_q4_shadow() noexcept {
+    return dflash_local_q4_shadow_ ? &*dflash_local_q4_shadow_ : nullptr;
+}
+
+const CyclicKVCache* StateImageDevicePool::dflash_local_q4_shadow() const noexcept {
+    return dflash_local_q4_shadow_ ? &*dflash_local_q4_shadow_ : nullptr;
+}
+
 void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_slot(slot, slot_count(), "StateImage zero slot is out of range");
     linear_.zero_slot(slot, stream);
     const Tensor hidden = continuation_hidden_slot(slot);
     CUDA_CHECK(cudaMemsetAsync(hidden.data, 0, hidden.bytes(), stream));
-    if (dflash_local_) {
-        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
-            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
+    const auto zero_cache_slot = [slot, stream](CyclicKVCache& cache) {
+        for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+            const CyclicKVCacheLayerView view = cache.layer_view(layer);
             const Tensor k                    = view.k.slice(3, slot, 1);
             const Tensor v                    = view.v.slice(3, slot, 1);
             CUDA_CHECK(cudaMemsetAsync(k.data, 0, k.bytes(), stream));
@@ -498,15 +594,17 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
                                            view.protected_v.slice(3, slot, 1).bytes(), stream));
             }
         }
-    }
+    };
+    if (dflash_local_) { zero_cache_slot(*dflash_local_); }
+    if (dflash_local_q4_shadow_) { zero_cache_slot(*dflash_local_q4_shadow_); }
 }
 
 void StateImageDevicePool::zero_all(cudaStream_t stream) {
     linear_.zero_all(stream);
     CUDA_CHECK(cudaMemsetAsync(continuation_hidden_.data, 0, continuation_hidden_.bytes(), stream));
-    if (dflash_local_) {
-        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
-            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
+    const auto zero_cache = [stream](CyclicKVCache& cache) {
+        for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+            const CyclicKVCacheLayerView view = cache.layer_view(layer);
             CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), stream));
             CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), stream));
             if (view.dtype == DType::U8) {
@@ -520,7 +618,9 @@ void StateImageDevicePool::zero_all(cudaStream_t stream) {
                                            stream));
             }
         }
-    }
+    };
+    if (dflash_local_) { zero_cache(*dflash_local_); }
+    if (dflash_local_q4_shadow_) { zero_cache(*dflash_local_q4_shadow_); }
 }
 
 void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destination,
@@ -536,6 +636,10 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
     if (dflash_local_) {
         dflash_local_->copy_slot_from(*dflash_local_, source, destination, stream);
     }
+    if (dflash_local_q4_shadow_) {
+        dflash_local_q4_shadow_->copy_slot_from(*dflash_local_q4_shadow_, source, destination,
+                                                stream);
+    }
 }
 
 void StateImageDevicePool::copy_dflash_local(std::int32_t source, std::int32_t destination,
@@ -545,6 +649,10 @@ void StateImageDevicePool::copy_dflash_local(std::int32_t source, std::int32_t d
     if (!dflash_local_) { throw std::logic_error("StateImage has no DFlash local component"); }
     if (source != destination) {
         dflash_local_->copy_slot_from(*dflash_local_, source, destination, stream);
+        if (dflash_local_q4_shadow_) {
+            dflash_local_q4_shadow_->copy_slot_from(*dflash_local_q4_shadow_, source, destination,
+                                                    stream);
+        }
     }
 }
 
@@ -576,29 +684,103 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
         cudaMemcpyAsync(byte_offset(destination.data, host_layout_.continuation_hidden.offset),
                         hidden.data, hidden.bytes(), cudaMemcpyDeviceToHost, stream));
     if (dflash_local_) {
-        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
-            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
+        const auto& host_dflash = host_dflash_spec(host_layout_.spec);
+        // Prefer the independently written Q4 shadow whenever it exists. Falling back to L0
+        // preserves the legacy conversion path for non-hierarchical snapshots and for Q4=L0.
+        const CyclicKVCache& snapshot_cache = dflash_local_q4_shadow_ ? *dflash_local_q4_shadow_
+                                                                       : *dflash_local_;
+        for (std::uint32_t layer = 0; layer < snapshot_cache.layer_count(); ++layer) {
+            const CyclicKVCacheLayerView view = snapshot_cache.layer_view(layer);
             const Tensor k                    = view.k.slice(3, source, 1);
             const Tensor v                    = view.v.slice(3, source, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                byte_offset(destination.data, host_layout_.dflash_local_k->offset +
-                                                  layer * host_layout_.dflash_local_layer_bytes),
-                k.data, k.bytes(), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                byte_offset(destination.data, host_layout_.dflash_local_v->offset +
-                                                  layer * host_layout_.dflash_local_layer_bytes),
-                v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
             if (view.dtype == DType::U8) {
                 const Tensor k_scale = view.k_scale.slice(3, source, 1);
                 const Tensor v_scale = view.v_scale.slice(3, source, 1);
+                const bool convert_oscar =
+                    host_dflash && view.quantization == CyclicKVCacheQuantization::OscarAffine &&
+                    host_dflash->quantization == CyclicKVCacheQuantization::OscarAffine &&
+                    view.quant_bits != host_dflash->quant_bits;
+                if (convert_oscar) {
+                    const int destination_bits = host_dflash->quant_bits;
+                    const int code_extent =
+                        (view.head_dim * destination_bits + 7) / 8;
+                    const std::size_t code_bytes =
+                        Tensor(nullptr, DType::U8,
+                               {code_extent, static_cast<std::int32_t>(view.padded_capacity),
+                                view.num_kv_heads})
+                            .bytes();
+                    const std::size_t metadata_bytes =
+                        Tensor(nullptr, DType::BF16,
+                               {2, static_cast<std::int32_t>(view.padded_capacity),
+                                view.num_kv_heads})
+                            .bytes();
+                    std::uint8_t* converted_k = nullptr;
+                    std::uint8_t* converted_v = nullptr;
+                    __nv_bfloat16* converted_k_scale = nullptr;
+                    __nv_bfloat16* converted_v_scale = nullptr;
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&converted_k), code_bytes,
+                                               stream));
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&converted_v), code_bytes,
+                                               stream));
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&converted_k_scale),
+                                               metadata_bytes, stream));
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&converted_v_scale),
+                                               metadata_bytes, stream));
+                    ops::cyclic_oscar_requantize_launch(
+                        static_cast<const std::uint8_t*>(k.data),
+                        static_cast<const __nv_bfloat16*>(k_scale.data),
+                        static_cast<const std::uint8_t*>(v.data),
+                        static_cast<const __nv_bfloat16*>(v_scale.data), converted_k,
+                        converted_k_scale, converted_v, converted_v_scale, view.quant_bits,
+                        destination_bits, static_cast<int>(view.padded_capacity), view.num_kv_heads,
+                        stream);
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        byte_offset(destination.data, host_layout_.dflash_local_k->offset +
+                                                          layer * host_layout_.dflash_local_layer_bytes),
+                        converted_k, code_bytes, cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        byte_offset(destination.data, host_layout_.dflash_local_v->offset +
+                                                          layer * host_layout_.dflash_local_layer_bytes),
+                        converted_v, code_bytes, cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        byte_offset(destination.data, host_layout_.dflash_local_k_scale->offset +
+                                                          layer * host_layout_.dflash_local_scale_layer_bytes),
+                        converted_k_scale, metadata_bytes, cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        byte_offset(destination.data, host_layout_.dflash_local_v_scale->offset +
+                                                          layer * host_layout_.dflash_local_scale_layer_bytes),
+                        converted_v_scale, metadata_bytes, cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaFreeAsync(converted_k, stream));
+                    CUDA_CHECK(cudaFreeAsync(converted_v, stream));
+                    CUDA_CHECK(cudaFreeAsync(converted_k_scale, stream));
+                    CUDA_CHECK(cudaFreeAsync(converted_v_scale, stream));
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        byte_offset(destination.data, host_layout_.dflash_local_k->offset +
+                                                          layer * host_layout_.dflash_local_layer_bytes),
+                        k.data, k.bytes(), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        byte_offset(destination.data, host_layout_.dflash_local_v->offset +
+                                                          layer * host_layout_.dflash_local_layer_bytes),
+                        v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        byte_offset(destination.data, host_layout_.dflash_local_k_scale->offset +
+                                                          layer * host_layout_.dflash_local_scale_layer_bytes),
+                        k_scale.data, k_scale.bytes(), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        byte_offset(destination.data, host_layout_.dflash_local_v_scale->offset +
+                                                          layer * host_layout_.dflash_local_scale_layer_bytes),
+                        v_scale.data, v_scale.bytes(), cudaMemcpyDeviceToHost, stream));
+                }
+            } else {
                 CUDA_CHECK(cudaMemcpyAsync(
-                    byte_offset(destination.data, host_layout_.dflash_local_k_scale->offset +
-                                                      layer * host_layout_.dflash_local_scale_layer_bytes),
-                    k_scale.data, k_scale.bytes(), cudaMemcpyDeviceToHost, stream));
+                    byte_offset(destination.data, host_layout_.dflash_local_k->offset +
+                                                      layer * host_layout_.dflash_local_layer_bytes),
+                    k.data, k.bytes(), cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaMemcpyAsync(
-                    byte_offset(destination.data, host_layout_.dflash_local_v_scale->offset +
-                                                      layer * host_layout_.dflash_local_scale_layer_bytes),
-                    v_scale.data, v_scale.bytes(), cudaMemcpyDeviceToHost, stream));
+                    byte_offset(destination.data, host_layout_.dflash_local_v->offset +
+                                                      layer * host_layout_.dflash_local_layer_bytes),
+                    v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
             }
             if (view.protected_capacity != 0 || view.protected_anchor_capacity != 0) {
                 const Tensor protected_k = view.protected_k.slice(3, source, 1);
@@ -642,33 +824,107 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                                byte_offset(source.data, host_layout_.continuation_hidden.offset),
                                hidden.bytes(), cudaMemcpyHostToDevice, stream));
     if (dflash_local_) {
+        const auto& host_dflash = host_dflash_spec(host_layout_.spec);
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
             const Tensor k                    = view.k.slice(3, destination, 1);
             const Tensor v                    = view.v.slice(3, destination, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                k.data,
-                byte_offset(source.data, host_layout_.dflash_local_k->offset +
-                                             layer * host_layout_.dflash_local_layer_bytes),
-                k.bytes(), cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                v.data,
-                byte_offset(source.data, host_layout_.dflash_local_v->offset +
-                                             layer * host_layout_.dflash_local_layer_bytes),
-                v.bytes(), cudaMemcpyHostToDevice, stream));
             if (view.dtype == DType::U8) {
                 const Tensor k_scale = view.k_scale.slice(3, destination, 1);
                 const Tensor v_scale = view.v_scale.slice(3, destination, 1);
+                const bool convert_oscar =
+                    host_dflash && view.quantization == CyclicKVCacheQuantization::OscarAffine &&
+                    host_dflash->quantization == CyclicKVCacheQuantization::OscarAffine &&
+                    view.quant_bits != host_dflash->quant_bits;
+                if (convert_oscar) {
+                    const int source_bits = host_dflash->quant_bits;
+                    const int code_extent =
+                        (view.head_dim * source_bits + 7) / 8;
+                    const std::size_t code_bytes =
+                        Tensor(nullptr, DType::U8,
+                               {code_extent, static_cast<std::int32_t>(view.padded_capacity),
+                                view.num_kv_heads})
+                            .bytes();
+                    const std::size_t metadata_bytes =
+                        Tensor(nullptr, DType::BF16,
+                               {2, static_cast<std::int32_t>(view.padded_capacity),
+                                view.num_kv_heads})
+                            .bytes();
+                    std::uint8_t* source_k_device = nullptr;
+                    std::uint8_t* source_v_device = nullptr;
+                    __nv_bfloat16* source_k_scale_device = nullptr;
+                    __nv_bfloat16* source_v_scale_device = nullptr;
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&source_k_device), code_bytes,
+                                               stream));
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&source_v_device), code_bytes,
+                                               stream));
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&source_k_scale_device),
+                                               metadata_bytes, stream));
+                    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&source_v_scale_device),
+                                               metadata_bytes, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        source_k_device,
+                        byte_offset(source.data, host_layout_.dflash_local_k->offset +
+                                                   layer * host_layout_.dflash_local_layer_bytes),
+                        code_bytes, cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        source_v_device,
+                        byte_offset(source.data, host_layout_.dflash_local_v->offset +
+                                                   layer * host_layout_.dflash_local_layer_bytes),
+                        code_bytes, cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        source_k_scale_device,
+                        byte_offset(source.data, host_layout_.dflash_local_k_scale->offset +
+                                                   layer * host_layout_.dflash_local_scale_layer_bytes),
+                        metadata_bytes, cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        source_v_scale_device,
+                        byte_offset(source.data, host_layout_.dflash_local_v_scale->offset +
+                                                   layer * host_layout_.dflash_local_scale_layer_bytes),
+                        metadata_bytes, cudaMemcpyHostToDevice, stream));
+                    ops::cyclic_oscar_requantize_launch(
+                        source_k_device, source_k_scale_device, source_v_device,
+                        source_v_scale_device, static_cast<std::uint8_t*>(k.data),
+                        static_cast<__nv_bfloat16*>(k_scale.data), static_cast<std::uint8_t*>(v.data),
+                        static_cast<__nv_bfloat16*>(v_scale.data), source_bits, view.quant_bits,
+                        static_cast<int>(view.padded_capacity), view.num_kv_heads, stream);
+                    CUDA_CHECK(cudaFreeAsync(source_k_device, stream));
+                    CUDA_CHECK(cudaFreeAsync(source_v_device, stream));
+                    CUDA_CHECK(cudaFreeAsync(source_k_scale_device, stream));
+                    CUDA_CHECK(cudaFreeAsync(source_v_scale_device, stream));
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        k.data,
+                        byte_offset(source.data, host_layout_.dflash_local_k->offset +
+                                                     layer * host_layout_.dflash_local_layer_bytes),
+                        k.bytes(), cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        v.data,
+                        byte_offset(source.data, host_layout_.dflash_local_v->offset +
+                                                     layer * host_layout_.dflash_local_layer_bytes),
+                        v.bytes(), cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        k_scale.data,
+                        byte_offset(source.data, host_layout_.dflash_local_k_scale->offset +
+                                                     layer * host_layout_.dflash_local_scale_layer_bytes),
+                        k_scale.bytes(), cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        v_scale.data,
+                        byte_offset(source.data, host_layout_.dflash_local_v_scale->offset +
+                                                     layer * host_layout_.dflash_local_scale_layer_bytes),
+                        v_scale.bytes(), cudaMemcpyHostToDevice, stream));
+                }
+            } else {
                 CUDA_CHECK(cudaMemcpyAsync(
-                    k_scale.data,
-                    byte_offset(source.data, host_layout_.dflash_local_k_scale->offset +
-                                                 layer * host_layout_.dflash_local_scale_layer_bytes),
-                    k_scale.bytes(), cudaMemcpyHostToDevice, stream));
+                    k.data,
+                    byte_offset(source.data, host_layout_.dflash_local_k->offset +
+                                                 layer * host_layout_.dflash_local_layer_bytes),
+                    k.bytes(), cudaMemcpyHostToDevice, stream));
                 CUDA_CHECK(cudaMemcpyAsync(
-                    v_scale.data,
-                    byte_offset(source.data, host_layout_.dflash_local_v_scale->offset +
-                                                 layer * host_layout_.dflash_local_scale_layer_bytes),
-                    v_scale.bytes(), cudaMemcpyHostToDevice, stream));
+                    v.data,
+                    byte_offset(source.data, host_layout_.dflash_local_v->offset +
+                                                 layer * host_layout_.dflash_local_layer_bytes),
+                    v.bytes(), cudaMemcpyHostToDevice, stream));
             }
             if (view.protected_capacity != 0 || view.protected_anchor_capacity != 0) {
                 const Tensor protected_k = view.protected_k.slice(3, destination, 1);
@@ -685,6 +941,56 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                                 host_layout_.dflash_local_protected_v->offset +
                                     layer * host_layout_.dflash_local_protected_layer_bytes),
                     protected_v.bytes(), cudaMemcpyHostToDevice, stream));
+            }
+        }
+        if (dflash_local_q4_shadow_) {
+            const auto& q4 = *dflash_local_q4_shadow_;
+            if (!host_dflash || host_dflash->dtype != DType::U8 ||
+                host_dflash->quantization != CyclicKVCacheQuantization::OscarAffine ||
+                host_dflash->quant_bits != 4) {
+                throw std::invalid_argument("StateImage OSCAR-Q4 host source is invalid");
+            }
+            // Restore the source shadow bit-for-bit. The active L0 cache is restored through the
+            // existing Q4->Q2 conversion above, while future snapshots continue from the
+            // independently preserved Q4 representation.
+            for (std::uint32_t layer = 0; layer < q4.layer_count(); ++layer) {
+                const CyclicKVCacheLayerView view = q4.layer_view(layer);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    view.k.slice(3, destination, 1).data,
+                    byte_offset(source.data, host_layout_.dflash_local_k->offset +
+                                                   layer * host_layout_.dflash_local_layer_bytes),
+                    view.k.slice(3, destination, 1).bytes(), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    view.v.slice(3, destination, 1).data,
+                    byte_offset(source.data, host_layout_.dflash_local_v->offset +
+                                                   layer * host_layout_.dflash_local_layer_bytes),
+                    view.v.slice(3, destination, 1).bytes(), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    view.k_scale.slice(3, destination, 1).data,
+                    byte_offset(source.data, host_layout_.dflash_local_k_scale->offset +
+                                                   layer * host_layout_.dflash_local_scale_layer_bytes),
+                    view.k_scale.slice(3, destination, 1).bytes(), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    view.v_scale.slice(3, destination, 1).data,
+                    byte_offset(source.data, host_layout_.dflash_local_v_scale->offset +
+                                                   layer * host_layout_.dflash_local_scale_layer_bytes),
+                    view.v_scale.slice(3, destination, 1).bytes(), cudaMemcpyHostToDevice, stream));
+                if (view.protected_capacity != 0 || view.protected_anchor_capacity != 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        view.protected_k.slice(3, destination, 1).data,
+                        byte_offset(source.data,
+                                    host_layout_.dflash_local_protected_k->offset +
+                                        layer * host_layout_.dflash_local_protected_layer_bytes),
+                        view.protected_k.slice(3, destination, 1).bytes(), cudaMemcpyHostToDevice,
+                        stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        view.protected_v.slice(3, destination, 1).data,
+                        byte_offset(source.data,
+                                    host_layout_.dflash_local_protected_v->offset +
+                                        layer * host_layout_.dflash_local_protected_layer_bytes),
+                        view.protected_v.slice(3, destination, 1).bytes(), cudaMemcpyHostToDevice,
+                        stream));
+                }
             }
         }
     }

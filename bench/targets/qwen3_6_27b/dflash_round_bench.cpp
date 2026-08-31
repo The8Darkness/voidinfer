@@ -51,6 +51,7 @@ struct Options {
     std::uint32_t protected_recent_tokens = 64;
     std::uint32_t protected_sink_tokens   = 4;
     std::uint32_t protected_pivot_tokens  = 4;
+    std::uint8_t l0_bits                  = 2;
 };
 
 void print_usage(const char* executable) {
@@ -63,8 +64,9 @@ void print_usage(const char* executable) {
                  " [--kv-dtype fp8-e4m3-row256|vericache-nvfp4]"
                  " [--hierarchical-vericache]"
                  " [--vericache-host-snapshots]"
-                 " [--vericache-l1-horizon <256..2048>]"
-                 " [--vericache-host-snapshot-horizon <256..2048>]"
+                  " [--vericache-l1-horizon <256..2048>]"
+                  " [--vericache-host-snapshot-horizon <256..2048>]"
+                 " [--vericache-l0-bits 2|4]"
                  " [--vericache-protected-recent <0..2048>]"
                  " [--vericache-protected-sinks <0..2048>]"
                  " [--vericache-protected-pivots <0..2048>]"
@@ -140,6 +142,13 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--vericache-host-snapshot-horizon") {
             options.host_snapshot_horizon = parse_u32(
                 value("--vericache-host-snapshot-horizon"), "vericache-host-snapshot-horizon");
+        } else if (argument == "--vericache-l0-bits") {
+            const std::uint32_t bits =
+                parse_u32(value("--vericache-l0-bits"), "vericache-l0-bits");
+            if (bits != 2 && bits != 4) {
+                throw std::invalid_argument("--vericache-l0-bits must be 2 or 4");
+            }
+            options.l0_bits = static_cast<std::uint8_t>(bits);
         } else if (argument == "--vericache-protected-recent") {
             options.protected_recent_tokens =
                 parse_u32(value("--vericache-protected-recent"), "vericache-protected-recent");
@@ -295,6 +304,7 @@ int run(const Options& options) {
     engine.hierarchical_vericache.l1_to_l2_min_horizon = options.l1_to_l2_horizon;
     engine.hierarchical_vericache.l1_to_l2_max_horizon = options.l1_to_l2_horizon;
     engine.hierarchical_vericache.host_snapshot_horizon = options.host_snapshot_horizon;
+    engine.hierarchical_vericache.l0_bits = options.l0_bits;
     // The direct target facade does not run Engine::normalize_engine_options().
     // Keep the benchmark's startup capacities identical to the production defaults.
     engine.context_cache.device_state_slots            = options.batch_size;
@@ -459,6 +469,23 @@ int run(const Options& options) {
                       ? "vericache-nvfp4"
                       : "fp8-e4m3-row256")
               << '\n';
+    const bool oscar_hierarchy =
+        options.hierarchical_vericache &&
+        options.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4;
+    std::cout << "vericache_l0_format,"
+              << (oscar_hierarchy ? "oscar-q" + std::to_string(options.l0_bits) : "n/a")
+              << '\n';
+    std::cout << "vericache_l1_format,"
+              << (oscar_hierarchy ? "oscar-q4-pinned-host" : "n/a") << '\n';
+    std::cout << "vericache_l2_format,"
+              << (oscar_hierarchy ? "bf16-authoritative-host" : "n/a") << '\n';
+    std::cout << "vericache_l1_live_logit_verifier,false\n";
+    std::cout << "vericache_l0_to_q4_source,"
+              << (oscar_hierarchy
+                      ? (options.l0_bits < 4 ? "independent-bf16-dual-write"
+                                             : "same-q4-resident")
+                      : "n/a")
+              << '\n';
     std::cout << "proposal_head,"
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
               << '\n';
@@ -470,6 +497,7 @@ int run(const Options& options) {
     std::cout << "vericache_l1_to_l2_horizon_configured," << options.l1_to_l2_horizon << '\n';
     std::cout << "vericache_host_snapshot_horizon_configured," << options.host_snapshot_horizon
               << '\n';
+    std::cout << "vericache_l0_bits," << static_cast<int>(options.l0_bits) << '\n';
     std::cout << "vericache_protected_recent_tokens," << options.protected_recent_tokens << '\n';
     std::cout << "vericache_protected_sink_tokens," << options.protected_sink_tokens << '\n';
     std::cout << "vericache_protected_pivot_tokens," << options.protected_pivot_tokens << '\n';
@@ -537,6 +565,8 @@ int run(const Options& options) {
     std::cout << "vericache_host_kv_d2h_seconds,"
               << vericache_stats.vericache_host_kv_d2h_seconds << '\n';
     std::cout << "vericache_l0_bytes," << vericache_stats.vericache_l0_bytes << '\n';
+    std::cout << "vericache_l0_q4_shadow_bytes,"
+              << vericache_stats.vericache_l0_q4_shadow_bytes << '\n';
     std::cout << "vericache_l1_bytes," << vericache_stats.vericache_l1_bytes << '\n';
     std::cout << "vericache_l2_bytes," << vericache_stats.vericache_l2_bytes << '\n';
     std::cout << "vericache_l3_bytes," << vericache_stats.vericache_l3_bytes << '\n';

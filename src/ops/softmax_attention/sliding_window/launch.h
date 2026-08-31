@@ -40,4 +40,16 @@ void sliding_window_attention_nvfp4_launch(
     const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
     Tensor& out, cudaStream_t stream);
 
+void sliding_window_attention_lowbit_launch(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& lanes, float scale,
+    const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
+    Tensor& out, cudaStream_t stream);
+
+void sliding_window_attention_oscar_launch(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& lanes, float scale,
+    const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
+    Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

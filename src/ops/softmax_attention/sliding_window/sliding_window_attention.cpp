@@ -71,18 +71,27 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
         require_shape(context.v, kHeadDim, padded, kKVHeads, context.lane_capacity, op,
                       "context v");
     } else if (context.dtype == DType::U8) {
-        if (context.quant_group != 16 || context.k.dtype != DType::U8 ||
-            context.v.dtype != DType::U8 || context.k_scale.dtype != DType::FP8_E4M3FN ||
-            context.v_scale.dtype != DType::FP8_E4M3FN) {
-            throw std::invalid_argument(std::string(op) + ": invalid NVFP4 context profile");
+        const std::uint8_t quant_bits = context.quant_bits == 0 ? 4 : context.quant_bits;
+        const bool oscar = context.quantization == CyclicKVCacheQuantization::OscarAffine;
+        const std::int32_t expected_quant_group = oscar ? 128 : 16;
+        const DType expected_scale_dtype = oscar ? DType::BF16 : DType::FP8_E4M3FN;
+        if (context.quant_group != expected_quant_group || quant_bits < 2 || quant_bits > 4 ||
+            context.k.dtype != DType::U8 || context.v.dtype != DType::U8 ||
+            context.k_scale.dtype != expected_scale_dtype ||
+            context.v_scale.dtype != expected_scale_dtype) {
+            throw std::invalid_argument(std::string(op) + ": invalid packed context profile");
         }
-        require_shape(context.k, kHeadDim / 2, padded, kKVHeads, context.lane_capacity, op,
+        const std::int32_t code_extent =
+            static_cast<std::int32_t>((static_cast<std::uint64_t>(kHeadDim) * quant_bits + 7U) /
+                                       8U);
+        require_shape(context.k, code_extent, padded, kKVHeads, context.lane_capacity, op,
                       "context k");
-        require_shape(context.v, kHeadDim / 2, padded, kKVHeads, context.lane_capacity, op,
+        require_shape(context.v, code_extent, padded, kKVHeads, context.lane_capacity, op,
                       "context v");
-        require_shape(context.k_scale, kHeadDim / 16, padded, kKVHeads, context.lane_capacity,
+        const std::int32_t scale_extent = oscar ? 2 : kHeadDim / 16;
+        require_shape(context.k_scale, scale_extent, padded, kKVHeads, context.lane_capacity,
                       op, "context k scales");
-        require_shape(context.v_scale, kHeadDim / 16, padded, kKVHeads, context.lane_capacity,
+        require_shape(context.v_scale, scale_extent, padded, kKVHeads, context.lane_capacity,
                       op, "context v scales");
         if (context.protected_capacity != 0 || context.protected_anchor_capacity != 0) {
             if (context.protected_capacity > context.capacity ||
@@ -95,7 +104,7 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
                 context.protected_k.dtype != DType::BF16 ||
                 context.protected_v.dtype != DType::BF16) {
                 throw std::invalid_argument(std::string(op) +
-                                            ": invalid protected NVFP4 sidecar profile");
+                                         ": invalid protected packed sidecar profile");
             }
             const auto protected_padded =
                 static_cast<std::int32_t>(context.protected_padded_capacity);
@@ -106,7 +115,7 @@ void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t windo
         } else if (context.protected_padded_capacity != 0 ||
                    context.protected_k.data != nullptr || context.protected_v.data != nullptr) {
             throw std::invalid_argument(std::string(op) +
-                                        ": unexpected protected NVFP4 sidecar");
+                                         ": unexpected protected packed sidecar");
         }
     } else {
         throw std::invalid_argument(std::string(op) + ": unsupported context K/V profile");
@@ -211,10 +220,22 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     }
 
     if (context.dtype == DType::U8) {
-        detail::sliding_window_attention_nvfp4_launch(
-            q, query_k, query_v, positions, valid_columns, lanes, scale, context,
-            static_cast<std::int32_t>(envelope.max_context), static_cast<std::int32_t>(window), out,
-            stream);
+        if (context.quantization == CyclicKVCacheQuantization::OscarAffine) {
+            detail::sliding_window_attention_oscar_launch(
+                q, query_k, query_v, positions, valid_columns, lanes, scale, context,
+                static_cast<std::int32_t>(envelope.max_context), static_cast<std::int32_t>(window),
+                out, stream);
+        } else if (context.quant_bits == 2 || context.quant_bits == 3) {
+            detail::sliding_window_attention_lowbit_launch(
+                q, query_k, query_v, positions, valid_columns, lanes, scale, context,
+                static_cast<std::int32_t>(envelope.max_context), static_cast<std::int32_t>(window),
+                out, stream);
+        } else {
+            detail::sliding_window_attention_nvfp4_launch(
+                q, query_k, query_v, positions, valid_columns, lanes, scale, context,
+                static_cast<std::int32_t>(envelope.max_context), static_cast<std::int32_t>(window),
+                out, stream);
+        }
         return;
     }
 
