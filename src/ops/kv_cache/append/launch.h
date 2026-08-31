@@ -18,6 +18,13 @@ void kv_cache_append_nvfp4_batch_launch(const Tensor& k, const Tensor& v, const 
                                         std::int32_t column_begin, std::int32_t width,
                                         PagedKVBatchLayerView cache, cudaStream_t stream);
 
+// OSCAR-Q2 full-attention pages use the same offset-aware append contract as NVFP4, but keep
+// their affine BF16 metadata and attention-aware rotation distinct from the NVFP4 codec.
+void kv_cache_append_oscar_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        std::int32_t column_begin, std::int32_t width,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream);
+
 struct KVCacheAppendPrefixPlan {
     std::int32_t tokens;
     std::int32_t min_count;

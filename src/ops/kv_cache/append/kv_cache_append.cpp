@@ -34,7 +34,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv_heads) {
     D256KVCacheProfile profile{};
     try {
-        profile = d256_kv_cache_profile(cache.dtype);
+        profile = d256_kv_cache_profile(cache.dtype, cache.quant_group);
     } catch (const std::invalid_argument&) {
         throw std::invalid_argument("kv_cache_append: invalid cache geometry or dtype");
     }

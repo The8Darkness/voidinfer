@@ -38,6 +38,7 @@ struct Options {
     int warmup                     = 2;
     int repetitions                = 10;
     std::uint32_t context_tokens   = 128;
+    std::vector<std::uint32_t> context_tokens_per_lane;
     std::uint32_t draft_tokens     = 7;
     std::uint32_t batch_size       = 1;
     std::uint32_t prefill_chunk    = 1024;
@@ -48,7 +49,7 @@ struct Options {
     bool host_tier_snapshots       = false;
     std::uint32_t l1_to_l2_horizon  = 512;
     std::uint32_t host_snapshot_horizon = 0;
-    std::uint32_t protected_recent_tokens = 64;
+    std::uint32_t protected_recent_tokens = 128;
     std::uint32_t protected_sink_tokens   = 4;
     std::uint32_t protected_pivot_tokens  = 4;
     std::uint8_t l0_bits                  = 2;
@@ -58,6 +59,7 @@ struct Options {
 void print_usage(const char* executable) {
     std::cout << "usage: " << executable
               << " [--artifact <model.ninfer>] [--device <id>] [--context <tokens>]"
+                 " [--contexts <tokens,tokens,...> --batch <n>]"
                  " [--warmup <n>] [--reps <n>] [--draft-tokens <1..7>]"
                  " [--batch <1..8>]"
                  " [--prefill-chunk <multiple-of-128>]"
@@ -100,6 +102,19 @@ Options parse_options(int argc, char** argv) {
             options.device = std::stoi(value("--device"));
         } else if (argument == "--context") {
             options.context_tokens = parse_u32(value("--context"), "context");
+        } else if (argument == "--contexts") {
+            const std::string_view list(value("--contexts"));
+            if (list.empty()) { throw std::invalid_argument("--contexts must not be empty"); }
+            std::size_t begin = 0;
+            while (begin <= list.size()) {
+                const std::size_t end = list.find(',', begin);
+                const std::string token = std::string(
+                    list.substr(begin, end == std::string_view::npos ? end : end - begin));
+                if (token.empty()) { throw std::invalid_argument("--contexts contains an empty value"); }
+                options.context_tokens_per_lane.push_back(parse_u32(token.c_str(), "contexts"));
+                if (end == std::string_view::npos) { break; }
+                begin = end + 1;
+            }
         } else if (argument == "--warmup") {
             options.warmup = std::stoi(value("--warmup"));
         } else if (argument == "--reps") {
@@ -183,6 +198,16 @@ Options parse_options(int argc, char** argv) {
     if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
         throw std::invalid_argument("--batch must be in [1,8]");
     }
+    if (!options.context_tokens_per_lane.empty()) {
+        if (options.context_tokens_per_lane.size() != options.batch_size) {
+            throw std::invalid_argument("--contexts count must equal --batch");
+        }
+        for (const std::uint32_t context : options.context_tokens_per_lane) {
+            if (context < 16) {
+                throw std::invalid_argument("every --contexts value must be at least 16 tokens");
+            }
+        }
+    }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
@@ -219,6 +244,7 @@ struct RoundMeasurement {
     float gpu_ms                  = 0.0F;
     double wall_ms                = 0.0;
     std::uint32_t licensed_tokens = 0;
+    std::array<std::uint32_t, ninfer::kMaximumConcurrency> licensed_tokens_per_lane{};
     std::array<ninfer::SpeculativeStats, ninfer::kMaximumConcurrency> stats{};
 };
 
@@ -256,9 +282,24 @@ RoundMeasurement measure_round(target::Package::Program& program, ninfer::Device
         std::chrono::duration<double, std::milli>(Clock::now() - wall_start).count();
     RoundMeasurement result{.gpu_ms = gpu_ms, .wall_ms = wall_ms, .licensed_tokens = licensed};
     for (std::uint32_t row = 0; row < batch_size; ++row) {
+        result.licensed_tokens_per_lane[row] = decisions[row].accepted_tokens;
         result.stats[row] = committed.rows[row].speculative;
     }
     return result;
+}
+
+std::uint32_t context_tokens_for_lane(const Options& options, std::uint32_t lane) {
+    return options.context_tokens_per_lane.empty() ? options.context_tokens
+                                                    : options.context_tokens_per_lane[lane];
+}
+
+std::uint64_t request_capacity_for_context(std::uint32_t context_tokens,
+                                           std::uint32_t measured_rounds,
+                                           std::uint64_t block,
+                                           std::uint32_t draft_tokens) {
+    return static_cast<std::uint64_t>(context_tokens) +
+           (static_cast<std::uint64_t>(measured_rounds) + 1ULL) * block +
+           2ULL * draft_tokens;
 }
 
 template <class T>
@@ -275,13 +316,19 @@ int run(const Options& options) {
     const std::uint32_t measured_rounds =
         static_cast<std::uint32_t>(options.warmup + options.repetitions);
     const std::uint64_t block = options.draft_tokens + 1ULL;
-    const std::uint64_t per_request_capacity =
-        options.context_tokens + (measured_rounds + 1ULL) * block +
-        2ULL * options.draft_tokens;
-    const std::uint64_t aligned_request_capacity = (per_request_capacity + 63ULL) & ~63ULL;
-    const std::uint64_t capacity                 = options.batch_size == 1
-                                                       ? per_request_capacity
-                                                       : aligned_request_capacity * options.batch_size;
+    std::array<std::uint64_t, ninfer::kMaximumConcurrency> lane_capacities{};
+    std::uint64_t per_request_capacity = 0;
+    std::uint64_t capacity             = 0;
+    std::uint64_t aggregate_context    = 0;
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        const std::uint32_t context_tokens = context_tokens_for_lane(options, lane);
+        aggregate_context += context_tokens;
+        lane_capacities[lane] = request_capacity_for_context(
+            context_tokens, measured_rounds, block, options.draft_tokens);
+        per_request_capacity = std::max(per_request_capacity, lane_capacities[lane]);
+        const std::uint64_t aligned = (lane_capacities[lane] + 63ULL) & ~63ULL;
+        capacity += options.batch_size == 1 ? lane_capacities[lane] : aligned;
+    }
     if (per_request_capacity > 262144 || capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("context and measured rounds exceed native capacity");
     }
@@ -355,7 +402,8 @@ int run(const Options& options) {
     std::uint64_t prefill_tokens = 0;
     const auto machine_cost = ninfer::runtime::generic_context_machine_cost_model();
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
-        auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
+        const std::uint32_t context_tokens = context_tokens_for_lane(options, lane);
+        auto prompt       = frontend.prepare_tokens(prompt_tokens(context_tokens), false);
         auto request_base = program->plan_request(prompt, execution);
         auto request_plan =
             program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr,
@@ -405,7 +453,7 @@ int run(const Options& options) {
         }
         prefill_seconds +=
             std::chrono::duration<double>(Clock::now() - prefill_start).count();
-        prefill_tokens += options.context_tokens;
+        prefill_tokens += context_tokens;
         const std::array<ninfer::runtime::CommitDecision, 1> begin_decision{
             ninfer::runtime::CommitDecision{.accepted_tokens = 1}};
         (void)program->commit(std::move(*progress->pending), begin_decision);
@@ -438,10 +486,14 @@ int run(const Options& options) {
     std::vector<float> gpu_ms;
     std::vector<double> wall_ms;
     std::uint64_t licensed_tokens = 0;
+    std::array<std::uint64_t, ninfer::kMaximumConcurrency> licensed_tokens_per_lane{};
     for (const RoundMeasurement& measurement : measurements) {
         gpu_ms.push_back(measurement.gpu_ms);
         wall_ms.push_back(measurement.wall_ms);
         licensed_tokens += measurement.licensed_tokens;
+        for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+            licensed_tokens_per_lane[lane] += measurement.licensed_tokens_per_lane[lane];
+        }
     }
     const auto [gpu_min, gpu_max] = std::minmax_element(gpu_ms.begin(), gpu_ms.end());
     std::uint64_t accepted        = 0;
@@ -465,7 +517,17 @@ int run(const Options& options) {
     std::cout << "format,ninfer_qwen3_6_27b_dflash_round_bench_v1\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
     std::cout << "device," << device.props.name << '\n';
-    std::cout << "context_tokens," << options.context_tokens << '\n';
+    if (options.context_tokens_per_lane.empty()) {
+        std::cout << "context_tokens," << options.context_tokens << '\n';
+    } else {
+        std::cout << "context_tokens_max_per_lane," << per_request_capacity << '\n';
+        std::cout << "context_tokens_per_lane";
+        for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+            std::cout << ',' << context_tokens_for_lane(options, lane);
+        }
+        std::cout << '\n';
+    }
+    std::cout << "aggregate_resident_context_tokens," << aggregate_context << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "batch_size," << options.batch_size << '\n';
     std::cout << "prefill_chunk," << options.prefill_chunk << '\n';
@@ -477,23 +539,28 @@ int run(const Options& options) {
     const bool oscar_hierarchy =
         options.hierarchical_vericache &&
         options.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4;
+    const char* full_bf16_value = std::getenv("NINFER_DFLASH_FULL_BF16");
+    const bool dflash_full_bf16 = full_bf16_value != nullptr && full_bf16_value[0] == '1';
     std::cout << "vericache_l0_format,"
               << (oscar_hierarchy ? "oscar-q" + std::to_string(options.l0_bits) : "n/a")
               << '\n';
     std::cout << "vericache_l1_format,"
-              << (oscar_hierarchy ? "oscar-q4-live-verifier" : "n/a") << '\n';
+              << (oscar_hierarchy ? "oscar-q4-pinned-host" : "n/a") << '\n';
     std::cout << "vericache_l2_format,"
               << (oscar_hierarchy ? "fp16-authoritative-host" : "n/a") << '\n';
-    std::cout << "vericache_l1_storage,"
-              << (oscar_hierarchy ? "device-q4-shadow+pinned-host-mirror" : "n/a") << '\n';
-    std::cout << "vericache_l1_live_verifier," << (oscar_hierarchy ? "true" : "false") << '\n';
-    std::cout << "vericache_l1_primary," << (oscar_hierarchy && !options.q2_filter ? "true" : "false")
+    std::cout << "dflash_full_attention_cache,"
+              << (oscar_hierarchy ? (dflash_full_bf16 ? "bf16-device" : "oscar-q2-device") : "n/a")
               << '\n';
+    std::cout << "vericache_l1_storage,"
+              << (oscar_hierarchy ? "pinned-host-only;no-device-q4-shadow" : "n/a") << '\n';
+    // Host Q4 is currently a promoted verifier record/persistence tier. The benchmark does not
+    // run target-model logits from pinned RAM, so do not label storage as a live logit verifier.
+    std::cout << "vericache_l1_live_verifier,false\n";
+    std::cout << "vericache_l1_primary,false\n";
     std::cout << "vericache_l1_live_logit_verifier,false\n";
     std::cout << "vericache_l0_to_q4_source,"
               << (oscar_hierarchy
-                      ? (options.l0_bits < 4 ? "independent-bf16-dual-write"
-                                             : "same-q4-resident")
+                      ? "q2-derived-host-conversion"
                       : "n/a")
               << '\n';
     std::cout << "proposal_head,"
@@ -532,6 +599,15 @@ int run(const Options& options) {
               << (drafted == 0 ? 0.0 : static_cast<double>(accepted) / drafted) << '\n';
     std::cout << "published_tokens_per_second," << 1000.0 * mean_licensed_per_batch / mean_wall_ms
               << '\n';
+    std::cout << "published_tokens_per_second_per_stream,"
+              << 1000.0 * mean_licensed_per_request / mean_wall_ms << '\n';
+    std::cout << "published_tokens_per_second_per_lane";
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        const double lane_mean = static_cast<double>(licensed_tokens_per_lane[lane]) /
+                                  static_cast<double>(options.repetitions);
+        std::cout << ',' << 1000.0 * lane_mean / mean_wall_ms;
+    }
+    std::cout << '\n';
     std::cout << "accepted_per_position";
     for (std::size_t position = 0; position < options.draft_tokens; ++position) {
         std::cout << ',' << accepted_per_position[position];

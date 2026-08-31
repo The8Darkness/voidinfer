@@ -343,6 +343,161 @@ __launch_bounds__(256) __global__
         position & kPagedKVPageMask, lane);
 }
 
+template <typename Geometry, int Bits, bool TransposedQ2>
+__device__ __forceinline__ void kv_cache_append_full_oscar_row(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    __nv_bfloat16* __restrict__ scale_k, __nv_bfloat16* __restrict__ scale_v, int token,
+    int kv_head, int physical_page, int page_off, int lane) {
+    static_assert(Bits == 2 || Bits == 4);
+    constexpr unsigned FullMask = 0xffffffffU;
+    constexpr int D             = kPagedKVCacheOscarHeadDim;
+    constexpr int CodeExtent    = cyclic_oscar_code_extent<Bits>(D);
+    float k_values[8];
+    float v_values[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        const int d = lane + 32 * item;
+        k_values[item] = __bfloat162float(k[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+        v_values[item] = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+    }
+    normalized_hadamard_d256_inplace(k_values, lane);
+    normalized_hadamard_d256_inplace(v_values, lane);
+    const auto k_quant = cyclic_oscar_quant_params<Bits, false>(k_values, lane);
+    const auto v_quant = cyclic_oscar_quant_params<Bits, true>(v_values, lane);
+    std::uint8_t k_codes[8];
+    std::uint8_t v_codes[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        k_codes[item] = cyclic_oscar_quantize<Bits>(k_values[item], k_quant);
+        v_codes[item] = cyclic_oscar_quantize_value<Bits>(v_values[item], v_quant);
+    }
+
+    if constexpr (TransposedQ2) {
+        static_assert(Bits == 2);
+        // The attention decoder owns one lane per byte.  Keep the four values separated by the
+        // natural H256 row stride in adjacent bit fields, so append becomes two coalesced stores
+        // per lane instead of rebuilding all 64 contiguous bytes through warp shuffles.
+        const std::uint8_t packed_k0 = static_cast<std::uint8_t>(
+            k_codes[0] | (k_codes[1] << 2) | (k_codes[2] << 4) | (k_codes[3] << 6));
+        const std::uint8_t packed_k1 = static_cast<std::uint8_t>(
+            k_codes[4] | (k_codes[5] << 2) | (k_codes[6] << 4) | (k_codes[7] << 6));
+        const std::uint8_t packed_v0 = static_cast<std::uint8_t>(
+            v_codes[0] | (v_codes[1] << 2) | (v_codes[2] << 4) | (v_codes[3] << 6));
+        const std::uint8_t packed_v1 = static_cast<std::uint8_t>(
+            v_codes[4] | (v_codes[5] << 2) | (v_codes[6] << 4) | (v_codes[7] << 6));
+        cache_k[paged_oscar_code_index<Bits, Geometry>(physical_page, kv_head, page_off, lane)] =
+            packed_k0;
+        cache_k[paged_oscar_code_index<Bits, Geometry>(physical_page, kv_head, page_off,
+                                                        lane + 32)] = packed_k1;
+        cache_v[paged_oscar_code_index<Bits, Geometry>(physical_page, kv_head, page_off, lane)] =
+            packed_v0;
+        cache_v[paged_oscar_code_index<Bits, Geometry>(physical_page, kv_head, page_off,
+                                                        lane + 32)] = packed_v1;
+    } else {
+        // Pack the contiguous symbol stream from lane-local rotated values.  Lane zero owns each
+        // byte, so Q2/Q4 writes are race-free even when the page is shared by concurrent rows.
+        for (int byte = 0; byte < CodeExtent; ++byte) {
+            std::uint8_t packed_k = 0;
+            std::uint8_t packed_v = 0;
+            int bit_cursor         = 0;
+            while (bit_cursor < 8) {
+                const int global_bit = byte * 8 + bit_cursor;
+                const int dimension  = global_bit / Bits;
+                const int bit_offset = global_bit - dimension * Bits;
+                const int take       = min(Bits - bit_offset, 8 - bit_cursor);
+                const int source_lane = dimension & 31;
+                const int source_item = dimension >> 5;
+                const int k_code = __shfl_sync(FullMask, static_cast<int>(k_codes[source_item]),
+                                               source_lane);
+                const int v_code = __shfl_sync(FullMask, static_cast<int>(v_codes[source_item]),
+                                               source_lane);
+                const int mask = (1 << take) - 1;
+                packed_k |=
+                    static_cast<std::uint8_t>(((k_code >> bit_offset) & mask) << bit_cursor);
+                packed_v |=
+                    static_cast<std::uint8_t>(((v_code >> bit_offset) & mask) << bit_cursor);
+                bit_cursor += take;
+            }
+            if (lane == 0) {
+                cache_k[paged_oscar_code_index<Bits, Geometry>(physical_page, kv_head, page_off,
+                                                                byte)] = packed_k;
+                cache_v[paged_oscar_code_index<Bits, Geometry>(physical_page, kv_head, page_off,
+                                                                byte)] = packed_v;
+            }
+        }
+    }
+    if (lane == 0) {
+        const std::int64_t scale_offset =
+            paged_oscar_scale_index<Geometry>(physical_page, kv_head, page_off, 0);
+        scale_k[scale_offset]     = __float2bfloat16(k_quant.scale);
+        scale_k[scale_offset + 1] = __float2bfloat16(k_quant.zero);
+        scale_v[scale_offset]     = __float2bfloat16(v_quant.scale);
+        scale_v[scale_offset + 1] = __float2bfloat16(v_quant.zero);
+    }
+}
+
+template <typename Geometry, int Bits, typename Metadata, bool TransposedQ2>
+__launch_bounds__(256) __global__ void kv_cache_append_full_oscar_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, Metadata metadata,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    __nv_bfloat16* __restrict__ scale_k, __nv_bfloat16* __restrict__ scale_v,
+    std::int32_t width) {
+    constexpr int Warps         = 8;
+    constexpr unsigned FullMask = 0xffffffffU;
+    const int tokens            = metadata.valid_tokens(width);
+    const int warp              = static_cast<int>(threadIdx.x) >> 5;
+    const int lane              = static_cast<int>(threadIdx.x) & 31;
+    const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
+    const int units             = tokens * Geometry::KVHeads;
+    if (unit >= units) return;
+
+    const int kv_head               = unit % Geometry::KVHeads;
+    const int token                 = unit / Geometry::KVHeads;
+    const int position              = positions[0] + token;
+    const std::int32_t* block_table = metadata.block_table();
+    int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    kv_cache_append_full_oscar_row<Geometry, Bits, TransposedQ2>(
+        k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, physical_page,
+        position & kPagedKVPageMask, lane);
+}
+
+template <typename Geometry, int Bits, bool Masked, bool TransposedQ2>
+__launch_bounds__(32) __global__ void kv_cache_append_oscar_batch_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ valid_columns,
+    const std::int32_t* __restrict__ table_rows, std::uint8_t* __restrict__ cache_k,
+    std::uint8_t* __restrict__ cache_v, __nv_bfloat16* __restrict__ scale_k,
+    __nv_bfloat16* __restrict__ scale_v, const std::int32_t* __restrict__ block_tables,
+    std::int32_t table_stride, std::int32_t logical_pages, std::int32_t full_width,
+    std::int32_t column_begin, std::int32_t width) {
+    const int kv_head = static_cast<int>(blockIdx.x);
+    const int token   = static_cast<int>(blockIdx.y);
+    const int batch   = static_cast<int>(blockIdx.z);
+    const int lane    = static_cast<int>(threadIdx.x);
+    int valid_tokens  = width;
+    if constexpr (Masked) {
+        const int remaining = valid_columns[batch] - column_begin;
+        valid_tokens        = remaining <= 0 ? 0 : min(remaining, width);
+    }
+    if (kv_head >= Geometry::KVHeads || token >= valid_tokens) return;
+
+    const std::int64_t batch_column = static_cast<std::int64_t>(batch) * full_width +
+                                      column_begin;
+    const int position               = positions[batch_column + token];
+    const std::int32_t* block_table =
+        block_tables + static_cast<std::int64_t>(table_rows[batch]) * table_stride;
+    const int physical_page = paged_kv_physical_page(block_table, position);
+    const std::int64_t input_offset =
+        static_cast<std::int64_t>(kPagedKVCacheOscarHeadDim) * Geometry::KVHeads * batch_column;
+    (void)logical_pages;
+    kv_cache_append_full_oscar_row<Geometry, Bits, TransposedQ2>(
+        k + input_offset, v + input_offset, cache_k, cache_v, scale_k, scale_v, token, kv_head,
+        physical_page, position & kPagedKVPageMask, lane);
+}
+
 template <typename Geometry, bool Masked>
 __launch_bounds__(32) __global__ void kv_cache_append_nvfp4_batch_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
@@ -589,33 +744,50 @@ __device__ __forceinline__ void kv_cache_append_prefix_cyclic_oscar_row(
         }
     }
 
-    // Pack a contiguous symbol stream without byte races. Every lane executes the same shuffles;
-    // lane zero owns the final byte stores. Q2/Q4 compile down to the same fixed-size loop.
-    for (int byte = 0; byte < CodeExtent; ++byte) {
-        std::uint8_t packed_k = 0;
-        std::uint8_t packed_v = 0;
-        int bit_cursor         = 0;
-        while (bit_cursor < 8) {
-            const int global_bit = byte * 8 + bit_cursor;
-            const int dimension  = global_bit / Bits;
-            const int bit_offset = global_bit - dimension * Bits;
-            const int take       = min(Bits - bit_offset, 8 - bit_cursor);
-            const int source_lane = dimension & 31;
-            const int source_item = dimension >> 5;
-            const int k_code = __shfl_sync(FullMask, static_cast<int>(k_codes[source_item]),
-                                           source_lane);
-            const int v_code = __shfl_sync(FullMask, static_cast<int>(v_codes[source_item]),
-                                           source_lane);
-            const int mask = (1 << take) - 1;
-            packed_k |= static_cast<std::uint8_t>(((k_code >> bit_offset) & mask) << bit_cursor);
-            packed_v |= static_cast<std::uint8_t>(((v_code >> bit_offset) & mask) << bit_cursor);
-            bit_cursor += take;
-        }
-        if (lane == 0) {
-            cache_k[cyclic_oscar_code_index<Bits>(slot, kv_head, lane_id, padded_capacity, byte)] =
-                packed_k;
-            cache_v[cyclic_oscar_code_index<Bits>(slot, kv_head, lane_id, padded_capacity, byte)] =
-                packed_v;
+    if constexpr (Bits == 2) {
+        // DFlash attention consumes Q2 in a lane-local layout: byte l contains
+        // the four symbols for dimensions l, l+32, l+64 and l+96. This is a
+        // storage-only transpose of the normal contiguous bitstream. Every
+        // lane writes a distinct byte, removing the 32-lane packing shuffles
+        // from the hot append path as well as from attention.
+        const std::uint8_t packed_k = static_cast<std::uint8_t>(
+            k_codes[0] | (k_codes[1] << 2) | (k_codes[2] << 4) | (k_codes[3] << 6));
+        const std::uint8_t packed_v = static_cast<std::uint8_t>(
+            v_codes[0] | (v_codes[1] << 2) | (v_codes[2] << 4) | (v_codes[3] << 6));
+        cache_k[cyclic_oscar_code_index<Bits>(slot, kv_head, lane_id, padded_capacity, lane)] =
+            packed_k;
+        cache_v[cyclic_oscar_code_index<Bits>(slot, kv_head, lane_id, padded_capacity, lane)] =
+            packed_v;
+    } else {
+        // Pack a contiguous symbol stream without byte races. Every lane executes the same
+        // shuffles; lane zero owns the final byte stores. Q4 shadow/snapshot data stays in the
+        // conventional OSCAR stream layout.
+        for (int byte = 0; byte < CodeExtent; ++byte) {
+            std::uint8_t packed_k = 0;
+            std::uint8_t packed_v = 0;
+            int bit_cursor         = 0;
+            while (bit_cursor < 8) {
+                const int global_bit = byte * 8 + bit_cursor;
+                const int dimension  = global_bit / Bits;
+                const int bit_offset = global_bit - dimension * Bits;
+                const int take       = min(Bits - bit_offset, 8 - bit_cursor);
+                const int source_lane = dimension & 31;
+                const int source_item = dimension >> 5;
+                const int k_code = __shfl_sync(FullMask, static_cast<int>(k_codes[source_item]),
+                                               source_lane);
+                const int v_code = __shfl_sync(FullMask, static_cast<int>(v_codes[source_item]),
+                                               source_lane);
+                const int mask = (1 << take) - 1;
+                packed_k |= static_cast<std::uint8_t>(((k_code >> bit_offset) & mask) << bit_cursor);
+                packed_v |= static_cast<std::uint8_t>(((v_code >> bit_offset) & mask) << bit_cursor);
+                bit_cursor += take;
+            }
+            if (lane == 0) {
+                cache_k[cyclic_oscar_code_index<Bits>(slot, kv_head, lane_id, padded_capacity,
+                                                      byte)] = packed_k;
+                cache_v[cyclic_oscar_code_index<Bits>(slot, kv_head, lane_id, padded_capacity,
+                                                      byte)] = packed_v;
+            }
         }
     }
     if constexpr (Dual) {

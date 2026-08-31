@@ -15,7 +15,10 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 
+#include "ops/kv_cache/d256_profile.h"
+
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -28,6 +31,14 @@ namespace {
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
+
+bool dflash_full_bf16_enabled() noexcept {
+    const char* value = std::getenv("NINFER_DFLASH_FULL_BF16");
+    // This is an explicit comparison mode for the DFlash full-attention cache. The serving
+    // hierarchy remains OSCAR-Q2 by default; setting the switch restores the BF16 target cache
+    // while leaving the local speculative cache at its configured L0 format.
+    return value != nullptr && value[0] == '1';
+}
 
 enum class GdnWorkspacePath : std::uint8_t {
     Prefill,
@@ -76,14 +87,16 @@ TargetKVCacheProfile target_kv_cache_profile(KvCacheStorage storage) {
     case KvCacheStorage::Nvfp4:
         return {DType::U8, qwen3_6::kKvNvfp4QuantGroup};
     case KvCacheStorage::VeriCacheNvfp4:
-        return {DType::BF16, 0};
+        // The hierarchical serving profile is deliberately Q2 on the device.  L1/L2 are
+        // host-side representations; no exact BF16 target KV is reserved in VRAM.
+        return {DType::U8, ops::kD256OscarQuantGroup};
     }
     throw std::invalid_argument("unknown KV-cache storage profile");
 }
 
 TargetKVCacheProfile mtp_kv_cache_profile(KvCacheStorage storage) {
     if (storage == KvCacheStorage::VeriCacheNvfp4) {
-        return {DType::U8, qwen3_6::kKvNvfp4QuantGroup};
+        return {DType::U8, ops::kD256OscarQuantGroup};
     }
     return target_kv_cache_profile(storage);
 }
@@ -223,9 +236,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                            : CyclicKVCacheQuantization::Auto,
             };
             if (dflash_nvfp4) {
-                // L1 is a separate OSCAR-Q4 mirror when hierarchy is enabled. Lower-bit L0 now
-                // has a source-side Q4 shadow so StateImage promotion can preserve independent
-                // Q4 quantization; L2 remains the BF16 target/GDN state below.
+                // L1 is a separate OSCAR-Q4 host mirror when hierarchy is enabled. The current
+                // shadow-free path promotes the resident L0 Q2 representation through bounded
+                // StateImage conversion; L2 remains the FP16 authoritative host state.
                 auto host_local = *state_image_spec.dflash_local;
                 host_local.quant_bits = 4;
                 host_local.quant_group = use_oscar ? 128 : qwen3_6::kKvNvfp4QuantGroup;
@@ -253,14 +266,33 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
+            constexpr bool dflash_v2 = DFlashConfig::is_v2;
+            const bool full_bf16 = dflash_v2 && dflash_full_bf16_enabled();
+            const bool full_oscar = dflash_v2 && !full_bf16;
+            const DType full_code_dtype = full_oscar ? DType::U8 : DType::BF16;
+            const std::int32_t full_code_extent =
+                full_oscar ? (DFlashConfig::head_dim * 2 + 7) / 8 : DFlashConfig::head_dim;
+            const std::int32_t full_scale_extent =
+                full_oscar ? ops::kD256OscarScaleExtent : 0;
+            const DType full_scale_dtype = DType::BF16;
             KVPageGeometry full_geometry{
                 .page_tokens        = kPagedKVPageSize,
                 .device_plane_order = PagedKVPlaneOrder::HeadMajor,
-                .planes =
-                    {
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                    },
+                .planes = [&] {
+                    std::vector<KVPlaneGeometry> planes;
+                    planes.reserve(full_oscar ? 4U : 2U);
+                    planes.push_back(
+                        {full_code_dtype, full_code_extent, DFlashConfig::kv_heads, 256});
+                    planes.push_back(
+                        {full_code_dtype, full_code_extent, DFlashConfig::kv_heads, 256});
+                    if (full_oscar) {
+                        planes.push_back(
+                            {full_scale_dtype, full_scale_extent, DFlashConfig::kv_heads, 256});
+                        planes.push_back(
+                            {full_scale_dtype, full_scale_extent, DFlashConfig::kv_heads, 256});
+                    }
+                    return planes;
+                }(),
             };
             dflash.full = qwen3_6::PagedKVCacheLayout{
                 .pages = plan_device_kv_page_pool(
@@ -276,8 +308,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .max_context = plan.capacity,
                 .kv_heads    = DFlashConfig::kv_heads,
                 .head_dim    = DFlashConfig::head_dim,
-                .dtype       = DType::BF16,
-                .quant_group = 0,
+                .dtype       = full_code_dtype,
+                .quant_group = full_oscar ? ops::kD256OscarQuantGroup : 0,
             };
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},

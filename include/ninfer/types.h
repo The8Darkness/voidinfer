@@ -125,17 +125,17 @@ struct HierarchicalVeriCacheOptions {
 
     // These are default protection classes. Prompt-derived vision/system/tool ranges are added
     // by the runtime when their exact token spans are known.
-    std::uint32_t protected_recent_tokens = 64;
+    // A 128-token BF16 recent sidecar is the measured Q2/DFlash acceptance knee on the RTX 5090;
+    // larger protection windows add memory without improving the short-context result.
+    std::uint32_t protected_recent_tokens = 128;
     std::uint32_t protected_sink_tokens   = 4;
     std::uint32_t protected_pivot_tokens  = 4;
 
-    // L0 is the resident speculative DFlash local KV. In the hierarchical OSCAR profile this
-    // defaults to Q2; Q4 remains available as a storage/throughput control. The host mirror is
-    // independently calibrated OSCAR-Q4 and sensitive ranges continue to use the BF16 sidecar.
-    std::uint8_t l0_bits = 4;
-    // With a Q4 shadow, make the higher-fidelity L1 pass the serving proposal/verifier by
-    // default. Q2 remains resident and dual-written for fallback; false retains the experimental
-    // two-pass Q2 -> Q4 refinement comparison path.
+    // L0 is the resident OSCAR-Q2 device KV. Q4 is a pinned-host representation; sensitive
+    // ranges may additionally use the explicit BF16 protection sidecar.
+    std::uint8_t l0_bits = 2;
+    // Reserved for a future host-side live verifier. It must not cause a persistent Q4 device
+    // shadow to be allocated.
     bool l1_live_verifier_primary = true;
     bool direct_low_bit_attention = false;
     // Opt-in asynchronous StateImage promotion. This materializes the existing compressed

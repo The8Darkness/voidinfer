@@ -90,4 +90,13 @@ void causal_attention_nvfp4_cached_launch(const Tensor& q, const Tensor& positio
                                           const PagedKVLayerView& cache, Tensor& out,
                                           cudaStream_t stream);
 
+void causal_attention_oscar_launch(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& table_rows, float scale,
+    PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream);
+
+void causal_attention_oscar_cached_launch(const Tensor& q, const Tensor& positions, float scale,
+                                          const PagedKVLayerView& cache, Tensor& out,
+                                          cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

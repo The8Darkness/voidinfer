@@ -329,7 +329,10 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
     const std::uint32_t mapped     = std::min(addresses.mapped_pages(address),
                                               mapped_limit.value_or(addresses.mapped_pages(address)));
     std::vector<std::uint8_t> selected(mapped, 0);
-    const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+    const HostKVPageLayout layout =
+        host_extents != nullptr
+            ? host_extents->page_layout(pages)
+            : plan_host_kv_page_layout(pages.physical_pool().geometry());
 
     for (const qwen3_6::detail::PressureKVDecision& action : existing_actions) {
         if (action.kind == qwen3_6::detail::PressureKVDecisionKind::None ||
@@ -777,8 +780,37 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::overflow_error("Qwen3.6 KV transaction address capacity exceeds uint32");
     }
     const auto address_capacity      = static_cast<std::uint32_t>(address_capacity64 + 1U);
+    const auto is_primary_oscar_q2_geometry = [](const KVPageGeometry& geometry) {
+        if (geometry.page_tokens != static_cast<std::uint32_t>(kPagedKVPageSize) ||
+            geometry.planes.empty() || geometry.planes.size() % 4U != 0U) {
+            return false;
+        }
+        for (std::size_t layer = 0; layer < geometry.planes.size() / 4U; ++layer) {
+            const KVPlaneGeometry& code_k = geometry.planes[layer * 4U];
+            const KVPlaneGeometry& code_v = geometry.planes[layer * 4U + 1U];
+            const KVPlaneGeometry& scale_k = geometry.planes[layer * 4U + 2U];
+            const KVPlaneGeometry& scale_v = geometry.planes[layer * 4U + 3U];
+            if (code_k.dtype != DType::U8 || code_v.dtype != DType::U8 ||
+                scale_k.dtype != DType::BF16 || scale_v.dtype != DType::BF16 ||
+                code_k.leading_extent != 64 || code_v.leading_extent != 64 ||
+                scale_k.leading_extent != 2 || scale_v.leading_extent != 2 ||
+                code_k.head_extent != code_v.head_extent ||
+                code_k.head_extent != scale_k.head_extent ||
+                code_k.head_extent != scale_v.head_extent) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto host_layout_for = [&](const KVPageGeometry& geometry) {
+        return hierarchical_vericache.enabled() &&
+                       hierarchical_vericache_options.enable_host_tier_snapshots &&
+                       is_primary_oscar_q2_geometry(geometry)
+                   ? plan_host_kv_page_layout(geometry, HostKVStorageFormat::OscarQ4AndFp16)
+                   : plan_host_kv_page_layout(geometry);
+    };
     const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
-        const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
+        const HostKVPageLayout host_layout = host_layout_for(pool.geometry());
         const std::uint64_t host_pages =
             plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
         const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
@@ -789,10 +821,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    // Hierarchical snapshots use one pinned record containing both the OSCAR-Q4 verifier copy
+    // and decoded FP16 authority.  The device still owns only the OSCAR-Q2 source pages.
     const HostKVPageLayout text_host_layout =
-        hierarchical_vericache.enabled()
-            ? plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry(), DType::FP16)
-            : plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry());
+        host_layout_for(decoder->text_kv.page_pool().geometry());
     text_host_kv_page_stride = text_host_layout.page_stride;
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
@@ -846,8 +878,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         hierarchical_vericache.set_tier_bytes(l0_bytes, 0U, 0U, 0U);
     }
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
-        backend_host_kv_page_stride =
-            plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;
+        backend_host_kv_page_stride = host_layout_for(backend->page_pool().geometry()).page_stride;
         backend_kv_pages = std::make_unique<LogicalKVPageStore>(
             backend->page_pool(), logical_page_capacity(backend->page_pool()));
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
@@ -858,8 +889,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         std::vector<HostKVPageLayout> layouts;
         layouts.push_back(text_host_layout);
         if (const qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
-            HostKVPageLayout backend_layout =
-                plan_host_kv_page_layout(backend->page_pool().geometry());
+            HostKVPageLayout backend_layout = host_layout_for(backend->page_pool().geometry());
             if (backend_layout != layouts.front()) { layouts.push_back(std::move(backend_layout)); }
         }
         host_kv_arena = std::make_unique<HostKVArena>(
@@ -2520,7 +2550,10 @@ ProgramImplCore::checkpoint_restore_requirements(const SequenceKVBundle& kv,
             ++missing;
         }
         if (missing == 0) { return; }
-        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        const HostKVPageLayout layout =
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(pages)
+                : plan_host_kv_page_layout(pages.physical_pool().geometry());
         requirements.push_back(kv_transfer_requirement(
             resource, runtime::ContextTransferDirection::HostToDevice, layout, missing, runs));
     };
@@ -2802,7 +2835,9 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
             }
             if (missing != 0) {
                 const HostKVPageLayout layout =
-                    plan_host_kv_page_layout(pages.physical_pool().geometry());
+                    host_kv_extents != nullptr
+                        ? host_kv_extents->page_layout(pages)
+                        : plan_host_kv_page_layout(pages.physical_pool().geometry());
                 requirements.push_back(kv_transfer_requirement(
                     resource, runtime::ContextTransferDirection::HostToDevice, layout, missing,
                     runs));
@@ -3030,7 +3065,9 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_checkp
         const std::uint32_t retained_pages = kv_pages_for_frontier(retained_frontier);
         const std::uint32_t mapped         = addresses.mapped_pages(address);
         const std::size_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(pages).page_stride
+                : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
         for (std::uint32_t page = retained_pages; page < mapped; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.address_references(logical) != 1) { continue; }
@@ -3765,7 +3802,9 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
                     return false;
                 }
                 const std::size_t stride =
-                    plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+                    host_kv_extents != nullptr
+                        ? host_kv_extents->page_layout(pages).page_stride
+                        : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
                 for (std::uint32_t offset = 0; offset < protected_pages; ++offset) {
                     const LogicalKVPageHandle page = addresses.logical_page(address, offset);
                     const std::uint32_t references = pages.address_references(page);
@@ -3966,7 +4005,9 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
                                            const std::vector<SelectedPage>& selected,
                                            runtime::ContextResourceClass resource) {
         const std::size_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(pages).page_stride
+                : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
         for (const SelectedPage& item : selected) {
             if (pages.address_references(item.page) != item.references ||
                 pages.writer_references(item.page) != 0 || pages.source_pins(item.page) != 0) {
@@ -4089,7 +4130,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
         for (const qwen3_6::detail::PressureKVDecision& action : changes) {
             append_host_releases(addresses, pages, address, action);
             if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
-                host_layouts.push_back(plan_host_kv_page_layout(pages.physical_pool().geometry()));
+                host_layouts.push_back(
+                    host_kv_extents != nullptr
+                        ? host_kv_extents->page_layout(pages)
+                        : plan_host_kv_page_layout(pages.physical_pool().geometry()));
                 host_requests.push_back(
                     {.layout = &host_layouts.back(), .pages = action.page_count});
             }
@@ -5602,8 +5646,10 @@ void ProgramImplCore::record_materialization_transfer_observations(
             context_transfer_observation(resource, direction, transfer_work, pages));
         transaction.transfer_timer_mask &= static_cast<std::uint8_t>(~bit);
     };
-    const auto host_layout = [](const LogicalKVPageStore& pages) {
-        return plan_host_kv_page_layout(pages.physical_pool().geometry());
+    const auto host_layout = [&](const LogicalKVPageStore& pages) {
+        return host_kv_extents != nullptr
+                   ? host_kv_extents->page_layout(pages)
+                   : plan_host_kv_page_layout(pages.physical_pool().geometry());
     };
     const auto restore_copy_runs = [](const auto& restores, const auto& destinations,
                                       const LogicalKVPageStore& pages) {
@@ -7820,14 +7866,18 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
         assessment.transfer_requirements.push_back(kv_transfer_requirement(
             runtime::ContextResourceClass::MainKV,
             runtime::ContextTransferDirection::DeviceToDevice,
-            plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()),
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(*text_kv_pages)
+                : plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()),
             added.device.main_kv_pages));
     }
     if (added.device.backend_kv_pages != 0) {
         assessment.transfer_requirements.push_back(kv_transfer_requirement(
             runtime::ContextResourceClass::BackendKV,
             runtime::ContextTransferDirection::DeviceToDevice,
-            plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()),
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(*backend_kv_pages)
+                : plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()),
             added.device.backend_kv_pages));
     }
     assessment.needs_transfer = !assessment.transfer_requirements.empty();
@@ -9136,16 +9186,27 @@ void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) c
     hierarchical_vericache.populate(out);
     if (!hierarchical_vericache.enabled()) { return; }
 
-    // Reuse the existing pinned StateImage and host KV stores for truthful tier accounting. The
-    // compressed DFlash portion of a host StateImage is the L1 OSCAR-Q4 mirror; its remaining
-    // payload is high-precision GDN/continuation state for L2. Host KV pages are authoritative
-    // L2 attention storage and are encoded as FP16 in hierarchical mode. The active target-side
-    // device cache remains BF16 for kernel compatibility before it is promoted to host L2. L3
-    // remains zero until a cold-store writer is attached.
-    if (state_images != nullptr) {
-        if (const CyclicKVCache* q4_shadow = state_images->dflash_local_q4_shadow()) {
-            out.vericache_l0_q4_shadow_bytes = q4_shadow->payload_bytes();
+    // The hierarchy's residency contract is strict: every persistent attention cache allocated
+    // on the device is OSCAR-Q2 (including the DFlash local/backend pages). Q4 and FP16 live in
+    // host records only; a Q4 device shadow is neither planned nor counted. Protected recent or
+    // anchor sidecars are an explicit sensitivity exception and remain part of the Q2 L0 pool.
+    const auto device_pool_bytes = [](const DeviceKVPagePool& pool) {
+        std::size_t bytes = 0;
+        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+            bytes += pool.plane(plane).bytes();
         }
+        return bytes;
+    };
+    std::size_t l0_bytes = 0;
+    if (decoder != nullptr) { l0_bytes += device_pool_bytes(decoder->text_kv.page_pool()); }
+    if (const qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
+        l0_bytes += device_pool_bytes(backend->page_pool());
+    }
+    if (state_images != nullptr) {
+        if (const CyclicKVCache* local = state_images->dflash_local()) {
+            l0_bytes += local->payload_bytes();
+        }
+        out.vericache_l0_q4_shadow_bytes = 0;
     }
     std::size_t l1_bytes = 0;
     std::size_t l2_bytes = 0;
@@ -9165,17 +9226,23 @@ void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) c
         l1_bytes = local_bytes * occupied;
         l2_bytes = (layout.image_bytes - local_bytes) * occupied;
     }
-    // The target text KV uses BF16 on the device but FP16 records in the hierarchical host arena,
-    // while the speculative MTP/DFlash backend uses the compressed U8/OSCAR geometry. Count them
-    // by owner rather than treating the shared arena as one undifferentiated tier.
-    if (text_kv_pages != nullptr) {
-        l2_bytes += static_cast<std::size_t>(text_kv_pages->host_resident_count()) *
-                    text_host_kv_page_stride;
-    }
-    if (backend_kv_pages != nullptr) {
-        l1_bytes += static_cast<std::size_t>(backend_kv_pages->host_resident_count()) *
-                    backend_host_kv_page_stride;
-    }
+    // A hierarchical text record is split into Q4 L1 bytes and FP16 L2 bytes. Generic host
+    // records (for a non-primary DFlash geometry) are deliberately not misreported as either
+    // tier until a matching verifier layout exists.
+    const auto add_host_tier_bytes = [&](const std::unique_ptr<LogicalKVPageStore>& pages) {
+        if (pages == nullptr || host_kv_extents == nullptr || pages->host_resident_count() == 0) {
+            return;
+        }
+        const HostKVPageLayout& layout = host_kv_extents->page_layout(*pages);
+        const std::size_t resident = pages->host_resident_count();
+        if (layout.storage_format == HostKVStorageFormat::OscarQ4AndFp16) {
+            l1_bytes += resident * layout.l1_page_payload_bytes;
+            l2_bytes += resident * layout.l2_page_payload_bytes;
+        }
+    };
+    add_host_tier_bytes(text_kv_pages);
+    add_host_tier_bytes(backend_kv_pages);
+    out.vericache_l0_bytes = l0_bytes;
     out.vericache_l1_bytes = l1_bytes;
     out.vericache_l2_bytes = l2_bytes;
 }

@@ -64,4 +64,41 @@ __device__ __forceinline__ void normalized_hadamard_d256_inplace(float (&values)
     for (float& value : values) { value = __fmul_rn(value, 0x1p-4f); }
 }
 
+// Packed-row layout used by the Q2 attention decoder.  Lane l owns dimensions
+//   [4*l + 0..3] and [128 + 4*l + 0..3],
+// so it can read one packed byte from each half of the 256-wide row.  This is
+// the same H256 transform as normalized_hadamard_d256_inplace(), factored over
+// the natural dimension bits: H4 on bits [0,1], H32 across lanes on bits
+// [2,6], and H2 on bit 7.  Keeping the transform in this layout removes the
+// four-lane broadcasts that otherwise duplicate every Q2 code byte.
+__device__ __forceinline__ void normalized_hadamard_d256_packed_inplace(
+    float (&values)[8], int lane) {
+#pragma unroll
+    for (int stride = 1; stride <= 2; stride <<= 1) {
+#pragma unroll
+        for (int base = 0; base < 8; base += 2 * stride) {
+#pragma unroll
+            for (int offset = 0; offset < stride; ++offset) {
+                const float low              = values[base + offset];
+                const float high             = values[base + offset + stride];
+                values[base + offset]        = __fadd_rn(low, high);
+                values[base + offset + stride] = __fsub_rn(low, high);
+            }
+        }
+    }
+
+    hadamard_d32_columns_inplace(values, lane);
+
+#pragma unroll
+    for (int offset = 0; offset < 4; ++offset) {
+        const float low       = values[offset];
+        const float high      = values[offset + 4];
+        values[offset]        = __fadd_rn(low, high);
+        values[offset + 4]    = __fsub_rn(low, high);
+    }
+
+#pragma unroll
+    for (float& value : values) { value = __fmul_rn(value, 0x1p-4f); }
+}
+
 } // namespace ninfer::ops

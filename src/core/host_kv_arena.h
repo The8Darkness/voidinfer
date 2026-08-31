@@ -21,6 +21,16 @@ struct HostKVPlaneLayout {
     friend bool operator==(const HostKVPlaneLayout&, const HostKVPlaneLayout&) = default;
 };
 
+// Host records normally mirror the device plane inventory.  The hierarchical OSCAR record is
+// intentionally different: one pinned record contains the Q4 verifier copy followed by the
+// decoded FP16 authority.  Keeping this in the layout (rather than overloading DType) prevents
+// the page allocator and transfer planner from treating packed U8 codes as FP16 tensors.
+enum class HostKVStorageFormat : std::uint8_t {
+    Native,
+    BFloat16AsFp16,
+    OscarQ4AndFp16,
+};
+
 struct HostKVPageLayout {
     KVPageGeometry geometry;
     // Empty means the host representation uses the source/device dtype for every plane. A
@@ -29,6 +39,12 @@ struct HostKVPageLayout {
     std::vector<DType> storage_dtypes;
     std::vector<HostKVPlaneLayout> planes;
     std::size_t page_stride = 0;
+    HostKVStorageFormat storage_format = HostKVStorageFormat::Native;
+    // For OscarQ4AndFp16 these describe the two logical host tiers inside one page record.
+    std::size_t l1_offset             = 0;
+    std::size_t l1_page_payload_bytes = 0;
+    std::size_t l2_offset             = 0;
+    std::size_t l2_page_payload_bytes = 0;
 
     friend bool operator==(const HostKVPageLayout&, const HostKVPageLayout&) = default;
 };
@@ -36,6 +52,8 @@ struct HostKVPageLayout {
 [[nodiscard]] HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry);
 [[nodiscard]] HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry,
                                                          DType storage_dtype);
+[[nodiscard]] HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry,
+                                                         HostKVStorageFormat storage_format);
 
 [[nodiscard]] TransferWork plan_host_kv_transfer_work(const HostKVPageLayout& layout,
                                                       std::uint32_t pages,

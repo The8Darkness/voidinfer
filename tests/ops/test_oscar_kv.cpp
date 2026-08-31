@@ -1,8 +1,10 @@
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sliding_window_attention.h"
 
+#include "core/host_kv_arena.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
+#include "ops/kv_cache/d256_profile.h"
 
 #include <cuda_runtime.h>
 
@@ -20,6 +22,31 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 namespace {
+
+int test_hierarchical_host_layout() {
+    const KVPageGeometry geometry{
+        .page_tokens        = kPagedKVPageSize,
+        .device_plane_order = PagedKVPlaneOrder::PageMajor,
+        .planes             = {
+            {DType::U8, ops::kD256OscarCodeExtent, 2, 256},
+            {DType::U8, ops::kD256OscarCodeExtent, 2, 256},
+            {DType::BF16, ops::kD256OscarScaleExtent, 2, 256},
+            {DType::BF16, ops::kD256OscarScaleExtent, 2, 256},
+        },
+    };
+    const HostKVPageLayout layout =
+        plan_host_kv_page_layout(geometry, HostKVStorageFormat::OscarQ4AndFp16);
+    if (layout.storage_format != HostKVStorageFormat::OscarQ4AndFp16 ||
+        layout.planes.size() != 6 || layout.storage_dtypes.size() != 6 ||
+        layout.l1_offset != 0 || layout.l1_page_payload_bytes == 0 ||
+        layout.l2_offset < layout.l1_page_payload_bytes || layout.l2_page_payload_bytes == 0 ||
+        layout.page_stride < layout.l2_offset + layout.l2_page_payload_bytes ||
+        layout.storage_dtypes[4] != DType::FP16 || layout.storage_dtypes[5] != DType::FP16) {
+        std::cerr << "hierarchical OSCAR host layout invalid\n";
+        return 1;
+    }
+    return 0;
+}
 
 constexpr int kD       = 128;
 constexpr int kQHeads  = 32;
@@ -130,6 +157,27 @@ std::vector<std::uint8_t> pack_oscar(const Head& values, int bits, bool is_value
     return packed;
 }
 
+std::vector<std::uint8_t> pack_oscar_dflash_q2(const Head& values, bool is_value,
+                                                QuantParams& params) {
+    params = oscar_quant_params(values, 2, is_value);
+    std::array<std::uint8_t, kD> codes{};
+    for (int d = 0; d < kD; ++d) {
+        codes[static_cast<std::size_t>(d)] = oscar_code(values[d], params, 2);
+    }
+    // DFlash L0 stores one Q2 byte per warp lane. Lane l owns the four
+    // transformed dimensions l + {0,32,64,96}; this is the hot-read layout
+    // used by sliding_window_attention_oscar_kernel<2>.
+    std::vector<std::uint8_t> packed(static_cast<std::size_t>(kD / 4), 0);
+    for (int lane = 0; lane < 32; ++lane) {
+        packed[static_cast<std::size_t>(lane)] = static_cast<std::uint8_t>(
+            codes[static_cast<std::size_t>(lane)] |
+            (codes[static_cast<std::size_t>(lane + 32)] << 2) |
+            (codes[static_cast<std::size_t>(lane + 64)] << 4) |
+            (codes[static_cast<std::size_t>(lane + 96)] << 6));
+    }
+    return packed;
+}
+
 std::uint8_t unpack_oscar(const std::vector<std::uint8_t>& packed, int dimension, int bits) {
     const int bit   = dimension * bits;
     const int byte  = bit >> 3;
@@ -141,11 +189,26 @@ std::uint8_t unpack_oscar(const std::vector<std::uint8_t>& packed, int dimension
     return static_cast<std::uint8_t>((word >> shift) & ((1U << bits) - 1U));
 }
 
+std::uint8_t unpack_oscar_dflash_q2(const std::vector<std::uint8_t>& packed, int dimension) {
+    return static_cast<std::uint8_t>(
+        (packed[static_cast<std::size_t>(dimension & 31)] >> (((dimension >> 5) & 3) << 1)) & 3U);
+}
+
 Head decode_oscar(const std::vector<std::uint8_t>& packed, float scale, float zero, int bits) {
     Head rotated{};
     for (int d = 0; d < kD; ++d) {
         rotated[static_cast<std::size_t>(d)] =
             static_cast<float>(unpack_oscar(packed, d, bits)) * scale + zero;
+    }
+    oscar_rotation(rotated);
+    return rotated;
+}
+
+Head decode_oscar_dflash_q2(const std::vector<std::uint8_t>& packed, float scale, float zero) {
+    Head rotated{};
+    for (int d = 0; d < kD; ++d) {
+        rotated[static_cast<std::size_t>(d)] =
+            static_cast<float>(unpack_oscar_dflash_q2(packed, d)) * scale + zero;
     }
     oscar_rotation(rotated);
     return rotated;
@@ -332,8 +395,10 @@ int run_case(int bits, bool protect) {
             oscar_rotation(raw_v);
             QuantParams k_params{};
             QuantParams v_params{};
-            const auto expected_k = pack_oscar(raw_k, bits, false, k_params);
-            const auto expected_v = pack_oscar(raw_v, bits, true, v_params);
+            const auto expected_k = bits == 2 ? pack_oscar_dflash_q2(raw_k, false, k_params)
+                                              : pack_oscar(raw_k, bits, false, k_params);
+            const auto expected_v = bits == 2 ? pack_oscar_dflash_q2(raw_v, true, v_params)
+                                              : pack_oscar(raw_v, bits, true, v_params);
             const std::size_t code_base = static_cast<std::size_t>(code_extent) *
                                           (slot + static_cast<std::size_t>(kWindow) * head);
             std::copy(expected_k.begin(), expected_k.end(), expected_k_codes.begin() + code_base);
@@ -398,10 +463,19 @@ int run_case(int bits, bool protect) {
                                                    host_k_codes.begin() + code_base + code_extent);
                 std::vector<std::uint8_t> packed_v(host_v_codes.begin() + code_base,
                                                    host_v_codes.begin() + code_base + code_extent);
-                decoded_k = decode_oscar(packed_k, bf16_to_f32(host_k_meta[scale_base]),
-                                         bf16_to_f32(host_k_meta[scale_base + 1]), bits);
-                decoded_v = decode_oscar(packed_v, bf16_to_f32(host_v_meta[scale_base]),
-                                         bf16_to_f32(host_v_meta[scale_base + 1]), bits);
+                if (bits == 2) {
+                    decoded_k = decode_oscar_dflash_q2(
+                        packed_k, bf16_to_f32(host_k_meta[scale_base]),
+                        bf16_to_f32(host_k_meta[scale_base + 1]));
+                    decoded_v = decode_oscar_dflash_q2(
+                        packed_v, bf16_to_f32(host_v_meta[scale_base]),
+                        bf16_to_f32(host_v_meta[scale_base + 1]));
+                } else {
+                    decoded_k = decode_oscar(packed_k, bf16_to_f32(host_k_meta[scale_base]),
+                                             bf16_to_f32(host_k_meta[scale_base + 1]), bits);
+                    decoded_v = decode_oscar(packed_v, bf16_to_f32(host_v_meta[scale_base]),
+                                             bf16_to_f32(host_v_meta[scale_base + 1]), bits);
+                }
             }
             for (int d = 0; d < kD; ++d) {
                 reconstructed_k[context_index(d, head, slot)] = decoded_k[static_cast<std::size_t>(d)];
@@ -467,6 +541,9 @@ int run_case(int bits, bool protect) {
 } // namespace
 
 int main() {
+    if (const int layout_failures = test_hierarchical_host_layout(); layout_failures != 0) {
+        return layout_failures;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: CUDA device unavailable\n";
         return 77;

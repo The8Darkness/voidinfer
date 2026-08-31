@@ -742,7 +742,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                      const LogicalKVPageStore& pages, std::uint32_t page_count,
                                      std::uint32_t contiguous_runs = 1) {
         if (page_count == 0) { return; }
-        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        const HostKVPageLayout layout =
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(pages)
+                : plan_host_kv_page_layout(pages.physical_pool().geometry());
         const TransferWork work =
             direction == runtime::ContextTransferDirection::DeviceToDevice
                 ? plan_device_kv_copy_work(layout, page_count)
@@ -961,7 +964,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 preparation = missing_source_pages + 1U;
                 if (!pages.host_resident(tail)) {
                     const std::size_t stride =
-                        plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+                        host_kv_extents != nullptr
+                            ? host_kv_extents->page_layout(pages).page_stride
+                            : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
                     if (stride > std::numeric_limits<std::size_t>::max() -
                                      retained_tail_added.host.kv_bytes) {
                         throw std::overflow_error("retained KV tail Host backup size overflow");
@@ -1071,7 +1076,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 throw std::logic_error("private COW tail has no restorable replica");
             }
             out.first  = 1;
-            out.second = plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            out.second = host_kv_extents != nullptr
+                             ? host_kv_extents->page_layout(pages).page_stride
+                             : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
             return out;
         };
     if (source != nullptr) {

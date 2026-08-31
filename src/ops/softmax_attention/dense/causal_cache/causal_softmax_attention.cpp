@@ -50,7 +50,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
     D256KVCacheProfile profile{};
     try {
-        profile = d256_kv_cache_profile(cache.dtype);
+        profile = d256_kv_cache_profile(cache.dtype, cache.quant_group);
     } catch (const std::invalid_argument&) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -108,7 +108,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
                                    const char* op) {
     D256KVCacheProfile profile{};
     try {
-        profile = d256_kv_cache_profile(cache.dtype);
+        profile = d256_kv_cache_profile(cache.dtype, cache.quant_group);
     } catch (const std::invalid_argument&) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -429,8 +429,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_contiguous_nonnull(v, op, "v");
 
     if (cache.dtype == DType::U8) {
-        detail::causal_attention_nvfp4_launch(
-            q, k, v, positions, valid_columns, kv_table_rows, scale, cache, out, stream);
+        if (cache.quant_group == kD256OscarQuantGroup) {
+            detail::causal_attention_oscar_launch(
+                q, k, v, positions, valid_columns, kv_table_rows, scale, cache, out, stream);
+        } else {
+            detail::causal_attention_nvfp4_launch(
+                q, k, v, positions, valid_columns, kv_table_rows, scale, cache, out, stream);
+        }
         return;
     }
 
@@ -465,7 +470,11 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
 
     if (cache.dtype == DType::U8) {
-        detail::causal_attention_nvfp4_cached_launch(q, positions, scale, cache, out, stream);
+        if (cache.quant_group == kD256OscarQuantGroup) {
+            detail::causal_attention_oscar_cached_launch(q, positions, scale, cache, out, stream);
+        } else {
+            detail::causal_attention_nvfp4_cached_launch(q, positions, scale, cache, out, stream);
+        }
         return;
     }
 

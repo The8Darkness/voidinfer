@@ -5,12 +5,20 @@
 #include "ops/kv_cache/append/kernel.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
 
 constexpr int kBlock = 256;
+
+bool use_oscar_q2_transposed_storage() noexcept {
+    const char* value = std::getenv("NINFER_OSCAR_Q2_TRANSPOSED");
+    // The transposed row is the serving layout: one lane owns one byte in each 128-wide half.
+    // Keep the contiguous writer available for controlled compatibility/A-B runs.
+    return value != nullptr && value[0] == '1';
+}
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, CacheView cache,
@@ -19,6 +27,35 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
     if (cache.dtype == DType::U8) {
+        if (cache.quant_group == kPagedKVCacheOscarQuantGroup) {
+            constexpr int FillWarps       = kBlock / 32;
+            const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
+            const int fill_grid =
+                static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+            if (use_oscar_q2_transposed_storage()) {
+                kv_cache_append_full_oscar_kernel<Geometry, 2, Metadata, true>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::uint8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_v.data),
+                        static_cast<__nv_bfloat16*>(cache.k_scale_pages.data),
+                        static_cast<__nv_bfloat16*>(cache.v_scale_pages.data), tokens);
+            } else {
+                kv_cache_append_full_oscar_kernel<Geometry, 2, Metadata, false>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::uint8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_v.data),
+                        static_cast<__nv_bfloat16*>(cache.k_scale_pages.data),
+                        static_cast<__nv_bfloat16*>(cache.v_scale_pages.data), tokens);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         constexpr int FillWarps       = kBlock / 32;
         const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
         const int fill_grid =
@@ -353,6 +390,66 @@ void kv_cache_append_nvfp4_batch_launch(const Tensor& k, const Tensor& v, const 
             launch.template operator()<KVCacheAppendD256Kv2::KVHeads, true>();
         } else {
             launch.template operator()<KVCacheAppendD256Kv2::KVHeads, false>();
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void kv_cache_append_oscar_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        std::int32_t column_begin, std::int32_t width,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (cache.dtype != DType::U8 || cache.quant_group != kPagedKVCacheOscarQuantGroup ||
+        width <= 0 || column_begin < 0 || column_begin + width > k.ne[2] ||
+        k.ne[3] != cache.block_tables.ne[1]) {
+        throw std::invalid_argument("OSCAR batch append has an invalid profile or offset");
+    }
+    const auto launch = [&]<int KVHeads, bool Masked, bool TransposedQ2>() {
+        using Geometry = KVCacheAppendFullGeometry<KVHeads>;
+        kv_cache_append_oscar_batch_kernel<Geometry, 2, Masked, TransposedQ2>
+            <<<dim3(KVHeads, static_cast<unsigned>(width), static_cast<unsigned>(k.ne[3])),
+                   32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+                static_cast<const std::int32_t*>(table_rows.data),
+                static_cast<std::uint8_t*>(cache.k_pages.data),
+                static_cast<std::uint8_t*>(cache.v_pages.data),
+                static_cast<__nv_bfloat16*>(cache.k_scale_pages.data),
+                static_cast<__nv_bfloat16*>(cache.v_scale_pages.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
+                cache.block_tables.ne[0], k.ne[2], column_begin, width);
+    };
+    const bool masked     = valid_columns.data != nullptr;
+    const bool transposed = use_oscar_q2_transposed_storage();
+    if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
+        if (masked) {
+            if (transposed) {
+                launch.template operator()<KVCacheAppendD256Kv4::KVHeads, true, true>();
+            } else {
+                launch.template operator()<KVCacheAppendD256Kv4::KVHeads, true, false>();
+            }
+        } else {
+            if (transposed) {
+                launch.template operator()<KVCacheAppendD256Kv4::KVHeads, false, true>();
+            } else {
+                launch.template operator()<KVCacheAppendD256Kv4::KVHeads, false, false>();
+            }
+        }
+    } else {
+        if (masked) {
+            if (transposed) {
+                launch.template operator()<KVCacheAppendD256Kv2::KVHeads, true, true>();
+            } else {
+                launch.template operator()<KVCacheAppendD256Kv2::KVHeads, true, false>();
+            }
+        } else {
+            if (transposed) {
+                launch.template operator()<KVCacheAppendD256Kv2::KVHeads, false, true>();
+            } else {
+                launch.template operator()<KVCacheAppendD256Kv2::KVHeads, false, false>();
+            }
         }
     }
     CUDA_CHECK(cudaGetLastError());

@@ -1,6 +1,7 @@
 #include "core/host_kv_arena.h"
 
 #include "core/dtype.h"
+#include "ops/kv_cache/d256_profile.h"
 
 #include <algorithm>
 #include <exception>
@@ -47,9 +48,102 @@ void increment_generation(std::uint32_t& generation) noexcept {
 namespace {
 
 HostKVPageLayout plan_host_kv_page_layout_impl(const KVPageGeometry& geometry,
-                                               std::span<const DType> storage_dtypes) {
+                                               std::span<const DType> storage_dtypes,
+                                               HostKVStorageFormat storage_format =
+                                                   HostKVStorageFormat::Native) {
     if (geometry.page_tokens == 0 || geometry.planes.empty()) {
         throw std::invalid_argument("Host KV page geometry is empty");
+    }
+    if (storage_format == HostKVStorageFormat::OscarQ4AndFp16) {
+        if (geometry.page_tokens != kPagedKVPageSize || geometry.planes.size() % 4U != 0U) {
+            throw std::invalid_argument("Hierarchical OSCAR host layout has invalid plane groups");
+        }
+
+        HostKVPageLayout out;
+        out.geometry       = geometry;
+        out.storage_format = storage_format;
+        out.l1_offset      = 0;
+        out.planes.reserve((geometry.planes.size() / 4U) * 6U);
+        out.storage_dtypes.reserve((geometry.planes.size() / 4U) * 6U);
+
+        const auto append_plane = [&](DType dtype, std::int32_t leading_extent,
+                                      std::int32_t head_extent, std::size_t& cursor,
+                                      const char* label) {
+            if (leading_extent <= 0 || head_extent <= 0) {
+                throw std::invalid_argument("Hierarchical OSCAR host plane geometry is invalid");
+            }
+            cursor = align_up(cursor, kHostKVAlignment, label);
+            const std::size_t head_bytes = checked_mul(
+                checked_mul(static_cast<std::size_t>(leading_extent), geometry.page_tokens,
+                            "Hierarchical OSCAR host head payload overflow"),
+                dtype_size(dtype), "Hierarchical OSCAR host head payload overflow");
+            const std::size_t page_bytes = checked_mul(
+                head_bytes, static_cast<std::size_t>(head_extent),
+                "Hierarchical OSCAR host plane payload overflow");
+            out.planes.push_back(HostKVPlaneLayout{
+                .offset             = cursor,
+                .page_payload_bytes = page_bytes,
+                .head_payload_bytes = head_bytes,
+            });
+            out.storage_dtypes.push_back(dtype);
+            cursor = checked_add(cursor, page_bytes,
+                                 "Hierarchical OSCAR host page payload overflow");
+        };
+
+        std::size_t cursor = 0;
+        for (std::size_t layer = 0; layer < geometry.planes.size() / 4U; ++layer) {
+            const KVPlaneGeometry& source_code_k = geometry.planes[layer * 4U];
+            const KVPlaneGeometry& source_code_v = geometry.planes[layer * 4U + 1U];
+            const KVPlaneGeometry& source_scale_k = geometry.planes[layer * 4U + 2U];
+            const KVPlaneGeometry& source_scale_v = geometry.planes[layer * 4U + 3U];
+            if (source_code_k.dtype != DType::U8 || source_code_v.dtype != DType::U8 ||
+                source_scale_k.dtype != DType::BF16 || source_scale_v.dtype != DType::BF16 ||
+                source_code_k.leading_extent != ops::kD256OscarCodeExtent ||
+                source_code_v.leading_extent != ops::kD256OscarCodeExtent ||
+                source_scale_k.leading_extent != ops::kD256OscarScaleExtent ||
+                source_scale_v.leading_extent != ops::kD256OscarScaleExtent ||
+                source_code_k.head_extent != source_code_v.head_extent ||
+                source_code_k.head_extent != source_scale_k.head_extent ||
+                source_code_k.head_extent != source_scale_v.head_extent) {
+                throw std::invalid_argument(
+                    "Hierarchical OSCAR host layout requires Q2 U8/BF16 source planes");
+            }
+            const std::int32_t heads = source_code_k.head_extent;
+            // L1: packed OSCAR-Q4 K/V plus independent BF16 affine metadata.
+            append_plane(DType::U8, ops::kD256OscarCodeExtent * 2, heads, cursor,
+                         "Hierarchical OSCAR Q4 code plane");
+            append_plane(DType::U8, ops::kD256OscarCodeExtent * 2, heads, cursor,
+                         "Hierarchical OSCAR Q4 code plane");
+            append_plane(DType::BF16, ops::kD256OscarScaleExtent, heads, cursor,
+                         "Hierarchical OSCAR Q4 scale plane");
+            append_plane(DType::BF16, ops::kD256OscarScaleExtent, heads, cursor,
+                         "Hierarchical OSCAR Q4 scale plane");
+        }
+        out.l1_page_payload_bytes = cursor;
+        out.l2_offset             = align_up(cursor, kHostKVAlignment,
+                                             "Hierarchical OSCAR FP16 section");
+        cursor                    = out.l2_offset;
+        for (std::size_t layer = 0; layer < geometry.planes.size() / 4U; ++layer) {
+            const std::int32_t heads = geometry.planes[layer * 4U].head_extent;
+            // L2: original-coordinate FP16 K/V.  The source OSCAR rotation is inverted while
+            // the host record is built, so a restore can re-encode Q2 from this authority.
+            append_plane(DType::FP16, ops::kD256KVCacheHeadDim, heads, cursor,
+                         "Hierarchical OSCAR FP16 plane");
+            append_plane(DType::FP16, ops::kD256KVCacheHeadDim, heads, cursor,
+                         "Hierarchical OSCAR FP16 plane");
+        }
+        out.l2_page_payload_bytes = cursor - out.l2_offset;
+        out.page_stride            = align_up(cursor, kHostKVAlignment,
+                                              "Hierarchical OSCAR host page record");
+        if (!storage_dtypes.empty()) {
+            if (storage_dtypes.size() != out.storage_dtypes.size() ||
+                !std::equal(storage_dtypes.begin(), storage_dtypes.end(),
+                            out.storage_dtypes.begin(), out.storage_dtypes.end())) {
+                throw std::invalid_argument(
+                    "Hierarchical OSCAR host storage dtype inventory is inconsistent");
+            }
+        }
+        return out;
     }
     if (!storage_dtypes.empty() && storage_dtypes.size() != geometry.planes.size()) {
         throw std::invalid_argument("Host KV storage dtype inventory is inconsistent");
@@ -59,6 +153,12 @@ HostKVPageLayout plan_host_kv_page_layout_impl(const KVPageGeometry& geometry,
     out.geometry = geometry;
     if (!storage_dtypes.empty()) {
         out.storage_dtypes.assign(storage_dtypes.begin(), storage_dtypes.end());
+        bool converted = false;
+        for (std::size_t index = 0; index < geometry.planes.size(); ++index) {
+            converted = converted || storage_dtypes[index] != geometry.planes[index].dtype;
+        }
+        out.storage_format = converted ? HostKVStorageFormat::BFloat16AsFp16
+                                       : HostKVStorageFormat::Native;
     }
     out.planes.reserve(geometry.planes.size());
     std::size_t cursor = 0;
@@ -104,11 +204,46 @@ HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry, DType 
     return plan_host_kv_page_layout_impl(geometry, storage_dtypes);
 }
 
+HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry,
+                                          HostKVStorageFormat storage_format) {
+    if (storage_format == HostKVStorageFormat::Native) {
+        return plan_host_kv_page_layout(geometry);
+    }
+    return plan_host_kv_page_layout_impl(geometry, {}, storage_format);
+}
+
 TransferWork plan_host_kv_transfer_work(const HostKVPageLayout& layout, std::uint32_t pages,
                                         std::uint32_t contiguous_runs) {
     if (pages == 0) { return {}; }
-    if (contiguous_runs == 0 || contiguous_runs > pages || layout.planes.empty() ||
-        layout.planes.size() != layout.geometry.planes.size()) {
+    if (contiguous_runs == 0 || contiguous_runs > pages || layout.planes.empty()) {
+        throw std::invalid_argument("Host KV transfer geometry is invalid");
+    }
+
+    if (layout.storage_format == HostKVStorageFormat::OscarQ4AndFp16) {
+        std::size_t source_bytes_per_page = 0;
+        for (const KVPlaneGeometry& plane : layout.geometry.planes) {
+            const std::size_t head_bytes = checked_mul(
+                checked_mul(static_cast<std::size_t>(plane.leading_extent),
+                            layout.geometry.page_tokens, "Host KV source payload overflow"),
+                dtype_size(plane.dtype), "Host KV source payload overflow");
+            source_bytes_per_page = checked_add(
+                source_bytes_per_page,
+                checked_mul(head_bytes, static_cast<std::size_t>(plane.head_extent),
+                            "Host KV source payload overflow"),
+                "Host KV source payload overflow");
+        }
+        const std::size_t payload = checked_mul(
+            source_bytes_per_page, pages, "Host KV hierarchical transfer payload overflow");
+        const std::size_t operations = checked_mul(
+            layout.geometry.planes.size(), contiguous_runs,
+            "Host KV hierarchical transfer operation count overflow");
+        if (operations > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("Host KV transfer operation count exceeds uint32");
+        }
+        return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
+                            .copy_operations = static_cast<std::uint32_t>(operations)};
+    }
+    if (layout.planes.size() != layout.geometry.planes.size()) {
         throw std::invalid_argument("Host KV transfer geometry is invalid");
     }
 
@@ -139,7 +274,35 @@ TransferWork plan_host_kv_transfer_work(const HostKVPageLayout& layout, std::uin
 
 TransferWork plan_device_kv_copy_work(const HostKVPageLayout& layout, std::uint32_t pages) {
     if (pages == 0) { return {}; }
-    if (layout.planes.empty() || layout.planes.size() != layout.geometry.planes.size()) {
+    if (layout.planes.empty()) {
+        throw std::invalid_argument("Device KV copy geometry is invalid");
+    }
+
+    if (layout.storage_format == HostKVStorageFormat::OscarQ4AndFp16) {
+        std::size_t bytes_per_page = 0;
+        for (const KVPlaneGeometry& plane : layout.geometry.planes) {
+            const std::size_t head_bytes = checked_mul(
+                checked_mul(static_cast<std::size_t>(plane.leading_extent),
+                            layout.geometry.page_tokens, "Device KV source payload overflow"),
+                dtype_size(plane.dtype), "Device KV source payload overflow");
+            bytes_per_page = checked_add(
+                bytes_per_page,
+                checked_mul(head_bytes, static_cast<std::size_t>(plane.head_extent),
+                            "Device KV source payload overflow"),
+                "Device KV source payload overflow");
+        }
+        const std::size_t payload = checked_mul(
+            bytes_per_page, pages, "Device KV hierarchical restore payload overflow");
+        const std::size_t operations = checked_mul(
+            layout.geometry.planes.size(), pages,
+            "Device KV hierarchical restore operation count overflow");
+        if (operations > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("Device KV copy operation count exceeds uint32");
+        }
+        return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
+                            .copy_operations = static_cast<std::uint32_t>(operations)};
+    }
+    if (layout.planes.size() != layout.geometry.planes.size()) {
         throw std::invalid_argument("Device KV copy geometry is invalid");
     }
 
@@ -242,7 +405,8 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
         const HostKVPageLayout planned =
             plan_host_kv_page_layout_impl(layouts_[index].geometry,
-                                          layouts_[index].storage_dtypes);
+                                          layouts_[index].storage_dtypes,
+                                          layouts_[index].storage_format);
         if (planned != layouts_[index]) {
             throw std::invalid_argument("Host KV arena received an inconsistent page layout");
         }
@@ -281,8 +445,14 @@ HostKVArena::find_layout(const HostKVPageLayout& layout) const noexcept {
         // Storage dtype is an implementation detail of the arena's canonical layout. Callers
         // written before the FP16 host-tier extension still pass the source-dtype plan; accept
         // that equivalent geometry and return the arena-owned layout for the actual copy format.
-        return candidate.geometry == layout.geometry && candidate.planes == layout.planes &&
-               candidate.page_stride == layout.page_stride;
+        return candidate.geometry == layout.geometry &&
+               candidate.storage_format == layout.storage_format &&
+               candidate.storage_dtypes == layout.storage_dtypes &&
+               candidate.planes == layout.planes && candidate.page_stride == layout.page_stride &&
+               candidate.l1_offset == layout.l1_offset &&
+               candidate.l1_page_payload_bytes == layout.l1_page_payload_bytes &&
+               candidate.l2_offset == layout.l2_offset &&
+               candidate.l2_page_payload_bytes == layout.l2_page_payload_bytes;
     });
     if (it == layouts_.end()) { return std::nullopt; }
     return static_cast<std::uint32_t>(it - layouts_.begin());

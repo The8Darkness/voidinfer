@@ -9,37 +9,36 @@ The hierarchy is experimental and remains separate from the stable fallback.
 
 | Tier | Representation | Status |
 | --- | --- | --- |
-| L0 VRAM | OSCAR-Q2 packed U8 with affine BF16 scale/zero metadata; protected recent/sink/pivot rows stay in BF16 sidecars. | Active DFlash2 speculative KV and direct OSCAR attention path. |
-| L1 pinned RAM | Independently written OSCAR-Q4 packed U8 with independently fitted metadata and protected sidecars. The source is also kept as a device Q4 shadow. | Live Q4 DFlash2 verifier/proposal; pinned mirror is used for promotion/restore. |
-| L2 RAM | Full authoritative target KV stored as FP16 host records plus protected GDN state. The active target device cache remains BF16 for kernel compatibility. | Authoritative restore/checkpoint tier. |
+| L0 VRAM | OSCAR-Q2 packed U8 with affine BF16 scale/zero metadata; the recent 128-token window and sink/pivot anchors stay in BF16 sidecars. | Active DFlash2 speculative KV and direct OSCAR attention path. |
+| L1 pinned RAM | Q2-derived OSCAR-Q4 packed U8 with affine metadata and protected sidecars. No persistent device Q4 shadow is allocated. | Host intermediate/persistence tier, not a per-token live logit verifier. |
+| L2 RAM | Full authoritative target KV stored as FP16 host records plus protected GDN state. | Authoritative restore/checkpoint tier. |
 | L3 NVMe | No active writer; current measured bytes are zero. | Reserved for cold persistence. |
 
-The Q4 mirror is dual-written from the BF16 append rows in one fused rotated kernel. It is not
-reconstructed from lossy Q2 codes. Q3 is not a serving or benchmark target.
+The current host Q4 mirror is derived during host promotion from the resident Q2 state. Q3 is not a
+serving or benchmark target. Exact target verification remains authoritative.
 
-The live serving decision uses the device Q4 shadow, not CPU attention over pinned RAM. The default
-Q4-first route avoids a discarded Q2 DFlash2 pass; `--vericache-q2-filter` retains the explicit
-two-pass Q2→Q4 comparison and reports its common-prefix acceptance. In both routes the exact target
-model remains authoritative and nested KV/GDN rollback is active. This distinction matters: the
-current measurements validate a live device-side Q4 verifier plus host FP16 promotion, not a claim
-that PCIe-backed host attention is on the per-token hot path.
+The default serving decision uses Q2 L0 plus exact target settlement; it does not run CPU attention
+over pinned RAM. Nested KV/GDN rollback is active. `NINFER_DFLASH_FULL_BF16=1` selects a real BF16
+DFlash full-attention cache for an A/B experiment, but it is not the default because it was neutral
+to slightly slower in the matched run.
 
 ## Matched context-512 serving controls
 
-Both rows used the same local Qwen3.8-27B DFlash2 artifact, DFlash2 `k=7`, optimized proposal head,
-1,024-token prefill chunks, two warmups, five measured repetitions, CUDA Graphs, batch 1, protected
-recent=64/sinks=4/pivots=4, and host snapshots enabled. The Q4-first row is the serving default;
-the two-pass row is the explicit Q2→Q4 research control.
+All rows used the same local Qwen3.8-27B DFlash2 artifact, DFlash2 `k=7`, optimized proposal head,
+1,024-token prefill chunks, two warmups, five measured repetitions, CUDA Graphs, batch 1, sinks=4,
+pivots=4, and host snapshots enabled. The current default protects 128 recent tokens.
 
-| Mode | Prefill tok/s | Round wall ms | Published tok/s | Accepted draft | Q2→Q4 accepted | Q4→target accepted | L0 bytes | Q4 shadow bytes | L2 FP16 bytes | Snapshot |
+| Mode | Prefill tok/s | Round wall ms | Published tok/s | Accepted draft | Exact target accepted | Target disagreements | L0 bytes | Q4 shadow bytes | L2 FP16 bytes | Snapshot |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| Q4-first default | 8,128.65 | 18.4731 | 184.052 | 12/35 (34.29%) | n/a | 13/49 | 15,073,280 | 25,559,040 | 187,508,736 | passed |
-| Q2→Q4 two-pass (`--vericache-q2-filter`) | 8,146.02 | 21.6515 | 157.033 | 12/35 (34.29%) | 22/49 | 13/49 | 15,073,280 | 25,559,040 | 187,508,736 | passed |
+| Current Q2 default | 7,061.80 | 22.4202 | 205.172 | 18/35 (51.43%) | 26/49 | 5 | 23,633,920 | 0 | 187,508,736 | passed |
+| Q2 + BF16 DFlash full cache (`NINFER_DFLASH_FULL_BF16=1`) | 7,052.78 | 22.4690 | 204.727 | 18/35 (51.43%) | 26/49 | 5 | 25,886,720 | 0 | 187,508,736 | passed |
+| Q2 default with 64 protected recent (control) | 7,146.33 | 22.3805 | 160.854 | 13/35 (37.14%) | 21/49 | 6 | 21,012,480 | 0 | 187,508,736 | passed |
+| Standalone Q4 L0 diagnostic | 6,983.92 | 22.7720 | 219.568 | 20/35 (57.14%) | 31/49 | 5 | 31,498,240 | 0 | 187,508,736 | passed |
 
-The rows are short direct probes, not broad task-quality claims. Q4-first deliberately does not
-execute a Q2 proposal pass, so Q2→Q4 acceptance is not applicable; Q4→target is the authoritative
-check. The two-pass row shows why it is retained for research but not selected for serving: it adds
-the Q2 pass without improving final acceptance in this trace.
+The rows are short direct probes, not broad task-quality claims. The Q4 L0 row is diagnostic only and
+uses more device KV; it shows that the shadow-free Q2 gap is chiefly local acceptance. The BF16 full
+cache row shows no acceptance change and a small throughput loss, so compressed DFlash full attention
+remains the default.
 
 ## OSCAR codec comparison
 
@@ -95,7 +94,8 @@ references, not multiplicative speedup claims.
 - OSCAR attention consumes packed Q2/Q4 bytes directly with rotated K/V and no full dequantized KV
   tensor; the current fallback rotation is normalized Hadamard because model-specific OSCAR matrices
   are not yet included in the artifact.
-- The fused OSCAR dual writer emits Q2 L0 and independent Q4 shadow rows from one BF16 load/rotation.
+- Direct OSCAR-Q2 append/attention avoids a full device dequantization; host promotion emits the Q4
+  mirror without allocating a persistent device Q4 shadow.
 - Protected sidecars, nested KV/GDN transactions, immutable COW manifests, ordered host transfers,
   and independent host-snapshot cadence are implemented.
 
@@ -111,6 +111,6 @@ build-windows-hierarchical\bench\ninfer_qwen3_6_27b_dflash_round_bench.exe `
   --vericache-l0-bits 2 --no-cuda-graph
 ```
 
-Use `--vericache-l0-bits 4` for the single-Q4 L0 control. Add `--vericache-q2-filter` to the
-hierarchical command to force the two-pass Q2→Q4 comparison. There is no Q3 control in the active
-hierarchy.
+Use `--vericache-l0-bits 4` for the single-Q4 L0 diagnostic. Set
+`NINFER_DFLASH_FULL_BF16=1` to compare a BF16 DFlash full-attention cache. There is no Q3 control in
+the active hierarchy.

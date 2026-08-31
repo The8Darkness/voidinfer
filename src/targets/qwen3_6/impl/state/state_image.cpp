@@ -12,6 +12,7 @@ namespace ninfer::targets::qwen3_6 {
 namespace {
 
 constexpr std::size_t kStateImageAlignment = 256;
+constexpr std::int32_t kDflashOscarHeadDim  = 128;
 
 std::size_t checked_mul(std::size_t left, std::size_t right, const char* label) {
     if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
@@ -297,22 +298,9 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
                                  dflash.quant_group, dflash.protected_capacity,
                                  dflash.protected_anchor_capacity, dflash.quant_bits,
                                  dflash.quantization);
-        // Keep an independently quantized Q4 source beside lower-bit OSCAR L0. This temporary
-        // device shadow lets asynchronous host snapshots export genuine Q4 rows from the original
-        // BF16 append inputs instead of requantizing information already discarded by Q2.
-        if (spec.dflash_host_local && dflash.dtype == DType::U8 &&
-            dflash.quantization == CyclicKVCacheQuantization::OscarAffine &&
-            dflash.quant_bits == 2 &&
-            spec.dflash_host_local->dtype == DType::U8 &&
-            spec.dflash_host_local->quantization == CyclicKVCacheQuantization::OscarAffine &&
-            spec.dflash_host_local->quant_bits == 4) {
-            const DFlashLocalStateSpec& q4 = *spec.dflash_host_local;
-            out.dflash_local_q4_shadow =
-                plan_cyclic_kv_cache(builder, q4.layers, q4.capacity, q4.kv_heads, q4.head_dim,
-                                     spec.linear.slot_count, q4.dtype, q4.quant_group,
-                                     q4.protected_capacity, q4.protected_anchor_capacity,
-                                     q4.quant_bits, q4.quantization);
-        }
+        // The pinned host layout may be OSCAR-Q4, but it is produced from the Q2 source through
+        // the bounded conversion scratch in copy_to_host().  Do not retain a second Q4 KV copy on
+        // the GPU: the hierarchy's residency contract allows only OSCAR-Q2 KV in VRAM.
     }
 
     out.host = plan_host_state_image(spec);
@@ -495,12 +483,10 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
     }
     const auto& device_dflash = layout.dflash_local;
     const auto& host_dflash = host_dflash_spec(host_layout_.spec);
-    const bool needs_q4_shadow =
-        device_dflash && host_dflash && device_dflash->dtype == DType::U8 &&
-        device_dflash->quantization == CyclicKVCacheQuantization::OscarAffine &&
-        device_dflash->quant_bits == 2 && host_dflash->dtype == DType::U8 &&
-        host_dflash->quantization == CyclicKVCacheQuantization::OscarAffine &&
-        host_dflash->quant_bits == 4;
+    // Q4 is a pinned-host representation.  The host copy path requantizes from the resident Q2
+    // rows through bounded temporary buffers, so a second persistent Q4 cache is never needed on
+    // the device.
+    constexpr bool needs_q4_shadow = false;
     if (layout.dflash_local_q4_shadow.has_value() != needs_q4_shadow) {
         throw std::invalid_argument("StateImage OSCAR-Q4 shadow layout is inconsistent");
     }
@@ -733,7 +719,10 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                         static_cast<const __nv_bfloat16*>(v_scale.data), converted_k,
                         converted_k_scale, converted_v, converted_v_scale, view.quant_bits,
                         destination_bits, static_cast<int>(view.padded_capacity), view.num_kv_heads,
-                        stream);
+                        stream,
+                        !dflash_local_q4_shadow_ && view.quant_bits == 2 &&
+                            view.head_dim == kDflashOscarHeadDim,
+                        false);
                     CUDA_CHECK(cudaMemcpyAsync(
                         byte_offset(destination.data, host_layout_.dflash_local_k->offset +
                                                           layer * host_layout_.dflash_local_layer_bytes),
@@ -887,7 +876,8 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                         source_v_scale_device, static_cast<std::uint8_t*>(k.data),
                         static_cast<__nv_bfloat16*>(k_scale.data), static_cast<std::uint8_t*>(v.data),
                         static_cast<__nv_bfloat16*>(v_scale.data), source_bits, view.quant_bits,
-                        static_cast<int>(view.padded_capacity), view.num_kv_heads, stream);
+                        static_cast<int>(view.padded_capacity), view.num_kv_heads, stream, false,
+                        view.quant_bits == 2 && view.head_dim == kDflashOscarHeadDim);
                     CUDA_CHECK(cudaFreeAsync(source_k_device, stream));
                     CUDA_CHECK(cudaFreeAsync(source_v_device, stream));
                     CUDA_CHECK(cudaFreeAsync(source_k_scale_device, stream));

@@ -8,6 +8,9 @@
 namespace ninfer::ops {
 
 inline constexpr std::int32_t kD256KVCacheHeadDim = 256;
+inline constexpr std::int32_t kD256OscarQuantGroup = 128;
+inline constexpr std::int32_t kD256OscarCodeExtent = 64;
+inline constexpr std::int32_t kD256OscarScaleExtent = 2;
 
 struct D256KVCacheProfile {
     DType code_dtype;
@@ -33,6 +36,17 @@ inline D256KVCacheProfile d256_kv_cache_profile(DType dtype) {
     default:
         throw std::invalid_argument("unsupported D256 KV-cache dtype");
     }
+}
+
+// DType::U8 is shared by the legacy NVFP4 and OSCAR packed routes.  The quantization group is
+// part of the public paged-cache view, so keep the profiles explicit instead of inferring OSCAR
+// from the storage dtype alone.
+inline D256KVCacheProfile d256_kv_cache_profile(DType dtype, std::int32_t quant_group) {
+    if (dtype == DType::U8 && quant_group == kD256OscarQuantGroup) {
+        return {DType::U8, DType::BF16, kD256OscarQuantGroup, kD256OscarScaleExtent,
+                kD256OscarCodeExtent};
+    }
+    return d256_kv_cache_profile(dtype);
 }
 
 } // namespace ninfer::ops

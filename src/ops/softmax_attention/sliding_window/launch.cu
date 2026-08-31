@@ -21,6 +21,15 @@ int nvfp4_pair_mode() noexcept {
     return value[0] == '1' ? 1 : 0;
 }
 
+bool use_oscar_q2_grouped() noexcept {
+    const char* value = std::getenv("NINFER_OSCAR_Q2_GROUPED");
+    // Grouped Q2 is retained as an experiment. At short serving windows the
+    // four barriers per row cost more than the duplicated scalar work, so the
+    // natural one-warp route remains the default until a context-aware policy
+    // selects it for a measured win.
+    return value != nullptr && value[0] != '0';
+}
+
 template <int Tokens, class Launch>
 void dispatch_token_case(Launch&& launch) {
     constexpr int Warps = (Tokens + 3) / 4;
@@ -306,6 +315,38 @@ void sliding_window_attention_oscar_launch(
     Tensor& out, cudaStream_t stream) {
     if (max_context < 0 || window < 2 || (window & (window - 1)) != 0) {
         throw std::invalid_argument("sliding_window_attention OSCAR launch has invalid bounds");
+    }
+    if (context.quant_bits == 2 && use_oscar_q2_grouped()) {
+        const dim3 grouped_grid(static_cast<unsigned>(q.ne[2] * kCyclicKVCacheOscarKVHeads),
+                                static_cast<unsigned>(q.ne[3]), 1u);
+        const auto launch_grouped = [&]<bool HasProtected>() {
+            sliding_window_attention_oscar_q2_grouped_kernel<HasProtected>
+                <<<grouped_grid, 128, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(query_k.data),
+                    static_cast<const __nv_bfloat16*>(query_v.data),
+                    static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(valid_columns.data),
+                    static_cast<const std::int32_t*>(lanes.data),
+                    static_cast<const std::uint8_t*>(context.k.data),
+                    static_cast<const std::uint8_t*>(context.v.data),
+                    static_cast<const __nv_bfloat16*>(context.k_scale.data),
+                    static_cast<const __nv_bfloat16*>(context.v_scale.data),
+                    static_cast<const __nv_bfloat16*>(context.protected_k.data),
+                    static_cast<const __nv_bfloat16*>(context.protected_v.data),
+                    static_cast<int>(context.padded_capacity), max_context, window,
+                    static_cast<int>(context.protected_capacity),
+                    static_cast<int>(context.protected_anchor_capacity),
+                    static_cast<int>(context.protected_padded_capacity), q.ne[2], scale,
+                    static_cast<__nv_bfloat16*>(out.data));
+        };
+        if (context.protected_capacity != 0 || context.protected_anchor_capacity != 0) {
+            launch_grouped.template operator()<true>();
+        } else {
+            launch_grouped.template operator()<false>();
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     const dim3 grid(static_cast<unsigned>(q.ne[2] * 32), static_cast<unsigned>(q.ne[3]), 1);
     const auto launch = [&]<int Bits>() {

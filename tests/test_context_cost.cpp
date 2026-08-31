@@ -1,6 +1,7 @@
 #include "runtime/engine/context_cost.h"
 
 #include "core/host_kv_arena.h"
+#include "ops/kv_cache/d256_profile.h"
 
 #include <nlohmann/json.hpp>
 
@@ -216,6 +217,51 @@ void test_kv_physical_work() {
            "HeadMajor Device KV work should remain one copy per plane and page");
 }
 
+void test_hierarchical_oscar_host_layout() {
+    const ninfer::KVPageGeometry geometry{
+        .page_tokens        = ninfer::kPagedKVPageSize,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {
+            {ninfer::DType::U8, ninfer::ops::kD256OscarCodeExtent, 2, 256},
+            {ninfer::DType::U8, ninfer::ops::kD256OscarCodeExtent, 2, 256},
+            {ninfer::DType::BF16, ninfer::ops::kD256OscarScaleExtent, 2, 256},
+            {ninfer::DType::BF16, ninfer::ops::kD256OscarScaleExtent, 2, 256},
+        },
+    };
+    const ninfer::HostKVPageLayout layout = ninfer::plan_host_kv_page_layout(
+        geometry, ninfer::HostKVStorageFormat::OscarQ4AndFp16);
+    expect(layout.storage_format == ninfer::HostKVStorageFormat::OscarQ4AndFp16 &&
+               layout.planes.size() == 6 && layout.storage_dtypes.size() == 6 &&
+               layout.l1_offset == 0 && layout.l1_page_payload_bytes != 0 &&
+               layout.l2_offset >= layout.l1_page_payload_bytes &&
+               layout.l2_page_payload_bytes != 0 &&
+               layout.page_stride >= layout.l2_offset + layout.l2_page_payload_bytes,
+           "hierarchical OSCAR host layout did not reserve Q4 L1 and FP16 L2 sections");
+    expect(layout.storage_dtypes[0] == ninfer::DType::U8 &&
+               layout.storage_dtypes[1] == ninfer::DType::U8 &&
+               layout.storage_dtypes[2] == ninfer::DType::BF16 &&
+               layout.storage_dtypes[3] == ninfer::DType::BF16 &&
+               layout.storage_dtypes[4] == ninfer::DType::FP16 &&
+               layout.storage_dtypes[5] == ninfer::DType::FP16,
+           "hierarchical OSCAR host layout has the wrong L1/L2 dtype inventory");
+    expect_throw(
+        [&] {
+            (void)ninfer::plan_host_kv_page_layout(
+                ninfer::KVPageGeometry{
+                    .page_tokens        = ninfer::kPagedKVPageSize,
+                    .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                    .planes             = {
+                        {ninfer::DType::U8, 32, 2, 256},
+                        {ninfer::DType::U8, 32, 2, 256},
+                        {ninfer::DType::BF16, 2, 2, 256},
+                        {ninfer::DType::BF16, 2, 2, 256},
+                    },
+                },
+                ninfer::HostKVStorageFormat::OscarQ4AndFp16);
+        },
+        "hierarchical OSCAR host layout accepted a non-D256 source geometry");
+}
+
 void test_schema_validation() {
     Json entries = Json::array();
     entries.push_back(prefill_entry("model", "weights", prefill()));
@@ -357,6 +403,7 @@ void test_resolution_and_atomic_upserts() {
 int main() {
     test_exact_evaluation();
     test_kv_physical_work();
+    test_hierarchical_oscar_host_layout();
     test_schema_validation();
     test_resolution_and_atomic_upserts();
     if (failures == 0) { std::cout << "ok\n"; }

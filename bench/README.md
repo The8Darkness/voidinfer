@@ -25,18 +25,19 @@ have a private prefill/decode loop and does not call target implementation inter
 
 The Qwen3.8-27B experimental DFlash2 round executable
 `ninfer_qwen3_6_27b_dflash_round_bench` exposes the OSCAR-Q2/Q4 Hierarchical VeriCache path. The
-default run keeps Q2 in VRAM, dual-writes an independently calibrated Q4 shadow, serves with the
-live Q4 verifier/proposal, and promotes authoritative target KV to FP16 host records. It reports
-protected sidecars, nested KV/GDN transaction activity, exact-target acceptance, host-transfer
-activity, and occupied tier bytes.
+default run keeps OSCAR-Q2 in VRAM, protects the recent 128-token window plus anchors in BF16,
+promotes a Q2-derived OSCAR-Q4 mirror to pinned RAM, and keeps authoritative FP16 KV/GDN state in
+the host tier. No persistent device Q4 shadow is allocated and pinned RAM is not used for a live
+per-token logit verifier. It reports protected sidecars, nested KV/GDN transaction activity,
+exact-target acceptance, host-transfer activity, and occupied tier bytes.
 
 The DFlash2 round harness accepts `--vericache-l1-horizon 256..2048` for the verifier controller
 and `--vericache-host-snapshot-horizon 0|256..2048` for asynchronous host persistence. A value of
 `0` follows the adaptive verifier horizon; a nonzero value is independent. The benchmark-only
-`--vericache-q2-filter` flag forces the two-pass Q2→Q4 comparison path; normal serving leaves it
-off so a discarded Q2 proposal pass does not reduce accepted tokens per second. The live verifier
-is device-side Q4 because PCIe-backed CPU attention is not viable on the per-token hot path; pinned
-RAM is the L1 mirror and FP16 L2 restore source.
+The benchmark reports the DFlash full-attention cache as `oscar-q2-device` by default. Set
+`NINFER_DFLASH_FULL_BF16=1` for a real BF16 full-cache A/B; the measured result was neutral/slightly
+slower, so it is not the serving default. Pinned RAM is the L1 mirror/intermediate and FP16 is the
+L2 restore source.
 
 Packed NVFP4 attention uses pair decoding by default. `NINFER_NVFP4_PAIR=2` selects the
 scalar-order-preserving pair route used by DFlash2 local attention, `NINFER_NVFP4_PAIR=1` selects

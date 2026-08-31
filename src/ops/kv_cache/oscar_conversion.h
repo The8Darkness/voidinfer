@@ -19,6 +19,7 @@ void cyclic_oscar_requantize_launch(const std::uint8_t* source_k,
                                     std::uint8_t* destination_v,
                                     __nv_bfloat16* destination_v_metadata, int source_bits,
                                     int destination_bits, int padded_capacity, int kv_heads,
-                                    cudaStream_t stream);
+                                    cudaStream_t stream, bool source_q2_transposed = false,
+                                    bool destination_q2_transposed = false);
 
 } // namespace ninfer::ops

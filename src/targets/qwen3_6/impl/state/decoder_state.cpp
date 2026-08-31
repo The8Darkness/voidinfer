@@ -1,5 +1,7 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 
+#include "ops/kv_cache/d256_profile.h"
+
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -22,13 +24,14 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
     const bool scaled = dtype == DType::I8 || dtype == DType::FP8_E4M3FN || dtype == DType::U8;
+    const bool oscar = dtype == DType::U8 && quant_group == ops::kD256OscarQuantGroup;
     const bool valid_profile =
         (dtype == DType::BF16 && quant_group == 0) ||
         (dtype == DType::I8 && quant_group == kKvInt8QuantGroup && head_dim % quant_group == 0) ||
         (dtype == DType::FP8_E4M3FN && head_dim == kKvFp8QuantGroup &&
          quant_group == kKvFp8QuantGroup) ||
         (dtype == DType::U8 && head_dim == 256 &&
-         quant_group == kKvNvfp4QuantGroup);
+         (quant_group == kKvNvfp4QuantGroup || quant_group == ops::kD256OscarQuantGroup));
     if (!valid_profile) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
@@ -41,12 +44,15 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     KVPageGeometry geometry;
     geometry.planes.reserve(static_cast<std::size_t>(layers) * (scaled ? 4ULL : 2ULL));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        const std::int32_t code_extent = dtype == DType::U8 ? head_dim / 2 : head_dim;
-        const std::int32_t scale_extent = scaled ? head_dim / quant_group : 0;
+        const std::int32_t code_extent = oscar ? ops::kD256OscarCodeExtent
+                                               : (dtype == DType::U8 ? head_dim / 2 : head_dim);
+        const std::int32_t scale_extent = oscar ? ops::kD256OscarScaleExtent
+                                                : (scaled ? head_dim / quant_group : 0);
         geometry.planes.push_back({dtype, code_extent, kv_heads, 256});
         geometry.planes.push_back({dtype, code_extent, kv_heads, 256});
         if (scaled) {
-            const DType scale_dtype = dtype == DType::U8 ? DType::FP8_E4M3FN : DType::FP16;
+            const DType scale_dtype = oscar ? DType::BF16
+                                            : (dtype == DType::U8 ? DType::FP8_E4M3FN : DType::FP16);
             geometry.planes.push_back({scale_dtype, scale_extent, kv_heads, 256});
             geometry.planes.push_back({scale_dtype, scale_extent, kv_heads, 256});
         }

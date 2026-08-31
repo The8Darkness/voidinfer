@@ -2,8 +2,11 @@
 
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "ops/kv_cache/d256_profile.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -196,6 +199,369 @@ void convert_host_records_fp16_to_bf16(std::byte* records, std::uint32_t pages,
             const std::size_t count = plane.page_payload_bytes / sizeof(std::uint16_t);
             for (std::size_t element = 0; element < count; ++element) {
                 values[element] = fp16_to_bf16(values[element]);
+            }
+        }
+    }
+}
+
+bool is_hierarchical_oscar_host_layout(const HostKVPageLayout& layout) noexcept {
+    return layout.storage_format == HostKVStorageFormat::OscarQ4AndFp16;
+}
+
+std::uint16_t float_to_bf16_bits(float value) noexcept {
+    const std::uint32_t bits = float_bits(value);
+    const std::uint32_t bias = 0x7fffU + ((bits >> 16U) & 1U);
+    return static_cast<std::uint16_t>((bits + bias) >> 16U);
+}
+
+float bf16_bits_to_float(std::uint16_t value) noexcept {
+    return bits_float(static_cast<std::uint32_t>(value) << 16U);
+}
+
+std::uint16_t load_u16(const std::byte* address) noexcept {
+    std::uint16_t value = 0;
+    std::memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+void store_u16(std::byte* address, std::uint16_t value) noexcept {
+    std::memcpy(address, &value, sizeof(value));
+}
+
+// CPU mirror of normalized_hadamard_d256_inplace().  Host conversion is deliberately off the
+// serving stream; matching the device butterfly order keeps L2 restores deterministic without
+// requiring a temporary FP16 allocation on the GPU.
+void normalized_hadamard_d256_host(std::array<float, 256>& values) noexcept {
+    for (int block = 0; block < 8; ++block) {
+        float* column = values.data() + block * 32;
+        for (int stride = 1; stride <= 16; stride <<= 1) {
+            for (int base = 0; base < 32; base += 2 * stride) {
+                for (int offset = 0; offset < stride; ++offset) {
+                    const float low  = column[base + offset];
+                    const float high = column[base + offset + stride];
+                    column[base + offset]        = low + high;
+                    column[base + offset + stride] = low - high;
+                }
+            }
+        }
+    }
+    for (int stride = 1; stride < 8; stride <<= 1) {
+        for (int base = 0; base < 8; base += 2 * stride) {
+            for (int offset = 0; offset < stride; ++offset) {
+                for (int dimension = 0; dimension < 32; ++dimension) {
+                    const int low_index  = (base + offset) * 32 + dimension;
+                    const int high_index = (base + offset + stride) * 32 + dimension;
+                    const float low       = values[low_index];
+                    const float high      = values[high_index];
+                    values[low_index]     = low + high;
+                    values[high_index]    = low - high;
+                }
+            }
+        }
+    }
+    for (float& value : values) { value *= 0.0625F; }
+}
+
+struct OscarHostQuantParams {
+    float scale = 1.0F;
+    float zero  = 0.0F;
+};
+
+template <bool IsValue>
+OscarHostQuantParams oscar_host_quant_params(const std::array<float, 256>& values,
+                                             int bits) noexcept {
+    float minimum = values[0];
+    float maximum = values[0];
+    for (float value : values) {
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+    }
+    const float ratio = bits == 2 ? (IsValue ? 0.91F : 0.93F) :
+                         bits == 4 ? (IsValue ? 0.98F : 0.985F) : 0.95F;
+    const float center    = 0.5F * (minimum + maximum);
+    const float half_span = 0.5F * (maximum - minimum) * ratio;
+    const float zero      = center - half_span;
+    const float span      = 2.0F * half_span;
+    return {.scale = span > 1.0e-8F ? span / static_cast<float>((1 << bits) - 1) : 1.0F,
+            .zero  = zero};
+}
+
+int oscar_host_quantize(float value, OscarHostQuantParams params, int bits) noexcept {
+    const float normalized = (value - params.zero) / params.scale;
+    const int rounded       = static_cast<int>(std::lrintf(normalized));
+    return std::clamp(rounded, 0, (1 << bits) - 1);
+}
+
+void pack_oscar_host_codes(const std::array<float, 256>& values, OscarHostQuantParams params,
+                           int bits, std::byte* destination) noexcept {
+    const int code_extent = (256 * bits + 7) / 8;
+    std::memset(destination, 0, static_cast<std::size_t>(code_extent));
+    for (int dimension = 0; dimension < 256; ++dimension) {
+        const int code       = oscar_host_quantize(values[dimension], params, bits);
+        const int bit_offset = dimension * bits;
+        auto* byte            = reinterpret_cast<std::uint8_t*>(destination) + (bit_offset >> 3);
+        *byte = static_cast<std::uint8_t>(*byte | (code << (bit_offset & 7)));
+        if ((bit_offset & 7) + bits > 8) {
+            byte[1] = static_cast<std::uint8_t>(byte[1] | (code >> (8 - (bit_offset & 7))));
+        }
+    }
+}
+
+float load_source_oscar_value(const std::byte* source, const HostKVPlaneLayout& code_plane,
+                              const HostKVPlaneLayout& scale_plane, int token, int head,
+                              int dimension, int bits, int page_tokens) noexcept {
+    const std::size_t code_leading_bytes =
+        code_plane.head_payload_bytes / static_cast<std::size_t>(page_tokens);
+    const auto* code = reinterpret_cast<const std::uint8_t*>(
+        source + code_plane.offset +
+        (static_cast<std::size_t>(dimension * bits) >> 3) +
+        static_cast<std::size_t>(code_plane.head_payload_bytes) * head +
+        code_leading_bytes * static_cast<std::size_t>(token));
+    const int shift = (dimension * bits) & 7;
+    std::uint16_t scale_bits = load_u16(
+        source + scale_plane.offset + sizeof(std::uint16_t) *
+                                           (2 * (token + page_tokens * head)));
+    std::uint16_t zero_bits = load_u16(
+        source + scale_plane.offset + sizeof(std::uint16_t) *
+                                           (2 * (token + page_tokens * head) + 1));
+    const std::uint32_t word = static_cast<std::uint32_t>(*code) |
+                               (static_cast<std::uint32_t>(code[1]) << 8U);
+    const int code_value = (static_cast<int>(word) >> shift) & ((1 << bits) - 1);
+    return static_cast<float>(code_value) * bf16_bits_to_float(scale_bits) +
+           bf16_bits_to_float(zero_bits);
+}
+
+void copy_device_pages_to_native(std::span<const std::int32_t> physical_pages,
+                                 std::byte* destination, const HostKVPageLayout& native,
+                                 const KVPageGeometry& geometry,
+                                 const std::vector<Tensor>& device_planes,
+                                 cudaStream_t stream) {
+    std::size_t begin = 0;
+    while (begin < physical_pages.size()) {
+        std::size_t end = begin + 1;
+        while (end < physical_pages.size() &&
+               physical_pages[end] == physical_pages[end - 1] + 1) {
+            ++end;
+        }
+        const std::size_t count = end - begin;
+        const std::int32_t first = physical_pages[begin];
+        for (std::size_t plane_index = 0; plane_index < device_planes.size(); ++plane_index) {
+            const Tensor& plane                 = device_planes[plane_index];
+            const HostKVPlaneLayout& host_plane = native.planes[plane_index];
+            auto* host_base = destination + begin * native.page_stride + host_plane.offset;
+            const auto* device_base = static_cast<const unsigned char*>(plane.data);
+            if (geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    host_base, native.page_stride,
+                    device_base + static_cast<std::int64_t>(first) * plane.nb[3], plane.nb[3],
+                    host_plane.page_payload_bytes, count, cudaMemcpyDeviceToHost, stream));
+            } else {
+                for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        host_base + static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
+                        native.page_stride,
+                        device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
+                            static_cast<std::int64_t>(first) * plane.nb[2],
+                        plane.nb[2], host_plane.head_payload_bytes, count,
+                        cudaMemcpyDeviceToHost, stream));
+                }
+            }
+        }
+        begin = end;
+    }
+}
+
+void copy_native_to_device(std::span<const std::int32_t> physical_pages,
+                           const std::byte* source, const HostKVPageLayout& native,
+                           const KVPageGeometry& geometry, const std::vector<Tensor>& device_planes,
+                           cudaStream_t stream) {
+    std::size_t begin = 0;
+    while (begin < physical_pages.size()) {
+        std::size_t end = begin + 1;
+        while (end < physical_pages.size() &&
+               physical_pages[end] == physical_pages[end - 1] + 1) {
+            ++end;
+        }
+        const std::size_t count = end - begin;
+        const std::int32_t first = physical_pages[begin];
+        for (std::size_t plane_index = 0; plane_index < device_planes.size(); ++plane_index) {
+            const Tensor& plane                 = device_planes[plane_index];
+            const HostKVPlaneLayout& host_plane = native.planes[plane_index];
+            const auto* host_base = source + begin * native.page_stride + host_plane.offset;
+            auto* device_base     = static_cast<unsigned char*>(plane.data);
+            if (geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    device_base + static_cast<std::int64_t>(first) * plane.nb[3], plane.nb[3],
+                    host_base, native.page_stride, host_plane.page_payload_bytes, count,
+                    cudaMemcpyHostToDevice, stream));
+            } else {
+                for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
+                            static_cast<std::int64_t>(first) * plane.nb[2],
+                        plane.nb[2],
+                        host_base + static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
+                        native.page_stride, host_plane.head_payload_bytes, count,
+                        cudaMemcpyHostToDevice, stream));
+                }
+            }
+        }
+        begin = end;
+    }
+}
+
+void native_oscar_to_hierarchical(const std::byte* source, std::byte* destination,
+                                  std::uint32_t pages, const HostKVPageLayout& native,
+                                  const HostKVPageLayout& hierarchical) {
+    const std::size_t layers = native.geometry.planes.size() / 4U;
+    const int page_tokens    = static_cast<int>(native.geometry.page_tokens);
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        const std::byte* source_page = source + static_cast<std::size_t>(page) * native.page_stride;
+        std::byte* destination_page =
+            destination + static_cast<std::size_t>(page) * hierarchical.page_stride;
+        for (std::size_t layer = 0; layer < layers; ++layer) {
+            const auto& source_k_code = native.planes[layer * 4U];
+            const auto& source_v_code = native.planes[layer * 4U + 1U];
+            const auto& source_k_scale = native.planes[layer * 4U + 2U];
+            const auto& source_v_scale = native.planes[layer * 4U + 3U];
+            const int heads = source_k_code.head_payload_bytes == 0
+                                  ? 0
+                                  : static_cast<int>(source_k_code.page_payload_bytes /
+                                                      source_k_code.head_payload_bytes);
+            for (int head = 0; head < heads; ++head) {
+                for (int token = 0; token < page_tokens; ++token) {
+                    std::array<float, 256> k_rotated{};
+                    std::array<float, 256> v_rotated{};
+                    for (int dimension = 0; dimension < 256; ++dimension) {
+                        k_rotated[dimension] = load_source_oscar_value(
+                            source_page, source_k_code, source_k_scale, token, head, dimension, 2,
+                            page_tokens);
+                        v_rotated[dimension] = load_source_oscar_value(
+                            source_page, source_v_code, source_v_scale, token, head, dimension, 2,
+                            page_tokens);
+                    }
+                    const auto k_quant = oscar_host_quant_params<false>(k_rotated, 4);
+                    const auto v_quant = oscar_host_quant_params<true>(v_rotated, 4);
+                    const std::size_t q4_base = layer * 4U;
+                    pack_oscar_host_codes(
+                        k_rotated, k_quant, 4,
+                        destination_page + hierarchical.planes[q4_base].offset +
+                            static_cast<std::size_t>(head) * hierarchical.planes[q4_base].head_payload_bytes +
+                            static_cast<std::size_t>(token) * 128U);
+                    pack_oscar_host_codes(
+                        v_rotated, v_quant, 4,
+                        destination_page + hierarchical.planes[q4_base + 1U].offset +
+                            static_cast<std::size_t>(head) * hierarchical.planes[q4_base + 1U].head_payload_bytes +
+                            static_cast<std::size_t>(token) * 128U);
+                    const std::size_t scale_index =
+                        static_cast<std::size_t>(2 * (token + page_tokens * head));
+                    store_u16(destination_page + hierarchical.planes[q4_base + 2U].offset +
+                                  scale_index * sizeof(std::uint16_t),
+                              float_to_bf16_bits(k_quant.scale));
+                    store_u16(destination_page + hierarchical.planes[q4_base + 2U].offset +
+                                  (scale_index + 1U) * sizeof(std::uint16_t),
+                              float_to_bf16_bits(k_quant.zero));
+                    store_u16(destination_page + hierarchical.planes[q4_base + 3U].offset +
+                                  scale_index * sizeof(std::uint16_t),
+                              float_to_bf16_bits(v_quant.scale));
+                    store_u16(destination_page + hierarchical.planes[q4_base + 3U].offset +
+                                  (scale_index + 1U) * sizeof(std::uint16_t),
+                              float_to_bf16_bits(v_quant.zero));
+
+                    std::array<float, 256> k_original = k_rotated;
+                    std::array<float, 256> v_original = v_rotated;
+                    normalized_hadamard_d256_host(k_original);
+                    normalized_hadamard_d256_host(v_original);
+                    const std::size_t l2_base = layers * 4U + layer * 2U;
+                    for (int dimension = 0; dimension < 256; ++dimension) {
+                        const std::size_t element =
+                            static_cast<std::size_t>(dimension) +
+                            static_cast<std::size_t>(256) * (token + page_tokens * head);
+                        store_u16(destination_page + hierarchical.planes[l2_base].offset +
+                                      element * sizeof(std::uint16_t),
+                                  float_to_fp16_bits(k_original[dimension]));
+                        store_u16(destination_page + hierarchical.planes[l2_base + 1U].offset +
+                                      element * sizeof(std::uint16_t),
+                                  float_to_fp16_bits(v_original[dimension]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+void hierarchical_to_native_oscar(const std::byte* source, std::byte* destination,
+                                  std::uint32_t pages, const HostKVPageLayout& native,
+                                  const HostKVPageLayout& hierarchical) {
+    const std::size_t layers = native.geometry.planes.size() / 4U;
+    const int page_tokens    = static_cast<int>(native.geometry.page_tokens);
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        const std::byte* source_page =
+            source + static_cast<std::size_t>(page) * hierarchical.page_stride;
+        std::byte* destination_page =
+            destination + static_cast<std::size_t>(page) * native.page_stride;
+        for (std::size_t layer = 0; layer < layers; ++layer) {
+            const int heads = hierarchical.planes[layer * 4U].head_payload_bytes == 0
+                                  ? 0
+                                  : static_cast<int>(hierarchical.planes[layer * 4U].page_payload_bytes /
+                                                      hierarchical.planes[layer * 4U].head_payload_bytes);
+            const std::size_t l2_base = layers * 4U + layer * 2U;
+            for (int head = 0; head < heads; ++head) {
+                for (int token = 0; token < page_tokens; ++token) {
+                    std::array<float, 256> k_original{};
+                    std::array<float, 256> v_original{};
+                    for (int dimension = 0; dimension < 256; ++dimension) {
+                        const std::size_t element =
+                            static_cast<std::size_t>(dimension) +
+                            static_cast<std::size_t>(256) * (token + page_tokens * head);
+                        k_original[dimension] = fp16_bits_to_float(load_u16(
+                            source_page + hierarchical.planes[l2_base].offset +
+                            element * sizeof(std::uint16_t)));
+                        v_original[dimension] = fp16_bits_to_float(load_u16(
+                            source_page + hierarchical.planes[l2_base + 1U].offset +
+                            element * sizeof(std::uint16_t)));
+                    }
+                    normalized_hadamard_d256_host(k_original);
+                    normalized_hadamard_d256_host(v_original);
+                    const auto k_quant = oscar_host_quant_params<false>(k_original, 2);
+                    const auto v_quant = oscar_host_quant_params<true>(v_original, 2);
+                    const auto& k_code = native.planes[layer * 4U];
+                    const auto& v_code = native.planes[layer * 4U + 1U];
+                    const auto& k_scale = native.planes[layer * 4U + 2U];
+                    const auto& v_scale = native.planes[layer * 4U + 3U];
+                    const std::size_t code_token_bytes =
+                        k_code.head_payload_bytes / static_cast<std::size_t>(page_tokens);
+                    const std::size_t code_offset =
+                        static_cast<std::size_t>(head) * k_code.head_payload_bytes +
+                        static_cast<std::size_t>(token) * code_token_bytes;
+                    std::memset(destination_page + k_code.offset + code_offset, 0,
+                                code_token_bytes);
+                    std::memset(destination_page + v_code.offset + code_offset, 0,
+                                code_token_bytes);
+                    for (int dimension = 0; dimension < 256; ++dimension) {
+                        const int k_value = oscar_host_quantize(k_original[dimension], k_quant, 2);
+                        const int v_value = oscar_host_quantize(v_original[dimension], v_quant, 2);
+                        const int bit      = dimension * 2;
+                        auto* k_byte = reinterpret_cast<std::uint8_t*>(
+                            destination_page + k_code.offset + code_offset + (bit >> 3));
+                        auto* v_byte = reinterpret_cast<std::uint8_t*>(
+                            destination_page + v_code.offset + code_offset + (bit >> 3));
+                        *k_byte = static_cast<std::uint8_t>(*k_byte | (k_value << (bit & 7)));
+                        *v_byte = static_cast<std::uint8_t>(*v_byte | (v_value << (bit & 7)));
+                    }
+                    const std::size_t scale_index =
+                        static_cast<std::size_t>(2 * (token + page_tokens * head));
+                    store_u16(destination_page + k_scale.offset + scale_index * sizeof(std::uint16_t),
+                              float_to_bf16_bits(k_quant.scale));
+                    store_u16(destination_page + k_scale.offset +
+                                  (scale_index + 1U) * sizeof(std::uint16_t),
+                              float_to_bf16_bits(k_quant.zero));
+                    store_u16(destination_page + v_scale.offset + scale_index * sizeof(std::uint16_t),
+                              float_to_bf16_bits(v_quant.scale));
+                    store_u16(destination_page + v_scale.offset +
+                                  (scale_index + 1U) * sizeof(std::uint16_t),
+                              float_to_bf16_bits(v_quant.zero));
+                }
             }
         }
     }
@@ -715,9 +1081,33 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
         destination.layout().geometry != geometry()) {
         throw std::invalid_argument("Paged KV D2H geometry or extent is inconsistent");
     }
+    if (source.empty()) { return; }
     for (DeviceKVPageHandle page : source) { (void)physical_index(page); }
 
     const HostKVPageLayout& host = destination.layout();
+    if (is_hierarchical_oscar_host_layout(host)) {
+        const HostKVPageLayout native = plan_host_kv_page_layout(geometry());
+        if (native.geometry != host.geometry || source.size() >
+                                                     std::numeric_limits<std::uint32_t>::max() ||
+            native.page_stride > std::numeric_limits<std::size_t>::max() / source.size()) {
+            throw std::invalid_argument("Paged KV hierarchical host conversion geometry is invalid");
+        }
+        std::vector<std::int32_t> physical_pages;
+        physical_pages.reserve(source.size());
+        for (const DeviceKVPageHandle page : source) { physical_pages.push_back(physical_index(page)); }
+        PinnedHostBuffer staging(native.page_stride * source.size());
+        copy_device_pages_to_native(
+            std::span<const std::int32_t>(physical_pages), static_cast<std::byte*>(staging.data()),
+            native, geometry(), planes_, stream);
+        // The conversion is intentionally outside the serving stream.  Host snapshots are
+        // checkpoint work, and synchronizing here is what makes the pinned record a complete
+        // Q4+FP16 pair before its extent is published.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        native_oscar_to_hierarchical(static_cast<const std::byte*>(staging.data()),
+                                     destination.data(), static_cast<std::uint32_t>(source.size()),
+                                     native, host);
+        return;
+    }
     const bool convert_bf16_to_fp16 = host_uses_fp16_for_bf16(host, planes_);
     std::size_t begin            = 0;
     while (begin < source.size()) {
@@ -766,9 +1156,33 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
         source.layout().geometry != geometry()) {
         throw std::invalid_argument("Paged KV H2D geometry or extent is inconsistent");
     }
+    if (destination.empty()) { return; }
     validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
 
     const HostKVPageLayout& host = source.layout();
+    if (is_hierarchical_oscar_host_layout(host)) {
+        const HostKVPageLayout native = plan_host_kv_page_layout(geometry());
+        if (native.geometry != host.geometry || destination.size() >
+                                                     std::numeric_limits<std::uint32_t>::max() ||
+            native.page_stride > std::numeric_limits<std::size_t>::max() / destination.size()) {
+            throw std::invalid_argument("Paged KV hierarchical host restore geometry is invalid");
+        }
+        std::vector<std::int32_t> physical_pages;
+        physical_pages.reserve(destination.size());
+        for (const DeviceKVPageHandle page : destination) {
+            physical_pages.push_back(physical_index(page));
+        }
+        PinnedHostBuffer staging(native.page_stride * destination.size());
+        hierarchical_to_native_oscar(source.data(), static_cast<std::byte*>(staging.data()),
+                                      static_cast<std::uint32_t>(destination.size()), native, host);
+        copy_native_to_device(
+            std::span<const std::int32_t>(physical_pages), static_cast<const std::byte*>(staging.data()),
+            native, geometry(), planes_, stream);
+        // The staging buffer is scoped to this call.  Wait for the H2D work before releasing it;
+        // the normal native path remains asynchronous.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return;
+    }
     const bool convert_fp16_to_bf16 = host_uses_fp16_for_bf16(host, planes_);
     if (convert_fp16_to_bf16) {
         // H2D restores are infrequent relative to decode. Convert bounded chunks into a temporary
