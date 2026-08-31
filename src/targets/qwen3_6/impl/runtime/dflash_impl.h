@@ -724,8 +724,10 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
+                                 bool greedy_target_head,
                                  DecodeGraphDefinition& definition) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope, false);
+    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope,
+                                         greedy_target_head);
     capture_graph(state, definition, body);
 }
 

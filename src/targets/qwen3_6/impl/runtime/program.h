@@ -406,6 +406,10 @@ struct DecodeGraphProfile {
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
+    // Greedy DFlash profiles capture the fused target-head/argmax route. Keep this bit in the
+    // internal profile rather than the public model profile: it is a serving-mode choice, not a
+    // change to the attention topology or artifact ABI.
+    bool greedy_target_head = false;
     DecodeGraphDefinition definition;
 };
 

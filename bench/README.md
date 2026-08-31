@@ -45,8 +45,9 @@ these controls are for workload-specific research and are not required for defau
 For greedy Qwen3.8 target verification, the uncaptured direct path fuses the FP8 vocabulary
 projection with BF16-rounded argmax and uses token-only draft acceptance. Set
 `NINFER_FP8_GREEDY_ARGMAX=0` to force the full-logit reference route for an A/B measurement.
-CUDA Graph capture currently keeps the full-logit route because the fused path's scratch and
-compact reduction need graph-safe integration.
+Single-lane greedy C1 CUDA Graph capture now uses a dedicated fixed fused graph family; sampled
+requests, mixed-sampling batches, and C2/C4/C8 graph families retain the full-logit reference
+route. This keeps the graph working-set change isolated while preserving the exact sampled path.
 
 The matrix contains three independently measured test kinds:
 

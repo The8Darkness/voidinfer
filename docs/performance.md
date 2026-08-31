@@ -742,7 +742,8 @@ The Qwen3.8 target verifier now has an exact greedy-only route for the FP8 vocab
 Tensor Core projection rounds each value to BF16 before comparing, reduces one winner per
 vocabulary tile, and writes only the token IDs; the existing target-logit BF16 allocation is reused
 as compact scratch. Greedy DFlash2/MTP acceptance can therefore consume target tokens directly,
-while sampled requests and CUDA Graph capture continue through the full-logit reference path.
+while sampled requests and C2/C4/C8 CUDA Graph families continue through the full-logit reference
+path. Single-lane greedy C1 capture has a separate fixed fused graph family.
 
 Focused `ninfer_linear_fp8_a16_test` and `ninfer_speculative_round_test` runs pass. A physical RTX
 5090 uncaptured C1 comparison with hierarchical VeriCache-NVFP4, optimized DFlash2, and `k=7`
@@ -754,6 +755,14 @@ measured:
 | Fused FP8 argmax | 20.4424 ms | 20.4536 ms | 2.75 | 14/56 (25.00%) |
 
 The 0.21% GPU difference is below the observed acceptance variance, so this is retained as a
-working-set/launch optimization rather than reported as an end-to-end speedup. The graph path is
-deliberately conservative until the fused scratch/reduction sequence is captured and replayed
-without changing its exact semantics.
+working-set/launch optimization rather than reported as an end-to-end speedup. The graph-safe
+follow-up uses a separate C1 greedy graph family, preserves the full-logit family for sampled and
+larger batches, and was measured as neutral/slightly slower in the matched run below:
+
+| Route | GPU round | Wall round | Licensed tokens/round | Draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| Full-logit C1 graph | 18.6411 ms | 18.6549 ms | 2.8 | 18/70 (25.71%) |
+| Fused-argmax C1 graph | 18.6593 ms | 18.6693 ms | 2.8 | 18/70 (25.71%) |
+
+The fused graph is retained for exactness and lower target-head materialization pressure; no
+throughput multiplier is claimed.

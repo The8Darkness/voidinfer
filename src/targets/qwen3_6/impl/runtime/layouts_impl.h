@@ -831,6 +831,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
                                 "DFlash exact-b graph allowance");
             }
+            // The default C1 greedy route has a second graph family because fused target-head
+            // argmax changes the captured node sequence. Reserve only one additional C1 family;
+            // C2/C4/C8 continue to share the existing full-logit graph set.
+            impl->graph_allowance_bytes =
+                checked_add(impl->graph_allowance_bytes, class_allowance(1U),
+                            "DFlash greedy C1 graph allowance");
         }
     }
 

@@ -582,11 +582,13 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
 }
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
-                                         std::uint32_t frontier, const char* label) {
+                                         std::uint32_t frontier, const char* label,
+                                         bool greedy_target_head = false) {
     const auto it = std::find_if(
         family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
             return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
-                   frontier <= profile.max_execution_frontier;
+                   frontier <= profile.max_execution_frontier &&
+                   profile.greedy_target_head == greedy_target_head;
         });
     if (it == family.profiles.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
@@ -10559,7 +10561,7 @@ void ProgramImplCore::prepare_graphs() {
                                       code_warm_target, nullptr);
         device.synchronize();
 
-        dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
+        dflash_graphs.profiles.reserve(batch_one_profiles.size() * (max_concurrency + 1U));
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
             const auto planned_profiles =
                 batch_size == 1 ? batch_one_profiles
@@ -10573,6 +10575,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
+                profile.greedy_target_head = false;
                 const ops::CausalAttentionExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -10581,7 +10584,27 @@ void ProgramImplCore::prepare_graphs() {
                 schedule::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
                     dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
+                    false,
                     profile.definition);
+
+                // Keep the additional fused-head graph family to C1.  This covers the default
+                // single-agent serving path while avoiding a second full graph matrix for every
+                // C2/C4/C8 topology.  Sampled requests and batched rows remain on the existing
+                // full-logit graphs.
+                if (batch_size == 1U) {
+                    dflash_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& greedy_profile = dflash_graphs.profiles.back();
+                    greedy_profile.batch_size             = batch_size;
+                    greedy_profile.min_execution_frontier = planned.min;
+                    greedy_profile.max_execution_frontier = planned.max;
+                    greedy_profile.topology_class =
+                        (planned.topology_class + 4U) * max_concurrency + (batch_size - 1U);
+                    greedy_profile.greedy_target_head = true;
+                    schedule::capture_dflash_decode_batch(
+                        dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
+                        dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
+                        true, greedy_profile.definition);
+                }
             }
         }
     }
@@ -11390,10 +11413,18 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        bool all_greedy_target_rows = true;
+        for (const std::uint32_t lane : lanes) {
+            all_greedy_target_rows =
+                all_greedy_target_rows && requests[lane].sampling_host.temperature <= 0.0F;
+        }
+        // Only C1 has a dedicated greedy graph profile for now.  C>1 keeps the established
+        // full-logit graph even when all rows happen to be greedy.
+        const bool use_greedy_graph = lanes.size() == 1U && all_greedy_target_rows;
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "DFlash batch");
+                                     maximum_frontier, "DFlash batch", use_greedy_graph);
             executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
                                                profile.max_execution_frontier, draft_window);
