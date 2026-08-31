@@ -456,9 +456,10 @@ int run_predecessor_ids_case() {
 }
 
 int run_fp8_candidate_score_case() {
-    constexpr std::int32_t rows   = 64;
-    constexpr std::int32_t hidden = 64;
-    constexpr std::int32_t tokens = 3;
+    constexpr std::int32_t rows            = 64;
+    constexpr std::int32_t hidden          = 64;
+    constexpr std::int32_t tokens          = 3;
+    constexpr std::int32_t candidate_count = kDFlash2ProposalShortlistTopK;
 
     const auto host_weight = quantized_weight::make_patterned_weight(
         QType::FP8_E4M3FN_ROW_BF16S, rows, hidden, 29U);
@@ -470,20 +471,18 @@ int run_fp8_candidate_score_case() {
         }
     }
 
-    std::vector<std::int32_t> candidate_ids(
-        static_cast<std::size_t>(kDFlash2SelectorTopK) * tokens);
+    std::vector<std::int32_t> candidate_ids(static_cast<std::size_t>(candidate_count) * tokens);
     for (std::int32_t t = 0; t < tokens; ++t) {
-        for (std::int32_t s = 0; s < kDFlash2SelectorTopK; ++s) {
-            candidate_ids[static_cast<std::size_t>(t) * kDFlash2SelectorTopK + s] =
+        for (std::int32_t s = 0; s < candidate_count; ++s) {
+            candidate_ids[static_cast<std::size_t>(t) * candidate_count + s] =
                 (7 * s + 11 * t + 3) % rows;
         }
     }
 
     std::vector<float> expected(candidate_ids.size());
     for (std::int32_t t = 0; t < tokens; ++t) {
-        for (std::int32_t s = 0; s < kDFlash2SelectorTopK; ++s) {
-            const std::int32_t row =
-                candidate_ids[static_cast<std::size_t>(t) * kDFlash2SelectorTopK + s];
+        for (std::int32_t s = 0; s < candidate_count; ++s) {
+            const std::int32_t row = candidate_ids[static_cast<std::size_t>(t) * candidate_count + s];
             float sum = 0.0F;
             for (std::int32_t c = 0; c < hidden; ++c) {
                 const float w = static_cast<float>(quantized_weight::detail::decode_e4m3fn(
@@ -495,7 +494,7 @@ int run_fp8_candidate_score_case() {
                 host_weight.payload,
                 static_cast<std::size_t>(host_weight.scale_plane_offset) +
                     static_cast<std::size_t>(row) * sizeof(std::uint16_t)));
-            expected[static_cast<std::size_t>(t) * kDFlash2SelectorTopK + s] =
+            expected[static_cast<std::size_t>(t) * candidate_count + s] =
                 bf16_to_f32(f32_to_bf16(sum * scale));
         }
     }
@@ -512,8 +511,8 @@ int run_fp8_candidate_score_case() {
     const Weight weight = host_weight.device_weight(device_weight.data());
     Tensor hidden_tensor(device_hidden.data(), DType::BF16, {hidden, tokens});
     Tensor candidate_tensor(device_candidates.data(), DType::I32,
-                            {kDFlash2SelectorTopK, tokens});
-    Tensor out_tensor(device_out.data(), DType::FP32, {kDFlash2SelectorTopK, tokens});
+                            {candidate_count, tokens});
+    Tensor out_tensor(device_out.data(), DType::FP32, {candidate_count, tokens});
     ops::dflash2_score_fp8_candidates(hidden_tensor, weight, candidate_tensor, out_tensor, nullptr);
     cuda_synchronize();
 
@@ -531,6 +530,51 @@ int run_fp8_candidate_score_case() {
     failures += device_hidden.verify_guards(label + " hidden");
     failures += device_candidates.verify_guards(label + " candidates");
     failures += device_out.verify_guards(label + " output");
+
+    const std::vector<float> actual_scores = actual_f;
+    std::vector<std::int32_t> expected_reduce_ids(
+        static_cast<std::size_t>(kDFlash2SelectorTopK) * tokens);
+    std::vector<float> expected_reduce_values(expected_reduce_ids.size());
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        std::vector<std::int32_t> slots(candidate_count);
+        std::iota(slots.begin(), slots.end(), 0);
+        std::sort(slots.begin(), slots.end(), [&](std::int32_t a, std::int32_t b) {
+            const float va = actual_scores[static_cast<std::size_t>(t) * candidate_count + a];
+            const float vb = actual_scores[static_cast<std::size_t>(t) * candidate_count + b];
+            const std::int32_t ia = candidate_ids[static_cast<std::size_t>(t) * candidate_count + a];
+            const std::int32_t ib = candidate_ids[static_cast<std::size_t>(t) * candidate_count + b];
+            return va != vb ? va > vb : ia < ib;
+        });
+        for (std::int32_t winner = 0; winner < kDFlash2SelectorTopK; ++winner) {
+            const std::int32_t slot = slots[winner];
+            expected_reduce_ids[static_cast<std::size_t>(t) * kDFlash2SelectorTopK + winner] =
+                candidate_ids[static_cast<std::size_t>(t) * candidate_count + slot];
+            expected_reduce_values[static_cast<std::size_t>(t) * kDFlash2SelectorTopK + winner] =
+                actual_scores[static_cast<std::size_t>(t) * candidate_count + slot];
+        }
+    }
+
+    GuardedDeviceBuffer device_reduce_ids(expected_reduce_ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_reduce_values(expected_reduce_values.size() * sizeof(float));
+    device_reduce_ids.fill(0xcd);
+    device_reduce_values.fill(0xcd);
+    Tensor reduce_ids(device_reduce_ids.data(), DType::I32,
+                      {kDFlash2SelectorTopK, tokens});
+    Tensor reduce_values(device_reduce_values.data(), DType::FP32,
+                         {kDFlash2SelectorTopK, tokens});
+    ops::dflash2_reduce_scored_candidates(candidate_tensor, out_tensor, reduce_ids, reduce_values,
+                                           nullptr);
+    cuda_synchronize();
+    failures += verify_exact((label + " reduced ids").c_str(),
+                             from_device<std::int32_t>(device_reduce_ids.data(),
+                                                        expected_reduce_ids.size()),
+                             expected_reduce_ids);
+    failures += verify_exact((label + " reduced values").c_str(),
+                             from_device<float>(device_reduce_values.data(),
+                                                expected_reduce_values.size()),
+                             expected_reduce_values);
+    failures += device_reduce_ids.verify_guards(label + " reduced ids");
+    failures += device_reduce_values.verify_guards(label + " reduced values");
     return failures;
 }
 
@@ -598,6 +642,77 @@ int run_select_candidates_case() {
     failures += device_logits.verify_guards(label + " logits");
     failures += device_ids.verify_guards(label + " ids");
     failures += device_values.verify_guards(label + " values");
+    return failures;
+}
+
+int run_wide_select_candidates_case() {
+    constexpr std::int32_t vocab  = 64;
+    constexpr std::int32_t tokens = 2;
+    constexpr std::int32_t top_k  = kDFlash2ProposalShortlistTopK;
+
+    std::vector<float> logits(static_cast<std::size_t>(vocab) * tokens);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t id = 0; id < vocab; ++id) {
+            logits[static_cast<std::size_t>(t) * vocab + id] =
+                static_cast<float>((id * 19 + t * 23) % 101) * 0.0625f - 2.0f;
+        }
+    }
+    const std::vector<std::uint16_t> input = bf16_bits(logits);
+    std::vector<std::int32_t> expected_ids(static_cast<std::size_t>(top_k) * tokens);
+    std::vector<float> expected_values(expected_ids.size());
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        std::vector<std::int32_t> ids(vocab);
+        std::iota(ids.begin(), ids.end(), 0);
+        std::sort(ids.begin(), ids.end(), [&](std::int32_t a, std::int32_t b) {
+            const float va = bf16_to_f32(input[static_cast<std::size_t>(t) * vocab + a]);
+            const float vb = bf16_to_f32(input[static_cast<std::size_t>(t) * vocab + b]);
+            return va != vb ? va > vb : a < b;
+        });
+        for (std::int32_t k = 0; k < top_k; ++k) {
+            expected_ids[static_cast<std::size_t>(t) * top_k + k] = ids[k];
+            expected_values[static_cast<std::size_t>(t) * top_k + k] =
+                bf16_to_f32(input[static_cast<std::size_t>(t) * vocab + ids[k]]);
+        }
+    }
+
+    GuardedDeviceBuffer device_logits(input.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_ids(expected_ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_values(expected_values.size() * sizeof(float));
+    GuardedDeviceBuffer device_scratch_ids(
+        static_cast<std::size_t>(kDFlash2SelectorTopK) * tokens * 2 * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_scratch_values(
+        static_cast<std::size_t>(kDFlash2SelectorTopK) * tokens * 2 * sizeof(float));
+    device_logits.copy_from_host(input.data(), device_logits.bytes());
+    device_ids.fill(0xcd);
+    device_values.fill(0xcd);
+    device_scratch_ids.fill(0xcd);
+    device_scratch_values.fill(0xcd);
+
+    Tensor logits_tensor(device_logits.data(), DType::BF16, {vocab, tokens});
+    Tensor ids_tensor(device_ids.data(), DType::I32, {top_k, tokens});
+    Tensor values_tensor(device_values.data(), DType::FP32, {top_k, tokens});
+    Tensor scratch_ids_tensor(device_scratch_ids.data(), DType::I32,
+                              {kDFlash2SelectorTopK, tokens * 2});
+    Tensor scratch_values_tensor(device_scratch_values.data(), DType::FP32,
+                                 {kDFlash2SelectorTopK, tokens * 2});
+    ops::dflash2_select_candidates_wide(logits_tensor, ids_tensor, values_tensor,
+                                        scratch_ids_tensor, scratch_values_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::string label = "dflash2_select_candidates_wide";
+    int failures = verify_exact(label.c_str(),
+                                from_device<std::int32_t>(device_ids.data(), expected_ids.size()),
+                                expected_ids);
+    failures += verify_exact((label + " values").c_str(),
+                             from_device<float>(device_values.data(), expected_values.size()),
+                             expected_values);
+    failures += verify_exact((label + " logits preserved").c_str(),
+                             from_device<std::uint16_t>(device_logits.data(), input.size()), input);
+    failures += device_logits.verify_guards(label + " logits");
+    failures += device_ids.verify_guards(label + " ids");
+    failures += device_values.verify_guards(label + " values");
+    failures += device_scratch_ids.verify_guards(label + " scratch ids");
+    failures += device_scratch_values.verify_guards(label + " scratch values");
     return failures;
 }
 
@@ -767,6 +882,7 @@ int main() {
     failures += run_predecessor_ids_case();
     failures += run_fp8_candidate_score_case();
     failures += run_select_candidates_case();
+    failures += run_wide_select_candidates_case();
     failures += run_selector_lattice_case();
     failures += run_trace_path_case();
     if (std::getenv("NINFER_DFLASH2_BENCH") != nullptr) {

@@ -12,6 +12,7 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kSelTopK = kDFlash2SelectorTopK;
+constexpr std::int32_t kWideTopK = kDFlash2ProposalShortlistTopK;
 
 void require_shape_2d(const Tensor& t, const char* label, std::int32_t rows, std::int32_t tokens,
                       DType dtype, const char* dtype_name) {
@@ -69,6 +70,87 @@ void dflash2_select_candidates(const Tensor& logits, Tensor& out_ids, Tensor& ou
     detail::dflash2_select_candidates_launch(logits, out_ids, out_values, stream);
 }
 
+void dflash2_select_candidates_wide(const Tensor& logits, Tensor& out_ids, Tensor& out_values,
+                                    Tensor& scratch_ids, Tensor& scratch_values,
+                                    cudaStream_t stream) {
+    if (logits.dtype != DType::BF16) {
+        throw std::invalid_argument("dflash2_select_candidates_wide: logits must be BF16");
+    }
+    if (out_ids.dtype != DType::I32 || out_values.dtype != DType::FP32) {
+        throw std::invalid_argument(
+            "dflash2_select_candidates_wide: out_ids must be I32 and out_values FP32");
+    }
+    const std::int32_t vocab = logits.ne[0];
+    const std::int32_t tokens = logits.ne[1];
+    if (logits.ne[2] != 1 || logits.ne[3] != 1 || vocab <= kWideTopK || tokens <= 0) {
+        throw std::invalid_argument(
+            "dflash2_select_candidates_wide: logits must be [vocab, T] with vocab > 32");
+    }
+    if (out_ids.ne[0] != kWideTopK || out_ids.ne[1] != tokens || out_ids.ne[2] != 1 ||
+        out_ids.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_select_candidates_wide: out_ids must be [32, T]");
+    }
+    if (out_values.ne[0] != kWideTopK || out_values.ne[1] != tokens || out_values.ne[2] != 1 ||
+        out_values.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_select_candidates_wide: out_values must be [32, T]");
+    }
+    if (scratch_ids.dtype != DType::I32 || scratch_values.dtype != DType::FP32 ||
+        scratch_ids.ne[0] != kSelTopK || scratch_ids.ne[1] != tokens * 2 || scratch_ids.ne[2] != 1 ||
+        scratch_ids.ne[3] != 1 || scratch_values.ne[0] != kSelTopK ||
+        scratch_values.ne[1] != tokens * 2 || scratch_values.ne[2] != 1 ||
+        scratch_values.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_select_candidates_wide: scratch tensors must each be [16, 2T]");
+    }
+    if (!logits.is_contiguous() || !out_ids.is_contiguous() || !out_values.is_contiguous() ||
+        !scratch_ids.is_contiguous() || !scratch_values.is_contiguous()) {
+        throw std::invalid_argument("dflash2_select_candidates_wide: tensors must be contiguous");
+    }
+    if (logits.data == nullptr || out_ids.data == nullptr || out_values.data == nullptr ||
+        scratch_ids.data == nullptr || scratch_values.data == nullptr) {
+        throw std::invalid_argument(
+            "dflash2_select_candidates_wide: tensor data pointers must be non-null");
+    }
+
+    detail::dflash2_select_candidates_wide_launch(logits, out_ids, out_values, scratch_ids,
+                                                  scratch_values, stream);
+}
+
+void dflash2_reduce_scored_candidates(const Tensor& candidate_ids, const Tensor& scores,
+                                      Tensor& out_ids, Tensor& out_values, cudaStream_t stream) {
+    if (candidate_ids.dtype != DType::I32 || scores.dtype != DType::FP32 ||
+        out_ids.dtype != DType::I32 || out_values.dtype != DType::FP32) {
+        throw std::invalid_argument(
+            "dflash2_reduce_scored_candidates: candidate_ids/out_ids must be I32 and "
+            "scores/out_values FP32");
+    }
+    const std::int32_t candidate_count = candidate_ids.ne[0];
+    const std::int32_t tokens = candidate_ids.ne[1];
+    if (candidate_count < kSelTopK || tokens <= 0 || candidate_ids.ne[2] != 1 ||
+        candidate_ids.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_reduce_scored_candidates: candidate_ids must be [C, T] with C >= 16");
+    }
+    if (scores.ne[0] != candidate_count || scores.ne[1] != tokens || scores.ne[2] != 1 ||
+        scores.ne[3] != 1 || out_ids.ne[0] != kSelTopK || out_ids.ne[1] != tokens ||
+        out_ids.ne[2] != 1 || out_ids.ne[3] != 1 || out_values.ne[0] != kSelTopK ||
+        out_values.ne[1] != tokens || out_values.ne[2] != 1 || out_values.ne[3] != 1) {
+        throw std::invalid_argument(
+            "dflash2_reduce_scored_candidates: invalid candidate, score, or output shape");
+    }
+    if (!candidate_ids.is_contiguous() || !scores.is_contiguous() || !out_ids.is_contiguous() ||
+        !out_values.is_contiguous() || candidate_ids.data == nullptr || scores.data == nullptr ||
+        out_ids.data == nullptr || out_values.data == nullptr) {
+        throw std::invalid_argument(
+            "dflash2_reduce_scored_candidates: tensors must be contiguous and non-null");
+    }
+
+    detail::dflash2_reduce_scored_candidates_launch(candidate_ids, scores, out_ids, out_values,
+                                                    stream);
+}
+
 void dflash2_score_fp8_candidates(const Tensor& hidden, const Weight& weight,
                                   const Tensor& candidate_ids, Tensor& out_values,
                                   cudaStream_t stream) {
@@ -81,19 +163,21 @@ void dflash2_score_fp8_candidates(const Tensor& hidden, const Weight& weight,
             "FP32");
     }
     const std::int32_t tokens = hidden.ne[1];
+    const std::int32_t candidate_count = candidate_ids.ne[0];
     if (hidden.ne[0] != weight.k || hidden.ne[2] != 1 || hidden.ne[3] != 1 || tokens <= 0) {
         throw std::invalid_argument(
             "dflash2_score_fp8_candidates: hidden must be [weight.k, T] with T > 0");
     }
-    if (candidate_ids.ne[0] != kSelTopK || candidate_ids.ne[1] != tokens ||
-        candidate_ids.ne[2] != 1 || candidate_ids.ne[3] != 1) {
+    if (candidate_count <= 0 || candidate_ids.ne[1] != tokens || candidate_ids.ne[2] != 1 ||
+        candidate_ids.ne[3] != 1) {
         throw std::invalid_argument(
-            "dflash2_score_fp8_candidates: candidate_ids must be [16, T]");
+            "dflash2_score_fp8_candidates: candidate_ids must be [C, T] with C > 0");
     }
-    if (out_values.ne[0] != kSelTopK || out_values.ne[1] != tokens || out_values.ne[2] != 1 ||
+    if (out_values.ne[0] != candidate_count || out_values.ne[1] != tokens ||
+        out_values.ne[2] != 1 ||
         out_values.ne[3] != 1) {
         throw std::invalid_argument(
-            "dflash2_score_fp8_candidates: out_values must be [16, T]");
+            "dflash2_score_fp8_candidates: out_values must be [C, T]");
     }
     if (!hidden.is_contiguous() || !candidate_ids.is_contiguous() || !out_values.is_contiguous() ||
         hidden.data == nullptr || candidate_ids.data == nullptr || out_values.data == nullptr) {

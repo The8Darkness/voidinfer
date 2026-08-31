@@ -29,6 +29,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -499,10 +500,10 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
         // DFlash2's selector only consumes the top-16 proposal candidates. When the caller
         // selected the optimized proposal profile, reuse the artifact's quantized 131K-row
         // draft head instead of streaming the full 248K-row target head. The candidate IDs are
-        // remapped to the target vocabulary before selector codebook lookup. On the FP8 target
-        // artifact, rescore just those rows from the target head so the selector keeps the
-        // target-head unary ordering without paying for a full vocabulary projection; target
-        // verification remains authoritative for every accepted token.
+        // remapped to the target vocabulary before selector codebook lookup. The default path
+        // rescored those 16 rows from the FP8 target head; an opt-in wider shortlist is retained
+        // for workload research through NINFER_DFLASH2_WIDE_SHORTLIST=1. Target verification
+        // remains authoritative for every accepted token.
         const OptimizedProposalWeights* private_proposal =
             state.execution.proposal_head == ProposalHead::Optimized &&
                     state.execution.model.optimized_proposal.has_value()
@@ -524,8 +525,48 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
             state.execution.work.alloc(DType::I32, {Config::selector_top_k, columns});
         Tensor unary =
             state.execution.work.alloc(DType::FP32, {Config::selector_top_k, columns});
-        ops::dflash2_select_candidates(logits, candidates, unary,
-                                       state.execution.device.stream);
+        const char* wide_shortlist_env = std::getenv("NINFER_DFLASH2_WIDE_SHORTLIST");
+        const bool use_wide_shortlist = wide_shortlist_env != nullptr &&
+                                        wide_shortlist_env[0] == '1';
+        if (private_proposal == nullptr || !use_wide_shortlist) {
+            ops::dflash2_select_candidates(logits, candidates, unary,
+                                           state.execution.device.stream);
+            if (private_proposal != nullptr) {
+                Tensor candidates_flat = candidates.view({Config::selector_top_k * columns});
+                ops::proposal_remap_token_ids(
+                    candidates_flat,
+                    static_cast<const std::int32_t*>(private_proposal->token_ids.data),
+                    private_proposal->head.n, state.execution.device.stream);
+                if (state.execution.model.output_head.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+                    ops::dflash2_score_fp8_candidates(proposal_hidden,
+                                                      state.execution.model.output_head, candidates,
+                                                      unary, state.execution.device.stream);
+                }
+            }
+        } else {
+            Tensor shortlist = state.execution.work.alloc(
+                DType::I32, {ops::kDFlash2ProposalShortlistTopK, columns});
+            Tensor shortlist_scores = state.execution.work.alloc(
+                DType::FP32, {ops::kDFlash2ProposalShortlistTopK, columns});
+            Tensor shortlist_scratch =
+                state.execution.work.alloc(DType::I32, {ops::kDFlash2SelectorTopK, columns * 2});
+            Tensor shortlist_scratch_scores = state.execution.work.alloc(
+                DType::FP32, {ops::kDFlash2SelectorTopK, columns * 2});
+            ops::dflash2_select_candidates_wide(logits, shortlist, shortlist_scores,
+                                                shortlist_scratch, shortlist_scratch_scores,
+                                                state.execution.device.stream);
+            Tensor shortlist_flat = shortlist.view({ops::kDFlash2ProposalShortlistTopK * columns});
+            ops::proposal_remap_token_ids(
+                shortlist_flat, static_cast<const std::int32_t*>(private_proposal->token_ids.data),
+                private_proposal->head.n, state.execution.device.stream);
+            if (state.execution.model.output_head.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+                ops::dflash2_score_fp8_candidates(proposal_hidden,
+                                                  state.execution.model.output_head, shortlist,
+                                                  shortlist_scores, state.execution.device.stream);
+            }
+            ops::dflash2_reduce_scored_candidates(shortlist, shortlist_scores, candidates, unary,
+                                                  state.execution.device.stream);
+        }
 
         Tensor selector_hidden =
             state.execution.work.alloc(DType::BF16, {Config::selector_rank, columns});
@@ -534,16 +575,6 @@ void propose_batch_v2_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState
 
         const std::int32_t top_k_columns = Config::selector_top_k * columns;
         Tensor candidates_flat = candidates.view({top_k_columns});
-        if (private_proposal != nullptr) {
-            ops::proposal_remap_token_ids(
-                candidates_flat, static_cast<const std::int32_t*>(private_proposal->token_ids.data),
-                private_proposal->head.n, state.execution.device.stream);
-            if (state.execution.model.output_head.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-                ops::dflash2_score_fp8_candidates(proposal_hidden,
-                                                  state.execution.model.output_head, candidates,
-                                                  unary, state.execution.device.stream);
-            }
-        }
         Tensor successor =
             state.execution.work.alloc(DType::BF16, {Config::selector_rank, top_k_columns});
         ops::embedding(candidates_flat,

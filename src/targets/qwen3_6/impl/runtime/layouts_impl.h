@@ -586,7 +586,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         }
                     }
                     matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
-                    matrix(layout, DType::BF16, TextConfig::output_rows, tokens);
+                    const std::int32_t proposal_rows =
+                        plan.proposal_head == ProposalHead::Optimized ? Variant::draft_head_rows
+                                                                        : TextConfig::output_rows;
+                    matrix(layout, DType::BF16, proposal_rows, tokens);
+                    if (plan.proposal_head == ProposalHead::Optimized) {
+                        matrix(layout, DType::I32, ops::kDFlash2ProposalShortlistTopK, tokens);
+                        matrix(layout, DType::FP32, ops::kDFlash2ProposalShortlistTopK, tokens);
+                        matrix(layout, DType::I32, ops::kDFlash2SelectorTopK, tokens * 2);
+                        matrix(layout, DType::FP32, ops::kDFlash2SelectorTopK, tokens * 2);
+                    }
                     matrix(layout, DType::I32, DFlashConfig::selector_top_k, tokens);
                     matrix(layout, DType::FP32, DFlashConfig::selector_top_k, tokens);
                     matrix(layout, DType::BF16, DFlashConfig::selector_rank, tokens);

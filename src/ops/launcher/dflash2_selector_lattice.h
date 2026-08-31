@@ -11,6 +11,14 @@ namespace ninfer::ops::detail {
 void dflash2_select_candidates_launch(const Tensor& logits, Tensor& out_ids, Tensor& out_values,
                                       cudaStream_t stream);
 
+void dflash2_select_candidates_wide_launch(const Tensor& logits, Tensor& out_ids,
+                                           Tensor& out_values, Tensor& scratch_ids,
+                                           Tensor& scratch_values, cudaStream_t stream);
+
+void dflash2_reduce_scored_candidates_launch(const Tensor& candidate_ids, const Tensor& scores,
+                                            Tensor& out_ids, Tensor& out_values,
+                                            cudaStream_t stream);
+
 void dflash2_score_fp8_candidates_launch(const Tensor& hidden, const Weight& weight,
                                          const Tensor& candidate_ids, Tensor& out_values,
                                          cudaStream_t stream);

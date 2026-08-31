@@ -11,6 +11,9 @@ namespace ninfer::ops {
 // Fixed DFlash2 candidate-selector geometry (the 27B checkpoint): top-16
 // candidates per draft position, 256-dimensional codebooks.
 inline constexpr std::int32_t kDFlash2SelectorTopK = 16;
+// The optimized private proposal head can cheaply retain a wider shortlist before sparse target
+// rescoring. The selector lattice itself remains the checkpoint-defined top-16 contract.
+inline constexpr std::int32_t kDFlash2ProposalShortlistTopK = 32;
 inline constexpr std::int32_t kDFlash2SelectorRank = 256;
 // The packed lattice has no semantic payload beyond candidate ids and the
 // predecessor/successor score matrix.  Keeping this width explicit lets the
@@ -38,7 +41,20 @@ void dflash2_select_candidates(const Tensor& logits, Tensor& out_ids, Tensor& ou
                                cudaStream_t stream);
 
 /**
- * Score an existing top-16 candidate list directly against a row-scaled FP8 output head.
+ * Select a wider deterministic shortlist for the private optimized proposal head.
+ * `scratch_ids` and `scratch_values` are compact [16, 2T] staging buffers owned by the caller;
+ * they let both scans use the low-register K16 selector before the final [32, T] pack.
+ */
+void dflash2_select_candidates_wide(const Tensor& logits, Tensor& out_ids, Tensor& out_values,
+                                    Tensor& scratch_ids, Tensor& scratch_values,
+                                    cudaStream_t stream);
+
+/** Reduce a scored candidate list to the deterministic top-16 selector contract. */
+void dflash2_reduce_scored_candidates(const Tensor& candidate_ids, const Tensor& scores,
+                                      Tensor& out_ids, Tensor& out_values, cudaStream_t stream);
+
+/**
+ * Score an existing candidate list directly against a row-scaled FP8 output head.
  *
  * This is the sparse companion to the full vocabulary projection used by the optimized
  * proposal route: only the selected rows are read, and the result is rounded to the same BF16
@@ -47,8 +63,9 @@ void dflash2_select_candidates(const Tensor& logits, Tensor& out_ids, Tensor& ou
  *
  *   out_values[s, t] = BF16(FP8_row(candidate_ids[s, t]) dot hidden[:, t])
  *
- * `hidden` is BF16 [K,T], `candidate_ids` is I32 [16,T], `out_values` is FP32 [16,T], and the
- * FP8 weight must use the validated row-scale layout. The operation performs no full-vocabulary
+ * `hidden` is BF16 [K,T], `candidate_ids` is I32 [C,T], `out_values` is FP32 [C,T], and C is
+ * positive (the optimized shortlist uses C=32 while the normal selector uses C=16). The FP8
+ * weight must use the validated row-scale layout. The operation performs no full-vocabulary
  * materialization and requires no workspace.
  */
 void dflash2_score_fp8_candidates(const Tensor& hidden, const Weight& weight,

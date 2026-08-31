@@ -58,10 +58,13 @@ __device__ float sel_key_value(unsigned long long key) {
     return __uint_as_float(u);
 }
 
+template <std::int32_t TopK, std::int32_t LocalTopK, std::int32_t OutputStride,
+          std::int32_t OutputOffset, bool ExcludeTopK>
 __launch_bounds__(kSelThreads, 1) __global__ void dflash2_select_candidates_kernel(
     const __nv_bfloat16* __restrict__ logits, std::int32_t vocab, std::int32_t tokens,
-    std::int32_t* __restrict__ out_ids, float* __restrict__ out_values) {
-    constexpr std::int32_t k = kDFlash2SelectorTopK;
+    const std::int32_t* __restrict__ exclude_ids, std::int32_t* __restrict__ out_ids,
+    float* __restrict__ out_values) {
+    constexpr std::int32_t k = TopK;
     (void)tokens;
 
     const std::int32_t t = blockIdx.x;
@@ -69,24 +72,33 @@ __launch_bounds__(kSelThreads, 1) __global__ void dflash2_select_candidates_kern
 
     // Per-thread private top-k.  Keep the logits and ids while scanning; the
     // 64-bit value/id key is only needed for the survivors that enter the
-    // shared merge.  This keeps the hot vocabulary pass to FP32 comparisons
+    // shared merge. This keeps the hot vocabulary pass to FP32 comparisons
     // and retains deterministic lower-id ordering for equal logits.
-    float my_val[k];
-    std::int32_t my_id[k];
+    float my_val[LocalTopK];
+    std::int32_t my_id[LocalTopK];
     std::int32_t n_real = 0;
 #pragma unroll
-    for (std::int32_t i = 0; i < k; ++i) {
+    for (std::int32_t i = 0; i < LocalTopK; ++i) {
         my_val[i] = __uint_as_float(0xff800000u);  // -inf
         my_id[i] = 0;
     }
     for (std::int32_t id = threadIdx.x; id < vocab; id += kSelThreads) {
+        if constexpr (ExcludeTopK) {
+            bool excluded = false;
+#pragma unroll
+            for (std::int32_t i = 0; i < kDFlash2SelectorTopK; ++i) {
+                excluded = excluded || id == exclude_ids[static_cast<std::int64_t>(t) *
+                                                          OutputStride + i];
+            }
+            if (excluded) { continue; }
+        }
         const float v = __bfloat162float(col[id]);
-        const float tail_value = my_val[k - 1];
-        const std::int32_t tail_id = my_id[k - 1];
+        const float tail_value = my_val[LocalTopK - 1];
+        const std::int32_t tail_id = my_id[LocalTopK - 1];
         if (v < tail_value || (v == tail_value && id >= tail_id)) {
             continue;  // cannot enter the top-k
         }
-        std::int32_t slot = k - 1;
+        std::int32_t slot = LocalTopK - 1;
         while (slot > 0 &&
                (v > my_val[slot - 1] ||
                 (v == my_val[slot - 1] && id < my_id[slot - 1]))) {
@@ -100,7 +112,7 @@ __launch_bounds__(kSelThreads, 1) __global__ void dflash2_select_candidates_kern
     }
 
     // Merge the 32 private runs inside each warp. All lanes execute the
-    // shuffles; lane zero owns the small merged run in a 16-entry shared slice.
+    // shuffles; lane zero owns the small merged run in a TopK-entry shared slice.
     // Keys make the merge order identical to the final output order while
     // avoiding a second per-thread register array.
     __shared__ unsigned long long warp_keys[kSelWarps * k];
@@ -112,7 +124,7 @@ __launch_bounds__(kSelThreads, 1) __global__ void dflash2_select_candidates_kern
         for (std::int32_t i = 0; i < k; ++i) { warp_keys[warp_base + i] = 0; }
     }
 #pragma unroll
-    for (std::int32_t i = 0; i < k; ++i) {
+    for (std::int32_t i = 0; i < LocalTopK; ++i) {
         for (std::int32_t source = 0; source < 32; ++source) {
             const float value = __shfl_sync(0xffffffffu, my_val[i], source);
             const std::int32_t id = __shfl_sync(0xffffffffu, my_id[i], source);
@@ -133,7 +145,7 @@ __launch_bounds__(kSelThreads, 1) __global__ void dflash2_select_candidates_kern
 
     __syncthreads();
 
-    // The final run contains only 16*16 entries, so one lane can select the
+    // The final run contains only 16*TopK entries, so one lane can select the
     // ordered winners without any further block-wide synchronization.
     if (threadIdx.x == 0) {
         constexpr std::int32_t kWarpCandidates = kSelWarps * k;
@@ -149,14 +161,16 @@ __launch_bounds__(kSelThreads, 1) __global__ void dflash2_select_candidates_kern
                 }
             }
             if (best_index >= 0) {
-                out_ids[static_cast<std::int64_t>(t) * k + winner] = static_cast<std::int32_t>(
+                out_ids[static_cast<std::int64_t>(t) * OutputStride + OutputOffset + winner] =
+                    static_cast<std::int32_t>(
                     0x7fffffffu - static_cast<unsigned>(best_key));
-                out_values[static_cast<std::int64_t>(t) * k + winner] =
+                out_values[static_cast<std::int64_t>(t) * OutputStride + OutputOffset + winner] =
                     sel_key_value(best_key);
                 warp_keys[best_index] = 0;
             } else {
-                out_ids[static_cast<std::int64_t>(t) * k + winner] = 0;
-                out_values[static_cast<std::int64_t>(t) * k + winner] = 0.0f;
+                out_ids[static_cast<std::int64_t>(t) * OutputStride + OutputOffset + winner] = 0;
+                out_values[static_cast<std::int64_t>(t) * OutputStride + OutputOffset + winner] =
+                    0.0f;
             }
         }
     }
@@ -275,12 +289,71 @@ __global__ void dflash2_trace_path_kernel(const float* __restrict__ lattice,
 
 } // namespace
 
-void dflash2_select_candidates_launch(const Tensor& logits, Tensor& out_ids, Tensor& out_values,
-                                      cudaStream_t stream) {
+template <std::int32_t TopK>
+void dflash2_select_candidates_launch_impl(const Tensor& logits, Tensor& out_ids,
+                                           Tensor& out_values, cudaStream_t stream) {
     const std::int32_t tokens = logits.ne[1];
     const std::int32_t vocab = logits.ne[0];
-    dflash2_select_candidates_kernel<<<tokens, kSelThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), vocab, tokens,
+    dflash2_select_candidates_kernel<TopK, TopK, TopK, 0, false>
+        <<<tokens, kSelThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), vocab, tokens, nullptr,
+        static_cast<std::int32_t*>(out_ids.data), static_cast<float*>(out_values.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dflash2_select_candidates_launch(const Tensor& logits, Tensor& out_ids, Tensor& out_values,
+                                      cudaStream_t stream) {
+    dflash2_select_candidates_launch_impl<kDFlash2SelectorTopK>(logits, out_ids, out_values,
+                                                                stream);
+}
+
+__global__ void dflash2_pack_wide_candidates_kernel(
+    const std::int32_t* __restrict__ scratch_ids, const float* __restrict__ scratch_values,
+    std::int32_t tokens, std::int32_t* __restrict__ out_ids, float* __restrict__ out_values) {
+    const std::int32_t flat = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    const std::int32_t count = tokens * kDFlash2SelectorTopK;
+    if (flat >= count) { return; }
+    const std::int32_t token = flat / kDFlash2SelectorTopK;
+    const std::int32_t slot = flat % kDFlash2SelectorTopK;
+    const std::int64_t source_first = flat;
+    const std::int64_t source_second = static_cast<std::int64_t>(count) + flat;
+    const std::int64_t destination =
+        static_cast<std::int64_t>(token) * kDFlash2ProposalShortlistTopK;
+    out_ids[destination + slot] = scratch_ids[source_first];
+    out_ids[destination + kDFlash2SelectorTopK + slot] = scratch_ids[source_second];
+    out_values[destination + slot] = scratch_values[source_first];
+    out_values[destination + kDFlash2SelectorTopK + slot] = scratch_values[source_second];
+}
+
+void dflash2_select_candidates_wide_launch(const Tensor& logits, Tensor& out_ids,
+                                           Tensor& out_values, Tensor& scratch_ids,
+                                           Tensor& scratch_values, cudaStream_t stream) {
+    // Keep the local per-thread heap and output stride at 16 entries. A monolithic K32 scan, or
+    // even a K16 scan compiled for a 32-wide output, spills heavily on SM120. Two compact K16
+    // scans preserve a deterministic high-recall top-32 set; a tiny pack kernel materializes the
+    // public layout. The first 16 are exact; the low-register tail is intentionally speculative.
+    const std::int32_t tokens = logits.ne[1];
+    const std::int32_t vocab = logits.ne[0];
+    dflash2_select_candidates_kernel<kDFlash2SelectorTopK, kDFlash2SelectorTopK,
+                                     kDFlash2SelectorTopK, 0, false>
+        <<<tokens, kSelThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), vocab, tokens, nullptr,
+            static_cast<std::int32_t*>(scratch_ids.data), static_cast<float*>(scratch_values.data));
+    CUDA_CHECK(cudaGetLastError());
+    const std::int64_t compact_offset =
+        static_cast<std::int64_t>(kDFlash2SelectorTopK) * tokens;
+    dflash2_select_candidates_kernel<kDFlash2SelectorTopK, 4, kDFlash2SelectorTopK, 0, true>
+        <<<tokens, kSelThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), vocab, tokens,
+            static_cast<const std::int32_t*>(scratch_ids.data),
+            static_cast<std::int32_t*>(scratch_ids.data) + compact_offset,
+            static_cast<float*>(scratch_values.data) + compact_offset);
+    CUDA_CHECK(cudaGetLastError());
+    const std::int32_t blocks =
+        (tokens * kDFlash2SelectorTopK + kSelThreads - 1) / kSelThreads;
+    dflash2_pack_wide_candidates_kernel<<<blocks, kSelThreads, 0, stream>>>(
+        static_cast<const std::int32_t*>(scratch_ids.data),
+        static_cast<const float*>(scratch_values.data), tokens,
         static_cast<std::int32_t*>(out_ids.data), static_cast<float*>(out_values.data));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -293,15 +366,15 @@ __global__ void dflash2_score_fp8_candidates_kernel(
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
     const __nv_bfloat16* __restrict__ row_scales, const std::int32_t* __restrict__ candidate_ids,
     float* __restrict__ out_values, std::int32_t n, std::int32_t input_rows,
-    std::int32_t tokens) {
-    constexpr std::int32_t k = kDFlash2SelectorTopK;
+    std::int32_t candidate_count, std::int32_t tokens) {
     const std::int32_t flat = static_cast<std::int32_t>(blockIdx.x);
-    const std::int32_t slot = flat % k;
-    const std::int32_t token = flat / k;
+    const std::int32_t slot = flat % candidate_count;
+    const std::int32_t token = flat / candidate_count;
     if (token >= tokens) { return; }
 
     const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x) & 31;
-    const std::int32_t row = candidate_ids[static_cast<std::int64_t>(token) * k + slot];
+    const std::int32_t row =
+        candidate_ids[static_cast<std::int64_t>(token) * candidate_count + slot];
     float sum = 0.0F;
     if (row >= 0 && row < n) {
         const auto* codes = weight_codes + static_cast<std::int64_t>(row) * input_rows;
@@ -320,7 +393,7 @@ __global__ void dflash2_score_fp8_candidates_kernel(
     sum = warp_reduce_sum(sum);
     if (lane == 0) {
         const float scaled = row >= 0 && row < n ? sum * __bfloat162float(row_scales[row]) : 0.0F;
-        out_values[static_cast<std::int64_t>(token) * k + slot] =
+        out_values[static_cast<std::int64_t>(token) * candidate_count + slot] =
             __bfloat162float(__float2bfloat16_rn(scaled));
     }
 }
@@ -329,12 +402,73 @@ void dflash2_score_fp8_candidates_launch(const Tensor& hidden, const Weight& wei
                                          const Tensor& candidate_ids, Tensor& out_values,
                                          cudaStream_t stream) {
     const std::int32_t tokens = hidden.ne[1];
-    dflash2_score_fp8_candidates_kernel<<<tokens * kDFlash2SelectorTopK, 32, 0, stream>>>(
+    const std::int32_t candidate_count = candidate_ids.ne[0];
+    dflash2_score_fp8_candidates_kernel<<<tokens * candidate_count, 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(hidden.data),
         static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const __nv_bfloat16*>(weight.scales),
         static_cast<const std::int32_t*>(candidate_ids.data), static_cast<float*>(out_values.data),
-        weight.n, weight.k, tokens);
+        weight.n, weight.k, candidate_count, tokens);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// The private head shortlist is intentionally wider than the selector contract. After sparse
+// target rescoring, one small CTA per token keeps the target-ranked top-16 rows for the existing
+// predecessor/successor lattice. This is only a 32-entry reduction and never revisits the full
+// vocabulary.
+__global__ void dflash2_reduce_scored_candidates_kernel(
+    const std::int32_t* __restrict__ candidate_ids, const float* __restrict__ scores,
+    std::int32_t candidate_count, std::int32_t tokens, std::int32_t* __restrict__ out_ids,
+    float* __restrict__ out_values) {
+    constexpr std::int32_t k = kDFlash2SelectorTopK;
+    const std::int32_t token = static_cast<std::int32_t>(blockIdx.x);
+    if (token >= tokens || threadIdx.x != 0) { return; }
+
+    std::int32_t chosen[k];
+#pragma unroll
+    for (std::int32_t winner = 0; winner < k; ++winner) { chosen[winner] = -1; }
+
+    for (std::int32_t winner = 0; winner < k; ++winner) {
+        float best_value = __uint_as_float(0xff800000u);
+        std::int32_t best_id = 0x7fffffff;
+        std::int32_t best_slot = -1;
+        for (std::int32_t slot = 0; slot < candidate_count; ++slot) {
+            bool already_chosen = false;
+#pragma unroll
+            for (std::int32_t previous = 0; previous < k; ++previous) {
+                already_chosen = already_chosen || chosen[previous] == slot;
+            }
+            if (already_chosen) { continue; }
+            const float value = scores[static_cast<std::int64_t>(token) * candidate_count + slot];
+            const std::int32_t id =
+                candidate_ids[static_cast<std::int64_t>(token) * candidate_count + slot];
+            if (best_slot < 0 || value > best_value ||
+                (value == best_value && id < best_id)) {
+                best_value = value;
+                best_id = id;
+                best_slot = slot;
+            }
+        }
+        if (best_slot >= 0) {
+            chosen[winner] = best_slot;
+            out_ids[static_cast<std::int64_t>(token) * k + winner] = best_id;
+            out_values[static_cast<std::int64_t>(token) * k + winner] = best_value;
+        } else {
+            out_ids[static_cast<std::int64_t>(token) * k + winner] = 0;
+            out_values[static_cast<std::int64_t>(token) * k + winner] = 0.0F;
+        }
+    }
+}
+
+void dflash2_reduce_scored_candidates_launch(const Tensor& candidate_ids, const Tensor& scores,
+                                             Tensor& out_ids, Tensor& out_values,
+                                             cudaStream_t stream) {
+    const std::int32_t tokens = candidate_ids.ne[1];
+    const std::int32_t candidate_count = candidate_ids.ne[0];
+    dflash2_reduce_scored_candidates_kernel<<<tokens, 32, 0, stream>>>(
+        static_cast<const std::int32_t*>(candidate_ids.data), static_cast<const float*>(scores.data),
+        candidate_count, tokens, static_cast<std::int32_t*>(out_ids.data),
+        static_cast<float*>(out_values.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
