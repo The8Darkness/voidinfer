@@ -26,11 +26,31 @@ struct OscarMixedKernelResources {
     int fused_max_threads = 0;
 };
 
+// D4.6's fixed production configuration is retained as a named baseline. D4.7B uses the
+// adaptive sentinel below in the production caller and selects one of the supported values at
+// launch time. An explicit supported value remains useful to the direct CUDA qualification and
+// benchmark harnesses; it does not change cache representation or attention arithmetic.
 inline constexpr int kOscarMixedFusedDecodeSplits = 4;
+inline constexpr int kOscarMixedFusedDecodeAdaptiveSplits = 0;
+inline constexpr int kOscarMixedFusedDecodeMaxSplits = 64;
+
+[[nodiscard]] constexpr std::size_t kOscarMixedFusedDecodeWorkspaceBytesForSplits(
+    int split_count) noexcept {
+    return static_cast<std::size_t>(split_count * 4 * 6 * 256 + split_count * 4 * 6 * 2) *
+           sizeof(float);
+}
+
+// Allocated once per resident cache and reused by all decode calls. This is intentionally sized
+// for the largest production policy value so adaptive dispatch never allocates in the hot loop.
 inline constexpr std::size_t kOscarMixedFusedDecodeWorkspaceBytes =
-    static_cast<std::size_t>(kOscarMixedFusedDecodeSplits * 4 * 6 * 256 +
-                             kOscarMixedFusedDecodeSplits * 4 * 6 * 2) *
-    sizeof(float);
+    kOscarMixedFusedDecodeWorkspaceBytesForSplits(kOscarMixedFusedDecodeMaxSplits);
+
+inline constexpr std::size_t kOscarMixedFusedDecodeD46WorkspaceBytes =
+    kOscarMixedFusedDecodeWorkspaceBytesForSplits(kOscarMixedFusedDecodeSplits);
+
+// Return the production split count for a visible logical sequence length. The implementation is
+// intentionally small and deterministic; thresholds are qualified by the D4.7B report.
+int oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(std::int32_t visible_tokens);
 
 // Persistent device-side cache view used by the D4.4 resident path.  Historical rows remain
 // packed INT2 plus FP32 metadata; prefix/recent rows remain BF16.  The view is intentionally
@@ -100,8 +120,10 @@ void oscar_int2_g128_mixed_attention_launch_fused_batch_ring(
     float attention_scale, float* output, cudaStream_t stream);
 
 // Split-KV decode variant. Each split independently computes online-softmax partials over a
-// disjoint logical history interval; a fixed-size merge combines those partials. The workspace
-// is constant-sized and contains no history-proportional score/probability tensor.
+// disjoint logical history interval; a fixed-size merge combines those partials. Passing zero for
+// split_count selects the production context-adaptive policy. Passing a supported nonzero value
+// is reserved for qualification/benchmark control. The workspace is constant-sized and contains
+// no history-proportional score/probability tensor.
 void oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
     const float* q_rotated, const std::uint16_t* prefix_k_bf16,
     const std::uint16_t* prefix_v_bf16, std::int32_t prefix_tokens,

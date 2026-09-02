@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
@@ -642,11 +643,11 @@ constexpr std::size_t kFusedDecodeSharedBytes =
                               kGqa * kFusedDecodeTokenTile + 4 * kGqa) *
     sizeof(float);
 
-constexpr int kFusedDecodeSplits = kOscarMixedFusedDecodeSplits;
+constexpr int kFusedDecodeMaxSplits = kOscarMixedFusedDecodeMaxSplits;
 constexpr std::size_t kFusedDecodePartialValues =
-    static_cast<std::size_t>(kFusedDecodeSplits) * kKVHeads * kGqa * kHeadDim;
+    static_cast<std::size_t>(kFusedDecodeMaxSplits) * kKVHeads * kGqa * kHeadDim;
 constexpr std::size_t kFusedDecodePartialRows =
-    static_cast<std::size_t>(kFusedDecodeSplits) * kKVHeads * kGqa;
+    static_cast<std::size_t>(kFusedDecodeMaxSplits) * kKVHeads * kGqa;
 static_assert(kFusedDecodePartialValues * sizeof(float) +
                       2 * kFusedDecodePartialRows * sizeof(float) ==
                   kOscarMixedFusedDecodeWorkspaceBytes,
@@ -660,7 +661,8 @@ __global__ void oscar_mixed_fused_decode_split_kernel(
     const std::uint16_t* __restrict__ prefix_v,
     const std::uint8_t* __restrict__ historical_v_packed,
     const float* __restrict__ historical_v_metadata, const std::uint16_t* __restrict__ recent_v,
-    int total_tokens, int query_token, float attention_scale, float* __restrict__ workspace) {
+    int total_tokens, int query_token, int split_count, float attention_scale,
+    float* __restrict__ workspace) {
     extern __shared__ float shared[];
     constexpr int kQueryValues = kGqa * kHeadDim;
     constexpr int kTileValues = kFusedDecodeTokenTile * kHeadDim;
@@ -686,8 +688,8 @@ __global__ void oscar_mixed_fused_decode_split_kernel(
     __syncthreads();
 
     const int maximum_visible = min(total_tokens, query_token + 1);
-    const int split_start = (maximum_visible * split_index) / kFusedDecodeSplits;
-    const int split_end = (maximum_visible * (split_index + 1)) / kFusedDecodeSplits;
+    const int split_start = (maximum_visible * split_index) / split_count;
+    const int split_end = (maximum_visible * (split_index + 1)) / split_count;
     float accum[kGqa] = {};
     for (int tile_start = split_start; tile_start < split_end;
          tile_start += kFusedDecodeTokenTile) {
@@ -796,6 +798,7 @@ __global__ void oscar_mixed_fused_decode_split_kernel(
 }
 
 __global__ void oscar_mixed_fused_decode_merge_kernel(const float* __restrict__ workspace,
+                                                      int split_count,
                                                       float* __restrict__ output) {
     const int kv_head = static_cast<int>(blockIdx.x);
     const int dimension = static_cast<int>(threadIdx.x);
@@ -803,13 +806,13 @@ __global__ void oscar_mixed_fused_decode_merge_kernel(const float* __restrict__ 
     const float* partial_l = partial_m + kFusedDecodePartialRows;
     for (int query_group = 0; query_group < kGqa; ++query_group) {
         float maximum = -3.402823466e+38F;
-        for (int split = 0; split < kFusedDecodeSplits; ++split) {
+        for (int split = 0; split < split_count; ++split) {
             const std::size_t row = static_cast<std::size_t>(split) * kKVHeads + kv_head;
             maximum = fmaxf(maximum, partial_m[row * kGqa + query_group]);
         }
         float total_l = 0.0F;
         float total_value = 0.0F;
-        for (int split = 0; split < kFusedDecodeSplits; ++split) {
+        for (int split = 0; split < split_count; ++split) {
             const std::size_t row = static_cast<std::size_t>(split) * kKVHeads + kv_head;
             const float scale = expf(partial_m[row * kGqa + query_group] - maximum);
             total_l += partial_l[row * kGqa + query_group] * scale;
@@ -1173,6 +1176,12 @@ void oscar_int2_g128_mixed_attention_launch_fused_batch_ring(
     CUDA_CHECK(cudaGetLastError());
 }
 
+int oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(std::int32_t visible_tokens) {
+    if (visible_tokens <= 512) return 16;
+    if (visible_tokens <= 8192) return 32;
+    return 64;
+}
+
 void oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
     const float* q_rotated, const std::uint16_t* prefix_k_bf16,
     const std::uint16_t* prefix_v_bf16, std::int32_t prefix_tokens,
@@ -1186,12 +1195,22 @@ void oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
         prefix_tokens < 0 || prefix_tokens > kPrefixTokens || historical_tokens < 0 ||
         recent_tokens < 0 || recent_tokens > kRecentTokens || recent_ring_head < 0 ||
         recent_ring_head >= kRecentTokens || query_token < 0 ||
-        split_count != kFusedDecodeSplits) {
+        (split_count != kOscarMixedFusedDecodeAdaptiveSplits && split_count != 1 &&
+         split_count != 2 && split_count != 4 && split_count != 8 && split_count != 16 &&
+         split_count != 32 && split_count != 64)) {
         throw std::invalid_argument("OSCAR split fused decode arguments are invalid");
     }
     const int total_tokens = prefix_tokens + historical_tokens + recent_tokens;
     if (total_tokens <= 0 || query_token >= total_tokens) {
         throw std::invalid_argument("OSCAR split fused decode extent is invalid");
+    }
+    const int maximum_visible = std::min(total_tokens, query_token + 1);
+    const int selected_splits = split_count == kOscarMixedFusedDecodeAdaptiveSplits
+                                    ? oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
+                                          maximum_visible)
+                                    : split_count;
+    if (selected_splits < 1 || selected_splits > kFusedDecodeMaxSplits) {
+        throw std::logic_error("OSCAR adaptive fused decode selected an invalid split count");
     }
     static std::once_flag fused_decode_attribute_once;
     std::call_once(fused_decode_attribute_once, [] {
@@ -1200,15 +1219,15 @@ void oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(kFusedDecodeSharedBytes)));
     });
-    const dim3 split_grid(kKVHeads, static_cast<unsigned>(split_count), 1u);
+    const dim3 split_grid(kKVHeads, static_cast<unsigned>(selected_splits), 1u);
     oscar_mixed_fused_decode_split_kernel<<<split_grid, kThreads, kFusedDecodeSharedBytes, stream>>>(
         q_rotated, prefix_k_bf16, prefix_tokens, historical_k_packed, historical_k_metadata,
         historical_tokens, recent_k_bf16, recent_tokens, recent_ring_head, prefix_v_bf16,
         historical_v_packed, historical_v_metadata, recent_v_bf16, total_tokens, query_token,
-        attention_scale, partial_workspace);
+        selected_splits, attention_scale, partial_workspace);
     CUDA_CHECK(cudaGetLastError());
     oscar_mixed_fused_decode_merge_kernel<<<static_cast<unsigned>(kKVHeads), kThreads, 0,
-                                            stream>>>(partial_workspace, output);
+                                            stream>>>(partial_workspace, selected_splits, output);
     CUDA_CHECK(cudaGetLastError());
 }
 

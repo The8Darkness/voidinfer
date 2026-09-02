@@ -1148,7 +1148,7 @@ void OscarLiveMixedReferenceCache::attention_gpu(std::int32_t model_layer,
                 view.recent_k_bf16, view.recent_v_bf16,
                 static_cast<std::int32_t>(recent), static_cast<std::int32_t>(resident.recent_head),
                 static_cast<std::int32_t>(query_token),
-                ::ninfer::ops::detail::kOscarMixedFusedDecodeSplits, 0.0625F,
+                ::ninfer::ops::detail::kOscarMixedFusedDecodeAdaptiveSplits, 0.0625F,
                 static_cast<float*>(gpu_resident_fused_decode_workspace_.p),
                 static_cast<float*>(rotated_output.data), stream);
             ++profile_.gpu_attention_calls;

@@ -329,7 +329,7 @@ struct DeviceMixed {
           output(static_cast<std::size_t>(kQHeads) * kHeadDim),
           fused_output(static_cast<std::size_t>(kQHeads) * kHeadDim),
           fused_decode_workspace(
-              ninfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes),
+              ninfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes / sizeof(float)),
           history_scores(static_cast<std::size_t>(kQHeads) * fixture.historical),
           history_softmax(static_cast<std::size_t>(kQHeads) * fixture.historical) {
         upload(q.data, fixture.q);
@@ -368,7 +368,7 @@ void launch_fused(const MixedFixture& fixture, DeviceMixed& device) {
         device.historical_k_packed.data, device.historical_k_metadata.data,
         device.historical_v_packed.data, device.historical_v_metadata.data, fixture.historical,
         device.recent_k.data, device.recent_v.data, fixture.recent, 0,
-        fixture.context - 1, ninfer::ops::detail::kOscarMixedFusedDecodeSplits,
+        fixture.context - 1, ninfer::ops::detail::kOscarMixedFusedDecodeAdaptiveSplits,
         kAttentionScale, device.fused_decode_workspace.data, device.fused_output.data, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -576,12 +576,21 @@ int main() {
                   << " softmax_smem=" << resources.softmax_static_shared_bytes << " av_smem="
                   << resources.av_static_shared_bytes << " fused_regs=" << resources.fused_registers
                   << " fused_dynamic_smem=" << resources.fused_dynamic_shared_bytes << "\n";
+        require(ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(321) == 16 &&
+                    ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(512) == 16 &&
+                    ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(1024) == 32 &&
+                    ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(8192) == 32 &&
+                    ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(16384) == 64,
+                "adaptive fused decode split policy changed unexpectedly");
 
         // Boundaries: no historical tier, first historical row, aging/partial historical page,
         // and the required mixed contexts. The cache-backed contexts also exercise the existing
         // page/slot representation rather than a synthetic contiguous-only source.
         for (const int context : {64, 65, 320, 321, 322, 332, 512, 2048, 4096}) {
             run_parity(make_fixture(context, 3), context == 321 || context == 332 || context == 512);
+        }
+        for (const int context : {8192, 16384, 32768}) {
+            run_parity(make_fixture(context, 3), false);
         }
 
         for (const std::uint32_t layer : {35U, 63U}) run_parity(make_fixture(332, layer), true);
@@ -608,8 +617,8 @@ int main() {
                      " cache_tiers=64/192..199/256 PASS\n";
 
         std::cout << "context,mixed_ms,fused_split_merge_ms,historical_ms,bf16_window_ms,cpu_scalar_ms,speedup"
-                     ",mixed_us_per_history_token,effective_GBps,workspace_bytes\n";
-        for (const int context : {512, 2048, 4096, 8192, 16384, 32768}) {
+                     ",mixed_us_per_history_token,effective_GBps,workspace_bytes,requested_splits,policy_splits\n";
+        for (const int context : {321, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
             const MixedFixture fixture = make_fixture(context, 3);
             DeviceMixed device(fixture);
             launch_mixed(fixture, device);
@@ -632,11 +641,16 @@ int main() {
             const double speedup = cpu_ms / mixed_ms;
             const double traffic = static_cast<double>(mixed_traffic_bytes(fixture));
             const double bandwidth = traffic / (fused_ms * 1.0e6);
+            const int requested_splits = ninfer::ops::detail::kOscarMixedFusedDecodeAdaptiveSplits;
+            const int policy_splits =
+                ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
+                    fixture.context);
             std::cout << std::fixed << std::setprecision(6)
                       << context << ',' << mixed_ms << ',' << fused_ms << ',' << historical_ms << ',' << bf16_ms
                       << ',' << cpu_ms << ',' << speedup << ','
                       << (fixture.historical == 0 ? 0.0 : fused_ms * 1000.0 / fixture.historical)
-                      << ',' << bandwidth << ',' << mixed_workspace_bytes(fixture) << '\n';
+                      << ',' << bandwidth << ',' << mixed_workspace_bytes(fixture) << ','
+                      << requested_splits << ',' << policy_splits << '\n';
         }
         std::cout << "PASS: mixed BF16-prefix + OscarInt2G128-history + BF16-recent GPU path is "
                      "reference-correct and materially faster; fused decode includes split-KV and merge kernels\n";
