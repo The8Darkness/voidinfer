@@ -20,6 +20,9 @@ function(ninfer_add_test name)
   else()
     target_link_libraries(${name} PRIVATE ninfer_core)
   endif()
+  if("${arg_LIBRARIES}" MATCHES "ninfer_engine|ninfer_serve|ninfer_media_decode")
+    ninfer_copy_runtime_dlls(${name})
+  endif()
   if(arg_NEEDS_SOURCE_DIR)
     target_compile_definitions(${name} PRIVATE
       NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
@@ -69,6 +72,26 @@ ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_context_cost_test SOURCES test_context_cost.cpp)
 ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
+ninfer_add_test(ninfer_oscar_mixed_cache_layout_test
+  SOURCES test_oscar_mixed_cache_layout.cpp
+  LIBRARIES ninfer_core ninfer_ops)
+ninfer_add_test(ninfer_oscar_mixed_cache_aging_test
+  SOURCES test_oscar_mixed_cache_aging.cpp
+  LIBRARIES ninfer_core ninfer_ops)
+ninfer_add_test(ninfer_oscar_mixed_state_transitions_test
+  SOURCES test_oscar_mixed_state_transitions.cpp
+  LIBRARIES ninfer_core ninfer_ops)
+ninfer_add_test(ninfer_oscar_mixed_attention_reference_test
+  SOURCES test_oscar_mixed_attention_reference.cpp
+  LIBRARIES ninfer_core ninfer_ops)
+ninfer_add_test(ninfer_oscar_history_attention_test
+  SOURCES test_oscar_history_attention.cpp
+  LIBRARIES ninfer_core ninfer_ops)
+set_tests_properties(ninfer_oscar_history_attention_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_oscar_mixed_gpu_attention_test
+  SOURCES test_oscar_mixed_gpu_attention.cpp
+  LIBRARIES ninfer_core ninfer_ops)
+set_tests_properties(ninfer_oscar_mixed_gpu_attention_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -87,6 +110,9 @@ ninfer_add_test(ninfer_state_store_test
   LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES test_gdn_replay_records.cpp
+  LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_hierarchical_vericache_test
+  SOURCES test_hierarchical_vericache.cpp
   LIBRARIES ninfer_core)
 set_tests_properties(
   ninfer_artifact_materialization_test
@@ -139,6 +165,35 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_oscar_capture_test
+  SOURCES targets/qwen3_6_27b/test_oscar_capture.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_oscar_capture_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_6_27b_oscar_capture_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_oscar_runtime_test
+  SOURCES targets/qwen3_6_27b/test_oscar_runtime.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_oscar_runtime_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_6_27b_oscar_runtime_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_oscar_live_reference_validator
+  SOURCES targets/qwen3_6_27b/test_oscar_live_reference_validator.cpp
+  LIBRARIES ninfer_core ninfer_ops)
+ninfer_add_test(ninfer_qwen3_6_27b_model_load_probe
+  SOURCES targets/qwen3_6_27b/test_model_load_probe.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_model_load_probe PROPERTIES SKIP_RETURN_CODE 77)
+# The full OSCAR validator is intentionally fail-closed, but it must not be
+# benchmarked as a Debug scalar oracle. Keep these flags target-local so the
+# rest of the Debug developer build retains its normal diagnostics.
+if(MSVC)
+  target_compile_options(ninfer_qwen3_6_27b_oscar_live_reference_validator PRIVATE
+    /O2 /Ob3 /Oi /Ot /arch:AVX2 /fp:precise /UNDEBUG)
+else()
+  target_compile_options(ninfer_qwen3_6_27b_oscar_live_reference_validator PRIVATE
+    -O3 -mavx2 -fno-fast-math -ffp-contract=off)
+endif()
+target_compile_definitions(ninfer_qwen3_6_27b_oscar_live_reference_validator PRIVATE
+  NINFER_OSCAR_FULL_VALIDATION_OPTIMIZED=1)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)
@@ -245,6 +300,12 @@ ninfer_add_op_test(ninfer_softmax_attention_test
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES ops/test_sliding_window_attention.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_oscar_kv_test
+  SOURCES ops/test_oscar_kv.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_oscar_int2_g128_test
+  SOURCES ops/test_oscar_int2_g128.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_kv_cache_append_test
   SOURCES ops/test_kv_cache_append.cpp
   LIBRARIES ninfer_ops)
@@ -262,6 +323,9 @@ ninfer_add_op_test(ninfer_mtp_round_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES ops/test_speculative_round.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash2_test
+  SOURCES ops/test_dflash2.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)

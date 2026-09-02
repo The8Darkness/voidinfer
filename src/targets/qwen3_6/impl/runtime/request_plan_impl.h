@@ -125,9 +125,10 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 }
 
 std::uint32_t capture_identity_tag(SpeculativeBackend backend, ProposalHead proposal,
-                                   DType dtype) noexcept {
+                                   DType dtype, KvCacheStorage storage) noexcept {
     return static_cast<std::uint32_t>(backend) | (static_cast<std::uint32_t>(proposal) << 8U) |
-           (static_cast<std::uint32_t>(dtype) << 16U);
+           (static_cast<std::uint32_t>(dtype) << 16U) |
+           (static_cast<std::uint32_t>(storage) << 24U);
 }
 
 runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
@@ -322,7 +323,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     if (base->summary.publish_continuation) {
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
-            capture_identity_tag(speculative_backend, proposal_head, kv_dtype);
+            capture_identity_tag(speculative_backend, proposal_head, kv_dtype, kv_storage);
     }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
@@ -741,7 +742,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                      const LogicalKVPageStore& pages, std::uint32_t page_count,
                                      std::uint32_t contiguous_runs = 1) {
         if (page_count == 0) { return; }
-        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        const HostKVPageLayout layout =
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(pages)
+                : plan_host_kv_page_layout(pages.physical_pool().geometry());
         const TransferWork work =
             direction == runtime::ContextTransferDirection::DeviceToDevice
                 ? plan_device_kv_copy_work(layout, page_count)
@@ -960,7 +964,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 preparation = missing_source_pages + 1U;
                 if (!pages.host_resident(tail)) {
                     const std::size_t stride =
-                        plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+                        host_kv_extents != nullptr
+                            ? host_kv_extents->page_layout(pages).page_stride
+                            : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
                     if (stride > std::numeric_limits<std::size_t>::max() -
                                      retained_tail_added.host.kv_bytes) {
                         throw std::overflow_error("retained KV tail Host backup size overflow");
@@ -1070,7 +1076,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 throw std::logic_error("private COW tail has no restorable replica");
             }
             out.first  = 1;
-            out.second = plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            out.second = host_kv_extents != nullptr
+                             ? host_kv_extents->page_layout(pages).page_stride
+                             : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
             return out;
         };
     if (source != nullptr) {

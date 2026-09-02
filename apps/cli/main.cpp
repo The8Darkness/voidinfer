@@ -150,11 +150,36 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_stage("load", "engine construction", wall_seconds);
     print_stage("load", "artifact/materialize", load.load_seconds);
     print_stage("load", "host to device", load.upload_seconds);
+    print_stage("load", "reader open/map", load.reader_open_map_seconds);
+    print_stage("load", "directory parse", load.directory_parse_seconds);
+    print_stage("load", "directory validate", load.directory_validate_seconds);
+    print_stage("load", "direct file reads", load.direct_read_seconds);
+    print_stage("load", "device allocation", load.device_allocation_seconds);
+    print_stage("load", "host staging alloc", load.host_staging_allocation_seconds);
+    print_stage("load", "host resource copy", load.host_resource_copy_seconds);
+    print_stage("load", "H2D stream span", load.h2d_stream_seconds);
+    print_stage("load", "H2D active", load.h2d_active_seconds);
+    print_stage("load", "materialize sync", load.materialization_sync_seconds);
+    print_stage("load", "tensor binding", load.tensor_binding_seconds);
+    print_stage("load", "planner", load.planner_seconds);
+    print_stage("load", "instance init", load.instance_seconds);
+    print_stage("load", "startup sync", load.startup_sync_seconds);
     print_metric("target", load.target);
     print_metric("weights", load.weights_id);
     print_metric("artifact file read", format_bytes(load.artifact_bytes_read));
+    print_metric("direct read bytes", format_bytes(load.direct_read_bytes));
     print_metric("weight H2D", format_bytes(load.host_to_device_bytes));
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
+    print_metric("direct read requests", std::to_string(load.direct_read_requests));
+    print_metric("read request range",
+                 format_bytes(load.direct_read_min_bytes) + " .. " +
+                     format_bytes(load.direct_read_max_bytes));
+    print_metric("max read depth", std::to_string(load.direct_read_max_outstanding));
+    if (load.direct_read_seconds > 0.0) {
+        print_metric("direct read rate",
+                     format_rate(static_cast<double>(load.direct_read_bytes),
+                                 load.direct_read_seconds));
+    }
     print_metric("tensors/resources",
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
 }
@@ -281,6 +306,7 @@ int main(int argc, char** argv) {
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
+        engine_options.disable_dual_artifact_loading = cli.disable_dual_artifact_loading;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;

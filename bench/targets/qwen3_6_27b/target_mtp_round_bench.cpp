@@ -37,13 +37,22 @@ struct Options {
     int repetitions                = 10;
     std::uint32_t draft_tokens     = 5;
     ninfer::ProposalHead proposal  = ninfer::ProposalHead::Optimized;
+    ninfer::KvCacheStorage kv_cache = ninfer::KvCacheStorage::BFloat16;
     bool use_cuda_graph            = true;
+    bool hierarchical_vericache    = false;
+    bool host_tier_snapshots       = false;
+    std::uint32_t l1_to_l2_horizon  = 512;
+    std::uint32_t host_snapshot_horizon = 0;
 };
 
 void print_usage(const char* executable) {
     std::cout << "usage: " << executable
               << " [--artifact <model.ninfer>] [--device <id>] [--warmup <n>] [--reps <n>]"
                  " [--draft-tokens <1..5>] [--proposal-head full|optimized]"
+                 " [--kv-dtype bf16|vericache-nvfp4]"
+                 " [--hierarchical-vericache] [--vericache-host-snapshots]"
+                 " [--vericache-l1-horizon <256..2048>]"
+                 " [--vericache-host-snapshot-horizon <256..2048>]"
                  " [--no-cuda-graph]\n";
 }
 
@@ -76,8 +85,28 @@ Options parse_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--proposal-head must be full or optimized");
             }
+        } else if (argument == "--kv-dtype") {
+            const std::string_view dtype(value("--kv-dtype"));
+            if (dtype == "bf16") {
+                options.kv_cache = ninfer::KvCacheStorage::BFloat16;
+            } else if (dtype == "vericache-nvfp4") {
+                options.kv_cache = ninfer::KvCacheStorage::VeriCacheNvfp4;
+            } else {
+                throw std::invalid_argument("--kv-dtype must be bf16 or vericache-nvfp4");
+            }
         } else if (argument == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (argument == "--hierarchical-vericache") {
+            options.hierarchical_vericache = true;
+        } else if (argument == "--vericache-host-snapshots") {
+            options.hierarchical_vericache = true;
+            options.host_tier_snapshots = true;
+        } else if (argument == "--vericache-l1-horizon") {
+            options.l1_to_l2_horizon =
+                static_cast<std::uint32_t>(std::stoul(value("--vericache-l1-horizon")));
+        } else if (argument == "--vericache-host-snapshot-horizon") {
+            options.host_snapshot_horizon = static_cast<std::uint32_t>(
+                std::stoul(value("--vericache-host-snapshot-horizon")));
         } else if (argument == "-h" || argument == "--help") {
             print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_6_27b_mtp_round_bench");
             std::exit(0);
@@ -90,6 +119,14 @@ Options parse_options(int argc, char** argv) {
     if (options.repetitions <= 0) { throw std::invalid_argument("--reps must be positive"); }
     if (options.draft_tokens == 0 || options.draft_tokens > 5) {
         throw std::invalid_argument("--draft-tokens must be in [1,5]");
+    }
+    if (options.l1_to_l2_horizon < 256 || options.l1_to_l2_horizon > 2048) {
+        throw std::invalid_argument("--vericache-l1-horizon must be in [256,2048]");
+    }
+    if (options.host_snapshot_horizon != 0 &&
+        (options.host_snapshot_horizon < 256 || options.host_snapshot_horizon > 2048)) {
+        throw std::invalid_argument(
+            "--vericache-host-snapshot-horizon must be 0 or in [256,2048]");
     }
     return options;
 }
@@ -136,11 +173,23 @@ int run(const Options& options) {
                                                             2ULL * options.draft_tokens);
     engine.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(engine.max_context);
     engine.prefill_chunk       = 128;
-    engine.kv_cache            = ninfer::KvCacheStorage::BFloat16;
-    engine.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+    engine.kv_cache                 = options.kv_cache;
+    engine.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
+    engine.hierarchical_vericache.enabled = options.hierarchical_vericache;
+    engine.hierarchical_vericache.enable_host_tier_snapshots = options.host_tier_snapshots;
+    engine.hierarchical_vericache.l1_to_l2_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.l1_to_l2_min_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.l1_to_l2_max_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.host_snapshot_horizon = options.host_snapshot_horizon;
+    // The direct package benchmark does not pass through Engine option normalization. Keep
+    // no-host controls lightweight, while a short host-snapshot run has one active image and one
+    // spare plus enough typed KV space for the boundary-rotation experiment.
+    engine.context_cache.host_state_slots = options.host_tier_snapshots ? 2U : 0U;
+    engine.context_cache.host_kv_capacity_bytes =
+        options.host_tier_snapshots ? (512ULL << 20) : 0U;
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.artifact);
@@ -240,6 +289,17 @@ int run(const Options& options) {
     std::cout << "format,ninfer_qwen3_6_27b_mtp_round_bench_v1\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
     std::cout << "device," << device.props.name << '\n';
+    std::cout << "kv_cache,"
+              << (options.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 ? "vericache-nvfp4"
+                                                                                : "bf16")
+              << '\n';
+    std::cout << "hierarchical_vericache,"
+              << (options.hierarchical_vericache ? "true" : "false") << '\n';
+    std::cout << "vericache_host_tier_snapshots_enabled,"
+              << (options.host_tier_snapshots ? "true" : "false") << '\n';
+    std::cout << "vericache_l1_to_l2_horizon_configured," << options.l1_to_l2_horizon << '\n';
+    std::cout << "vericache_host_snapshot_horizon_configured," << options.host_snapshot_horizon
+              << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "proposal_head,"
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
@@ -252,6 +312,30 @@ int run(const Options& options) {
     std::cout << "mtp_round_max_ms," << *maximum << '\n';
     std::cout << "mean_licensed_tokens," << mean_licensed << '\n';
     std::cout << "accepted_draft_tokens," << stats.accepted_tokens << '\n';
+    ninfer::RuntimeStats vericache_stats;
+    program->populate_hierarchical_vericache_stats(vericache_stats);
+    std::cout << "vericache_l0_to_l1_horizon," << vericache_stats.vericache_l0_to_l1_horizon
+              << '\n';
+    std::cout << "vericache_l1_to_l2_horizon," << vericache_stats.vericache_l1_to_l2_horizon
+              << '\n';
+    std::cout << "vericache_exact_target_checks," << vericache_stats.vericache_exact_target_checks
+              << '\n';
+    std::cout << "vericache_host_tier_snapshots," << vericache_stats.vericache_host_tier_snapshots
+              << '\n';
+    std::cout << "vericache_host_tier_snapshot_bytes,"
+              << vericache_stats.vericache_host_tier_snapshot_bytes << '\n';
+    std::cout << "vericache_host_state_d2h_bytes,"
+              << vericache_stats.vericache_host_state_d2h_bytes << '\n';
+    std::cout << "vericache_host_kv_d2h_pages," << vericache_stats.vericache_host_kv_d2h_pages
+              << '\n';
+    std::cout << "vericache_host_kv_d2h_bytes," << vericache_stats.vericache_host_kv_d2h_bytes
+              << '\n';
+    std::cout << "vericache_host_kv_d2h_seconds,"
+              << vericache_stats.vericache_host_kv_d2h_seconds << '\n';
+    std::cout << "vericache_l0_bytes," << vericache_stats.vericache_l0_bytes << '\n';
+    std::cout << "vericache_l1_bytes," << vericache_stats.vericache_l1_bytes << '\n';
+    std::cout << "vericache_l2_bytes," << vericache_stats.vericache_l2_bytes << '\n';
+    std::cout << "vericache_l3_bytes," << vericache_stats.vericache_l3_bytes << '\n';
     return 0;
 }
 

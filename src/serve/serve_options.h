@@ -21,6 +21,7 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
+    bool disable_dual_artifact_loading = false;
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
@@ -41,9 +42,27 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
-    KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
-    SpeculativeOptions speculative;
+    // The experimental Qwen3.8 serving profile is the default on this research branch. Use
+    // --no-spec/--no-hierarchical-vericache to return to the stable non-speculative route.
+    KvCacheStorage kv_cache = KvCacheStorage::VeriCacheNvfp4;
+    SpeculativeOptions speculative{
+        .backend = SpeculativeBackend::DFlash,
+        .draft_tokens = 7,
+        .proposal_head = ProposalHead::Optimized,
+    };
     ContextCacheOptions context_cache;
+    // The upstream Engine API remains opt-in, but this research server enables the hierarchy by
+    // default. The Engine normalizes these values once at construction.
+    HierarchicalVeriCacheOptions hierarchical_vericache = [] {
+        HierarchicalVeriCacheOptions value;
+        value.enabled                    = true;
+        value.enable_host_tier_snapshots = true;
+        value.l0_bits                    = 2;
+        // The current host tier is an asynchronous persistence/checkpoint path. Keep its
+        // measured lower-DMA cadence separate from the future adaptive host verifier.
+        value.host_snapshot_horizon      = 2048;
+        return value;
+    }();
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;

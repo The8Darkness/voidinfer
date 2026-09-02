@@ -3,6 +3,7 @@
 #include "artifact/binder.h"
 #include "core/arena.h"
 #include "core/device.h"
+#include "ninfer/types.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +27,15 @@ struct MaterializationStats {
     std::uint64_t peak_staging_bytes      = 0;
     std::size_t tensor_count              = 0;
     std::size_t resource_count            = 0;
-    double upload_seconds                 = 0.0;
+    double upload_seconds                    = 0.0;
+    double device_allocation_seconds        = 0.0;
+    double host_staging_allocation_seconds  = 0.0;
+    double host_resource_copy_seconds       = 0.0;
+    double h2d_stream_seconds               = 0.0;
+    double h2d_active_seconds               = 0.0;
+    double synchronization_seconds         = 0.0;
+    std::uint32_t dual_max_parallel_reads  = 0;
+    double dual_direct_read_wall_seconds    = 0.0;
 };
 
 class MaterializedArtifact {
@@ -49,6 +58,9 @@ public:
 private:
     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
                                             DeviceContext&, LoadProgress*);
+    friend MaterializedArtifact materialize_dual(const Reader&, const Reader&,
+                                                  const MaterializationPlan&, DeviceContext&,
+                                                  ArtifactReadMode, LoadProgress*);
 
     struct ObjectStorage {
         void* device = nullptr;
@@ -62,5 +74,10 @@ private:
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  DeviceContext& device, LoadProgress* progress = nullptr);
+
+MaterializedArtifact materialize_dual(const Reader& primary, const Reader& secondary,
+                                      const MaterializationPlan& plan, DeviceContext& device,
+                                      ArtifactReadMode mode,
+                                      LoadProgress* progress = nullptr);
 
 } // namespace ninfer::artifact

@@ -4,6 +4,7 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/hierarchical_vericache.h"
 #include "targets/registry.h"
 
 #include <limits>
@@ -16,11 +17,46 @@
 namespace ninfer {
 namespace {
 
+std::filesystem::path discover_dual_artifact(const std::filesystem::path& primary) {
+    std::wstring primary_text = primary.wstring();
+    if (primary_text.size() < 3 || primary_text[1] != L':' ||
+        (primary_text[2] != L'\\' && primary_text[2] != L'/') ||
+        (primary_text[0] != L'C' && primary_text[0] != L'c' && primary_text[0] != L'D' &&
+         primary_text[0] != L'd')) {
+        return {};
+    }
+    const wchar_t alternate_drive =
+        primary_text[0] == L'C' || primary_text[0] == L'c' ? L'D' : L'C';
+    primary_text[0] = alternate_drive;
+    const std::filesystem::path candidate(primary_text);
+    std::error_code error;
+    return std::filesystem::is_regular_file(candidate, error) && !error ? candidate
+                                                                          : std::filesystem::path{};
+}
+
 EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
+    if (options.disable_dual_artifact_loading) {
+        if (options.artifact_read_mode != ArtifactReadMode::Single) {
+            throw std::invalid_argument(
+                "dual artifact loading cannot be enabled while the dual-source opt-out is set");
+        }
+        options.secondary_artifact_path.clear();
+    } else {
+        if (options.secondary_artifact_path.empty()) {
+            options.secondary_artifact_path = discover_dual_artifact(options.artifact_path);
+        }
+        if (!options.secondary_artifact_path.empty() &&
+            options.artifact_read_mode == ArtifactReadMode::Single) {
+            options.artifact_read_mode = ArtifactReadMode::DualDynamic;
+        }
+    }
+
+    options.hierarchical_vericache = runtime::normalize_hierarchical_vericache_options(
+        std::move(options.hierarchical_vericache));
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     if (!cache.enabled) {

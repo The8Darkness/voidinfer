@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/layout.h"
+#include "core/oscar_kv_layout.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime_api.h>
@@ -27,6 +28,8 @@ struct PagedKVLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    // Relevant to U8 OSCAR pages; BF16/other profiles retain the harmless default.
+    OscarKVLayout layout      = OscarKVLayout::Contiguous;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -40,6 +43,8 @@ struct PagedKVBatchLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    // Relevant to U8 OSCAR pages; BF16/other profiles retain the harmless default.
+    OscarKVLayout layout      = OscarKVLayout::Contiguous;
 };
 
 // A plane is storage-only. Target code assigns K/V/layer meaning to plane indices.
@@ -61,6 +66,7 @@ struct KVPageGeometry {
     std::uint32_t page_tokens            = kPagedKVPageSize;
     PagedKVPlaneOrder device_plane_order = PagedKVPlaneOrder::PageMajor;
     std::vector<KVPlaneGeometry> planes;
+    OscarKVLayout oscar_layout           = OscarKVLayout::Contiguous;
 
     friend bool operator==(const KVPageGeometry&, const KVPageGeometry&) = default;
 };

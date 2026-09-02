@@ -26,6 +26,9 @@ add_library(ninfer_core STATIC
   core/cyclic_kv_cache.cpp
   core/host_kv_arena.cpp
   core/paged_kv_cache.cpp
+  core/oscar_mixed_cache_layout.cpp
+  core/oscar_mixed_state_transitions.cpp
+  core/oscar_mixed_attention_reference.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
@@ -70,6 +73,10 @@ add_library(ninfer_ops STATIC
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
+  ops/launcher/dflash2_dynamic_conv.cu
+  ops/launcher/dflash2_qkv_proj.cu
+  ops/launcher/dflash2_predecessor_ids.cu
+  ops/launcher/dflash2_selector_lattice.cu
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
@@ -94,16 +101,21 @@ add_library(ninfer_ops STATIC
   ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
   ops/softmax_attention/dense/causal_cache/small_t.cu
   ops/softmax_attention/dense/causal_cache/small_t_fp8.cu
+  ops/softmax_attention/dense/causal_cache/nvfp4.cu
   ops/softmax_attention/dense/causal_cache/prompt.cu
   ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
   ops/softmax_attention/dense/packed/packed_softmax_attention.cpp
   ops/softmax_attention/dense/packed/launch.cu
   ops/softmax_attention/dense/context/context_softmax_attention.cpp
   ops/softmax_attention/dense/context/launch.cu
+  ops/softmax_attention/oscar_mixed/launch.cu
+  ops/softmax_attention/oscar_history/launch.cu
   ops/softmax_attention/sliding_window/sliding_window_attention.cpp
   ops/softmax_attention/sliding_window/launch.cu
   ops/kv_cache/append/kv_cache_append.cpp
   ops/kv_cache/append/launch.cu
+  ops/kv_cache/oscar_int2_g128.cpp
+  ops/kv_cache/oscar_conversion.cu
   # Gated DeltaNet Linear Attention core.
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp
@@ -165,6 +177,7 @@ add_library(ninfer_ops STATIC
   ops/linear/fp8/fp8_gemv.cu
   ops/linear/fp8/fp8_small_t.cu
   ops/linear/fp8/fp8_a16_mma.cu
+  ops/linear/fp8/fp8_a16_gemm_mma.cu
   ops/linear/fp8/fp8_a8.cu
   ops/linear/fp8/fp8_dispatch.cpp
   ops/linear/nvfp4/nvfp4_format.cpp
@@ -241,6 +254,10 @@ add_library(ninfer_ops STATIC
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
+  ops/wrapper/dflash2_dynamic_conv.cpp
+  ops/wrapper/dflash2_qkv_proj.cpp
+  ops/wrapper/dflash2_predecessor_ids.cpp
+  ops/wrapper/dflash2_selector_lattice.cpp
   ops/wrapper/embedding.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp

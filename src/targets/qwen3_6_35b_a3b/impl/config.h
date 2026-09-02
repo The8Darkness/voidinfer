@@ -70,6 +70,7 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 
 struct DFlashConfig {
     static constexpr bool supported        = true;
+    static constexpr bool is_v2            = false;
     static constexpr int layers            = 6;
     static constexpr int local_layers      = 5;
     static constexpr int feature_layers    = 8;
@@ -88,6 +89,18 @@ struct DFlashConfig {
     static constexpr float attention_scale = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{1,  6,  11, 16,
                                                                            22, 27, 32, 37};
+    // The common family planner is also compiled for this legacy DFlash1
+    // variant. Keep the v2-only geometry names available so its discarded
+    // compile-time branches remain well-formed; is_v2 keeps them inactive.
+    static constexpr int full_layers          = layers - local_layers;
+    static constexpr int conv_kernel_size     = 2;
+    static constexpr int conv_group_size      = 16;
+    static constexpr int conv_projection_rows =
+        2 * conv_kernel_size * (hidden / conv_group_size);
+    static constexpr int selector_rank  = 256;
+    static constexpr int selector_top_k = 16;
+    static constexpr int selector_vocab = 248320;
+    static constexpr int block_size      = 8;
 };
 
 inline constexpr float kAttentionScale                   = 0.0625F;

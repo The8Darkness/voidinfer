@@ -1,0 +1,1240 @@
+{
+  "chunk_id": 1,
+  "gqa_ratio": 6,
+  "head_dim": 256,
+  "kv_heads": 4,
+  "layers": [
+    3,
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    35,
+    39,
+    43,
+    47,
+    51,
+    55,
+    59,
+    63
+  ],
+  "notes": [
+    "Source tensors retain exact BF16 values; diagnostic products use float64.",
+    "The raw rotated attention output is intentionally not invariant until V inverse is applied.",
+    "The captured activation set does not contain the model output projection or residual input, so the layer residual is not tested here."
+  ],
+  "orientation": "row vectors [tokens, heads, head_dim]; Q'=Q@Rk, K'=K@Rk, V'=V@Rv, O=O'@Rv.T",
+  "q_heads": 24,
+  "results": [
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 1.8360487652469004e-07,
+        "rms": 4.4856395098569566e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 3,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.1434133590236826e-07,
+        "rms": 4.393473174085021e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 4.149036306734312,
+        "rms": 0.8453302364973115
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 9.359409475218072e-08,
+        "rms": 2.1847358788953372e-08
+      },
+      "score": {
+        "max_abs": 1.9282653118679605e-07,
+        "rms": 4.903110176446902e-08
+      },
+      "softmax": {
+        "max_abs": 2.4996635539231704e-08,
+        "rms": 3.5549582973076046e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 9.605974815585228e-08,
+        "rms": 2.218414736688378e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 1.911736173809686e-07,
+        "rms": 4.738742621921688e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 7,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.0221073870896333e-07,
+        "rms": 4.514650926448771e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 6.221278806101026,
+        "rms": 0.6520726408487632
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 1.0883929180138807e-07,
+        "rms": 1.716251166660446e-08
+      },
+      "score": {
+        "max_abs": 1.9513653359837235e-07,
+        "rms": 5.1307673188306234e-08
+      },
+      "softmax": {
+        "max_abs": 3.455283925646313e-08,
+        "rms": 4.918367872969584e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 8.69294636274276e-08,
+        "rms": 1.5754873949958628e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.0751634202675895e-07,
+        "rms": 4.880098123182705e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 11,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.426620235307375e-07,
+        "rms": 4.7729116459291804e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 7.88634547693016,
+        "rms": 0.657296988384414
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 2.0634808173269903e-07,
+        "rms": 1.7985934587154972e-08
+      },
+      "score": {
+        "max_abs": 2.5111868140470506e-07,
+        "rms": 6.863555353937802e-08
+      },
+      "softmax": {
+        "max_abs": 3.246614177498941e-08,
+        "rms": 4.826746711559624e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 1.119890895018294e-07,
+        "rms": 1.3675230778376371e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.158149655651087e-07,
+        "rms": 4.7073301956035606e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 15,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.520843606079737e-07,
+        "rms": 4.494382581096914e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 5.605344025579996,
+        "rms": 0.5459777184200671
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 1.5595350211228265e-07,
+        "rms": 1.4291068138361595e-08
+      },
+      "score": {
+        "max_abs": 2.2430330304246127e-07,
+        "rms": 5.525074000322862e-08
+      },
+      "softmax": {
+        "max_abs": 3.635663886614182e-08,
+        "rms": 5.649594864939305e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 1.0470063260825668e-07,
+        "rms": 1.395647132117051e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.388747806225666e-07,
+        "rms": 4.921360658920427e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 19,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.175148552108208e-07,
+        "rms": 4.491635429272804e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 6.484682802552015,
+        "rms": 0.7161919817677808
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 1.5781829221239718e-07,
+        "rms": 1.9538689257665544e-08
+      },
+      "score": {
+        "max_abs": 2.2371097685436325e-07,
+        "rms": 5.935336244514258e-08
+      },
+      "softmax": {
+        "max_abs": 3.290356132001904e-08,
+        "rms": 5.855925102966895e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 1.4732383635251978e-07,
+        "rms": 1.9182446983662855e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.0549041424011705e-07,
+        "rms": 5.018773333010928e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 23,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.0204377593202594e-07,
+        "rms": 4.342257712076865e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 15.763301525858026,
+        "rms": 0.8433637956978971
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 4.508082622756149e-07,
+        "rms": 2.4208828810895842e-08
+      },
+      "score": {
+        "max_abs": 2.4997554781691633e-07,
+        "rms": 5.5532698801941805e-08
+      },
+      "softmax": {
+        "max_abs": 5.5302171286797375e-08,
+        "rms": 8.147005589636213e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 1.3227238182533796e-07,
+        "rms": 2.0293791365719305e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.3747388577799455e-07,
+        "rms": 5.436968243367935e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 27,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.394435229535752e-07,
+        "rms": 4.770311694269854e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 27.47916380466621,
+        "rms": 1.4125602738800638
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 1.469125495034973e-06,
+        "rms": 4.11656985891615e-08
+      },
+      "score": {
+        "max_abs": 3.240096528855929e-07,
+        "rms": 6.746571527047e-08
+      },
+      "softmax": {
+        "max_abs": 7.114301309174564e-08,
+        "rms": 8.317625838563163e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 2.650545738447363e-07,
+        "rms": 3.149214406002416e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.514691881394526e-07,
+        "rms": 5.602139555485932e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 31,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.545580805035641e-07,
+        "rms": 4.517849060345047e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 38.38722737614617,
+        "rms": 1.3691223190719268
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 2.0248478698192685e-06,
+        "rms": 3.9629841110259844e-08
+      },
+      "score": {
+        "max_abs": 3.3799925525102026e-07,
+        "rms": 6.685377900964649e-08
+      },
+      "softmax": {
+        "max_abs": 5.283500731367852e-08,
+        "rms": 7.611112558972532e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 2.5454960933535276e-07,
+        "rms": 3.067516549395369e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.5814464599260845e-07,
+        "rms": 5.6440290899252926e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 35,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.742001348199352e-07,
+        "rms": 4.9144617432583314e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 33.74178927817667,
+        "rms": 1.3583612831382708
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 1.6942714964329753e-06,
+        "rms": 3.7708849289196304e-08
+      },
+      "score": {
+        "max_abs": 3.933178049919661e-07,
+        "rms": 8.8757378863093e-08
+      },
+      "softmax": {
+        "max_abs": 5.860079022035336e-08,
+        "rms": 7.587090884456912e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 2.395434612681435e-07,
+        "rms": 3.40545347778779e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.6957450205422617e-07,
+        "rms": 5.8316975526058316e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 39,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.503875866644023e-07,
+        "rms": 4.7260303930619676e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 35.02946247646749,
+        "rms": 1.0689604950023364
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 9.086132184421558e-07,
+        "rms": 2.949534870511162e-08
+      },
+      "score": {
+        "max_abs": 4.415737221152849e-07,
+        "rms": 7.65694149026454e-08
+      },
+      "softmax": {
+        "max_abs": 4.9450666395056686e-08,
+        "rms": 6.236510372129805e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 2.342946311406635e-07,
+        "rms": 2.9881348635466894e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.656792429389654e-07,
+        "rms": 5.728013490376678e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 43,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.626317643361631e-07,
+        "rms": 4.849260193400912e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 56.77834764734817,
+        "rms": 1.7682980875829843
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 2.2821028125008525e-06,
+        "rms": 5.0478693044983904e-08
+      },
+      "score": {
+        "max_abs": 3.810843463014635e-07,
+        "rms": 7.787859436811562e-08
+      },
+      "softmax": {
+        "max_abs": 6.232390314941938e-08,
+        "rms": 7.307126278932835e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 5.039543466978103e-07,
+        "rms": 5.509491568928029e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.7031993843351643e-07,
+        "rms": 5.819559118742338e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 47,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.690614451239526e-07,
+        "rms": 4.592006059203674e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 57.282195385008876,
+        "rms": 1.9893303750724414
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 3.0806651771797533e-06,
+        "rms": 6.010781121940165e-08
+      },
+      "score": {
+        "max_abs": 3.343878844930259e-07,
+        "rms": 7.191605732201845e-08
+      },
+      "softmax": {
+        "max_abs": 6.174881528320242e-08,
+        "rms": 7.381832376364476e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 3.7548294710976204e-07,
+        "rms": 5.480033938979794e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 3.206442791281461e-07,
+        "rms": 5.8327433860505786e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 51,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.9453893279907106e-07,
+        "rms": 4.52121322211818e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 48.49794476075553,
+        "rms": 2.1009558948166824
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 3.373735722789206e-06,
+        "rms": 6.329770243970597e-08
+      },
+      "score": {
+        "max_abs": 4.971724871793981e-07,
+        "rms": 8.004364505783075e-08
+      },
+      "softmax": {
+        "max_abs": 6.477188568831949e-08,
+        "rms": 8.045945979962815e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 3.548033860045763e-07,
+        "rms": 5.751136417641519e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.2921744058379545e-07,
+        "rms": 5.370822170295418e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 55,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.1514177728221284e-07,
+        "rms": 4.1884813692307435e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 27.474168306132967,
+        "rms": 1.5746756844411227
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 9.307173485240128e-07,
+        "rms": 4.3443216568375813e-08
+      },
+      "score": {
+        "max_abs": 3.374257003807557e-07,
+        "rms": 5.553532792026266e-08
+      },
+      "softmax": {
+        "max_abs": 3.9896491776936216e-08,
+        "rms": 4.949720739242507e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 2.8734520185480505e-07,
+        "rms": 4.654693499336465e-08
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.2021891599166565e-07,
+        "rms": 5.267597359156278e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 59,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.0609727486783913e-07,
+        "rms": 3.848007657973081e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 75.57940794925881,
+        "rms": 3.8967410766640875
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 1.0423333485221065e-06,
+        "rms": 1.0432974804703818e-07
+      },
+      "score": {
+        "max_abs": 2.263791669676607e-07,
+        "rms": 5.25713940249682e-08
+      },
+      "softmax": {
+        "max_abs": 4.886619509036905e-08,
+        "rms": 6.625203405369331e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 6.398221770176349e-07,
+        "rms": 1.023985385090649e-07
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    },
+    {
+      "diagnostic_compute_dtype": "torch.float64",
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "k_roundtrip": {
+        "max_abs": 2.592647654342528e-07,
+        "rms": 5.464009853091969e-08
+      },
+      "k_shape": [
+        256,
+        4,
+        256
+      ],
+      "layer": 63,
+      "passed": true,
+      "q_roundtrip": {
+        "max_abs": 2.7356332987782395e-07,
+        "rms": 4.5768705632983565e-08
+      },
+      "q_shape": [
+        256,
+        24,
+        256
+      ],
+      "raw_rotated_attention_output_before_v_inverse": {
+        "max_abs": 82.32807710249597,
+        "rms": 7.848015819613067
+      },
+      "recovered_attention_output_after_v_inverse": {
+        "max_abs": 1.7102738425478492e-06,
+        "rms": 1.9590012743617343e-07
+      },
+      "score": {
+        "max_abs": 2.7318417039623455e-07,
+        "rms": 7.390408114429013e-08
+      },
+      "softmax": {
+        "max_abs": 3.556130567794469e-08,
+        "rms": 4.711111174899133e-10
+      },
+      "source_dtype": "torch.bfloat16",
+      "v_roundtrip": {
+        "max_abs": 1.0324260286687093e-06,
+        "rms": 1.9863090534304228e-07
+      },
+      "v_shape": [
+        256,
+        4,
+        256
+      ]
+    }
+  ],
+  "schema": "oscar-rotation-invariance-v1",
+  "tokens": 256,
+  "tolerances": {
+    "recovered_attention_output_max_abs": 1e-05,
+    "score_max_abs": 1e-05,
+    "softmax_max_abs": 1e-06
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "schema": "oscar-rotation-asset-set-v1",
+  "identity": "qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1",
+  "recorded": "2026-09-01",
+  "status": "validated_production_candidate_for_next_runtime_integration_phase",
+  "model": {
+    "id": "qwen3.8-27b",
+    "weights_id": "nvfp4-dflash2",
+    "artifact": "D:\\AI\\voidinfer\\models\\Qwen3.8-27B-NVFP4-DFlash2-NInfer\\qwen3_8_27b_nvfp4.ninfer",
+    "sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+    "total_layers": 64,
+    "full_attention_layers": [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63],
+    "query_heads": 24,
+    "kv_heads": 4,
+    "gqa_ratio": 6,
+    "head_dim": 256,
+    "rotary_dim": 64
+  },
+  "dataset": {
+    "capture_manifest": "../../captures/qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1/manifest.json",
+    "capture_manifest_sha256": "8a5f6a6f89f2ab21d178f7644297365012bc6dcebb03388d514ddf12e0b59bd8",
+    "conversion_manifest": "../../dumps/qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1-official/conversion_manifest.json",
+    "conversion_manifest_sha256": "2c0a200a64b8825aef36bb14c958b7bb9bb82912f00d54692fff9d7ca0e6ba76",
+    "input_description": "deterministic_request_formula_v1_cal30k_seed30017",
+    "useful_tokens": 30720,
+    "raw_chunks": 120,
+    "prompt_tokens_per_chunk": 256,
+    "official_chunk_ids": "1..120",
+    "raw_payload_bytes": 8053063680,
+    "official_pt_payload_bytes": 8061249216,
+    "tensor_layout": "[tokens, heads, head_dim]",
+    "dtype": "BF16"
+  },
+  "capture_source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\frontend\\frontend.cpp=392464d0fc60e0ba0bd17f92960482f21d849229d7afcddc593fa22d2a318b69;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab38c99c011a5f0d996658daa0fe90cd2845b215acfceec876a35988c0b3d49e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=4e18232d7b40d0cc97fbe751df9b1649bf158e69f06f16bd99530338cce9c345;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=6c238fb737b82f0bb5c9a42b7b4041615488c7b5bb123f8b401fc8113f5b11be;tools\\oscar\\capture_qkv_calibration.ps1=cd5a7edc5a0b11f8bffe92dfea645bfb0fa70d0f6f421d3132feb73592d06110;tools\\oscar\\validate_calibration_dump.py=52118eb1d2e85c9498bd497b537bff2a2221c5e6386cfc523453d0e60b8bd949",
+  "executable_sha256": "8f79d0c0be7a7a7d5a72749dcd1446f42a64b8c8016844150225d19950da40b4",
+  "fitter": {
+    "source": "D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\upstream_compute_kv_rotation.py",
+    "upstream_repository": "FutureMLS-Lab/OSCAR",
+    "upstream_commit": "41ebcdba3db5f0ce1339c3727caea80df575d437",
+    "source_sha256": "f7f9f738be5dea75cc1d7e8d6928e4ee91df1cbf1e1c7b7d9c7d308b55d4da8b",
+    "method": "qqt_sst",
+    "composition": "r_h_pbr",
+    "head_dim": 256,
+    "chunk_id": "all",
+    "command": "$env:OMP_NUM_THREADS='1'; $env:MKL_NUM_THREADS='1'; & 'D:\\AI\\tools\\oscar-calibration\\.venv\\Scripts\\python.exe' 'D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\upstream_compute_kv_rotation.py' --dump-path 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\dumps\\qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1-official' --output-dir 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1' --chunk-id all --head-dim 256 --method qqt_sst --composition r_h_pbr",
+    "elapsed_seconds": 85.181,
+    "exit_code": 0,
+    "warning": "Known non-fatal missing NumPy warning in the minimal CPU environment"
+  },
+  "target_runtime_group_size": 128,
+  "assets": {
+    "k": {
+      "path": "k_rotation_qqt_r_h_pbr.pt",
+      "objective": "qqt_r_h_pbr",
+      "dtype": "torch.float32",
+      "bytes": 4220861,
+      "sha256": "f2b97b27bb3c453e4e01f1303c9ab21ef96bcf595b48569ad5cbfb2799cfda08"
+    },
+    "v": {
+      "path": "v_rotation_sst_r_h_pbr.pt",
+      "objective": "sst_r_h_pbr",
+      "dtype": "torch.float32",
+      "bytes": 4220861,
+      "sha256": "516bb00b45ba37dadc311b20de3620b0b0e792a3e6a5b76951ef4d24c87036da"
+    }
+  },
+  "orthogonality": {
+    "report": "rotation_validation.json",
+    "report_sha256": "78822c39f0f09bd5fd4618a103e702c2715a578fd9a289d0be296b6cab96407a",
+    "k_max_abs_r_rt_minus_i": 2.082505102e-08,
+    "v_max_abs_r_rt_minus_i": 2.296734802e-08,
+    "independent_r_h_pbr_fixture_max_abs_error": 2.2e-16,
+    "layers": 16,
+    "result": "PASS"
+  },
+  "heldout": {
+    "capture_manifest_sha256": "605efbc46d60c50eeb4da5682a1ab03f7e065904df25d05c843f969b268a34b3",
+    "conversion_manifest_sha256": "7b7115c03cdab3abeb37ff21d3aa6ed595723637b5bf765691466edf59bb351a",
+    "useful_tokens": 1024,
+    "evaluation_json": "../../evaluations/qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1-heldout.json",
+    "evaluation_json_sha256": "6ef7ca996516473871efa7b1de1354ac7f0666e0bde43c67f4192b59dce18c98"
+  }
+}

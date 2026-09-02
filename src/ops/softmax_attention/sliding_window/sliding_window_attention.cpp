@@ -16,7 +16,6 @@ namespace {
 constexpr std::int32_t kHeadDim = 128;
 constexpr std::int32_t kQHeads  = 32;
 constexpr std::int32_t kKVHeads = 8;
-constexpr std::int32_t kWindow  = 4096;
 constexpr float kExpectedScale  = 0.08838834764831844055f;
 
 void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const char* op) {
@@ -24,8 +23,8 @@ void require_profile(AttentionHeadGeometry geometry, std::uint32_t window, const
         geometry.query_heads != kQHeads || geometry.kv_heads != kKVHeads) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
-    if (window != static_cast<std::uint32_t>(kWindow)) {
-        throw std::invalid_argument(std::string(op) + ": supported window is 4096");
+    if (window < 2 || (window & (window - 1)) != 0) {
+        throw std::invalid_argument(std::string(op) + ": window must be a power of two");
     }
 }
 
@@ -45,9 +44,11 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
-void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
+void validate_context(const CyclicKVCacheLayerView& context, std::uint32_t window,
+                     const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
+        context.capacity != window || context.padded_capacity < context.capacity ||
+        (context.capacity & (context.capacity - 1)) != 0 ||
         context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
@@ -56,13 +57,79 @@ void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
         throw std::overflow_error(std::string(op) + ": padded capacity exceeds int32");
     }
     const auto padded = static_cast<std::int32_t>(context.padded_capacity);
-    if (context.k.dtype != DType::BF16 || context.v.dtype != DType::BF16) {
-        throw std::invalid_argument(std::string(op) + ": context K/V must be BF16");
+    if (context.dtype == DType::BF16) {
+        if (context.quant_group != 0 || context.k_scale.data != nullptr ||
+            context.v_scale.data != nullptr || context.protected_capacity != 0 ||
+            context.protected_anchor_capacity != 0 ||
+            context.protected_padded_capacity != 0 || context.protected_k.data != nullptr ||
+            context.protected_v.data != nullptr || context.k.dtype != DType::BF16 ||
+            context.v.dtype != DType::BF16) {
+            throw std::invalid_argument(std::string(op) + ": invalid BF16 context profile");
+        }
+        require_shape(context.k, kHeadDim, padded, kKVHeads, context.lane_capacity, op,
+                      "context k");
+        require_shape(context.v, kHeadDim, padded, kKVHeads, context.lane_capacity, op,
+                      "context v");
+    } else if (context.dtype == DType::U8) {
+        const std::uint8_t quant_bits = context.quant_bits == 0 ? 4 : context.quant_bits;
+        const bool oscar = context.quantization == CyclicKVCacheQuantization::OscarAffine;
+        const std::int32_t expected_quant_group = oscar ? 128 : 16;
+        const DType expected_scale_dtype = oscar ? DType::BF16 : DType::FP8_E4M3FN;
+        if (context.quant_group != expected_quant_group || quant_bits < 2 || quant_bits > 4 ||
+            context.k.dtype != DType::U8 || context.v.dtype != DType::U8 ||
+            context.k_scale.dtype != expected_scale_dtype ||
+            context.v_scale.dtype != expected_scale_dtype) {
+            throw std::invalid_argument(std::string(op) + ": invalid packed context profile");
+        }
+        const std::int32_t code_extent =
+            static_cast<std::int32_t>((static_cast<std::uint64_t>(kHeadDim) * quant_bits + 7U) /
+                                       8U);
+        require_shape(context.k, code_extent, padded, kKVHeads, context.lane_capacity, op,
+                      "context k");
+        require_shape(context.v, code_extent, padded, kKVHeads, context.lane_capacity, op,
+                      "context v");
+        const std::int32_t scale_extent = oscar ? 2 : kHeadDim / 16;
+        require_shape(context.k_scale, scale_extent, padded, kKVHeads, context.lane_capacity,
+                      op, "context k scales");
+        require_shape(context.v_scale, scale_extent, padded, kKVHeads, context.lane_capacity,
+                      op, "context v scales");
+        if (context.protected_capacity != 0 || context.protected_anchor_capacity != 0) {
+            if (context.protected_capacity > context.capacity ||
+                (context.protected_capacity != 0 &&
+                 (context.protected_capacity & (context.protected_capacity - 1U)) != 0U) ||
+                context.protected_anchor_capacity > context.capacity ||
+                context.protected_anchor_capacity > context.capacity - context.protected_capacity ||
+                context.protected_padded_capacity <
+                    context.protected_capacity + context.protected_anchor_capacity ||
+                context.protected_k.dtype != DType::BF16 ||
+                context.protected_v.dtype != DType::BF16) {
+                throw std::invalid_argument(std::string(op) +
+                                         ": invalid protected packed sidecar profile");
+            }
+            const auto protected_padded =
+                static_cast<std::int32_t>(context.protected_padded_capacity);
+            require_shape(context.protected_k, kHeadDim, protected_padded, kKVHeads,
+                          context.lane_capacity, op, "context protected k");
+            require_shape(context.protected_v, kHeadDim, protected_padded, kKVHeads,
+                          context.lane_capacity, op, "context protected v");
+        } else if (context.protected_padded_capacity != 0 ||
+                   context.protected_k.data != nullptr || context.protected_v.data != nullptr) {
+            throw std::invalid_argument(std::string(op) +
+                                         ": unexpected protected packed sidecar");
+        }
+    } else {
+        throw std::invalid_argument(std::string(op) + ": unsupported context K/V profile");
     }
-    require_shape(context.k, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context k");
-    require_shape(context.v, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context v");
     require_contiguous_nonnull(context.k, op, "context k");
     require_contiguous_nonnull(context.v, op, "context v");
+    if (context.dtype == DType::U8) {
+        require_contiguous_nonnull(context.k_scale, op, "context k scales");
+        require_contiguous_nonnull(context.v_scale, op, "context v scales");
+        if (context.protected_capacity != 0 || context.protected_anchor_capacity != 0) {
+            require_contiguous_nonnull(context.protected_k, op, "context protected k");
+            require_contiguous_nonnull(context.protected_v, op, "context protected v");
+        }
+    }
 }
 
 struct PartialWorkspace {
@@ -95,7 +162,8 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
         throw std::invalid_argument(
             "sliding_window_attention workspace: invalid envelope or token interval");
     }
-    const auto plan = detail::sliding_window_attention_resolve_plan(max_tokens, envelope);
+    const auto plan = detail::sliding_window_attention_resolve_plan(
+        max_tokens, envelope, static_cast<std::int32_t>(window));
     WorkspaceLayoutBuilder layout;
     (void)allocate_workspace(layout, max_tokens, plan.split_capacity, batch_size);
     return layout.peak_bytes(1);
@@ -141,7 +209,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
     require_contiguous_nonnull(valid_columns, op, "valid columns");
     require_contiguous_nonnull(lanes, op, "lanes");
     require_contiguous_nonnull(out, op, "out");
-    validate_context(context, op);
+    validate_context(context, window, op);
     if (envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -151,8 +219,29 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         throw std::invalid_argument("sliding_window_attention: scale must be 1/sqrt(128)");
     }
 
+    if (context.dtype == DType::U8) {
+        if (context.quantization == CyclicKVCacheQuantization::OscarAffine) {
+            detail::sliding_window_attention_oscar_launch(
+                q, query_k, query_v, positions, valid_columns, lanes, scale, context,
+                static_cast<std::int32_t>(envelope.max_context), static_cast<std::int32_t>(window),
+                out, stream);
+        } else if (context.quant_bits == 2 || context.quant_bits == 3) {
+            detail::sliding_window_attention_lowbit_launch(
+                q, query_k, query_v, positions, valid_columns, lanes, scale, context,
+                static_cast<std::int32_t>(envelope.max_context), static_cast<std::int32_t>(window),
+                out, stream);
+        } else {
+            detail::sliding_window_attention_nvfp4_launch(
+                q, query_k, query_v, positions, valid_columns, lanes, scale, context,
+                static_cast<std::int32_t>(envelope.max_context), static_cast<std::int32_t>(window),
+                out, stream);
+        }
+        return;
+    }
+
     auto scope               = workspace.scope();
-    const auto plan          = detail::sliding_window_attention_resolve_plan(tokens, envelope);
+    const auto plan = detail::sliding_window_attention_resolve_plan(
+        tokens, envelope, static_cast<std::int32_t>(window));
     PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     detail::sliding_window_attention_launch(q, query_k, query_v, positions, valid_columns, lanes,
                                             scale, context, plan, partial.acc, partial.m, partial.l,

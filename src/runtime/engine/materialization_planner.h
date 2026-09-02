@@ -237,8 +237,10 @@ public:
         }
 
         const Clock::time_point search_started = Clock::now();
+        // Keep bounded pressure search responsive while allowing the common two-step path
+        // (checkpoint release followed by partial KV spill) to be scored before cutoff.
         const std::uint64_t search_budget_ns =
-            has_incumbent ? std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U)
+            has_incumbent ? std::min<std::uint64_t>(10'000'000ULL, incumbent.cost.total_ns / 20U)
                           : std::numeric_limits<std::uint64_t>::max();
         std::uint64_t maximum_expansion_ns    = 0;
         std::uint32_t optional_targets        = 0;

@@ -106,6 +106,26 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
                                                   stream);
 }
 
+void speculative_common_prefix(const Tensor& left, const Tensor& right,
+                               const Tensor& current_extents, Tensor& verified_extents,
+                               Tensor& valid_columns, cudaStream_t stream) {
+    constexpr const char* op = "speculative_common_prefix";
+    if (left.dtype != DType::I32 || right.dtype != DType::I32 ||
+        left.ne[0] <= 0 || left.ne[1] <= 0 || left.ne[2] != 1 || left.ne[3] != 1 ||
+        right.ne[0] != left.ne[0] || right.ne[1] != left.ne[1] || right.ne[2] != 1 ||
+        right.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": left/right must be matching [K,B] I32");
+    }
+    const std::int32_t batch = left.ne[1];
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_vector(verified_extents, DType::I32, batch, op, "verified_extents");
+    require_vector(valid_columns, DType::I32, batch, op, "valid_columns");
+    require_contiguous_nonnull(left, op, "left");
+    require_contiguous_nonnull(right, op, "right");
+    detail::speculative_common_prefix_launch(left, right, current_extents, verified_extents,
+                                             valid_columns, stream);
+}
+
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,
                                       const Tensor& drafts, const Tensor& current_extents,
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
@@ -146,6 +166,28 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
         licensed_counts, accepted, token_domain, configs, scratch, stream);
+}
+
+void speculative_accept_greedy_drafts_from_tokens(
+    const Tensor& target_tokens, const Tensor& drafts, const Tensor& current_extents,
+    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted, cudaStream_t stream) {
+    constexpr const char* op = "speculative_accept_greedy_drafts_from_tokens";
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t batch = drafts.ne[1];
+    if (k < 1) { throw std::invalid_argument(std::string(op) + ": K must be >=1"); }
+    if (batch < 1) { throw std::invalid_argument(std::string(op) + ": B must be >=1"); }
+    require_matrix(target_tokens, DType::I32, k + 1, batch, op, "target_tokens");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_vector(lengths, DType::I32, batch, op, "lengths");
+    require_vector(anchors, DType::I32, batch, op, "anchors");
+    require_matrix(licensed_tokens, DType::I32, k + 1, batch, op, "licensed_tokens");
+    require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+    require_vector(accepted, DType::I32, batch, op, "accepted");
+    detail::speculative_accept_greedy_drafts_from_tokens_launch(
+        target_tokens, drafts, current_extents, lengths, anchors, licensed_tokens, licensed_counts,
+        accepted, stream);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

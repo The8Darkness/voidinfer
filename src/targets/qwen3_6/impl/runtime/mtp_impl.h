@@ -68,8 +68,9 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 }
 
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                           MtpCausalAttentionEnvelopes envelopes) {
-    return [&state, batch_size, k, envelopes] {
+                           MtpCausalAttentionEnvelopes envelopes,
+                           bool allow_greedy_target_head) {
+    return [&state, batch_size, k, envelopes, allow_greedy_target_head] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kMtpDecodeMaximumDrafts) {
             throw std::logic_error("MTP decode batch state is incomplete");
@@ -77,6 +78,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
         qwen3_6::MtpDecodeState& frame = state.frame;
         const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
+        bool all_greedy_target_rows   = allow_greedy_target_head;
+        for (std::int32_t row = 0; row < batch_size; ++row) {
+            all_greedy_target_rows =
+                all_greedy_target_rows && state.host_ingress.sampling[row].temperature <= 0.0F;
+        }
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_6::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
@@ -131,6 +137,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  .target_hidden           = target_hidden,
                                  .target_logits           = target_logits,
                                  .target_tokens           = target_tokens,
+                                 .greedy_target_head      = all_greedy_target_rows,
                                  .drafts                  = current_drafts,
                                  .current_extents         = current_extents,
                                  .frontiers               = frontiers,
@@ -187,13 +194,13 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               MtpCausalAttentionEnvelopes envelopes,
                               DecodeGraphDefinition& definition) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes, false);
     capture_graph(state, definition, body);
 }
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                       MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes, executable == nullptr);
     run_prepared(state, executable, body);
 }
 

@@ -1,9 +1,11 @@
 #include "runtime/engine/context_cost.h"
 
 #include "core/host_kv_arena.h"
+#include "ops/kv_cache/d256_profile.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -176,6 +178,26 @@ void test_kv_physical_work() {
                ninfer::TransferWork{.payload_bytes = 3 * page_payload, .copy_operations = 6},
            "PageMajor Device KV work does not count one copy per plane and page");
 
+    const ninfer::HostKVPageLayout page_major_fp16 =
+        ninfer::plan_host_kv_page_layout(page_major.geometry, ninfer::DType::FP16);
+    expect(page_major_fp16.storage_dtypes.size() == page_major.geometry.planes.size() &&
+               std::all_of(page_major_fp16.storage_dtypes.begin(),
+                           page_major_fp16.storage_dtypes.end(),
+                           [](ninfer::DType dtype) { return dtype == ninfer::DType::FP16; }) &&
+               page_major_fp16.page_stride == page_major.page_stride &&
+               page_major_fp16.planes == page_major.planes,
+           "BF16 Host KV geometry did not produce an equivalent FP16 authoritative layout");
+    const ninfer::KVPageGeometry int8_geometry{
+        .page_tokens        = 3,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {{ninfer::DType::I8, 8, 2, 256}},
+    };
+    expect_throw(
+        [&] {
+            (void)ninfer::plan_host_kv_page_layout(int8_geometry, ninfer::DType::FP16);
+        },
+        "non-BF16 Host KV plane accepted an unsupported FP16 conversion");
+
     const ninfer::HostKVPageLayout head_major = ninfer::plan_host_kv_page_layout({
         .page_tokens        = 3,
         .device_plane_order = ninfer::PagedKVPlaneOrder::HeadMajor,
@@ -193,6 +215,51 @@ void test_kv_physical_work() {
     expect(ninfer::plan_device_kv_copy_work(head_major, 7) ==
                ninfer::TransferWork{.payload_bytes = 7 * head_payload, .copy_operations = 14},
            "HeadMajor Device KV work should remain one copy per plane and page");
+}
+
+void test_hierarchical_oscar_host_layout() {
+    const ninfer::KVPageGeometry geometry{
+        .page_tokens        = ninfer::kPagedKVPageSize,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {
+            {ninfer::DType::U8, ninfer::ops::kD256OscarCodeExtent, 2, 256},
+            {ninfer::DType::U8, ninfer::ops::kD256OscarCodeExtent, 2, 256},
+            {ninfer::DType::BF16, ninfer::ops::kD256OscarScaleExtent, 2, 256},
+            {ninfer::DType::BF16, ninfer::ops::kD256OscarScaleExtent, 2, 256},
+        },
+    };
+    const ninfer::HostKVPageLayout layout = ninfer::plan_host_kv_page_layout(
+        geometry, ninfer::HostKVStorageFormat::OscarQ4AndFp16);
+    expect(layout.storage_format == ninfer::HostKVStorageFormat::OscarQ4AndFp16 &&
+               layout.planes.size() == 6 && layout.storage_dtypes.size() == 6 &&
+               layout.l1_offset == 0 && layout.l1_page_payload_bytes != 0 &&
+               layout.l2_offset >= layout.l1_page_payload_bytes &&
+               layout.l2_page_payload_bytes != 0 &&
+               layout.page_stride >= layout.l2_offset + layout.l2_page_payload_bytes,
+           "hierarchical OSCAR host layout did not reserve Q4 L1 and FP16 L2 sections");
+    expect(layout.storage_dtypes[0] == ninfer::DType::U8 &&
+               layout.storage_dtypes[1] == ninfer::DType::U8 &&
+               layout.storage_dtypes[2] == ninfer::DType::BF16 &&
+               layout.storage_dtypes[3] == ninfer::DType::BF16 &&
+               layout.storage_dtypes[4] == ninfer::DType::FP16 &&
+               layout.storage_dtypes[5] == ninfer::DType::FP16,
+           "hierarchical OSCAR host layout has the wrong L1/L2 dtype inventory");
+    expect_throw(
+        [&] {
+            (void)ninfer::plan_host_kv_page_layout(
+                ninfer::KVPageGeometry{
+                    .page_tokens        = ninfer::kPagedKVPageSize,
+                    .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                    .planes             = {
+                        {ninfer::DType::U8, 32, 2, 256},
+                        {ninfer::DType::U8, 32, 2, 256},
+                        {ninfer::DType::BF16, 2, 2, 256},
+                        {ninfer::DType::BF16, 2, 2, 256},
+                    },
+                },
+                ninfer::HostKVStorageFormat::OscarQ4AndFp16);
+        },
+        "hierarchical OSCAR host layout accepted a non-D256 source geometry");
 }
 
 void test_schema_validation() {
@@ -336,6 +403,7 @@ void test_resolution_and_atomic_upserts() {
 int main() {
     test_exact_evaluation();
     test_kv_physical_work();
+    test_hierarchical_oscar_host_layout();
     test_schema_validation();
     test_resolution_and_atomic_upserts();
     if (failures == 0) { std::cout << "ok\n"; }

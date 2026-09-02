@@ -36,6 +36,23 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
     }
 }
 
+__global__ void speculative_common_prefix_kernel(const std::int32_t* left,
+                                                 const std::int32_t* right,
+                                                 const std::int32_t* current_extents,
+                                                 std::int32_t* verified_extents,
+                                                 std::int32_t* valid_columns, std::int32_t k) {
+    if (threadIdx.x != 0) { return; }
+    const int row = static_cast<int>(blockIdx.x);
+    int extent    = current_extents[row];
+    extent        = extent < 0 ? 0 : (extent > k ? k : extent);
+    const std::int32_t* left_row  = left + row * k;
+    const std::int32_t* right_row = right + row * k;
+    int common = 0;
+    while (common < extent && left_row[common] == right_row[common]) { ++common; }
+    verified_extents[row] = common;
+    valid_columns[row]    = common + 1;
+}
+
 template <typename T>
 __device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offset) {
     return ptr == nullptr
@@ -195,6 +212,39 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             for (int i = 0; i < produced; ++i) { atomicAdd(&cfg.token_counts[row_tokens[i]], 1); }
         }
     }
+}
+
+// The target output-head argmax fast path already has the exact BF16-rounded winner for every
+// verification column. Keep the sequential prefix/commit logic in a tiny kernel so no full
+// [vocab,K+1,B] logits buffer is needed on the greedy route.
+__launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_from_tokens_kernel(
+    const std::int32_t* target_tokens, const std::int32_t* drafts,
+    const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
+    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
+    std::int32_t k) {
+    if (threadIdx.x != 0) { return; }
+    const int row   = static_cast<int>(blockIdx.x);
+    const int cols  = k + 1;
+    int extent      = current_extents[row];
+    extent          = extent < 0 ? 0 : (extent > k ? k : extent);
+    const auto* row_targets = target_tokens + row * cols;
+    const auto* row_drafts  = drafts + row * k;
+    auto* row_tokens        = licensed_tokens + row * cols;
+
+    int accepted_count = 0;
+    while (accepted_count < extent && row_targets[accepted_count] == row_drafts[accepted_count]) {
+        ++accepted_count;
+    }
+    const int correction = row_targets[accepted_count];
+    for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+    for (int i = 0; i < accepted_count; ++i) { row_tokens[i] = row_drafts[i]; }
+    row_tokens[accepted_count] = correction;
+
+    const int produced       = accepted_count + 1;
+    licensed_counts[row]     = produced;
+    accepted[row]            = accepted_count;
+    anchors[row]             = correction;
+    lengths[row]            += produced;
 }
 
 __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(

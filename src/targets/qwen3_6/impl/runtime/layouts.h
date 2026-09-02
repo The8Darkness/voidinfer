@@ -26,6 +26,9 @@ struct DFlashPersistentLayout {
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
+    // Dense per-K ReplaySSM scratch is allocated only for the opt-in eager Adaptive DFlash2 path.
+    // The ordinary replay record plane remains the fixed graph-shaped baseline storage.
+    std::optional<GdnReplayRecordLayout> adaptive_replay_records;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept { return full.payload_bytes(); }
 };
@@ -78,6 +81,11 @@ struct SequencePlanningInputs {
     bool use_cuda_graph = true;
     int device          = 0;
     ContextCacheOptions context_cache;
+    HierarchicalVeriCacheOptions hierarchical_vericache;
+    KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
+    DType mtp_kv_dtype = DType::BF16;
+    std::int32_t mtp_kv_quant_group = 0;
+    bool mtp_kv_profile_explicit = false;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -101,6 +109,11 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     ContextCacheOptions context_cache;
+    HierarchicalVeriCacheOptions hierarchical_vericache;
+    KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
+    DType mtp_kv_dtype = DType::BF16;
+    std::int32_t mtp_kv_quant_group = 0;
+    bool mtp_kv_profile_explicit = false;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

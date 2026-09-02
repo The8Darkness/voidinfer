@@ -1,0 +1,24 @@
+{
+  "schema":"oscar-d2-2b-aging-v1",
+  "status":"PASS",
+  "asset_identity":"qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1",
+  "model_sha256":"6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+  "asset_manifest_sha256":"4d6d7af496238c1c65c95cc9425f18c3d9cb6028d4dda42d4d0de91e9efaf560",
+  "rotation_mode":"qqt_sst+r_h_pbr",
+  "calibrated":true,
+  "full_attention_layers":16,
+  "layers":[3,7,11,15,19,23,27,31,35,39,43,47,51,55,59,63],
+  "boundary_sequence":{"prefix_last":63,"first_recent":64,
+    "first_aging_append_token":320,"first_aged_token":64,
+    "subsequent_aged_tokens":[65,66,67]},
+  "codec_parity":{"layers":[3,35,63],"kv_heads":4,
+    "clips":{"k":0.96,"v":0.92},"symbols":"exact",
+    "packed_bytes":"exact","fp32_metadata":"exact"},
+  "transitions":[
+    {"append_token":320,"aged_token":64,"accounting":{"context_tokens":321,"prefix_tokens":64,"historical_tokens":1,"recent_tokens":256,"bf16_prefix_bytes":4194304,"bf16_recent_bytes":16777216,"int2_payload_bytes":524288,"int2_metadata_bytes":131072,"page_header_bytes":5376,"slot_table_bytes":246528,"mixed_total_bytes":21878784,"conversion_count":1}},    {"append_token":321,"aged_token":65,"accounting":{"context_tokens":322,"prefix_tokens":64,"historical_tokens":2,"recent_tokens":256,"bf16_prefix_bytes":4194304,"bf16_recent_bytes":16777216,"int2_payload_bytes":524288,"int2_metadata_bytes":131072,"page_header_bytes":5376,"slot_table_bytes":247296,"mixed_total_bytes":21879552,"conversion_count":2}},    {"append_token":322,"aged_token":66,"accounting":{"context_tokens":323,"prefix_tokens":64,"historical_tokens":3,"recent_tokens":256,"bf16_prefix_bytes":4194304,"bf16_recent_bytes":16777216,"int2_payload_bytes":524288,"int2_metadata_bytes":131072,"page_header_bytes":5376,"slot_table_bytes":248064,"mixed_total_bytes":21880320,"conversion_count":3}},    {"append_token":323,"aged_token":67,"accounting":{"context_tokens":324,"prefix_tokens":64,"historical_tokens":4,"recent_tokens":256,"bf16_prefix_bytes":4194304,"bf16_recent_bytes":16777216,"int2_payload_bytes":524288,"int2_metadata_bytes":131072,"page_header_bytes":5376,"slot_table_bytes":248832,"mixed_total_bytes":21881088,"conversion_count":4}}
+  ],
+  "final_accounting":{"context_tokens":324,"prefix_tokens":64,"historical_tokens":4,"recent_tokens":256,"bf16_prefix_bytes":4194304,"bf16_recent_bytes":16777216,"int2_payload_bytes":524288,"int2_metadata_bytes":131072,"page_header_bytes":5376,"slot_table_bytes":248832,"mixed_total_bytes":21881088,"conversion_count":4},
+  "guards":{"bad_asset_rejected":true,"gdn_rejected":true,
+    "double_conversion_rejected":true,"prefix_aging_rejected":true,
+    "no_bf16_historical_overlap":true,"no_holes_or_overlap":true}
+}

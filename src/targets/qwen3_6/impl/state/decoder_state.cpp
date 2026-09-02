@@ -1,5 +1,7 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 
+#include "ops/kv_cache/d256_profile.h"
+
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -21,12 +23,15 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
-    const bool scaled = dtype == DType::I8 || dtype == DType::FP8_E4M3FN;
+    const bool scaled = dtype == DType::I8 || dtype == DType::FP8_E4M3FN || dtype == DType::U8;
+    const bool oscar = dtype == DType::U8 && quant_group == ops::kD256OscarQuantGroup;
     const bool valid_profile =
         (dtype == DType::BF16 && quant_group == 0) ||
         (dtype == DType::I8 && quant_group == kKvInt8QuantGroup && head_dim % quant_group == 0) ||
         (dtype == DType::FP8_E4M3FN && head_dim == kKvFp8QuantGroup &&
-         quant_group == kKvFp8QuantGroup);
+         quant_group == kKvFp8QuantGroup) ||
+        (dtype == DType::U8 && head_dim == 256 &&
+         (quant_group == kKvNvfp4QuantGroup || quant_group == ops::kD256OscarQuantGroup));
     if (!valid_profile) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
@@ -37,13 +42,23 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
 
     KVPageGeometry geometry;
+    // Contiguous is the only layout selected by the current safe default. A
+    // calibrated transposed asset must opt into TransposedQ2 only after its
+    // writer/reader byte round-trip has been verified.
+    geometry.oscar_layout = OscarKVLayout::Contiguous;
     geometry.planes.reserve(static_cast<std::size_t>(layers) * (scaled ? 4ULL : 2ULL));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        geometry.planes.push_back({dtype, head_dim, kv_heads, 256});
-        geometry.planes.push_back({dtype, head_dim, kv_heads, 256});
+        const std::int32_t code_extent = oscar ? ops::kD256OscarCodeExtent
+                                               : (dtype == DType::U8 ? head_dim / 2 : head_dim);
+        const std::int32_t scale_extent = oscar ? ops::kD256OscarScaleExtent
+                                                : (scaled ? head_dim / quant_group : 0);
+        geometry.planes.push_back({dtype, code_extent, kv_heads, 256});
+        geometry.planes.push_back({dtype, code_extent, kv_heads, 256});
         if (scaled) {
-            geometry.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
-            geometry.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+            const DType scale_dtype = oscar ? DType::BF16
+                                            : (dtype == DType::U8 ? DType::FP8_E4M3FN : DType::FP16);
+            geometry.planes.push_back({scale_dtype, scale_extent, kv_heads, 256});
+            geometry.planes.push_back({scale_dtype, scale_extent, kv_heads, 256});
         }
     }
     return PagedKVCacheLayout{
@@ -65,13 +80,16 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 } // namespace
 
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
+    const DType mtp_dtype = spec.mtp_kv_profile_explicit ? spec.mtp_kv_dtype : spec.kv_dtype;
+    const std::int32_t mtp_quant_group =
+        spec.mtp_kv_profile_explicit ? spec.mtp_kv_quant_group : spec.kv_quant_group;
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 spec.kv_table_rows, spec.text_physical_page_groups);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
-                                   spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
+                                   spec.attention_head_dim, mtp_dtype, mtp_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups);
     }
     return layout;
@@ -80,7 +98,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
-      head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group) {}
+      head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group),
+      oscar_layout_(layout.pages.spec.geometry.oscar_layout) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
@@ -103,7 +122,8 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN;
+    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN ||
+                         dtype_ == DType::U8;
     const std::size_t stride = scaled ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVLayerView{
@@ -116,12 +136,14 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,
         .quant_group   = quant_group_,
+        .layout        = oscar_layout_,
     };
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN;
+    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN ||
+                         dtype_ == DType::U8;
     const std::size_t stride = scaled ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVBatchLayerView{
@@ -134,6 +156,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,
         .quant_group   = quant_group_,
+        .layout        = oscar_layout_,
     };
 }
 

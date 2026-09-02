@@ -120,6 +120,21 @@ struct PayloadSpan {
     std::span<const std::byte> data;
 };
 
+struct ReaderDiagnostics {
+    double file_open_map_seconds      = 0.0;
+    double directory_parse_seconds    = 0.0;
+    double directory_validate_seconds = 0.0;
+};
+
+struct DirectReadDiagnostics {
+    std::uint64_t request_count     = 0;
+    std::uint64_t bytes_read        = 0;
+    std::uint64_t min_request_bytes = 0;
+    std::uint64_t max_request_bytes = 0;
+    std::uint32_t max_outstanding   = 0;
+    double elapsed_seconds          = 0.0;
+};
+
 struct ArtifactIdentity {
     std::string model_id;
     std::string weights_id;
@@ -145,6 +160,8 @@ public:
 
     std::uint64_t file_bytes() const noexcept;
     std::uint64_t payload_offset() const noexcept;
+    const ReaderDiagnostics& diagnostics() const noexcept;
+    const DirectReadDiagnostics& direct_read_diagnostics() const noexcept;
     PayloadSpan payload(const ObjectDescriptor& object) const;
     PayloadSpan payload(std::string_view name) const;
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;

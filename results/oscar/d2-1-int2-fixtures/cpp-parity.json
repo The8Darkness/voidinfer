@@ -1,0 +1,26 @@
+{
+  "schema": "oscar-d2-1-cpp-parity-v1",
+  "passed": true,
+  "cases": [
+    {"name": "random_finite", "source_kind": "synthetic", "source_layer": -1, "rows": 3, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "positive_only", "source_kind": "synthetic", "source_layer": -1, "rows": 1, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "negative_only", "source_kind": "synthetic", "source_layer": -1, "rows": 1, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "mixed_sign", "source_kind": "synthetic", "source_layer": -1, "rows": 1, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "near_zero_range", "source_kind": "synthetic", "source_layer": -1, "rows": 1, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "clipping_sensitive_outliers", "source_kind": "synthetic", "source_layer": -1, "rows": 1, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "exact_group_boundary", "source_kind": "synthetic", "source_layer": -1, "rows": 1, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "multiple_groups", "source_kind": "synthetic", "source_layer": -1, "rows": 3, "clip_ratio": 0.920000017, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "page_fragment_like_rows", "source_kind": "synthetic", "source_layer": -1, "rows": 3, "clip_ratio": 0.920000017, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "real_layer_3_k_rotated", "source_kind": "real_rotated_capture", "source_layer": 3, "rows": 8, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "real_layer_3_v_rotated", "source_kind": "real_rotated_capture", "source_layer": 3, "rows": 8, "clip_ratio": 0.920000017, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "real_layer_35_k_rotated", "source_kind": "real_rotated_capture", "source_layer": 35, "rows": 8, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "real_layer_35_v_rotated", "source_kind": "real_rotated_capture", "source_layer": 35, "rows": 8, "clip_ratio": 0.920000017, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "real_layer_63_k_rotated", "source_kind": "real_rotated_capture", "source_layer": 63, "rows": 8, "clip_ratio": 0.959999979, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0},
+    {"name": "real_layer_63_v_rotated", "source_kind": "real_rotated_capture", "source_layer": 63, "rows": 8, "clip_ratio": 0.920000017, "max_clipped_abs": 0, "max_scale_abs": 0, "max_decoded_abs": 0, "max_decoded_relative_l2": 0}
+  ],
+  "total_rows": 63,
+  "max_clipped_abs": 0,
+  "max_scale_abs": 0,
+  "max_decoded_abs": 0,
+  "max_decoded_relative_l2": 0
+}

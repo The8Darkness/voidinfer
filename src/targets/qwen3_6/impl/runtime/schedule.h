@@ -113,6 +113,7 @@ struct TargetVerifyFrameView {
     Tensor target_hidden;
     Tensor target_logits;
     Tensor target_tokens;
+    bool greedy_target_head = false;
     Tensor drafts;
     Tensor current_extents;
     Tensor frontiers;
@@ -190,6 +191,7 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
+                                 bool greedy_target_head,
                                  DecodeGraphDefinition& definition);
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          DFlashEnvelopes envelopes,

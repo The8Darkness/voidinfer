@@ -17,6 +17,7 @@
 
 #include <math_constants.h>
 
+#include "ops/kv_cache/oscar_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
 namespace ninfer::ops {
@@ -61,14 +62,54 @@ causal_prompt_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache, int kv_he
     }
 }
 
+// Decode one OSCAR-Q2 tile into the same swizzled BF16 shared-memory layout consumed by the
+// tensor-core prompt kernel. The packed cache row is expanded once per KV tile, so the QK and PV
+// contractions can reuse it for all query rows in the CTA.
+template <typename Geometry>
+__device__ __forceinline__ void causal_prompt_stage_oscar_q2(
+    __nv_bfloat16* dst, const std::uint8_t* cache, const __nv_bfloat16* cache_scale, int kv_head,
+    int k0, int max_query_abs, int physical_page, int tid) {
+    constexpr int D         = kCausalPromptHeadDim;
+    constexpr int Bc        = kCausalPromptBc;
+    constexpr int Threads   = kCausalPromptThreads;
+    constexpr int CodeBytes = kPagedKVCacheOscarCodeExtent;
+    const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
+    const std::uint8_t* cache_block =
+        cache + paged_kv_element_offset<CodeBytes, Geometry::KVHeads>(
+                    physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+    const __nv_bfloat16* scale_block =
+        cache_scale +
+        paged_kv_element_offset<kPagedKVCacheOscarScaleExtent, Geometry::KVHeads>(
+            physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+
+    for (int chunk = tid; chunk < Bc * CodeBytes; chunk += Threads) {
+        const int key_l     = chunk / CodeBytes;
+        const int code_byte = chunk - key_l * CodeBytes;
+        const bool valid    = full_tile || (k0 + key_l) <= max_query_abs;
+        const int packed    = valid ? static_cast<int>(cache_block[key_l * CodeBytes + code_byte]) : 0;
+        const float scale   = valid ? __bfloat162float(scale_block[key_l * 2 + 0]) : 0.0F;
+        const float zero    = valid ? __bfloat162float(scale_block[key_l * 2 + 1]) : 0.0F;
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            const int d = code_byte * 4 + item;
+            dst[key_l * D + causal_prompt_swz(key_l, d)] =
+                __float2bfloat16(valid ? fmaf(static_cast<float>((packed >> (item << 1)) & 3),
+                                               scale, zero)
+                                        : 0.0F);
+        }
+    }
+}
+
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, bool OscarQ2 = false>
 __launch_bounds__(kCausalPromptThreads, 1) __global__
     void causal_attention_prompt_bf16_kernel(const __nv_bfloat16* __restrict__ q,
-                                             const __nv_bfloat16* __restrict__ cache_k,
-                                             const __nv_bfloat16* __restrict__ cache_v,
+                                             const void* __restrict__ cache_k,
+                                             const void* __restrict__ cache_v,
+                                             const void* __restrict__ cache_k_scale,
+                                             const void* __restrict__ cache_v_scale,
                                              Metadata metadata,
                                              const std::int32_t* __restrict__ positions,
                                              float scale, __nv_bfloat16* __restrict__ out,
@@ -140,14 +181,31 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
-    // Stage Q into smem once via cp.async (overlaps with the K(0) prologue load
-    // below); it stays resident for the whole key loop. Global Q rows are 256 bf16
-    // contiguous, with a token stride of 256*QHeads.
+    // Stage Q into smem once; it stays resident for the whole key loop. OSCAR Q2 stores K/V in a
+    // rotated basis, so Q follows the same normalized H256 transform before the first MMA.
     {
         constexpr int VecPerRow      = D / 8;
         constexpr int QRowStride     = D * Geometry::QHeads; // global stride between tokens
         const __nv_bfloat16* q_block = q + causal_prompt_q_index<Geometry>(q_head, 0, q0);
-        if (q0 + Br <= tokens) {
+        if constexpr (OscarQ2) {
+            for (int row = warp * 16; row < warp * 16 + 16; ++row) {
+                float q_values[D / 32];
+                const bool row_valid = q0 + row < tokens;
+#pragma unroll
+                for (int r = 0; r < D / 32; ++r) {
+                    q_values[r] = row_valid
+                                      ? __bfloat162float(
+                                            q_block[row * QRowStride + lane + 32 * r])
+                                      : 0.0F;
+                }
+                normalized_hadamard_d256_inplace(q_values, lane);
+#pragma unroll
+                for (int r = 0; r < D / 32; ++r) {
+                    const int d = lane + 32 * r;
+                    q_s[row * D + causal_prompt_swz(row, d)] = __float2bfloat16(q_values[r]);
+                }
+            }
+        } else if (q0 + Br <= tokens) {
 #pragma unroll
             for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
                 const int row    = chunk >> 5;
@@ -189,7 +247,15 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
-    causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
+    if constexpr (OscarQ2) {
+        causal_prompt_stage_oscar_q2<Geometry>(
+            k_s, static_cast<const std::uint8_t*>(cache_k),
+            static_cast<const __nv_bfloat16*>(cache_k_scale), kv_head, 0, max_query_abs,
+            physical_page, tid);
+    } else {
+        causal_prompt_stage_kv<Geometry>(k_s, static_cast<const __nv_bfloat16*>(cache_k), kv_head,
+                                         0, max_query_abs, physical_page, tid);
+    }
     ninfer::ops::cp_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
@@ -200,8 +266,15 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
-        causal_prompt_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
-                                         tid);
+        if constexpr (OscarQ2) {
+            causal_prompt_stage_oscar_q2<Geometry>(
+                v_s, static_cast<const std::uint8_t*>(cache_v),
+                static_cast<const __nv_bfloat16*>(cache_v_scale), kv_head, k0, max_query_abs,
+                physical_page, tid);
+        } else {
+            causal_prompt_stage_kv<Geometry>(v_s, static_cast<const __nv_bfloat16*>(cache_v),
+                                             kv_head, k0, max_query_abs, physical_page, tid);
+        }
         ninfer::ops::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -356,8 +429,16 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             physical_page = next_physical_page;
-            causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                             physical_page, tid);
+            if constexpr (OscarQ2) {
+                causal_prompt_stage_oscar_q2<Geometry>(
+                    k_s, static_cast<const std::uint8_t*>(cache_k),
+                    static_cast<const __nv_bfloat16*>(cache_k_scale), kv_head,
+                    (kb + 1) * Bc, max_query_abs, physical_page, tid);
+            } else {
+                causal_prompt_stage_kv<Geometry>(
+                    k_s, static_cast<const __nv_bfloat16*>(cache_k), kv_head, (kb + 1) * Bc,
+                    max_query_abs, physical_page, tid);
+            }
             ninfer::ops::cp_commit();
         }
 

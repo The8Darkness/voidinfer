@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -31,6 +32,7 @@ namespace ninfer::artifact {
 namespace {
 
 using Json = nlohmann::json;
+using Clock = std::chrono::steady_clock;
 
 constexpr std::array<std::byte, 8> kMagic = {
     std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
@@ -188,6 +190,7 @@ struct TransparentStringHash {
 class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
+        const auto open_start = Clock::now();
 #ifdef _WIN32
         mapping_file_ = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -284,6 +287,7 @@ public:
         data_ = static_cast<const std::byte*>(mapping);
         size_ = size;
 #endif
+        open_seconds_ = std::chrono::duration<double>(Clock::now() - open_start).count();
     }
 
     ~MappedFile() {
@@ -305,6 +309,10 @@ public:
 
     std::size_t size() const noexcept { return size_; }
 
+    double open_seconds() const noexcept { return open_seconds_; }
+
+    const DirectReadDiagnostics& direct_stats() const noexcept { return direct_stats_; }
+
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const {
         constexpr std::size_t alignment = Reader::direct_io_alignment;
         if (absolute_offset % alignment != 0 || destination.size() % alignment != 0 ||
@@ -322,6 +330,7 @@ public:
             operation.OffsetHigh = static_cast<DWORD>(offset >> 32U);
 
             DWORD bytes = 0;
+            const auto request_start = Clock::now();
             const BOOL started = ::ReadFile(direct_file_, destination.data() + total, amount,
                                             &bytes, &operation);
             if (!started) {
@@ -334,6 +343,18 @@ public:
                                             "direct artifact read");
                 }
             }
+            direct_stats_.request_count += 1;
+            direct_stats_.bytes_read += bytes;
+            direct_stats_.min_request_bytes =
+                direct_stats_.request_count == 1
+                    ? amount
+                    : std::min<std::uint64_t>(direct_stats_.min_request_bytes, amount);
+            direct_stats_.max_request_bytes =
+                std::max<std::uint64_t>(direct_stats_.max_request_bytes, amount);
+            direct_stats_.max_outstanding = std::max<std::uint32_t>(
+                direct_stats_.max_outstanding, 1U);
+            direct_stats_.elapsed_seconds +=
+                std::chrono::duration<double>(Clock::now() - request_start).count();
             total += bytes;
             if (bytes != amount) { break; }
         }
@@ -366,6 +387,8 @@ private:
 #endif
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
+    double open_seconds_ = 0.0;
+    mutable DirectReadDiagnostics direct_stats_;
 };
 
 } // namespace
@@ -405,12 +428,16 @@ struct Reader::Impl {
         }
 
         Json directory;
+        const auto parse_start = Clock::now();
         try {
             const auto* begin = reinterpret_cast<const char*>(file.data() + kPrefixBytes);
             directory         = Json::parse(begin, begin + json_bytes);
         } catch (const Json::exception& error) {
             throw ArtifactError(std::string("invalid JSON directory: ") + error.what());
         }
+        diagnostics.directory_parse_seconds =
+            std::chrono::duration<double>(Clock::now() - parse_start).count();
+        const auto validate_start = Clock::now();
 
         static constexpr std::array root_members = {"identity", "objects"};
         require_members(directory, root_members, "directory root");
@@ -462,9 +489,13 @@ struct Reader::Impl {
             entries.push_back(std::move(object));
             cursor = end;
         }
+        diagnostics.file_open_map_seconds = file.open_seconds();
+        diagnostics.directory_validate_seconds =
+            std::chrono::duration<double>(Clock::now() - validate_start).count();
     }
 
     MappedFile file;
+    ReaderDiagnostics diagnostics;
     ArtifactIdentity identity;
     std::vector<ObjectDescriptor> entries;
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
@@ -489,6 +520,12 @@ const ObjectDescriptor* Reader::find(std::string_view name) const noexcept {
 std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.size(); }
 
 std::uint64_t Reader::payload_offset() const noexcept { return impl_->payload_start; }
+
+const ReaderDiagnostics& Reader::diagnostics() const noexcept { return impl_->diagnostics; }
+
+const DirectReadDiagnostics& Reader::direct_read_diagnostics() const noexcept {
+    return impl_->file.direct_stats();
+}
 
 PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
     const auto absolute =

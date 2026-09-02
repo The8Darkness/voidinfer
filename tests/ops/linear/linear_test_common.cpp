@@ -1,6 +1,7 @@
 #include "ops/linear/linear_test_common.h"
 
 #include "core/arena.h"
+#include "ninfer/ops/argmax.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -349,6 +350,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         }
 
         failures += output.verify_guards(case_label);
+
         const std::vector<std::int32_t> columns = shape.comparison == Comparison::Full
                                                       ? all_indices(invocation.t)
                                                       : sampled_indices(invocation.t);
@@ -373,6 +375,43 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                                  static_cast<std::int32_t>(oracle_rows.size()), shape.k,
                                  static_cast<std::int32_t>(columns.size()));
             failures += compare_output(case_label, actual.selected, reference, activation_compute);
+        }
+
+        // The Qwen3.8 vocabulary head has a greedy-only fused epilogue that must be bit-identical
+        // to the established full-logit plus argmax route. Exercise representative small-T
+        // schedules while the same patterned 248320-row weight is resident. The comparison runs
+        // after the normal output check because the fused route deliberately reuses that output
+        // buffer as compact scratch.
+        if (shape.n == 248320 && shape.k == 5120 &&
+            (invocation.t == 1 || invocation.t == 8 || invocation.t == 24 ||
+             invocation.t == 48)) {
+            GuardedDeviceBuffer fused_ids(static_cast<std::size_t>(invocation.t) *
+                                           sizeof(std::int32_t));
+            GuardedDeviceBuffer reference_ids(static_cast<std::size_t>(invocation.t) *
+                                              sizeof(std::int32_t));
+            fused_ids.fill(0xcd);
+            reference_ids.fill(0xcd);
+            Tensor fused_tensor(fused_ids.data(), DType::I32, {invocation.t});
+            Tensor reference_tensor(reference_ids.data(), DType::I32, {invocation.t});
+            try {
+                ops::argmax(destination, reference_tensor, 248077, nullptr);
+                // linear_argmax reuses destination as compact scratch, so capture the reference
+                // winner before launching the destructive scratch-producing route.
+                cuda_check(cudaDeviceSynchronize(), "synchronize reference vocabulary argmax");
+                ops::linear_argmax(input, weight, fused_tensor, 248077, destination, nullptr);
+                cuda_check(cudaDeviceSynchronize(), "synchronize fused vocabulary argmax");
+                const auto fused = from_device<std::int32_t>(
+                    fused_ids.data(), static_cast<std::size_t>(invocation.t));
+                const auto reference = from_device<std::int32_t>(
+                    reference_ids.data(), static_cast<std::size_t>(invocation.t));
+                failures += verify_exact((case_label + " fused argmax").c_str(), fused, reference);
+            } catch (const std::exception& error) {
+                std::cerr << case_label << ": fused vocabulary argmax exception: " << error.what()
+                          << '\n';
+                ++failures;
+            }
+            failures += fused_ids.verify_guards(case_label + " fused argmax output");
+            failures += reference_ids.verify_guards(case_label + " reference argmax output");
         }
     }
 

@@ -50,8 +50,15 @@ int main() {
                           defaults.context_cache.host_kv_capacity_bytes ==
                               ninfer::kDefaultHostKvCapacityBytes,
                       "Host context-cache defaults mismatch");
-    failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
-                      "speculative decoding is not disabled by default");
+    failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                          defaults.speculative.draft_tokens == 7 &&
+                          defaults.speculative.proposal_head == ninfer::ProposalHead::Optimized &&
+                          defaults.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4,
+                      "DFlash2 VeriCache serving profile is not the default");
+    failures += check(defaults.hierarchical_vericache.enabled &&
+                          defaults.hierarchical_vericache.enable_host_tier_snapshots &&
+                          defaults.hierarchical_vericache.host_snapshot_horizon == 2048,
+                      "hierarchical VeriCache is not enabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
@@ -70,6 +77,69 @@ int main() {
     const ServeOptions fp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp8"});
     failures += check(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256,
                       "--kv-dtype fp8 did not select row-scaled E4M3 KV");
+
+    const ServeOptions vericache = parse({"ninfer-serve", "model.ninfer", "--kv-dtype",
+                                          "vericache-nvfp4", "--spec", "mtp",
+                                          "--draft-tokens", "4"});
+    failures += check(vericache.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 &&
+                          vericache.speculative.backend == ninfer::SpeculativeBackend::Mtp,
+                      "--kv-dtype vericache-nvfp4 did not select the hybrid profile");
+    bool vericache_without_mtp_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "vericache-nvfp4",
+                     "--no-spec"});
+    } catch (const std::invalid_argument&) { vericache_without_mtp_rejected = true; }
+    failures += check(vericache_without_mtp_rejected,
+                      "VeriCache NVFP4 was accepted without an MTP draft tier");
+
+    const ServeOptions vericache_dflash = parse({"ninfer-serve", "model.ninfer", "--kv-dtype",
+                                                 "vericache-nvfp4", "--spec", "dflash",
+                                                 "--draft-tokens", "15"});
+    failures += check(vericache_dflash.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 &&
+                          vericache_dflash.speculative.backend ==
+                              ninfer::SpeculativeBackend::DFlash,
+                      "--kv-dtype vericache-nvfp4 did not select DFlash hybrid profile");
+
+    const ServeOptions hierarchical = parse(
+        {"ninfer-serve", "model.ninfer", "--hierarchical-vericache",
+         "--vericache-host-snapshots", "--vericache-l0-horizon", "48", "--vericache-l1-horizon",
+         "1024", "--vericache-host-snapshot-horizon", "1536",
+         "--vericache-protected-recent", "128", "--vericache-protected-sinks", "8",
+         "--vericache-protected-pivots", "16"});
+    failures += check(hierarchical.hierarchical_vericache.enabled &&
+                          hierarchical.hierarchical_vericache.enable_host_tier_snapshots &&
+                          hierarchical.hierarchical_vericache.l0_to_l1_horizon == 48 &&
+                          hierarchical.hierarchical_vericache.l1_to_l2_horizon == 1024 &&
+                          hierarchical.hierarchical_vericache.host_snapshot_horizon == 1536 &&
+                          hierarchical.hierarchical_vericache.protected_recent_tokens == 128 &&
+                          hierarchical.hierarchical_vericache.protected_sink_tokens == 8 &&
+                          hierarchical.hierarchical_vericache.protected_pivot_tokens == 16,
+                      "hierarchical VeriCache serving controls did not parse");
+    bool host_snapshot_without_hierarchy_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--no-hierarchical-vericache",
+                     "--vericache-host-snapshots"});
+    } catch (const std::invalid_argument&) { host_snapshot_without_hierarchy_rejected = true; }
+    failures += check(host_snapshot_without_hierarchy_rejected,
+                      "host-tier snapshots were accepted without hierarchical VeriCache");
+    bool invalid_l0_horizon_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vericache-l0-horizon", "23"});
+    } catch (const std::invalid_argument&) { invalid_l0_horizon_rejected = true; }
+    failures += check(invalid_l0_horizon_rejected,
+                      "out-of-range L0 VeriCache horizon was accepted");
+    bool invalid_l1_horizon_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vericache-l1-horizon", "2049"});
+    } catch (const std::invalid_argument&) { invalid_l1_horizon_rejected = true; }
+    failures += check(invalid_l1_horizon_rejected,
+                      "out-of-range L1 VeriCache horizon was accepted");
+    bool invalid_host_snapshot_horizon_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--vericache-host-snapshot-horizon", "2049"});
+    } catch (const std::invalid_argument&) { invalid_host_snapshot_horizon_rejected = true; }
+    failures += check(invalid_host_snapshot_horizon_rejected,
+                      "out-of-range host snapshot horizon was accepted");
 
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
@@ -108,6 +178,13 @@ int main() {
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
 
+    const ServeOptions implicit_vision = parse({"ninfer-serve", "model.ninfer", "--vision"});
+    failures += check(implicit_vision.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          implicit_vision.speculative.draft_tokens == 5 &&
+                          implicit_vision.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 &&
+                          implicit_vision.hierarchical_vericache.enabled,
+                      "implicit default vision route did not fall back to protected MTP");
+
     bool dflash_vision_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",
@@ -115,11 +192,19 @@ int main() {
     } catch (const std::invalid_argument&) { dflash_vision_rejected = true; }
     failures += check(dflash_vision_rejected, "DFlash and Vision were accepted together");
 
-    bool implicit_backend_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "3"});
-    } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
-    failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
+    const ServeOptions default_draft_override =
+        parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "3"});
+    failures += check(default_draft_override.speculative.backend ==
+                              ninfer::SpeculativeBackend::DFlash &&
+                          default_draft_override.speculative.draft_tokens == 3,
+                      "--draft-tokens did not override the default DFlash2 window");
+    const ServeOptions no_spec =
+        parse({"ninfer-serve", "model.ninfer", "--no-spec"});
+    failures += check(no_spec.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          no_spec.kv_cache == ninfer::KvCacheStorage::BFloat16 &&
+                          !no_spec.hierarchical_vericache.enabled &&
+                          !no_spec.hierarchical_vericache.enable_host_tier_snapshots,
+                      "--no-spec did not restore the stable KV/speculation defaults");
 
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
@@ -266,6 +351,11 @@ int main() {
                       "serve help omits --default-thinking-budget");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
+    failures += check(serve_usage_text("ninfer-serve").find("--hierarchical-vericache") !=
+                          std::string::npos,
+                      "serve help omits hierarchical VeriCache controls");
+    failures += check(serve_usage_text("ninfer-serve").find("--no-spec") != std::string::npos,
+                      "serve help omits the stable speculation fallback");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");

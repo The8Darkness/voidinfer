@@ -3,6 +3,14 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
+#define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
+#define NINFER_QWEN36_RUNTIME_NS qwen3_6_27b_load_plan_test_runtime
+#include "targets/qwen3_6/impl/runtime/layouts.h"
+#undef NINFER_QWEN36_RUNTIME_NS
+#undef NINFER_QWEN36_VARIANT
+
+#include "ops/kv_cache/d256_profile.h"
+
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
@@ -33,6 +41,14 @@ ninfer::targets::qwen3_6::StartupFeatures all_features() {
         .vision        = true,
         .speculative   = ninfer::SpeculativeBackend::Mtp,
         .proposal_head = ninfer::ProposalHead::Optimized,
+    };
+}
+
+ninfer::targets::qwen3_6::StartupFeatures dflash_features() {
+    return {
+        .vision        = false,
+        .speculative   = ninfer::SpeculativeBackend::DFlash,
+        .proposal_head = ninfer::ProposalHead::Full,
     };
 }
 
@@ -162,6 +178,96 @@ int verify_nvfp4(const std::filesystem::path& path) {
     return 0;
 }
 
+int verify_nvfp4_dflash2(const std::filesystem::path& path) {
+    ninfer::artifact::Reader reader(path);
+    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen38Nvfp4Dflash2) {
+        std::cerr << "DFlash2 identity resolved to the wrong profile\n";
+        return 1;
+    }
+    if (reader.objects().size() != 1190) {
+        std::cerr << "DFlash2 artifact object count changed: " << reader.objects().size() << '\n';
+        return 1;
+    }
+
+    ninfer::artifact::Binder binder(reader);
+    const ArtifactLoadPlan plan =
+        bind_artifact(binder, WeightsProfile::Qwen38Nvfp4Dflash2, dflash_features());
+    if (plan.materialization.object_count != reader.objects().size() ||
+        plan.materialization.device_objects.empty() || plan.materialization.host_objects.size() != 6 ||
+        plan.materialization.device_capacity_bytes == 0) {
+        std::cerr << "DFlash2 materialization plan is incomplete: objects="
+                  << plan.materialization.object_count
+                  << " device=" << plan.materialization.device_objects.size()
+                  << " host=" << plan.materialization.host_objects.size() << '\n';
+        return 1;
+    }
+
+    const auto& dflash = plan.bindings.dflash;
+    if (dflash.feature_projection.index == 0 || dflash.final_norm.index == 0 ||
+        dflash.selector_predecessor_codebook.index == 0 ||
+        dflash.selector_successor_codebook.index == 0 ||
+        dflash.selector_hidden_projection.index == 0) {
+        std::cerr << "DFlash2 top-level bindings are incomplete\n";
+        return 1;
+    }
+    for (const auto& layer : dflash.layers) {
+        if (layer.query_key_value.index == 0 || layer.attention_output.index == 0 ||
+            layer.attention_conv_base.index == 0 || layer.attention_conv_projection.index == 0 ||
+            layer.mlp_conv_base.index == 0 || layer.mlp_conv_projection.index == 0) {
+            std::cerr << "DFlash2 layer bindings are incomplete\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int verify_dflash2_local_cache_layout() {
+    ninfer::DeviceContext device(0);
+    ninfer::EngineOptions options;
+    options.max_context                      = 128;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(128);
+    options.prefill_chunk                    = 128;
+    options.max_concurrency                  = 1;
+    options.kv_cache                         = ninfer::KvCacheStorage::VeriCacheNvfp4;
+    options.speculative.backend              = ninfer::SpeculativeBackend::DFlash;
+    options.speculative.draft_tokens         = 7;
+    options.speculative.proposal_head        = ninfer::ProposalHead::Full;
+    options.use_cuda_graph                   = false;
+    options.context_cache.device_state_slots = options.max_concurrency;
+    options.hierarchical_vericache.enabled   = true;
+
+    auto planner = Package::make_sequence_planner(
+        device, options, WeightsProfile::Qwen38Nvfp4Dflash2);
+    const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
+    auto sequence             = std::move(planner).finalize(pages);
+    const auto& persistent = sequence.impl_->persistent;
+    if (sequence.impl_->kv_dtype != ninfer::DType::U8 ||
+        sequence.impl_->kv_quant_group != ninfer::ops::kD256OscarQuantGroup) {
+        std::cerr << "DFlash2 target KV cache unexpectedly changed from OSCAR-Q2\n";
+        return 1;
+    }
+    if (!persistent.state_images.dflash_local) {
+        std::cerr << "DFlash2 sequence plan has no local drafter cache\n";
+        return 1;
+    }
+
+    const auto& local = *persistent.state_images.dflash_local;
+    const auto& host  = persistent.state_images.host;
+    const auto& spec  = host.spec.dflash_local;
+    if (local.dtype != ninfer::DType::BF16 || local.quant_group != 0 || local.quant_bits != 0 ||
+        local.quantization != ninfer::CyclicKVCacheQuantization::Auto ||
+        local.k.size() != Variant::DFlashConfig::local_layers ||
+        !spec || spec->dtype != ninfer::DType::BF16 || spec->quant_group != 0 ||
+        spec->quant_bits != 0 ||
+        spec->quantization != ninfer::CyclicKVCacheQuantization::Auto ||
+        host.dflash_local_k_scale || host.dflash_local_v_scale ||
+        persistent.state_images.dflash_local_q4_shadow) {
+        std::cerr << "DFlash2 local drafter cache is not an unquantized BF16 layout\n";
+        return 1;
+    }
+    return 0;
+}
+
 int verify_rejection() {
     try {
         (void)Package::resolve_weights({"qwen3.6-27b", "unknown"});
@@ -238,15 +344,26 @@ int main() {
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =
         artifact_path("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS", "qwen3_6_27b_nvfp4.ninfer");
-    if (!std::filesystem::is_regular_file(groupwise) || !std::filesystem::is_regular_file(nvfp4)) {
-        std::cerr << "skip: both real 27B artifacts are required: groupwise=" << groupwise
-                  << " nvfp4=" << nvfp4 << '\n';
+    const std::filesystem::path nvfp4_dflash2 = artifact_path(
+        "NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS", "qwen3_8_27b_nvfp4_dflash2.ninfer");
+    const bool have_legacy_artifacts = std::filesystem::is_regular_file(groupwise) &&
+                                       std::filesystem::is_regular_file(nvfp4);
+    const bool have_dflash2_artifact = std::filesystem::is_regular_file(nvfp4_dflash2);
+    if (const int result = verify_dflash2_local_cache_layout(); result != 0) { return result; }
+    if (!have_legacy_artifacts && !have_dflash2_artifact) {
+        std::cerr << "skip: no real 27B artifact is available: groupwise=" << groupwise
+                  << " nvfp4=" << nvfp4 << " dflash2=" << nvfp4_dflash2 << '\n';
         return 77;
     }
     if (const int result = verify_vision_workspace_planning(); result != 0) { return result; }
     if (const int result = verify_rejection(); result != 0) { return result; }
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
-    if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
-    if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }
+    if (have_legacy_artifacts) {
+        if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
+        if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }
+    }
+    if (have_dflash2_artifact) {
+        if (const int result = verify_nvfp4_dflash2(nvfp4_dflash2); result != 0) { return result; }
+    }
     return 0;
 }

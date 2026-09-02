@@ -98,6 +98,13 @@ int main() {
     options.allow_prefix_reuse             = true;
     options.preserve_thinking              = true;
     options.default_thinking_budget        = 512;
+    options.hierarchical_vericache.enabled = true;
+    options.hierarchical_vericache.l0_to_l1_horizon = 48;
+    options.hierarchical_vericache.l1_to_l2_horizon = 1024;
+    options.hierarchical_vericache.enable_host_tier_snapshots = true;
+    options.hierarchical_vericache.protected_recent_tokens = 128;
+    options.hierarchical_vericache.protected_sink_tokens = 8;
+    options.hierarchical_vericache.protected_pivot_tokens = 16;
     options.sampling_overrides.temperature = 0.6F;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
@@ -120,6 +127,7 @@ int main() {
     engine_options.context_cache.max_shared_prefixes               = 2;
     engine_options.context_cache.max_long_anchors_per_continuation = 2;
     engine_options.context_cache.max_cache_markers_per_request     = 4;
+    engine_options.hierarchical_vericache = options.hierarchical_vericache;
 
     const ninfer::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
@@ -222,6 +230,15 @@ int main() {
                       "speculative backend missing");
     failures +=
         check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
+    failures += check(
+        server.at("engine").at("hierarchical_vericache").at("enabled") == true &&
+            server.at("engine").at("hierarchical_vericache").at("l0_to_l1_horizon") == 48 &&
+            server.at("engine").at("hierarchical_vericache").at("l1_to_l2_horizon") == 1024 &&
+            server.at("engine").at("hierarchical_vericache").at("l1_live_verifier_primary") ==
+                true &&
+            server.at("engine").at("hierarchical_vericache").at("host_tier_snapshots") == true &&
+            server.at("engine").at("hierarchical_vericache").at("protected_recent_tokens") == 128,
+        "hierarchical VeriCache startup provenance missing");
     failures += check(
         server.at("engine").at("context_cost").at("transfer_source") == "external" &&
             server.at("engine").at("context_cost").at("prefill_source") == "compiled-default" &&
@@ -510,6 +527,25 @@ int main() {
     throughput.current.pressure_private_owners_degraded = 1;
     throughput.current.pressure_checkpoints_dropped     = 1;
     throughput.current.pressure_searches                = 1;
+    throughput.current.hierarchical_vericache_enabled   = true;
+    throughput.current.vericache_l0_to_l1_horizon       = 48;
+    throughput.current.vericache_l1_to_l2_horizon       = 1024;
+    throughput.previous.vericache_l0_l1_checks          = 1;
+    throughput.current.vericache_l0_l1_checks            = 3;
+    throughput.previous.vericache_l0_l1_proposed_tokens = 4;
+    throughput.current.vericache_l0_l1_proposed_tokens  = 12;
+    throughput.previous.vericache_l0_l1_accepted_tokens = 2;
+    throughput.current.vericache_l0_l1_accepted_tokens  = 9;
+    throughput.previous.vericache_l0_l1_disagreements   = 1;
+    throughput.current.vericache_l0_l1_disagreements    = 2;
+    throughput.previous.vericache_exact_target_checks   = 2;
+    throughput.current.vericache_exact_target_checks    = 5;
+    throughput.previous.vericache_host_tier_snapshots   = 1;
+    throughput.current.vericache_host_tier_snapshots    = 2;
+    throughput.current.vericache_l0_bytes                = 128;
+    throughput.current.vericache_l1_bytes                = 256;
+    throughput.current.vericache_l2_bytes                = 512;
+    throughput.current.vericache_l3_bytes                = 1024;
     throughput.current.host_work                        = {
                                .engine_boundary_ns            = 1000000,
                                .program_submit_ns             = 2000000,
@@ -542,6 +578,9 @@ int main() {
                           human_throughput.find("host=15.00ms") != std::string::npos &&
                           human_throughput.find("decode-host=1000.0us/round") != std::string::npos,
                       "human throughput report mismatch");
+    failures += check(human_throughput.find("vericache=l0->l1@48 l1->l2@1024") !=
+                          std::string::npos,
+                      "human throughput report omits hierarchical VeriCache state");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
@@ -593,6 +632,15 @@ int main() {
             throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
+    failures += check(
+        throughput_json.at("hierarchical_vericache").at("enabled") == true &&
+            throughput_json.at("hierarchical_vericache").at("horizons").at("l0_to_l1") == 48 &&
+            throughput_json.at("hierarchical_vericache").at("l0_to_l1").at("checks") == 2 &&
+            throughput_json.at("hierarchical_vericache").at("l0_to_l1").at("accepted_tokens") == 7 &&
+            throughput_json.at("hierarchical_vericache").at("exact_target_fallback").at("checks") == 3 &&
+            throughput_json.at("hierarchical_vericache").at("host_tier").at("snapshots") == 1 &&
+            throughput_json.at("hierarchical_vericache").at("tier_bytes").at("l3_nvme") == 1024,
+        "hierarchical VeriCache throughput telemetry missing or not interval-scoped");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);

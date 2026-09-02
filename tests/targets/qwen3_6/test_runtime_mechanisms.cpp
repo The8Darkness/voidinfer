@@ -109,6 +109,37 @@ void test_decoder_layout() {
            "FP8 MTP KV has row-scaled code and scale planes");
     expect(fp8.kv_payload_bytes() == fp8.text_kv.payload_bytes() + fp8.mtp_kv->payload_bytes(),
            "FP8 Text/MTP KV payload accounting");
+
+    q36::DecoderStateSpec vericache_spec{
+        .full_attention_layers     = 2,
+        .mtp_layers                = 1,
+        .capacity                  = 129,
+        .kv_heads                  = 2,
+        .attention_head_dim        = 256,
+        .kv_dtype                  = ninfer::DType::BF16,
+        .kv_quant_group            = 0,
+        .enable_mtp                = true,
+        .kv_table_rows             = 1,
+        .text_physical_page_groups = 5,
+        .mtp_physical_page_groups  = 4,
+        .mtp_kv_dtype              = ninfer::DType::U8,
+        .mtp_kv_quant_group        = q36::kKvNvfp4QuantGroup,
+        .mtp_kv_profile_explicit   = true,
+    };
+    ninfer::LayoutBuilder vericache_builder;
+    const q36::DecoderStateLayout vericache =
+        q36::plan_decoder_state(vericache_builder, vericache_spec);
+    (void)vericache_builder.finish(256);
+    expect(vericache.text_kv.pages.planes.size() == 4 &&
+               vericache.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::BF16 &&
+               vericache.text_kv.pages.planes[0].geometry.leading_extent == 256,
+           "VeriCache keeps the target text KV exact BF16");
+    expect(vericache.mtp_kv && vericache.mtp_kv->pages.planes.size() == 4 &&
+               vericache.mtp_kv->pages.planes[0].geometry.dtype == ninfer::DType::U8 &&
+               vericache.mtp_kv->pages.planes[0].geometry.leading_extent == 128 &&
+               vericache.mtp_kv->pages.planes[2].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               vericache.mtp_kv->pages.planes[2].geometry.leading_extent == 16,
+           "VeriCache assigns packed NVFP4 only to the MTP draft KV");
 }
 
 void test_round_layout() {

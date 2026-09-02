@@ -47,6 +47,18 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
+void speculative_common_prefix_launch(const Tensor& left, const Tensor& right,
+                                      const Tensor& current_extents, Tensor& verified_extents,
+                                      Tensor& valid_columns, cudaStream_t stream) {
+    constexpr int kBlock = 32;
+    speculative_common_prefix_kernel<<<left.ne[1], kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(left.data), static_cast<const std::int32_t*>(right.data),
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(verified_extents.data),
+        static_cast<std::int32_t*>(valid_columns.data), left.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
                                              const Tensor& drafts, const Tensor& current_extents,
                                              Tensor& lengths, Tensor& anchors,
@@ -95,6 +107,22 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
         configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void speculative_accept_greedy_drafts_from_tokens_launch(
+    const Tensor& target_tokens, const Tensor& drafts, const Tensor& current_extents,
+    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted, cudaStream_t stream) {
+    const int batch = drafts.ne[1];
+    speculative_accept_greedy_drafts_from_tokens_kernel<<<batch, kSamplerBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(target_tokens.data),
+        static_cast<const std::int32_t*>(drafts.data),
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
+        static_cast<std::int32_t*>(licensed_tokens.data),
+        static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
+        drafts.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

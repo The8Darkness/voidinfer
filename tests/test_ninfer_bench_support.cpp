@@ -142,6 +142,17 @@ int test_cli_contract() {
     const qb::BenchOptions fp8 =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
     failures += expect(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256, "FP8 KV");
+    const qb::BenchOptions vericache = parse_for_test(
+        {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "vericache-nvfp4",
+         "--mtp-draft-tokens", "4"});
+    failures += expect(vericache.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4,
+                       "VeriCache NVFP4 KV");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "vericache-nvfp4"});
+        },
+        "VeriCache NVFP4 without MTP");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(

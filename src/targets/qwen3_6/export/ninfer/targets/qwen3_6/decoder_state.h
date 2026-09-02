@@ -11,6 +11,7 @@ namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvInt8QuantGroup = 64;
 inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
+inline constexpr std::int32_t kKvNvfp4QuantGroup = 16;
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
@@ -24,6 +25,11 @@ struct DecoderStateSpec {
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
+    // By default MTP follows the target profile. VeriCache sets this explicitly so target text
+    // KV stays exact while the separate MTP draft cache uses its compressed profile.
+    DType mtp_kv_dtype              = DType::BF16;
+    std::int32_t mtp_kv_quant_group = 0;
+    bool mtp_kv_profile_explicit    = false;
 };
 
 struct PagedKVCacheLayout {
@@ -97,6 +103,7 @@ private:
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
+    OscarKVLayout oscar_layout_ = OscarKVLayout::Contiguous;
 };
 
 struct DecoderStateLayout {

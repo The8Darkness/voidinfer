@@ -1,0 +1,319 @@
+{
+  "schema": "oscar-d2-1-golden-v1",
+  "upstream": {
+    "repository": "FutureMLS-Lab/OSCAR",
+    "commit": "41ebcdba3db5f0ce1339c3727caea80df575d437",
+    "source": "https://raw.githubusercontent.com/FutureMLS-Lab/OSCAR/41ebcdba3db5f0ce1339c3727caea80df575d437/sglang-research/python/sglang/QuantKernel/oscar_rotation_clip_int2_kv.py",
+    "source_sha256": "c1d7fd911c688cf29df9b98ce19fb48c6e7147ea6fcc81761e33cbf5f38b4157"
+  },
+  "official_semantics": {
+    "head_dim": 256,
+    "group_size": 128,
+    "groups": 2,
+    "levels": 3,
+    "k_clip_ratio": 0.96,
+    "v_clip_ratio": 0.92,
+    "clip_rule": "threshold=sort(abs(row))[int(clip_ratio*head_dim)], symmetric clamp",
+    "scale_rule": "max(group_max-group_min,1e-8)/3 in FP32",
+    "zero_rule": "zero_point=-group_min/scale in FP32",
+    "quant_rule": "uint8(value/scale+zero_point+0.5), symbols 0..3",
+    "decode_rule": "(symbol-zero_point)*scale in FP32",
+    "packing": "byte[j]=q[j]|q[j+64]<<2|q[j+128]<<4|q[j+192]<<6",
+    "metadata": "FP32 [scale_group0,zero_group0,scale_group1,zero_group1]"
+  },
+  "model": {
+    "sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+    "full_attention_layers": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47,
+      51,
+      55,
+      59,
+      63
+    ],
+    "kv_heads": 4,
+    "head_dim": 256
+  },
+  "capture": {
+    "manifest": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\captures\\phase-b2-qkv-256\\manifest.json",
+    "manifest_sha256": "df0319563e91cc71a6dcc16a5f34f167da47931566f4ae94fc25f246a8425a89",
+    "schema": "oscar-qkv-v1",
+    "stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+    "selected_payload_hashes": {
+      "layer_3_k": "d7b67b0e88dc9030ec135df5e18a7371c46a8366ac1515aa8a84641f44d5b4d7",
+      "layer_3_v": "b24109a54d16d5365a80128cd0b674c8ae9cdf00d9a3aba1f9c650d90525c6a0",
+      "layer_35_k": "ee46856fcd924517debc84c7c7795d710951c632ba1dd82079ae0a55b1647456",
+      "layer_35_v": "0293bf642ae308c67dd18c77390c13fccc54c845d80e0cc0993c81e3a8780e48",
+      "layer_63_k": "16e00bde8f5d200a05d782214d922e2686991e98b37544cad75760925812ef40",
+      "layer_63_v": "d53477353d66375b6a693835313dc5ce5c1af7974f90ef896973f2ff4769c8d0"
+    }
+  },
+  "source_files": {
+    "generator": "dd0629ddac591784c1ac8267c254355b65827d5bbb23b13ab4e95a99868bc97c",
+    "capture_manifest": "df0319563e91cc71a6dcc16a5f34f167da47931566f4ae94fc25f246a8425a89",
+    "rotation_k_pt": "f2b97b27bb3c453e4e01f1303c9ab21ef96bcf595b48569ad5cbfb2799cfda08",
+    "rotation_v_pt": "516bb00b45ba37dadc311b20de3620b0b0e792a3e6a5b76951ef4d24c87036da"
+  },
+  "cases": [
+    {
+      "name": "random_finite",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 3,
+      "input_sha256": "d6e8ff3f3cb96eea15b6e29631ed418760c3aa6903d58c44d49de29d14f1eae6",
+      "thresholds": [
+        2.1785287857055664,
+        1.803525686264038,
+        2.140488386154175
+      ],
+      "packed_sha256": "582bf3d76775169fb1bd93d8e578665ea0ebc3a65818c2a1780f65df7fbfae53"
+    },
+    {
+      "name": "positive_only",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 1,
+      "input_sha256": "43b98f01eac0ef5f4ff98c578ca45b7dcdf5781dc9fd4615de5fc433a873a759",
+      "thresholds": [
+        1.9264706373214722
+      ],
+      "packed_sha256": "c623c7fcdb1e395d137ae54912eea93b188b111fd1bdc40c7283dc7656bee00b"
+    },
+    {
+      "name": "negative_only",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 1,
+      "input_sha256": "3290965b0341ba8798ae4369e5d9c79d14e7dcb0cd2d5fbf3dd75ce082990fe6",
+      "thresholds": [
+        1.9264706373214722
+      ],
+      "packed_sha256": "f5ded7a67b120c74c38af9e0a65dad52283d3250b48648416e5a49c6c5742d39"
+    },
+    {
+      "name": "mixed_sign",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 1,
+      "input_sha256": "54574d26920b700eee38b9094e65b7915916512a93ec02e5a3d0469d57c86de5",
+      "thresholds": [
+        2.882352828979492
+      ],
+      "packed_sha256": "900080317424d4c006e3e80012e6a17324cc445a2b1d0a6fbfc2a8a66a77d5c2"
+    },
+    {
+      "name": "near_zero_range",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 1,
+      "input_sha256": "f85d943a61cf98e3ff616bcb24ca6a6b7dbe873962c53f11b0300c4dcafe60c4",
+      "thresholds": [
+        1.2249999625790764e-10
+      ],
+      "packed_sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"
+    },
+    {
+      "name": "clipping_sensitive_outliers",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 1,
+      "input_sha256": "db6f3da45083533c199c3f39a7e7c981a987ab912702d8bf64bac6de02050b36",
+      "thresholds": [
+        0.9764705896377563
+      ],
+      "packed_sha256": "9191f970a3818f0eec2aacc9f3a5e7cee6143bcbec3e84a076ec4dc9611fc124"
+    },
+    {
+      "name": "exact_group_boundary",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 1,
+      "input_sha256": "2c6280709ba067abe0131a827edd408105abe8c3bd2e9acbee202dbbcb005937",
+      "thresholds": [
+        12.763779640197754
+      ],
+      "packed_sha256": "c623c7fcdb1e395d137ae54912eea93b188b111fd1bdc40c7283dc7656bee00b"
+    },
+    {
+      "name": "multiple_groups",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.92,
+      "clip_index": 235,
+      "rows": 3,
+      "input_sha256": "604be224416ada9c4d96643764e6835d1f5cf3ae51b4271b1c1ba1950910c5c9",
+      "thresholds": [
+        7.5806450843811035,
+        13.823529243469238,
+        0.9920282363891602
+      ],
+      "packed_sha256": "a88ad656aa2a33872471b1e59f5eb4711654f833cc4f1a6d64385dcd8cdff6d3"
+    },
+    {
+      "name": "page_fragment_like_rows",
+      "source_kind": "synthetic",
+      "source_layer": -1,
+      "clip_ratio": 0.92,
+      "clip_index": 235,
+      "rows": 3,
+      "input_sha256": "c4dd1f4434902f721c7a2f44f6fae7410da705bc56af78a04930e029d9db48f6",
+      "thresholds": [
+        1.8030712604522705,
+        0.050190020352602005,
+        31.142419815063477
+      ],
+      "packed_sha256": "aff50a7d0a0683a386c0aee9ccb3abcef63d0fdfae597829e6eec2b42971e748"
+    },
+    {
+      "name": "real_layer_3_k_rotated",
+      "source_kind": "real_rotated_capture",
+      "source_layer": 3,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 8,
+      "input_sha256": "1d8d11e84089954ee5a7192ebf7771ced36a498d326c3a4591f8dbf6cc42b832",
+      "thresholds": [
+        2.305145502090454,
+        2.1543989181518555,
+        2.279994010925293,
+        2.526876211166382,
+        2.391880989074707,
+        2.3398334980010986,
+        2.3065390586853027,
+        2.695505142211914
+      ],
+      "packed_sha256": "99ac3c4f8b805e981688d234f56506977cdb3fe864ce0151e59a6e230f21fd47"
+    },
+    {
+      "name": "real_layer_3_v_rotated",
+      "source_kind": "real_rotated_capture",
+      "source_layer": 3,
+      "clip_ratio": 0.92,
+      "clip_index": 235,
+      "rows": 8,
+      "input_sha256": "f243eaec1cdf718f4e8dda5033f32317133777644e8efd27ece0895c88daea8c",
+      "thresholds": [
+        0.85627681016922,
+        1.3801764249801636,
+        1.2109816074371338,
+        1.3420628309249878,
+        1.1419216394424438,
+        1.6456971168518066,
+        1.4293310642242432,
+        1.6737066507339478
+      ],
+      "packed_sha256": "6dd0cd5fe3a4819106abda0109c85d976e4e1dd329f6bff8ff031968b4424e3c"
+    },
+    {
+      "name": "real_layer_35_k_rotated",
+      "source_kind": "real_rotated_capture",
+      "source_layer": 35,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 8,
+      "input_sha256": "fe68d21aa1235a4e33fa91219dfc9f086257dcf2d80fdb9fae85497486a2c95b",
+      "thresholds": [
+        3.087360382080078,
+        2.9541187286376953,
+        2.9498209953308105,
+        3.568068027496338,
+        3.2142224311828613,
+        2.9602105617523193,
+        3.1692044734954834,
+        3.248657703399658
+      ],
+      "packed_sha256": "ceeed0926473f43156a65291fa83b4d15671969492edec9c86995885238c0a48"
+    },
+    {
+      "name": "real_layer_35_v_rotated",
+      "source_kind": "real_rotated_capture",
+      "source_layer": 35,
+      "clip_ratio": 0.92,
+      "clip_index": 235,
+      "rows": 8,
+      "input_sha256": "0bf4c0b52dd3d6a2f064267cbe7858ac577d98cfe6b9146d18ecf6e4da5e4e8e",
+      "thresholds": [
+        2.6718709468841553,
+        2.707826614379883,
+        3.9294586181640625,
+        3.5589561462402344,
+        1.5523074865341187,
+        2.389390230178833,
+        1.7463250160217285,
+        2.031553268432617
+      ],
+      "packed_sha256": "625a2ff276795e565221a2a3de8414e30b233d52c262bde6bf371827714d3347"
+    },
+    {
+      "name": "real_layer_63_k_rotated",
+      "source_kind": "real_rotated_capture",
+      "source_layer": 63,
+      "clip_ratio": 0.96,
+      "clip_index": 245,
+      "rows": 8,
+      "input_sha256": "b221c17485a00e2b55a33ae339245d52754cb8aaad0db3dae9f25d4b0e835fc1",
+      "thresholds": [
+        3.255600690841675,
+        2.9924135208129883,
+        2.7082085609436035,
+        2.8440022468566895,
+        3.0040671825408936,
+        3.02724289894104,
+        3.1029651165008545,
+        3.0583903789520264
+      ],
+      "packed_sha256": "6832bdbb6df1df004a1179abf109e705fc3c6e15fbc84a096701605fc6c5a872"
+    },
+    {
+      "name": "real_layer_63_v_rotated",
+      "source_kind": "real_rotated_capture",
+      "source_layer": 63,
+      "clip_ratio": 0.92,
+      "clip_index": 235,
+      "rows": 8,
+      "input_sha256": "56d05a69f8f2d393e232e5f2b869494611414d491ad955e75ed46fac8bfc5ba0",
+      "thresholds": [
+        8.741241455078125,
+        11.692612648010254,
+        8.560482025146484,
+        8.493043899536133,
+        8.610822677612305,
+        10.406190872192383,
+        8.080257415771484,
+        7.685935974121094
+      ],
+      "packed_sha256": "5d69f528380ba530a495a9a7928e2959eff332f9f3494cd99dba5f3847bcbad4"
+    }
+  ],
+  "fixture": {
+    "path": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\d2-1-int2-fixtures\\golden.bin",
+    "bytes": 215506,
+    "sha256": "a0d2bba734fcefde2999542bba559dd338487270235e1c462dcb7392eac98bfe",
+    "case_count": 15,
+    "row_count": 63
+  }
+}

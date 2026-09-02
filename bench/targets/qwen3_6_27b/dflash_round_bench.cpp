@@ -1,0 +1,919 @@
+#include <ninfer/targets/qwen3_6_27b/package.h>
+
+#include "artifact/binder.h"
+#include "artifact/materializer.h"
+#include "artifact/reader.h"
+#include "core/device.h"
+#include "runtime/engine/context_cost.h"
+#include "runtime/engine/kv_capacity.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace {
+
+namespace target = ninfer::targets::qwen3_6_27b;
+using Clock      = std::chrono::steady_clock;
+
+enum class Workload {
+    Normal,
+    Coding,
+    Reasoning,
+    Repetitive,
+    Tool,
+};
+
+struct Options {
+    std::filesystem::path artifact =
+        "models/Qwen3.8-27B-NVFP4-DFlash2-NInfer/qwen3_8_27b_nvfp4.ninfer";
+    int device                     = 0;
+    int warmup                     = 2;
+    int repetitions                = 10;
+    std::uint32_t context_tokens   = 128;
+    std::vector<std::uint32_t> context_tokens_per_lane;
+    std::uint32_t draft_tokens     = 7;
+    std::uint32_t batch_size       = 1;
+    std::uint32_t prefill_chunk    = 1024;
+    ninfer::ProposalHead proposal  = ninfer::ProposalHead::Full;
+    ninfer::KvCacheStorage kv_cache = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    bool use_cuda_graph            = false;
+    bool profile_phases             = false;
+    bool adaptive_k                 = false;
+    bool hierarchical_vericache    = false;
+    bool host_tier_snapshots       = false;
+    std::uint32_t l1_to_l2_horizon  = 512;
+    std::uint32_t host_snapshot_horizon = 0;
+    std::uint32_t protected_recent_tokens = 128;
+    std::uint32_t protected_sink_tokens   = 4;
+    std::uint32_t protected_pivot_tokens  = 4;
+    // Keep disabled hierarchy valid; Q2 is selected explicitly by --vericache-l0-bits 2.
+    std::uint8_t l0_bits                  = 4;
+    bool q2_filter                        = false;
+    Workload workload                     = Workload::Normal;
+};
+
+const char* workload_name(Workload workload) noexcept {
+    switch (workload) {
+    case Workload::Normal:
+        return "normal";
+    case Workload::Coding:
+        return "coding";
+    case Workload::Reasoning:
+        return "reasoning";
+    case Workload::Repetitive:
+        return "repetitive";
+    case Workload::Tool:
+        return "tool";
+    }
+    return "unknown";
+}
+
+void print_usage(const char* executable) {
+    std::cout << "usage: " << executable
+              << " [--artifact <model.ninfer>] [--device <id>] [--context <tokens>]"
+                 " [--contexts <tokens,tokens,...> --batch <n>]"
+                 " [--warmup <n>] [--reps <n>] [--draft-tokens <1..7>]"
+                 " [--batch <1..8>]"
+                 " [--prefill-chunk <multiple-of-128>]"
+                 " [--proposal-head full|optimized]"
+                 " [--kv-dtype bf16|fp8-e4m3-row256|vericache-nvfp4]"
+                 " [--hierarchical-vericache]"
+                 " [--vericache-host-snapshots]"
+                  " [--vericache-l1-horizon <256..2048>]"
+                  " [--vericache-host-snapshot-horizon <256..2048>]"
+                 " [--vericache-l0-bits 2|4]"
+                 " [--vericache-q2-filter]"
+                 " [--vericache-protected-recent <0..2048>]"
+                 " [--vericache-protected-sinks <0..2048>]"
+                 " [--vericache-protected-pivots <0..2048>]"
+                 " [--workload normal|coding|reasoning|repetitive|tool]"
+                 " [--adaptive-k]"
+                 " [--profile-phases]"
+                 " [--cuda-graph|--no-cuda-graph]\n";
+}
+
+std::uint32_t parse_u32(const char* text, const char* label) {
+    std::size_t consumed      = 0;
+    const unsigned long value = std::stoul(text, &consumed);
+    if (text[consumed] != '\0' || value > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(std::string(label) + " is not a uint32");
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+Options parse_options(int argc, char** argv) {
+    Options options;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        const auto value = [&](const char* name) -> const char* {
+            if (++index >= argc) {
+                throw std::invalid_argument(std::string(name) + " needs value");
+            }
+            return argv[index];
+        };
+        if (argument == "--artifact") {
+            options.artifact = value("--artifact");
+        } else if (argument == "--device") {
+            options.device = std::stoi(value("--device"));
+        } else if (argument == "--context") {
+            options.context_tokens = parse_u32(value("--context"), "context");
+        } else if (argument == "--contexts") {
+            const std::string_view list(value("--contexts"));
+            if (list.empty()) { throw std::invalid_argument("--contexts must not be empty"); }
+            std::size_t begin = 0;
+            while (begin <= list.size()) {
+                const std::size_t end = list.find(',', begin);
+                const std::string token = std::string(
+                    list.substr(begin, end == std::string_view::npos ? end : end - begin));
+                if (token.empty()) { throw std::invalid_argument("--contexts contains an empty value"); }
+                options.context_tokens_per_lane.push_back(parse_u32(token.c_str(), "contexts"));
+                if (end == std::string_view::npos) { break; }
+                begin = end + 1;
+            }
+        } else if (argument == "--warmup") {
+            options.warmup = std::stoi(value("--warmup"));
+        } else if (argument == "--reps") {
+            options.repetitions = std::stoi(value("--reps"));
+        } else if (argument == "--draft-tokens") {
+            options.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
+        } else if (argument == "--batch") {
+            options.batch_size = parse_u32(value("--batch"), "batch");
+        } else if (argument == "--prefill-chunk") {
+            options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
+        } else if (argument == "--proposal-head") {
+            const std::string_view head(value("--proposal-head"));
+            if (head == "full") {
+                options.proposal = ninfer::ProposalHead::Full;
+            } else if (head == "optimized") {
+                options.proposal = ninfer::ProposalHead::Optimized;
+            } else {
+                throw std::invalid_argument("--proposal-head must be full or optimized");
+            }
+        } else if (argument == "--kv-dtype") {
+            const std::string_view dtype(value("--kv-dtype"));
+            if (dtype == "bf16") {
+                options.kv_cache = ninfer::KvCacheStorage::BFloat16;
+            } else if (dtype == "fp8-e4m3-row256") {
+                options.kv_cache = ninfer::KvCacheStorage::Fp8E4M3Row256;
+            } else if (dtype == "vericache-nvfp4") {
+                options.kv_cache = ninfer::KvCacheStorage::VeriCacheNvfp4;
+            } else {
+                throw std::invalid_argument(
+                    "--kv-dtype must be bf16, fp8-e4m3-row256, or vericache-nvfp4");
+            }
+        } else if (argument == "--no-cuda-graph") {
+            options.use_cuda_graph = false;
+        } else if (argument == "--cuda-graph") {
+            options.use_cuda_graph = true;
+        } else if (argument == "--profile-phases") {
+            options.profile_phases = true;
+        } else if (argument == "--adaptive-k") {
+            options.adaptive_k = true;
+        } else if (argument == "--workload") {
+            const std::string_view workload(value("--workload"));
+            if (workload == "normal") {
+                options.workload = Workload::Normal;
+            } else if (workload == "coding") {
+                options.workload = Workload::Coding;
+            } else if (workload == "reasoning") {
+                options.workload = Workload::Reasoning;
+            } else if (workload == "repetitive") {
+                options.workload = Workload::Repetitive;
+            } else if (workload == "tool") {
+                options.workload = Workload::Tool;
+            } else {
+                throw std::invalid_argument(
+                    "--workload must be normal, coding, reasoning, repetitive, or tool");
+            }
+        } else if (argument == "--hierarchical-vericache") {
+            options.hierarchical_vericache = true;
+        } else if (argument == "--vericache-host-snapshots") {
+            options.hierarchical_vericache = true;
+            options.host_tier_snapshots = true;
+        } else if (argument == "--vericache-l1-horizon") {
+            options.l1_to_l2_horizon = parse_u32(value("--vericache-l1-horizon"),
+                                                 "vericache-l1-horizon");
+        } else if (argument == "--vericache-host-snapshot-horizon") {
+            options.host_snapshot_horizon = parse_u32(
+                value("--vericache-host-snapshot-horizon"), "vericache-host-snapshot-horizon");
+        } else if (argument == "--vericache-l0-bits") {
+            const std::uint32_t bits =
+                parse_u32(value("--vericache-l0-bits"), "vericache-l0-bits");
+            if (bits != 2 && bits != 4) {
+                throw std::invalid_argument("--vericache-l0-bits must be 2 or 4");
+            }
+            options.l0_bits = static_cast<std::uint8_t>(bits);
+        } else if (argument == "--vericache-q2-filter") {
+            options.q2_filter = true;
+        } else if (argument == "--vericache-protected-recent") {
+            options.protected_recent_tokens =
+                parse_u32(value("--vericache-protected-recent"), "vericache-protected-recent");
+        } else if (argument == "--vericache-protected-sinks") {
+            options.protected_sink_tokens =
+                parse_u32(value("--vericache-protected-sinks"), "vericache-protected-sinks");
+        } else if (argument == "--vericache-protected-pivots") {
+            options.protected_pivot_tokens =
+                parse_u32(value("--vericache-protected-pivots"), "vericache-protected-pivots");
+        } else if (argument == "-h" || argument == "--help") {
+            print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_6_27b_dflash_round_bench");
+            std::exit(0);
+        } else {
+            throw std::invalid_argument("unknown argument: " + std::string(argument));
+        }
+    }
+    if (options.device < 0) { throw std::invalid_argument("--device must be nonnegative"); }
+    if (options.warmup < 1) {
+        throw std::invalid_argument("--warmup must be positive so measured rounds are steady");
+    }
+    if (options.repetitions <= 0) { throw std::invalid_argument("--reps must be positive"); }
+    if (options.context_tokens < 16) {
+        throw std::invalid_argument("--context must be at least 16 tokens");
+    }
+    if (options.draft_tokens == 0 || options.draft_tokens > 7) {
+        throw std::invalid_argument("--draft-tokens must be in [1,7]");
+    }
+    if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
+        throw std::invalid_argument("--batch must be in [1,8]");
+    }
+    if (!options.context_tokens_per_lane.empty()) {
+        if (options.context_tokens_per_lane.size() != options.batch_size) {
+            throw std::invalid_argument("--contexts count must equal --batch");
+        }
+        for (const std::uint32_t context : options.context_tokens_per_lane) {
+            if (context < 16) {
+                throw std::invalid_argument("every --contexts value must be at least 16 tokens");
+            }
+        }
+    }
+    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (options.protected_recent_tokens > 2048) {
+        throw std::invalid_argument("--vericache-protected-recent must be in [0,2048]");
+    }
+    if (options.l1_to_l2_horizon < 256 || options.l1_to_l2_horizon > 2048) {
+        throw std::invalid_argument("--vericache-l1-horizon must be in [256,2048]");
+    }
+    if (options.host_snapshot_horizon != 0 &&
+        (options.host_snapshot_horizon < 256 || options.host_snapshot_horizon > 2048)) {
+        throw std::invalid_argument(
+            "--vericache-host-snapshot-horizon must be 0 or in [256,2048]");
+    }
+    if (options.protected_sink_tokens > 2048) {
+        throw std::invalid_argument("--vericache-protected-sinks must be in [0,2048]");
+    }
+    if (options.protected_pivot_tokens > 2048) {
+        throw std::invalid_argument("--vericache-protected-pivots must be in [0,2048]");
+    }
+    return options;
+}
+
+std::vector<ninfer::TokenId> prompt_tokens(std::uint32_t count, Workload workload) {
+    std::vector<ninfer::TokenId> prompt{
+        248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
+        1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+    };
+    const std::array<ninfer::TokenId, 8> pattern = [&] {
+        switch (workload) {
+        case Workload::Normal:
+            return std::array<ninfer::TokenId, 8>{374, 374, 374, 374, 374, 374, 374, 374};
+        case Workload::Coding:
+            return std::array<ninfer::TokenId, 8>{110, 107, 106, 40, 41, 58, 10, 374};
+        case Workload::Reasoning:
+            return std::array<ninfer::TokenId, 8>{220, 198, 25, 32, 44, 374, 198, 220};
+        case Workload::Repetitive:
+            return std::array<ninfer::TokenId, 8>{374, 374, 374, 374, 374, 374, 374, 374};
+        case Workload::Tool:
+            return std::array<ninfer::TokenId, 8>{90, 91, 92, 93, 58, 34, 44, 10};
+        }
+        return std::array<ninfer::TokenId, 8>{374, 374, 374, 374, 374, 374, 374, 374};
+    }();
+    prompt.reserve(count);
+    const std::uint32_t prefix_size = static_cast<std::uint32_t>(prompt.size());
+    for (std::uint32_t index = prefix_size; index < count; ++index) {
+        prompt.push_back(pattern[(index - prefix_size) % pattern.size()]);
+    }
+    return prompt;
+}
+
+struct RoundMeasurement {
+    float gpu_ms                  = 0.0F;
+    double wall_ms                = 0.0;
+    std::uint32_t licensed_tokens = 0;
+    std::array<std::uint32_t, ninfer::kMaximumConcurrency> licensed_tokens_per_lane{};
+    std::array<ninfer::SpeculativeStats, ninfer::kMaximumConcurrency> stats{};
+};
+
+RoundMeasurement measure_round(target::Package::Program& program, ninfer::DeviceContext& device,
+                               std::span<const target::Package::SequenceHandle> sequences,
+                               std::uint32_t batch_size, std::uint32_t draft_tokens) {
+    std::array<ninfer::runtime::RoundBudget, ninfer::kMaximumConcurrency> budgets{};
+    for (std::uint32_t row = 0; row < batch_size; ++row) {
+        budgets[row] = {.generated_tokens_remaining = draft_tokens + 1};
+    }
+    const auto budget_span =
+        std::span<const ninfer::runtime::RoundBudget>(budgets.data(), batch_size);
+    ninfer::CudaEventTimer timer(device);
+    const auto wall_start = Clock::now();
+    timer.start();
+    auto pending = program.decode(sequences, budget_span);
+    if (pending.row_counts().size() != batch_size) {
+        throw std::runtime_error("DFlash benchmark round returned invalid row counts");
+    }
+    std::array<ninfer::runtime::CommitDecision, ninfer::kMaximumConcurrency> decisions{};
+    std::uint32_t licensed = 0;
+    for (std::uint32_t row = 0; row < batch_size; ++row) {
+        const std::int32_t count = pending.row_counts()[row];
+        if (count <= 0 || count > static_cast<std::int32_t>(draft_tokens + 1U)) {
+            throw std::runtime_error("DFlash benchmark round returned an invalid row extent");
+        }
+        decisions[row].accepted_tokens = static_cast<std::uint32_t>(count);
+        licensed += decisions[row].accepted_tokens;
+    }
+    const auto committed = program.commit(
+        std::move(pending),
+        std::span<const ninfer::runtime::CommitDecision>(decisions.data(), batch_size));
+    const float gpu_ms = timer.stop_ms();
+    const double wall_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - wall_start).count();
+    RoundMeasurement result{.gpu_ms = gpu_ms, .wall_ms = wall_ms, .licensed_tokens = licensed};
+    for (std::uint32_t row = 0; row < batch_size; ++row) {
+        result.licensed_tokens_per_lane[row] = decisions[row].accepted_tokens;
+        result.stats[row] = committed.rows[row].speculative;
+    }
+    return result;
+}
+
+std::uint32_t context_tokens_for_lane(const Options& options, std::uint32_t lane) {
+    return options.context_tokens_per_lane.empty() ? options.context_tokens
+                                                    : options.context_tokens_per_lane[lane];
+}
+
+std::uint64_t request_capacity_for_context(std::uint32_t context_tokens,
+                                           std::uint32_t measured_rounds,
+                                           std::uint64_t block,
+                                           std::uint32_t draft_tokens) {
+    return static_cast<std::uint64_t>(context_tokens) +
+           (static_cast<std::uint64_t>(measured_rounds) + 1ULL) * block +
+           2ULL * draft_tokens;
+}
+
+template <class T>
+double mean(const std::vector<T>& values) {
+    return std::accumulate(values.begin(), values.end(), 0.0) / static_cast<double>(values.size());
+}
+
+void set_phase_timing_environment(bool enabled) {
+#ifdef _WIN32
+    if (_putenv_s("NINFER_DFLASH_PHASE_TIMING", enabled ? "1" : "0") != 0) {
+        throw std::runtime_error("could not set DFlash phase timing environment");
+    }
+#else
+    if (setenv("NINFER_DFLASH_PHASE_TIMING", enabled ? "1" : "0", 1) != 0) {
+        throw std::runtime_error("could not set DFlash phase timing environment");
+    }
+#endif
+}
+
+void set_adaptive_k_environment(bool enabled) {
+#ifdef _WIN32
+    if (_putenv_s("NINFER_DFLASH2_ADAPTIVE_K", enabled ? "1" : "0") != 0) {
+        throw std::runtime_error("could not set Adaptive DFlash2 K environment");
+    }
+#else
+    if (setenv("NINFER_DFLASH2_ADAPTIVE_K", enabled ? "1" : "0", 1) != 0) {
+        throw std::runtime_error("could not set Adaptive DFlash2 K environment");
+    }
+#endif
+}
+
+std::optional<int> query_gpu_utilization(int device) {
+    const std::string command =
+        "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i " +
+        std::to_string(device);
+#ifdef _WIN32
+    FILE* pipe = _popen(command.c_str(), "r");
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+#endif
+    if (pipe == nullptr) { return std::nullopt; }
+    char buffer[64]{};
+    const bool read = std::fgets(buffer, sizeof(buffer), pipe) != nullptr;
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    if (!read) { return std::nullopt; }
+    char* end = nullptr;
+    const long value = std::strtol(buffer, &end, 10);
+    if (end == buffer || value < 0 || value > 100) { return std::nullopt; }
+    return static_cast<int>(value);
+}
+
+int run(const Options& options) {
+    if (!std::filesystem::exists(options.artifact)) {
+        std::cout << "SKIP: artifact not present: " << options.artifact.string() << '\n';
+        return 0;
+    }
+
+    // Phase timers are deliberately opt-in and disabled for CUDA-graph runs because adding event
+    // nodes while capturing every profile would change the graph topology being benchmarked.
+    set_phase_timing_environment(options.profile_phases && !options.use_cuda_graph);
+    set_adaptive_k_environment(options.adaptive_k && !options.use_cuda_graph);
+
+    const std::uint32_t measured_rounds =
+        static_cast<std::uint32_t>(options.warmup + options.repetitions);
+    const std::uint64_t block = options.draft_tokens + 1ULL;
+    std::array<std::uint64_t, ninfer::kMaximumConcurrency> lane_capacities{};
+    std::uint64_t per_request_capacity = 0;
+    std::uint64_t capacity             = 0;
+    std::uint64_t aggregate_context    = 0;
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        const std::uint32_t context_tokens = context_tokens_for_lane(options, lane);
+        aggregate_context += context_tokens;
+        lane_capacities[lane] = request_capacity_for_context(
+            context_tokens, measured_rounds, block, options.draft_tokens);
+        per_request_capacity = std::max(per_request_capacity, lane_capacities[lane]);
+        const std::uint64_t aligned = (lane_capacities[lane] + 63ULL) & ~63ULL;
+        capacity += options.batch_size == 1 ? lane_capacities[lane] : aligned;
+    }
+    if (per_request_capacity > 262144 || capacity > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("context and measured rounds exceed native capacity");
+    }
+
+    ninfer::EngineOptions engine;
+    engine.artifact_path = options.artifact;
+    engine.device        = options.device;
+    engine.max_context   = static_cast<std::uint32_t>(per_request_capacity);
+    engine.kv_capacity =
+        ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
+    engine.prefill_chunk             = options.prefill_chunk;
+    engine.kv_cache                  = options.kv_cache;
+    engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+    engine.speculative.draft_tokens  = options.draft_tokens;
+    engine.speculative.proposal_head = options.proposal;
+    engine.use_cuda_graph            = options.use_cuda_graph;
+    engine.max_concurrency           = options.batch_size;
+    engine.hierarchical_vericache.enabled = options.hierarchical_vericache;
+    engine.hierarchical_vericache.protected_recent_tokens = options.protected_recent_tokens;
+    engine.hierarchical_vericache.protected_sink_tokens = options.protected_sink_tokens;
+    engine.hierarchical_vericache.protected_pivot_tokens = options.protected_pivot_tokens;
+    engine.hierarchical_vericache.enable_host_tier_snapshots = options.host_tier_snapshots;
+    engine.hierarchical_vericache.l1_to_l2_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.l1_to_l2_min_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.l1_to_l2_max_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.host_snapshot_horizon = options.host_snapshot_horizon;
+    engine.hierarchical_vericache.l0_bits = options.l0_bits;
+    engine.hierarchical_vericache.l1_live_verifier_primary = !options.q2_filter;
+    // The direct target facade does not run Engine::normalize_engine_options().
+    // Keep the benchmark's startup capacities identical to the production defaults.
+    engine.context_cache.device_state_slots            = options.batch_size;
+    engine.context_cache.max_private_continuations    = 2U * options.batch_size;
+    engine.context_cache.max_shared_prefixes           = options.batch_size;
+    engine.context_cache.max_long_anchors_per_continuation = 2U;
+    engine.context_cache.max_cache_markers_per_request = 4U;
+
+    ninfer::DeviceContext device(options.device);
+    ninfer::artifact::Reader reader(options.artifact);
+    const auto weights_profile = target::Package::resolve_weights(reader.identity());
+    ninfer::artifact::Binder binder(reader);
+    auto load_plan        = target::Package::plan_load(binder, engine, weights_profile);
+    auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
+    const auto resolution = ninfer::runtime::resolve_kv_capacity(
+        engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
+    auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
+    const std::uint64_t weight_bytes   = load_plan.materialization().device_capacity_bytes;
+    const std::uint64_t sequence_bytes = sequence.device_reservation_bytes();
+    if (sequence_bytes > std::numeric_limits<std::uint64_t>::max() - weight_bytes) {
+        throw std::overflow_error("benchmark device-memory requirement overflows uint64");
+    }
+    const std::uint64_t required_bytes = weight_bytes + sequence_bytes;
+    std::size_t free_bytes             = 0;
+    std::size_t total_bytes            = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    if (required_bytes > free_bytes) {
+        throw std::invalid_argument(
+            "benchmark configuration requires " + std::to_string(required_bytes) +
+            " bytes of device memory, but only " + std::to_string(free_bytes) + " bytes are free");
+    }
+    auto materialized =
+        ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
+    auto model =
+        target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    auto frontend = target::Package::make_frontend(*model, engine);
+    auto program  = target::Package::create_program(*model, std::move(sequence), device);
+    ninfer::runtime::ResolvedExecutionOptions execution;
+    execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
+    execution.allow_prefix_reuse      = false;
+    std::array<target::Package::SequenceHandle, ninfer::kMaximumConcurrency> active_sequences{};
+    double prefill_seconds = 0.0;
+    std::uint64_t prefill_tokens = 0;
+    const auto machine_cost = ninfer::runtime::generic_context_machine_cost_model();
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        const std::uint32_t context_tokens = context_tokens_for_lane(options, lane);
+        auto prompt       = frontend.prepare_tokens(prompt_tokens(context_tokens, options.workload), false);
+        auto request_base = program->plan_request(prompt, execution);
+        auto request_plan =
+            program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr,
+                                       nullptr, std::nullopt, false, machine_cost);
+        if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
+        auto resource_plan = program->seal_identity(*request_plan, prompt);
+        if (!resource_plan) {
+            throw std::runtime_error("benchmark root resources were not sealed");
+        }
+        const auto reserved =
+            program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
+        if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
+            throw std::runtime_error("benchmark root materialization was not reserved");
+        }
+        std::optional<target::Package::MaterializationResult> published;
+        for (;;) {
+            auto transaction = program->progress_context_transaction({});
+            if (std::holds_alternative<ninfer::runtime::ContextTransactionInProgress>(
+                    transaction)) {
+                continue;
+            }
+            if (!std::holds_alternative<target::Package::MaterializationResult>(transaction)) {
+                program->finalize_context_transaction();
+                throw std::runtime_error("benchmark root returned the wrong transaction result");
+            }
+            published.emplace(
+                std::get<target::Package::MaterializationResult>(std::move(transaction)));
+            break;
+        }
+        if (published->status != ninfer::runtime::ContextTransactionStatus::Published ||
+            !published->published) {
+            program->finalize_context_transaction();
+            throw std::runtime_error("benchmark root materialization was not published");
+        }
+        auto started = std::move(*published->published);
+        program->finalize_context_transaction();
+        active_sequences[lane] = started.sequence;
+        const auto prefill_start = Clock::now();
+        std::optional<target::Package::PrefillProgress> progress;
+        progress.emplace(program->advance_prefill(active_sequences[lane]));
+        while (!progress->complete) {
+            progress.reset();
+            progress.emplace(program->advance_prefill(active_sequences[lane]));
+        }
+        if (!progress->pending || progress->pending->tokens().size() != 1) {
+            throw std::runtime_error("benchmark seed prefill did not license exactly one token");
+        }
+        prefill_seconds +=
+            std::chrono::duration<double>(Clock::now() - prefill_start).count();
+        prefill_tokens += context_tokens;
+        const std::array<ninfer::runtime::CommitDecision, 1> begin_decision{
+            ninfer::runtime::CommitDecision{.accepted_tokens = 1}};
+        (void)program->commit(std::move(*progress->pending), begin_decision);
+    }
+
+    const auto active_span = std::span<const target::Package::SequenceHandle>(
+        active_sequences.data(), options.batch_size);
+    RoundMeasurement warmup_state;
+    for (int iteration = 0; iteration < options.warmup; ++iteration) {
+        warmup_state =
+            measure_round(*program, device, active_span, options.batch_size, options.draft_tokens);
+    }
+
+    std::vector<RoundMeasurement> measurements;
+    measurements.reserve(static_cast<std::size_t>(options.repetitions));
+    for (int iteration = 0; iteration < options.repetitions; ++iteration) {
+        measurements.push_back(
+            measure_round(*program, device, active_span, options.batch_size, options.draft_tokens));
+    }
+    const auto& before = warmup_state.stats;
+    const auto& after  = measurements.back().stats;
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        if (after[lane].rounds - before[lane].rounds !=
+                static_cast<std::uint64_t>(options.repetitions) ||
+            after[lane].fallback_steps != before[lane].fallback_steps) {
+            throw std::runtime_error("benchmark left the complete DFlash round path");
+        }
+    }
+
+    std::vector<float> gpu_ms;
+    std::vector<double> wall_ms;
+    std::uint64_t licensed_tokens = 0;
+    std::array<std::uint64_t, ninfer::kMaximumConcurrency> licensed_tokens_per_lane{};
+    for (const RoundMeasurement& measurement : measurements) {
+        gpu_ms.push_back(measurement.gpu_ms);
+        wall_ms.push_back(measurement.wall_ms);
+        licensed_tokens += measurement.licensed_tokens;
+        for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+            licensed_tokens_per_lane[lane] += measurement.licensed_tokens_per_lane[lane];
+        }
+    }
+    const auto [gpu_min, gpu_max] = std::minmax_element(gpu_ms.begin(), gpu_ms.end());
+    std::uint64_t accepted        = 0;
+    std::uint64_t drafted         = 0;
+    std::uint64_t verifier_calls  = 0;
+    double draft_seconds          = 0.0;
+    double selector_seconds       = 0.0;
+    double verifier_seconds       = 0.0;
+    std::array<std::uint64_t, 15> accepted_per_position{};
+    std::array<std::uint64_t, 15> proposed_per_position{};
+    std::array<std::uint64_t, 16> selected_k_histogram{};
+    std::size_t selected_k_limit = options.draft_tokens;
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        accepted += after[lane].accepted_tokens - before[lane].accepted_tokens;
+        drafted += after[lane].drafted_tokens - before[lane].drafted_tokens;
+        verifier_calls += after[lane].verifier_calls - before[lane].verifier_calls;
+        draft_seconds += after[lane].draft_seconds - before[lane].draft_seconds;
+        selector_seconds += after[lane].selector_seconds - before[lane].selector_seconds;
+        verifier_seconds += after[lane].verifier_seconds - before[lane].verifier_seconds;
+        for (std::size_t position = 0; position < options.draft_tokens; ++position) {
+            accepted_per_position[position] += after[lane].accepted_per_position[position] -
+                                               before[lane].accepted_per_position[position];
+            if (position < after[lane].proposed_per_position.size() &&
+                position < before[lane].proposed_per_position.size()) {
+                proposed_per_position[position] +=
+                    after[lane].proposed_per_position[position] -
+                    before[lane].proposed_per_position[position];
+            }
+        }
+        for (std::size_t selected = 0; selected < selected_k_histogram.size(); ++selected) {
+            if (selected < after[lane].selected_k_histogram.size()) {
+                selected_k_histogram[selected] +=
+                    after[lane].selected_k_histogram[selected] -
+                    before[lane].selected_k_histogram[selected];
+            }
+        }
+        if (!after[lane].selected_k_histogram.empty()) {
+            selected_k_limit = std::max(
+                selected_k_limit,
+                std::min(selected_k_histogram.size() - 1,
+                         after[lane].selected_k_histogram.size() - 1));
+        }
+    }
+    const double mean_gpu_ms  = mean(gpu_ms);
+    const double mean_wall_ms = mean(wall_ms);
+    const double mean_licensed_per_batch =
+        static_cast<double>(licensed_tokens) / static_cast<double>(options.repetitions);
+    const double mean_licensed_per_request =
+        mean_licensed_per_batch / static_cast<double>(options.batch_size);
+    const double mean_draft_ms =
+        draft_seconds * 1000.0 / static_cast<double>(options.repetitions * options.batch_size);
+    const double mean_selector_ms = selector_seconds * 1000.0 /
+                                    static_cast<double>(options.repetitions * options.batch_size);
+    const double mean_verifier_ms = verifier_seconds * 1000.0 /
+                                    static_cast<double>(options.repetitions * options.batch_size);
+    std::size_t free_after = 0;
+    std::size_t total_after = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
+    const std::size_t used_after = total_after >= free_after ? total_after - free_after : 0;
+    const std::optional<int> gpu_utilization = query_gpu_utilization(options.device);
+
+    std::cout << "format,ninfer_qwen3_6_27b_dflash_round_bench_v1\n";
+    std::cout << "artifact," << options.artifact.string() << '\n';
+    std::cout << "device," << device.props.name << '\n';
+    if (options.context_tokens_per_lane.empty()) {
+        std::cout << "context_tokens," << options.context_tokens << '\n';
+    } else {
+        std::cout << "context_tokens_max_per_lane," << per_request_capacity << '\n';
+        std::cout << "context_tokens_per_lane";
+        for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+            std::cout << ',' << context_tokens_for_lane(options, lane);
+        }
+        std::cout << '\n';
+    }
+    std::cout << "aggregate_resident_context_tokens," << aggregate_context << '\n';
+    std::cout << "workload," << workload_name(options.workload) << '\n';
+    std::cout << "draft_tokens," << options.draft_tokens << '\n';
+    std::cout << "batch_size," << options.batch_size << '\n';
+    std::cout << "prefill_chunk," << options.prefill_chunk << '\n';
+    const auto kv_cache_name = [&] {
+        switch (options.kv_cache) {
+        case ninfer::KvCacheStorage::BFloat16:
+            return "bf16";
+        case ninfer::KvCacheStorage::Fp8E4M3Row256:
+            return "fp8-e4m3-row256";
+        case ninfer::KvCacheStorage::VeriCacheNvfp4:
+            return "vericache-nvfp4";
+        default:
+            return "other";
+        }
+    };
+    std::cout << "kv_cache," << kv_cache_name() << '\n';
+    const bool oscar_hierarchy =
+        options.hierarchical_vericache &&
+        options.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4;
+    const char* full_bf16_value = std::getenv("NINFER_DFLASH_FULL_BF16");
+    const bool dflash_full_bf16 = full_bf16_value != nullptr && full_bf16_value[0] == '1';
+    std::cout << "vericache_l0_format,"
+              << (oscar_hierarchy ? "oscar-q" + std::to_string(options.l0_bits) : "n/a")
+              << '\n';
+    std::cout << "vericache_l1_format,"
+              << (oscar_hierarchy ? "oscar-q4-pinned-host" : "n/a") << '\n';
+    std::cout << "vericache_l2_format,"
+              << (oscar_hierarchy ? "fp16-authoritative-host" : "n/a") << '\n';
+    std::cout << "dflash_full_attention_cache,"
+              << (options.kv_cache == ninfer::KvCacheStorage::BFloat16
+                      ? "bf16-device"
+                      : (oscar_hierarchy
+                             ? (dflash_full_bf16 ? "bf16-device" : "oscar-q2-device")
+                             : "n/a"))
+              << '\n';
+    std::cout << "dflash2_local_drafter_cache,bf16-cyclic-kv\n";
+    std::cout << "vericache_l1_storage,"
+              << (oscar_hierarchy ? "pinned-host-only;no-device-q4-shadow" : "n/a") << '\n';
+    // Host Q4 is currently a promoted verifier record/persistence tier. The benchmark does not
+    // run target-model logits from pinned RAM, so do not label storage as a live logit verifier.
+    std::cout << "vericache_l1_live_verifier,false\n";
+    std::cout << "vericache_l1_primary,false\n";
+    std::cout << "vericache_l1_live_logit_verifier,false\n";
+    std::cout << "vericache_l0_to_q4_source,"
+              << (oscar_hierarchy
+                      ? "q2-derived-host-conversion"
+                      : "n/a")
+              << '\n';
+    std::cout << "proposal_head,"
+              << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
+              << '\n';
+    std::cout << "cuda_graph," << (options.use_cuda_graph ? "true" : "false") << '\n';
+    std::cout << "phase_timing," << (options.profile_phases && !options.use_cuda_graph ? "true" : "false")
+              << '\n';
+    std::cout << "adaptive_k," << (options.adaptive_k && !options.use_cuda_graph ? "true" : "false")
+              << '\n';
+    std::cout << "hierarchical_vericache," << (options.hierarchical_vericache ? "true" : "false")
+              << '\n';
+    std::cout << "vericache_host_tier_snapshots_enabled,"
+              << (options.host_tier_snapshots ? "true" : "false") << '\n';
+    std::cout << "vericache_l1_to_l2_horizon_configured," << options.l1_to_l2_horizon << '\n';
+    std::cout << "vericache_host_snapshot_horizon_configured," << options.host_snapshot_horizon
+              << '\n';
+    std::cout << "vericache_l0_bits," << static_cast<int>(options.l0_bits) << '\n';
+    std::cout << "vericache_protected_recent_tokens," << options.protected_recent_tokens << '\n';
+    std::cout << "vericache_protected_sink_tokens," << options.protected_sink_tokens << '\n';
+    std::cout << "vericache_protected_pivot_tokens," << options.protected_pivot_tokens << '\n';
+    std::cout << "warmup," << options.warmup << '\n';
+    std::cout << "repetitions," << options.repetitions << '\n';
+    std::cout << "seed_prefill_seconds," << prefill_seconds << '\n';
+    std::cout << "seed_prefill_tokens," << prefill_tokens << '\n';
+    std::cout << "seed_prefill_tokens_per_second,"
+              << (prefill_seconds <= 0.0
+                      ? 0.0
+                      : static_cast<double>(prefill_tokens) / prefill_seconds)
+              << '\n';
+    std::cout << "steady_round_gpu_mean_ms," << mean_gpu_ms << '\n';
+    std::cout << "steady_round_gpu_min_ms," << *gpu_min << '\n';
+    std::cout << "steady_round_gpu_max_ms," << *gpu_max << '\n';
+    std::cout << "steady_round_wall_mean_ms," << mean_wall_ms << '\n';
+    std::cout << "mean_licensed_tokens_per_batch," << mean_licensed_per_batch << '\n';
+    std::cout << "mean_licensed_tokens_per_request," << mean_licensed_per_request << '\n';
+    std::cout << "drafted_tokens," << drafted << '\n';
+    std::cout << "accepted_draft_tokens," << accepted << '\n';
+    std::cout << "verifier_calls," << verifier_calls << '\n';
+    std::cout << "verifier_calls_per_token,"
+              << (licensed_tokens == 0
+                      ? 0.0
+                      : static_cast<double>(verifier_calls) /
+                            static_cast<double>(licensed_tokens))
+              << '\n';
+    std::cout << "acceptance_rate,"
+              << (drafted == 0 ? 0.0 : static_cast<double>(accepted) / drafted) << '\n';
+    std::cout << "published_tokens_per_second," << 1000.0 * mean_licensed_per_batch / mean_wall_ms
+              << '\n';
+    std::cout << "published_tokens_per_second_per_stream,"
+              << 1000.0 * mean_licensed_per_request / mean_wall_ms << '\n';
+    std::cout << "published_tokens_per_second_per_lane";
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        const double lane_mean = static_cast<double>(licensed_tokens_per_lane[lane]) /
+                                  static_cast<double>(options.repetitions);
+        std::cout << ',' << 1000.0 * lane_mean / mean_wall_ms;
+    }
+    std::cout << '\n';
+    std::cout << "draft_latency_gpu_mean_ms," << mean_draft_ms << '\n';
+    std::cout << "selector_latency_gpu_mean_ms," << mean_selector_ms << '\n';
+    std::cout << "verifier_latency_gpu_mean_ms," << mean_verifier_ms << '\n';
+    std::cout << "accepted_per_position";
+    for (std::size_t position = 0; position < options.draft_tokens; ++position) {
+        std::cout << ',' << accepted_per_position[position];
+    }
+    std::cout << '\n';
+    std::cout << "proposed_per_position";
+    for (std::size_t position = 0; position < options.draft_tokens; ++position) {
+        std::cout << ',' << proposed_per_position[position];
+    }
+    std::cout << '\n';
+    std::cout << "acceptance_by_position";
+    for (std::size_t position = 0; position < options.draft_tokens; ++position) {
+        const double denominator = static_cast<double>(proposed_per_position[position]);
+        std::cout << ',' << (denominator == 0.0
+                                  ? 0.0
+                                  : static_cast<double>(accepted_per_position[position]) /
+                                        denominator);
+    }
+    std::cout << '\n';
+    std::cout << "selected_k_histogram";
+    for (std::size_t selected = 0; selected <= selected_k_limit; ++selected) {
+        std::cout << ',' << selected_k_histogram[selected];
+    }
+    std::cout << '\n';
+    std::uint64_t selected_k_total = 0;
+    std::uint64_t selected_k_rounds = 0;
+    for (std::size_t selected = 0; selected <= selected_k_limit; ++selected) {
+        selected_k_total += selected * selected_k_histogram[selected];
+        selected_k_rounds += selected_k_histogram[selected];
+    }
+    std::cout << "average_selected_k,"
+              << (selected_k_rounds == 0
+                      ? 0.0
+                      : static_cast<double>(selected_k_total) /
+                            static_cast<double>(selected_k_rounds))
+              << '\n';
+    std::cout << "device_vram_used_bytes," << used_after << '\n';
+    std::cout << "device_vram_total_bytes," << total_after << '\n';
+    std::cout << "gpu_utilization_sample_percent,"
+              << (gpu_utilization ? std::to_string(*gpu_utilization) : "n/a") << '\n';
+    ninfer::RuntimeStats vericache_stats;
+    program->populate_hierarchical_vericache_stats(vericache_stats);
+    std::cout << "vericache_l0_to_l1_horizon," << vericache_stats.vericache_l0_to_l1_horizon
+              << '\n';
+    std::cout << "vericache_l1_to_l2_horizon," << vericache_stats.vericache_l1_to_l2_horizon
+              << '\n';
+    std::cout << "vericache_l0_l1_checks," << vericache_stats.vericache_l0_l1_checks << '\n';
+    std::cout << "vericache_l0_l1_proposed_tokens,"
+              << vericache_stats.vericache_l0_l1_proposed_tokens << '\n';
+    std::cout << "vericache_l0_l1_accepted_tokens,"
+              << vericache_stats.vericache_l0_l1_accepted_tokens << '\n';
+    std::cout << "vericache_l0_l1_disagreements,"
+              << vericache_stats.vericache_l0_l1_disagreements << '\n';
+    std::cout << "vericache_l1_l2_checks," << vericache_stats.vericache_l1_l2_checks << '\n';
+    std::cout << "vericache_l1_l2_proposed_tokens,"
+              << vericache_stats.vericache_l1_l2_proposed_tokens << '\n';
+    std::cout << "vericache_l1_l2_accepted_tokens,"
+              << vericache_stats.vericache_l1_l2_accepted_tokens << '\n';
+    std::cout << "vericache_l1_l2_disagreements,"
+              << vericache_stats.vericache_l1_l2_disagreements << '\n';
+    std::cout << "vericache_exact_target_checks," << vericache_stats.vericache_exact_target_checks
+              << '\n';
+    std::cout << "vericache_exact_target_proposed_tokens,"
+              << vericache_stats.vericache_exact_target_proposed_tokens << '\n';
+    std::cout << "vericache_exact_target_accepted_tokens,"
+              << vericache_stats.vericache_exact_target_accepted_tokens << '\n';
+    std::cout << "vericache_exact_target_disagreements,"
+              << vericache_stats.vericache_exact_target_disagreements << '\n';
+    std::cout << "vericache_speculative_rounds," << vericache_stats.vericache_speculative_rounds
+              << '\n';
+    std::cout << "vericache_speculative_rollbacks,"
+              << vericache_stats.vericache_speculative_rollbacks << '\n';
+    std::cout << "vericache_nested_commits," << vericache_stats.vericache_nested_commits << '\n';
+    std::cout << "vericache_nested_rollbacks," << vericache_stats.vericache_nested_rollbacks
+              << '\n';
+    std::cout << "vericache_max_nested_depth," << vericache_stats.vericache_max_nested_depth
+              << '\n';
+    std::cout << "vericache_host_tier_snapshots," << vericache_stats.vericache_host_tier_snapshots
+              << '\n';
+    std::cout << "vericache_host_tier_snapshot_bytes,"
+              << vericache_stats.vericache_host_tier_snapshot_bytes << '\n';
+    std::cout << "vericache_host_state_d2h_bytes,"
+              << vericache_stats.vericache_host_state_d2h_bytes << '\n';
+    std::cout << "vericache_host_kv_d2h_pages," << vericache_stats.vericache_host_kv_d2h_pages
+              << '\n';
+    std::cout << "vericache_host_kv_d2h_bytes," << vericache_stats.vericache_host_kv_d2h_bytes
+              << '\n';
+    std::cout << "vericache_host_kv_d2h_seconds,"
+              << vericache_stats.vericache_host_kv_d2h_seconds << '\n';
+    std::cout << "vericache_l0_bytes," << vericache_stats.vericache_l0_bytes << '\n';
+    std::cout << "vericache_l0_q4_shadow_bytes,"
+              << vericache_stats.vericache_l0_q4_shadow_bytes << '\n';
+    std::cout << "vericache_l1_bytes," << vericache_stats.vericache_l1_bytes << '\n';
+    std::cout << "vericache_l2_bytes," << vericache_stats.vericache_l2_bytes << '\n';
+    std::cout << "vericache_l3_bytes," << vericache_stats.vericache_l3_bytes << '\n';
+    for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
+        const auto aborted = program->abort(active_sequences[lane]);
+        if (aborted.status != ninfer::runtime::ConsumeStatus::Consumed) {
+            throw std::runtime_error("benchmark could not release an active sequence");
+        }
+    }
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    try {
+        return run(parse_options(argc, argv));
+    } catch (const std::exception& error) {
+        std::cerr << "ninfer_qwen3_6_27b_dflash_round_bench: " << error.what() << '\n';
+        return 1;
+    }
+}

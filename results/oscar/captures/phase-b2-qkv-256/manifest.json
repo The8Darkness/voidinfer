@@ -1,0 +1,1790 @@
+{
+  "schema": "oscar-qkv-v1",
+  "post_rope_qkv": true,
+  "dtype": "bf16",
+  "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+  "complete": true,
+  "useful_tokens": 256,
+  "expected_useful_tokens": 256,
+  "model": {
+    "id": "qwen3.8-27b",
+    "weights_id": "nvfp4-dflash2",
+    "sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+    "total_layers": 64,
+    "query_heads": 24,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "rotary_dim": 64
+  },
+  "executable": {
+    "sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e"
+  },
+  "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+  "gqa": {
+    "ratio": 6,
+    "q_head_to_kv_head": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3
+    ]
+  },
+  "input": {
+    "kind": "deterministic_token_prompt",
+    "token_id": 198
+  },
+  "captures": [
+    {
+      "model_layer": 3,
+      "full_attention_index": 0,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_3/chunk_0000/q.bin",
+        "k": "layer_3/chunk_0000/k.bin",
+        "v": "layer_3/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "49bcda4107f712a3bd7c1530ccfff8a70f061c17c7525b649b86b37af46cbfbb",
+        "k": "d7b67b0e88dc9030ec135df5e18a7371c46a8366ac1515aa8a84641f44d5b4d7",
+        "v": "b24109a54d16d5365a80128cd0b674c8ae9cdf00d9a3aba1f9c650d90525c6a0"
+      }
+    },
+    {
+      "model_layer": 7,
+      "full_attention_index": 1,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_7/chunk_0000/q.bin",
+        "k": "layer_7/chunk_0000/k.bin",
+        "v": "layer_7/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "ff98ff400717117fae83432e23f6f33bf59ac82f0c2f128376ffabeef83eefd0",
+        "k": "f20e8fd288f43c28aa81106b4ffd350fa949a41990e0b9488a42df46b8ed9c2a",
+        "v": "43028927e4175908ca4a804baad68db6c58c4ff487103f5c95d768b344063cf8"
+      }
+    },
+    {
+      "model_layer": 11,
+      "full_attention_index": 2,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_11/chunk_0000/q.bin",
+        "k": "layer_11/chunk_0000/k.bin",
+        "v": "layer_11/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "9e09c268084a110c85f6a42906a9318437eb48376d364c8a16051326524954f8",
+        "k": "ba8b054e98a148151f35ab452b4a32358a457cc8a9ecfd031eb86d28ea60a214",
+        "v": "dd68d47a38bf231c42c2078f065d73b414008dedaf474a538fc2464c2a05cad1"
+      }
+    },
+    {
+      "model_layer": 15,
+      "full_attention_index": 3,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_15/chunk_0000/q.bin",
+        "k": "layer_15/chunk_0000/k.bin",
+        "v": "layer_15/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "f70cee3097fd531b8f54b452b653d43ea6643c685dd3d6b04400d3f72ca0f936",
+        "k": "b12b32ec43959d2dbc85d2df6cbe3ae69dd1fb2808f2b509147d5f636b2c5d45",
+        "v": "1ab16b39d1c8ffe083dcea9959348868c713e5e6a3154104254dc6f596f24d2f"
+      }
+    },
+    {
+      "model_layer": 19,
+      "full_attention_index": 4,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_19/chunk_0000/q.bin",
+        "k": "layer_19/chunk_0000/k.bin",
+        "v": "layer_19/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "a26da64290a82b363fb5ddcebe087078b9465eb04359fc19d3c5fa79e547ac48",
+        "k": "90688c82168b003608092a032b435bdb917729401bb62f8091d5938ccaaa74c3",
+        "v": "cfcc0f46c086f56e0be600a266f472dcb6330925dcc8a4c61ea75b40dfa20cad"
+      }
+    },
+    {
+      "model_layer": 23,
+      "full_attention_index": 5,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_23/chunk_0000/q.bin",
+        "k": "layer_23/chunk_0000/k.bin",
+        "v": "layer_23/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "5ed2559f1e27ac29398fe5eed4b3801dacf2826afc09dcc07ff5c820d6adc006",
+        "k": "868d9cf7de32aec884c2b90811ba2fd764a595e3558a781b73a2009290b52804",
+        "v": "be64caaaa3a569525b8944d948759ee05a3c634cd28f60eecee50ace111ea7d7"
+      }
+    },
+    {
+      "model_layer": 27,
+      "full_attention_index": 6,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_27/chunk_0000/q.bin",
+        "k": "layer_27/chunk_0000/k.bin",
+        "v": "layer_27/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "b1c27d34bcb8d1b5cf95e932fb2917c0f914bd2ff31d29c979d108de5acdd0d6",
+        "k": "751f98250694573673826881ed23a7873c29ef992b8580dd0159f0e8fdd53a87",
+        "v": "e0ff9fece5161cae26b2dae7b46b8f7b97414670fcecc3ef7ba9ed7d58f18fad"
+      }
+    },
+    {
+      "model_layer": 31,
+      "full_attention_index": 7,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_31/chunk_0000/q.bin",
+        "k": "layer_31/chunk_0000/k.bin",
+        "v": "layer_31/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "df247e36be364f71b210bf90f7c8153aad480b45910ab2d71c0cb62f57f907ce",
+        "k": "f6d54bce6d62371f72a1f2409554bb0851f61d85526ce3b83f1b36d451e5445a",
+        "v": "2e778a051d77452537947a9bb7da6d79f934790e67cbd2e2d7f88555182e6d69"
+      }
+    },
+    {
+      "model_layer": 35,
+      "full_attention_index": 8,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_35/chunk_0000/q.bin",
+        "k": "layer_35/chunk_0000/k.bin",
+        "v": "layer_35/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "31c43bc9e907167f4d10cdf8ce2279af1046070984283258eb41c58652ca3a53",
+        "k": "ee46856fcd924517debc84c7c7795d710951c632ba1dd82079ae0a55b1647456",
+        "v": "0293bf642ae308c67dd18c77390c13fccc54c845d80e0cc0993c81e3a8780e48"
+      }
+    },
+    {
+      "model_layer": 39,
+      "full_attention_index": 9,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_39/chunk_0000/q.bin",
+        "k": "layer_39/chunk_0000/k.bin",
+        "v": "layer_39/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "e2a0a26520402c00a3811ccc635bd597033cb0ecf650756986bc785515eba18e",
+        "k": "7457b1963f8d3cd6022a4eeefd82fa7c33e177bc2db4c858b8b4ee3e7e008bbe",
+        "v": "01ec0b6700758a4ead2e08a0594b55c57b8a222736eb84e79e8f370db1e0449c"
+      }
+    },
+    {
+      "model_layer": 43,
+      "full_attention_index": 10,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_43/chunk_0000/q.bin",
+        "k": "layer_43/chunk_0000/k.bin",
+        "v": "layer_43/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "1d70a5a728b3630c404a54784ced37dc63f919ffac686113c90a3f1eafb145ae",
+        "k": "6381525495a81c2fcd6309b1de02b6fd6eebc76c3858d666e179255edf006c7f",
+        "v": "ecd01b194d31176d23dea9e6759a0fc38648e78af54071ecbe89fe2d1f5ed88a"
+      }
+    },
+    {
+      "model_layer": 47,
+      "full_attention_index": 11,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_47/chunk_0000/q.bin",
+        "k": "layer_47/chunk_0000/k.bin",
+        "v": "layer_47/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "cd9c1ec758d9702f408d36c2652b0978df8faa89ffd2663bba0cb93ac70491e2",
+        "k": "1124bf8b6e743e0c7d1694c20c950f8d75cb1779c954174679686d3be5171169",
+        "v": "495e4a354feb59d2459806cc2dad77eaab4424179b0331e1930bd5b01b2c85d9"
+      }
+    },
+    {
+      "model_layer": 51,
+      "full_attention_index": 12,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_51/chunk_0000/q.bin",
+        "k": "layer_51/chunk_0000/k.bin",
+        "v": "layer_51/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "71e351004ff716dc746ce8629097d1fb114b6860b439893f9d893126a5d772bc",
+        "k": "9399cb12be72c89d569f3ad95c75f7687b6258ad63d4ee6be35e475cec791657",
+        "v": "0ef9868e9c6c0a118244a7d6fa285399d923401625d1288027f07a01709c1f56"
+      }
+    },
+    {
+      "model_layer": 55,
+      "full_attention_index": 13,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_55/chunk_0000/q.bin",
+        "k": "layer_55/chunk_0000/k.bin",
+        "v": "layer_55/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "dcda545b97aa78c140a4d74f37a042ea7721fefbf97663d4b306509a55e447ac",
+        "k": "c1d23adb47c63b0d1b416aa401b7031f44a1c4fe91c69b2439311c6d4c3e89a5",
+        "v": "2043f0963bb95b34169fbbc6a5916a5f6d401728b30a3d96cce59be336b7b9b8"
+      }
+    },
+    {
+      "model_layer": 59,
+      "full_attention_index": 14,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_59/chunk_0000/q.bin",
+        "k": "layer_59/chunk_0000/k.bin",
+        "v": "layer_59/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "9a1557eb07dfdefedcd688dacb43c36bc722de0023e6b83bec64251c6815d5e6",
+        "k": "71be8dc103d2d830321a9ab03e92c2e539d1558eece8255b6665ea1233590bb2",
+        "v": "aa04b37cb8ddfda6c084c642a975bb3354b6733f6c74ed928012010f0221e9e4"
+      }
+    },
+    {
+      "model_layer": 63,
+      "full_attention_index": 15,
+      "kind": "full_attention",
+      "dtype": "bf16",
+      "tokens": 256,
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "dimensions": {
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "files": {
+        "q": "layer_63/chunk_0000/q.bin",
+        "k": "layer_63/chunk_0000/k.bin",
+        "v": "layer_63/chunk_0000/v.bin"
+      },
+      "sha256": {
+        "q": "f606360e29a5be5854d02f4485346922b775c192da316ce4d477c8baaf2721a5",
+        "k": "16e00bde8f5d200a05d782214d922e2686991e98b37544cad75760925812ef40",
+        "v": "d53477353d66375b6a693835313dc5ce5c1af7974f90ef896973f2ff4769c8d0"
+      }
+    }
+  ],
+  "tensor_records": [
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 3,
+      "full_attention_index": 0,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_3/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "49bcda4107f712a3bd7c1530ccfff8a70f061c17c7525b649b86b37af46cbfbb"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 3,
+      "full_attention_index": 0,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_3/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "d7b67b0e88dc9030ec135df5e18a7371c46a8366ac1515aa8a84641f44d5b4d7"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 3,
+      "full_attention_index": 0,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_3/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "b24109a54d16d5365a80128cd0b674c8ae9cdf00d9a3aba1f9c650d90525c6a0"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 7,
+      "full_attention_index": 1,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_7/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "ff98ff400717117fae83432e23f6f33bf59ac82f0c2f128376ffabeef83eefd0"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 7,
+      "full_attention_index": 1,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_7/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "f20e8fd288f43c28aa81106b4ffd350fa949a41990e0b9488a42df46b8ed9c2a"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 7,
+      "full_attention_index": 1,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_7/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "43028927e4175908ca4a804baad68db6c58c4ff487103f5c95d768b344063cf8"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 11,
+      "full_attention_index": 2,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_11/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "9e09c268084a110c85f6a42906a9318437eb48376d364c8a16051326524954f8"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 11,
+      "full_attention_index": 2,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_11/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "ba8b054e98a148151f35ab452b4a32358a457cc8a9ecfd031eb86d28ea60a214"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 11,
+      "full_attention_index": 2,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_11/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "dd68d47a38bf231c42c2078f065d73b414008dedaf474a538fc2464c2a05cad1"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 15,
+      "full_attention_index": 3,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_15/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "f70cee3097fd531b8f54b452b653d43ea6643c685dd3d6b04400d3f72ca0f936"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 15,
+      "full_attention_index": 3,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_15/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "b12b32ec43959d2dbc85d2df6cbe3ae69dd1fb2808f2b509147d5f636b2c5d45"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 15,
+      "full_attention_index": 3,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_15/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "1ab16b39d1c8ffe083dcea9959348868c713e5e6a3154104254dc6f596f24d2f"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 19,
+      "full_attention_index": 4,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_19/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "a26da64290a82b363fb5ddcebe087078b9465eb04359fc19d3c5fa79e547ac48"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 19,
+      "full_attention_index": 4,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_19/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "90688c82168b003608092a032b435bdb917729401bb62f8091d5938ccaaa74c3"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 19,
+      "full_attention_index": 4,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_19/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "cfcc0f46c086f56e0be600a266f472dcb6330925dcc8a4c61ea75b40dfa20cad"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 23,
+      "full_attention_index": 5,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_23/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "5ed2559f1e27ac29398fe5eed4b3801dacf2826afc09dcc07ff5c820d6adc006"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 23,
+      "full_attention_index": 5,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_23/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "868d9cf7de32aec884c2b90811ba2fd764a595e3558a781b73a2009290b52804"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 23,
+      "full_attention_index": 5,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_23/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "be64caaaa3a569525b8944d948759ee05a3c634cd28f60eecee50ace111ea7d7"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 27,
+      "full_attention_index": 6,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_27/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "b1c27d34bcb8d1b5cf95e932fb2917c0f914bd2ff31d29c979d108de5acdd0d6"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 27,
+      "full_attention_index": 6,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_27/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "751f98250694573673826881ed23a7873c29ef992b8580dd0159f0e8fdd53a87"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 27,
+      "full_attention_index": 6,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_27/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "e0ff9fece5161cae26b2dae7b46b8f7b97414670fcecc3ef7ba9ed7d58f18fad"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 31,
+      "full_attention_index": 7,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_31/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "df247e36be364f71b210bf90f7c8153aad480b45910ab2d71c0cb62f57f907ce"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 31,
+      "full_attention_index": 7,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_31/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "f6d54bce6d62371f72a1f2409554bb0851f61d85526ce3b83f1b36d451e5445a"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 31,
+      "full_attention_index": 7,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_31/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "2e778a051d77452537947a9bb7da6d79f934790e67cbd2e2d7f88555182e6d69"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 35,
+      "full_attention_index": 8,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_35/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "31c43bc9e907167f4d10cdf8ce2279af1046070984283258eb41c58652ca3a53"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 35,
+      "full_attention_index": 8,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_35/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "ee46856fcd924517debc84c7c7795d710951c632ba1dd82079ae0a55b1647456"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 35,
+      "full_attention_index": 8,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_35/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "0293bf642ae308c67dd18c77390c13fccc54c845d80e0cc0993c81e3a8780e48"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 39,
+      "full_attention_index": 9,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_39/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "e2a0a26520402c00a3811ccc635bd597033cb0ecf650756986bc785515eba18e"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 39,
+      "full_attention_index": 9,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_39/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "7457b1963f8d3cd6022a4eeefd82fa7c33e177bc2db4c858b8b4ee3e7e008bbe"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 39,
+      "full_attention_index": 9,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_39/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "01ec0b6700758a4ead2e08a0594b55c57b8a222736eb84e79e8f370db1e0449c"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 43,
+      "full_attention_index": 10,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_43/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "1d70a5a728b3630c404a54784ced37dc63f919ffac686113c90a3f1eafb145ae"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 43,
+      "full_attention_index": 10,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_43/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "6381525495a81c2fcd6309b1de02b6fd6eebc76c3858d666e179255edf006c7f"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 43,
+      "full_attention_index": 10,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_43/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "ecd01b194d31176d23dea9e6759a0fc38648e78af54071ecbe89fe2d1f5ed88a"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 47,
+      "full_attention_index": 11,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_47/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "cd9c1ec758d9702f408d36c2652b0978df8faa89ffd2663bba0cb93ac70491e2"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 47,
+      "full_attention_index": 11,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_47/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "1124bf8b6e743e0c7d1694c20c950f8d75cb1779c954174679686d3be5171169"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 47,
+      "full_attention_index": 11,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_47/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "495e4a354feb59d2459806cc2dad77eaab4424179b0331e1930bd5b01b2c85d9"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 51,
+      "full_attention_index": 12,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_51/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "71e351004ff716dc746ce8629097d1fb114b6860b439893f9d893126a5d772bc"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 51,
+      "full_attention_index": 12,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_51/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "9399cb12be72c89d569f3ad95c75f7687b6258ad63d4ee6be35e475cec791657"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 51,
+      "full_attention_index": 12,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_51/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "0ef9868e9c6c0a118244a7d6fa285399d923401625d1288027f07a01709c1f56"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 55,
+      "full_attention_index": 13,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_55/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "dcda545b97aa78c140a4d74f37a042ea7721fefbf97663d4b306509a55e447ac"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 55,
+      "full_attention_index": 13,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_55/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "c1d23adb47c63b0d1b416aa401b7031f44a1c4fe91c69b2439311c6d4c3e89a5"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 55,
+      "full_attention_index": 13,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_55/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "2043f0963bb95b34169fbbc6a5916a5f6d401728b30a3d96cce59be336b7b9b8"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 59,
+      "full_attention_index": 14,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_59/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "9a1557eb07dfdefedcd688dacb43c36bc722de0023e6b83bec64251c6815d5e6"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 59,
+      "full_attention_index": 14,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_59/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "71be8dc103d2d830321a9ab03e92c2e539d1558eece8255b6665ea1233590bb2"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 59,
+      "full_attention_index": 14,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_59/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "aa04b37cb8ddfda6c084c642a975bb3354b6733f6c74ed928012010f0221e9e4"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 63,
+      "full_attention_index": 15,
+      "qkv_type": "q",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        24,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_63/chunk_0000/q.bin",
+      "byte_count": 3145728,
+      "data_sha256": "f606360e29a5be5854d02f4485346922b775c192da316ce4d477c8baaf2721a5"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 63,
+      "full_attention_index": 15,
+      "qkv_type": "k",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_63/chunk_0000/k.bin",
+      "byte_count": 524288,
+      "data_sha256": "16e00bde8f5d200a05d782214d922e2686991e98b37544cad75760925812ef40"
+    },
+    {
+      "model_sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+      "executable_sha256": "e7844c73276c7d551a677e283a228d5c3cdb57648d113fd028a3390888e1959e",
+      "source_identity": "src\\targets\\qwen3_6\\impl\\runtime\\text_context_impl.h=1c57f26989556549421655f62dea77e5c67d0df28f6116af658697466b3e678e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.h=ab0a4ce46777b4d822c7679d940934ed21cfdc54e0000bfb7e6b2a5cc58fc56e;src\\targets\\qwen3_6\\impl\\runtime\\oscar_qkv_capture.cpp=65206e4360ae5548d09d137201f72c10be45bbc8d5b40fba0caab2e9c231a171;tests\\targets\\qwen3_6_27b\\test_oscar_capture.cpp=9ffca215c3611b5124840e1ea00375f93f377088fdcd368bebd006bc5597cb36;tools\\oscar\\capture_qkv_smoke.ps1=7ef81f89a4bc0ea17452070babb4db8696fa9bd90dfdb6cf739df8da9030bc6d",
+      "layer_index": 63,
+      "full_attention_index": 15,
+      "qkv_type": "v",
+      "dtype": "bf16",
+      "dimensions": [
+        256,
+        4,
+        256
+      ],
+      "q_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "token_count": 256,
+      "chunk_id": 0,
+      "capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "file": "layer_63/chunk_0000/v.bin",
+      "byte_count": 524288,
+      "data_sha256": "d53477353d66375b6a693835313dc5ce5c1af7974f90ef896973f2ff4769c8d0"
+    }
+  ],
+  "dump_bytes": 67108864,
+  "capture_count": 16
+}

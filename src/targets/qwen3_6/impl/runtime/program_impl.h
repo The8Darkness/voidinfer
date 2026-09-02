@@ -11,12 +11,15 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -36,6 +39,65 @@ std::uint64_t elapsed_ns(Clock::time_point started) noexcept {
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count();
     return elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0;
+}
+
+bool dflash_phase_timing_enabled() noexcept {
+    const char* value = std::getenv("NINFER_DFLASH_PHASE_TIMING");
+    return value != nullptr && value[0] == '1';
+}
+
+bool dflash2_adaptive_k_enabled() noexcept {
+    const char* value = std::getenv("NINFER_DFLASH2_ADAPTIVE_K");
+    return value != nullptr && value[0] == '1';
+}
+
+std::vector<TokenId> oscar_forced_decode_tokens_from_environment() {
+    const char* d23_raw = std::getenv("NINFER_OSCAR_D2_3B_FORCED_DECODE_TOKENS");
+    const bool d23 = d23_raw != nullptr && *d23_raw != '\0';
+    const char* raw = d23 ? d23_raw : std::getenv("NINFER_OSCAR_D1_3_FORCED_DECODE_TOKENS");
+    if (raw == nullptr || *raw == '\0') { return {}; }
+    if (d23) {
+        const char* d23_harness = std::getenv("NINFER_OSCAR_D2_3B_LIVE");
+        const char* d31_harness = std::getenv("NINFER_OSCAR_D3_1_LIVE");
+        const char* d43_harness = std::getenv("NINFER_OSCAR_D4_3_LIVE");
+        const char* d44_harness = std::getenv("NINFER_OSCAR_D4_4_LIVE");
+        const char* d45_harness = std::getenv("NINFER_OSCAR_D4_5_LIVE");
+        const bool qualified_harness =
+            (d23_harness != nullptr && std::string_view(d23_harness) == "1") ||
+            (d31_harness != nullptr && std::string_view(d31_harness) == "1") ||
+            (d43_harness != nullptr && std::string_view(d43_harness) == "1") ||
+            (d44_harness != nullptr && std::string_view(d44_harness) == "1") ||
+            (d45_harness != nullptr && std::string_view(d45_harness) == "1");
+        if (!qualified_harness) {
+            throw std::invalid_argument(
+                "NINFER_OSCAR_D2_3B_FORCED_DECODE_TOKENS requires a qualified OSCAR harness");
+        }
+    } else {
+        const char* matched = std::getenv("NINFER_OSCAR_MATCHED_FP32");
+        if (matched == nullptr || std::string_view(matched) != "1") {
+            throw std::invalid_argument(
+                "NINFER_OSCAR_D1_3_FORCED_DECODE_TOKENS requires matched FP32 mode");
+        }
+    }
+    const std::string_view text(raw);
+    std::vector<TokenId> result;
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        const std::size_t comma = text.find(',', begin);
+        const std::size_t end   = comma == std::string_view::npos ? text.size() : comma;
+        if (end == begin) { throw std::invalid_argument("empty forced OSCAR decode token"); }
+        std::uint32_t value = 0;
+        const auto parsed = std::from_chars(text.data() + begin, text.data() + end, value, 10);
+        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + end ||
+            value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::invalid_argument("invalid forced OSCAR decode token list");
+        }
+        result.push_back(TokenId{static_cast<std::int32_t>(value)});
+        if (comma == std::string_view::npos) { break; }
+        begin = comma + 1;
+        if (begin == text.size()) { throw std::invalid_argument("trailing forced OSCAR comma"); }
+    }
+    return result;
 }
 
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
@@ -329,7 +391,10 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
     const std::uint32_t mapped     = std::min(addresses.mapped_pages(address),
                                               mapped_limit.value_or(addresses.mapped_pages(address)));
     std::vector<std::uint8_t> selected(mapped, 0);
-    const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+    const HostKVPageLayout layout =
+        host_extents != nullptr
+            ? host_extents->page_layout(pages)
+            : plan_host_kv_page_layout(pages.physical_pool().geometry());
 
     for (const qwen3_6::detail::PressureKVDecision& action : existing_actions) {
         if (action.kind == qwen3_6::detail::PressureKVDecisionKind::None ||
@@ -582,11 +647,13 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
 }
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
-                                         std::uint32_t frontier, const char* label) {
+                                         std::uint32_t frontier, const char* label,
+                                         bool greedy_target_head = false) {
     const auto it = std::find_if(
         family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
             return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
-                   frontier <= profile.max_execution_frontier;
+                   frontier <= profile.max_execution_frontier &&
+                   profile.greedy_target_head == greedy_target_head;
         });
     if (it == family.profiles.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
@@ -699,14 +766,22 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), context_cache(plan.context_cache),
+      hierarchical_vericache_options(plan.hierarchical_vericache),
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
-      kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
+      dflash2_adaptive_k(dflash2_adaptive_k_enabled() && !plan.use_cuda_graph &&
+                         plan.speculative_backend == SpeculativeBackend::DFlash &&
+                         Variant::DFlashConfig::is_v2 && plan.persistent.dflash.has_value() &&
+                         plan.persistent.dflash->adaptive_replay_records.has_value()),
+      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
+      kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
+      mtp_kv_dtype(plan.mtp_kv_dtype), mtp_kv_quant_group(plan.mtp_kv_quant_group),
+      proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
+      hierarchical_vericache(plan.hierarchical_vericache),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
@@ -726,9 +801,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
+      hierarchical_snapshot_source_ready_(device_in), hierarchical_snapshot_tail_ready_(device_in),
+      hierarchical_snapshot_state_ready_(device_in), hierarchical_snapshot_completion_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
+    oscar_forced_decode_tokens_ = oscar_forced_decode_tokens_from_environment();
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
@@ -769,8 +847,37 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::overflow_error("Qwen3.6 KV transaction address capacity exceeds uint32");
     }
     const auto address_capacity      = static_cast<std::uint32_t>(address_capacity64 + 1U);
+    const auto is_primary_oscar_q2_geometry = [](const KVPageGeometry& geometry) {
+        if (geometry.page_tokens != static_cast<std::uint32_t>(kPagedKVPageSize) ||
+            geometry.planes.empty() || geometry.planes.size() % 4U != 0U) {
+            return false;
+        }
+        for (std::size_t layer = 0; layer < geometry.planes.size() / 4U; ++layer) {
+            const KVPlaneGeometry& code_k = geometry.planes[layer * 4U];
+            const KVPlaneGeometry& code_v = geometry.planes[layer * 4U + 1U];
+            const KVPlaneGeometry& scale_k = geometry.planes[layer * 4U + 2U];
+            const KVPlaneGeometry& scale_v = geometry.planes[layer * 4U + 3U];
+            if (code_k.dtype != DType::U8 || code_v.dtype != DType::U8 ||
+                scale_k.dtype != DType::BF16 || scale_v.dtype != DType::BF16 ||
+                code_k.leading_extent != 64 || code_v.leading_extent != 64 ||
+                scale_k.leading_extent != 2 || scale_v.leading_extent != 2 ||
+                code_k.head_extent != code_v.head_extent ||
+                code_k.head_extent != scale_k.head_extent ||
+                code_k.head_extent != scale_v.head_extent) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto host_layout_for = [&](const KVPageGeometry& geometry) {
+        return hierarchical_vericache.enabled() &&
+                       hierarchical_vericache_options.enable_host_tier_snapshots &&
+                       is_primary_oscar_q2_geometry(geometry)
+                   ? plan_host_kv_page_layout(geometry, HostKVStorageFormat::OscarQ4AndFp16)
+                   : plan_host_kv_page_layout(geometry);
+    };
     const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
-        const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
+        const HostKVPageLayout host_layout = host_layout_for(pool.geometry());
         const std::uint64_t host_pages =
             plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
         const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
@@ -781,8 +888,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
-    text_host_kv_page_stride =
-        plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
+    // Hierarchical snapshots use one pinned record containing the OSCAR-Q4 verifier copy and
+    // decoded FP16 authority for target KV pages. DFlash2's separate local drafter state remains
+    // BF16 and is copied as part of the StateImage record.
+    const HostKVPageLayout text_host_layout =
+        host_layout_for(decoder->text_kv.page_pool().geometry());
+    text_host_kv_page_stride = text_host_layout.page_stride;
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
@@ -815,14 +926,28 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         if (local == nullptr) {
             throw std::logic_error("DFlash StateImage has no local fixed state");
         }
-        dflash.emplace(backing, *plan.persistent.dflash, *local);
+        dflash.emplace(backing, *plan.persistent.dflash, *local, device,
+                       !use_cuda_graph && dflash_phase_timing_enabled(),
+                       state_images->dflash_local_q4_shadow());
+        dflash->q4_primary = hierarchical_vericache.enabled() &&
+                             hierarchical_vericache_options.l1_live_verifier_primary &&
+                             dflash->local_q4_shadow != nullptr;
     }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
+    if (hierarchical_vericache.enabled()) {
+        const std::size_t l0_bytes =
+            plan.persistent.state_images.dflash_local
+                ? plan.persistent.state_images.dflash_local->payload_bytes()
+                : 0U;
+        // The resident DFlash local cache is the L0 allocation. Host L1/L2 occupancy is dynamic
+        // and is derived from the pinned stores when runtime statistics are populated; do not
+        // infer it from the device reservation before any page/state has been promoted.
+        hierarchical_vericache.set_tier_bytes(l0_bytes, 0U, 0U, 0U);
+    }
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
-        backend_host_kv_page_stride =
-            plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;
+        backend_host_kv_page_stride = host_layout_for(backend->page_pool().geometry()).page_stride;
         backend_kv_pages = std::make_unique<LogicalKVPageStore>(
             backend->page_pool(), logical_page_capacity(backend->page_pool()));
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
@@ -831,10 +956,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     if (plan.context_cache.host_kv_capacity_bytes != 0) {
         std::vector<HostKVPageLayout> layouts;
-        layouts.push_back(plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()));
+        layouts.push_back(text_host_layout);
         if (const qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
-            HostKVPageLayout backend_layout =
-                plan_host_kv_page_layout(backend->page_pool().geometry());
+            HostKVPageLayout backend_layout = host_layout_for(backend->page_pool().geometry());
             if (backend_layout != layouts.front()) { layouts.push_back(std::move(backend_layout)); }
         }
         host_kv_arena = std::make_unique<HostKVArena>(
@@ -944,6 +1068,794 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
+bool ProgramImplCore::validate_hierarchical_host_snapshot(
+    const HierarchicalHostSnapshot& snapshot) const noexcept {
+    try {
+        if (snapshot.frontier == 0 || snapshot.transfer ||
+            !snapshot.pending_text_kv_extents.empty() ||
+            !snapshot.pending_backend_kv_extents.empty() || snapshot.superseded_text_address ||
+            snapshot.superseded_backend_address || !snapshot.superseded_text_pages.empty() ||
+            !snapshot.superseded_backend_pages.empty() || !snapshot.state ||
+            !snapshot.text_kv_checkpoint || !state_store || !text_kv_addresses ||
+            !text_kv_pages || !host_kv_extents ||
+            !state_store->valid(*snapshot.state) ||
+            state_store->role(*snapshot.state) != StateImageRole::CheckpointImmutable ||
+            state_store->residency(*snapshot.state) != StateReplicaResidency::HostOnly ||
+            snapshot.state_content_epoch == 0 ||
+            state_store->content_epoch(*snapshot.state) != snapshot.state_content_epoch) {
+            return false;
+        }
+
+        const auto contains_extent = [](const std::vector<HostKVExtentCapability>& extents,
+                                        HostKVExtentCapability extent) {
+            return std::find(extents.begin(), extents.end(), extent) != extents.end();
+        };
+        const auto validate_kv = [&](const KVAddressSpaceStore& addresses,
+                                     const LogicalKVPageStore& pages,
+                                     std::optional<KVAddressSpaceHandle> address,
+                                     std::uint32_t frontier,
+                                     const std::vector<HostKVExtentCapability>& extents) {
+            if (frontier == 0 || !address || !addresses.valid(*address) ||
+                addresses.active(*address) ||
+                addresses.committed_frontier(*address) != frontier ||
+                addresses.mapped_pages(*address) != kv_pages_for_frontier(frontier)) {
+                return false;
+            }
+            const std::uint32_t required_pages = kv_pages_for_frontier(frontier);
+            for (std::uint32_t page = 0; page < required_pages; ++page) {
+                const LogicalKVPageHandle logical = addresses.logical_page(*address, page);
+                const std::uint32_t begin = page * static_cast<std::uint32_t>(kPagedKVPageSize);
+                const std::uint32_t required =
+                    std::min(static_cast<std::uint32_t>(kPagedKVPageSize), frontier - begin);
+                if (!pages.valid(logical) || !pages.host_replica_current(logical) ||
+                    pages.committed_columns(logical) < required) {
+                    return false;
+                }
+                const HostKVPageReplica replica = pages.host_replica(logical);
+                if (!host_kv_extents->valid(replica.extent) ||
+                    !contains_extent(extents, replica.extent)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (!validate_kv(*text_kv_addresses, *text_kv_pages, snapshot.text_kv_checkpoint,
+                         snapshot.frontier, snapshot.text_kv_extents)) {
+            return false;
+        }
+        if (snapshot.backend_frontier == 0) {
+            return !snapshot.backend_kv_checkpoint;
+        }
+        return backend_kv_addresses && backend_kv_pages && snapshot.backend_kv_checkpoint &&
+               validate_kv(*backend_kv_addresses, *backend_kv_pages,
+                           snapshot.backend_kv_checkpoint, snapshot.backend_frontier,
+                           snapshot.backend_kv_extents);
+    } catch (...) {
+        // This is a diagnostic/invariant gate. A stale manifest must never turn an admission or
+        // cleanup path into an exception; the caller will leave the checkpoint unpublished.
+        return false;
+    }
+}
+
+void ProgramImplCore::reap_hierarchical_host_snapshots() {
+    bool pending = false;
+    for (const auto& snapshot : hierarchical_host_snapshots) {
+        pending = pending || snapshot.transfer.has_value() ||
+                  !snapshot.pending_text_kv_extents.empty() ||
+                  !snapshot.pending_backend_kv_extents.empty() ||
+                  snapshot.superseded_text_address.has_value() ||
+                  snapshot.superseded_backend_address.has_value();
+    }
+    if (!pending || !hierarchical_snapshot_completion_.ready()) { return; }
+    // Host extent reclamation may partition an allocation after an older checkpoint address is
+    // released. Partitioning deliberately changes capability generations for retained runs, so
+    // the manifest must be rebuilt from the newly published checkpoint before validation rather
+    // than retaining stale capability values from the previous snapshot.
+    const auto rebuild_manifest_extents = [](const KVAddressSpaceStore& addresses,
+                                              const LogicalKVPageStore& pages,
+                                              std::optional<KVAddressSpaceHandle> address,
+                                              std::uint32_t frontier,
+                                              std::vector<HostKVExtentCapability>& extents) {
+        extents.clear();
+        if (frontier == 0) { return; }
+        if (!address || !addresses.valid(*address) || addresses.active(*address) ||
+            addresses.committed_frontier(*address) != frontier) {
+            throw std::logic_error("hierarchical checkpoint address changed during reaping");
+        }
+        const std::uint32_t required_pages = kv_pages_for_frontier(frontier);
+        for (std::uint32_t page = 0; page < required_pages; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(*address, page);
+            if (!pages.valid(logical) || !pages.host_resident(logical)) {
+                throw std::logic_error("hierarchical checkpoint lost a Host KV replica");
+            }
+            const HostKVExtentCapability capability = pages.host_replica(logical).extent;
+            if (std::find(extents.begin(), extents.end(), capability) == extents.end()) {
+                extents.push_back(capability);
+            }
+        }
+    };
+    for (auto& snapshot : hierarchical_host_snapshots) {
+        if (!snapshot.transfer && snapshot.pending_text_kv_extents.empty() &&
+            snapshot.pending_backend_kv_extents.empty() &&
+            !snapshot.superseded_text_address && !snapshot.superseded_backend_address) {
+            continue;
+        }
+
+        if (host_kv_extents) {
+            for (auto& reservation : snapshot.pending_text_kv_extents) {
+                snapshot.text_kv_extents.push_back(host_kv_extents->publish(std::move(reservation)));
+            }
+            for (auto& reservation : snapshot.pending_backend_kv_extents) {
+                snapshot.backend_kv_extents.push_back(
+                    host_kv_extents->publish(std::move(reservation)));
+            }
+        }
+        snapshot.pending_text_kv_extents.clear();
+        snapshot.pending_backend_kv_extents.clear();
+
+        const auto publish_checkpoint_address = [](KVAddressSpaceStore& addresses,
+                                                   std::optional<KVAddressSpaceHandle>& current,
+                                                   std::optional<KVAddressSpaceHandle>& incoming,
+                                                   const char* label) {
+            if (!incoming) { return; }
+            if (current && *current != *incoming && addresses.valid(*current) &&
+                !addresses.release(*current)) {
+                throw std::logic_error(std::string("hierarchical ") + label +
+                                       " checkpoint release failed");
+            }
+            current = *incoming;
+            incoming.reset();
+        };
+        if (snapshot.superseded_text_address) {
+            if (!text_kv_addresses) {
+                throw std::logic_error("hierarchical Text KV checkpoint store disappeared");
+            }
+            publish_checkpoint_address(*text_kv_addresses, snapshot.text_kv_checkpoint,
+                                       snapshot.superseded_text_address, "Text KV");
+        }
+        if (snapshot.superseded_backend_address) {
+            if (!backend_kv_addresses) {
+                throw std::logic_error("hierarchical Backend KV checkpoint store disappeared");
+            }
+            publish_checkpoint_address(*backend_kv_addresses, snapshot.backend_kv_checkpoint,
+                                       snapshot.superseded_backend_address, "Backend KV");
+        }
+
+        for (const LogicalKVPageHandle page : snapshot.superseded_text_pages) {
+            if (text_kv_pages && text_kv_pages->valid(page)) {
+                (void)text_kv_pages->drop_device_replica(page);
+            }
+        }
+        for (const LogicalKVPageHandle page : snapshot.superseded_backend_pages) {
+            if (backend_kv_pages && backend_kv_pages->valid(page)) {
+                (void)backend_kv_pages->drop_device_replica(page);
+            }
+        }
+        if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+
+        if (snapshot.pending_host_kv_pages != 0 || snapshot.pending_host_kv_bytes != 0) {
+            const double seconds =
+                std::chrono::duration<double>(Clock::now() - snapshot.host_kv_transfer_started)
+                    .count();
+            hierarchical_vericache.record_host_kv_transfer(
+                snapshot.pending_host_kv_pages, snapshot.pending_host_kv_bytes, seconds);
+        }
+        snapshot.pending_host_kv_pages = 0;
+        snapshot.pending_host_kv_bytes = 0;
+        snapshot.superseded_text_address.reset();
+        snapshot.superseded_backend_address.reset();
+        snapshot.superseded_text_pages.clear();
+        snapshot.superseded_backend_pages.clear();
+
+        if (snapshot.transfer) {
+            state_store->publish_transfer(std::move(*snapshot.transfer), false);
+            snapshot.transfer.reset();
+        }
+        rebuild_manifest_extents(*text_kv_addresses, *text_kv_pages,
+                                 snapshot.text_kv_checkpoint, snapshot.frontier,
+                                 snapshot.text_kv_extents);
+        if (snapshot.backend_frontier == 0) {
+            snapshot.backend_kv_extents.clear();
+        } else if (!backend_kv_addresses || !backend_kv_pages ||
+                   !snapshot.backend_kv_checkpoint) {
+            throw std::logic_error("hierarchical Backend KV checkpoint disappeared");
+        } else {
+            rebuild_manifest_extents(*backend_kv_addresses, *backend_kv_pages,
+                                     snapshot.backend_kv_checkpoint, snapshot.backend_frontier,
+                                     snapshot.backend_kv_extents);
+        }
+        if (!validate_hierarchical_host_snapshot(snapshot)) {
+            throw std::logic_error("hierarchical host checkpoint manifest failed validation");
+        }
+    }
+}
+
+void ProgramImplCore::discard_hierarchical_host_snapshot(std::uint32_t lane) noexcept {
+    if (lane >= max_concurrency) { return; }
+    auto& snapshot = hierarchical_host_snapshots[lane];
+    const bool has_async_work =
+        snapshot.transfer.has_value() || !snapshot.pending_text_kv_extents.empty() ||
+        !snapshot.pending_backend_kv_extents.empty() || snapshot.superseded_text_address.has_value() ||
+        snapshot.superseded_backend_address.has_value();
+    if (has_async_work) {
+        // The transfer owns a pinned destination. Synchronizing here is restricted to cleanup
+        // paths; the normal decode path only polls the completion event.
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+    }
+    if (snapshot.transfer) {
+        if (state_store) { state_store->abort_transfer(std::move(*snapshot.transfer)); }
+        snapshot.transfer.reset();
+    }
+    // Reservations are deliberately cleared only after the transfer stream has drained: their
+    // destructors unpin the source pages that back the asynchronous host DMA.
+    snapshot.pending_text_kv_extents.clear();
+    snapshot.pending_backend_kv_extents.clear();
+    if (snapshot.state && state_store) {
+        (void)state_store->release(*snapshot.state);
+    }
+    if (snapshot.backend_kv_checkpoint && backend_kv_addresses &&
+        backend_kv_addresses->valid(*snapshot.backend_kv_checkpoint)) {
+        (void)backend_kv_addresses->release(*snapshot.backend_kv_checkpoint);
+    }
+    if (snapshot.text_kv_checkpoint && text_kv_addresses &&
+        text_kv_addresses->valid(*snapshot.text_kv_checkpoint)) {
+        (void)text_kv_addresses->release(*snapshot.text_kv_checkpoint);
+    }
+    if (host_kv_extents) {
+        for (const HostKVExtentCapability capability : snapshot.text_kv_extents) {
+            if (host_kv_extents->valid(capability)) { (void)host_kv_extents->release(capability); }
+        }
+        for (const HostKVExtentCapability capability : snapshot.backend_kv_extents) {
+            if (host_kv_extents->valid(capability)) { (void)host_kv_extents->release(capability); }
+        }
+        (void)host_kv_extents->release_unreferenced();
+    }
+    if (snapshot.superseded_backend_address && backend_kv_addresses &&
+        backend_kv_addresses->valid(*snapshot.superseded_backend_address)) {
+        (void)backend_kv_addresses->release(*snapshot.superseded_backend_address);
+    }
+    if (snapshot.superseded_text_address && text_kv_addresses &&
+        text_kv_addresses->valid(*snapshot.superseded_text_address)) {
+        (void)text_kv_addresses->release(*snapshot.superseded_text_address);
+    }
+    for (const LogicalKVPageHandle page : snapshot.superseded_text_pages) {
+        if (text_kv_pages && text_kv_pages->valid(page)) {
+            (void)text_kv_pages->drop_device_replica(page);
+        }
+    }
+    for (const LogicalKVPageHandle page : snapshot.superseded_backend_pages) {
+        if (backend_kv_pages && backend_kv_pages->valid(page)) {
+            (void)backend_kv_pages->drop_device_replica(page);
+        }
+    }
+    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    snapshot.text_kv_extents.clear();
+    snapshot.backend_kv_extents.clear();
+    snapshot.state.reset();
+    snapshot.text_kv_checkpoint.reset();
+    snapshot.backend_kv_checkpoint.reset();
+    snapshot.superseded_text_address.reset();
+    snapshot.superseded_backend_address.reset();
+    snapshot.superseded_text_pages.clear();
+    snapshot.superseded_backend_pages.clear();
+    snapshot.frontier              = 0;
+    snapshot.backend_frontier      = 0;
+    snapshot.state_content_epoch   = 0;
+    snapshot.pending_host_kv_bytes = 0;
+    snapshot.pending_host_kv_pages = 0;
+    snapshot.host_kv_transfer_started = {};
+}
+
+bool ProgramImplCore::snapshot_hierarchical_host_kv(SequenceState& sequence,
+                                                    HierarchicalHostSnapshot& snapshot) {
+    if (!host_kv_arena || !host_kv_extents || !sequence.kv || !text_kv_addresses ||
+        !text_kv_pages) {
+        return false;
+    }
+
+    const std::uint32_t frontier         = sequence.execution_frontier;
+    const std::uint32_t backend_frontier = backend_kv_valid(sequence);
+    if (frontier == 0 || !text_kv_addresses->active(sequence.kv->text) ||
+        text_kv_addresses->committed_frontier(sequence.kv->text) < frontier) {
+        return false;
+    }
+    if (sequence.kv->backend &&
+        (!backend_kv_addresses || !backend_kv_pages || backend_frontier == 0 ||
+         !backend_kv_addresses->active(*sequence.kv->backend) ||
+         backend_kv_addresses->committed_frontier(*sequence.kv->backend) < backend_frontier)) {
+        return false;
+    }
+    if (frontier == snapshot.frontier && backend_frontier == snapshot.backend_frontier) {
+        return true;
+    }
+
+    const auto collect_missing = [](LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                    KVAddressSpaceHandle address, std::uint32_t tokens,
+                                    std::vector<LogicalKVPageHandle>& missing) {
+        const std::uint32_t required = kv_pages_for_frontier(tokens);
+        if (required > addresses.mapped_pages(address)) { return false; }
+        missing.clear();
+        missing.reserve(required);
+        for (std::uint32_t page = 0; page < required; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (pages.host_resident(logical)) {
+                // A stale Host duplicate must never become an authoritative checkpoint. The
+                // normal context manager removes these before a writer can mutate the page.
+                if (!pages.host_replica_current(logical)) { return false; }
+            } else {
+                missing.push_back(logical);
+            }
+        }
+        return true;
+    };
+
+    std::vector<LogicalKVPageHandle> missing_text;
+    std::vector<LogicalKVPageHandle> missing_backend;
+    if (!collect_missing(*text_kv_pages, *text_kv_addresses, sequence.kv->text, frontier,
+                         missing_text)) {
+        return false;
+    }
+    if (sequence.kv->backend &&
+        !collect_missing(*backend_kv_pages, *backend_kv_addresses, *sequence.kv->backend,
+                         backend_frontier, missing_backend)) {
+        return false;
+    }
+
+    const SequenceKVBundle old_bundle = *sequence.kv;
+    const std::uint32_t old_text_entitlement =
+        text_kv_addresses->entitlement(old_bundle.text);
+    const std::optional<std::uint32_t> old_backend_entitlement =
+        old_bundle.backend ? std::optional<std::uint32_t>(
+                                 backend_kv_addresses->entitlement(*old_bundle.backend))
+                           : std::nullopt;
+    const std::optional<KVAddressSpaceHandle> text_destination =
+        text_kv_addresses->create_inactive();
+    if (!text_destination) { return false; }
+    const std::optional<KVAddressSpaceHandle> backend_destination =
+        old_bundle.backend ? backend_kv_addresses->create_inactive() : std::nullopt;
+    if (old_bundle.backend && !backend_destination) {
+        (void)text_kv_addresses->release(*text_destination);
+        return false;
+    }
+
+    const auto collect_source_pages = [](LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+                                         KVAddressSpaceHandle address, std::uint32_t tokens,
+                                         std::vector<LogicalKVPageHandle>& out) {
+        const std::uint32_t required = kv_pages_for_frontier(tokens);
+        if (required > addresses.mapped_pages(address)) { return false; }
+        out.clear();
+        out.reserve(required);
+        for (std::uint32_t page = 0; page < required; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (!pages.valid(logical)) { return false; }
+            out.push_back(logical);
+        }
+        return true;
+    };
+    std::vector<LogicalKVPageHandle> old_text_pages;
+    std::vector<LogicalKVPageHandle> old_backend_pages;
+    if (!collect_source_pages(*text_kv_pages, *text_kv_addresses, old_bundle.text, frontier,
+                              old_text_pages) ||
+        (old_bundle.backend &&
+         !collect_source_pages(*backend_kv_pages, *backend_kv_addresses, *old_bundle.backend,
+                               backend_frontier, old_backend_pages))) {
+        (void)text_kv_addresses->release(*text_destination);
+        if (backend_destination) { (void)backend_kv_addresses->release(*backend_destination); }
+        return false;
+    }
+
+    std::optional<KVPrefixForkReservation> text_fork;
+    std::optional<KVPrefixForkReservation> backend_fork;
+    bool text_committed   = false;
+    bool backend_committed = false;
+    const char* stage      = "source preparation";
+
+    const auto restore_original = [&]() {
+        if (backend_committed && backend_destination &&
+            backend_kv_addresses->active(*backend_destination)) {
+            backend_kv_addresses->deactivate(*backend_destination);
+        }
+        if (text_committed && text_kv_addresses->active(*text_destination)) {
+            text_kv_addresses->deactivate(*text_destination);
+        }
+        if (backend_destination && backend_kv_addresses->valid(*backend_destination)) {
+            (void)backend_kv_addresses->release(*backend_destination);
+        }
+        if (text_kv_addresses->valid(*text_destination)) {
+            (void)text_kv_addresses->release(*text_destination);
+        }
+        sequence.kv = old_bundle;
+        if (!text_kv_addresses->active(old_bundle.text)) {
+            text_kv_addresses->activate(old_bundle.text, old_text_entitlement,
+                                         static_cast<std::int32_t>(sequence.lane));
+        }
+        if (old_bundle.backend && !backend_kv_addresses->active(*old_bundle.backend)) {
+            backend_kv_addresses->activate(*old_bundle.backend, *old_backend_entitlement,
+                                            static_cast<std::int32_t>(sequence.lane));
+        }
+        bind_sequence_kv(sequence);
+    };
+    const auto fork_entitlement = [](LogicalKVPageStore& pages, std::uint32_t frontier,
+                                     std::uint32_t requested) {
+        // A prefix fork owns the partial tail page too.  Using floor(frontier / page_size)
+        // under-entitles every non-page-aligned checkpoint and makes the host snapshot path
+        // reject an otherwise valid retained prefix before the tail-copy can be submitted.
+        const std::uint32_t required_pages = kv_pages_for_frontier(frontier);
+        const std::uint32_t free_pages = pages.physical_pool().available_pages();
+        return std::min(requested, required_pages + free_pages);
+    };
+
+    bool tail_copy_submitted = false;
+    try {
+        // The producer event is the only dependency needed by the transfer stream. Keeping the
+        // wait stream-scoped avoids a device-wide barrier and leaves later decode work free to
+        // overlap the host DMA once the COW destination is safe to write.
+        stage = "source deactivation";
+        unbind_sequence_kv(sequence);
+        if (text_kv_addresses->active(old_bundle.text) ||
+            (old_bundle.backend && backend_kv_addresses->active(*old_bundle.backend))) {
+            throw std::logic_error("hierarchical KV source remained active after unbind");
+        }
+
+        stage = "Text prefix fork preparation";
+        const std::uint32_t text_fork_entitlement =
+            fork_entitlement(*text_kv_pages, frontier, old_text_entitlement);
+        text_fork.emplace(text_kv_addresses->prepare_prefix_fork(
+            old_bundle.text, *text_destination, frontier, text_fork_entitlement,
+            static_cast<std::int32_t>(sequence.lane)));
+        if (old_bundle.backend) {
+            stage = "Backend prefix fork preparation";
+            const std::uint32_t backend_fork_entitlement =
+                fork_entitlement(*backend_kv_pages, backend_frontier, *old_backend_entitlement);
+            backend_fork.emplace(backend_kv_addresses->prepare_prefix_fork(
+                *old_bundle.backend, *backend_destination, backend_frontier,
+                backend_fork_entitlement, static_cast<std::int32_t>(sequence.lane)));
+        }
+        stage = "prefix fork tail copy";
+        if (text_fork->needs_tail_copy()) {
+            text_kv_pages->physical_pool().copy_page(
+                text_kv_addresses->prefix_fork_tail_source(*text_fork),
+                text_kv_addresses->prefix_fork_tail_destination(*text_fork),
+                device.transfer_stream);
+            tail_copy_submitted = true;
+        }
+        if (backend_fork && backend_fork->needs_tail_copy()) {
+            backend_kv_pages->physical_pool().copy_page(
+                backend_kv_addresses->prefix_fork_tail_source(*backend_fork),
+                backend_kv_addresses->prefix_fork_tail_destination(*backend_fork),
+                device.transfer_stream);
+            tail_copy_submitted = true;
+        }
+        if (tail_copy_submitted) {
+            stage = "prefix fork producer wait";
+            hierarchical_snapshot_tail_ready_.record(device.transfer_stream);
+            hierarchical_snapshot_tail_ready_.wait(device.stream);
+        }
+
+        stage = "Text prefix fork commit";
+        text_kv_addresses->commit_prefix_fork(std::move(*text_fork), device.stream);
+        text_fork.reset();
+        text_committed = true;
+        if (backend_fork) {
+            stage = "Backend prefix fork commit";
+            backend_kv_addresses->commit_prefix_fork(std::move(*backend_fork), device.stream);
+            backend_fork.reset();
+            backend_committed = true;
+        }
+
+        SequenceKVBundle next_bundle{.text = *text_destination};
+        if (backend_destination) { next_bundle.backend = *backend_destination; }
+        stage = "new KV bundle binding";
+        sequence.kv = next_bundle;
+        bind_sequence_kv(sequence);
+    } catch (const std::exception& error) {
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        if (backend_fork) { backend_kv_addresses->abort_prefix_fork(*backend_fork); }
+        if (text_fork) { text_kv_addresses->abort_prefix_fork(*text_fork); }
+        try {
+            restore_original();
+        } catch (...) { std::terminate(); }
+        throw std::runtime_error(std::string("hierarchical KV snapshot failed at ") + stage +
+                                 ": " + error.what());
+    }
+
+    const std::size_t pending_text_begin    = snapshot.pending_text_kv_extents.size();
+    const std::size_t pending_backend_begin = snapshot.pending_backend_kv_extents.size();
+    std::uint64_t copied_bytes             = 0;
+    std::uint32_t copied_pages             = 0;
+    const auto copy_missing = [&](LogicalKVPageStore& pages, std::vector<LogicalKVPageHandle>& missing,
+                                  std::vector<HostKVExtentReservation>& pending) {
+        if (missing.empty()) { return true; }
+        std::optional<HostKVExtentReservation> reservation =
+            host_kv_extents->prepare(pages, std::span<const LogicalKVPageHandle>(missing));
+        if (!reservation) { return false; }
+        const std::uint32_t page_count = host_kv_extents->page_count(*reservation);
+        const HostKVPageLayout layout = host_kv_extents->page_layout(pages);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(layout.page_stride) * page_count;
+        std::vector<DeviceKVPageHandle> sources = host_kv_extents->device_sources(*reservation);
+        pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reservation),
+                                           device.transfer_stream);
+        // Keep the reservation alive until the completion event. Publishing here would expose a
+        // partially copied Host extent to a future verifier and would unpin the source page while
+        // the asynchronous DMA is still reading it.
+        pending.push_back(std::move(*reservation));
+        if (snapshot.pending_host_kv_pages == 0 && copied_pages == 0) {
+            snapshot.host_kv_transfer_started = Clock::now();
+        }
+        copied_pages = copied_pages > std::numeric_limits<std::uint32_t>::max() - page_count
+                           ? std::numeric_limits<std::uint32_t>::max()
+                           : copied_pages + page_count;
+        if (bytes > std::numeric_limits<std::uint64_t>::max() - copied_bytes) {
+            copied_bytes = std::numeric_limits<std::uint64_t>::max();
+        } else {
+            copied_bytes += bytes;
+        }
+        return true;
+    };
+
+    bool host_ready = false;
+    try {
+        const bool text_ready =
+            copy_missing(*text_kv_pages, missing_text, snapshot.pending_text_kv_extents);
+        const bool backend_ready =
+            !old_bundle.backend ||
+            copy_missing(*backend_kv_pages, missing_backend, snapshot.pending_backend_kv_extents);
+        host_ready = text_ready && backend_ready;
+    } catch (...) {
+        host_ready = false;
+    }
+
+    if (!host_ready) {
+        // A failed enqueue may have left one or both DMA batches in flight. Drain the transfer
+        // stream before the reservation destructors unpin their source pages.
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        while (snapshot.pending_text_kv_extents.size() > pending_text_begin) {
+            snapshot.pending_text_kv_extents.pop_back();
+        }
+        while (snapshot.pending_backend_kv_extents.size() > pending_backend_begin) {
+            snapshot.pending_backend_kv_extents.pop_back();
+        }
+        if (!text_kv_addresses->release(old_bundle.text)) {
+            throw std::logic_error("hierarchical Text KV source release failed");
+        }
+        if (old_bundle.backend && !backend_kv_addresses->release(*old_bundle.backend)) {
+            throw std::logic_error("hierarchical Backend KV source release failed");
+        }
+        for (const LogicalKVPageHandle page : old_text_pages) {
+            if (text_kv_pages->can_drop_device_replica(page)) {
+                (void)text_kv_pages->drop_device_replica(page);
+            }
+        }
+        for (const LogicalKVPageHandle page : old_backend_pages) {
+            if (backend_kv_pages->can_drop_device_replica(page)) {
+                (void)backend_kv_pages->drop_device_replica(page);
+            }
+        }
+        (void)host_kv_extents->release_unreferenced();
+        snapshot.pending_host_kv_bytes = 0;
+        snapshot.pending_host_kv_pages = 0;
+        snapshot.host_kv_transfer_started = {};
+        return false;
+    }
+
+    // Existing Host replicas may have been produced by the ordinary context manager rather than
+    // by this checkpoint. Record their capabilities in the manifest only after the new COW
+    // address spaces and any asynchronous copies have been successfully staged.
+    const auto retain_existing_extents =
+        [&](LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
+            KVAddressSpaceHandle address, std::uint32_t tokens,
+            std::vector<HostKVExtentCapability>& extents) {
+            const std::uint32_t required = kv_pages_for_frontier(tokens);
+            for (std::uint32_t page = 0; page < required; ++page) {
+                const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                if (!pages.host_resident(logical)) { continue; }
+                const HostKVExtentCapability capability = pages.host_replica(logical).extent;
+                if (std::find(extents.begin(), extents.end(), capability) == extents.end()) {
+                    extents.push_back(capability);
+                }
+            }
+        };
+    retain_existing_extents(*text_kv_pages, *text_kv_addresses, *text_destination, frontier,
+                            snapshot.text_kv_extents);
+    if (old_bundle.backend) {
+        retain_existing_extents(*backend_kv_pages, *backend_kv_addresses, *backend_destination,
+                                backend_frontier, snapshot.backend_kv_extents);
+    }
+
+    if (copied_bytes > std::numeric_limits<std::uint64_t>::max() - snapshot.pending_host_kv_bytes) {
+        snapshot.pending_host_kv_bytes = std::numeric_limits<std::uint64_t>::max();
+    } else {
+        snapshot.pending_host_kv_bytes += copied_bytes;
+    }
+    snapshot.pending_host_kv_pages =
+        copied_pages > std::numeric_limits<std::uint32_t>::max() - snapshot.pending_host_kv_pages
+            ? std::numeric_limits<std::uint32_t>::max()
+            : snapshot.pending_host_kv_pages + copied_pages;
+    snapshot.superseded_text_address = old_bundle.text;
+    snapshot.superseded_backend_address = old_bundle.backend;
+    snapshot.superseded_text_pages    = std::move(old_text_pages);
+    snapshot.superseded_backend_pages = std::move(old_backend_pages);
+    return true;
+}
+
+void ProgramImplCore::maybe_snapshot_hierarchical_host_tier(SequenceState& sequence) {
+    if (!hierarchical_vericache.enabled() ||
+        !hierarchical_vericache_options.enable_host_tier_snapshots ||
+        host_state_images == nullptr || state_store == nullptr || sequence.lane >= max_concurrency) {
+        return;
+    }
+
+    reap_hierarchical_host_snapshots();
+    auto& snapshot = hierarchical_host_snapshots[sequence.lane];
+    if (sequence.execution_frontier <
+        hierarchical_vericache.next_host_snapshot_boundary(snapshot.frontier)) {
+        return;
+    }
+    if (snapshot.transfer || !snapshot.pending_text_kv_extents.empty() ||
+        !snapshot.pending_backend_kv_extents.empty() || snapshot.superseded_text_address ||
+        snapshot.superseded_backend_address) {
+        return;
+    }
+
+    // The active StateImage is mutable, while Device-to-Host transfers intentionally accept only
+    // immutable images. Copying into a spare device image makes the host snapshot a real nested
+    // checkpoint and keeps the running MTP/DFlash/GDN state independent from asynchronous D2H
+    // DMA.
+    const StateImageSelectors selectors = state_selectors(sequence);
+    const std::optional<StateImageHandle> destination =
+        state_store->reserve_reset(device.transfer_stream);
+    if (!destination) { return; }
+    const auto release_destination = [&]() noexcept {
+        if (state_store && state_store->valid(*destination)) {
+            (void)state_store->release(*destination);
+        }
+    };
+    try {
+        hierarchical_snapshot_source_ready_.record(device.stream);
+        hierarchical_snapshot_source_ready_.wait(device.transfer_stream);
+        if (!snapshot_hierarchical_host_kv(sequence, snapshot)) {
+            release_destination();
+            return;
+        }
+        state_images->copy_slot(selectors.destination, state_store->physical_slot(*destination),
+                                device.transfer_stream);
+        // The active recurrent state may be mutated as soon as this function returns. Wait only
+        // for the device-to-device checkpoint copy on the worker stream; the following D2H transfer
+        // remains overlapped with later decode work.
+        hierarchical_snapshot_state_ready_.record(device.transfer_stream);
+        hierarchical_snapshot_state_ready_.wait(device.stream);
+        state_store->freeze(*destination);
+        const std::uint64_t state_content_epoch = state_store->content_epoch(*destination);
+        std::optional<StateImageTransfer> transfer =
+            state_store->begin_device_to_host(*destination, device.transfer_stream);
+        if (!transfer) {
+            release_destination();
+            return;
+        }
+        if (snapshot.state) { (void)state_store->release(*snapshot.state); }
+        snapshot.state               = *destination;
+        snapshot.state_content_epoch = state_content_epoch;
+        snapshot.frontier          = sequence.execution_frontier;
+        snapshot.backend_frontier  = backend_kv_valid(sequence);
+        snapshot.transfer.emplace(std::move(*transfer));
+        hierarchical_snapshot_completion_.record(device.transfer_stream);
+        const std::uint64_t state_bytes =
+            static_cast<std::uint64_t>(state_images->host_layout().image_bytes);
+        hierarchical_vericache.record_host_state_transfer(state_bytes);
+        const std::uint64_t kv_bytes = snapshot.pending_host_kv_bytes;
+        const std::uint64_t total_bytes =
+            kv_bytes > std::numeric_limits<std::uint64_t>::max() - state_bytes
+                ? std::numeric_limits<std::uint64_t>::max()
+                : state_bytes + kv_bytes;
+        hierarchical_vericache.record_host_tier_snapshot(total_bytes);
+    } catch (...) {
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        if (snapshot.transfer) {
+            state_store->abort_transfer(std::move(*snapshot.transfer));
+            snapshot.transfer.reset();
+        }
+        snapshot.pending_text_kv_extents.clear();
+        snapshot.pending_backend_kv_extents.clear();
+        if (snapshot.superseded_backend_address && backend_kv_addresses &&
+            backend_kv_addresses->valid(*snapshot.superseded_backend_address)) {
+            (void)backend_kv_addresses->release(*snapshot.superseded_backend_address);
+        }
+        if (snapshot.superseded_text_address && text_kv_addresses &&
+            text_kv_addresses->valid(*snapshot.superseded_text_address)) {
+            (void)text_kv_addresses->release(*snapshot.superseded_text_address);
+        }
+        for (const LogicalKVPageHandle page : snapshot.superseded_text_pages) {
+            if (text_kv_pages && text_kv_pages->valid(page)) {
+                (void)text_kv_pages->drop_device_replica(page);
+            }
+        }
+        for (const LogicalKVPageHandle page : snapshot.superseded_backend_pages) {
+            if (backend_kv_pages && backend_kv_pages->valid(page)) {
+                (void)backend_kv_pages->drop_device_replica(page);
+            }
+        }
+        if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+        snapshot.superseded_text_address.reset();
+        snapshot.superseded_backend_address.reset();
+        snapshot.superseded_text_pages.clear();
+        snapshot.superseded_backend_pages.clear();
+        snapshot.pending_host_kv_bytes = 0;
+        snapshot.pending_host_kv_pages = 0;
+        snapshot.host_kv_transfer_started = {};
+        if (snapshot.state && *snapshot.state == *destination) {
+            snapshot.state.reset();
+            snapshot.state_content_epoch = 0;
+        }
+        release_destination();
+        throw;
+    }
+}
+
+void ProgramImplCore::begin_hierarchical_speculation(
+    std::uint32_t lane, runtime::HierarchicalVeriCacheFrontier base,
+    runtime::HierarchicalVeriCacheFrontier proposed) {
+    if (!hierarchical_vericache.enabled()) { return; }
+    if (lane >= max_concurrency) { throw std::out_of_range("VeriCache lane is out of range"); }
+    auto& transaction = hierarchical_transactions[lane];
+    if (transaction.active()) {
+        throw std::logic_error("VeriCache lane already has an open transaction");
+    }
+    const auto parent = transaction.begin(runtime::HierarchicalVeriCacheTransactionKind::L0Speculation,
+                                          base, proposed);
+    try {
+        (void)transaction.begin(runtime::HierarchicalVeriCacheTransactionKind::GdnRecurrentState,
+                                base, proposed);
+    } catch (...) {
+        (void)transaction.rollback(parent);
+        throw;
+    }
+    hierarchical_vericache.record_speculative_round();
+}
+
+void ProgramImplCore::commit_hierarchical_speculation(
+    std::uint32_t lane, runtime::HierarchicalVeriCacheFrontier final_frontier) noexcept {
+    if (!hierarchical_vericache.enabled() || lane >= max_concurrency) { return; }
+    auto& transaction = hierarchical_transactions[lane];
+    if (!transaction.active()) { return; }
+    bool rejected_tail = false;
+    if (const auto* frame = transaction.top_frame()) {
+        rejected_tail = final_frontier.kv < frame->proposed.kv ||
+                        final_frontier.gdn < frame->proposed.gdn;
+    }
+    while (transaction.active()) {
+        const auto token = transaction.top_token();
+        if (!transaction.commit(token, final_frontier)) {
+            (void)transaction.rollback(token);
+        }
+    }
+    hierarchical_vericache.record_transactions(
+        transaction.commits(), transaction.rollbacks() + transaction.partial_rollbacks(),
+        transaction.max_depth());
+    if (rejected_tail) { hierarchical_vericache.record_speculative_rollback(); }
+    transaction.reset();
+}
+
+void ProgramImplCore::rollback_hierarchical_speculation(std::uint32_t lane) noexcept {
+    if (!hierarchical_vericache.enabled() || lane >= max_concurrency) { return; }
+    auto& transaction = hierarchical_transactions[lane];
+    if (!transaction.active()) { return; }
+    transaction.rollback_all();
+    hierarchical_vericache.record_transactions(
+        transaction.commits(), transaction.rollbacks() + transaction.partial_rollbacks(),
+        transaction.max_depth());
+    hierarchical_vericache.record_speculative_rollback();
+    transaction.reset();
+}
+
 void ProgramImplCore::start_context_transfer_timer(runtime::ContextResourceClass resource) {
     context_transfer_timers_[context_resource_index(resource)].start();
 }
@@ -979,6 +1891,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
     std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
     const runtime::ContextMachineCostModel& machine_cost) {
+    // Host-tier promotion is intentionally nonblocking on the request path. Poll here as well as
+    // at the next snapshot boundary so a workload that stops generating still releases its
+    // superseded KV descriptors and host reservations before the next admission.
+    reap_hierarchical_host_snapshots();
     const std::uint32_t lane = destination.value;
     if (lane >= max_concurrency) { throw std::out_of_range("admission lane is out of range"); }
     if (requests[lane].lifecycle != Lifecycle::Empty ||
@@ -1703,7 +2619,10 @@ ProgramImplCore::checkpoint_restore_requirements(const SequenceKVBundle& kv,
             ++missing;
         }
         if (missing == 0) { return; }
-        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        const HostKVPageLayout layout =
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(pages)
+                : plan_host_kv_page_layout(pages.physical_pool().geometry());
         requirements.push_back(kv_transfer_requirement(
             resource, runtime::ContextTransferDirection::HostToDevice, layout, missing, runs));
     };
@@ -1985,7 +2904,9 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
             }
             if (missing != 0) {
                 const HostKVPageLayout layout =
-                    plan_host_kv_page_layout(pages.physical_pool().geometry());
+                    host_kv_extents != nullptr
+                        ? host_kv_extents->page_layout(pages)
+                        : plan_host_kv_page_layout(pages.physical_pool().geometry());
                 requirements.push_back(kv_transfer_requirement(
                     resource, runtime::ContextTransferDirection::HostToDevice, layout, missing,
                     runs));
@@ -2213,7 +3134,9 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_checkp
         const std::uint32_t retained_pages = kv_pages_for_frontier(retained_frontier);
         const std::uint32_t mapped         = addresses.mapped_pages(address);
         const std::size_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(pages).page_stride
+                : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
         for (std::uint32_t page = retained_pages; page < mapped; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.address_references(logical) != 1) { continue; }
@@ -2948,7 +3871,9 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
                     return false;
                 }
                 const std::size_t stride =
-                    plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+                    host_kv_extents != nullptr
+                        ? host_kv_extents->page_layout(pages).page_stride
+                        : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
                 for (std::uint32_t offset = 0; offset < protected_pages; ++offset) {
                     const LogicalKVPageHandle page = addresses.logical_page(address, offset);
                     const std::uint32_t references = pages.address_references(page);
@@ -3149,7 +4074,9 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
                                            const std::vector<SelectedPage>& selected,
                                            runtime::ContextResourceClass resource) {
         const std::size_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(pages).page_stride
+                : plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
         for (const SelectedPage& item : selected) {
             if (pages.address_references(item.page) != item.references ||
                 pages.writer_references(item.page) != 0 || pages.source_pins(item.page) != 0) {
@@ -3272,7 +4199,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
         for (const qwen3_6::detail::PressureKVDecision& action : changes) {
             append_host_releases(addresses, pages, address, action);
             if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
-                host_layouts.push_back(plan_host_kv_page_layout(pages.physical_pool().geometry()));
+                host_layouts.push_back(
+                    host_kv_extents != nullptr
+                        ? host_kv_extents->page_layout(pages)
+                        : plan_host_kv_page_layout(pages.physical_pool().geometry()));
                 host_requests.push_back(
                     {.layout = &host_layouts.back(), .pages = action.page_count});
             }
@@ -4785,8 +5715,10 @@ void ProgramImplCore::record_materialization_transfer_observations(
             context_transfer_observation(resource, direction, transfer_work, pages));
         transaction.transfer_timer_mask &= static_cast<std::uint8_t>(~bit);
     };
-    const auto host_layout = [](const LogicalKVPageStore& pages) {
-        return plan_host_kv_page_layout(pages.physical_pool().geometry());
+    const auto host_layout = [&](const LogicalKVPageStore& pages) {
+        return host_kv_extents != nullptr
+                   ? host_kv_extents->page_layout(pages)
+                   : plan_host_kv_page_layout(pages.physical_pool().geometry());
     };
     const auto restore_copy_runs = [](const auto& restores, const auto& destinations,
                                       const LogicalKVPageStore& pages) {
@@ -6638,7 +7570,8 @@ ProgramImplCore::checkpoint_summary(const SequenceState& sequence,
                                                             : 0U;
     const std::uint32_t identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                        (static_cast<std::uint32_t>(proposal_head) << 8U) |
-                                       (static_cast<std::uint32_t>(kv_dtype) << 16U);
+                                       (static_cast<std::uint32_t>(kv_dtype) << 16U) |
+                                       (static_cast<std::uint32_t>(kv_storage) << 24U);
     return qwen3_6::CheckpointSummary{
         .ref   = checkpoint,
         .scope = runtime::CheckpointScope::Private,
@@ -7002,14 +7935,18 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
         assessment.transfer_requirements.push_back(kv_transfer_requirement(
             runtime::ContextResourceClass::MainKV,
             runtime::ContextTransferDirection::DeviceToDevice,
-            plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()),
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(*text_kv_pages)
+                : plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()),
             added.device.main_kv_pages));
     }
     if (added.device.backend_kv_pages != 0) {
         assessment.transfer_requirements.push_back(kv_transfer_requirement(
             runtime::ContextResourceClass::BackendKV,
             runtime::ContextTransferDirection::DeviceToDevice,
-            plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()),
+            host_kv_extents != nullptr
+                ? host_kv_extents->page_layout(*backend_kv_pages)
+                : plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()),
             added.device.backend_kv_pages));
     }
     assessment.needs_transfer = !assessment.transfer_requirements.empty();
@@ -7865,6 +8802,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 throw std::logic_error("forced-token commit did not establish a valid frontier");
             }
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            maybe_snapshot_hierarchical_host_tier(sequence);
             request.timings.decode_seconds +=
                 std::chrono::duration<double>(Clock::now() - started).count();
         }
@@ -8088,6 +9026,7 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
         populate_continuation_summary(state, out.summary);
         out.summary.active_references = 0;
     } catch (...) { return out; }
+    discard_hierarchical_host_snapshot(lane);
     release_active_shared_references(state);
     release_sequence_growth_entitlement(state);
     unbind_sequence_kv(state);
@@ -8310,6 +9249,71 @@ qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept 
         .device_backend_kv_pages = usage.device.backend_kv_pages,
         .host_kv_bytes           = usage.host.kv_bytes,
     };
+}
+
+void ProgramImplCore::populate_hierarchical_vericache_stats(RuntimeStats& out) const noexcept {
+    hierarchical_vericache.populate(out);
+    if (!hierarchical_vericache.enabled()) { return; }
+
+    // The target attention pages use OSCAR-Q2 on the device; DFlash2's local drafter cache is a
+    // separate BF16 StateImage component. Q4 and FP16 target representations live in host records
+    // only; a Q4 device shadow is neither planned nor counted. Protected recent or anchor
+    // sidecars remain an explicit sensitivity exception for quantized legacy local caches.
+    const auto device_pool_bytes = [](const DeviceKVPagePool& pool) {
+        std::size_t bytes = 0;
+        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+            bytes += pool.plane(plane).bytes();
+        }
+        return bytes;
+    };
+    std::size_t l0_bytes = 0;
+    if (decoder != nullptr) { l0_bytes += device_pool_bytes(decoder->text_kv.page_pool()); }
+    if (const qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
+        l0_bytes += device_pool_bytes(backend->page_pool());
+    }
+    if (state_images != nullptr) {
+        if (const CyclicKVCache* local = state_images->dflash_local()) {
+            l0_bytes += local->payload_bytes();
+        }
+        out.vericache_l0_q4_shadow_bytes = 0;
+    }
+    std::size_t l1_bytes = 0;
+    std::size_t l2_bytes = 0;
+    if (host_state_images != nullptr) {
+        const auto& layout = host_state_images->layout();
+        std::size_t local_bytes = 0;
+        const auto add_optional = [&local_bytes](const auto& region) {
+            if (region) { local_bytes += region->bytes; }
+        };
+        add_optional(layout.dflash_local_k);
+        add_optional(layout.dflash_local_v);
+        add_optional(layout.dflash_local_k_scale);
+        add_optional(layout.dflash_local_v_scale);
+        add_optional(layout.dflash_local_protected_k);
+        add_optional(layout.dflash_local_protected_v);
+        const std::size_t occupied = host_state_images->occupied();
+        l1_bytes = local_bytes * occupied;
+        l2_bytes = (layout.image_bytes - local_bytes) * occupied;
+    }
+    // A hierarchical text record is split into Q4 L1 bytes and FP16 L2 bytes. Generic host
+    // records (for a non-primary DFlash geometry) are deliberately not misreported as either
+    // tier until a matching verifier layout exists.
+    const auto add_host_tier_bytes = [&](const std::unique_ptr<LogicalKVPageStore>& pages) {
+        if (pages == nullptr || host_kv_extents == nullptr || pages->host_resident_count() == 0) {
+            return;
+        }
+        const HostKVPageLayout& layout = host_kv_extents->page_layout(*pages);
+        const std::size_t resident = pages->host_resident_count();
+        if (layout.storage_format == HostKVStorageFormat::OscarQ4AndFp16) {
+            l1_bytes += resident * layout.l1_page_payload_bytes;
+            l2_bytes += resident * layout.l2_page_payload_bytes;
+        }
+    };
+    add_host_tier_bytes(text_kv_pages);
+    add_host_tier_bytes(backend_kv_pages);
+    out.vericache_l0_bytes = l0_bytes;
+    out.vericache_l1_bytes = l1_bytes;
+    out.vericache_l2_bytes = l2_bytes;
 }
 
 void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence,
@@ -8866,6 +9870,14 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
 
+    const ops::GdnReplayFoldPlan* active_replay_fold = &*replay_fold;
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash2_adaptive_k) {
+        if (!dflash || !dflash->adaptive_replay_fold) {
+            throw std::logic_error("Adaptive DFlash2 pending batch has no ReplaySSM fold plan");
+        }
+        active_replay_fold = &*dflash->adaptive_replay_fold;
+    }
+
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
@@ -8910,8 +9922,8 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     const auto tail_started = Clock::now();
     try {
         timing.resume_submit();
-        replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+        active_replay_fold->execute(
+            std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()), device.stream);
 
         if (needs_hidden_correction) {
             const auto batch = static_cast<std::int32_t>(lanes.size());
@@ -8984,12 +9996,17 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             SequenceState& sequence = active_sequence(lanes[row]);
             RequestControl& request = requests[lanes[row]];
             if (cancelled[row]) {
+                rollback_hierarchical_speculation(lanes[row]);
                 clear_lane(sequence, request);
                 continue;
             }
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
+            commit_hierarchical_speculation(
+                lanes[row],
+                runtime::HierarchicalVeriCacheFrontier{.kv = pending.base_E + committed,
+                                                        .gdn = pending.base_E + committed});
             settle_state_fork(sequence);
             const TokenId* token_base =
                 speculative_backend == SpeculativeBackend::Mtp
@@ -9024,6 +10041,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 
             commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            maybe_snapshot_hierarchical_host_tier(sequence);
             if (terminal[row]) {
                 request.lifecycle = Lifecycle::Finishable;
             } else {
@@ -9053,6 +10071,8 @@ void ProgramImplCore::clear_execution_failure_lanes(std::span<const std::uint32_
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
+    rollback_hierarchical_speculation(sequence.lane);
+    discard_hierarchical_host_snapshot(sequence.lane);
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
@@ -9742,7 +10762,7 @@ void ProgramImplCore::prepare_graphs() {
                                       code_warm_target, nullptr);
         device.synchronize();
 
-        dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
+        dflash_graphs.profiles.reserve(batch_one_profiles.size() * (max_concurrency + 1U));
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
             const auto planned_profiles =
                 batch_size == 1 ? batch_one_profiles
@@ -9756,6 +10776,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
+                profile.greedy_target_head = false;
                 const ops::CausalAttentionExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -9764,7 +10785,27 @@ void ProgramImplCore::prepare_graphs() {
                 schedule::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
                     dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
+                    false,
                     profile.definition);
+
+                // Keep the additional fused-head graph family to C1.  This covers the default
+                // single-agent serving path while avoiding a second full graph matrix for every
+                // C2/C4/C8 topology.  Sampled requests and batched rows remain on the existing
+                // full-logit graphs.
+                if (batch_size == 1U) {
+                    dflash_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& greedy_profile = dflash_graphs.profiles.back();
+                    greedy_profile.batch_size             = batch_size;
+                    greedy_profile.min_execution_frontier = planned.min;
+                    greedy_profile.max_execution_frontier = planned.max;
+                    greedy_profile.topology_class =
+                        (planned.topology_class + 4U) * max_concurrency + (batch_size - 1U);
+                    greedy_profile.greedy_target_head = true;
+                    schedule::capture_dflash_decode_batch(
+                        dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
+                        dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
+                        true, greedy_profile.definition);
+                }
             }
         }
     }
@@ -9827,6 +10868,9 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .proposed_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .selected_k_histogram  = std::vector<std::uint64_t>(draft_window + 1U, 0),
+        .verifier_seconds_by_k = std::vector<double>(draft_window + 1U, 0.0),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
@@ -10162,6 +11206,18 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
+        // The runtime's completed prefill round commits one initial Begin token before entering
+        // ordinary decode. D1.3 treats that commit as forced continuation position zero, then
+        // ordinary decode commits positions one onward. This keeps A and B on one exact ledger
+        // without replacing the ordinary decode input path.
+        if (!oscar_forced_decode_tokens_.empty()) {
+            if (oscar_forced_decode_step_ != 0 || oscar_forced_decode_tokens_.empty()) {
+                throw std::logic_error("D1.3 forced prefill state is not at position zero");
+            }
+            host_tokens[0] = oscar_forced_decode_tokens_[0];
+            oscar_forced_decode_step_ = 1;
+        }
+
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
         if (sequence.ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
@@ -10254,6 +11310,18 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
     const auto start = Clock::now();
     try {
+        const bool forced_decode = !oscar_forced_decode_tokens_.empty();
+        if (forced_decode && lanes.size() != 1) {
+            throw std::logic_error("D1.3 forced OSCAR decode requires one active lane");
+        }
+        if (forced_decode && oscar_forced_decode_step_ >= oscar_forced_decode_tokens_.size()) {
+            throw std::logic_error("D1.3 forced OSCAR decode sequence is exhausted");
+        }
+        const std::size_t forced_step = oscar_forced_decode_step_;
+        if (forced_decode) {
+            oscar_internal::set_matched_diagnostic_step(
+                static_cast<std::int32_t>(forced_step));
+        }
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
@@ -10305,7 +11373,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             RequestControl& request    = requests[lanes[row]];
             const std::uint32_t base_E = sequence.execution_frontier;
             const std::uint32_t base_S = sequence.ledger_frontier;
-            const TokenId token        = ordinary_host_egress->sampled_tokens[row];
+            const TokenId token = forced_decode ? oscar_forced_decode_tokens_[forced_step]
+                                                : ordinary_host_egress->sampled_tokens[row];
+            if (forced_decode) { ordinary_host_egress->sampled_tokens[row] = token; }
             validate_licensed_tokens(std::span<const TokenId>(&token, 1));
             sequence.text_kv_valid = base_E + 1;
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
@@ -10322,6 +11392,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
         }
+        if (forced_decode) { ++oscar_forced_decode_step_; }
         return runtime::BatchedGeneratedRound{
             .tokens =
                 std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(), lanes.size()),
@@ -10402,6 +11473,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t extent =
                 std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
+            begin_hierarchical_speculation(
+                lanes[row],
+                runtime::HierarchicalVeriCacheFrontier{.kv = frontier, .gdn = frontier},
+                runtime::HierarchicalVeriCacheFrontier{.kv = frontier + extent + 1U,
+                                                        .gdn = frontier + extent + 1U});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -10476,10 +11552,18 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 request.speculative_stats.rounds += 1;
                 request.speculative_stats.drafted_tokens += pcur;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                for (std::uint32_t i = 0; i < pcur; ++i) {
+                    request.speculative_stats.proposed_per_position[i] += 1;
+                }
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+            }
+            if (hierarchical_vericache.enabled() && pcur != 0) {
+                const bool disagreement = accepted_i < static_cast<std::int32_t>(pcur);
+                hierarchical_vericache.observe_exact_target_fallback(
+                    pcur, static_cast<std::uint32_t>(accepted_i), disagreement, disagreement);
             }
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,
@@ -10510,6 +11594,104 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     }
 }
 
+std::uint32_t ProgramImplCore::select_dflash_k(
+    std::span<const std::uint32_t> lanes,
+    std::span<const runtime::RoundBudget> budgets) const noexcept {
+    if (!dflash2_adaptive_k || draft_window <= 1U) { return draft_window; }
+
+    // The first controller deliberately uses only statistics already paid for by verification.
+    // A position's survival denominator is the number of earlier rounds that actually proposed
+    // that position, which keeps shortening K from falsely improving later-position confidence.
+    constexpr std::array<std::uint32_t, 6> candidates{1U, 2U, 3U, 4U, 5U, 7U};
+    std::uint32_t budget_cap = draft_window;
+    for (const runtime::RoundBudget& budget : budgets) {
+        budget_cap = std::min(budget_cap,
+                              budget.generated_tokens_remaining > 1U
+                                  ? budget.generated_tokens_remaining - 1U
+                                  : 1U);
+    }
+    std::uint64_t total_rounds = 0;
+    double fixed_ms           = 0.0;
+    double verifier_ms        = 0.0;
+    for (const std::uint32_t lane : lanes) {
+        if (lane >= max_concurrency) { continue; }
+        const SpeculativeStats& stats = requests[lane].speculative_stats;
+        total_rounds += stats.rounds;
+        if (stats.rounds != 0) {
+            fixed_ms += (stats.draft_seconds + stats.selector_seconds) * 1000.0 /
+                        static_cast<double>(stats.rounds);
+            verifier_ms += stats.verifier_seconds * 1000.0 /
+                           static_cast<double>(stats.rounds);
+        }
+    }
+    if (total_rounds < 4U) { return budget_cap; }
+    const double row_count = static_cast<double>(std::max<std::size_t>(1U, lanes.size()));
+    fixed_ms /= row_count;
+    verifier_ms /= row_count;
+    // With profiling disabled no device phase cost is available yet. The fallback remains a
+    // normalized unit cost; when enabled, the verifier estimate below uses the measured cost for
+    // this exact K rather than assuming that target verification scales linearly with width.
+    if (!(fixed_ms > 0.0)) { fixed_ms = 3.0; }
+    if (!(verifier_ms > 0.0)) { verifier_ms = 1.0; }
+
+    std::uint32_t best_k = draft_window;
+    double best_utility  = -std::numeric_limits<double>::infinity();
+    for (const std::uint32_t candidate : candidates) {
+        if (candidate > draft_window || candidate > budget_cap) { continue; }
+        double expected_accepted = 1.0; // The authoritative target always licenses one token.
+        for (std::uint32_t position = 0; position < candidate; ++position) {
+            std::uint64_t proposed = 0;
+            std::uint64_t accepted = 0;
+            for (const std::uint32_t lane : lanes) {
+                if (lane >= max_concurrency) { continue; }
+                const SpeculativeStats& stats = requests[lane].speculative_stats;
+                if (position < stats.proposed_per_position.size()) {
+                    proposed += stats.proposed_per_position[position];
+                }
+            }
+            for (const std::uint32_t lane : lanes) {
+                if (lane >= max_concurrency) { continue; }
+                const SpeculativeStats& stats = requests[lane].speculative_stats;
+                if (position < stats.accepted_per_position.size()) {
+                    accepted += stats.accepted_per_position[position];
+                }
+            }
+            const double survival = proposed == 0
+                                        ? 0.0
+                                        : std::clamp(static_cast<double>(accepted) /
+                                                         static_cast<double>(proposed),
+                                                     0.0, 1.0);
+            expected_accepted += survival;
+        }
+        double candidate_verifier_ms = 0.0;
+        std::uint64_t candidate_samples = 0;
+        for (const std::uint32_t lane : lanes) {
+            if (lane >= max_concurrency) { continue; }
+            const SpeculativeStats& stats = requests[lane].speculative_stats;
+            if (candidate < stats.selected_k_histogram.size() &&
+                candidate < stats.verifier_seconds_by_k.size()) {
+                candidate_samples += stats.selected_k_histogram[candidate];
+                candidate_verifier_ms += stats.verifier_seconds_by_k[candidate] * 1000.0;
+            }
+        }
+        if (candidate_samples != 0U) {
+            candidate_verifier_ms /= static_cast<double>(candidate_samples);
+        } else {
+            // Unexplored K values use the observed mean target cost. This is deliberately
+            // width-flat until a K is actually measured; it avoids rejecting deep speculation
+            // on an invalid linear-cost assumption during controller warm-up.
+            candidate_verifier_ms = verifier_ms;
+        }
+        const double estimated_cycle_ms = fixed_ms + candidate_verifier_ms;
+        const double utility = expected_accepted / estimated_cycle_ms;
+        if (utility > best_utility + 1.0e-9) {
+            best_utility = utility;
+            best_k        = candidate;
+        }
+    }
+    return best_k;
+}
+
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets,
@@ -10522,7 +11704,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
-    const std::uint32_t width           = draft_window + 1U;
+    const std::uint32_t selected_k       = select_dflash_k(lanes, budgets);
+    const std::uint32_t width            = draft_window + 1U;
+    const bool live_q4_verifier         = dflash->local_q4_shadow != nullptr;
+    const bool q4_primary               = live_q4_verifier && dflash->q4_primary;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -10551,8 +11736,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
-        const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+        const std::uint32_t extent = std::min(
+            {selected_k, max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -10563,10 +11748,18 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        bool all_greedy_target_rows = true;
+        for (const std::uint32_t lane : lanes) {
+            all_greedy_target_rows =
+                all_greedy_target_rows && requests[lane].sampling_host.temperature <= 0.0F;
+        }
+        // Only C1 has a dedicated greedy graph profile for now.  C>1 keeps the established
+        // full-logit graph even when all rows happen to be greedy.
+        const bool use_greedy_graph = lanes.size() == 1U && all_greedy_target_rows;
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "DFlash batch");
+                                     maximum_frontier, "DFlash batch", use_greedy_graph);
             executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
                                                profile.max_execution_frontier, draft_window);
@@ -10583,8 +11776,13 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
-            const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+        const std::uint32_t extent =
+            std::min({selected_k, max_by_budget, capacity - frontier - 1U});
+            begin_hierarchical_speculation(
+                lanes[row],
+                runtime::HierarchicalVeriCacheFrontier{.kv = frontier, .gdn = frontier},
+                runtime::HierarchicalVeriCacheFrontier{.kv = frontier + extent + 1U,
+                                                        .gdn = frontier + extent + 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -10617,10 +11815,27 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      draft_window, envelopes, target_envelope, executable);
+                                      selected_k, envelopes, target_envelope, executable);
         timing.begin_wait();
         device.synchronize();
         timing.end_wait();
+
+        if constexpr (Variant::DFlashConfig::is_v2) {
+            const DFlashPhaseTiming::Durations phase = dflash->phase_timing.durations();
+            for (const std::uint32_t lane : lanes) {
+                RequestControl& request = requests[lane];
+                request.speculative_stats.draft_seconds +=
+                    static_cast<double>(phase.draft_ms) * 1.0e-3;
+                request.speculative_stats.selector_seconds +=
+                    static_cast<double>(phase.selector_ms) * 1.0e-3;
+                request.speculative_stats.verifier_seconds +=
+                    static_cast<double>(phase.verifier_ms) * 1.0e-3;
+                if (selected_k < request.speculative_stats.verifier_seconds_by_k.size()) {
+                    request.speculative_stats.verifier_seconds_by_k[selected_k] +=
+                        static_cast<double>(phase.verifier_ms) * 1.0e-3;
+                }
+            }
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -10639,19 +11854,54 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     capacity) {
                 throw std::runtime_error("DFlash batch returned invalid row metadata");
             }
+            const std::int32_t l0_l1_accepted_i =
+                live_q4_verifier && !q4_primary ? dflash_host_egress->l0_l1_accepted[row]
+                                  : static_cast<std::int32_t>(extent);
+            if (l0_l1_accepted_i < 0 || l0_l1_accepted_i > static_cast<std::int32_t>(extent)) {
+                throw std::runtime_error("DFlash live verifier returned invalid prefix metadata");
+            }
             const std::span<const TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() +
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            request.speculative_stats.verifier_calls += 1;
+            if (selected_k < request.speculative_stats.selected_k_histogram.size()) {
+                request.speculative_stats.selected_k_histogram[selected_k] += 1;
+            }
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
                 request.speculative_stats.rounds += 1;
                 request.speculative_stats.drafted_tokens += extent;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                for (std::uint32_t i = 0; i < extent; ++i) {
+                    request.speculative_stats.proposed_per_position[i] += 1;
+                }
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
+                }
+            }
+            if (hierarchical_vericache.enabled() && extent != 0) {
+                if (live_q4_verifier) {
+                    const std::uint32_t l1_accepted =
+                        static_cast<std::uint32_t>(l0_l1_accepted_i);
+                    const bool l0_l1_disagreement = l1_accepted < extent;
+                    const bool l1_l2_disagreement =
+                        accepted_i < static_cast<std::int32_t>(l1_accepted);
+                    if (!q4_primary) {
+                        hierarchical_vericache.observe_l0_to_l1(
+                            extent, l1_accepted, l0_l1_disagreement, l0_l1_disagreement);
+                    }
+                    hierarchical_vericache.observe_l1_to_l2(
+                        extent, static_cast<std::uint32_t>(accepted_i),
+                        l1_l2_disagreement, l1_l2_disagreement);
+                    hierarchical_vericache.record_exact_target(
+                        extent, static_cast<std::uint32_t>(accepted_i), l1_l2_disagreement);
+                } else {
+                    const bool disagreement = accepted_i < static_cast<std::int32_t>(extent);
+                    hierarchical_vericache.observe_exact_target_fallback(
+                        extent, static_cast<std::uint32_t>(accepted_i), disagreement, disagreement);
                 }
             }
             sequence.dflash_context_frontier = base_E;
@@ -10748,6 +11998,7 @@ ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence, Reques
         settle_state_fork(sequence);
     }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+    maybe_snapshot_hierarchical_host_tier(sequence);
     if (terminal) { sequence.mtp_draft_count = 0; }
     request.lifecycle = terminal ? Lifecycle::Finishable : Lifecycle::Active;
     request.pending   = {};
@@ -10759,19 +12010,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.device      = device.device;
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
-    switch (kv_dtype) {
-    case DType::BF16:
-        out.kv_cache = KvCacheStorage::BFloat16;
-        break;
-    case DType::I8:
-        out.kv_cache = KvCacheStorage::Int8Group64;
-        break;
-    case DType::FP8_E4M3FN:
-        out.kv_cache = KvCacheStorage::Fp8E4M3Row256;
-        break;
-    default:
-        std::terminate();
-    }
+    out.kv_cache = kv_storage;
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

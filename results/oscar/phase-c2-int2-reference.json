@@ -1,0 +1,5996 @@
+{
+  "bits": 2,
+  "chunk_id": 1,
+  "classification": "PASS",
+  "command": "'D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\test_int2_reference.py' 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\dumps\\phase-b2-256-official' 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\phase-b3-qqt-sst-r-h-pbr' --upstream 'D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\upstream_compute_kv_rotation.py' --c1-json 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\phase-c1-rotation-invariance.json' --report-json 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\phase-c2-int2-reference.json' --layers all --representative-command '& '\"'\"'D:\\AI\\tools\\oscar-calibration\\.venv\\Scripts\\python.exe'\"'\"' '\"'\"'D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\test_int2_reference.py'\"'\"' '\"'\"'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\dumps\\phase-b2-256-official'\"'\"' '\"'\"'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\phase-b3-qqt-sst-r-h-pbr'\"'\"' --upstream '\"'\"'D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\upstream_compute_kv_rotation.py'\"'\"' --c1-json '\"'\"'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\phase-c1-rotation-invariance.json'\"'\"' --report-json '\"'\"'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\phase-c2-int2-reference-layer3.json'\"'\"' --layers 3'",
+  "dump_root": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\dumps\\phase-b2-256-official",
+  "expected_full_attention_layers": [
+    3,
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    35,
+    39,
+    43,
+    47,
+    51,
+    55,
+    59,
+    63
+  ],
+  "gqa_ratio": 6,
+  "head_dim": 256,
+  "kv_heads": 4,
+  "layers": [
+    3,
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    35,
+    39,
+    43,
+    47,
+    51,
+    55,
+    59,
+    63
+  ],
+  "notes": [
+    "BF16 source values are retained exactly; diagnostic attention products use FP64.",
+    "The calibrated quantizer is checked element-for-element against the pinned upstream function.",
+    "The fixed-Hadamard control mirrors current runtime clipping and BF16 metadata, not upstream OSCAR simulation.",
+    "The smoke capture has no output projection/residual/LM-head tensors, so layer-output and LM-logit metrics are unavailable.",
+    "No CUDA runtime, INT2 packing, 10K/30K calibration, or fitter invocation was performed in C2."
+  ],
+  "orientation": "row vectors [tokens, heads, head_dim]; Q'=Q@Rk, K'=K@Rk, V'=V@Rv, O=O'@Rv.T",
+  "outliers": {
+    "calibrated_attention_output_max_abs": {
+      "layer": 63,
+      "value": 44.031058901973914
+    }
+  },
+  "provenance": {
+    "c1_report": {
+      "chunk_id": 1,
+      "gqa_ratio": 6,
+      "head_dim": 256,
+      "kv_heads": 4,
+      "layers": [
+        3,
+        7,
+        11,
+        15,
+        19,
+        23,
+        27,
+        31,
+        35,
+        39,
+        43,
+        47,
+        51,
+        55,
+        59,
+        63
+      ],
+      "notes": [
+        "Source tensors retain exact BF16 values; diagnostic products use float64.",
+        "The raw rotated attention output is intentionally not invariant until V inverse is applied.",
+        "The captured activation set does not contain the model output projection or residual input, so the layer residual is not tested here."
+      ],
+      "orientation": "row vectors [tokens, heads, head_dim]; Q'=Q@Rk, K'=K@Rk, V'=V@Rv, O=O'@Rv.T",
+      "q_heads": 24,
+      "results": [
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 1.8360487652469004e-07,
+            "rms": 4.4856395098569566e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 3,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.1434133590236826e-07,
+            "rms": 4.393473174085021e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 4.149036306734312,
+            "rms": 0.8453302364973115
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 9.359409475218072e-08,
+            "rms": 2.1847358788953372e-08
+          },
+          "score": {
+            "max_abs": 1.9282653118679605e-07,
+            "rms": 4.903110176446902e-08
+          },
+          "softmax": {
+            "max_abs": 2.4996635539231704e-08,
+            "rms": 3.5549582973076046e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 9.605974815585228e-08,
+            "rms": 2.218414736688378e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 1.911736173809686e-07,
+            "rms": 4.738742621921688e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 7,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.0221073870896333e-07,
+            "rms": 4.514650926448771e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 6.221278806101026,
+            "rms": 0.6520726408487632
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 1.0883929180138807e-07,
+            "rms": 1.716251166660446e-08
+          },
+          "score": {
+            "max_abs": 1.9513653359837235e-07,
+            "rms": 5.1307673188306234e-08
+          },
+          "softmax": {
+            "max_abs": 3.455283925646313e-08,
+            "rms": 4.918367872969584e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 8.69294636274276e-08,
+            "rms": 1.5754873949958628e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.0751634202675895e-07,
+            "rms": 4.880098123182705e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 11,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.426620235307375e-07,
+            "rms": 4.7729116459291804e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 7.88634547693016,
+            "rms": 0.657296988384414
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 2.0634808173269903e-07,
+            "rms": 1.7985934587154972e-08
+          },
+          "score": {
+            "max_abs": 2.5111868140470506e-07,
+            "rms": 6.863555353937802e-08
+          },
+          "softmax": {
+            "max_abs": 3.246614177498941e-08,
+            "rms": 4.826746711559624e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 1.119890895018294e-07,
+            "rms": 1.3675230778376371e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.158149655651087e-07,
+            "rms": 4.7073301956035606e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 15,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.520843606079737e-07,
+            "rms": 4.494382581096914e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 5.605344025579996,
+            "rms": 0.5459777184200671
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 1.5595350211228265e-07,
+            "rms": 1.4291068138361595e-08
+          },
+          "score": {
+            "max_abs": 2.2430330304246127e-07,
+            "rms": 5.525074000322862e-08
+          },
+          "softmax": {
+            "max_abs": 3.635663886614182e-08,
+            "rms": 5.649594864939305e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 1.0470063260825668e-07,
+            "rms": 1.395647132117051e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.388747806225666e-07,
+            "rms": 4.921360658920427e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 19,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.175148552108208e-07,
+            "rms": 4.491635429272804e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 6.484682802552015,
+            "rms": 0.7161919817677808
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 1.5781829221239718e-07,
+            "rms": 1.9538689257665544e-08
+          },
+          "score": {
+            "max_abs": 2.2371097685436325e-07,
+            "rms": 5.935336244514258e-08
+          },
+          "softmax": {
+            "max_abs": 3.290356132001904e-08,
+            "rms": 5.855925102966895e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 1.4732383635251978e-07,
+            "rms": 1.9182446983662855e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.0549041424011705e-07,
+            "rms": 5.018773333010928e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 23,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.0204377593202594e-07,
+            "rms": 4.342257712076865e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 15.763301525858026,
+            "rms": 0.8433637956978971
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 4.508082622756149e-07,
+            "rms": 2.4208828810895842e-08
+          },
+          "score": {
+            "max_abs": 2.4997554781691633e-07,
+            "rms": 5.5532698801941805e-08
+          },
+          "softmax": {
+            "max_abs": 5.5302171286797375e-08,
+            "rms": 8.147005589636213e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 1.3227238182533796e-07,
+            "rms": 2.0293791365719305e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.3747388577799455e-07,
+            "rms": 5.436968243367935e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 27,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.394435229535752e-07,
+            "rms": 4.770311694269854e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 27.47916380466621,
+            "rms": 1.4125602738800638
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 1.469125495034973e-06,
+            "rms": 4.11656985891615e-08
+          },
+          "score": {
+            "max_abs": 3.240096528855929e-07,
+            "rms": 6.746571527047e-08
+          },
+          "softmax": {
+            "max_abs": 7.114301309174564e-08,
+            "rms": 8.317625838563163e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 2.650545738447363e-07,
+            "rms": 3.149214406002416e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.514691881394526e-07,
+            "rms": 5.602139555485932e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 31,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.545580805035641e-07,
+            "rms": 4.517849060345047e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 38.38722737614617,
+            "rms": 1.3691223190719268
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 2.0248478698192685e-06,
+            "rms": 3.9629841110259844e-08
+          },
+          "score": {
+            "max_abs": 3.3799925525102026e-07,
+            "rms": 6.685377900964649e-08
+          },
+          "softmax": {
+            "max_abs": 5.283500731367852e-08,
+            "rms": 7.611112558972532e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 2.5454960933535276e-07,
+            "rms": 3.067516549395369e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.5814464599260845e-07,
+            "rms": 5.6440290899252926e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 35,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.742001348199352e-07,
+            "rms": 4.9144617432583314e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 33.74178927817667,
+            "rms": 1.3583612831382708
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 1.6942714964329753e-06,
+            "rms": 3.7708849289196304e-08
+          },
+          "score": {
+            "max_abs": 3.933178049919661e-07,
+            "rms": 8.8757378863093e-08
+          },
+          "softmax": {
+            "max_abs": 5.860079022035336e-08,
+            "rms": 7.587090884456912e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 2.395434612681435e-07,
+            "rms": 3.40545347778779e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.6957450205422617e-07,
+            "rms": 5.8316975526058316e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 39,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.503875866644023e-07,
+            "rms": 4.7260303930619676e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 35.02946247646749,
+            "rms": 1.0689604950023364
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 9.086132184421558e-07,
+            "rms": 2.949534870511162e-08
+          },
+          "score": {
+            "max_abs": 4.415737221152849e-07,
+            "rms": 7.65694149026454e-08
+          },
+          "softmax": {
+            "max_abs": 4.9450666395056686e-08,
+            "rms": 6.236510372129805e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 2.342946311406635e-07,
+            "rms": 2.9881348635466894e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.656792429389654e-07,
+            "rms": 5.728013490376678e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 43,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.626317643361631e-07,
+            "rms": 4.849260193400912e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 56.77834764734817,
+            "rms": 1.7682980875829843
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 2.2821028125008525e-06,
+            "rms": 5.0478693044983904e-08
+          },
+          "score": {
+            "max_abs": 3.810843463014635e-07,
+            "rms": 7.787859436811562e-08
+          },
+          "softmax": {
+            "max_abs": 6.232390314941938e-08,
+            "rms": 7.307126278932835e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 5.039543466978103e-07,
+            "rms": 5.509491568928029e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.7031993843351643e-07,
+            "rms": 5.819559118742338e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 47,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.690614451239526e-07,
+            "rms": 4.592006059203674e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 57.282195385008876,
+            "rms": 1.9893303750724414
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 3.0806651771797533e-06,
+            "rms": 6.010781121940165e-08
+          },
+          "score": {
+            "max_abs": 3.343878844930259e-07,
+            "rms": 7.191605732201845e-08
+          },
+          "softmax": {
+            "max_abs": 6.174881528320242e-08,
+            "rms": 7.381832376364476e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 3.7548294710976204e-07,
+            "rms": 5.480033938979794e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 3.206442791281461e-07,
+            "rms": 5.8327433860505786e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 51,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.9453893279907106e-07,
+            "rms": 4.52121322211818e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 48.49794476075553,
+            "rms": 2.1009558948166824
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 3.373735722789206e-06,
+            "rms": 6.329770243970597e-08
+          },
+          "score": {
+            "max_abs": 4.971724871793981e-07,
+            "rms": 8.004364505783075e-08
+          },
+          "softmax": {
+            "max_abs": 6.477188568831949e-08,
+            "rms": 8.045945979962815e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 3.548033860045763e-07,
+            "rms": 5.751136417641519e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.2921744058379545e-07,
+            "rms": 5.370822170295418e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 55,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.1514177728221284e-07,
+            "rms": 4.1884813692307435e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 27.474168306132967,
+            "rms": 1.5746756844411227
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 9.307173485240128e-07,
+            "rms": 4.3443216568375813e-08
+          },
+          "score": {
+            "max_abs": 3.374257003807557e-07,
+            "rms": 5.553532792026266e-08
+          },
+          "softmax": {
+            "max_abs": 3.9896491776936216e-08,
+            "rms": 4.949720739242507e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 2.8734520185480505e-07,
+            "rms": 4.654693499336465e-08
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.2021891599166565e-07,
+            "rms": 5.267597359156278e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 59,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.0609727486783913e-07,
+            "rms": 3.848007657973081e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 75.57940794925881,
+            "rms": 3.8967410766640875
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 1.0423333485221065e-06,
+            "rms": 1.0432974804703818e-07
+          },
+          "score": {
+            "max_abs": 2.263791669676607e-07,
+            "rms": 5.25713940249682e-08
+          },
+          "softmax": {
+            "max_abs": 4.886619509036905e-08,
+            "rms": 6.625203405369331e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 6.398221770176349e-07,
+            "rms": 1.023985385090649e-07
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        },
+        {
+          "diagnostic_compute_dtype": "torch.float64",
+          "gqa_mapping": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ],
+          "k_roundtrip": {
+            "max_abs": 2.592647654342528e-07,
+            "rms": 5.464009853091969e-08
+          },
+          "k_shape": [
+            256,
+            4,
+            256
+          ],
+          "layer": 63,
+          "passed": true,
+          "q_roundtrip": {
+            "max_abs": 2.7356332987782395e-07,
+            "rms": 4.5768705632983565e-08
+          },
+          "q_shape": [
+            256,
+            24,
+            256
+          ],
+          "raw_rotated_attention_output_before_v_inverse": {
+            "max_abs": 82.32807710249597,
+            "rms": 7.848015819613067
+          },
+          "recovered_attention_output_after_v_inverse": {
+            "max_abs": 1.7102738425478492e-06,
+            "rms": 1.9590012743617343e-07
+          },
+          "score": {
+            "max_abs": 2.7318417039623455e-07,
+            "rms": 7.390408114429013e-08
+          },
+          "softmax": {
+            "max_abs": 3.556130567794469e-08,
+            "rms": 4.711111174899133e-10
+          },
+          "source_dtype": "torch.bfloat16",
+          "v_roundtrip": {
+            "max_abs": 1.0324260286687093e-06,
+            "rms": 1.9863090534304228e-07
+          },
+          "v_shape": [
+            256,
+            4,
+            256
+          ]
+        }
+      ],
+      "schema": "oscar-rotation-invariance-v1",
+      "tokens": 256,
+      "tolerances": {
+        "recovered_attention_output_max_abs": 1e-05,
+        "score_max_abs": 1e-05,
+        "softmax_max_abs": 1e-06
+      }
+    },
+    "c1_report_sha256": "514eaa0a7b8b7574e7628b4a8d7db4bfdda4c84bd11d8a0d1674d47a441b0a91",
+    "conversion_manifest": {
+      "chunk_policy": "explicit nonzero chunk; do not invoke upstream --chunk-id all",
+      "gqa": {
+        "q_head_to_kv_head": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3
+        ],
+        "ratio": 6
+      },
+      "model": {
+        "head_dim": 256,
+        "id": "qwen3.8-27b",
+        "kv_heads": 4,
+        "query_heads": 24,
+        "rotary_dim": 64,
+        "sha256": "6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e",
+        "total_layers": 64,
+        "weights_id": "nvfp4-dflash2"
+      },
+      "official_fitter_chunk_id": 1,
+      "schema": "oscar-official-pt-conversion-v1",
+      "source_capture_stage": "post_qk_rmsnorm_post_rope_pre_causal_attention_cache_append",
+      "source_manifest": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\captures\\phase-b2-qkv-256\\manifest.json",
+      "source_manifest_sha256": "df0319563e91cc71a6dcc16a5f34f167da47931566f4ae94fc25f246a8425a89",
+      "source_schema": "oscar-qkv-v1",
+      "tensor_layout": "[tokens, heads, head_dim]",
+      "tensors": [
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 3,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_3/q/1.pt",
+          "pt_sha256": "43fb9beaeebe579915c34970ef34f14c72707afa2745db3e4d08b8c52525523c",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_3/chunk_0000/q.bin",
+          "source_sha256": "49bcda4107f712a3bd7c1530ccfff8a70f061c17c7525b649b86b37af46cbfbb"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 3,
+          "pt_bytes": 525631,
+          "pt_file": "layer_3/k/1.pt",
+          "pt_sha256": "f44ab422d77b976f509f871f2e6332a0f27d912a672d7be20beaf5c9ee042e15",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_3/chunk_0000/k.bin",
+          "source_sha256": "d7b67b0e88dc9030ec135df5e18a7371c46a8366ac1515aa8a84641f44d5b4d7"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 3,
+          "pt_bytes": 525631,
+          "pt_file": "layer_3/v/1.pt",
+          "pt_sha256": "9003dd91860d16c98314995b562355187f0bda6828a53ef75d54cc5a5c650b98",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_3/chunk_0000/v.bin",
+          "source_sha256": "b24109a54d16d5365a80128cd0b674c8ae9cdf00d9a3aba1f9c650d90525c6a0"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 7,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_7/q/1.pt",
+          "pt_sha256": "c810759bafed5e2ce3199852368fb86e1bc165fd64241ff8f6d233ae54cca923",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_7/chunk_0000/q.bin",
+          "source_sha256": "ff98ff400717117fae83432e23f6f33bf59ac82f0c2f128376ffabeef83eefd0"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 7,
+          "pt_bytes": 525631,
+          "pt_file": "layer_7/k/1.pt",
+          "pt_sha256": "a8b6510025ecda49fd47b25498578a34a0a7cdf260058915d4a8d57b733d1c93",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_7/chunk_0000/k.bin",
+          "source_sha256": "f20e8fd288f43c28aa81106b4ffd350fa949a41990e0b9488a42df46b8ed9c2a"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 7,
+          "pt_bytes": 525631,
+          "pt_file": "layer_7/v/1.pt",
+          "pt_sha256": "ee6c153aaf8d7b80e231a2e4576d401ae51f38a01c1d4e65dcdf2b760593ff85",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_7/chunk_0000/v.bin",
+          "source_sha256": "43028927e4175908ca4a804baad68db6c58c4ff487103f5c95d768b344063cf8"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 11,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_11/q/1.pt",
+          "pt_sha256": "39b97cef072c76a53c48bf12f63743330ac85472837466dc97e0964ece7e797e",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_11/chunk_0000/q.bin",
+          "source_sha256": "9e09c268084a110c85f6a42906a9318437eb48376d364c8a16051326524954f8"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 11,
+          "pt_bytes": 525631,
+          "pt_file": "layer_11/k/1.pt",
+          "pt_sha256": "71d954b4d21bd8ced26b753fed083a1041d5cda907812f94c041e165bec8037c",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_11/chunk_0000/k.bin",
+          "source_sha256": "ba8b054e98a148151f35ab452b4a32358a457cc8a9ecfd031eb86d28ea60a214"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 11,
+          "pt_bytes": 525631,
+          "pt_file": "layer_11/v/1.pt",
+          "pt_sha256": "37b7891d9028c4d8ebd89c40220586142e5c59a0bb3908cbfd900c64b742597c",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_11/chunk_0000/v.bin",
+          "source_sha256": "dd68d47a38bf231c42c2078f065d73b414008dedaf474a538fc2464c2a05cad1"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 15,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_15/q/1.pt",
+          "pt_sha256": "be9488d9d54d25b6e4181302c94f4901a1a5f886a6b26884dd25f29261c98b2e",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_15/chunk_0000/q.bin",
+          "source_sha256": "f70cee3097fd531b8f54b452b653d43ea6643c685dd3d6b04400d3f72ca0f936"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 15,
+          "pt_bytes": 525631,
+          "pt_file": "layer_15/k/1.pt",
+          "pt_sha256": "121e714b6dcd12bb22bbbad66ec5d9f00f1ac0e1e4fb240545bbc23884bb76ee",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_15/chunk_0000/k.bin",
+          "source_sha256": "b12b32ec43959d2dbc85d2df6cbe3ae69dd1fb2808f2b509147d5f636b2c5d45"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 15,
+          "pt_bytes": 525631,
+          "pt_file": "layer_15/v/1.pt",
+          "pt_sha256": "1a6b1388f036ee78da56b1054d5063f69770cc8f963f0df3350be6b17f844822",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_15/chunk_0000/v.bin",
+          "source_sha256": "1ab16b39d1c8ffe083dcea9959348868c713e5e6a3154104254dc6f596f24d2f"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 19,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_19/q/1.pt",
+          "pt_sha256": "0d24ef9a3ba3743f2c6ee00430ed49c569528f78da27d022592e0dd93b002206",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_19/chunk_0000/q.bin",
+          "source_sha256": "a26da64290a82b363fb5ddcebe087078b9465eb04359fc19d3c5fa79e547ac48"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 19,
+          "pt_bytes": 525631,
+          "pt_file": "layer_19/k/1.pt",
+          "pt_sha256": "9ab86c761799f0e1d9475f6b857a09e069715b36cefee1f2202c9dd88109691c",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_19/chunk_0000/k.bin",
+          "source_sha256": "90688c82168b003608092a032b435bdb917729401bb62f8091d5938ccaaa74c3"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 19,
+          "pt_bytes": 525631,
+          "pt_file": "layer_19/v/1.pt",
+          "pt_sha256": "5a2b6914b535ff529808b3d7dcf53b2de8b1b08a1a4f7c90463011295e78a289",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_19/chunk_0000/v.bin",
+          "source_sha256": "cfcc0f46c086f56e0be600a266f472dcb6330925dcc8a4c61ea75b40dfa20cad"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 23,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_23/q/1.pt",
+          "pt_sha256": "de0debd2b9963a31dce51564f264de57410f83ca77a05826cbb609a3c44f0b00",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_23/chunk_0000/q.bin",
+          "source_sha256": "5ed2559f1e27ac29398fe5eed4b3801dacf2826afc09dcc07ff5c820d6adc006"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 23,
+          "pt_bytes": 525631,
+          "pt_file": "layer_23/k/1.pt",
+          "pt_sha256": "363f129110e7146b93d655e092f675cfc62245d629ff2aa0dcbde7234c451d7e",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_23/chunk_0000/k.bin",
+          "source_sha256": "868d9cf7de32aec884c2b90811ba2fd764a595e3558a781b73a2009290b52804"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 23,
+          "pt_bytes": 525631,
+          "pt_file": "layer_23/v/1.pt",
+          "pt_sha256": "3a2b7efb3a440309491ee854fc3a3ea5075452d39fbc4c14615bc0069fc6f72a",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_23/chunk_0000/v.bin",
+          "source_sha256": "be64caaaa3a569525b8944d948759ee05a3c634cd28f60eecee50ace111ea7d7"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 27,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_27/q/1.pt",
+          "pt_sha256": "82e4ccf80ea9a5d84df5cfa9fc6f968ed7746c5d13d9cad61be3e88aee18c780",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_27/chunk_0000/q.bin",
+          "source_sha256": "b1c27d34bcb8d1b5cf95e932fb2917c0f914bd2ff31d29c979d108de5acdd0d6"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 27,
+          "pt_bytes": 525631,
+          "pt_file": "layer_27/k/1.pt",
+          "pt_sha256": "b7bcddfb8349d08112eba65952b9bc04a1bc99f70a2156fb84e6ba8c649fe97b",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_27/chunk_0000/k.bin",
+          "source_sha256": "751f98250694573673826881ed23a7873c29ef992b8580dd0159f0e8fdd53a87"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 27,
+          "pt_bytes": 525631,
+          "pt_file": "layer_27/v/1.pt",
+          "pt_sha256": "ffb482cb6fc3b14401f0f33856c25d29735a39b62706ff6ea87120928deec2a7",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_27/chunk_0000/v.bin",
+          "source_sha256": "e0ff9fece5161cae26b2dae7b46b8f7b97414670fcecc3ef7ba9ed7d58f18fad"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 31,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_31/q/1.pt",
+          "pt_sha256": "f896ba6be145aa341820a51c6c7758f90ae668da835667b518c04fb8d1e45b43",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_31/chunk_0000/q.bin",
+          "source_sha256": "df247e36be364f71b210bf90f7c8153aad480b45910ab2d71c0cb62f57f907ce"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 31,
+          "pt_bytes": 525631,
+          "pt_file": "layer_31/k/1.pt",
+          "pt_sha256": "c54760eb7d353d0b7b84942edfa9cc8c76bd6479a1b5b0a7369138ef96ce408e",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_31/chunk_0000/k.bin",
+          "source_sha256": "f6d54bce6d62371f72a1f2409554bb0851f61d85526ce3b83f1b36d451e5445a"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 31,
+          "pt_bytes": 525631,
+          "pt_file": "layer_31/v/1.pt",
+          "pt_sha256": "cebe9aa933801c453c066078d4141e7bbec777f87a0473688aacb2ecb7b8676d",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_31/chunk_0000/v.bin",
+          "source_sha256": "2e778a051d77452537947a9bb7da6d79f934790e67cbd2e2d7f88555182e6d69"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 35,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_35/q/1.pt",
+          "pt_sha256": "9b9079fe7e9230b951714f985d65478f8a9e84fdf0b2042ba0acc01b5e2b0db2",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_35/chunk_0000/q.bin",
+          "source_sha256": "31c43bc9e907167f4d10cdf8ce2279af1046070984283258eb41c58652ca3a53"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 35,
+          "pt_bytes": 525631,
+          "pt_file": "layer_35/k/1.pt",
+          "pt_sha256": "1c42113f4481d08a49736d008306f9d0aecbad747a411a0bf837319a2e173426",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_35/chunk_0000/k.bin",
+          "source_sha256": "ee46856fcd924517debc84c7c7795d710951c632ba1dd82079ae0a55b1647456"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 35,
+          "pt_bytes": 525631,
+          "pt_file": "layer_35/v/1.pt",
+          "pt_sha256": "ad2f05015b150ab1e3d5709abbd0b9e15ef0170e1a4b3724e99fa0ffa7ac02ee",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_35/chunk_0000/v.bin",
+          "source_sha256": "0293bf642ae308c67dd18c77390c13fccc54c845d80e0cc0993c81e3a8780e48"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 39,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_39/q/1.pt",
+          "pt_sha256": "3661df5c1d069da8e43f75a042596d07acbf2c3960eb60a6e3a431178ec4d5c3",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_39/chunk_0000/q.bin",
+          "source_sha256": "e2a0a26520402c00a3811ccc635bd597033cb0ecf650756986bc785515eba18e"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 39,
+          "pt_bytes": 525631,
+          "pt_file": "layer_39/k/1.pt",
+          "pt_sha256": "d9fe3b07c6bc26d4f18472636d9a48a5d569b2bed685a1bb3270ede2f4b6aad2",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_39/chunk_0000/k.bin",
+          "source_sha256": "7457b1963f8d3cd6022a4eeefd82fa7c33e177bc2db4c858b8b4ee3e7e008bbe"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 39,
+          "pt_bytes": 525631,
+          "pt_file": "layer_39/v/1.pt",
+          "pt_sha256": "8b6724d8e02183de6ba81c6391eae94790e61e7e8eaf419b5fb68525761aa454",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_39/chunk_0000/v.bin",
+          "source_sha256": "01ec0b6700758a4ead2e08a0594b55c57b8a222736eb84e79e8f370db1e0449c"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 43,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_43/q/1.pt",
+          "pt_sha256": "f1323ec07b5859284ad6145422cd2ff1e759ad4500d17667e123f2126c91da99",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_43/chunk_0000/q.bin",
+          "source_sha256": "1d70a5a728b3630c404a54784ced37dc63f919ffac686113c90a3f1eafb145ae"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 43,
+          "pt_bytes": 525631,
+          "pt_file": "layer_43/k/1.pt",
+          "pt_sha256": "2e7fd5c719e7f71e1a0a9e2dc8d1b33486f7a2c73780b6304fa1f06ea5c61769",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_43/chunk_0000/k.bin",
+          "source_sha256": "6381525495a81c2fcd6309b1de02b6fd6eebc76c3858d666e179255edf006c7f"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 43,
+          "pt_bytes": 525631,
+          "pt_file": "layer_43/v/1.pt",
+          "pt_sha256": "56f0bf6e9fc3d4881b388a397b2a0abc1a8feec10c616bdb46375a9e151abc77",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_43/chunk_0000/v.bin",
+          "source_sha256": "ecd01b194d31176d23dea9e6759a0fc38648e78af54071ecbe89fe2d1f5ed88a"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 47,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_47/q/1.pt",
+          "pt_sha256": "2e479b1425860f4072f5bf2eb069d63dee6995550f9b40ba4c770d07170f2fa4",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_47/chunk_0000/q.bin",
+          "source_sha256": "cd9c1ec758d9702f408d36c2652b0978df8faa89ffd2663bba0cb93ac70491e2"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 47,
+          "pt_bytes": 525631,
+          "pt_file": "layer_47/k/1.pt",
+          "pt_sha256": "93c6f5185ff8c22336329ce62b2f9581da2e79eae247b4ee70688407dd2c6e45",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_47/chunk_0000/k.bin",
+          "source_sha256": "1124bf8b6e743e0c7d1694c20c950f8d75cb1779c954174679686d3be5171169"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 47,
+          "pt_bytes": 525631,
+          "pt_file": "layer_47/v/1.pt",
+          "pt_sha256": "5004cee20c95f7544356e0b7199effb9e2cf01a2d3970f3e90dccc9edfb835bc",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_47/chunk_0000/v.bin",
+          "source_sha256": "495e4a354feb59d2459806cc2dad77eaab4424179b0331e1930bd5b01b2c85d9"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 51,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_51/q/1.pt",
+          "pt_sha256": "fe2d0cdb28da330492892f4900280e0550d98e48bd4e5b274403b006b8c8c2e6",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_51/chunk_0000/q.bin",
+          "source_sha256": "71e351004ff716dc746ce8629097d1fb114b6860b439893f9d893126a5d772bc"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 51,
+          "pt_bytes": 525631,
+          "pt_file": "layer_51/k/1.pt",
+          "pt_sha256": "674e674f973dcdfb143316a6178cb8cce1e940e188a89145f95e087e0139b339",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_51/chunk_0000/k.bin",
+          "source_sha256": "9399cb12be72c89d569f3ad95c75f7687b6258ad63d4ee6be35e475cec791657"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 51,
+          "pt_bytes": 525631,
+          "pt_file": "layer_51/v/1.pt",
+          "pt_sha256": "407489a2d8238eba83f601b826a874abbbcb0d19abd976ee51ab875883635161",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_51/chunk_0000/v.bin",
+          "source_sha256": "0ef9868e9c6c0a118244a7d6fa285399d923401625d1288027f07a01709c1f56"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 55,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_55/q/1.pt",
+          "pt_sha256": "be57e50332524cb3cef9d53a092430a6042fb19ec523aebc1ed5448a26d00077",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_55/chunk_0000/q.bin",
+          "source_sha256": "dcda545b97aa78c140a4d74f37a042ea7721fefbf97663d4b306509a55e447ac"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 55,
+          "pt_bytes": 525631,
+          "pt_file": "layer_55/k/1.pt",
+          "pt_sha256": "fcf8c1501dc2943157b4e9a3052d2de879dfa4021e3536cf0a7048329ef48d21",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_55/chunk_0000/k.bin",
+          "source_sha256": "c1d23adb47c63b0d1b416aa401b7031f44a1c4fe91c69b2439311c6d4c3e89a5"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 55,
+          "pt_bytes": 525631,
+          "pt_file": "layer_55/v/1.pt",
+          "pt_sha256": "87c2b0e4b7119a7da82ecfb8e779c26db9ed79e6e305d087b310b14e24227d41",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_55/chunk_0000/v.bin",
+          "source_sha256": "2043f0963bb95b34169fbbc6a5916a5f6d401728b30a3d96cce59be336b7b9b8"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 59,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_59/q/1.pt",
+          "pt_sha256": "f7e57e6b0f79a6982a3232ea8bcb9fae5dfa022b4a824bb47671b221c9dab298",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_59/chunk_0000/q.bin",
+          "source_sha256": "9a1557eb07dfdefedcd688dacb43c36bc722de0023e6b83bec64251c6815d5e6"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 59,
+          "pt_bytes": 525631,
+          "pt_file": "layer_59/k/1.pt",
+          "pt_sha256": "edf2fa0dd706d0a5d71c56da142dbcdb1e1ce5b312930760ee237a56db990dbf",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_59/chunk_0000/k.bin",
+          "source_sha256": "71be8dc103d2d830321a9ab03e92c2e539d1558eece8255b6665ea1233590bb2"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 59,
+          "pt_bytes": 525631,
+          "pt_file": "layer_59/v/1.pt",
+          "pt_sha256": "175b8cab08b2fab223629588d0b55ec156b200a5023523c29f0250ee6b55ff4c",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_59/chunk_0000/v.bin",
+          "source_sha256": "aa04b37cb8ddfda6c084c642a975bb3354b6733f6c74ed928012010f0221e9e4"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 63,
+          "pt_bytes": 3147071,
+          "pt_file": "layer_63/q/1.pt",
+          "pt_sha256": "eced4db3b935ff65df4095f87ba0b4cc24a856eb71edcb321292ffb90fe7c949",
+          "qkv_type": "q",
+          "shape": [
+            256,
+            24,
+            256
+          ],
+          "source_file": "layer_63/chunk_0000/q.bin",
+          "source_sha256": "f606360e29a5be5854d02f4485346922b775c192da316ce4d477c8baaf2721a5"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 63,
+          "pt_bytes": 525631,
+          "pt_file": "layer_63/k/1.pt",
+          "pt_sha256": "1f4f68f9e0b135220fb44fb6b5f1749a8e68e937ae4ac681bd456c7462a9431b",
+          "qkv_type": "k",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_63/chunk_0000/k.bin",
+          "source_sha256": "16e00bde8f5d200a05d782214d922e2686991e98b37544cad75760925812ef40"
+        },
+        {
+          "chunk_id": 1,
+          "dtype": "torch.bfloat16",
+          "layer": 63,
+          "pt_bytes": 525631,
+          "pt_file": "layer_63/v/1.pt",
+          "pt_sha256": "da6fbdd42c3e8a28d0482411861747d8021674a4be75edb859abb76005312517",
+          "qkv_type": "v",
+          "shape": [
+            256,
+            4,
+            256
+          ],
+          "source_file": "layer_63/chunk_0000/v.bin",
+          "source_sha256": "d53477353d66375b6a693835313dc5ce5c1af7974f90ef896973f2ff4769c8d0"
+        }
+      ],
+      "useful_tokens": 256,
+      "value_preservation": "BF16 uint16 bit patterns compared before and after torch.save/load"
+    },
+    "conversion_manifest_sha256": "d3117a51ba933b79bc1a54a2f436dbddbe7a40e5bf46e73f3497708c3fb3d0a4"
+  },
+  "q_heads": 24,
+  "quantization_authority": "FutureMLS-Lab OSCAR simulate_int2_asym",
+  "recorded": "2026-09-01 (Europe/Berlin)",
+  "representative_command": "& 'D:\\AI\\tools\\oscar-calibration\\.venv\\Scripts\\python.exe' 'D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\test_int2_reference.py' 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\dumps\\phase-b2-256-official' 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\phase-b3-qqt-sst-r-h-pbr' --upstream 'D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\upstream_compute_kv_rotation.py' --c1-json 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\phase-c1-rotation-invariance.json' --report-json 'D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\phase-c2-int2-reference-layer3.json' --layers 3",
+  "results": [
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.3454895364120603,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.4393526832677992,
+          "mean_abs": 0.5838451332679079,
+          "relative_l2": 0.5440751697777162,
+          "rms": 0.6783892135065088
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2579,
+            "agreement": 0.4197591245174408,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 1.721750412823573,
+            "mean_abs": 0.09162732484525032,
+            "relative_l2": 0.20916404436587072,
+            "rms": 0.12279542769994879
+          },
+          "attention_score_logits": {
+            "max_abs": 3.4370042439984934,
+            "mean_abs": 0.6466017770103408,
+            "relative_l2": 0.1271012860391707,
+            "rms": 0.8171395922717649
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.37963339765120124,
+            "mean_abs": 0.0021350878486361,
+            "relative_l2": 0.48552667173090736,
+            "rms": 0.007614735752287227
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 0.5488838396267965,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 0.6268815972599491,
+          "mean_abs": 0.1143085388016808,
+          "relative_l2": 0.22394584203635287,
+          "rms": 0.13491753211649288
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 2.77423095703125,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 9.079957842826843,
+          "mean_abs": 1.5575213282697007,
+          "relative_l2": 1.5621511566062625,
+          "rms": 1.9477942645413038
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 152,
+            "agreement": 0.02473958395421505,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 4.2490234375,
+            "mean_abs": 0.6775180168944842,
+            "relative_l2": 1.4739564598657358,
+            "rms": 0.8653261340831424
+          },
+          "attention_score_logits": {
+            "max_abs": 17.2307986933738,
+            "mean_abs": 4.584130657414048,
+            "relative_l2": 0.8621371964891473,
+            "rms": 5.542716829823066
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.883525353737311,
+            "mean_abs": 0.003719819507688363,
+            "relative_l2": 0.9767311304728469,
+            "rms": 0.015318518822186466
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 1.0959548950195312,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 4.414956092834472,
+          "mean_abs": 0.6969172544808941,
+          "relative_l2": 1.4847998050354,
+          "rms": 0.8945266572726713
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 3,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 1.8360487652469004e-07,
+          "mean_abs": 3.574406405624058e-08,
+          "relative_l2": 3.5975293058371344e-08,
+          "rms": 4.485639509848922e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 9.359409475218072e-08,
+            "mean_abs": 1.701435790638698e-08,
+            "relative_l2": 3.721377911705139e-08,
+            "rms": 2.1847358788953372e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 1.9282653118679605e-07,
+            "mean_abs": 3.905599365303171e-08,
+            "relative_l2": 7.626501211201813e-09,
+            "rms": 4.903110176446902e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 2.4996635539231704e-08,
+            "mean_abs": 6.666455984376348e-11,
+            "relative_l2": 2.2666933251301625e-08,
+            "rms": 3.554958297307605e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.1434133590236826e-07,
+          "mean_abs": 3.494421267628645e-08,
+          "relative_l2": 3.607951281588919e-08,
+          "rms": 4.3934731740782127e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 9.605974815585228e-08,
+          "mean_abs": 1.719451559776486e-08,
+          "relative_l2": 3.68228463818726e-08,
+          "rms": 2.218414736689464e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.308008872321807,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.3809958871853496,
+          "mean_abs": 0.5757238489007416,
+          "relative_l2": 0.5138364667673819,
+          "rms": 0.6681257052536054
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 3090,
+            "agreement": 0.5029296875,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 2.4008542721568773,
+            "mean_abs": 0.09755568543562619,
+            "relative_l2": 0.2873141588068062,
+            "rms": 0.13418952580008167
+          },
+          "attention_score_logits": {
+            "max_abs": 3.6459339640053474,
+            "mean_abs": 0.6490145716467941,
+            "relative_l2": 0.11037693709486947,
+            "rms": 0.8170416406605646
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.6308347232724384,
+            "mean_abs": 0.0021510187711442992,
+            "relative_l2": 0.47380061949980856,
+            "rms": 0.012632079003754432
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 0.3948130030184984,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 0.5458197163121667,
+          "mean_abs": 0.12275523824631951,
+          "relative_l2": 0.3086603140117673,
+          "rms": 0.13820792788818909
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.152252197265625,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 11.72690200805664,
+          "mean_abs": 1.5441710846727688,
+          "relative_l2": 1.5270706261649665,
+          "rms": 1.9856028228248228
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 508,
+            "agreement": 0.0826822891831398,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 7.388299877660575,
+            "mean_abs": 0.5094342421103009,
+            "relative_l2": 1.4495477076545644,
+            "rms": 0.6770084715719018
+          },
+          "attention_score_logits": {
+            "max_abs": 21.94909778609872,
+            "mean_abs": 6.804649837236161,
+            "relative_l2": 1.0784661238754065,
+            "rms": 7.983114538598328
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9574781363949476,
+            "mean_abs": 0.004854935463829473,
+            "relative_l2": 1.0265894056027316,
+            "rms": 0.02737007496883658
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 0.8564491271972656,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 4.925769805908203,
+          "mean_abs": 0.4960694973660047,
+          "relative_l2": 1.469238064763985,
+          "rms": 0.6578764397381557
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 7,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 1.911736173809686e-07,
+          "mean_abs": 3.798992564705019e-08,
+          "relative_l2": 3.644432098755376e-08,
+          "rms": 4.738742621914646e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 1.0883929180138807e-07,
+            "mean_abs": 1.3221800811712664e-08,
+            "relative_l2": 3.674677716537152e-08,
+            "rms": 1.716251166660446e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 1.9513653359837235e-07,
+            "mean_abs": 4.121278644654278e-08,
+            "relative_l2": 6.9313282630384466e-09,
+            "rms": 5.1307673188306234e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 3.455283925646313e-08,
+            "mean_abs": 7.783560963416852e-11,
+            "relative_l2": 1.8447681845944244e-08,
+            "rms": 4.918367872969584e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.0221073870896333e-07,
+          "mean_abs": 3.608058391148611e-08,
+          "relative_l2": 3.5966771031734013e-08,
+          "rms": 4.5146509264445055e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 8.69294636274276e-08,
+          "mean_abs": 1.2007263081513919e-08,
+          "relative_l2": 3.518542254238344e-08,
+          "rms": 1.5754873949979707e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.543470839271322,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.753117133108944,
+          "mean_abs": 0.6374353409518178,
+          "relative_l2": 0.5695656955767019,
+          "rms": 0.7436909263133437
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2963,
+            "agreement": 0.4822591245174408,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 2.3151287086024235,
+            "mean_abs": 0.09254388481747934,
+            "relative_l2": 0.28704624725115613,
+            "rms": 0.13440726066509343
+          },
+          "attention_score_logits": {
+            "max_abs": 5.024081887456961,
+            "mean_abs": 0.8006554559056097,
+            "relative_l2": 0.14102890359258774,
+            "rms": 1.0162633301539326
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.7595785128741102,
+            "mean_abs": 0.0021843531818062137,
+            "relative_l2": 0.38203552544239905,
+            "rms": 0.011479135172586457
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 0.3498497907858109,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 0.6580903678447498,
+          "mean_abs": 0.10295857363982934,
+          "relative_l2": 0.3145568652427222,
+          "rms": 0.11669526091013521
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.064300537109375,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 14.21038818359375,
+          "mean_abs": 1.6323549769360355,
+          "relative_l2": 1.5577194723444738,
+          "rms": 2.0339389244103727
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 210,
+            "agreement": 0.0341796875,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 14.231445312499998,
+            "mean_abs": 0.4886487269978222,
+            "relative_l2": 1.4059784244234697,
+            "rms": 0.6583388927416942
+          },
+          "attention_score_logits": {
+            "max_abs": 24.452302183955904,
+            "mean_abs": 6.304603035170917,
+            "relative_l2": 1.045874135417663,
+            "rms": 7.536636141282987
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9968699998845204,
+            "mean_abs": 0.005204521455278739,
+            "relative_l2": 1.0312233394958104,
+            "rms": 0.030985474697648514
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 0.7617626190185547,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 7.1447086334228525,
+          "mean_abs": 0.4641708222498693,
+          "relative_l2": 1.594095554339316,
+          "rms": 0.5913824088522386
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 11,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.0751634202675895e-07,
+          "mean_abs": 3.908456247190027e-08,
+          "relative_l2": 3.737488762397673e-08,
+          "rms": 4.880098123152989e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 2.0634808173269903e-07,
+            "mean_abs": 1.3683702082256635e-08,
+            "relative_l2": 3.841157837009903e-08,
+            "rms": 1.7985934587154972e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 2.5111868140470506e-07,
+            "mean_abs": 5.603199732884584e-08,
+            "relative_l2": 9.524693626073144e-09,
+            "rms": 6.863555353937802e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 3.246614177498941e-08,
+            "mean_abs": 8.037428917696172e-11,
+            "relative_l2": 1.6063829621344052e-08,
+            "rms": 4.826746711559624e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.426620235307375e-07,
+          "mean_abs": 3.814908583777652e-08,
+          "relative_l2": 3.692236198821193e-08,
+          "rms": 4.7729116459236515e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 1.119890895018294e-07,
+          "mean_abs": 1.0607654646918299e-08,
+          "relative_l2": 3.686214581645245e-08,
+          "rms": 1.3675230778391438e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.398742118035443,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.5640199416546352,
+          "mean_abs": 0.5972182790807603,
+          "relative_l2": 0.5299301834289806,
+          "rms": 0.693337503096296
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 3655,
+            "agreement": 0.5948893427848816,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 2.395646826027019,
+            "mean_abs": 0.09266030986004015,
+            "relative_l2": 0.3384401373741014,
+            "rms": 0.12867907293835024
+          },
+          "attention_score_logits": {
+            "max_abs": 3.796586956925445,
+            "mean_abs": 0.6955310929248174,
+            "relative_l2": 0.1103952763995061,
+            "rms": 0.877397158727034
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.5589002031144759,
+            "mean_abs": 0.0017910030337038331,
+            "relative_l2": 0.25890284161615806,
+            "rms": 0.009195738152349048
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 0.38618955240235664,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 0.8570630589874213,
+          "mean_abs": 0.10666792659421467,
+          "relative_l2": 0.32077885820873847,
+          "rms": 0.12419904412432246
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.056854248046875,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 15.47748327255249,
+          "mean_abs": 1.6614438242182814,
+          "relative_l2": 1.5793325028105234,
+          "rms": 2.0663296564386013
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 1360,
+            "agreement": 0.2213541716337204,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 5.61979389695231,
+            "mean_abs": 0.4637567478526945,
+            "relative_l2": 1.6203500117640277,
+            "rms": 0.6160768606442338
+          },
+          "attention_score_logits": {
+            "max_abs": 21.937645140569657,
+            "mean_abs": 6.366326058819347,
+            "relative_l2": 0.9206948659381096,
+            "rms": 7.317478480739456
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9915877900461815,
+            "mean_abs": 0.004760850775407813,
+            "relative_l2": 0.948248719602773,
+            "rms": 0.03367999699939589
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 0.905853271484375,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 6.503954887390136,
+          "mean_abs": 0.4694501020589428,
+          "relative_l2": 1.5959675834959224,
+          "rms": 0.6179261603766805
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 15,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.158149655651087e-07,
+          "mean_abs": 3.7090906855470415e-08,
+          "relative_l2": 3.59789618091422e-08,
+          "rms": 4.7073301956238815e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 1.5595350211228265e-07,
+            "mean_abs": 1.11779838397537e-08,
+            "relative_l2": 3.7587083536784414e-08,
+            "rms": 1.4291068138361595e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 2.2430330304246127e-07,
+            "mean_abs": 4.369469081021844e-08,
+            "relative_l2": 6.951721524586519e-09,
+            "rms": 5.525074000322862e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 3.635663886614182e-08,
+            "mean_abs": 6.83193596841682e-11,
+            "relative_l2": 1.5906239828492697e-08,
+            "rms": 5.649594864939306e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.520843606079737e-07,
+          "mean_abs": 3.555899293240288e-08,
+          "relative_l2": 3.5742941055048376e-08,
+          "rms": 4.494382581097181e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 1.0470063260825668e-07,
+          "mean_abs": 1.0883297621478419e-08,
+          "relative_l2": 3.604650075821624e-08,
+          "rms": 1.39564713211474e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.631957004312426,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.6586664937919124,
+          "mean_abs": 0.653593986799246,
+          "relative_l2": 0.5607403189522825,
+          "rms": 0.7612689604563523
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 4282,
+            "agreement": 0.6969401240348816,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 3.7527824339460603,
+            "mean_abs": 0.11417693486323932,
+            "relative_l2": 0.3588852482082595,
+            "rms": 0.18181286236353184
+          },
+          "attention_score_logits": {
+            "max_abs": 4.30708255270056,
+            "mean_abs": 0.7121706320168129,
+            "relative_l2": 0.15952099627614905,
+            "rms": 0.8994819935436089
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.6679307758156906,
+            "mean_abs": 0.0021436613953764185,
+            "relative_l2": 0.446107753465964,
+            "rms": 0.013532314142842752
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 0.5461121134867426,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 0.8015066598285046,
+          "mean_abs": 0.11531759869457625,
+          "relative_l2": 0.27431745256909484,
+          "rms": 0.14486804985708812
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 2.9804840087890625,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 16.3477201461792,
+          "mean_abs": 1.7041230130190002,
+          "relative_l2": 1.5608387960611965,
+          "rms": 2.119016750230643
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 1501,
+            "agreement": 0.2443033903837204,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 11.299041003551194,
+            "mean_abs": 0.5331533508074724,
+            "relative_l2": 1.4638359462047148,
+            "rms": 0.7415857986329544
+          },
+          "attention_score_logits": {
+            "max_abs": 21.294828830286857,
+            "mean_abs": 5.549327008350634,
+            "relative_l2": 1.1554508761248716,
+            "rms": 6.515175317105912
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.982459350970786,
+            "mean_abs": 0.004654384646383249,
+            "relative_l2": 0.9922680857889725,
+            "rms": 0.030099641502505804
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 1.1840248107910156,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 6.966570854187012,
+          "mean_abs": 0.5657919496582196,
+          "relative_l2": 1.4627903190494278,
+          "rms": 0.7725049181232231
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 19,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.388747806225666e-07,
+          "mean_abs": 3.92457263560699e-08,
+          "relative_l2": 3.625007043954664e-08,
+          "rms": 4.9213606589152476e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 1.5781829221239718e-07,
+            "mean_abs": 1.4681169173159045e-08,
+            "relative_l2": 3.856793877366449e-08,
+            "rms": 1.9538689257665544e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 2.2371097685436325e-07,
+            "mean_abs": 4.740373335975484e-08,
+            "relative_l2": 1.0526177930797694e-08,
+            "rms": 5.935336244514258e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 3.290356132001904e-08,
+            "mean_abs": 8.21954497030422e-11,
+            "relative_l2": 1.9304706974535876e-08,
+            "rms": 5.855925102966894e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.175148552108208e-07,
+          "mean_abs": 3.5713626033350464e-08,
+          "relative_l2": 3.549502659064595e-08,
+          "rms": 4.491635429281053e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 1.4732383635251978e-07,
+          "mean_abs": 1.4312766667671395e-08,
+          "relative_l2": 3.6323260972482647e-08,
+          "rms": 1.9182446983756485e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.5666655637323856,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.7050133988292373,
+          "mean_abs": 0.6428025392327665,
+          "relative_l2": 0.5191306756265367,
+          "rms": 0.7457190672492879
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 4571,
+            "agreement": 0.7439778447151184,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 6.899521915419953,
+            "mean_abs": 0.1421698879553588,
+            "relative_l2": 0.3622690966478917,
+            "rms": 0.21269754665866702
+          },
+          "attention_score_logits": {
+            "max_abs": 4.549098759207829,
+            "mean_abs": 0.737108978828918,
+            "relative_l2": 0.1844146699666515,
+            "rms": 0.9303672984060011
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.5773472494109824,
+            "mean_abs": 0.0018731980404601964,
+            "relative_l2": 0.30530246991366683,
+            "rms": 0.01067639145933945
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 0.6882674570661038,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 0.8856567380842861,
+          "mean_abs": 0.17405758601245308,
+          "relative_l2": 0.35709211513077616,
+          "rms": 0.20561022953828897
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.2835693359375,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 18.469927847385406,
+          "mean_abs": 1.8704050902630982,
+          "relative_l2": 1.619747188081857,
+          "rms": 2.326728931976302
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 848,
+            "agreement": 0.1380208283662796,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 20.711705507377708,
+            "mean_abs": 0.642276974398395,
+            "relative_l2": 1.525245318591051,
+            "rms": 0.8955109346029845
+          },
+          "attention_score_logits": {
+            "max_abs": 21.428352683782578,
+            "mean_abs": 3.7938384151400792,
+            "relative_l2": 0.919377155034546,
+            "rms": 4.638234258155074
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9986611995148078,
+            "mean_abs": 0.005109839923209126,
+            "relative_l2": 1.02899231630849,
+            "rms": 0.03598374025820531
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 1.3180923461914062,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 11.395862579345705,
+          "mean_abs": 0.6632136014692556,
+          "relative_l2": 1.4972952373704564,
+          "rms": 0.8621282976144325
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 23,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.0549041424011705e-07,
+          "mean_abs": 4.0407231097950496e-08,
+          "relative_l2": 3.493807930114528e-08,
+          "rms": 5.018773333011664e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 4.508082622756149e-07,
+            "mean_abs": 1.7997149576084336e-08,
+            "relative_l2": 4.1232777161745376e-08,
+            "rms": 2.4208828810895842e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 2.4997554781691633e-07,
+            "mean_abs": 4.528146253819939e-08,
+            "relative_l2": 1.1007528251974873e-08,
+            "rms": 5.5532698801941805e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 5.5302171286797375e-08,
+            "mean_abs": 9.227930569423884e-11,
+            "relative_l2": 2.3297206161736792e-08,
+            "rms": 8.147005589636215e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.0204377593202594e-07,
+          "mean_abs": 3.4431950827110253e-08,
+          "relative_l2": 3.5436243131897875e-08,
+          "rms": 4.3422577120874366e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 1.3227238182533796e-07,
+          "mean_abs": 1.566796672271744e-08,
+          "relative_l2": 3.524509895333925e-08,
+          "rms": 2.0293791365595033e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.760967976413667,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.9208048903088866,
+          "mean_abs": 0.6890244284649492,
+          "relative_l2": 0.5379717568768373,
+          "rms": 0.8008198257744635
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 3201,
+            "agreement": 0.52099609375,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 18.00648557535059,
+            "mean_abs": 0.2356338534180097,
+            "relative_l2": 0.4099763143840057,
+            "rms": 0.4059122033487799
+          },
+          "attention_score_logits": {
+            "max_abs": 6.222492282767371,
+            "mean_abs": 0.861642876684674,
+            "relative_l2": 0.18337153115802446,
+            "rms": 1.0888079936899706
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.6886109304785315,
+            "mean_abs": 0.002600259431523246,
+            "relative_l2": 0.5348245257441232,
+            "rms": 0.015555983194678368
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 1.0720380580169149,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 1.5999937719566333,
+          "mean_abs": 0.27026093102544735,
+          "relative_l2": 0.36703257089607005,
+          "rms": 0.32273379408386255
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.7283477783203125,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 22.700037479400635,
+          "mean_abs": 1.8526689510232686,
+          "relative_l2": 1.5755087819845728,
+          "rms": 2.3452879316399136
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 603,
+            "agreement": 0.09814453125,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 64.85498046874999,
+            "mean_abs": 0.9357743075173569,
+            "relative_l2": 1.4140820602842321,
+            "rms": 1.4000642102175667
+          },
+          "attention_score_logits": {
+            "max_abs": 25.840793095063415,
+            "mean_abs": 5.308555403458065,
+            "relative_l2": 1.0992016594752512,
+            "rms": 6.526746796276408
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9984449063138799,
+            "mean_abs": 0.005701240452041803,
+            "relative_l2": 1.1086708820539175,
+            "rms": 0.03224696097409575
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 2.0537872314453125,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 27.768049240112305,
+          "mean_abs": 1.0498039405249813,
+          "relative_l2": 1.5786939050787825,
+          "rms": 1.3881543892261987
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 27,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.3747388577799455e-07,
+          "mean_abs": 4.3255660459606865e-08,
+          "relative_l2": 3.652426254032199e-08,
+          "rms": 5.436968243361333e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 1.469125495034973e-06,
+            "mean_abs": 2.8919823872250882e-08,
+            "relative_l2": 4.1577861536047595e-08,
+            "rms": 4.11656985891615e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 3.240096528855929e-07,
+            "mean_abs": 5.4942165687158926e-08,
+            "relative_l2": 1.1362234279609971e-08,
+            "rms": 6.746571527047e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 7.114301309174564e-08,
+            "mean_abs": 1.0436177801379981e-10,
+            "relative_l2": 2.8596522886116445e-08,
+            "rms": 8.317625838563163e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.394435229535752e-07,
+          "mean_abs": 3.785771942561758e-08,
+          "relative_l2": 3.5584552857707693e-08,
+          "rms": 4.7703116942692055e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 2.650545738447363e-07,
+          "mean_abs": 2.421539382858597e-08,
+          "relative_l2": 3.581478852161257e-08,
+          "rms": 3.149214406006666e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.88189201336354,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.9549127311344705,
+          "mean_abs": 0.717872310950068,
+          "relative_l2": 0.539610436398609,
+          "rms": 0.8342826702342698
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2938,
+            "agreement": 0.4781900942325592,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 34.95982371049599,
+            "mean_abs": 0.23166645733657162,
+            "relative_l2": 0.4606063399211104,
+            "rms": 0.4498932147213368
+          },
+          "attention_score_logits": {
+            "max_abs": 6.1296924753321544,
+            "mean_abs": 0.8294986782042513,
+            "relative_l2": 0.19909444662347814,
+            "rms": 1.0550186720343295
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.813304078473029,
+            "mean_abs": 0.0026912909761069425,
+            "relative_l2": 0.6500313757526389,
+            "rms": 0.016546863975590107
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 1.4149941279320046,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 1.4874709679224907,
+          "mean_abs": 0.34780185561064986,
+          "relative_l2": 0.4725556718378475,
+          "rms": 0.4109128588739014
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.926971435546875,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 21.03465986251831,
+          "mean_abs": 1.9247691730303416,
+          "relative_l2": 1.5854958864965645,
+          "rms": 2.4513086728716695
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 487,
+            "agreement": 0.0792643204331398,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 45.04441999783867,
+            "mean_abs": 0.9681942739639199,
+            "relative_l2": 1.4907131776223634,
+            "rms": 1.456041060622074
+          },
+          "attention_score_logits": {
+            "max_abs": 32.98889456503093,
+            "mean_abs": 4.904864176481727,
+            "relative_l2": 1.184277121340966,
+            "rms": 6.275586773350266
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9986316717454735,
+            "mean_abs": 0.005945905551737477,
+            "relative_l2": 1.285103675077659,
+            "rms": 0.03271293740462898
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 2.3767547607421875,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 37.33052968978882,
+          "mean_abs": 1.1365872530300933,
+          "relative_l2": 1.6692543891991154,
+          "rms": 1.4515074815238893
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 31,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.514691881394526e-07,
+          "mean_abs": 4.486703537485689e-08,
+          "relative_l2": 3.623439723883967e-08,
+          "rms": 5.60213955547496e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 2.0248478698192685e-06,
+            "mean_abs": 2.790550334251901e-08,
+            "relative_l2": 4.057353049158167e-08,
+            "rms": 3.9629841110259844e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 3.3799925525102026e-07,
+            "mean_abs": 5.1912753707560324e-08,
+            "relative_l2": 1.2616095325544012e-08,
+            "rms": 6.68537790096465e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 5.283500731367852e-08,
+            "mean_abs": 1.1676636040704865e-10,
+            "relative_l2": 2.9899695646350694e-08,
+            "rms": 7.611112558972532e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.545580805035641e-07,
+          "mean_abs": 3.5749351661982553e-08,
+          "relative_l2": 3.5659124503293605e-08,
+          "rms": 4.517849060353451e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 2.5454960933535276e-07,
+          "mean_abs": 2.4020325054559305e-08,
+          "relative_l2": 3.527687958334282e-08,
+          "rms": 3.067516549386729e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.9137565789278597,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 2.0001859864577085,
+          "mean_abs": 0.7270227590413643,
+          "relative_l2": 0.5321590452449813,
+          "rms": 0.8446433396281491
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2244,
+            "agreement": 0.365234375,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 18.700758608318537,
+            "mean_abs": 0.199908186605349,
+            "relative_l2": 0.3509121616516417,
+            "rms": 0.3375607058105541
+          },
+          "attention_score_logits": {
+            "max_abs": 5.9706695477909975,
+            "mean_abs": 0.8898539467088715,
+            "relative_l2": 0.25488394547236926,
+            "rms": 1.1303424922848715
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.7536405948995066,
+            "mean_abs": 0.0028626859970587244,
+            "relative_l2": 0.690487124528904,
+            "rms": 0.01599516835540805
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 1.4667078052880242,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 1.619887471700249,
+          "mean_abs": 0.35469929589862803,
+          "relative_l2": 0.45087898396201953,
+          "rms": 0.42357176920719747
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.92535400390625,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 18.234371185302734,
+          "mean_abs": 2.0935564911241613,
+          "relative_l2": 1.6429722224773025,
+          "rms": 2.607727065857199
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 299,
+            "agreement": 0.0486653633415699,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 40.08203125,
+            "mean_abs": 0.8998503566841775,
+            "relative_l2": 1.386557830529462,
+            "rms": 1.333802276095863
+          },
+          "attention_score_logits": {
+            "max_abs": 25.032908292487264,
+            "mean_abs": 4.298260016662862,
+            "relative_l2": 1.2410010427067386,
+            "rms": 5.503509485234808
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9937462290001395,
+            "mean_abs": 0.0061834677376733345,
+            "relative_l2": 1.4185746507752695,
+            "rms": 0.032861351874367624
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 2.5386123657226562,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 37.820088624954224,
+          "mean_abs": 1.144705840492049,
+          "relative_l2": 1.6063844088143417,
+          "rms": 1.5090947025193298
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 35,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.5814464599260845e-07,
+          "mean_abs": 4.477835687888222e-08,
+          "relative_l2": 3.555963788922697e-08,
+          "rms": 5.6440290899143176e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 1.6942714964329753e-06,
+            "mean_abs": 2.7580103573712137e-08,
+            "relative_l2": 3.9200338160491385e-08,
+            "rms": 3.7708849289196304e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 3.933178049919661e-07,
+            "mean_abs": 7.207271411420477e-08,
+            "relative_l2": 2.0014138253513994e-08,
+            "rms": 8.8757378863093e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 5.860079022035336e-08,
+            "mean_abs": 1.2959209203432017e-10,
+            "relative_l2": 3.2752319024993884e-08,
+            "rms": 7.587090884456912e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.742001348199352e-07,
+          "mean_abs": 3.881300111766478e-08,
+          "relative_l2": 3.61903708058507e-08,
+          "rms": 4.9144617432660864e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 2.395434612681435e-07,
+          "mean_abs": 2.6450494414782466e-08,
+          "relative_l2": 3.624999387061854e-08,
+          "rms": 3.40545347778207e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 3.0140080836135894,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 2.0312249987926236,
+          "mean_abs": 0.7570653343838533,
+          "relative_l2": 0.5466476185755188,
+          "rms": 0.879184725263339
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2272,
+            "agreement": 0.3697916567325592,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 15.856039388954672,
+            "mean_abs": 0.16035044016803704,
+            "relative_l2": 0.3314831418211377,
+            "rms": 0.25166797110478323
+          },
+          "attention_score_logits": {
+            "max_abs": 7.0586413144636735,
+            "mean_abs": 0.8741585311303849,
+            "relative_l2": 0.15939268605921084,
+            "rms": 1.1127231303641723
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.8415731259058633,
+            "mean_abs": 0.002760000914819837,
+            "relative_l2": 0.637170442283009,
+            "rms": 0.015064448914384658
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 1.2503951598191634,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 1.4746057711104728,
+          "mean_abs": 0.31012772517773873,
+          "relative_l2": 0.45075403819559057,
+          "rms": 0.3693809983251911
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.9719085693359375,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 20.258380889892578,
+          "mean_abs": 1.997892228872729,
+          "relative_l2": 1.5627505715129781,
+          "rms": 2.513404222424611
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 409,
+            "agreement": 0.0665690079331398,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 33.55822753906249,
+            "mean_abs": 0.8066038370125256,
+            "relative_l2": 1.5148741045118652,
+            "rms": 1.1501197022181908
+          },
+          "attention_score_logits": {
+            "max_abs": 28.907383379526433,
+            "mean_abs": 5.969167947452959,
+            "relative_l2": 0.986085527932035,
+            "rms": 6.88388032459496
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9991598625658308,
+            "mean_abs": 0.005811206807152255,
+            "relative_l2": 1.3650255377661302,
+            "rms": 0.032272930625640475
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 2.0933761596679688,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 28.202122002840042,
+          "mean_abs": 1.0068934638554055,
+          "relative_l2": 1.5925410015255157,
+          "rms": 1.3050451798083829
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 39,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.6957450205422617e-07,
+          "mean_abs": 4.653410507113385e-08,
+          "relative_l2": 3.6259542344635896e-08,
+          "rms": 5.8316975526022555e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 9.086132184421558e-07,
+            "mean_abs": 2.2358154978688413e-08,
+            "relative_l2": 3.884964310301399e-08,
+            "rms": 2.9495348705111623e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 4.415737221152849e-07,
+            "mean_abs": 6.145765929995545e-08,
+            "relative_l2": 1.09682313401004e-08,
+            "rms": 7.65694149026454e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 4.9450666395056686e-08,
+            "mean_abs": 1.0951766748117835e-10,
+            "relative_l2": 2.6378131020233455e-08,
+            "rms": 6.236510372129804e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.503875866644023e-07,
+          "mean_abs": 3.727085182463478e-08,
+          "relative_l2": 3.684176544192936e-08,
+          "rms": 4.726030393061144e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 2.342946311406635e-07,
+          "mean_abs": 2.3216927365222398e-08,
+          "relative_l2": 3.646408079892003e-08,
+          "rms": 2.9881348635417435e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.9245818937197328,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.90566729674579,
+          "mean_abs": 0.7294393266163596,
+          "relative_l2": 0.5344185606672865,
+          "rms": 0.8483379033283174
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2370,
+            "agreement": 0.3857421875,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 27.497459264215614,
+            "mean_abs": 0.2821900859947543,
+            "relative_l2": 0.38398972871117065,
+            "rms": 0.4781605319529391
+          },
+          "attention_score_logits": {
+            "max_abs": 6.465347663435276,
+            "mean_abs": 0.9045619783024339,
+            "relative_l2": 0.20320780630562116,
+            "rms": 1.1452387758761677
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.8157888546376912,
+            "mean_abs": 0.00295454307827455,
+            "relative_l2": 0.7339775428648156,
+            "rms": 0.017687962775736674
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.165362400817685,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 2.803099887296362,
+          "mean_abs": 0.5299361700447536,
+          "relative_l2": 0.4327955296431639,
+          "rms": 0.671585548547802
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 4.2272186279296875,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 21.278378307819366,
+          "mean_abs": 2.0878729825761866,
+          "relative_l2": 1.651760312292343,
+          "rms": 2.622010129873887
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 288,
+            "agreement": 0.046875,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 68.79642825268245,
+            "mean_abs": 1.640235021990427,
+            "relative_l2": 2.0717267427286137,
+            "rms": 2.579803279345956
+          },
+          "attention_score_logits": {
+            "max_abs": 31.21501987538795,
+            "mean_abs": 4.876025555552796,
+            "relative_l2": 1.053745216304306,
+            "rms": 5.938698436568496
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9998056976574096,
+            "mean_abs": 0.0064357684830310775,
+            "relative_l2": 1.5166171660220085,
+            "rms": 0.03654862228200524
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 4.555900573730469,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 60.078274607658386,
+          "mean_abs": 1.7492120049728968,
+          "relative_l2": 1.6718397627805872,
+          "rms": 2.5942583691426284
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 43,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.656792429389654e-07,
+          "mean_abs": 4.528975527882623e-08,
+          "relative_l2": 3.608416780670315e-08,
+          "rms": 5.72801349040458e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 2.2821028125008525e-06,
+            "mean_abs": 3.485645120435985e-08,
+            "relative_l2": 4.053722202639964e-08,
+            "rms": 5.0478693044983904e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 3.810843463014635e-07,
+            "mean_abs": 6.149044306981948e-08,
+            "relative_l2": 1.3818549155919795e-08,
+            "rms": 7.787859436811562e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 6.232390314941938e-08,
+            "mean_abs": 1.223218777548705e-10,
+            "relative_l2": 3.032156195495308e-08,
+            "rms": 7.307126278932835e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.626317643361631e-07,
+          "mean_abs": 3.85279278165766e-08,
+          "relative_l2": 3.5850055993536693e-08,
+          "rms": 4.849260193394063e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 5.039543466978103e-07,
+          "mean_abs": 3.960368546149702e-08,
+          "relative_l2": 3.55052803806302e-08,
+          "rms": 5.5094915689179345e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.908147387439385,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.8879942895705142,
+          "mean_abs": 0.724972234871397,
+          "relative_l2": 0.525069979511851,
+          "rms": 0.8426634082847234
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2698,
+            "agreement": 0.4391275942325592,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 37.43782930508813,
+            "mean_abs": 0.30476939958248633,
+            "relative_l2": 0.3769679682165719,
+            "rms": 0.5217894205237674
+          },
+          "attention_score_logits": {
+            "max_abs": 7.046906077207222,
+            "mean_abs": 0.8588840619914955,
+            "relative_l2": 0.2023648171123808,
+            "rms": 1.0920575744704144
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.8259612407017077,
+            "mean_abs": 0.0027786981078500154,
+            "relative_l2": 0.7157802302954408,
+            "rms": 0.01514669580483522
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.2499107014155015,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 2.324547726028584,
+          "mean_abs": 0.562706024770955,
+          "relative_l2": 0.4457859930096541,
+          "rms": 0.6718943725301704
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 4.1622161865234375,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 18.355928897857666,
+          "mean_abs": 2.1330270836855973,
+          "relative_l2": 1.6543366844137326,
+          "rms": 2.6549775126276844
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 211,
+            "agreement": 0.0343424491584301,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 69.34596976553898,
+            "mean_abs": 1.449606244543917,
+            "relative_l2": 1.562263022464615,
+            "rms": 2.1624445202972873
+          },
+          "attention_score_logits": {
+            "max_abs": 26.3190603274852,
+            "mean_abs": 5.341262566952701,
+            "relative_l2": 1.1730768925011092,
+            "rms": 6.330485329278449
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9966242120015861,
+            "mean_abs": 0.0059647595725958345,
+            "relative_l2": 1.4695334620569005,
+            "rms": 0.031096942025927058
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 4.153923034667969,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 49.62455177307129,
+          "mean_abs": 1.8265450159467669,
+          "relative_l2": 1.6344799477201761,
+          "rms": 2.4635091631453916
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 47,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.7031993843351643e-07,
+          "mean_abs": 4.6220528203134994e-08,
+          "relative_l2": 3.626211555998002e-08,
+          "rms": 5.8195591187159155e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 3.0806651771797533e-06,
+            "mean_abs": 4.171595079519321e-08,
+            "relative_l2": 4.342502660666906e-08,
+            "rms": 6.010781121940165e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 3.343878844930259e-07,
+            "mean_abs": 5.768667860587198e-08,
+            "relative_l2": 1.3326476669026829e-08,
+            "rms": 7.191605732201846e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 6.174881528320242e-08,
+            "mean_abs": 1.372055086378465e-10,
+            "relative_l2": 3.488397566332451e-08,
+            "rms": 7.381832376364476e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.690614451239526e-07,
+          "mean_abs": 3.6298702304430666e-08,
+          "relative_l2": 3.623251107069012e-08,
+          "rms": 4.592006059203698e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 3.7548294710976204e-07,
+          "mean_abs": 4.140003442893676e-08,
+          "relative_l2": 3.635872648677607e-08,
+          "rms": 5.480033938955041e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 3.13804496335797,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 2.1829476343237104,
+          "mean_abs": 0.7816217925865023,
+          "relative_l2": 0.5575733102894084,
+          "rms": 0.911330674128835
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2092,
+            "agreement": 0.3404947817325592,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 31.19293124549843,
+            "mean_abs": 0.3220775719173792,
+            "relative_l2": 0.3601066742529453,
+            "rms": 0.5448339872938197
+          },
+          "attention_score_logits": {
+            "max_abs": 6.235047339522436,
+            "mean_abs": 0.8679139665137767,
+            "relative_l2": 0.19282041982077597,
+            "rms": 1.1073299666784235
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.7294795984144142,
+            "mean_abs": 0.0027795128568708894,
+            "relative_l2": 0.7204142785245402,
+            "rms": 0.016099528127074946
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.1125523240771145,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 2.3318999591676643,
+          "mean_abs": 0.5139515029742889,
+          "relative_l2": 0.39283407567480005,
+          "rms": 0.6167423488939329
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.95361328125,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 16.64792251586914,
+          "mean_abs": 2.096489735463223,
+          "relative_l2": 1.6185937115489832,
+          "rms": 2.6455249392539963
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 169,
+            "agreement": 0.02750650979578495,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 102.58627033433487,
+            "mean_abs": 1.5434641167216931,
+            "relative_l2": 1.4590661571748906,
+            "rms": 2.2075370688094442
+          },
+          "attention_score_logits": {
+            "max_abs": 26.01149806939065,
+            "mean_abs": 5.859340643388937,
+            "relative_l2": 1.1870336115586337,
+            "rms": 6.816901917105816
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9959277587039728,
+            "mean_abs": 0.006120210569938905,
+            "relative_l2": 1.3541356268076108,
+            "rms": 0.030261677567403528
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 4.1617431640625,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 48.6395742893219,
+          "mean_abs": 1.860517772565629,
+          "relative_l2": 1.6359424952886608,
+          "rms": 2.5683999420653514
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 51,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 3.206442791281461e-07,
+          "mean_abs": 4.662396830405883e-08,
+          "relative_l2": 3.5686081146653487e-08,
+          "rms": 5.832743386070401e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 3.373735722789206e-06,
+            "mean_abs": 4.407899894139848e-08,
+            "relative_l2": 4.1836459628064325e-08,
+            "rms": 6.329770243970597e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 4.971724871793981e-07,
+            "mean_abs": 6.328434151321916e-08,
+            "relative_l2": 1.393807601029031e-08,
+            "rms": 8.004364505783075e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 6.477188568831949e-08,
+            "mean_abs": 1.3083049990330732e-10,
+            "relative_l2": 3.600362894148679e-08,
+            "rms": 8.045945979962815e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.9453893279907106e-07,
+          "mean_abs": 3.565735897574807e-08,
+          "relative_l2": 3.6314829094547975e-08,
+          "rms": 4.5212132221222676e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 3.548033860045763e-07,
+          "mean_abs": 4.2654328325749494e-08,
+          "relative_l2": 3.663186682004168e-08,
+          "rms": 5.751136417649461e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.846672808052972,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.9392058721556964,
+          "mean_abs": 0.7115573850661953,
+          "relative_l2": 0.5459759642149659,
+          "rms": 0.8279019417799695
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 4109,
+            "agreement": 0.6687825322151184,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 13.720779481993066,
+            "mean_abs": 0.2382939355179736,
+            "relative_l2": 0.30697261420889804,
+            "rms": 0.34382205849798336
+          },
+          "attention_score_logits": {
+            "max_abs": 6.825515724448312,
+            "mean_abs": 0.7550332190554789,
+            "relative_l2": 0.2200095693324854,
+            "rms": 0.9620400403524992
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.6834561477878704,
+            "mean_abs": 0.0021102655500719364,
+            "relative_l2": 0.5204824345685677,
+            "rms": 0.012583543452726094
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 1.7721533133590128,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 1.718532902612651,
+          "mean_abs": 0.43566721455266044,
+          "relative_l2": 0.4041488092575374,
+          "rms": 0.5229935294645777
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.4388427734375,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 15.938661098480225,
+          "mean_abs": 1.8436750724689048,
+          "relative_l2": 1.5369153638784463,
+          "rms": 2.330533388704421
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 557,
+            "agreement": 0.0906575545668602,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 52.31520875197062,
+            "mean_abs": 1.248635367410748,
+            "relative_l2": 1.7045629723911702,
+            "rms": 1.9091812196906643
+          },
+          "attention_score_logits": {
+            "max_abs": 22.834930493001593,
+            "mean_abs": 3.7950552148088277,
+            "relative_l2": 1.0799494028401162,
+            "rms": 4.722315353096582
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9775001882949204,
+            "mean_abs": 0.00576932010305424,
+            "relative_l2": 1.0320294212241292,
+            "rms": 0.024951057334394462
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.1438217163085938,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 26.544020652770996,
+          "mean_abs": 1.6424615414531445,
+          "relative_l2": 1.6524409414889125,
+          "rms": 2.1383606717714208
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 55,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.2921744058379545e-07,
+          "mean_abs": 4.30159105467287e-08,
+          "relative_l2": 3.541892662914746e-08,
+          "rms": 5.3708221702594673e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 9.307173485240128e-07,
+            "mean_abs": 3.1021617100279236e-08,
+            "relative_l2": 3.8787150009794503e-08,
+            "rms": 4.3443216568375813e-08
+          },
+          "attention_score_logits": {
+            "max_abs": 3.374257003807557e-07,
+            "mean_abs": 4.360284933675413e-08,
+            "relative_l2": 1.2700410654424166e-08,
+            "rms": 5.553532792026266e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 3.9896491776936216e-08,
+            "mean_abs": 8.23583139102202e-11,
+            "relative_l2": 2.047311006215296e-08,
+            "rms": 4.949720739242506e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.1514177728221284e-07,
+          "mean_abs": 3.318554350367837e-08,
+          "relative_l2": 3.579719696505864e-08,
+          "rms": 4.188481369225943e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 2.8734520185480505e-07,
+          "mean_abs": 3.6061902101311464e-08,
+          "relative_l2": 3.596963884502149e-08,
+          "rms": 4.65469349934605e-08
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.707374171470292,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.8217907041512014,
+          "mean_abs": 0.6759129748009651,
+          "relative_l2": 0.5420863462292265,
+          "rms": 0.7861850480977891
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 4499,
+            "agreement": 0.7322590947151184,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 13.54597102706807,
+            "mean_abs": 0.46698406584397106,
+            "relative_l2": 0.2642331428249697,
+            "rms": 0.7161002324435111
+          },
+          "attention_score_logits": {
+            "max_abs": 4.815977742473024,
+            "mean_abs": 0.6689060290352457,
+            "relative_l2": 0.20751638671724898,
+            "rms": 0.8547462823665439
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.6756882946544166,
+            "mean_abs": 0.001811109589062305,
+            "relative_l2": 0.48317048883515756,
+            "rms": 0.011750974627368576
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 3.5178874963894486,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 4.045150129939202,
+          "mean_abs": 0.8828773186679517,
+          "relative_l2": 0.3697008435312279,
+          "rms": 1.0395500530401218
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.5587158203125,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 13.662641048431396,
+          "mean_abs": 1.863271062978086,
+          "relative_l2": 1.6192339212070141,
+          "rms": 2.3483666517427704
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 126,
+            "agreement": 0.0205078125,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 75.23227983422912,
+            "mean_abs": 2.643053846453253,
+            "relative_l2": 1.4471185426588302,
+            "rms": 3.9218468723953515
+          },
+          "attention_score_logits": {
+            "max_abs": 20.878774117707508,
+            "mean_abs": 3.2704663897022037,
+            "relative_l2": 1.0082656910396124,
+            "rms": 4.152979746260291
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9541100405782996,
+            "mean_abs": 0.0058671307704728495,
+            "relative_l2": 1.1072971804053802,
+            "rms": 0.026930082388247064
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 9.5703125,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 62.5803861618042,
+          "mean_abs": 3.438555389258255,
+          "relative_l2": 1.6329373077690643,
+          "rms": 4.591604519091937
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 59,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.2021891599166565e-07,
+          "mean_abs": 4.217196431777918e-08,
+          "relative_l2": 3.632087144862104e-08,
+          "rms": 5.267597359163619e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 1.0423333485221065e-06,
+            "mean_abs": 7.742632258391305e-08,
+            "relative_l2": 3.849653437835015e-08,
+            "rms": 1.0432974804703818e-07
+          },
+          "attention_score_logits": {
+            "max_abs": 2.263791669676607e-07,
+            "mean_abs": 4.290974508976976e-08,
+            "relative_l2": 1.2763349730571756e-08,
+            "rms": 5.25713940249682e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 4.886619509036905e-08,
+            "mean_abs": 9.822381822187018e-11,
+            "relative_l2": 2.724116823934859e-08,
+            "rms": 6.625203405369331e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.0609727486783913e-07,
+          "mean_abs": 3.056901012226235e-08,
+          "relative_l2": 3.518950971211113e-08,
+          "rms": 3.848007657975058e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 6.398221770176349e-07,
+          "mean_abs": 7.957673133726878e-08,
+          "relative_l2": 3.641654961733178e-08,
+          "rms": 1.0239853850918778e-07
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    },
+    {
+      "calibrated_oscar_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 2.80726524698548,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "k_quantization_error_in_rotated_basis": {
+          "max_abs": 1.8198540356120247,
+          "mean_abs": 0.7014823660186761,
+          "relative_l2": 0.5348412340677642,
+          "rms": 0.8144437769578309
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 2931,
+            "agreement": 0.47705078125,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 44.031058901973914,
+            "mean_abs": 0.9583746476948614,
+            "relative_l2": 0.239697698756307,
+            "rms": 1.2947535713316753
+          },
+          "attention_score_logits": {
+            "max_abs": 5.749995642166159,
+            "mean_abs": 0.8519057577925062,
+            "relative_l2": 0.1487647741893514,
+            "rms": 1.0839599809518479
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.852184416934868,
+            "mean_abs": 0.0026454231438496623,
+            "relative_l2": 0.6579137017612988,
+            "rms": 0.017914625247224
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "last dimension of each [token, KV-head, head_dim] row",
+          "mean_scale": 6.042945178691298,
+          "metadata_dtype": "not serialized; upstream simulation dequantizes from FP32 params",
+          "quantizer": "FutureMLS-Lab_OSCAR_simulate_int2_asym",
+          "rounding": "int32(x_fp32/scale + zero + 0.5), clamped [0,3]",
+          "scale": "(row_max-row_min)/3, clamped to 1e-8 before division",
+          "zero": "-row_min/scale"
+        },
+        "v_quantization_error_in_rotated_basis": {
+          "max_abs": 6.050539037519208,
+          "mean_abs": 1.4842727242142437,
+          "relative_l2": 0.3096010421853925,
+          "rms": 1.7056767860079132
+        }
+      },
+      "diagnostic_compute_dtype": "torch.float64; upstream quantizer parameters use FP32",
+      "fixed_hadamard_int2": {
+        "codes": {
+          "k_max": 3,
+          "k_min": 0,
+          "v_max": 3,
+          "v_min": 0
+        },
+        "k_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 3.8424224853515625,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "k_quantization_error_in_hadamard_basis": {
+          "max_abs": 11.800676822662354,
+          "mean_abs": 1.9608017447598627,
+          "relative_l2": 1.613719179943462,
+          "rms": 2.4573339903396145
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 309,
+            "agreement": 0.05029296875,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 128.00924073805564,
+            "mean_abs": 6.354515497218178,
+            "relative_l2": 1.5340698564032742,
+            "rms": 8.286447619464873
+          },
+          "attention_score_logits": {
+            "max_abs": 27.028838394209743,
+            "mean_abs": 7.726721698673687,
+            "relative_l2": 1.2058195619748957,
+            "rms": 8.786086333623661
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 0.9983192821485869,
+            "mean_abs": 0.00610191180166323,
+            "relative_l2": 1.154672502569227,
+            "rms": 0.031441091911332486
+          }
+        },
+        "v_params": {
+          "bits": 2,
+          "code_max": 3,
+          "code_min": 0,
+          "grouping": "one full D=256 row per token and KV head",
+          "k_clip_ratio": 0.93,
+          "mean_scale": 12.87664794921875,
+          "metadata_dtype": "BF16 (scale, zero)",
+          "quantizer": "existing_runtime_oscar_affine_q2",
+          "v_clip_ratio": 0.91
+        },
+        "v_quantization_error_in_hadamard_basis": {
+          "max_abs": 93.99323844909668,
+          "mean_abs": 6.793154739705372,
+          "relative_l2": 1.5891764999466946,
+          "rms": 8.755207818242832
+        }
+      },
+      "gqa_mapping": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "layer": 63,
+      "rotated_bf16": {
+        "k_roundtrip": {
+          "max_abs": 2.592647654342528e-07,
+          "mean_abs": 4.356463258775151e-08,
+          "relative_l2": 3.588188473355594e-08,
+          "rms": 5.46400985308434e-08
+        },
+        "metrics_vs_bf16": {
+          "attention_argmax": {
+            "agree": 6144,
+            "agreement": 1.0,
+            "total": 6144
+          },
+          "attention_output_original_coordinates": {
+            "max_abs": 1.7102738425478492e-06,
+            "mean_abs": 1.5505717430683568e-07,
+            "relative_l2": 3.626698606764379e-08,
+            "rms": 1.9590012743617343e-07
+          },
+          "attention_score_logits": {
+            "max_abs": 2.7318417039623455e-07,
+            "mean_abs": 5.997166852283535e-08,
+            "relative_l2": 1.0142739710231336e-08,
+            "rms": 7.390408114429013e-08
+          },
+          "layer_output": {
+            "available": false,
+            "reason": "Phase B2 contains no output-projection weights, residual input, or post-projection activation"
+          },
+          "softmax": {
+            "max_abs": 3.556130567794469e-08,
+            "mean_abs": 8.728180207977523e-11,
+            "relative_l2": 1.7301531847378197e-08,
+            "rms": 4.711111174899133e-10
+          }
+        },
+        "q_roundtrip": {
+          "max_abs": 2.7356332987782395e-07,
+          "mean_abs": 3.6244755393528234e-08,
+          "relative_l2": 3.527123710895615e-08,
+          "rms": 4.5768705632888e-08
+        },
+        "v_roundtrip": {
+          "max_abs": 1.0324260286687093e-06,
+          "mean_abs": 1.5814487295520525e-07,
+          "relative_l2": 3.605392053359783e-08,
+          "rms": 1.9863090534289387e-07
+        }
+      },
+      "shapes": {
+        "k": [
+          256,
+          4,
+          256
+        ],
+        "q": [
+          256,
+          24,
+          256
+        ],
+        "v": [
+          256,
+          4,
+          256
+        ]
+      },
+      "source_dtype": "torch.bfloat16"
+    }
+  ],
+  "rotation_dir": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\phase-b3-qqt-sst-r-h-pbr",
+  "rotation_hashes": {
+    "k": "a5d424c835d82d055ae26b8001581b2e5389d825a4a01bd47ad1fbe12b5981fa",
+    "v": "cccf5eb11910034ac05b0716ddc98d3ed6c946cfc7a2e917e0ddaf7a8041abd7"
+  },
+  "schema": "oscar-int2-reference-v1",
+  "tokens": 256,
+  "upstream_path": "D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\upstream_compute_kv_rotation.py",
+  "upstream_sha256": "f7f9f738be5dea75cc1d7e8d6928e4ee91df1cbf1e1c7b7d9c7d308b55d4da8b"
+}

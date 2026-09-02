@@ -6,6 +6,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "runtime/engine/context_cost.h"
+#include "runtime/engine/hierarchical_vericache.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -22,6 +23,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <array>
 #include <memory>
@@ -404,6 +406,10 @@ struct DecodeGraphProfile {
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
+    // Greedy DFlash profiles capture the fused target-head/argmax route. Keep this bit in the
+    // internal profile rather than the public model profile: it is a serving-mode choice, not a
+    // change to the attention topology or artifact ABI.
+    bool greedy_target_head = false;
     DecodeGraphDefinition definition;
 };
 
@@ -580,6 +586,8 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
+    void populate_hierarchical_vericache_stats(RuntimeStats& out) const noexcept;
+
     void reset_memory_peaks() noexcept;
 
     friend struct qwen3_6::detail::PressurePlanningSessionImpl<Variant>;
@@ -590,19 +598,29 @@ public:
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
+    const HierarchicalVeriCacheOptions hierarchical_vericache_options;
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    // Adaptive K is eager-only until every runtime K has a dedicated captured graph profile.
+    const bool dflash2_adaptive_k;
     const SpeculativeBackend speculative_backend;
+    const KvCacheStorage kv_storage;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
+    const DType mtp_kv_dtype;
+    const std::int32_t mtp_kv_quant_group;
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
+
+    runtime::AdaptiveHierarchicalVeriCacheController hierarchical_vericache;
+    std::array<runtime::NestedHierarchicalVeriCacheTransaction, kMaximumConcurrency>
+        hierarchical_transactions;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
@@ -619,6 +637,38 @@ public:
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_6::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
+    struct HierarchicalHostSnapshot {
+        std::optional<StateImageHandle> state;
+        std::optional<StateImageTransfer> transfer;
+        // The inactive KV address spaces are the immutable logical manifest for this checkpoint.
+        // Keeping them alive is what prevents a Host extent from being reclaimed merely because
+        // the serving sequence has moved on to its copy-on-write successor.
+        std::optional<KVAddressSpaceHandle> text_kv_checkpoint;
+        std::optional<KVAddressSpaceHandle> backend_kv_checkpoint;
+        // Host-KV extents owned by this hierarchical checkpoint.  Older, already-published
+        // extents can be reused by later checkpoints; only newly copied extents are appended.
+        std::vector<HostKVExtentCapability> text_kv_extents;
+        std::vector<HostKVExtentCapability> backend_kv_extents;
+        // Reservations keep the source logical pages pinned until the asynchronous D2H DMA has
+        // completed. They must not be published early: a Host verifier may only observe a fully
+        // copied extent.
+        std::vector<HostKVExtentReservation> pending_text_kv_extents;
+        std::vector<HostKVExtentReservation> pending_backend_kv_extents;
+        // Prefix-forking replaces the active address space before the host DMA is complete. Keep
+        // the superseded descriptors alive until publication so a failed transfer can unwind
+        // without leaking their device replicas.
+        std::optional<KVAddressSpaceHandle> superseded_text_address;
+        std::optional<KVAddressSpaceHandle> superseded_backend_address;
+        std::vector<LogicalKVPageHandle> superseded_text_pages;
+        std::vector<LogicalKVPageHandle> superseded_backend_pages;
+        std::uint32_t frontier = 0;
+        std::uint32_t backend_frontier = 0;
+        std::uint64_t state_content_epoch = 0;
+        std::uint64_t pending_host_kv_bytes = 0;
+        std::uint32_t pending_host_kv_pages = 0;
+        std::chrono::steady_clock::time_point host_kv_transfer_started{};
+    };
+    std::array<HierarchicalHostSnapshot, kMaximumConcurrency> hierarchical_host_snapshots;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
@@ -644,6 +694,10 @@ public:
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
+    // D1.3-only teacher-forced ordinary decode. The committed forced token becomes the next
+    // ordinary decode input, so this does not alter the DFlash/MTP paths or production behavior.
+    std::vector<TokenId> oscar_forced_decode_tokens_;
+    std::size_t oscar_forced_decode_step_ = 0;
     std::optional<PinnedHostBuffer> mtp_host;
     qwen3_6::MtpDecodeIngress* mtp_host_ingress = nullptr;
     qwen3_6::MtpDecodeEgress* mtp_host_egress   = nullptr;
@@ -662,6 +716,13 @@ private:
     std::uint64_t resource_revision_            = 1;
     std::uint32_t pressure_planning_generation_ = 0;
     bool pressure_planning_active_              = false;
+
+    void begin_hierarchical_speculation(std::uint32_t lane,
+                                        runtime::HierarchicalVeriCacheFrontier base,
+                                        runtime::HierarchicalVeriCacheFrontier proposed);
+    void commit_hierarchical_speculation(
+        std::uint32_t lane, runtime::HierarchicalVeriCacheFrontier final_frontier) noexcept;
+    void rollback_hierarchical_speculation(std::uint32_t lane) noexcept;
 
     struct MaterializationSourceProtection {
         struct StateOwnershipCandidate {
@@ -806,6 +867,10 @@ private:
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
+    CudaCompletionEvent hierarchical_snapshot_source_ready_;
+    CudaCompletionEvent hierarchical_snapshot_tail_ready_;
+    CudaCompletionEvent hierarchical_snapshot_state_ready_;
+    CudaCompletionEvent hierarchical_snapshot_completion_;
     std::vector<TokenId> materialization_ledger_;
     qwen3_6::detail::ResidentPrefixIdentity materialization_identity_;
     qwen3_6::detail::PrefixShortlistDigests materialization_prefix_digests_;
@@ -1036,6 +1101,13 @@ private:
     void release_continuation_slot(std::uint32_t index) noexcept;
     void clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
+    void reap_hierarchical_host_snapshots();
+    void discard_hierarchical_host_snapshot(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool validate_hierarchical_host_snapshot(
+        const HierarchicalHostSnapshot& snapshot) const noexcept;
+    [[nodiscard]] bool snapshot_hierarchical_host_kv(SequenceState& sequence,
+                                                     HierarchicalHostSnapshot& snapshot);
+    void maybe_snapshot_hierarchical_host_tier(SequenceState& sequence);
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
     [[nodiscard]] std::uint32_t state_footprint(const SequenceState& sequence) const noexcept;
@@ -1102,6 +1174,9 @@ private:
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] std::uint32_t
+    select_dflash_k(std::span<const std::uint32_t> lanes,
+                    std::span<const runtime::RoundBudget> budgets) const noexcept;
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);

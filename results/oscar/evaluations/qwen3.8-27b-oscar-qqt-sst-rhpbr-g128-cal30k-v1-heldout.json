@@ -1,0 +1,1765 @@
+{
+  "aggregate": {
+    "calibrated_oscar_int2_10k_assets": {
+      "attention_argmax": {
+        "agree": 194837,
+        "agreement": 0.49549611409505206,
+        "total": 393216
+      },
+      "attention_output_original_coordinates": {
+        "max_abs": 39.49778622261782,
+        "mean_abs": 0.29581144235981816,
+        "relative_l2": 0.30570459249406345,
+        "rms": 0.5238742489121562
+      },
+      "attention_score_logits": {
+        "max_abs": 6.932930609703796,
+        "mean_abs": 0.7551661324124522,
+        "relative_l2": 0.16967878772601086,
+        "rms": 0.9574267700374598
+      },
+      "layer_output": {
+        "available": false,
+        "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+      },
+      "softmax": {
+        "max_abs": 0.87486507067705,
+        "mean_abs": 0.0024461215712716093,
+        "relative_l2": 0.5467491316987736,
+        "rms": 0.01342527727865575
+      }
+    },
+    "calibrated_oscar_int2_30k_assets": {
+      "attention_argmax": {
+        "agree": 184448,
+        "agreement": 0.4690755208333333,
+        "total": 393216
+      },
+      "attention_output_original_coordinates": {
+        "max_abs": 39.59547075694421,
+        "mean_abs": 0.2940526709141265,
+        "relative_l2": 0.3025147417055443,
+        "rms": 0.518407923815945
+      },
+      "attention_score_logits": {
+        "max_abs": 7.722678176229401,
+        "mean_abs": 0.7574742163531019,
+        "relative_l2": 0.1702245179616084,
+        "rms": 0.9605060985957451
+      },
+      "layer_output": {
+        "available": false,
+        "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+      },
+      "softmax": {
+        "max_abs": 0.9168377601503277,
+        "mean_abs": 0.0024795251315827055,
+        "relative_l2": 0.5568186689863812,
+        "rms": 0.013672532047463272
+      }
+    },
+    "rotated_bf16_30k_assets": {
+      "attention_argmax": {
+        "agree": 393216,
+        "agreement": 1.0,
+        "total": 393216
+      },
+      "attention_output_original_coordinates": {
+        "max_abs": 3.7461608037858696e-06,
+        "mean_abs": 3.387337861970931e-08,
+        "relative_l2": 3.777895352111409e-08,
+        "rms": 6.474034537425287e-08
+      },
+      "attention_score_logits": {
+        "max_abs": 4.309936603164033e-07,
+        "mean_abs": 5.217521255466165e-08,
+        "relative_l2": 1.172065450227741e-08,
+        "rms": 6.613477461284483e-08
+      },
+      "layer_output": {
+        "available": false,
+        "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+      },
+      "softmax": {
+        "max_abs": 8.126785522311053e-08,
+        "mean_abs": 1.2120357499749714e-10,
+        "relative_l2": 2.8898268956311286e-08,
+        "rms": 7.09589190212735e-10
+      }
+    }
+  },
+  "cal10k_assets": {
+    "k_path": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\phase-c3-cal10k-qqt-sst-r-h-pbr\\k_rotation_qqt_r_h_pbr.pt",
+    "k_sha256": "322b6d56a51f3948bd3fae6d0650bd916c47b3b62bb5cee73c1d5173644582dc",
+    "v_path": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\phase-c3-cal10k-qqt-sst-r-h-pbr\\v_rotation_sst_r_h_pbr.pt",
+    "v_sha256": "26a1471d90788c528bb0d8ad3ea3a8e697f841fd220b6b5334083bdbc7f3b379"
+  },
+  "cal30k_assets": {
+    "k_path": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1\\k_rotation_qqt_r_h_pbr.pt",
+    "k_sha256": "f2b97b27bb3c453e4e01f1303c9ab21ef96bcf595b48569ad5cbfb2799cfda08",
+    "v_path": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1\\v_rotation_sst_r_h_pbr.pt",
+    "v_sha256": "516bb00b45ba37dadc311b20de3620b0b0e792a3e6a5b76951ef4d24c87036da"
+  },
+  "gqa_ratio": 6,
+  "head_dim": 256,
+  "heldout_chunks": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "heldout_conversion": {
+    "chunks": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "input_kind": "deterministic_request_formula_v1_cal30k_heldout_seed40019",
+    "path": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\dumps\\qwen3.8-27b-oscar-qqt-sst-rhpbr-g128-cal30k-v1-heldout-1024-official\\conversion_manifest.json",
+    "raw_manifest_sha256": "605efbc46d60c50eeb4da5682a1ab03f7e065904df25d05c843f969b268a34b3",
+    "sha256": "7b7115c03cdab3abeb37ff21d3aa6ed595723637b5bf765691466edf59bb351a",
+    "target_runtime_group_size": 128,
+    "useful_tokens": 1024
+  },
+  "heldout_tokens": 1024,
+  "kv_heads": 4,
+  "layers": [
+    3,
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    35,
+    39,
+    43,
+    47,
+    51,
+    55,
+    59,
+    63
+  ],
+  "outliers": {
+    "calibrated_oscar_int2_10k_assets": [
+      {
+        "layer": 47,
+        "max_abs": 39.49778622261782,
+        "relative_l2": 0.5584435532327143
+      },
+      {
+        "layer": 43,
+        "max_abs": 38.38748863704674,
+        "relative_l2": 0.4964158580741973
+      },
+      {
+        "layer": 51,
+        "max_abs": 32.04063366635648,
+        "relative_l2": 0.5450886691100322
+      },
+      {
+        "layer": 31,
+        "max_abs": 27.114617980218824,
+        "relative_l2": 0.5222777282481182
+      },
+      {
+        "layer": 35,
+        "max_abs": 24.877948096942472,
+        "relative_l2": 0.46836572796257553
+      },
+      {
+        "layer": 27,
+        "max_abs": 24.48292024790301,
+        "relative_l2": 0.5625690638374695
+      },
+      {
+        "layer": 59,
+        "max_abs": 20.90363777720276,
+        "relative_l2": 0.3027994713038453
+      },
+      {
+        "layer": 63,
+        "max_abs": 20.263011794756764,
+        "relative_l2": 0.22161822982505766
+      },
+      {
+        "layer": 39,
+        "max_abs": 19.210417084247716,
+        "relative_l2": 0.5539867038847953
+      },
+      {
+        "layer": 55,
+        "max_abs": 14.548585851240228,
+        "relative_l2": 0.5330821498632589
+      },
+      {
+        "layer": 23,
+        "max_abs": 8.138381125485589,
+        "relative_l2": 0.49906647995660086
+      },
+      {
+        "layer": 7,
+        "max_abs": 7.4763596173105755,
+        "relative_l2": 0.4419405534624078
+      },
+      {
+        "layer": 19,
+        "max_abs": 6.117140040663431,
+        "relative_l2": 0.4668008308304735
+      },
+      {
+        "layer": 11,
+        "max_abs": 6.098431873952029,
+        "relative_l2": 0.42992717870137737
+      },
+      {
+        "layer": 15,
+        "max_abs": 3.6548593267859952,
+        "relative_l2": 0.4472311717898991
+      },
+      {
+        "layer": 3,
+        "max_abs": 3.626708781254004,
+        "relative_l2": 0.43133258302735605
+      }
+    ],
+    "calibrated_oscar_int2_30k_assets": [
+      {
+        "layer": 59,
+        "max_abs": 39.59547075694421,
+        "relative_l2": 0.30064511896511525
+      },
+      {
+        "layer": 43,
+        "max_abs": 33.857726061301165,
+        "relative_l2": 0.525869805588014
+      },
+      {
+        "layer": 47,
+        "max_abs": 31.749875343681868,
+        "relative_l2": 0.48264011022805353
+      },
+      {
+        "layer": 51,
+        "max_abs": 29.507699286278473,
+        "relative_l2": 0.5156639695076163
+      },
+      {
+        "layer": 63,
+        "max_abs": 28.70199914474266,
+        "relative_l2": 0.2198075039356569
+      },
+      {
+        "layer": 31,
+        "max_abs": 27.693244358471127,
+        "relative_l2": 0.4642220510491903
+      },
+      {
+        "layer": 35,
+        "max_abs": 24.701868586202593,
+        "relative_l2": 0.49831960855503005
+      },
+      {
+        "layer": 39,
+        "max_abs": 24.045486000789772,
+        "relative_l2": 0.6260657607262572
+      },
+      {
+        "layer": 27,
+        "max_abs": 22.143459808487652,
+        "relative_l2": 0.5195643813817549
+      },
+      {
+        "layer": 55,
+        "max_abs": 14.713834931406755,
+        "relative_l2": 0.555171048373307
+      },
+      {
+        "layer": 23,
+        "max_abs": 8.338178204167743,
+        "relative_l2": 0.5170988631440985
+      },
+      {
+        "layer": 7,
+        "max_abs": 7.6027851740499806,
+        "relative_l2": 0.44752653894271577
+      },
+      {
+        "layer": 11,
+        "max_abs": 5.992789810511374,
+        "relative_l2": 0.4408571110121742
+      },
+      {
+        "layer": 19,
+        "max_abs": 5.023315220655709,
+        "relative_l2": 0.47379018699524017
+      },
+      {
+        "layer": 3,
+        "max_abs": 3.279474840750506,
+        "relative_l2": 0.4215441741564075
+      },
+      {
+        "layer": 15,
+        "max_abs": 2.9784976917054435,
+        "relative_l2": 0.43503697651398504
+      }
+    ]
+  },
+  "paths": {
+    "calibrated_oscar_int2_10k_assets": "same reference semantics using the previous 10K assets",
+    "calibrated_oscar_int2_30k_assets": "Q/K rotated by 30K R_K; K/V upstream INT2; V output recovered with R_V.T",
+    "rotated_bf16_30k_assets": "Q/K/V rotated by 30K assets; no quantization; V output recovered with R_V.T"
+  },
+  "per_layer": [
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 10503,
+          "agreement": 0.4273681640625,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 3.626708781254004,
+          "mean_abs": 0.14060461108979194,
+          "relative_l2": 0.43133258302735605,
+          "rms": 0.199723708716771
+        },
+        "attention_score_logits": {
+          "max_abs": 5.01280519854463,
+          "mean_abs": 0.6203296550894698,
+          "relative_l2": 0.13480391684719434,
+          "rms": 0.7832300903922793
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.715700387512207,
+          "mean_abs": 0.002222583892333037,
+          "relative_l2": 0.6109169139025006,
+          "rms": 0.010656002255635313
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 10617,
+          "agreement": 0.4320068359375,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 3.279474840750506,
+          "mean_abs": 0.1369827503218672,
+          "relative_l2": 0.4215441741564075,
+          "rms": 0.19519129591266343
+        },
+        "attention_score_logits": {
+          "max_abs": 4.532714739225908,
+          "mean_abs": 0.6246196431563183,
+          "relative_l2": 0.13515674624678625,
+          "rms": 0.7852800798065238
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7348109818020194,
+          "mean_abs": 0.002206515417090368,
+          "relative_l2": 0.5919087530784236,
+          "rms": 0.010324449797342811
+        }
+      },
+      "layer": 3,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 2.0536351819089305e-07,
+          "mean_abs": 1.2945501174995988e-08,
+          "relative_l2": 3.8598816865292544e-08,
+          "rms": 1.787274868573225e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 2.7873928143407056e-07,
+          "mean_abs": 3.9597725973540015e-08,
+          "relative_l2": 8.532228614420943e-09,
+          "rms": 4.957347193773023e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 4.004145182090468e-08,
+          "mean_abs": 1.0615238266530082e-10,
+          "relative_l2": 2.68755355740209e-08,
+          "rms": 4.687802239240009e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 12475,
+          "agreement": 0.5076090494791666,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 7.4763596173105755,
+          "mean_abs": 0.16660313921341485,
+          "relative_l2": 0.4419405534624078,
+          "rms": 0.23617913204312815
+        },
+        "attention_score_logits": {
+          "max_abs": 5.298603397238482,
+          "mean_abs": 0.6975894427839581,
+          "relative_l2": 0.1822245801573709,
+          "rms": 0.8804995407572911
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8154025409177671,
+          "mean_abs": 0.0022612018361688932,
+          "relative_l2": 0.5132628367534762,
+          "rms": 0.013617016968394496
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 12279,
+          "agreement": 0.4996337890625,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 7.6027851740499806,
+          "mean_abs": 0.1673399899532304,
+          "relative_l2": 0.44752653894271577,
+          "rms": 0.2391643597892777
+        },
+        "attention_score_logits": {
+          "max_abs": 5.590678605353435,
+          "mean_abs": 0.7046411108052185,
+          "relative_l2": 0.18415122773941967,
+          "rms": 0.8898090000504889
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7294975805237822,
+          "mean_abs": 0.002265131495121569,
+          "relative_l2": 0.51632807810917,
+          "rms": 0.013698338740718245
+        }
+      },
+      "layer": 7,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 4.976364920139531e-07,
+          "mean_abs": 1.533148085215654e-08,
+          "relative_l2": 3.832216283818242e-08,
+          "rms": 2.047989279605052e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.3133305343824304e-07,
+          "mean_abs": 4.984007103534371e-08,
+          "relative_l2": 1.3042061398024461e-08,
+          "rms": 6.301855140273418e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 5.2548214946046556e-08,
+          "mean_abs": 1.1482831167777324e-10,
+          "relative_l2": 2.490424795512841e-08,
+          "rms": 6.607171661504298e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 13589,
+          "agreement": 0.5529378255208334,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 6.098431873952029,
+          "mean_abs": 0.16663078508391266,
+          "relative_l2": 0.42992717870137737,
+          "rms": 0.23509276294814538
+        },
+        "attention_score_logits": {
+          "max_abs": 5.05678979562615,
+          "mean_abs": 0.7371561252161303,
+          "relative_l2": 0.21695379448191118,
+          "rms": 0.9285828081162336
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7755905554821801,
+          "mean_abs": 0.0022892419904786136,
+          "relative_l2": 0.4871190592647396,
+          "rms": 0.014491428917369766
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 14180,
+          "agreement": 0.5769856770833334,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 5.992789810511374,
+          "mean_abs": 0.17066013103677233,
+          "relative_l2": 0.4408571110121742,
+          "rms": 0.2410694681044533
+        },
+        "attention_score_logits": {
+          "max_abs": 5.726645850955849,
+          "mean_abs": 0.7426319196715624,
+          "relative_l2": 0.21866998714330974,
+          "rms": 0.9359282754061491
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7723102542859973,
+          "mean_abs": 0.0022707048774394814,
+          "relative_l2": 0.4796307391008837,
+          "rms": 0.014268656974246004
+        }
+      },
+      "layer": 11,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 3.2214409984021586e-07,
+          "mean_abs": 1.5600020198748344e-08,
+          "relative_l2": 3.743968708309512e-08,
+          "rms": 2.0472768218248547e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.404884676427855e-07,
+          "mean_abs": 5.125641567352826e-08,
+          "relative_l2": 1.507561033291994e-08,
+          "rms": 6.452504142846919e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 5.919466400383655e-08,
+          "mean_abs": 1.1940311836663467e-10,
+          "relative_l2": 2.4124850876237622e-08,
+          "rms": 7.17696331042429e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 16020,
+          "agreement": 0.65185546875,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 3.6548593267859952,
+          "mean_abs": 0.14800480058424226,
+          "relative_l2": 0.4472311717898991,
+          "rms": 0.20518009917854893
+        },
+        "attention_score_logits": {
+          "max_abs": 5.73749289665577,
+          "mean_abs": 0.7365033969128454,
+          "relative_l2": 0.19037475312110613,
+          "rms": 0.9300413508617533
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7906818970940223,
+          "mean_abs": 0.0020739387918192295,
+          "relative_l2": 0.39832042457225014,
+          "rms": 0.013508072461377465
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 16263,
+          "agreement": 0.6617431640625,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 2.9784976917054435,
+          "mean_abs": 0.14400380986463424,
+          "relative_l2": 0.43503697651398504,
+          "rms": 0.19958566311520132
+        },
+        "attention_score_logits": {
+          "max_abs": 7.722678176229401,
+          "mean_abs": 0.7293482612409712,
+          "relative_l2": 0.18866726229369618,
+          "rms": 0.9216997139079384
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8619262065760235,
+          "mean_abs": 0.0020211634113607093,
+          "relative_l2": 0.3849494586724588,
+          "rms": 0.013054628537564245
+        }
+      },
+      "layer": 15,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 2.695018817000516e-07,
+          "mean_abs": 1.4219525033498294e-08,
+          "relative_l2": 4.045108493768912e-08,
+          "rms": 1.855809286767255e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.3663041776321734e-07,
+          "mean_abs": 4.936259959894077e-08,
+          "relative_l2": 1.2723842593826498e-08,
+          "rms": 6.216002678982726e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 6.373529282122092e-08,
+          "mean_abs": 1.1661063134404107e-10,
+          "relative_l2": 2.4184047283507547e-08,
+          "rms": 8.201433894980783e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 14129,
+          "agreement": 0.5749104817708334,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 6.117140040663431,
+          "mean_abs": 0.18514499900304604,
+          "relative_l2": 0.4668008308304735,
+          "rms": 0.2719789594227795
+        },
+        "attention_score_logits": {
+          "max_abs": 5.748393633854919,
+          "mean_abs": 0.7223534465878564,
+          "relative_l2": 0.1815916865367218,
+          "rms": 0.9131555862005108
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7686664037936746,
+          "mean_abs": 0.0022238714542743543,
+          "relative_l2": 0.4709620528457268,
+          "rms": 0.013444138282311956
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 14041,
+          "agreement": 0.5713297526041666,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 5.023315220655709,
+          "mean_abs": 0.18870044109051823,
+          "relative_l2": 0.47379018699524017,
+          "rms": 0.2760512696912648
+        },
+        "attention_score_logits": {
+          "max_abs": 5.4946853699015215,
+          "mean_abs": 0.7227893278625841,
+          "relative_l2": 0.18202258570749608,
+          "rms": 0.9153224143873405
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7794342913527637,
+          "mean_abs": 0.002240162070778026,
+          "relative_l2": 0.47976532658187276,
+          "rms": 0.01369543757220307
+        }
+      },
+      "layer": 19,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 4.922615124414165e-07,
+          "mean_abs": 1.7483079982735213e-08,
+          "relative_l2": 4.015745813249027e-08,
+          "rms": 2.3397524071470724e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.472643732571612e-07,
+          "mean_abs": 4.84397070231969e-08,
+          "relative_l2": 1.2102267717480197e-08,
+          "rms": 6.085770545270167e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 5.964805205316281e-08,
+          "mean_abs": 1.1948407673714137e-10,
+          "relative_l2": 2.548113443325365e-08,
+          "rms": 7.273874675059207e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 15604,
+          "agreement": 0.6349283854166666,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 8.138381125485589,
+          "mean_abs": 0.20137231311572912,
+          "relative_l2": 0.49906647995660086,
+          "rms": 0.2847120403278668
+        },
+        "attention_score_logits": {
+          "max_abs": 5.510728962750447,
+          "mean_abs": 0.7529090401489388,
+          "relative_l2": 0.19236590276392682,
+          "rms": 0.9526062651592377
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8081212124736359,
+          "mean_abs": 0.002162538045687411,
+          "relative_l2": 0.4314609800405811,
+          "rms": 0.014031400487624805
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 15009,
+          "agreement": 0.6107177734375,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 8.338178204167743,
+          "mean_abs": 0.20649881244254023,
+          "relative_l2": 0.5170988631440985,
+          "rms": 0.2949993203105513
+        },
+        "attention_score_logits": {
+          "max_abs": 5.03166483679148,
+          "mean_abs": 0.761262755664111,
+          "relative_l2": 0.1943871627284235,
+          "rms": 0.9626156528835168
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8087178018781406,
+          "mean_abs": 0.002267253561543169,
+          "relative_l2": 0.4663934931666676,
+          "rms": 0.015167429246622269
+        }
+      },
+      "layer": 23,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 7.211092096781613e-07,
+          "mean_abs": 1.7461694167148677e-08,
+          "relative_l2": 4.099366111960683e-08,
+          "rms": 2.3386441218988212e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.596858446641704e-07,
+          "mean_abs": 5.3572594633430854e-08,
+          "relative_l2": 1.3644246927597605e-08,
+          "rms": 6.756704239087489e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 6.766227905741218e-08,
+          "mean_abs": 1.2153741814551652e-10,
+          "relative_l2": 2.689275045773787e-08,
+          "rms": 8.745702840863716e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 14701,
+          "agreement": 0.5981852213541666,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 24.48292024790301,
+          "mean_abs": 0.24535086090129657,
+          "relative_l2": 0.5625690638374695,
+          "rms": 0.44590584579885173
+        },
+        "attention_score_logits": {
+          "max_abs": 6.3401519701555245,
+          "mean_abs": 0.826290680384296,
+          "relative_l2": 0.20846124415890227,
+          "rms": 1.0445411625834822
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8072561327161227,
+          "mean_abs": 0.0025501091628547553,
+          "relative_l2": 0.6061861625975157,
+          "rms": 0.016403225247886788
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 12328,
+          "agreement": 0.5016276041666666,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 22.143459808487652,
+          "mean_abs": 0.2341121655981876,
+          "relative_l2": 0.5195643813817549,
+          "rms": 0.4118192944109735
+        },
+        "attention_score_logits": {
+          "max_abs": 6.111788840831272,
+          "mean_abs": 0.8283371343614556,
+          "relative_l2": 0.20885541191337767,
+          "rms": 1.0465162272827933
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8154777544679175,
+          "mean_abs": 0.0026695087339440675,
+          "relative_l2": 0.6249607230968979,
+          "rms": 0.01691125951822021
+        }
+      },
+      "layer": 27,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 1.605802596671424e-06,
+          "mean_abs": 2.3995162437842712e-08,
+          "relative_l2": 4.601299520925127e-08,
+          "rms": 3.647101283274146e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.7754252879551586e-07,
+          "mean_abs": 5.5188778062521005e-08,
+          "relative_l2": 1.3888329246464772e-08,
+          "rms": 6.959054492827643e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 8.126785522311053e-08,
+          "mean_abs": 1.5196315079145748e-10,
+          "relative_l2": 3.8556580209683295e-08,
+          "rms": 1.0433301005380636e-09
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 12194,
+          "agreement": 0.4961751302083333,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 27.114617980218824,
+          "mean_abs": 0.24388476443817866,
+          "relative_l2": 0.5222777282481182,
+          "rms": 0.4068279582592628
+        },
+        "attention_score_logits": {
+          "max_abs": 6.810597754349564,
+          "mean_abs": 0.7994947827701194,
+          "relative_l2": 0.16426142527825546,
+          "rms": 1.0147649040777316
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8723046094489312,
+          "mean_abs": 0.002668260574935462,
+          "relative_l2": 0.6478271910060543,
+          "rms": 0.015321423656200872
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 11717,
+          "agreement": 0.4767659505208333,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 27.693244358471127,
+          "mean_abs": 0.2210772732901416,
+          "relative_l2": 0.4642220510491903,
+          "rms": 0.3616055194249992
+        },
+        "attention_score_logits": {
+          "max_abs": 6.824273222385134,
+          "mean_abs": 0.7930572208060169,
+          "relative_l2": 0.16309902004917817,
+          "rms": 1.0075838630707765
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8550341306270737,
+          "mean_abs": 0.002612620009536296,
+          "relative_l2": 0.6184829512564196,
+          "rms": 0.014627418317562526
+        }
+      },
+      "layer": 31,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 2.125581589851322e-06,
+          "mean_abs": 2.3018320957666178e-08,
+          "relative_l2": 4.291794290715326e-08,
+          "rms": 3.343090876988335e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.893102924479308e-07,
+          "mean_abs": 5.4829413519652156e-08,
+          "relative_l2": 1.1214370836152539e-08,
+          "rms": 6.927950324650502e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 6.228696664001276e-08,
+          "mean_abs": 1.321162515805812e-10,
+          "relative_l2": 3.2295428102975837e-08,
+          "rms": 7.638023580881834e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 10610,
+          "agreement": 0.4317220052083333,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 24.877948096942472,
+          "mean_abs": 0.22289753488616096,
+          "relative_l2": 0.46836572796257553,
+          "rms": 0.3530697337762992
+        },
+        "attention_score_logits": {
+          "max_abs": 6.429470126949969,
+          "mean_abs": 0.7407469093662808,
+          "relative_l2": 0.15472379370568348,
+          "rms": 0.9382867973274802
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8102223372057733,
+          "mean_abs": 0.0025177107447194188,
+          "relative_l2": 0.6141248299810609,
+          "rms": 0.012954851390048757
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 10226,
+          "agreement": 0.4160970052083333,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 24.701868586202593,
+          "mean_abs": 0.22910789584317018,
+          "relative_l2": 0.49831960855503005,
+          "rms": 0.3756499697221497
+        },
+        "attention_score_logits": {
+          "max_abs": 6.918797119345397,
+          "mean_abs": 0.7525695386651238,
+          "relative_l2": 0.1573810179208552,
+          "rms": 0.9544009213346587
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8470236286488934,
+          "mean_abs": 0.002592440325107834,
+          "relative_l2": 0.645757576294605,
+          "rms": 0.013622138409796378
+        }
+      },
+      "layer": 35,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 2.0552212376401258e-06,
+          "mean_abs": 2.2338094098355697e-08,
+          "relative_l2": 4.386711727544013e-08,
+          "rms": 3.306849859691466e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.517504518768533e-07,
+          "mean_abs": 5.6335409285220586e-08,
+          "relative_l2": 1.1588867411357616e-08,
+          "rms": 7.027801624835753e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 6.802552154905328e-08,
+          "mean_abs": 1.2436999493554966e-10,
+          "relative_l2": 3.453575354241595e-08,
+          "rms": 7.285254282897929e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 14861,
+          "agreement": 0.6046956380208334,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 19.210417084247716,
+          "mean_abs": 0.22546833730506158,
+          "relative_l2": 0.5539867038847953,
+          "rms": 0.35283245094129934
+        },
+        "attention_score_logits": {
+          "max_abs": 5.956257719446148,
+          "mean_abs": 0.7936605860966196,
+          "relative_l2": 0.16447348583420643,
+          "rms": 1.0031622310974417
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8507618266075998,
+          "mean_abs": 0.002516601762491229,
+          "relative_l2": 0.5932739091828216,
+          "rms": 0.014421028085228405
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 11617,
+          "agreement": 0.4726969401041667,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 24.045486000789772,
+          "mean_abs": 0.2370559951213662,
+          "relative_l2": 0.6260657607262572,
+          "rms": 0.39873938356002686
+        },
+        "attention_score_logits": {
+          "max_abs": 6.3474753370879,
+          "mean_abs": 0.8005947982743469,
+          "relative_l2": 0.16586233041852083,
+          "rms": 1.0116331188200551
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7873504165775295,
+          "mean_abs": 0.0027723907901195666,
+          "relative_l2": 0.6746650252345194,
+          "rms": 0.0163994457306063
+        }
+      },
+      "layer": 39,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 1.27528517523956e-06,
+          "mean_abs": 1.9617319077217382e-08,
+          "relative_l2": 4.356451377497649e-08,
+          "rms": 2.7746106651121783e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 4.309936603164033e-07,
+          "mean_abs": 5.8447703639913575e-08,
+          "relative_l2": 1.2037447901868339e-08,
+          "rms": 7.341920816422589e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 6.597609958358674e-08,
+          "mean_abs": 1.3670255916817155e-10,
+          "relative_l2": 3.665315326898921e-08,
+          "rms": 8.909479154954548e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 11696,
+          "agreement": 0.4759114583333333,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 38.38748863704674,
+          "mean_abs": 0.282650872865215,
+          "relative_l2": 0.4964158580741973,
+          "rms": 0.4929928679061276
+        },
+        "attention_score_logits": {
+          "max_abs": 6.932930609703796,
+          "mean_abs": 0.8722042429318811,
+          "relative_l2": 0.180326628371413,
+          "rms": 1.1013422169278395
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.87486507067705,
+          "mean_abs": 0.0027810335970343443,
+          "relative_l2": 0.6478149597196502,
+          "rms": 0.01533805328315032
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 10969,
+          "agreement": 0.4463297526041667,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 33.857726061301165,
+          "mean_abs": 0.29823172410611615,
+          "relative_l2": 0.525869805588014,
+          "rms": 0.52224371841748
+        },
+        "attention_score_logits": {
+          "max_abs": 7.289844250672486,
+          "mean_abs": 0.8716736900338001,
+          "relative_l2": 0.18064432116465517,
+          "rms": 1.1032825209659691
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.9168377601503277,
+          "mean_abs": 0.0028088032679129365,
+          "relative_l2": 0.6575126958343407,
+          "rms": 0.015567662666233145
+        }
+      },
+      "layer": 43,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 2.8421130195965816e-06,
+          "mean_abs": 2.9830636991357694e-08,
+          "relative_l2": 4.4986218941271854e-08,
+          "rms": 4.467602058110668e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 4.1981632925569556e-07,
+          "mean_abs": 6.208806533200512e-08,
+          "relative_l2": 1.2939235322008652e-08,
+          "rms": 7.902618844256691e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 6.036780592078017e-08,
+          "mean_abs": 1.4498628638175913e-10,
+          "relative_l2": 3.39365280814294e-08,
+          "rms": 8.035014754573632e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 13340,
+          "agreement": 0.5428059895833334,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 39.49778622261782,
+          "mean_abs": 0.30023311745672404,
+          "relative_l2": 0.5584435532327143,
+          "rms": 0.5418268811442869
+        },
+        "attention_score_logits": {
+          "max_abs": 5.593099959417174,
+          "mean_abs": 0.7532436454414829,
+          "relative_l2": 0.1567414528059964,
+          "rms": 0.9522860870171607
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8027753616802825,
+          "mean_abs": 0.002554683946060826,
+          "relative_l2": 0.6663261790239341,
+          "rms": 0.013103889053502486
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 10665,
+          "agreement": 0.4339599609375,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 31.749875343681868,
+          "mean_abs": 0.27948851654798723,
+          "relative_l2": 0.48264011022805353,
+          "rms": 0.468278994584482
+        },
+        "attention_score_logits": {
+          "max_abs": 6.405909955790085,
+          "mean_abs": 0.7785456663235619,
+          "relative_l2": 0.16253957507311756,
+          "rms": 0.9875127042709765
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7869481689082621,
+          "mean_abs": 0.0026895442991926714,
+          "relative_l2": 0.701798119677582,
+          "rms": 0.013801475895308276
+        }
+      },
+      "layer": 47,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 3.7461608037858696e-06,
+          "mean_abs": 2.924993140444616e-08,
+          "relative_l2": 4.579807899513596e-08,
+          "rms": 4.443534205147043e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.5443644197385993e-07,
+          "mean_abs": 4.833531766313216e-08,
+          "relative_l2": 1.002910365281819e-08,
+          "rms": 6.093203618351541e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 7.32597592589812e-08,
+          "mean_abs": 1.272113268933552e-10,
+          "relative_l2": 3.7022193547627914e-08,
+          "rms": 7.280739254100147e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 8779,
+          "agreement": 0.3572184244791667,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 32.04063366635648,
+          "mean_abs": 0.33650147756627913,
+          "relative_l2": 0.5450886691100322,
+          "rms": 0.5538774245690097
+        },
+        "attention_score_logits": {
+          "max_abs": 6.253458092907267,
+          "mean_abs": 0.8102689428930785,
+          "relative_l2": 0.1693311930848209,
+          "rms": 1.0245892279560704
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7841317938979354,
+          "mean_abs": 0.002785389776467816,
+          "relative_l2": 0.7618573384858631,
+          "rms": 0.012420337364595323
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 8610,
+          "agreement": 0.350341796875,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 29.507699286278473,
+          "mean_abs": 0.33193944059908126,
+          "relative_l2": 0.5156639695076163,
+          "rms": 0.5239782948345536
+        },
+        "attention_score_logits": {
+          "max_abs": 5.549973498311886,
+          "mean_abs": 0.7852704992657452,
+          "relative_l2": 0.16413214688423186,
+          "rms": 0.9931308378288531
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7765853704270798,
+          "mean_abs": 0.002746800088111786,
+          "relative_l2": 0.7459487084437677,
+          "rms": 0.01216098362190636
+        }
+      },
+      "layer": 51,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 1.8599429019161562e-06,
+          "mean_abs": 3.020233370626102e-08,
+          "relative_l2": 4.026339553042308e-08,
+          "rms": 4.091258374019221e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 3.209378016677533e-07,
+          "mean_abs": 4.774516016179453e-08,
+          "relative_l2": 9.991911583289158e-09,
+          "rms": 6.045906125399685e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 5.6025591221864346e-08,
+          "mean_abs": 1.2044111146628528e-10,
+          "relative_l2": 3.1558548882375556e-08,
+          "rms": 5.144897923214667e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 8338,
+          "agreement": 0.3392740885416667,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 14.548585851240228,
+          "mean_abs": 0.3845102543803951,
+          "relative_l2": 0.5330821498632589,
+          "rms": 0.5520448210420805
+        },
+        "attention_score_logits": {
+          "max_abs": 5.414670468740784,
+          "mean_abs": 0.7441208996561187,
+          "relative_l2": 0.15998233421627053,
+          "rms": 0.9379092513464021
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7536553725819719,
+          "mean_abs": 0.002634579689656803,
+          "relative_l2": 0.7617658602084251,
+          "rms": 0.010864282842933927
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 8131,
+          "agreement": 0.3308512369791667,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 14.713834931406755,
+          "mean_abs": 0.3946179392503287,
+          "relative_l2": 0.555171048373307,
+          "rms": 0.5749194605852056
+        },
+        "attention_score_logits": {
+          "max_abs": 5.484192008803616,
+          "mean_abs": 0.7444499775091584,
+          "relative_l2": 0.16041481066324859,
+          "rms": 0.9404446791647124
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.6802183657451639,
+          "mean_abs": 0.0026482442348093158,
+          "relative_l2": 0.7647513969800429,
+          "rms": 0.010906862482714528
+        }
+      },
+      "layer": 55,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 5.509529761305032e-07,
+          "mean_abs": 2.984747351523461e-08,
+          "relative_l2": 3.879260796888001e-08,
+          "rms": 4.0172529373623166e-08
+        },
+        "attention_score_logits": {
+          "max_abs": 4.141923755085486e-07,
+          "mean_abs": 5.7289262092966586e-08,
+          "relative_l2": 1.25701785719634e-08,
+          "rms": 7.36936789394697e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 3.361594153039604e-08,
+          "mean_abs": 1.0245318094149538e-10,
+          "relative_l2": 2.689958219578355e-08,
+          "rms": 3.8364106951679577e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 7197,
+          "agreement": 0.2928466796875,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 20.90363777720276,
+          "mean_abs": 0.6168879791679136,
+          "relative_l2": 0.3027994713038453,
+          "rms": 0.8835382811432992
+        },
+        "attention_score_logits": {
+          "max_abs": 5.207191791806046,
+          "mean_abs": 0.7006424372741481,
+          "relative_l2": 0.1745557238736851,
+          "rms": 0.8897402569611031
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.7053124546959086,
+          "mean_abs": 0.002557318620216018,
+          "relative_l2": 0.7492041762574833,
+          "rms": 0.010952374861560256
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 7127,
+          "agreement": 0.2899983723958333,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 39.59547075694421,
+          "mean_abs": 0.6019945666868773,
+          "relative_l2": 0.30064511896511525,
+          "rms": 0.8772520985613337
+        },
+        "attention_score_logits": {
+          "max_abs": 5.821816186131734,
+          "mean_abs": 0.6939310427844699,
+          "relative_l2": 0.17215871383855103,
+          "rms": 0.8775222885251792
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8249028112609583,
+          "mean_abs": 0.002491701292978302,
+          "relative_l2": 0.7324242519841149,
+          "rms": 0.010707074546086088
+        }
+      },
+      "layer": 59,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 1.0478538357006073e-06,
+          "mean_abs": 8.016419095825907e-08,
+          "relative_l2": 3.824214127190395e-08,
+          "rms": 1.1158670661188884e-07
+        },
+        "attention_score_logits": {
+          "max_abs": 2.99620018573421e-07,
+          "mean_abs": 4.806510121359119e-08,
+          "relative_l2": 1.1990435937302049e-08,
+          "rms": 6.111729432402226e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 3.216020905139061e-08,
+          "mean_abs": 1.0519007337493219e-10,
+          "relative_l2": 2.7483714758164617e-08,
+          "rms": 4.0177558555968897e-10
+        }
+      }
+    },
+    {
+      "calibrated_oscar_int2_10k_assets": {
+        "attention_argmax": {
+          "agree": 10801,
+          "agreement": 0.4394938151041667,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 20.263011794756764,
+          "mean_abs": 0.8662372306997286,
+          "relative_l2": 0.22161822982505766,
+          "rms": 1.2250529101292422
+        },
+        "attention_score_logits": {
+          "max_abs": 6.044402959644957,
+          "mean_abs": 0.7751438850460148,
+          "relative_l2": 0.13607779588933502,
+          "rms": 0.9802775450421763
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8310441675233303,
+          "mean_abs": 0.0023388812551475317,
+          "relative_l2": 0.4191396416836634,
+          "rms": 0.01165826859409334
+        }
+      },
+      "calibrated_oscar_int2_30k_assets": {
+        "attention_argmax": {
+          "agree": 10669,
+          "agreement": 0.4341227213541667,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 28.70199914474266,
+          "mean_abs": 0.8630312828732052,
+          "relative_l2": 0.2198075039356569,
+          "rms": 1.2150436477052629
+        },
+        "attention_score_logits": {
+          "max_abs": 6.106592071439092,
+          "mean_abs": 0.7858648752251871,
+          "relative_l2": 0.13776229392159967,
+          "rms": 0.9924123359160648
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 0.8118008504036525,
+          "mean_abs": 0.002369418230277187,
+          "relative_l2": 0.4198210976086573,
+          "rms": 0.011677223127185707
+        }
+      },
+      "layer": 63,
+      "rotated_bf16_30k_assets": {
+        "attention_argmax": {
+          "agree": 24576,
+          "agreement": 1.0,
+          "total": 24576
+        },
+        "attention_output_original_coordinates": {
+          "max_abs": 1.1538147308698399e-06,
+          "mean_abs": 1.606692933594254e-07,
+          "relative_l2": 3.638097944331922e-08,
+          "rms": 2.0110540895291963e-07
+        },
+        "attention_score_logits": {
+          "max_abs": 3.70824044360063e-07,
+          "mean_abs": 5.4410075965808886e-08,
+          "relative_l2": 9.31683954391136e-09,
+          "rms": 6.711667054840279e-08
+        },
+        "layer_output": {
+          "available": false,
+          "reason": "QKV dumps do not contain output-projection, residual, or post-attention activation tensors"
+        },
+        "softmax": {
+          "max_abs": 3.5804410547513044e-08,
+          "mean_abs": 9.580732548995917e-11,
+          "relative_l2": 1.494496932949948e-08,
+          "rms": 4.156907370391135e-10
+        }
+      }
+    }
+  ],
+  "q_heads": 24,
+  "reference": "BF16 original-coordinate causal GQA attention; all candidate outputs recovered with R_V.T",
+  "reference_quantization": "official upstream simulate_int2_asym per [token, KV-head, 256] row; group-128 is the intended runtime target, not changed here",
+  "schema": "oscar-c4-heldout-evaluation-v1",
+  "target_runtime_group_size": 128,
+  "upstream_path": "D:\\AI\\voidinfer-adaptive-dflash2\\tools\\oscar\\upstream_compute_kv_rotation.py",
+  "upstream_sha256": "f7f9f738be5dea75cc1d7e8d6928e4ee91df1cbf1e1c7b7d9c7d308b55d4da8b"
+}

@@ -1,0 +1,182 @@
+{
+  "composition_fixture": {
+    "composition": "r_h_pbr",
+    "composition_max_abs_error": 2.220446049250313e-16,
+    "dimension": 8,
+    "pbr_orthogonality_max_abs_error": 0.0
+  },
+  "expected_layers": [
+    3,
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    35,
+    39,
+    43,
+    47,
+    51,
+    55,
+    59,
+    63
+  ],
+  "head_dim": 256,
+  "k": {
+    "dtype": "torch.float32",
+    "layers": [
+      {
+        "layer": 3,
+        "max_abs_r_rt_minus_i": 1.6162842175759806e-08
+      },
+      {
+        "layer": 7,
+        "max_abs_r_rt_minus_i": 1.4029001516036033e-08
+      },
+      {
+        "layer": 11,
+        "max_abs_r_rt_minus_i": 1.8202842344550163e-08
+      },
+      {
+        "layer": 15,
+        "max_abs_r_rt_minus_i": 1.750568290326271e-08
+      },
+      {
+        "layer": 19,
+        "max_abs_r_rt_minus_i": 1.5755945881323896e-08
+      },
+      {
+        "layer": 23,
+        "max_abs_r_rt_minus_i": 1.346792233292149e-08
+      },
+      {
+        "layer": 27,
+        "max_abs_r_rt_minus_i": 1.6913099809556797e-08
+      },
+      {
+        "layer": 31,
+        "max_abs_r_rt_minus_i": 2.01165272217807e-08
+      },
+      {
+        "layer": 35,
+        "max_abs_r_rt_minus_i": 1.565807661307872e-08
+      },
+      {
+        "layer": 39,
+        "max_abs_r_rt_minus_i": 1.974953556249659e-08
+      },
+      {
+        "layer": 43,
+        "max_abs_r_rt_minus_i": 1.734229970740131e-08
+      },
+      {
+        "layer": 47,
+        "max_abs_r_rt_minus_i": 1.8265339685186177e-08
+      },
+      {
+        "layer": 51,
+        "max_abs_r_rt_minus_i": 1.759121537325825e-08
+      },
+      {
+        "layer": 55,
+        "max_abs_r_rt_minus_i": 1.7228491078213892e-08
+      },
+      {
+        "layer": 59,
+        "max_abs_r_rt_minus_i": 1.7739004931627278e-08
+      },
+      {
+        "layer": 63,
+        "max_abs_r_rt_minus_i": 1.7064974100478025e-08
+      }
+    ],
+    "max_orthogonality_error": 2.01165272217807e-08,
+    "objective": "qqt_r_h_pbr",
+    "path": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\phase-b3-qqt-sst-r-h-pbr\\k_rotation_qqt_r_h_pbr.pt",
+    "rotation_shape": [
+      256,
+      256
+    ],
+    "sha256": "a5d424c835d82d055ae26b8001581b2e5389d825a4a01bd47ad1fbe12b5981fa"
+  },
+  "schema": "oscar-rotation-validation-v1",
+  "v": {
+    "dtype": "torch.float32",
+    "layers": [
+      {
+        "layer": 3,
+        "max_abs_r_rt_minus_i": 1.5824232812988726e-08
+      },
+      {
+        "layer": 7,
+        "max_abs_r_rt_minus_i": 1.2611040212107127e-08
+      },
+      {
+        "layer": 11,
+        "max_abs_r_rt_minus_i": 1.3489698469371092e-08
+      },
+      {
+        "layer": 15,
+        "max_abs_r_rt_minus_i": 1.7714851363592743e-08
+      },
+      {
+        "layer": 19,
+        "max_abs_r_rt_minus_i": 1.6747844222564368e-08
+      },
+      {
+        "layer": 23,
+        "max_abs_r_rt_minus_i": 1.9166137121828797e-08
+      },
+      {
+        "layer": 27,
+        "max_abs_r_rt_minus_i": 1.709784025472061e-08
+      },
+      {
+        "layer": 31,
+        "max_abs_r_rt_minus_i": 1.5015850785005114e-08
+      },
+      {
+        "layer": 35,
+        "max_abs_r_rt_minus_i": 1.3935163245548665e-08
+      },
+      {
+        "layer": 39,
+        "max_abs_r_rt_minus_i": 1.860080756088678e-08
+      },
+      {
+        "layer": 43,
+        "max_abs_r_rt_minus_i": 1.703272956010693e-08
+      },
+      {
+        "layer": 47,
+        "max_abs_r_rt_minus_i": 1.6113669953909948e-08
+      },
+      {
+        "layer": 51,
+        "max_abs_r_rt_minus_i": 1.6049822360031385e-08
+      },
+      {
+        "layer": 55,
+        "max_abs_r_rt_minus_i": 1.7320114453767133e-08
+      },
+      {
+        "layer": 59,
+        "max_abs_r_rt_minus_i": 1.6782676803828167e-08
+      },
+      {
+        "layer": 63,
+        "max_abs_r_rt_minus_i": 1.696254048333401e-08
+      }
+    ],
+    "max_orthogonality_error": 1.9166137121828797e-08,
+    "objective": "sst_r_h_pbr",
+    "path": "D:\\AI\\voidinfer-adaptive-dflash2\\results\\oscar\\rotations\\phase-b3-qqt-sst-r-h-pbr\\v_rotation_sst_r_h_pbr.pt",
+    "rotation_shape": [
+      256,
+      256
+    ],
+    "sha256": "cccf5eb11910034ac05b0716ddc98d3ed6c946cfc7a2e917e0ddaf7a8041abd7"
+  }
+}

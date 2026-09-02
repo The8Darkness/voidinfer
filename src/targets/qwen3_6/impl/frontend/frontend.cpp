@@ -18,6 +18,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -869,7 +870,9 @@ public:
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
-          split_reasoning(starts_in_reasoning && !output.raw) {
+          split_reasoning(starts_in_reasoning && !output.raw),
+          capture_only(std::getenv("NINFER_OSCAR_QKV_CAPTURE_ONLY") != nullptr &&
+                       std::string_view(std::getenv("NINFER_OSCAR_QKV_CAPTURE_ONLY")) == "1") {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -886,6 +889,7 @@ public:
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool preserve_special = false;
     bool split_reasoning  = false;
+    bool capture_only     = false;
     DecoderState state;
     DecoderState preview_state;
     SemanticThinkingState semantic;
@@ -1007,6 +1011,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         const std::uint32_t count          = static_cast<std::uint32_t>(index + 1);
         const TokenId token                = tokens[index];
         const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        if (impl_->capture_only) {
+            continue;
+        }
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         if (impl_->preview_semantic.in_reasoning) {

@@ -242,8 +242,10 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
+    engine_options.disable_dual_artifact_loading = options_.disable_dual_artifact_loading;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
+    engine_options.hierarchical_vericache   = options_.hierarchical_vericache;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;

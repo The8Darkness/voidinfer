@@ -257,7 +257,10 @@ std::vector<ops::GdnReplayFoldRow> make_rows(std::int32_t batch, std::int32_t wi
             constexpr std::int32_t kMixed[kRecordCapacity] = {0, 1, 2, 3, 16, 7, 12, 5};
             commit                                         = std::min(width, kMixed[row]);
         }
-        rows[static_cast<std::size_t>(row)] = {kSlots[row], commit};
+        // Fold rows carry source, destination, and commit extent. Use an in-place destination for
+        // the benchmark: each active row has a distinct source slot, so this is race-free and
+        // exercises the full state transition rather than the commit=0 early-return path.
+        rows[static_cast<std::size_t>(row)] = {kSlots[row], kSlots[row], commit};
     }
     return rows;
 }

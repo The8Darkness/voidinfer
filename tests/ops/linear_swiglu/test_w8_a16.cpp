@@ -18,8 +18,14 @@ int main() {
         const int failures = run_profile(
             "LinearSwiGLU W8_A16",
             {QType::W8G32_F16S, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU W8_A16 correctness\n";
-        return failures == 0 ? 0 : 1;
+        constexpr std::array<std::int32_t, 8> kQwenTokenCases{1, 2, 8, 16, 32, 40, 41, 64};
+        const int qwen_failures = run_profile(
+            "LinearSwiGLU Qwen3.8 W8_A16",
+            {QType::W8G32_F16S, 34816, 5120, 17408, 3801U, ActivationCompute::A16},
+            kQwenTokenCases);
+        std::cout << (failures == 0 && qwen_failures == 0 ? "OK" : "FAIL")
+                  << " LinearSwiGLU W8_A16 correctness\n";
+        return failures == 0 && qwen_failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "LinearSwiGLU W8_A16 test failed: " << error.what() << '\n';
         return 1;

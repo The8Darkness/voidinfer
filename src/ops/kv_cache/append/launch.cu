@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -18,6 +19,50 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
+    if (cache.dtype == DType::U8) {
+        if (cache.quant_group == kPagedKVCacheOscarQuantGroup) {
+            constexpr int FillWarps       = kBlock / 32;
+            const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
+            const int fill_grid =
+                static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+            if (cache.layout == OscarKVLayout::TransposedQ2) {
+                kv_cache_append_full_oscar_kernel<Geometry, 2, Metadata, true>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::uint8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_v.data),
+                        static_cast<__nv_bfloat16*>(cache.k_scale_pages.data),
+                        static_cast<__nv_bfloat16*>(cache.v_scale_pages.data), tokens);
+            } else {
+                kv_cache_append_full_oscar_kernel<Geometry, 2, Metadata, false>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::uint8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_v.data),
+                        static_cast<__nv_bfloat16*>(cache.k_scale_pages.data),
+                        static_cast<__nv_bfloat16*>(cache.v_scale_pages.data), tokens);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        constexpr int FillWarps       = kBlock / 32;
+        const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
+        const int fill_grid =
+            static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+        kv_cache_append_full_nvfp4_kernel<Geometry, Metadata><<<fill_grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(positions.data), metadata,
+            static_cast<std::uint8_t*>(cache_k.data), static_cast<std::uint8_t*>(cache_v.data),
+            static_cast<std::uint8_t*>(cache.k_scale_pages.data),
+            static_cast<std::uint8_t*>(cache.v_scale_pages.data), tokens);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (cache.dtype == DType::FP8_E4M3FN) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
@@ -131,6 +176,83 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     validate_plan(k, plan);
     if (plan.max_count == 0) return;
+    if (cache.dtype == DType::U8) {
+        const dim3 grid(static_cast<unsigned>(plan.max_count), k.ne[3], 1);
+        if (cache.quantization == CyclicKVCacheQuantization::OscarAffine) {
+            const auto launch_oscar = [&]<int Bits>() {
+                kv_cache_append_prefix_cyclic_oscar_kernel<Bits, false><<<grid, kBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data),
+                    static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(counts.data),
+                    static_cast<const std::int32_t*>(lanes.data),
+                    static_cast<std::uint8_t*>(cache.k.data),
+                    static_cast<std::uint8_t*>(cache.v.data),
+                    static_cast<__nv_bfloat16*>(cache.k_scale.data),
+                    static_cast<__nv_bfloat16*>(cache.v_scale.data),
+                    static_cast<__nv_bfloat16*>(cache.protected_k.data),
+                    static_cast<__nv_bfloat16*>(cache.protected_v.data),
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
+                    static_cast<int>(cache.padded_capacity), static_cast<int>(cache.protected_capacity),
+                    static_cast<int>(cache.protected_anchor_capacity),
+                    static_cast<int>(cache.protected_padded_capacity));
+            };
+            if (cache.quant_bits == 2) {
+                launch_oscar.template operator()<2>();
+            } else if (cache.quant_bits == 3) {
+                launch_oscar.template operator()<3>();
+            } else if (cache.quant_bits == 4) {
+                launch_oscar.template operator()<4>();
+            } else {
+                throw std::invalid_argument("OSCAR cyclic KV launch requires 2, 3, or 4 bits");
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        const auto launch_lowbit = [&]<int Bits>() {
+            kv_cache_append_prefix_cyclic_lowbit_kernel<Bits><<<grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(counts.data),
+                static_cast<const std::int32_t*>(lanes.data),
+                static_cast<std::uint8_t*>(cache.k.data),
+                static_cast<std::uint8_t*>(cache.v.data),
+                static_cast<std::uint8_t*>(cache.k_scale.data),
+                static_cast<std::uint8_t*>(cache.v_scale.data),
+                static_cast<__nv_bfloat16*>(cache.protected_k.data),
+                static_cast<__nv_bfloat16*>(cache.protected_v.data),
+                plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
+                static_cast<int>(cache.padded_capacity), static_cast<int>(cache.protected_capacity),
+                static_cast<int>(cache.protected_anchor_capacity),
+                static_cast<int>(cache.protected_padded_capacity));
+        };
+        if (cache.quant_bits == 2) {
+            launch_lowbit.template operator()<2>();
+        } else if (cache.quant_bits == 3) {
+            launch_lowbit.template operator()<3>();
+        } else {
+            kv_cache_append_prefix_cyclic_nvfp4_kernel<<<grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(counts.data),
+                static_cast<const std::int32_t*>(lanes.data),
+                static_cast<std::uint8_t*>(cache.k.data),
+                static_cast<std::uint8_t*>(cache.v.data),
+                static_cast<std::uint8_t*>(cache.k_scale.data),
+                static_cast<std::uint8_t*>(cache.v_scale.data),
+                static_cast<__nv_bfloat16*>(cache.protected_k.data),
+                static_cast<__nv_bfloat16*>(cache.protected_v.data),
+                plan.min_count, plan.max_count, plan.tokens, static_cast<int>(cache.capacity),
+                static_cast<int>(cache.padded_capacity), static_cast<int>(cache.protected_capacity),
+                static_cast<int>(cache.protected_anchor_capacity),
+                static_cast<int>(cache.protected_padded_capacity));
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k.data);
     auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v.data);
     const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);
@@ -143,7 +265,47 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     const dim3 grid(1 + (plan.max_count - 1) / 4, k.ne[3], 1);
     kv_cache_append_prefix_cyclic_kernel<<<grid, kBlock, 0, stream>>>(
         input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
-        plan.tokens, padded);
+        plan.tokens, static_cast<int>(cache.capacity), padded);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_cyclic_oscar_dual(const Tensor& k, const Tensor& v, const Tensor& positions,
+                              const Tensor& counts, const Tensor& lanes,
+                              CyclicKVCacheLayerView l0_cache,
+                              CyclicKVCacheLayerView q4_shadow_cache,
+                              const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
+    validate_plan(k, plan);
+    if (plan.max_count == 0) return;
+    const dim3 grid(static_cast<unsigned>(plan.max_count), k.ne[3], 1);
+    const auto launch = [&]<int Bits>() {
+        kv_cache_append_prefix_cyclic_oscar_kernel<Bits, true><<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(counts.data),
+            static_cast<const std::int32_t*>(lanes.data),
+            static_cast<std::uint8_t*>(l0_cache.k.data),
+            static_cast<std::uint8_t*>(l0_cache.v.data),
+            static_cast<__nv_bfloat16*>(l0_cache.k_scale.data),
+            static_cast<__nv_bfloat16*>(l0_cache.v_scale.data),
+            static_cast<__nv_bfloat16*>(l0_cache.protected_k.data),
+            static_cast<__nv_bfloat16*>(l0_cache.protected_v.data),
+            static_cast<std::uint8_t*>(q4_shadow_cache.k.data),
+            static_cast<std::uint8_t*>(q4_shadow_cache.v.data),
+            static_cast<__nv_bfloat16*>(q4_shadow_cache.k_scale.data),
+            static_cast<__nv_bfloat16*>(q4_shadow_cache.v_scale.data),
+            static_cast<__nv_bfloat16*>(q4_shadow_cache.protected_k.data),
+            static_cast<__nv_bfloat16*>(q4_shadow_cache.protected_v.data),
+            plan.min_count, plan.max_count, plan.tokens, static_cast<int>(l0_cache.capacity),
+            static_cast<int>(l0_cache.padded_capacity), static_cast<int>(l0_cache.protected_capacity),
+            static_cast<int>(l0_cache.protected_anchor_capacity),
+            static_cast<int>(l0_cache.protected_padded_capacity));
+    };
+    if (l0_cache.quant_bits == 2) {
+        launch.template operator()<2>();
+    } else {
+        throw std::invalid_argument("OSCAR dual append requires Q2 L0");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -184,6 +346,121 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
     }
 }
 
+void kv_cache_append_nvfp4_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        std::int32_t column_begin, std::int32_t width,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream) {
+    // block_tables.ne[1] is the number of table rows reserved by the cache, not the
+    // number of active sequences in this launch. The active batch is k.ne[3] and each
+    // sequence selects its backing row through table_rows[batch].
+    if (width <= 0 || column_begin < 0 || column_begin + width > k.ne[2] || k.ne[3] <= 0 ||
+        table_rows.ne[0] < k.ne[3] || cache.block_tables.ne[0] <= 0 ||
+        cache.block_tables.ne[1] <= 0) {
+        throw std::invalid_argument("NVFP4 batch append has an invalid offset or batch");
+    }
+    const auto launch = [&]<int KVHeads, bool Masked>() {
+        using Geometry = KVCacheAppendFullGeometry<KVHeads>;
+        kv_cache_append_nvfp4_batch_kernel<Geometry, Masked>
+            <<<dim3(KVHeads, static_cast<unsigned>(width), static_cast<unsigned>(k.ne[3])),
+                   32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+                static_cast<const std::int32_t*>(table_rows.data),
+                static_cast<std::uint8_t*>(cache.k_pages.data),
+                static_cast<std::uint8_t*>(cache.v_pages.data),
+                static_cast<std::uint8_t*>(cache.k_scale_pages.data),
+                static_cast<std::uint8_t*>(cache.v_scale_pages.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
+                cache.block_tables.ne[0], k.ne[2], column_begin, width);
+    };
+    const bool masked = valid_columns.data != nullptr;
+    if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
+        if (masked) {
+            launch.template operator()<KVCacheAppendD256Kv4::KVHeads, true>();
+        } else {
+            launch.template operator()<KVCacheAppendD256Kv4::KVHeads, false>();
+        }
+    } else {
+        if (masked) {
+            launch.template operator()<KVCacheAppendD256Kv2::KVHeads, true>();
+        } else {
+            launch.template operator()<KVCacheAppendD256Kv2::KVHeads, false>();
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void kv_cache_append_oscar_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        std::int32_t column_begin, std::int32_t width,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (cache.dtype != DType::U8 || cache.quant_group != kPagedKVCacheOscarQuantGroup ||
+        width <= 0 || column_begin < 0 || column_begin + width > k.ne[2] || k.ne[3] <= 0 ||
+        table_rows.ne[0] < k.ne[3] || cache.block_tables.ne[0] <= 0 ||
+        cache.block_tables.ne[1] <= 0) {
+        throw std::invalid_argument(
+            "OSCAR batch append has an invalid profile or offset: k=[" +
+            std::to_string(k.ne[0]) + "," + std::to_string(k.ne[1]) + "," +
+            std::to_string(k.ne[2]) + "," + std::to_string(k.ne[3]) + "] cache=[" +
+            std::to_string(cache.block_tables.ne[0]) + "," +
+            std::to_string(cache.block_tables.ne[1]) + "] dtype=" +
+            std::to_string(static_cast<int>(cache.dtype)) + " qgroup=" +
+            std::to_string(cache.quant_group) + " column_begin=" +
+            std::to_string(column_begin) + " width=" + std::to_string(width));
+    }
+    const auto launch = [&]<int KVHeads, bool Masked, bool TransposedQ2>() {
+        using Geometry = KVCacheAppendFullGeometry<KVHeads>;
+        kv_cache_append_oscar_batch_kernel<Geometry, 2, Masked, TransposedQ2>
+            <<<dim3(KVHeads, static_cast<unsigned>(width), static_cast<unsigned>(k.ne[3])),
+                   32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(k.data),
+                static_cast<const __nv_bfloat16*>(v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+                static_cast<const std::int32_t*>(table_rows.data),
+                static_cast<std::uint8_t*>(cache.k_pages.data),
+                static_cast<std::uint8_t*>(cache.v_pages.data),
+                static_cast<__nv_bfloat16*>(cache.k_scale_pages.data),
+                static_cast<__nv_bfloat16*>(cache.v_scale_pages.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
+                cache.block_tables.ne[0], k.ne[2], column_begin, width);
+    };
+    const bool masked     = valid_columns.data != nullptr;
+    const bool transposed = cache.layout == OscarKVLayout::TransposedQ2;
+    if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
+        if (masked) {
+            if (transposed) {
+                launch.template operator()<KVCacheAppendD256Kv4::KVHeads, true, true>();
+            } else {
+                launch.template operator()<KVCacheAppendD256Kv4::KVHeads, true, false>();
+            }
+        } else {
+            if (transposed) {
+                launch.template operator()<KVCacheAppendD256Kv4::KVHeads, false, true>();
+            } else {
+                launch.template operator()<KVCacheAppendD256Kv4::KVHeads, false, false>();
+            }
+        }
+    } else {
+        if (masked) {
+            if (transposed) {
+                launch.template operator()<KVCacheAppendD256Kv2::KVHeads, true, true>();
+            } else {
+                launch.template operator()<KVCacheAppendD256Kv2::KVHeads, true, false>();
+            }
+        } else {
+            if (transposed) {
+                launch.template operator()<KVCacheAppendD256Kv2::KVHeads, false, true>();
+            } else {
+                launch.template operator()<KVCacheAppendD256Kv2::KVHeads, false, false>();
+            }
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 KVCacheAppendPrefixPlan
 kv_cache_append_prefix_resolve_plan(std::int32_t tokens,
                                     KVCacheAppendPrefixExecutionEnvelope envelope) {
@@ -213,6 +490,15 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
                                    CyclicKVCacheLayerView cache,
                                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     launch_cyclic(k, v, positions, counts, lanes, cache, plan, stream);
+}
+
+void kv_cache_append_prefix_oscar_dual_launch(
+    const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
+    const Tensor& lanes, CyclicKVCacheLayerView l0_cache,
+    CyclicKVCacheLayerView q4_shadow_cache, const KVCacheAppendPrefixPlan& plan,
+    cudaStream_t stream) {
+    launch_cyclic_oscar_dual(k, v, positions, counts, lanes, l0_cache, q4_shadow_cache, plan,
+                             stream);
 }
 
 } // namespace ninfer::ops::detail

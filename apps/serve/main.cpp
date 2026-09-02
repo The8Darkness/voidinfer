@@ -1,4 +1,5 @@
 #include "product/load_progress/load_progress.h"
+#include "product/speculative_options.h"
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -123,6 +124,21 @@ int main(int argc, char** argv) {
                  << " shared=" << *cache.max_shared_prefixes
                  << " anchors=" << *cache.max_long_anchors_per_continuation
                  << " markers=" << *cache.max_cache_markers_per_request;
+        capacity << " speculative="
+                 << ninfer::product::speculative_backend_name(engine.speculative.backend)
+                 << " draft=" << engine.speculative.draft_tokens
+                 << " proposal-head="
+                 << (engine.speculative.proposal_head == ninfer::ProposalHead::Optimized
+                         ? "optimized"
+                         : "full")
+                 << " vericache="
+                 << (engine.hierarchical_vericache.enabled ? "on" : "off");
+        if (engine.hierarchical_vericache.enabled) {
+            capacity << " l0-l1=" << engine.hierarchical_vericache.l0_to_l1_horizon
+                     << " l1-l2=" << engine.hierarchical_vericache.l1_to_l2_horizon
+                     << " host-snapshots="
+                     << (engine.hierarchical_vericache.enable_host_tier_snapshots ? "on" : "off");
+        }
         capacity << " context-cost-transfer="
                  << ninfer::context_cost_preset_source_name(context_cost.transfer_source)
                  << " context-cost-prefill="

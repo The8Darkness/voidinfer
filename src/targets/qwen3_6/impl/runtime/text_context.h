@@ -8,6 +8,8 @@
 #include "core/gdn_replay_records.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "targets/qwen3_6/impl/runtime/oscar_qkv_capture.h"
+#include "targets/qwen3_6/impl/runtime/oscar_rotated_bf16.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
@@ -18,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -131,7 +134,7 @@ struct DFlashFeatureSink {
 
     Tensor* features                  = nullptr;
     Tensor* positions                 = nullptr;
-    Tensor* batch_features            = nullptr;
+    Tensor batch_features;
     const Tensor* batch_lanes         = nullptr;
     const Tensor* batch_valid_columns = nullptr;
     std::int32_t batch_width          = 0;
@@ -213,12 +216,14 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
+                             Tensor& logits, Tensor& target_tokens,
+                             bool greedy_target_head = false);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink,
+                             bool greedy_target_head = false);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -241,7 +246,7 @@ private:
     }
 
     [[nodiscard]] const MtpW& mtp_weights() const;
-    void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
+    void attn_mix(const FullLayerW& weights, Tensor& x, int layer, int index, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
@@ -253,7 +258,8 @@ private:
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                                  Tensor& logits, Tensor& target_tokens, Tap& tap);
+                                  Tensor& logits, Tensor& target_tokens, bool greedy_target_head,
+                                  Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
@@ -317,6 +323,10 @@ private:
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
+    oscar_internal::OscarQKVCapture* oscar_capture_ = nullptr;
+    std::shared_ptr<const oscar_internal::OscarRotationSet> oscar_rotations_;
+    std::shared_ptr<oscar_internal::OscarMatchedFP32Cache> matched_fp32_cache_;
+    std::shared_ptr<oscar_internal::OscarLiveMixedReferenceCache> live_mixed_cache_;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

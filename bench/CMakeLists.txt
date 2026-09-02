@@ -72,6 +72,7 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
+ninfer_copy_runtime_dlls(ninfer_bench)
 
 # Static context-cost calibrator. Transfer measurements call production Paged-KV copy primitives,
 # then release their synthetic fixtures before the public Engine optionally loads one real artifact
@@ -93,6 +94,7 @@ target_compile_definitions(ninfer_context_cost_bench PRIVATE
   NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_context_cost_bench PRIVATE
   ninfer_engine ninfer_core CUDA::cudart)
+ninfer_copy_runtime_dlls(ninfer_context_cost_bench)
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
@@ -106,6 +108,20 @@ target_include_directories(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
   ninfer_engine ninfer_core)
+ninfer_copy_runtime_dlls(ninfer_qwen3_6_27b_mtp_round_bench)
+
+# Complete production Qwen3.8 27B DFlash2 steady round over the canonical NVFP4 artifact.
+add_executable(ninfer_qwen3_6_27b_dflash_round_bench
+  targets/qwen3_6_27b/dflash_round_bench.cpp)
+target_include_directories(ninfer_qwen3_6_27b_dflash_round_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_qwen3_6_27b_dflash_round_bench PRIVATE
+  ninfer_engine ninfer_core)
+ninfer_copy_runtime_dlls(ninfer_qwen3_6_27b_dflash_round_bench)
 
 # Complete production DFlash steady round: confirmed-context append, next proposal, target
 # verification/acceptance, and host publication over a real 35B artifact.
@@ -119,3 +135,4 @@ target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ninfer_engine ninfer_core)
+ninfer_copy_runtime_dlls(ninfer_qwen3_6_35b_a3b_dflash_round_bench)

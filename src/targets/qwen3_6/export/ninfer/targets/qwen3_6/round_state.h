@@ -89,6 +89,9 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    // Host-visible result of the live OSCAR-Q2 -> OSCAR-Q4 prefix intersection. It is copied
+    // after the normal target egress so the target's licensed-token ABI remains unchanged.
+    std::array<std::int32_t, kMaximumConcurrency> l0_l1_accepted{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -137,11 +140,21 @@ struct DFlashDecodeStateLayout {
     TensorRegion append_positions;
     TensorRegion append_counts;
     TensorRegion draft_tokens;
+    TensorRegion q2_drafts;
+    TensorRegion q2_l1_accepted;
     TensorRegion verify_ids;
     TensorRegion target_argmax;
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    // Dense scratch storage for eager Adaptive DFlash2 short verification widths.
+    TensorRegion adaptive_drafts;
+    TensorRegion adaptive_verify_ids;
+    TensorRegion adaptive_target_positions;
+    TensorRegion adaptive_target_tokens;
+    TensorRegion adaptive_target_logits;
+    TensorRegion adaptive_target_hidden;
+    TensorRegion adaptive_licensed_tokens;
 };
 
 struct RoundStateLayout {
@@ -232,6 +245,16 @@ struct MtpDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    // Eager Adaptive DFlash2 uses these as densely packed [K,B] / [V,K,B] scratch tensors when
+    // the fixed-width proposal is verified at a shorter runtime K. They are separate from the
+    // graph-shaped frame tensors because slicing a wider [Kmax,B] allocation is strided.
+    Tensor adaptive_drafts;
+    Tensor adaptive_verify_ids;
+    Tensor adaptive_target_positions;
+    Tensor adaptive_target_tokens;
+    Tensor adaptive_target_logits;
+    Tensor adaptive_target_hidden;
+    Tensor adaptive_licensed_tokens;
     Tensor proposal_logits;
     Tensor alignment_ids;
     Tensor alignment_hidden;
@@ -268,11 +291,20 @@ struct DFlashDecodeState {
     Tensor append_positions;
     Tensor append_counts;
     Tensor draft_tokens;
+    Tensor q2_drafts;
+    Tensor q2_l1_accepted;
     Tensor verify_ids;
     Tensor target_argmax;
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    Tensor adaptive_drafts;
+    Tensor adaptive_verify_ids;
+    Tensor adaptive_target_positions;
+    Tensor adaptive_target_tokens;
+    Tensor adaptive_target_logits;
+    Tensor adaptive_target_hidden;
+    Tensor adaptive_licensed_tokens;
 
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,

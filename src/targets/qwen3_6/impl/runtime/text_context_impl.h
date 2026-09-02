@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
+#include "core/arena.h"
 #include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -33,8 +34,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <initializer_list>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -43,6 +49,21 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
+
+bool oscar_d4_profile_enabled() noexcept {
+    const char* value = std::getenv("NINFER_OSCAR_D4_1_PROFILE");
+    return value != nullptr && value[0] == '1';
+}
+
+double oscar_d4_elapsed_us(std::chrono::steady_clock::time_point start,
+                           std::chrono::steady_clock::time_point end) noexcept {
+    return std::chrono::duration<double, std::micro>(end - start).count();
+}
+
+bool fp8_greedy_argmax_enabled() {
+    const char* value = std::getenv("NINFER_FP8_GREEDY_ARGMAX");
+    return value == nullptr || value[0] != '0';
+}
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -81,6 +102,22 @@ void require_tensor_window(const Tensor& t, DType dtype, std::int32_t rows, std:
         throw std::invalid_argument(std::string(label) + " must be contiguous");
     }
     if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
+}
+
+std::uint16_t runtime_float_to_bf16(float value) noexcept {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    // Match CUDA's __float2bfloat16 round-to-nearest-even conversion used by the qualified
+    // rotation path, rather than truncating the FP32 mantissa.
+    const std::uint32_t rounding = 0x7FFFU + ((bits >> 16U) & 1U);
+    return static_cast<std::uint16_t>((bits + rounding) >> 16U);
+}
+
+float runtime_bf16_to_float(std::uint16_t bits) noexcept {
+    const std::uint32_t expanded = static_cast<std::uint32_t>(bits) << 16U;
+    float value = 0.0F;
+    std::memcpy(&value, &expanded, sizeof(value));
+    return value;
 }
 
 Tensor matrix_window(Tensor& t, std::int32_t cols) {
@@ -141,8 +178,8 @@ private:
 } // namespace
 
 void DFlashFeatureSink::begin(const Tensor& value) {
-    const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
-    const bool batch   = batch_features != nullptr && batch_lanes != nullptr &&
+    const bool prefill = features != nullptr && positions != nullptr && batch_features.data == nullptr;
+    const bool batch   = batch_features.data != nullptr && batch_lanes != nullptr &&
                        batch_valid_columns != nullptr && batch_width > 0 && batch_size > 0;
     if ((!prefill && !batch) || layers.empty()) {
         throw std::logic_error("DFlash feature sink is incomplete");
@@ -158,17 +195,17 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
     const auto it = std::find(layers.begin(), layers.end(), layer);
     if (it == layers.end()) { return; }
     const std::size_t index = static_cast<std::size_t>(it - layers.begin());
-    Tensor* destination     = batch_features != nullptr ? batch_features : features;
+    Tensor* destination     = batch_features.data != nullptr ? &batch_features : features;
     if (layers.size() > 32 || active_tokens <= 0 || value.dtype != DType::BF16 ||
         destination == nullptr ||
         value.ne[0] * static_cast<std::int32_t>(layers.size()) != destination->ne[0] ||
         value.ne[1] != active_tokens) {
         throw std::logic_error("DFlash feature capture shape is invalid");
     }
-    if (batch_features != nullptr) {
+    if (batch_features.data != nullptr) {
         Tensor source = value.view({value.ne[0], batch_width, batch_size});
         Tensor target =
-            batch_features->slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
+            batch_features.slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
         ops::scatter_bf16_batch(source, *batch_lanes, *batch_valid_columns, target, stream);
         captured_mask |= 1U << index;
         return;
@@ -192,7 +229,7 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
     if (captured_mask != complete_mask) {
         throw std::logic_error("DFlash target call did not publish every feature layer");
     }
-    if (batch_features != nullptr) {
+    if (batch_features.data != nullptr) {
         if (source.dtype != DType::I32 || source.ne[0] != batch_width ||
             source.ne[1] != batch_size) {
             throw std::logic_error("DFlash batch feature positions are invalid");
@@ -233,6 +270,24 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
     }
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
+    }
+    oscar_rotations_ = oscar_internal::rotation_set_from_environment();
+    if (oscar_internal::matched_fp32_mode_enabled()) {
+        if (batch_text_kv_ == nullptr) {
+            throw std::logic_error("OSCAR matched FP32 mode requires a text KV owner");
+        }
+        matched_fp32_cache_ = oscar_internal::matched_fp32_cache_for(
+            batch_text_kv_, static_cast<std::uint32_t>(batch_text_kv_->max_context()));
+    }
+    if (oscar_internal::live_int2_reference_mode_enabled() ||
+        oscar_internal::live_int2_gpu_mode_enabled()) {
+        if (batch_text_kv_ == nullptr || !oscar_rotations_) {
+            throw std::logic_error(
+                "OSCAR live INT2 mode requires a text KV owner and rotation assets");
+        }
+        live_mixed_cache_ = oscar_internal::live_mixed_cache_for(
+            batch_text_kv_, static_cast<std::uint32_t>(batch_text_kv_->max_context()),
+            oscar_rotations_);
     }
     set_linear_state_slots(0, 0);
     bind();
@@ -691,7 +746,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& linear_state_source_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                           Tap& tap) {
+                                           bool greedy_target_head, Tap& tap) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -739,8 +794,17 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        const bool use_greedy_fp8_head =
+            greedy_target_head && fp8_greedy_argmax_enabled() && columns <= 48 &&
+            lm_head_->qtype == QType::FP8_E4M3FN_ROW_BF16S && lm_head_->n == kCfg.vocab &&
+            lm_head_->k == kCfg.hidden;
+        if (use_greedy_fp8_head) {
+            ops::linear_argmax(flat_hidden, *lm_head_, flat_tokens, kCfg.token_domain, flat_logits,
+                               stream);
+        } else {
+            ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        }
     }
     work_.reset();
 }
@@ -750,11 +814,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
-                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
+                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens,
+                                      bool greedy_target_head) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap);
+                             greedy_target_head, tap);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -763,10 +828,10 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink) {
+                                      DFlashFeatureSink& sink, bool greedy_target_head) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink);
+                             greedy_target_head, sink);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -809,9 +874,24 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+void dump_runtime_attention_diagnostic(std::int32_t layer, const char* label,
+                                       const Tensor& value, cudaStream_t stream);
+void dump_runtime_layer_stage_diagnostic(std::int32_t layer, const char* label,
+                                         const Tensor& value, cudaStream_t stream);
+void dump_runtime_position_diagnostic(std::int32_t layer, const Tensor& value,
+                                      cudaStream_t stream);
+void dump_runtime_matched_cache_diagnostic(
+    std::int32_t layer, std::int32_t full_layer, const oscar_internal::OscarMatchedFP32Cache& cache,
+    const Tensor& positions, cudaStream_t stream);
+
+void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int layer, int fidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    if (ph == Phase::Prefill && oscar_internal::matched_fp32_mode_enabled()) {
+        // D1.3 uses one deterministic prefill dump followed by step-tagged ordinary decode
+        // dumps. The tag is thread-local because TextContext executes on the runtime worker.
+        oscar_internal::set_matched_diagnostic_step(0);
+    }
     if (active_causal_attention_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
@@ -842,34 +922,790 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
-
-    Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
-    const Tensor& kv_table_rows =
-        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
-    if (active_sequence_batch_ != 0) {
-        const std::int32_t width = active_sequence_width_;
-        if (width <= 0 || width * active_sequence_batch_ != T) {
-            throw std::logic_error("Text sequence batch binding does not match aggregate columns");
-        }
-        Tensor q_batch        = qn.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
-        Tensor k_batch        = kn.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
-        Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
-        Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
-        Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
-        const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
-                                      kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
-                                      kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a_batch, s);
-    } else {
-        ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
-                                      {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                      batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a, s);
+    dump_runtime_attention_diagnostic(layer, "q", qn, s);
+    dump_runtime_attention_diagnostic(layer, "k", kn, s);
+    dump_runtime_attention_diagnostic(layer, "v", v, s);
+    const char* capture_armed = std::getenv("NINFER_OSCAR_QKV_CAPTURE_ARMED");
+    if (ph == Phase::Prefill && oscar_capture_ == nullptr && capture_armed != nullptr &&
+        capture_armed[0] == '1') {
+        oscar_capture_ = oscar_internal::qkv_capture_from_environment();
     }
-    ops::sigmoid_mul(gate, a, s);
+    if (ph == Phase::Prefill && oscar_capture_ != nullptr) {
+        oscar_capture_->capture(layer, fidx, qn, kn, v, s);
+    }
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    const bool live_gpu = live_mixed_cache_ != nullptr &&
+                          oscar_internal::live_int2_gpu_mode_enabled();
+    const bool live_gpu_resident = live_mixed_cache_ != nullptr &&
+                                   oscar_internal::live_int2_gpu_resident_mode_enabled();
+    const bool live_reference = live_mixed_cache_ != nullptr && !live_gpu;
+    const bool matched_fp32 = matched_fp32_cache_ != nullptr;
+    const bool d4_profile = oscar_d4_profile_enabled();
+    const auto live_full_attention_start = d4_profile && (live_reference || live_gpu)
+                                               ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+    Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
+    Tensor attention_for_output = a;
+    if (live_gpu) {
+        if ((active_sequence_batch_ != 0 &&
+             (active_sequence_batch_ != 1 || active_sequence_width_ != 1)) ||
+            (active_sequence_batch_ == 0 && T <= 0)) {
+            throw std::logic_error(
+                "OSCAR live INT2 GPU path currently supports one sequence only");
+        }
+        if (cache_positions.dtype != DType::I32 || !cache_positions.is_contiguous() ||
+            cache_positions.ne[0] != T || cache_positions.ne[1] != 1 || cache_positions.ne[2] != 1 ||
+            cache_positions.ne[3] != 1) {
+            throw std::logic_error("OSCAR live INT2 GPU positions must be [T]");
+        }
+        if (!oscar_rotations_) {
+            throw std::logic_error("OSCAR live INT2 GPU path has no rotation assets");
+        }
+
+        std::vector<std::int32_t> positions(static_cast<std::size_t>(T));
+        std::vector<float> rotated_k;
+        std::vector<float> rotated_v;
+        if (!live_gpu_resident) {
+            rotated_k.resize(static_cast<std::size_t>(kCfg.kv_size) * T);
+            rotated_v.resize(static_cast<std::size_t>(kCfg.kv_size) * T);
+        }
+        // The normal work arena is sized for the production BF16 path and deliberately
+        // rejects these diagnostic FP32 temporaries. Keep this first live integration
+        // self-contained in temporary device allocations; D4.4 can replace them with a
+        // persistent per-request scratch plan after the correctness gate.
+        ::ninfer::DeviceBuffer fp32_q_storage(
+            static_cast<std::size_t>(kCfg.q_size) * T * sizeof(float));
+        ::ninfer::DeviceBuffer fp32_k_storage(
+            static_cast<std::size_t>(kCfg.kv_size) * T * sizeof(float));
+        ::ninfer::DeviceBuffer fp32_v_storage(
+            static_cast<std::size_t>(kCfg.kv_size) * T * sizeof(float));
+        Tensor fp32_q(fp32_q_storage.p, DType::FP32, {kCfg.q_size, T});
+        Tensor fp32_k(fp32_k_storage.p, DType::FP32, {kCfg.kv_size, T});
+        Tensor fp32_v(fp32_v_storage.p, DType::FP32, {kCfg.kv_size, T});
+        fp32_q = fp32_q.view({kCfg.head_dim, kCfg.n_q, T});
+        fp32_k = fp32_k.view({kCfg.head_dim, kCfg.n_kv, T});
+        fp32_v = fp32_v.view({kCfg.head_dim, kCfg.n_kv, T});
+        const auto qkv_rotation_start = d4_profile ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
+        oscar_rotations_->rotate_qkv_fp32(layer, qn, kn, v, fp32_q, fp32_k, fp32_v, s);
+        CUDA_CHECK(cudaMemcpyAsync(positions.data(), cache_positions.data,
+                                   positions.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                   s));
+        if (!live_gpu_resident) {
+            CUDA_CHECK(cudaMemcpyAsync(rotated_k.data(), fp32_k.data,
+                                       rotated_k.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                       s));
+            CUDA_CHECK(cudaMemcpyAsync(rotated_v.data(), fp32_v.data,
+                                       rotated_v.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                       s));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        for (int token = 1; token < T; ++token) {
+            if (positions[token] != positions[0] + token) {
+                throw std::logic_error("OSCAR live GPU positions are not a contiguous append");
+            }
+        }
+        if (live_gpu_resident) {
+            live_mixed_cache_->record_gpu_incremental_host_device_bytes(
+                positions.size() * sizeof(std::int32_t));
+        }
+        if (d4_profile) {
+            live_mixed_cache_->record_qkv_rotation_us(
+                oscar_d4_elapsed_us(qkv_rotation_start, std::chrono::steady_clock::now()));
+        }
+        if (live_gpu_resident) {
+            live_mixed_cache_->append_gpu(layer, static_cast<std::uint32_t>(positions[0]), fp32_k,
+                                          fp32_v, s);
+        } else {
+            for (const float value : rotated_k) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("OSCAR live GPU rotated K is NaN/Inf");
+                }
+            }
+            for (const float value : rotated_v) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("OSCAR live GPU rotated V is NaN/Inf");
+                }
+            }
+            std::vector<std::uint16_t> k_row(static_cast<std::size_t>(kCfg.n_kv) * kCfg.head_dim);
+            std::vector<std::uint16_t> v_row(k_row.size());
+            for (int token = 0; token < T; ++token) {
+                for (int head = 0; head < kCfg.n_kv; ++head) {
+                    for (int dimension = 0; dimension < kCfg.head_dim; ++dimension) {
+                        const std::size_t source = static_cast<std::size_t>(dimension) +
+                                                   static_cast<std::size_t>(kCfg.head_dim) *
+                                                       (static_cast<std::size_t>(head) +
+                                                        static_cast<std::size_t>(kCfg.n_kv) * token);
+                        const std::size_t row = static_cast<std::size_t>(head) * kCfg.head_dim +
+                                                dimension;
+                        k_row[row] = runtime_float_to_bf16(rotated_k[source]);
+                        v_row[row] = runtime_float_to_bf16(rotated_v[source]);
+                    }
+                }
+                live_mixed_cache_->append(layer, static_cast<std::uint32_t>(positions[token]), k_row,
+                                          v_row);
+            }
+            const auto staging_start = d4_profile ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
+            live_mixed_cache_->prepare_gpu(layer, s);
+            if (d4_profile) {
+                // prepare_gpu records its own cache-copy timing; this local marker is intentionally
+                // retained only as a synchronization boundary for the kernel timing below.
+                (void)staging_start;
+            }
+        }
+        ::ninfer::DeviceBuffer fp32_attention_storage(
+            static_cast<std::size_t>(kCfg.q_size) * T * sizeof(float));
+        Tensor fp32_attention(fp32_attention_storage.p, DType::FP32, {kCfg.q_size, T});
+        fp32_attention = fp32_attention.view({kCfg.head_dim, kCfg.n_q, T});
+        const auto gpu_start = d4_profile ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+        if (live_gpu_resident && ph == Phase::Prefill && T > 1) {
+            const std::uint32_t query_block =
+                oscar_internal::live_gpu_prefill_query_block_size();
+            for (std::uint32_t token = 0; token < static_cast<std::uint32_t>(T);) {
+                const std::uint32_t count = std::min(
+                    query_block, static_cast<std::uint32_t>(T) - token);
+                live_mixed_cache_->attention_gpu_batch(
+                    layer, static_cast<std::uint32_t>(positions[token]),
+                    fp32_q.slice(2, static_cast<std::int32_t>(token),
+                                 static_cast<std::int32_t>(count)),
+                    fp32_attention.slice(2, static_cast<std::int32_t>(token),
+                                         static_cast<std::int32_t>(count)),
+                    count, s);
+                live_mixed_cache_->record_gpu_prefill_batch(count);
+                token += count;
+            }
+        } else {
+            for (int token = 0; token < T; ++token) {
+                live_mixed_cache_->attention_gpu(
+                    layer, static_cast<std::uint32_t>(positions[token]),
+                    fp32_q.slice(2, token, 1), fp32_attention.slice(2, token, 1), s);
+                if (live_gpu_resident) {
+                    if (ph == Phase::Prefill) {
+                        live_mixed_cache_->record_gpu_prefill_batch(1);
+                    } else {
+                        live_mixed_cache_->record_gpu_decode_batch(1);
+                    }
+                }
+            }
+        }
+        if (d4_profile) {
+            CUDA_CHECK(cudaStreamSynchronize(s));
+            live_mixed_cache_->record_gpu_mixed_kernel_us(
+                oscar_d4_elapsed_us(gpu_start, std::chrono::steady_clock::now()));
+        }
+
+        ::ninfer::DeviceBuffer fp32_recovered_storage(
+            static_cast<std::size_t>(kCfg.q_size) * T * sizeof(float));
+        Tensor fp32_recovered(fp32_recovered_storage.p, DType::FP32, {kCfg.q_size, T});
+        fp32_recovered = fp32_recovered.view({kCfg.head_dim, kCfg.n_q, T});
+        const auto recovery_start = d4_profile ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+        oscar_rotations_->inverse_value_fp32(layer, fp32_attention, fp32_recovered, s);
+        if (d4_profile) {
+            CUDA_CHECK(cudaStreamSynchronize(s));
+            live_mixed_cache_->record_gpu_recovery_us(
+                oscar_d4_elapsed_us(recovery_start, std::chrono::steady_clock::now()));
+        }
+
+        const char* validate_reference_d43 = std::getenv("NINFER_OSCAR_D4_3_VALIDATE_REFERENCE");
+        const char* validate_reference_d44 = std::getenv("NINFER_OSCAR_D4_4_VALIDATE_REFERENCE");
+        const char* validate_reference_d45 = std::getenv("NINFER_OSCAR_D4_5_VALIDATE_REFERENCE");
+        const bool d45_reference = validate_reference_d45 != nullptr &&
+                                   validate_reference_d45[0] == '1';
+        if (((validate_reference_d43 != nullptr && validate_reference_d43[0] == '1') ||
+             (validate_reference_d44 != nullptr && validate_reference_d44[0] == '1') ||
+             d45_reference) &&
+            (layer == 3 || layer == 35 || layer == 63)) {
+            CUDA_CHECK(cudaStreamSynchronize(s));
+            const auto metrics = [](std::span<const float> expected,
+                                    std::span<const float> actual) {
+                if (expected.size() != actual.size() || expected.empty()) {
+                    throw std::logic_error("OSCAR D4.5 validation shape mismatch");
+                }
+                double abs_sum = 0.0;
+                double diff2 = 0.0;
+                double ref2 = 0.0;
+                float max_abs = 0.0F;
+                for (std::size_t index = 0; index < expected.size(); ++index) {
+                    const float diff = std::abs(expected[index] - actual[index]);
+                    max_abs = std::max(max_abs, diff);
+                    abs_sum += diff;
+                    diff2 += static_cast<double>(diff) * diff;
+                    ref2 += static_cast<double>(expected[index]) * expected[index];
+                }
+                return std::array<double, 3>{max_abs, abs_sum / expected.size(),
+                    std::sqrt(diff2 / std::max(ref2, std::numeric_limits<double>::min()))};
+            };
+            std::vector<int> validation_tokens{T - 1};
+            if (d45_reference) {
+                constexpr std::array<std::uint32_t, 13> kD45BoundaryQueries{
+                    63U, 64U, 68U, 319U, 320U, 321U, 322U, 323U, 324U, 325U, 326U, 327U,
+                    331U};
+                for (int candidate = 0; candidate < T; ++candidate) {
+                    if (std::find(kD45BoundaryQueries.begin(), kD45BoundaryQueries.end(),
+                                  static_cast<std::uint32_t>(positions[candidate])) !=
+                        kD45BoundaryQueries.end()) {
+                        validation_tokens.push_back(candidate);
+                    }
+                }
+                std::sort(validation_tokens.begin(), validation_tokens.end());
+                validation_tokens.erase(
+                    std::unique(validation_tokens.begin(), validation_tokens.end()),
+                    validation_tokens.end());
+            }
+            for (const int token : validation_tokens) {
+                std::vector<std::uint16_t> q_bits(static_cast<std::size_t>(kCfg.q_size));
+                std::vector<float> gpu_rotated(static_cast<std::size_t>(kCfg.q_size));
+                std::vector<float> gpu_recovered(static_cast<std::size_t>(kCfg.q_size));
+                const Tensor q_current = qn.slice(2, token, 1);
+                const Tensor raw_current = fp32_attention.slice(2, token, 1);
+                const Tensor recovered_current = fp32_recovered.slice(2, token, 1);
+                CUDA_CHECK(cudaMemcpy(q_bits.data(), q_current.data,
+                                      q_bits.size() * sizeof(std::uint16_t),
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(gpu_rotated.data(), raw_current.data,
+                                      gpu_rotated.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(gpu_recovered.data(), recovered_current.data,
+                                      gpu_recovered.size() * sizeof(float),
+                                      cudaMemcpyDeviceToHost));
+                std::vector<float> q_original(q_bits.size());
+                for (std::size_t index = 0; index < q_bits.size(); ++index) {
+                    q_original[index] = runtime_bf16_to_float(q_bits[index]);
+                }
+                const auto trace = live_mixed_cache_->attention(
+                    layer, static_cast<std::uint32_t>(positions[token]), q_original);
+                const auto av_error = metrics(trace.rotated_av, gpu_rotated);
+                const auto recovered_error = metrics(trace.recovered_output, gpu_recovered);
+                std::cerr << (d45_reference ? "OSCAR D4.5" : "OSCAR D4.3")
+                          << " live/reference layer=" << layer
+                          << " query=" << positions[token]
+                          << " rotated_av_max_abs=" << av_error[0]
+                          << " rotated_av_mean_abs=" << av_error[1]
+                          << " rotated_av_rel_l2=" << av_error[2]
+                          << " recovered_max_abs=" << recovered_error[0]
+                          << " recovered_mean_abs=" << recovered_error[1]
+                          << " recovered_rel_l2=" << recovered_error[2]
+                          << " verdict="
+                          << ((av_error[2] <= 1.0e-4 && recovered_error[2] <= 1.0e-4) ? "PASS"
+                                                                                         : "FAIL")
+                          << '\n';
+                if (av_error[2] > 1.0e-4 || recovered_error[2] > 1.0e-4 ||
+                    av_error[0] > 1.0e-3 || recovered_error[0] > 1.0e-3) {
+                    throw std::logic_error("OSCAR batched live/reference attention mismatch");
+                }
+            }
+        }
+        dump_runtime_attention_diagnostic(layer, "attention_gpu_rotated_fp32", fp32_attention, s);
+        dump_runtime_attention_diagnostic(layer, "attention_gpu_recovered_fp32", fp32_recovered, s);
+        oscar_rotations_->fp32_to_bf16(fp32_recovered, a, s);
+        attention_for_output = a;
+        if (d4_profile) {
+            const double full_attention_us =
+                oscar_d4_elapsed_us(live_full_attention_start, std::chrono::steady_clock::now());
+            live_mixed_cache_->record_full_attention_us(full_attention_us);
+            if (live_gpu_resident) {
+                live_mixed_cache_->record_gpu_phase_full_attention_us(
+                    ph == Phase::Prefill, full_attention_us);
+            }
+        }
+        if (layer == 63 && d4_profile) {
+            const auto counts = live_mixed_cache_->accounting();
+            const auto& profile = live_mixed_cache_->profile_totals();
+            std::cerr << "OSCAR GPU telemetry: oscar_calibrated=true"
+                      << " asset_identity=" << oscar_rotations_->asset_identity()
+                      << " asset_hash=" << oscar_rotations_->asset_hash()
+                      << " group_size=128 k_clip=0.96 v_clip=0.92 prefix_length=64 recent_length=256"
+                      << " prefix_token_count=" << counts.prefix_tokens
+                      << " historical_token_count=" << counts.historical_tokens
+                      << " recent_token_count=" << counts.recent_tokens
+                      << " int2_payload_bytes=" << counts.physical_int2_payload_bytes
+                      << " int2_metadata_bytes=" << counts.physical_int2_metadata_bytes
+                      << " gpu_cache_staging_us=" << profile.gpu_cache_staging_us
+                      << " gpu_cache_staging_bytes=" << profile.gpu_cache_staging_bytes
+                      << " gpu_qkv_rotation_us=" << profile.qkv_rotation_us
+                      << " gpu_mixed_kernel_us=" << profile.gpu_mixed_kernel_us
+                      << " gpu_recovery_us=" << profile.gpu_recovery_us
+                      << " gpu_full_attention_us=" << profile.full_attention_us
+                      << " gpu_prefill_full_attention_us="
+                      << profile.gpu_prefill_full_attention_us
+                      << " gpu_decode_full_attention_us="
+                      << profile.gpu_decode_full_attention_us
+                      << " gpu_attention_calls=" << profile.gpu_attention_calls
+                      << " gpu_attention_batches=" << profile.gpu_attention_batches
+                      << " gpu_attention_kernel_launches="
+                      << profile.gpu_attention_kernel_launches
+                      << " gpu_prefill_queries=" << profile.gpu_prefill_queries
+                      << " gpu_prefill_batches=" << profile.gpu_prefill_batches
+                      << " gpu_decode_queries=" << profile.gpu_decode_queries
+                      << " gpu_decode_batches=" << profile.gpu_decode_batches
+                      << " gpu_prefill_query_block="
+                      << oscar_internal::live_gpu_prefill_query_block_size()
+                      << " gpu_resident_publish_us=" << profile.gpu_resident_publish_us
+                      << " gpu_resident_aging_us=" << profile.gpu_resident_aging_us
+                      << " gpu_resident_append_calls=" << profile.gpu_resident_append_calls
+                      << " gpu_resident_aging_events=" << profile.gpu_resident_aging_events
+                      << " gpu_resident_codec_parity_checks="
+                      << profile.gpu_resident_codec_parity_checks
+                      << " gpu_incremental_host_device_bytes="
+                      << profile.gpu_incremental_host_device_bytes
+                      << " gpu_resident_cache_bytes=" << profile.gpu_resident_cache_bytes
+                      << " gpu_resident_workspace_bytes="
+                      << profile.gpu_resident_workspace_bytes
+                      << " legacy_q2_dispatched=false bf16_historical_shadow=false fallback=false"
+                      << " selected_layout=mixed-bf16-prefix-oscar-int2-g128-bf16-recent"
+                      << " selected_attention_implementation="
+                      << (live_gpu_resident ? "oscar-mixed-gpu-d4-4-resident"
+                                             : "oscar-mixed-gpu-d4-2b")
+                      << '\n';
+        }
+    } else if (live_reference) {
+        if ((active_sequence_batch_ != 0 &&
+             (active_sequence_batch_ != 1 || active_sequence_width_ != 1)) ||
+            (active_sequence_batch_ == 0 && T <= 0)) {
+            throw std::logic_error(
+                "OSCAR live INT2 reference path currently supports one sequence only");
+        }
+        if (cache_positions.dtype != DType::I32 || !cache_positions.is_contiguous() ||
+            cache_positions.ne[0] != T || cache_positions.ne[1] != 1 || cache_positions.ne[2] != 1 ||
+            cache_positions.ne[3] != 1) {
+            throw std::logic_error("OSCAR live INT2 reference positions must be [T]");
+        }
+        std::vector<std::int32_t> positions(static_cast<std::size_t>(T));
+        std::vector<std::uint16_t> q_bf16(static_cast<std::size_t>(kCfg.q_size) * T);
+        std::vector<float> rotated_k(static_cast<std::size_t>(kCfg.kv_size) * T);
+        std::vector<float> rotated_v(static_cast<std::size_t>(kCfg.kv_size) * T);
+        Tensor fp32_q = work_.alloc(DType::FP32, {kCfg.q_size, T})
+                            .view({kCfg.head_dim, kCfg.n_q, T});
+        Tensor fp32_k = work_.alloc(DType::FP32, {kCfg.kv_size, T})
+                            .view({kCfg.head_dim, kCfg.n_kv, T});
+        Tensor fp32_v = work_.alloc(DType::FP32, {kCfg.kv_size, T})
+                            .view({kCfg.head_dim, kCfg.n_kv, T});
+        if (!oscar_rotations_) {
+            throw std::logic_error("OSCAR live INT2 reference path has no rotation assets");
+        }
+        const auto qkv_rotation_start = d4_profile ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
+        oscar_rotations_->rotate_qkv_fp32(layer, qn, kn, v, fp32_q, fp32_k, fp32_v, s);
+        CUDA_CHECK(cudaMemcpyAsync(positions.data(), cache_positions.data,
+                                   positions.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                   s));
+        CUDA_CHECK(cudaMemcpyAsync(q_bf16.data(), qn.data, q_bf16.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(rotated_k.data(), fp32_k.data, rotated_k.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(rotated_v.data(), fp32_v.data, rotated_v.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        if (d4_profile) {
+            live_mixed_cache_->record_qkv_rotation_us(
+                oscar_d4_elapsed_us(qkv_rotation_start, std::chrono::steady_clock::now()));
+        }
+        for (const float value : rotated_k) {
+            if (!std::isfinite(value)) { throw std::runtime_error("OSCAR live rotated K is NaN/Inf"); }
+        }
+        for (const float value : rotated_v) {
+            if (!std::isfinite(value)) { throw std::runtime_error("OSCAR live rotated V is NaN/Inf"); }
+        }
+        std::vector<std::uint16_t> k_row(static_cast<std::size_t>(kCfg.n_kv) * kCfg.head_dim);
+        std::vector<std::uint16_t> v_row(k_row.size());
+        for (int token = 0; token < T; ++token) {
+            for (int head = 0; head < kCfg.n_kv; ++head) {
+                for (int dimension = 0; dimension < kCfg.head_dim; ++dimension) {
+                    const std::size_t source = static_cast<std::size_t>(dimension) +
+                                               static_cast<std::size_t>(kCfg.head_dim) *
+                                                   (static_cast<std::size_t>(head) +
+                                                    static_cast<std::size_t>(kCfg.n_kv) * token);
+                    const std::size_t row = static_cast<std::size_t>(head) * kCfg.head_dim +
+                                            dimension;
+                    k_row[row] = runtime_float_to_bf16(rotated_k[source]);
+                    v_row[row] = runtime_float_to_bf16(rotated_v[source]);
+                }
+            }
+            live_mixed_cache_->append(layer, static_cast<std::uint32_t>(positions[token]), k_row,
+                                      v_row);
+        }
+        std::vector<std::uint16_t> output_bf16(static_cast<std::size_t>(kCfg.q_size) * T);
+        std::vector<float> q_original(static_cast<std::size_t>(kCfg.q_size));
+        for (int token = 0; token < T; ++token) {
+            for (int head = 0; head < kCfg.n_q; ++head) {
+                for (int dimension = 0; dimension < kCfg.head_dim; ++dimension) {
+                    const std::size_t tensor_index = static_cast<std::size_t>(dimension) +
+                                                     static_cast<std::size_t>(kCfg.head_dim) *
+                                                         (static_cast<std::size_t>(head) +
+                                                          static_cast<std::size_t>(kCfg.n_q) * token);
+                    q_original[static_cast<std::size_t>(head) * kCfg.head_dim + dimension] =
+                        runtime_bf16_to_float(q_bf16[tensor_index]);
+                }
+            }
+            const auto trace = live_mixed_cache_->attention(
+                layer, static_cast<std::uint32_t>(positions[token]), q_original);
+            if (trace.recovered_output.size() != static_cast<std::size_t>(kCfg.q_size)) {
+                throw std::logic_error("OSCAR live attention output shape mismatch");
+            }
+            for (int head = 0; head < kCfg.n_q; ++head) {
+                for (int dimension = 0; dimension < kCfg.head_dim; ++dimension) {
+                    const std::size_t tensor_index = static_cast<std::size_t>(dimension) +
+                                                     static_cast<std::size_t>(kCfg.head_dim) *
+                                                         (static_cast<std::size_t>(head) +
+                                                          static_cast<std::size_t>(kCfg.n_q) * token);
+                    const float recovered = trace.recovered_output[
+                        static_cast<std::size_t>(head) * kCfg.head_dim + dimension];
+                    if (!std::isfinite(recovered)) {
+                        throw std::runtime_error("OSCAR live recovered attention is NaN/Inf");
+                    }
+                    output_bf16[tensor_index] = runtime_float_to_bf16(recovered);
+                }
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(a.data, output_bf16.data(), output_bf16.size() * sizeof(std::uint16_t),
+                                   cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        dump_runtime_attention_diagnostic(layer, "attention_live_recovered", a, s);
+        attention_for_output = a;
+        if (d4_profile) {
+            const double full_attention_us =
+                oscar_d4_elapsed_us(live_full_attention_start, std::chrono::steady_clock::now());
+            live_mixed_cache_->record_full_attention_us(full_attention_us);
+            if (live_gpu_resident) {
+                live_mixed_cache_->record_gpu_phase_full_attention_us(
+                    ph == Phase::Prefill, full_attention_us);
+            }
+        }
+    } else if (matched_fp32) {
+        if ((active_sequence_batch_ != 0 &&
+             (active_sequence_batch_ != 1 || active_sequence_width_ != 1)) ||
+            (active_sequence_batch_ == 0 && T <= 0)) {
+            throw std::logic_error(
+                "OSCAR matched FP32 diagnostic path currently supports one sequence only");
+        }
+        Tensor fp32_q = work_.alloc(DType::FP32, {kCfg.q_size, T})
+                            .view({kCfg.head_dim, kCfg.n_q, T});
+        Tensor fp32_k = work_.alloc(DType::FP32, {kCfg.kv_size, T})
+                            .view({kCfg.head_dim, kCfg.n_kv, T});
+        Tensor fp32_v = work_.alloc(DType::FP32, {kCfg.kv_size, T})
+                            .view({kCfg.head_dim, kCfg.n_kv, T});
+        if (oscar_rotations_) {
+            oscar_rotations_->rotate_qkv_fp32(layer, qn, kn, v, fp32_q, fp32_k, fp32_v, s);
+        } else {
+            oscar_internal::bf16_to_fp32(qn, fp32_q, s);
+            oscar_internal::bf16_to_fp32(kn, fp32_k, s);
+            oscar_internal::bf16_to_fp32(v, fp32_v, s);
+        }
+        dump_runtime_attention_diagnostic(layer, "q_fp32", fp32_q, s);
+        dump_runtime_attention_diagnostic(layer, "k_fp32", fp32_k, s);
+        dump_runtime_attention_diagnostic(layer, "v_fp32", fp32_v, s);
+
+        // The diagnostic cache is indexed by absolute token position and survives the stack
+        // lifetime of this TextContext, so the same FP32 representation is used by prefill and
+        // the subsequent ordinary decode card.
+        Tensor matched_positions = cache_positions.view({T});
+        dump_runtime_position_diagnostic(layer, matched_positions, s);
+        matched_fp32_cache_->append(fidx, fp32_k, fp32_v, matched_positions, s);
+        if (layer == 3) {
+            dump_runtime_matched_cache_diagnostic(layer, fidx, *matched_fp32_cache_,
+                                                  matched_positions, s);
+        }
+        Tensor fp32_attention = work_.alloc(DType::FP32, {kCfg.q_size, T})
+                                    .view({kCfg.head_dim, kCfg.n_q, T});
+        matched_fp32_cache_->attention(fidx, fp32_q, matched_positions, kAttnScale,
+                                       fp32_attention, s);
+        dump_runtime_attention_diagnostic(layer, "attention_fp32", fp32_attention, s);
+
+        if (oscar_rotations_) {
+            Tensor fp32_recovered = work_.alloc(DType::FP32, {kCfg.q_size, T})
+                                        .view({kCfg.head_dim, kCfg.n_q, T});
+            oscar_rotations_->inverse_value_fp32(layer, fp32_attention, fp32_recovered, s);
+            dump_runtime_attention_diagnostic(layer, "attention_recovered_fp32", fp32_recovered,
+                                              s);
+            oscar_internal::fp32_to_bf16(fp32_recovered, a, s);
+        } else {
+            // Both matched paths cross the same single final BF16 boundary before gate/output.
+            oscar_internal::fp32_to_bf16(fp32_attention, a, s);
+        }
+        dump_runtime_attention_diagnostic(layer, "attention_recovered", a, s);
+        attention_for_output = a;
+    } else {
+        Tensor q_for_attention = qn;
+        Tensor k_for_attention = kn;
+        Tensor v_for_attention = v;
+        Tensor rotated_q;
+        Tensor rotated_k;
+        Tensor rotated_v;
+        Tensor fp32_q;
+        Tensor fp32_k;
+        Tensor fp32_v;
+        Tensor fp32_attention;
+        Tensor fp32_recovered;
+        const auto rotation_precision = oscar_rotations_
+                                            ? oscar_internal::rotation_precision_mode()
+                                            : oscar_internal::RotationPrecision::Bf16Materialized;
+        const bool fp32_rotation =
+            rotation_precision == oscar_internal::RotationPrecision::Fp32Rotation ||
+            rotation_precision == oscar_internal::RotationPrecision::Fp32RotationAndInverse;
+        const bool fp32_inverse =
+            rotation_precision == oscar_internal::RotationPrecision::Fp32Inverse ||
+            rotation_precision == oscar_internal::RotationPrecision::Fp32RotationAndInverse;
+        const bool use_fp32_reference_attention =
+            oscar_rotations_ && fp32_rotation && ph == Phase::Prefill &&
+            active_sequence_batch_ == 0 && T <= 64;
+        if (oscar_rotations_) {
+            rotated_q = work_.alloc(DType::BF16, {kCfg.q_size, T});
+            rotated_k = work_.alloc(DType::BF16, {kCfg.kv_size, T});
+            rotated_v = work_.alloc(DType::BF16, {kCfg.kv_size, T});
+            rotated_q = rotated_q.view({kCfg.head_dim, kCfg.n_q, T});
+            rotated_k = rotated_k.view({kCfg.head_dim, kCfg.n_kv, T});
+            rotated_v = rotated_v.view({kCfg.head_dim, kCfg.n_kv, T});
+            oscar_rotations_->rotate_qkv(layer, qn, kn, v, rotated_q, rotated_k, rotated_v, s);
+            dump_runtime_attention_diagnostic(layer, "q_rot", rotated_q, s);
+            dump_runtime_attention_diagnostic(layer, "k_rot", rotated_k, s);
+            dump_runtime_attention_diagnostic(layer, "v_rot", rotated_v, s);
+            if (fp32_rotation) {
+                fp32_q = work_.alloc(DType::FP32, {kCfg.q_size, T})
+                             .view({kCfg.head_dim, kCfg.n_q, T});
+                fp32_k = work_.alloc(DType::FP32, {kCfg.kv_size, T})
+                             .view({kCfg.head_dim, kCfg.n_kv, T});
+                fp32_v = work_.alloc(DType::FP32, {kCfg.kv_size, T})
+                             .view({kCfg.head_dim, kCfg.n_kv, T});
+                oscar_rotations_->rotate_qkv_fp32(layer, qn, kn, v, fp32_q, fp32_k, fp32_v, s);
+                dump_runtime_attention_diagnostic(layer, "q_fp32", fp32_q, s);
+                dump_runtime_attention_diagnostic(layer, "k_fp32", fp32_k, s);
+                dump_runtime_attention_diagnostic(layer, "v_fp32", fp32_v, s);
+            }
+            if (fp32_inverse) {
+                fp32_recovered = work_.alloc(DType::FP32, {kCfg.q_size, T})
+                                     .view({kCfg.head_dim, kCfg.n_q, T});
+            }
+            q_for_attention = rotated_q;
+            k_for_attention = rotated_k;
+            v_for_attention = rotated_v;
+        }
+
+        const Tensor& kv_table_rows =
+            active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+        if (active_sequence_batch_ != 0) {
+            const std::int32_t width = active_sequence_width_;
+            if (width <= 0 || width * active_sequence_batch_ != T) {
+                throw std::logic_error("Text sequence batch binding does not match aggregate columns");
+            }
+            Tensor q_batch =
+                q_for_attention.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
+            Tensor k_batch =
+                k_for_attention.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
+            Tensor v_batch =
+                v_for_attention.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
+            Tensor a_batch = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
+            Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
+            const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+            ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
+                                          kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
+                                          kAttnScale, batch_text_kv_->batch_layer_view(fidx),
+                                          *active_causal_attention_envelope_, work_, a_batch, s);
+        } else {
+            ops::causal_softmax_attention(q_for_attention, k_for_attention, v_for_attention,
+                                          cache_positions, Tensor{}, kv_table_rows,
+                                          {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+                                          batch_text_kv_->batch_layer_view(fidx),
+                                          *active_causal_attention_envelope_, work_, a, s);
+        }
+        dump_runtime_attention_diagnostic(layer, "attention_raw", a, s);
+        if (use_fp32_reference_attention) {
+            fp32_attention = work_.alloc(DType::FP32, {kCfg.q_size, T})
+                                 .view({kCfg.head_dim, kCfg.n_q, T});
+            oscar_rotations_->reference_attention_fp32(fp32_q, fp32_k, fp32_v, kAttnScale,
+                                                       fp32_attention, s);
+            dump_runtime_attention_diagnostic(layer, "attention_fp32", fp32_attention, s);
+        }
+        bool recovered_in_attention_output = false;
+        if (oscar_rotations_) {
+            rotated_q = rotated_q.view({kCfg.head_dim, kCfg.n_q, T});
+            if (use_fp32_reference_attention) {
+                if (fp32_inverse) {
+                    oscar_rotations_->inverse_value_fp32(layer, fp32_attention, fp32_recovered, s);
+                    dump_runtime_attention_diagnostic(layer, "attention_recovered_fp32",
+                                                      fp32_recovered, s);
+                    oscar_rotations_->fp32_to_bf16(fp32_recovered, rotated_q, s);
+                } else {
+                    oscar_rotations_->fp32_to_bf16(fp32_attention, rotated_q, s);
+                    oscar_rotations_->inverse_value(layer, rotated_q, a, s);
+                    attention_for_output = a;
+                    recovered_in_attention_output = true;
+                }
+            } else if (fp32_inverse) {
+                oscar_rotations_->inverse_value_fp32(layer, a, fp32_recovered, s);
+                dump_runtime_attention_diagnostic(layer, "attention_recovered_fp32", fp32_recovered,
+                                                  s);
+                oscar_rotations_->fp32_to_bf16(fp32_recovered, rotated_q, s);
+            } else {
+                oscar_rotations_->inverse_value(layer, a, rotated_q, s);
+            }
+            dump_runtime_attention_diagnostic(layer, "attention_recovered",
+                                              recovered_in_attention_output ? a : rotated_q, s);
+            if (!recovered_in_attention_output) { attention_for_output = rotated_q; }
+        }
+    }
+    ops::sigmoid_mul(gate, attention_for_output, s);
+
+    Variant::attention_output_projection(attention_for_output.view({kCfg.q_size, T}), *w.o_proj, x,
+                                         ph, work_, s);
+    // linear_add writes the attention output projection directly into the residual stream.
+    // This tap therefore records the exact post-attention residual boundary, not a separate
+    // unfused projection tensor.
+    dump_runtime_layer_stage_diagnostic(layer, "post_attention_linear_add", x, s);
+}
+
+void dump_runtime_diagnostic(const Tensor& hidden, const Tensor& logits, cudaStream_t stream) {
+    const char* prefix = std::getenv("NINFER_OSCAR_RUNTIME_DIAGNOSTIC_PREFIX");
+    if (prefix == nullptr || *prefix == '\0') { return; }
+    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, 1},
+                         "OSCAR runtime diagnostic hidden");
+    require_tensor_shape(logits, DType::BF16, {kCfg.vocab, 1},
+                         "OSCAR runtime diagnostic logits");
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto write = [](const std::string& path, const Tensor& tensor) {
+        std::vector<std::uint8_t> bytes(tensor.bytes());
+        CUDA_CHECK(cudaMemcpy(bytes.data(), tensor.data, bytes.size(), cudaMemcpyDeviceToHost));
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output) { throw std::runtime_error("cannot open OSCAR runtime diagnostic " + path); }
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+        if (!output) { throw std::runtime_error("cannot write OSCAR runtime diagnostic " + path); }
+    };
+    write(std::string(prefix) + ".hidden.bf16", hidden);
+    write(std::string(prefix) + ".logits.bf16", logits);
+}
+
+void dump_runtime_layer_diagnostic(std::int32_t layer, const Tensor& value,
+                                   cudaStream_t stream) {
+    if (oscar_d4_profile_enabled()) { return; }
+    const char* prefix = std::getenv("NINFER_OSCAR_RUNTIME_LAYER_DIAGNOSTIC_PREFIX");
+    if (prefix == nullptr || *prefix == '\0') { return; }
+    require_tensor_window(value, DType::BF16, kCfg.hidden, value.ne[1],
+                          "OSCAR runtime diagnostic layer value");
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::uint8_t> bytes(value.bytes());
+    CUDA_CHECK(cudaMemcpy(bytes.data(), value.data, bytes.size(), cudaMemcpyDeviceToHost));
+    const std::string path = std::string(prefix) + ".tokens_" + std::to_string(value.ne[1]) +
+                             oscar_internal::matched_diagnostic_step_suffix() + ".layer_" +
+                             std::to_string(layer) + ".bf16";
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) { throw std::runtime_error("cannot open OSCAR layer diagnostic " + path); }
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    if (!output) { throw std::runtime_error("cannot write OSCAR layer diagnostic " + path); }
+}
+
+void dump_runtime_layer_stage_diagnostic(std::int32_t layer, const char* label,
+                                         const Tensor& value, cudaStream_t stream) {
+    if (oscar_d4_profile_enabled()) { return; }
+    const char* prefix = std::getenv("NINFER_OSCAR_RUNTIME_LAYER_DIAGNOSTIC_PREFIX");
+    if (prefix == nullptr || *prefix == '\0') { return; }
+    require_tensor_window(value, DType::BF16, kCfg.hidden, value.ne[1],
+                          "OSCAR runtime diagnostic layer stage value");
+    if (label == nullptr || *label == '\0') {
+        throw std::invalid_argument("OSCAR runtime diagnostic layer stage label is empty");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::uint8_t> bytes(value.bytes());
+    CUDA_CHECK(cudaMemcpy(bytes.data(), value.data, bytes.size(), cudaMemcpyDeviceToHost));
+    const std::string path = std::string(prefix) + ".tokens_" + std::to_string(value.ne[1]) +
+                             oscar_internal::matched_diagnostic_step_suffix() + ".layer_" +
+                             std::to_string(layer) + "." + label + ".bf16";
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) { throw std::runtime_error("cannot open OSCAR layer stage diagnostic " + path); }
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    if (!output) {
+        throw std::runtime_error("cannot write OSCAR layer stage diagnostic " + path);
+    }
+}
+
+void dump_runtime_attention_diagnostic(std::int32_t layer, const char* label,
+                                       const Tensor& value, cudaStream_t stream) {
+    if (oscar_d4_profile_enabled()) { return; }
+    const char* prefix = std::getenv("NINFER_OSCAR_RUNTIME_ATTENTION_DIAGNOSTIC_PREFIX");
+    if (prefix == nullptr || *prefix == '\0') { return; }
+    if ((value.dtype != DType::BF16 && value.dtype != DType::FP32) || !value.is_contiguous() ||
+        value.data == nullptr || value.ne[0] <= 0 || value.ne[1] <= 0 || value.ne[2] <= 0 ||
+        value.ne[3] != 1) {
+        throw std::invalid_argument("OSCAR runtime diagnostic attention value has invalid shape/dtype");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::uint8_t> bytes(value.bytes());
+    CUDA_CHECK(cudaMemcpy(bytes.data(), value.data, bytes.size(), cudaMemcpyDeviceToHost));
+    const std::string path = std::string(prefix) + ".tokens_" + std::to_string(value.ne[2]) +
+                             oscar_internal::matched_diagnostic_step_suffix() + ".layer_" +
+                             std::to_string(layer) + "." + label +
+                             (value.dtype == DType::BF16 ? ".bf16" : ".fp32");
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) { throw std::runtime_error("cannot open OSCAR attention diagnostic " + path); }
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    if (!output) { throw std::runtime_error("cannot write OSCAR attention diagnostic " + path); }
+}
+
+void dump_runtime_position_diagnostic(std::int32_t layer, const Tensor& value,
+                                      cudaStream_t stream) {
+    if (oscar_d4_profile_enabled()) { return; }
+    const char* prefix = std::getenv("NINFER_OSCAR_RUNTIME_ATTENTION_DIAGNOSTIC_PREFIX");
+    if (prefix == nullptr || *prefix == '\0') { return; }
+    if (value.dtype != DType::I32 || !value.is_contiguous() || value.data == nullptr ||
+        value.ne[0] <= 0 || value.ne[1] != 1 || value.ne[2] != 1 || value.ne[3] != 1) {
+        throw std::invalid_argument("OSCAR runtime diagnostic positions have invalid shape/dtype");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(value.ne[0]));
+    CUDA_CHECK(cudaMemcpy(positions.data(), value.data, positions.size() * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost));
+    const std::string path = std::string(prefix) + ".tokens_" + std::to_string(value.ne[0]) +
+                             oscar_internal::matched_diagnostic_step_suffix() + ".layer_" +
+                             std::to_string(layer) + ".positions.i32";
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) { throw std::runtime_error("cannot open OSCAR position diagnostic " + path); }
+    output.write(reinterpret_cast<const char*>(positions.data()),
+                 static_cast<std::streamsize>(positions.size() * sizeof(std::int32_t)));
+    if (!output) { throw std::runtime_error("cannot write OSCAR position diagnostic " + path); }
+}
+
+void dump_runtime_matched_cache_diagnostic(
+    std::int32_t layer, std::int32_t full_layer,
+    const oscar_internal::OscarMatchedFP32Cache& cache,
+    const Tensor& positions, cudaStream_t stream) {
+    if (oscar_d4_profile_enabled()) { return; }
+    const char* prefix = std::getenv("NINFER_OSCAR_RUNTIME_ATTENTION_DIAGNOSTIC_PREFIX");
+    if (prefix == nullptr || *prefix == '\0') { return; }
+    if (positions.dtype != DType::I32 || !positions.is_contiguous() || positions.data == nullptr ||
+        positions.ne[0] <= 0 || positions.ne[1] != 1 || positions.ne[2] != 1 ||
+        positions.ne[3] != 1) {
+        throw std::invalid_argument("OSCAR runtime diagnostic cache positions are invalid");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::int32_t last_position = -1;
+    CUDA_CHECK(cudaMemcpy(&last_position,
+                          static_cast<const std::uint8_t*>(positions.data) +
+                              static_cast<std::size_t>(positions.ne[0] - 1) * sizeof(std::int32_t),
+                          sizeof(last_position), cudaMemcpyDeviceToHost));
+    if (last_position < 0 || static_cast<std::uint64_t>(last_position) + 1U > cache.max_context()) {
+        throw std::invalid_argument("OSCAR runtime diagnostic cache position is out of range");
+    }
+    const std::uint32_t token_count = static_cast<std::uint32_t>(last_position) + 1U;
+    std::vector<float> k(static_cast<std::size_t>(token_count) * 4U * kCfg.head_dim);
+    std::vector<float> v(k.size());
+    cache.copy_layer_prefix(full_layer, token_count, k.data(), v.data(), stream);
+    const std::string suffix = oscar_internal::matched_diagnostic_step_suffix();
+    const auto write = [&](const char* label, const std::vector<float>& values) {
+        const std::string path = std::string(prefix) + ".cache_tokens_" +
+                                 std::to_string(token_count) + suffix + ".layer_" +
+                                 std::to_string(layer) + "." + label + ".fp32";
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output) { throw std::runtime_error("cannot open OSCAR cache diagnostic " + path); }
+        output.write(reinterpret_cast<const char*>(values.data()),
+                     static_cast<std::streamsize>(values.size() * sizeof(float)));
+        if (!output) { throw std::runtime_error("cannot write OSCAR cache diagnostic " + path); }
+    };
+    write("cache_k_fp32", k);
+    write("cache_v_fp32", v);
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
@@ -923,18 +1759,13 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 query_output, key_output, value_output, gate_output, ph, work_, s);
         }
     } else {
-        const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
-        Tensor qkv      = conv.projected;
+        Tensor qkv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
         Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
-        Tensor qkv_c = conv.convolved;
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state_in, conv_state_out, qkv_c, s);
-        ops::extract_bf16_columns(qkv_c, 0, qc, s);
-        ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
-        ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
+        ops::causal_conv1d_silu_split(qkv, *w.conv1d, conv_state_in, conv_state_out, qc, kc, vc, s);
     }
 
     Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
@@ -1009,7 +1840,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                attn_mix(full, x, fidx, ph);
+                attn_mix(full, x, layer, fidx, ph);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
@@ -1017,6 +1848,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
+                dump_runtime_layer_diagnostic(layer, x, ctx_.stream);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
@@ -1038,6 +1870,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
+                dump_runtime_layer_diagnostic(layer, x, ctx_.stream);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
@@ -1103,6 +1936,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
         throw std::logic_error("MTP proposal extent exceeds the configured draft window");
     }
+    if (matched_fp32_cache_ && kv_.valid() && base == 0) { matched_fp32_cache_->reset(s); }
+    if (live_mixed_cache_ && kv_.valid() && base == 0) { live_mixed_cache_->reset(); }
     int t0 = 0;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
@@ -1196,6 +2031,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);
+                dump_runtime_diagnostic(last_xf, logits, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).

@@ -17,11 +17,13 @@ struct SlidingWindowAttentionPlan {
     std::int32_t warps;
     std::int32_t split_capacity;
     std::int32_t max_context;
+    std::int32_t window;
 };
 
 [[nodiscard]] SlidingWindowAttentionPlan
 sliding_window_attention_resolve_plan(std::int32_t tokens,
-                                      SlidingWindowAttentionExecutionEnvelope envelope);
+                                      SlidingWindowAttentionExecutionEnvelope envelope,
+                                      std::int32_t window = 4096);
 [[nodiscard]] const char* sliding_window_attention_route_name(SlidingWindowAttentionRoute route);
 
 void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
@@ -31,5 +33,23 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream);
+
+void sliding_window_attention_nvfp4_launch(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& lanes, float scale,
+    const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
+    Tensor& out, cudaStream_t stream);
+
+void sliding_window_attention_lowbit_launch(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& lanes, float scale,
+    const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
+    Tensor& out, cudaStream_t stream);
+
+void sliding_window_attention_oscar_launch(
+    const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Tensor& positions,
+    const Tensor& valid_columns, const Tensor& lanes, float scale,
+    const CyclicKVCacheLayerView& context, std::int32_t max_context, std::int32_t window,
+    Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

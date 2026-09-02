@@ -11,6 +11,12 @@
 
 namespace ninfer {
 
+enum class CyclicKVCacheQuantization : std::uint8_t {
+    Auto = 0,
+    Nvfp4 = 1,
+    OscarAffine = 2,
+};
+
 /**
  * Fixed cyclic BF16 K/V storage with absolute-position addressing.
  *
@@ -25,6 +31,26 @@ struct CyclicKVCacheLayerView {
     std::int32_t num_kv_heads     = 0;
     std::int32_t head_dim         = 0;
     std::int32_t lane_capacity    = 0;
+    // Quantized cyclic caches expose one scale plane per K/V stream.  They remain empty for
+    // BF16, so existing callers can keep constructing the view with only K/V tensors.
+    Tensor k_scale;
+    Tensor v_scale;
+    // Optional BF16 sidecar for recent/high-sensitivity tokens.  This is populated alongside a
+    // packed NVFP4 cache and is deliberately empty for the default/stable cache profile.
+    Tensor protected_k;
+    Tensor protected_v;
+    // protected_capacity is the power-of-two recent-token ring. The optional prefix anchor
+    // region occupies slots [0, protected_anchor_capacity) in the same BF16 sidecar; recent
+    // slots start immediately after it.
+    std::uint32_t protected_capacity        = 0;
+    std::uint32_t protected_anchor_capacity = 0;
+    std::uint32_t protected_padded_capacity = 0;
+    DType dtype              = DType::BF16;
+    std::int32_t quant_group = 0;
+    // U8 cyclic caches use packed 2/3/4-bit codes. Oscar Q2/Q3/Q4 use affine BF16 metadata;
+    // legacy NVFP4 uses E4M3 group scales. Zero is reserved for the unquantized BF16 profile.
+    std::uint8_t quant_bits = 0;
+    CyclicKVCacheQuantization quantization = CyclicKVCacheQuantization::Auto;
 };
 
 struct CyclicKVCacheSlotView {
@@ -35,6 +61,21 @@ struct CyclicKVCacheSlotView {
     std::ptrdiff_t k_layer_pitch_bytes = 0;
     std::ptrdiff_t v_layer_pitch_bytes = 0;
     std::uint32_t layers               = 0;
+    Tensor k_scale_layer0;
+    Tensor v_scale_layer0;
+    std::size_t k_scale_layer_bytes          = 0;
+    std::size_t v_scale_layer_bytes          = 0;
+    std::ptrdiff_t k_scale_layer_pitch_bytes = 0;
+    std::ptrdiff_t v_scale_layer_pitch_bytes = 0;
+    Tensor protected_k_layer0;
+    Tensor protected_v_layer0;
+    std::size_t protected_k_layer_bytes          = 0;
+    std::size_t protected_v_layer_bytes          = 0;
+    std::ptrdiff_t protected_k_layer_pitch_bytes = 0;
+    std::ptrdiff_t protected_v_layer_pitch_bytes = 0;
+    std::uint32_t protected_capacity              = 0;
+    std::uint32_t protected_anchor_capacity      = 0;
+    std::uint32_t protected_padded_capacity      = 0;
 };
 
 struct CyclicKVCacheLayout {
@@ -45,13 +86,29 @@ struct CyclicKVCacheLayout {
     std::int32_t lane_capacity    = 0;
     std::vector<TensorRegion> k;
     std::vector<TensorRegion> v;
+    std::vector<TensorRegion> k_scale;
+    std::vector<TensorRegion> v_scale;
+    std::vector<TensorRegion> protected_k;
+    std::vector<TensorRegion> protected_v;
+    std::uint32_t protected_capacity        = 0;
+    std::uint32_t protected_anchor_capacity = 0;
+    std::uint32_t protected_padded_capacity = 0;
+    DType dtype              = DType::BF16;
+    std::int32_t quant_group = 0;
+    std::uint8_t quant_bits = 0;
+    CyclicKVCacheQuantization quantization = CyclicKVCacheQuantization::Auto;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
 };
 
 [[nodiscard]] CyclicKVCacheLayout
 plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
-                     std::int32_t num_kv_heads, std::int32_t head_dim, std::int32_t lane_capacity);
+                     std::int32_t num_kv_heads, std::int32_t head_dim, std::int32_t lane_capacity,
+                     DType dtype = DType::BF16, std::int32_t quant_group = 0,
+                     std::uint32_t protected_capacity = 0,
+                     std::uint32_t protected_anchor_capacity = 0,
+                     std::uint8_t quant_bits = 0,
+                     CyclicKVCacheQuantization quantization = CyclicKVCacheQuantization::Auto);
 
 class CyclicKVCache {
 public:
@@ -74,6 +131,30 @@ public:
 
     [[nodiscard]] std::int32_t lane_capacity() const noexcept { return lane_capacity_; }
 
+    [[nodiscard]] DType dtype() const noexcept { return dtype_; }
+
+    [[nodiscard]] std::int32_t quant_group() const noexcept { return quant_group_; }
+
+    [[nodiscard]] std::uint8_t quant_bits() const noexcept { return quant_bits_; }
+
+    [[nodiscard]] std::size_t payload_bytes() const noexcept;
+
+    [[nodiscard]] CyclicKVCacheQuantization quantization() const noexcept {
+        return quantization_;
+    }
+
+    [[nodiscard]] std::uint32_t protected_capacity() const noexcept {
+        return protected_capacity_;
+    }
+
+    [[nodiscard]] std::uint32_t protected_padded_capacity() const noexcept {
+        return protected_padded_capacity_;
+    }
+
+    [[nodiscard]] std::uint32_t protected_anchor_capacity() const noexcept {
+        return protected_anchor_capacity_;
+    }
+
     [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
     [[nodiscard]] CyclicKVCacheSlotView slot_view(std::int32_t slot) const;
 
@@ -89,6 +170,19 @@ private:
     std::int32_t num_kv_heads_     = 0;
     std::int32_t head_dim_         = 0;
     std::int32_t lane_capacity_    = 0;
+    std::int32_t code_head_dim_    = 0;
+    std::int32_t scale_extent_     = 0;
+    DType dtype_                   = DType::BF16;
+    std::int32_t quant_group_      = 0;
+    std::uint8_t quant_bits_       = 0;
+    CyclicKVCacheQuantization quantization_ = CyclicKVCacheQuantization::Auto;
+    std::uint32_t protected_capacity_        = 0;
+    std::uint32_t protected_anchor_capacity_ = 0;
+    std::uint32_t protected_padded_capacity_ = 0;
+    std::vector<Tensor> k_scale_;
+    std::vector<Tensor> v_scale_;
+    std::vector<Tensor> protected_k_;
+    std::vector<Tensor> protected_v_;
 };
 
 } // namespace ninfer

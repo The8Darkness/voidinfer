@@ -1,68 +1,41 @@
-# NInfer documentation
+# Qwen3.8-27B OSCAR-Q2/Q4 documentation
 
-Start with the [project README](../README.md) to build NInfer, download a published artifact, and
-run the CLI or HTTP server.
+Start with the [project README](../README.md) to build VoidInfer and run the current DFlash2 plus
+OSCAR-Q2/Q4 hierarchical VeriCache serving profile on an RTX 5090.
 
 ## User guides
 
 | Document | Purpose |
 | --- | --- |
-| [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
-| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
-| [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
-| [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
+| [CLI](cli.md) | text generation, chat history, sampling, and runtime options |
+| [HTTP serving](serving.md) | OpenAI/Anthropic-compatible serving and the DFlash2 default |
+| [Performance](performance.md) | OSCAR-Q2/Q4, DFlash2 context, speed, quality, and tier measurements |
+| [CLI examples](../examples/cli/) | committed text, multimodal, thinking, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
 
-## Model artifacts
+## Current artifact
 
-| Model | Weights | Download | Versioned model card source |
-| --- | --- | --- | --- |
-| Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
-| Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
-| Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
-| Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
-| Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
+| Profile | Download | Model card |
+| --- | --- | --- |
+| `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [NVFP4 model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
 
-## Repository-local guides
+The registered artifact is the Qwen3.8-27B NVFP4 base model. The local experimental DFlash2 artifact
+adds the DFlash2 proposal weights and is documented in the project README; it is not yet a public
+download.
 
-- [Benchmarks](../bench/README.md)
-- [Tests](../tests/README.md)
-- [Maintainer tools](../tools/README.md)
-- [Capability evaluation](../eval/README.md)
-- [Muse Spark 1.2 Contributor master prompt](../MASTERPROMPT_MUSE_SPARK_1_2_CONTRIBUTOR.md)
-- [Current project state and agent handoff](../PROJECT_STATE.md)
-- [Known issues and blockers](../KNOWN_ISSUES.md)
-- [Experiment log](../EXPERIMENTS.md)
-- [Upstream audit](../UPSTREAM_AUDIT.md)
+## Optimization and validation records
 
-## Maintainer references
+- [Project README](../README.md) — current default, exact KV hierarchy, and published results.
+- [Performance report](performance.md) — reproducible RTX 5090 measurements and open quality gates.
+- [Experiment registry](../EXPERIMENTS.md) — accepted, neutral, rejected, and pending optimization claims.
+- [Current project state](../PROJECT_STATE.md) — hardware, artifact identity, and milestone history.
+- [Qwen3.8-27B artifact contract](maintainer/qwen3.8-27b-artifact.md) — storage format and tensor mapping.
+- [HTTP serving](serving.md) — runtime flags and endpoint behavior.
 
-The active references under [`maintainer/`](maintainer/) record current architecture, model,
-artifact, and maintenance contracts. These files are not additional user workflows or installed
-API documentation.
-
-Runtime and Op references:
-
-- [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
-- [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
-- [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
-- [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
-- [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
-- [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
-
-`engine-architecture.md` is the sole top-level Engine architecture reference.
-`resource-scheduling-and-context-cache.md` is its narrower authority for resource selection,
-materialization, checkpoint ownership, and replica policy. The remaining files define physical
-storage, model, artifact, Op, or measurement contracts rather than parallel architecture variants.
-
-Artifact and model references:
-
-- [NInfer artifact container](maintainer/artifact-container.md)
-- [Persistent tensor numeric formats](maintainer/tensor-formats.md)
-- [Persistent storage layouts](maintainer/storage-layouts.md)
-- [Qwen3.6-27B model semantics](maintainer/qwen3.6-27b-model.md)
-- [Qwen3.6-27B artifact contracts, including NVFP4](maintainer/qwen3.6-27b-artifact.md)
-- [Qwen3.8-27B artifact contracts, including the NVFP4 target](maintainer/qwen3.8-27b-artifact.md)
-- [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
-- [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
+The isolated `exp/hierarchical-vericache-20260830` branch is the active Qwen3.8 NVFP4 research track
+for OSCAR-Q2 target L0, a BF16 DFlash2 local drafter cache, a host-only OSCAR-Q4 L1 mirror, FP16
+host L2, and future L3 residency. The current path has no device Q4 shadow and no CPU logit verifier;
+exact target settlement remains authoritative.
+Host-side logit verification, NVMe persistence, and the full quality matrix remain explicitly open
+until measured.

@@ -23,6 +23,41 @@ The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, 
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
 have a private prefill/decode loop and does not call target implementation interfaces.
 
+The Qwen3.8-27B experimental DFlash2 round executable
+`ninfer_qwen3_6_27b_dflash_round_bench` exposes the OSCAR-Q2/Q4 Hierarchical VeriCache path. The
+default run keeps OSCAR-Q2 in VRAM, protects the recent 128-token window plus anchors in BF16,
+promotes a Q2-derived OSCAR-Q4 mirror to pinned RAM, and keeps authoritative FP16 KV/GDN state in
+the host tier. No persistent device Q4 shadow is allocated and pinned RAM is not used for a live
+per-token logit verifier. It reports protected sidecars, nested KV/GDN transaction activity,
+exact-target acceptance, host-transfer activity, and occupied tier bytes.
+
+The DFlash2 round harness accepts `--vericache-l1-horizon 256..2048` for the verifier controller
+and `--vericache-host-snapshot-horizon 0|256..2048` for asynchronous host persistence. A value of
+`0` follows the adaptive verifier horizon; a nonzero value is independent. The benchmark-only
+The benchmark reports the DFlash full-attention cache as `oscar-q2-device` by default. Set
+`NINFER_DFLASH_FULL_BF16=1` for a real BF16 full-cache A/B; the measured result was neutral/slightly
+slower, so it is not the serving default. Pinned RAM is the L1 mirror/intermediate and FP16 is the
+L2 restore source.
+
+Packed NVFP4 attention uses pair decoding by default. `NINFER_NVFP4_PAIR=2` selects the
+scalar-order-preserving pair route used by DFlash2 local attention, `NINFER_NVFP4_PAIR=1` selects
+the faster reassociated pair route for experiments, and `NINFER_NVFP4_PAIR=0` restores the scalar
+fallback. `NINFER_NVFP4_XQA=1` or `2` enables the grouped direct-low-bit XQA prototypes; they are
+not the serving default because the current RTX 5090 measurements are slower than pair decoding.
+
+The Qwen3.8 DFlash2 fused W8 gate/up path keeps its production narrow schedule by default.
+`NINFER_DFLASH2_W8_GATEUP_WARPS=8` selects an eight-warp/two-resident-block small-T candidate,
+`=81` selects the eight-warp/one-resident-block candidate, and `=16` selects a sixteen-warp
+candidate. `NINFER_DFLASH2_W8_GATEUP_LARGE_SCHEDULE=64` selects the opt-in BM64 large-T route;
+these controls are for workload-specific research and are not required for default serving.
+
+For greedy Qwen3.8 target verification, the uncaptured direct path fuses the FP8 vocabulary
+projection with BF16-rounded argmax and uses token-only draft acceptance. Set
+`NINFER_FP8_GREEDY_ARGMAX=0` to force the full-logit reference route for an A/B measurement.
+Single-lane greedy C1 CUDA Graph capture now uses a dedicated fixed fused graph family; sampled
+requests, mixed-sampling batches, and C2/C4/C8 graph families retain the full-logit reference
+route. This keeps the graph working-set change isolated while preserving the exact sampled path.
+
 The matrix contains three independently measured test kinds:
 
 - `pp{P}` prepares `P` tokens and requests one output token. This is the smallest request that runs
@@ -817,6 +852,30 @@ cmake --build build --parallel --target \
 Aligned registered shapes use 16-byte BF16 packs in the cache-sized regime. GELU and AddBias
 select their BF16x2 streaming routes for larger Vision items; odd or unaligned repository-internal
 test shapes exercise the scalar fallbacks.
+
+## Causal conv1d SiLU Op benchmark
+
+`ninfer_causal_conv1d_silu_bench` times one public entry per invocation. `--tokens` takes a list, so
+a route decision comes from one process rather than a series of them. `--cache` defaults to warm;
+pass `--cache cold` for the state route decisions are made in.
+
+```bash
+./build/bench/ninfer_causal_conv1d_silu_bench --split --cache cold --channels 8192 --tokens 1,2,7,15,16,17,24,32,33,64,65
+./build/bench/ninfer_causal_conv1d_silu_bench --split --cache cold --channels 10240 --tokens 1024,4096,8192
+```
+
+`--split` selects the split-output entry. Its partition follows the channel extent, because those
+are the row profiles the entry admits: `--channels 8192` gives (2048, 2048, 4096) and
+`--channels 10240` gives (2048, 2048, 6144).
+
+`--legacy-stage` times the stage the split entry replaced - one packed convolution into a `[C,T]`
+plane followed by three `extract_bf16_columns` - so the two can be compared under one set of
+timing conditions. It is a decision benchmark and is meant to be removed once that decision is
+closed.
+
+```bash
+./build/bench/ninfer_causal_conv1d_silu_bench --legacy-stage --split --cache cold --channels 8192 --tokens 1024,8192
+```
 
 ## Reports
 

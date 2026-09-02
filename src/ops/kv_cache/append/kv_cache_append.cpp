@@ -13,7 +13,6 @@ namespace {
 
 constexpr std::int32_t kHeadDim       = 128;
 constexpr std::int32_t kKVHeads       = 8;
-constexpr std::uint32_t kWindow       = 4096;
 constexpr std::int32_t kFullHeadDim   = 256;
 constexpr const char* kAppendOp       = "kv_cache_append";
 constexpr const char* kPrefixAppendOp = "kv_cache_append_prefix";
@@ -35,9 +34,12 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv_heads) {
     D256KVCacheProfile profile{};
     try {
-        profile = d256_kv_cache_profile(cache.dtype);
+        profile = d256_kv_cache_profile(cache.dtype, cache.quant_group);
     } catch (const std::invalid_argument&) {
         throw std::invalid_argument("kv_cache_append: invalid cache geometry or dtype");
+    }
+    if (!is_valid_oscar_kv_layout(cache.layout)) {
+        throw std::invalid_argument("kv_cache_append: invalid OSCAR cache layout");
     }
     if (cache.num_kv_heads != kv_heads || cache.head_dim != kFullHeadDim ||
         cache.quant_group != profile.quant_group) {
@@ -55,9 +57,9 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
     if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache code dtype");
     }
-    require_shape(cache.k_pages, kFullHeadDim, kPagedKVPageSize, kv_heads, physical_pages,
+    require_shape(cache.k_pages, profile.code_leading_extent, kPagedKVPageSize, kv_heads, physical_pages,
                   kAppendOp, "cache k pages");
-    require_shape(cache.v_pages, kFullHeadDim, kPagedKVPageSize, kv_heads, physical_pages,
+    require_shape(cache.v_pages, profile.code_leading_extent, kPagedKVPageSize, kv_heads, physical_pages,
                   kAppendOp, "cache v pages");
     require_contiguous_nonnull(cache.k_pages, kAppendOp, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, kAppendOp, "cache v pages");
@@ -74,7 +76,8 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != profile.scale_dtype ||
+        cache.v_scale_pages.dtype != profile.scale_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
@@ -127,6 +130,9 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
 
 void validate_paged_cache(const PagedKVBatchLayerView& cache,
                           KVCacheAppendPrefixExecutionEnvelope envelope) {
+    if (!is_valid_oscar_kv_layout(cache.layout)) {
+        throw std::invalid_argument("kv_cache_append_prefix: invalid OSCAR cache layout");
+    }
     if (cache.dtype != DType::BF16 || cache.quant_group != 0 || cache.num_kv_heads != kKVHeads ||
         cache.head_dim != kHeadDim || cache.k_pages.ne[2] <= 0 ||
         cache.k_pages.ne[2] != cache.v_pages.ne[2] || cache.block_tables.ne[0] <= 0 ||
@@ -152,23 +158,98 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
 
 void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
                            KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity != kWindow ||
-        cache.padded_capacity < cache.capacity ||
+    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity < 2 ||
+        (cache.capacity & (cache.capacity - 1)) != 0 || cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         envelope.max_count > cache.capacity) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache");
     }
     const auto padded = static_cast<std::int32_t>(cache.padded_capacity);
-    if (cache.k.dtype != DType::BF16 || cache.v.dtype != DType::BF16 || cache.k.ne[0] != kHeadDim ||
-        cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.v.ne[0] != kHeadDim ||
-        cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
+    const bool packed = cache.dtype == DType::U8;
+    const std::uint8_t quant_bits = packed ? (cache.quant_bits == 0 ? 4 : cache.quant_bits) : 0;
+    if (packed && (quant_bits < 2 || quant_bits > 4)) {
+        throw std::invalid_argument("kv_cache_append_prefix: packed cyclic cache must use 2, 3, or 4 bits");
+    }
+    const std::int32_t code_extent = packed
+                                         ? static_cast<std::int32_t>(
+                                               (static_cast<std::uint64_t>(kHeadDim) * quant_bits +
+                                                7U) /
+                                               8U)
+                                         : kHeadDim;
+    const bool oscar = packed && cache.quantization == CyclicKVCacheQuantization::OscarAffine;
+    const std::int32_t expected_quant_group = oscar ? 128 : 16;
+    const std::int32_t scale_extent = packed ? (oscar ? 2 : kHeadDim / 16) : 0;
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::U8) ||
+        (packed ? cache.quant_group != expected_quant_group : cache.quant_group != 0) ||
+        cache.k.dtype != cache.dtype || cache.v.dtype != cache.dtype ||
+        cache.k.ne[0] != code_extent || cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads ||
+        cache.v.ne[0] != code_extent || cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
         cache.v.ne[3] != cache.lane_capacity || cache.lane_capacity <= 0 ||
         cache.k.ne[3] != cache.lane_capacity) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache tensors");
     }
     require_vector_aligned(cache.k, "cache k");
     require_vector_aligned(cache.v, "cache v");
+    if (!packed) {
+        if (cache.k_scale.data != nullptr || cache.v_scale.data != nullptr) {
+            throw std::invalid_argument("kv_cache_append_prefix: BF16 cyclic cache must not have scales");
+        }
+        return;
+    }
+    const DType expected_scale_dtype = oscar ? DType::BF16 : DType::FP8_E4M3FN;
+    if (cache.k_scale.dtype != expected_scale_dtype || cache.v_scale.dtype != expected_scale_dtype ||
+        cache.k_scale.ne[0] != scale_extent || cache.k_scale.ne[1] != padded ||
+        cache.k_scale.ne[2] != kKVHeads || cache.k_scale.ne[3] != cache.lane_capacity ||
+        cache.v_scale.ne[0] != scale_extent || cache.v_scale.ne[1] != padded ||
+        cache.v_scale.ne[2] != kKVHeads || cache.v_scale.ne[3] != cache.lane_capacity) {
+        throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic packed scales");
+    }
+    require_vector_aligned(cache.k_scale, "cache k scales");
+    require_vector_aligned(cache.v_scale, "cache v scales");
+    if (cache.protected_capacity != 0 || cache.protected_anchor_capacity != 0) {
+        if (cache.protected_capacity > cache.capacity ||
+            (cache.protected_capacity != 0 &&
+             (cache.protected_capacity & (cache.protected_capacity - 1U)) != 0U) ||
+            cache.protected_anchor_capacity > cache.capacity ||
+            cache.protected_anchor_capacity > cache.capacity - cache.protected_capacity ||
+            cache.protected_padded_capacity <
+                cache.protected_capacity + cache.protected_anchor_capacity ||
+            cache.protected_padded_capacity >
+                static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
+            cache.protected_k.dtype != DType::BF16 || cache.protected_v.dtype != DType::BF16 ||
+            cache.protected_k.ne[0] != kHeadDim ||
+            cache.protected_k.ne[1] != static_cast<std::int32_t>(cache.protected_padded_capacity) ||
+            cache.protected_k.ne[2] != kKVHeads ||
+            cache.protected_k.ne[3] != cache.lane_capacity ||
+            cache.protected_v.ne[0] != kHeadDim ||
+            cache.protected_v.ne[1] != static_cast<std::int32_t>(cache.protected_padded_capacity) ||
+            cache.protected_v.ne[2] != kKVHeads ||
+            cache.protected_v.ne[3] != cache.lane_capacity) {
+            throw std::invalid_argument("kv_cache_append: invalid protected cyclic sidecar");
+        }
+        require_vector_aligned(cache.protected_k, "cache protected k");
+        require_vector_aligned(cache.protected_v, "cache protected v");
+    } else if (cache.protected_padded_capacity != 0 || cache.protected_k.data != nullptr ||
+               cache.protected_v.data != nullptr) {
+        throw std::invalid_argument("kv_cache_append: unexpected protected cyclic sidecar");
+    }
+}
+
+void validate_oscar_dual_cache(const CyclicKVCacheLayerView& l0,
+                               const CyclicKVCacheLayerView& q4) {
+    if (l0.dtype != DType::U8 || q4.dtype != DType::U8 ||
+        l0.quantization != CyclicKVCacheQuantization::OscarAffine ||
+        q4.quantization != CyclicKVCacheQuantization::OscarAffine ||
+        l0.quant_bits != 2 || q4.quant_bits != 4 ||
+        l0.capacity != q4.capacity || l0.padded_capacity != q4.padded_capacity ||
+        l0.num_kv_heads != q4.num_kv_heads || l0.head_dim != q4.head_dim ||
+        l0.lane_capacity != q4.lane_capacity ||
+        l0.protected_capacity != q4.protected_capacity ||
+        l0.protected_anchor_capacity != q4.protected_anchor_capacity ||
+        l0.protected_padded_capacity != q4.protected_padded_capacity) {
+        throw std::invalid_argument("kv_cache_append_prefix_oscar_dual: cache geometry mismatch");
+    }
 }
 
 } // namespace
@@ -216,6 +297,19 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
     const auto plan = validate_inputs(k, v, positions, counts, lanes, envelope);
     validate_cyclic_cache(cache, envelope);
     detail::kv_cache_append_prefix_launch(k, v, positions, counts, lanes, cache, plan, stream);
+}
+
+void kv_cache_append_prefix_oscar_dual(
+    const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
+    const Tensor& lanes, KVCacheAppendPrefixExecutionEnvelope envelope,
+    CyclicKVCacheLayerView l0_cache, CyclicKVCacheLayerView q4_shadow_cache,
+    cudaStream_t stream) {
+    const auto plan = validate_inputs(k, v, positions, counts, lanes, envelope);
+    validate_cyclic_cache(l0_cache, envelope);
+    validate_cyclic_cache(q4_shadow_cache, envelope);
+    validate_oscar_dual_cache(l0_cache, q4_shadow_cache);
+    detail::kv_cache_append_prefix_oscar_dual_launch(
+        k, v, positions, counts, lanes, l0_cache, q4_shadow_cache, plan, stream);
 }
 
 } // namespace ninfer::ops
