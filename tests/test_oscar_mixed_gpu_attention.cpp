@@ -312,7 +312,8 @@ struct DeviceMixed {
     DeviceBuffer<std::uint16_t> prefix_k, prefix_v, recent_k, recent_v;
     DeviceBuffer<std::uint8_t> historical_k_packed, historical_v_packed;
     DeviceBuffer<float> historical_k_metadata, historical_v_metadata;
-    DeviceBuffer<float> scores, softmax, output;
+    DeviceBuffer<float> scores, softmax, output, fused_output;
+    DeviceBuffer<float> fused_decode_workspace;
     DeviceBuffer<float> history_scores, history_softmax;
 
     explicit DeviceMixed(const MixedFixture& fixture)
@@ -326,6 +327,9 @@ struct DeviceMixed {
           scores(static_cast<std::size_t>(kQHeads) * fixture.context),
           softmax(static_cast<std::size_t>(kQHeads) * fixture.context),
           output(static_cast<std::size_t>(kQHeads) * kHeadDim),
+          fused_output(static_cast<std::size_t>(kQHeads) * kHeadDim),
+          fused_decode_workspace(
+              ninfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes),
           history_scores(static_cast<std::size_t>(kQHeads) * fixture.historical),
           history_softmax(static_cast<std::size_t>(kQHeads) * fixture.historical) {
         upload(q.data, fixture.q);
@@ -355,6 +359,17 @@ void launch_history(const MixedFixture& fixture, DeviceMixed& device) {
         device.historical_v_packed.data, device.historical_v_metadata.data, fixture.historical,
         kAttentionScale, device.history_scores.data, device.history_softmax.data,
         device.output.data, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void launch_fused(const MixedFixture& fixture, DeviceMixed& device) {
+    ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
+        device.q.data, device.prefix_k.data, device.prefix_v.data, fixture.prefix,
+        device.historical_k_packed.data, device.historical_k_metadata.data,
+        device.historical_v_packed.data, device.historical_v_metadata.data, fixture.historical,
+        device.recent_k.data, device.recent_v.data, fixture.recent, 0,
+        fixture.context - 1, ninfer::ops::detail::kOscarMixedFusedDecodeSplits,
+        kAttentionScale, device.fused_decode_workspace.data, device.fused_output.data, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
@@ -486,17 +501,23 @@ void run_parity(const MixedFixture& fixture, bool compare_reader) {
     DeviceMixed device(fixture);
     launch_mixed(fixture, device);
     const DeviceOutput actual = download(fixture, device);
+    launch_fused(fixture, device);
+    std::vector<float> fused_output(actual.output.size());
+    CUDA_CHECK(cudaMemcpy(fused_output.data(), device.fused_output.data,
+                          fused_output.size() * sizeof(float), cudaMemcpyDeviceToHost));
     const Metrics score = compare(expected.scores, actual.scores);
     const Metrics softmax = compare(expected.softmax, actual.softmax);
     const Metrics output = compare(expected.output, actual.output);
+    const Metrics fused = compare(expected.output, fused_output);
     require(score.relative_l2 <= kParityTolerance && softmax.relative_l2 <= kParityTolerance &&
-                output.relative_l2 <= kParityTolerance,
+                output.relative_l2 <= kParityTolerance && fused.relative_l2 <= kParityTolerance,
             "mixed GPU parity exceeded tolerance at context " + std::to_string(fixture.context));
     std::cout << std::scientific << std::setprecision(9)
               << "parity context=" << fixture.context << " tiers=" << fixture.prefix << '/'
               << fixture.historical << '/' << fixture.recent << " score=" << score.max_abs << '/'
               << score.relative_l2 << " softmax=" << softmax.max_abs << '/' << softmax.relative_l2
-              << " av=" << output.max_abs << '/' << output.relative_l2 << " PASS\n"
+              << " av=" << output.max_abs << '/' << output.relative_l2
+              << " fused_av=" << fused.max_abs << '/' << fused.relative_l2 << " PASS\n"
               << std::defaultfloat;
 
     if (compare_reader) {
@@ -553,7 +574,8 @@ int main() {
                   << " softmax_regs=" << resources.softmax_registers << " av_regs="
                   << resources.av_registers << " score_smem=" << resources.score_static_shared_bytes
                   << " softmax_smem=" << resources.softmax_static_shared_bytes << " av_smem="
-                  << resources.av_static_shared_bytes << "\n";
+                  << resources.av_static_shared_bytes << " fused_regs=" << resources.fused_registers
+                  << " fused_dynamic_smem=" << resources.fused_dynamic_shared_bytes << "\n";
 
         // Boundaries: no historical tier, first historical row, aging/partial historical page,
         // and the required mixed contexts. The cache-backed contexts also exercise the existing
@@ -585,7 +607,7 @@ int main() {
         std::cout << "forced-decode logical_tokens=997,1001,1003,1005,1007,1009,1011,1013"
                      " cache_tiers=64/192..199/256 PASS\n";
 
-        std::cout << "context,mixed_ms,historical_ms,bf16_window_ms,merge_ms,cpu_scalar_ms,speedup"
+        std::cout << "context,mixed_ms,fused_split_merge_ms,historical_ms,bf16_window_ms,cpu_scalar_ms,speedup"
                      ",mixed_us_per_history_token,effective_GBps,workspace_bytes\n";
         for (const int context : {512, 2048, 4096, 8192, 16384, 32768}) {
             const MixedFixture fixture = make_fixture(context, 3);
@@ -594,6 +616,8 @@ int main() {
             const int gpu_repetitions = context <= 4096 ? 20 : (context <= 16384 ? 8 : 4);
             const int cpu_repetitions = context <= 4096 ? 2 : 1;
             const double mixed_ms = benchmark_cuda([&] { launch_mixed(fixture, device); }, gpu_repetitions);
+            const double fused_ms = benchmark_cuda([&] { launch_fused(fixture, device); },
+                                                   gpu_repetitions);
             const double historical_ms = fixture.historical == 0
                 ? 0.0 : benchmark_cuda([&] { launch_history(fixture, device); }, gpu_repetitions);
             const double bf16_ms = benchmark_cuda([&] {
@@ -607,15 +631,15 @@ int main() {
             const double cpu_ms = benchmark_cpu(fixture, cpu_repetitions);
             const double speedup = cpu_ms / mixed_ms;
             const double traffic = static_cast<double>(mixed_traffic_bytes(fixture));
-            const double bandwidth = traffic / (mixed_ms * 1.0e6);
+            const double bandwidth = traffic / (fused_ms * 1.0e6);
             std::cout << std::fixed << std::setprecision(6)
-                      << context << ',' << mixed_ms << ',' << historical_ms << ',' << bf16_ms
-                      << ",0.000000," << cpu_ms << ',' << speedup << ','
-                      << (fixture.historical == 0 ? 0.0 : mixed_ms * 1000.0 / fixture.historical)
+                      << context << ',' << mixed_ms << ',' << fused_ms << ',' << historical_ms << ',' << bf16_ms
+                      << ',' << cpu_ms << ',' << speedup << ','
+                      << (fixture.historical == 0 ? 0.0 : fused_ms * 1000.0 / fixture.historical)
                       << ',' << bandwidth << ',' << mixed_workspace_bytes(fixture) << '\n';
         }
         std::cout << "PASS: mixed BF16-prefix + OscarInt2G128-history + BF16-recent GPU path is "
-                     "reference-correct and materially faster; no separate merge kernel is used\n";
+                     "reference-correct and materially faster; fused decode includes split-KV and merge kernels\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

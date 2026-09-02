@@ -1112,11 +1112,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int layer, int fidx, 
         const char* validate_reference_d43 = std::getenv("NINFER_OSCAR_D4_3_VALIDATE_REFERENCE");
         const char* validate_reference_d44 = std::getenv("NINFER_OSCAR_D4_4_VALIDATE_REFERENCE");
         const char* validate_reference_d45 = std::getenv("NINFER_OSCAR_D4_5_VALIDATE_REFERENCE");
+        const char* validate_reference_d46 = std::getenv("NINFER_OSCAR_D4_6_VALIDATE_REFERENCE");
         const bool d45_reference = validate_reference_d45 != nullptr &&
                                    validate_reference_d45[0] == '1';
+        const bool d46_reference = validate_reference_d46 != nullptr &&
+                                   validate_reference_d46[0] == '1';
         if (((validate_reference_d43 != nullptr && validate_reference_d43[0] == '1') ||
              (validate_reference_d44 != nullptr && validate_reference_d44[0] == '1') ||
-             d45_reference) &&
+             d45_reference || d46_reference) &&
             (layer == 3 || layer == 35 || layer == 63)) {
             CUDA_CHECK(cudaStreamSynchronize(s));
             const auto metrics = [](std::span<const float> expected,
@@ -1139,7 +1142,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int layer, int fidx, 
                     std::sqrt(diff2 / std::max(ref2, std::numeric_limits<double>::min()))};
             };
             std::vector<int> validation_tokens{T - 1};
-            if (d45_reference) {
+            if (d45_reference || d46_reference) {
                 constexpr std::array<std::uint32_t, 13> kD45BoundaryQueries{
                     63U, 64U, 68U, 319U, 320U, 321U, 322U, 323U, 324U, 325U, 326U, 327U,
                     331U};
@@ -1178,7 +1181,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int layer, int fidx, 
                     layer, static_cast<std::uint32_t>(positions[token]), q_original);
                 const auto av_error = metrics(trace.rotated_av, gpu_rotated);
                 const auto recovered_error = metrics(trace.recovered_output, gpu_recovered);
-                std::cerr << (d45_reference ? "OSCAR D4.5" : "OSCAR D4.3")
+                std::cerr << (d46_reference ? "OSCAR D4.6" :
+                              (d45_reference ? "OSCAR D4.5" : "OSCAR D4.3"))
                           << " live/reference layer=" << layer
                           << " query=" << positions[token]
                           << " rotated_av_max_abs=" << av_error[0]
@@ -1226,6 +1230,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int layer, int fidx, 
                       << " gpu_cache_staging_bytes=" << profile.gpu_cache_staging_bytes
                       << " gpu_qkv_rotation_us=" << profile.qkv_rotation_us
                       << " gpu_mixed_kernel_us=" << profile.gpu_mixed_kernel_us
+                      << " gpu_fused_kernel_us=" << profile.gpu_fused_kernel_us
                       << " gpu_recovery_us=" << profile.gpu_recovery_us
                       << " gpu_full_attention_us=" << profile.full_attention_us
                       << " gpu_prefill_full_attention_us="
@@ -1240,6 +1245,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int layer, int fidx, 
                       << " gpu_prefill_batches=" << profile.gpu_prefill_batches
                       << " gpu_decode_queries=" << profile.gpu_decode_queries
                       << " gpu_decode_batches=" << profile.gpu_decode_batches
+                      << " gpu_fused_query_tiles=" << profile.gpu_fused_query_tiles
+                      << " gpu_fused_kv_tiles=" << profile.gpu_fused_kv_tiles
                       << " gpu_prefill_query_block="
                       << oscar_internal::live_gpu_prefill_query_block_size()
                       << " gpu_resident_publish_us=" << profile.gpu_resident_publish_us
@@ -1256,8 +1263,11 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int layer, int fidx, 
                       << " legacy_q2_dispatched=false bf16_historical_shadow=false fallback=false"
                       << " selected_layout=mixed-bf16-prefix-oscar-int2-g128-bf16-recent"
                       << " selected_attention_implementation="
-                      << (live_gpu_resident ? "oscar-mixed-gpu-d4-4-resident"
-                                             : "oscar-mixed-gpu-d4-2b")
+                      << (live_gpu_resident
+                              ? (oscar_internal::live_int2_gpu_fused_mode_enabled()
+                                     ? "oscar-mixed-gpu-d4-6-fused-resident"
+                                     : "oscar-mixed-gpu-d4-5-three-stage-resident")
+                              : "oscar-mixed-gpu-d4-2b")
                       << '\n';
         }
     } else if (live_reference) {

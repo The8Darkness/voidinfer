@@ -540,15 +540,18 @@ void write_live_trace_vector(std::ofstream& output, std::span<const float> value
 bool oscar_d4_profile_enabled() noexcept {
     const char* d41 = std::getenv("NINFER_OSCAR_D4_1_PROFILE");
     const char* d44 = std::getenv("NINFER_OSCAR_D4_4_PROFILE");
-    return (d41 != nullptr && d41[0] == '1') || (d44 != nullptr && d44[0] == '1');
+    const char* d46 = std::getenv("NINFER_OSCAR_D4_6_PROFILE");
+    return (d41 != nullptr && d41[0] == '1') || (d44 != nullptr && d44[0] == '1') ||
+           (d46 != nullptr && d46[0] == '1');
 }
 
 bool oscar_gpu_oracle_enabled() noexcept {
     const char* d43 = std::getenv("NINFER_OSCAR_D4_3_VALIDATE_REFERENCE");
     const char* d44 = std::getenv("NINFER_OSCAR_D4_4_VALIDATE_REFERENCE");
     const char* d45 = std::getenv("NINFER_OSCAR_D4_5_VALIDATE_REFERENCE");
+    const char* d46 = std::getenv("NINFER_OSCAR_D4_6_VALIDATE_REFERENCE");
     return (d43 != nullptr && d43[0] == '1') || (d44 != nullptr && d44[0] == '1') ||
-           (d45 != nullptr && d45[0] == '1');
+           (d45 != nullptr && d45[0] == '1') || (d46 != nullptr && d46[0] == '1');
 }
 
 bool oscar_resident_async_profile_enabled() noexcept {
@@ -568,6 +571,7 @@ OscarLiveMixedReferenceCache::OscarLiveMixedReferenceCache(
     std::shared_ptr<const OscarRotationSet> rotations)
     : max_context_(max_context), sequence_id_(sequence_id), rotations_(std::move(rotations)),
       gpu_resident_enabled_(live_int2_gpu_resident_mode_enabled()),
+      gpu_fused_enabled_(live_int2_gpu_fused_mode_enabled()),
       gpu_host_oracle_enabled_(oscar_gpu_oracle_enabled()),
       asset_(::ninfer::OscarMixedAgingAssetContract::from_runtime(
           rotations_ ? rotations_->asset_identity() : std::string{},
@@ -582,28 +586,7 @@ OscarLiveMixedReferenceCache::OscarLiveMixedReferenceCache(
         rotations_->asset_hash() != asset_.asset_manifest_sha256) {
         throw std::invalid_argument("OSCAR live mixed cache rotation contract mismatch");
     }
-    const char* tap_root = std::getenv("NINFER_OSCAR_LIVE_REFERENCE_TAP_DIR");
-    if (tap_root != nullptr && *tap_root != '\0') {
-        tap_root_ = std::filesystem::absolute(tap_root).lexically_normal();
-        std::error_code error;
-        std::filesystem::create_directories(tap_root_, error);
-        if (error) {
-            throw std::runtime_error("cannot create OSCAR live reference tap directory: " +
-                                     error.message());
-        }
-        tap_layers_ = parse_live_list(std::getenv("NINFER_OSCAR_LIVE_REFERENCE_TAP_LAYERS"),
-                                      "OSCAR live tap layer list");
-        tap_queries_ = parse_live_list(std::getenv("NINFER_OSCAR_LIVE_REFERENCE_TAP_QUERIES"),
-                                       "OSCAR live tap query list");
-        if (tap_layers_.empty()) { tap_layers_.push_back(3); }
-        if (tap_queries_.empty()) { tap_queries_.push_back(0); }
-        for (const std::uint32_t layer : tap_layers_) {
-            if (std::find(asset_.full_attention_layers.begin(), asset_.full_attention_layers.end(),
-                          layer) == asset_.full_attention_layers.end()) {
-                throw std::invalid_argument("OSCAR live tap layer is not full-attention");
-            }
-        }
-    }
+    refresh_live_reference_taps();
     initialize_layers();
     if (gpu_resident_enabled_) {
         gpu_prefill_query_block_size_ = live_gpu_prefill_query_block_size();
@@ -651,11 +634,20 @@ void OscarLiveMixedReferenceCache::initialize_gpu_resident_storage() {
     }
     const std::size_t attention_workspace_bytes =
         static_cast<std::size_t>(max_context_) * ::ninfer::kOscarMixedQueryHeads * sizeof(float);
-    const std::size_t batched_workspace_bytes =
-        attention_workspace_bytes * static_cast<std::size_t>(gpu_prefill_query_block_size_);
-    gpu_resident_scores_ = DeviceBuffer(batched_workspace_bytes);
-    gpu_resident_softmax_ = DeviceBuffer(batched_workspace_bytes);
-    gpu_resident_workspace_bytes_ = 2ULL * batched_workspace_bytes;
+    if (!gpu_fused_enabled_) {
+        const std::size_t batched_workspace_bytes =
+            attention_workspace_bytes * static_cast<std::size_t>(gpu_prefill_query_block_size_);
+        gpu_resident_scores_ = DeviceBuffer(batched_workspace_bytes);
+        gpu_resident_softmax_ = DeviceBuffer(batched_workspace_bytes);
+        gpu_resident_workspace_bytes_ = 2ULL * batched_workspace_bytes;
+    } else {
+        // D4.6 keeps only a fixed split-KV decode reduction buffer. The D4.5 score and softmax
+        // buffers are deliberately not allocated in the production fused mode.
+        gpu_resident_fused_decode_workspace_ = DeviceBuffer(
+            ::ninfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes);
+        gpu_resident_workspace_bytes_ =
+            ::ninfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes;
+    }
     profile_.gpu_resident_cache_bytes = gpu_resident_cache_bytes_;
     profile_.gpu_resident_workspace_bytes = gpu_resident_workspace_bytes_;
 }
@@ -1062,7 +1054,24 @@ void OscarLiveMixedReferenceCache::attention_gpu_batch(
         static_cast<float*>(resident.historical_v_metadata.p),
         static_cast<std::uint16_t*>(resident.recent_k.p),
         static_cast<std::uint16_t*>(resident.recent_v.p),
-        static_cast<std::int32_t>(max_context_)};
+         static_cast<std::int32_t>(max_context_)};
+    if (gpu_fused_enabled_) {
+        ::ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_batch_ring(
+            static_cast<const float*>(q_rotated.data), view.prefix_k_bf16, view.prefix_v_bf16,
+            static_cast<std::int32_t>(prefix), view.historical_k_packed,
+            view.historical_k_metadata, view.historical_v_packed, view.historical_v_metadata,
+            static_cast<std::int32_t>(historical), view.recent_k_bf16, view.recent_v_bf16,
+            static_cast<std::int32_t>(recent), static_cast<std::int32_t>(resident.recent_head),
+            static_cast<std::int32_t>(query_start), static_cast<std::int32_t>(query_count),
+            0.0625F, static_cast<float*>(rotated_output.data), stream);
+        ++profile_.gpu_attention_batches;
+        profile_.gpu_attention_calls += query_count;
+        profile_.gpu_attention_kernel_launches += 1;
+        profile_.gpu_fused_query_tiles += (query_count + 3U) / 4U;
+        profile_.gpu_fused_kv_tiles +=
+            ((query_start + query_count + 31U) / 32U) * ((query_count + 3U) / 4U);
+        return;
+    }
     ::ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_batch_ring(
         static_cast<const float*>(q_rotated.data), view.prefix_k_bf16, view.prefix_v_bf16,
         static_cast<std::int32_t>(prefix), view.historical_k_packed,
@@ -1106,6 +1115,7 @@ void OscarLiveMixedReferenceCache::attention_gpu(std::int32_t model_layer,
         const std::uint32_t recent_begin = live_recent_begin(resident.context);
         const std::uint32_t historical = recent_begin - prefix;
         const std::uint32_t history_end = prefix + historical;
+        const std::uint32_t recent = resident.context - history_end;
         const std::uint32_t visible = query_token + 1U;
         const std::uint32_t visible_prefix = std::min(visible, prefix);
         const std::uint32_t visible_historical =
@@ -1128,7 +1138,26 @@ void OscarLiveMixedReferenceCache::attention_gpu(std::int32_t model_layer,
             static_cast<float*>(resident.historical_v_metadata.p),
             static_cast<std::uint16_t*>(resident.recent_k.p),
             static_cast<std::uint16_t*>(resident.recent_v.p),
-            static_cast<std::int32_t>(max_context_)};
+             static_cast<std::int32_t>(max_context_)};
+        if (gpu_fused_enabled_) {
+            ::ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
+                static_cast<const float*>(q_rotated.data), view.prefix_k_bf16, view.prefix_v_bf16,
+                static_cast<std::int32_t>(prefix), view.historical_k_packed,
+                view.historical_k_metadata, view.historical_v_packed,
+                view.historical_v_metadata, static_cast<std::int32_t>(historical),
+                view.recent_k_bf16, view.recent_v_bf16,
+                static_cast<std::int32_t>(recent), static_cast<std::int32_t>(resident.recent_head),
+                static_cast<std::int32_t>(query_token),
+                ::ninfer::ops::detail::kOscarMixedFusedDecodeSplits, 0.0625F,
+                static_cast<float*>(gpu_resident_fused_decode_workspace_.p),
+                static_cast<float*>(rotated_output.data), stream);
+            ++profile_.gpu_attention_calls;
+            ++profile_.gpu_attention_batches;
+            profile_.gpu_attention_kernel_launches += 2;
+            ++profile_.gpu_fused_query_tiles;
+            profile_.gpu_fused_kv_tiles += (query_token + 64U) / 64U;
+            return;
+        }
         ::ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_ring(
             static_cast<const float*>(q_rotated.data), view.prefix_k_bf16, view.prefix_v_bf16,
             static_cast<std::int32_t>(visible_prefix), view.historical_k_packed,
@@ -1481,6 +1510,11 @@ void OscarLiveMixedReferenceCache::record_full_attention_us(double value) noexce
 
 void OscarLiveMixedReferenceCache::record_gpu_mixed_kernel_us(double value) noexcept {
     profile_.gpu_mixed_kernel_us += value;
+    if (gpu_fused_enabled_) { profile_.gpu_fused_kernel_us += value; }
+}
+
+void OscarLiveMixedReferenceCache::record_gpu_fused_kernel_us(double value) noexcept {
+    profile_.gpu_fused_kernel_us += value;
 }
 
 void OscarLiveMixedReferenceCache::record_gpu_recovery_us(double value) noexcept {
@@ -1509,6 +1543,33 @@ void OscarLiveMixedReferenceCache::record_gpu_prefill_batch(std::uint32_t query_
 void OscarLiveMixedReferenceCache::record_gpu_decode_batch(std::uint32_t query_count) noexcept {
     profile_.gpu_decode_batches += 1;
     profile_.gpu_decode_queries += query_count;
+}
+
+void OscarLiveMixedReferenceCache::refresh_live_reference_taps() {
+    tap_root_.clear();
+    tap_layers_.clear();
+    tap_queries_.clear();
+    const char* tap_root = std::getenv("NINFER_OSCAR_LIVE_REFERENCE_TAP_DIR");
+    if (tap_root == nullptr || *tap_root == '\0') { return; }
+    tap_root_ = std::filesystem::absolute(tap_root).lexically_normal();
+    std::error_code error;
+    std::filesystem::create_directories(tap_root_, error);
+    if (error) {
+        throw std::runtime_error("cannot create OSCAR live reference tap directory: " +
+                                 error.message());
+    }
+    tap_layers_ = parse_live_list(std::getenv("NINFER_OSCAR_LIVE_REFERENCE_TAP_LAYERS"),
+                                  "OSCAR live tap layer list");
+    tap_queries_ = parse_live_list(std::getenv("NINFER_OSCAR_LIVE_REFERENCE_TAP_QUERIES"),
+                                   "OSCAR live tap query list");
+    if (tap_layers_.empty()) { tap_layers_.push_back(3); }
+    if (tap_queries_.empty()) { tap_queries_.push_back(0); }
+    for (const std::uint32_t layer : tap_layers_) {
+        if (std::find(asset_.full_attention_layers.begin(), asset_.full_attention_layers.end(),
+                      layer) == asset_.full_attention_layers.end()) {
+            throw std::invalid_argument("OSCAR live tap layer is not full-attention");
+        }
+    }
 }
 
 void OscarLiveMixedReferenceCache::write_tap_if_selected(
@@ -1603,9 +1664,27 @@ live_mixed_cache_for(const void* owner, std::uint32_t max_context,
     std::lock_guard lock(mutex);
     if (current_cache && current_owner == owner) {
         if (current_cache->max_context() != max_context) {
-            throw std::logic_error("OSCAR live mixed cache exceeded configured capacity");
+            // A new engine can reuse the PagedKVCache address with a different capacity after
+            // the previous cache has been released. An active owner changing capacity is still
+            // rejected, but an idle diagnostic cache may be replaced safely.
+            if (current_cache.use_count() > 1) {
+                throw std::logic_error("OSCAR live mixed cache exceeded configured capacity");
+            }
+            current_owner = nullptr;
+            current_cache.reset();
+        } else if (current_cache->gpu_resident_mode_enabled() !=
+                   live_int2_gpu_resident_mode_enabled()) {
+            // The owner address is also reused by the D4.3 scalar oracle and the resident GPU
+            // path. Do not hand a cache with the wrong storage/append contract to the new mode.
+            if (current_cache.use_count() > 1) {
+                throw std::logic_error("OSCAR live mixed cache mode changed while active");
+            }
+            current_owner = nullptr;
+            current_cache.reset();
+        } else {
+            current_cache->refresh_live_reference_taps();
+            return current_cache;
         }
-        return current_cache;
     }
     if (current_cache && current_cache.use_count() > 1) {
         throw std::logic_error("OSCAR live mixed diagnostic cache is already in use");
@@ -1664,6 +1743,19 @@ bool live_int2_gpu_resident_mode_enabled() {
         throw std::invalid_argument("unsupported NINFER_OSCAR_ROTATION_MODE");
     }
     return std::string_view(value) == "oscar-int2-gpu-resident";
+}
+
+bool live_int2_gpu_fused_mode_enabled() {
+    if (!live_int2_gpu_resident_mode_enabled()) { return false; }
+    const char* value = std::getenv("NINFER_OSCAR_D4_6_FUSED");
+    if (value == nullptr || *value == '\0' || std::string_view(value) == "1" ||
+        std::string_view(value) == "true") {
+        return true;
+    }
+    if (std::string_view(value) == "0" || std::string_view(value) == "false") {
+        return false;
+    }
+    throw std::invalid_argument("NINFER_OSCAR_D4_6_FUSED must be 0 or 1");
 }
 
 std::uint32_t live_gpu_prefill_query_block_size() {

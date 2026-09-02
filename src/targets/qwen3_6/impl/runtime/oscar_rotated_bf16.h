@@ -106,6 +106,9 @@ private:
 [[nodiscard]] bool live_int2_reference_mode_enabled();
 [[nodiscard]] bool live_int2_gpu_mode_enabled();
 [[nodiscard]] bool live_int2_gpu_resident_mode_enabled();
+// D4.6 fused resident attention is the default. Set NINFER_OSCAR_D4_6_FUSED=0 only for an
+// explicit D4.5 three-stage control measurement.
+[[nodiscard]] bool live_int2_gpu_fused_mode_enabled();
 // D4.5 prefill query block selected by NINFER_OSCAR_D4_5_QBLOCK; defaults to Q64 and accepts
 // only the benchmarked candidates Q8/Q16/Q32/Q64.
 [[nodiscard]] std::uint32_t live_gpu_prefill_query_block_size();
@@ -141,6 +144,7 @@ public:
         double gpu_cache_staging_us = 0.0;
         double gpu_mixed_kernel_us = 0.0;
         double gpu_recovery_us = 0.0;
+        double gpu_fused_kernel_us = 0.0;
         double gpu_prefill_full_attention_us = 0.0;
         double gpu_decode_full_attention_us = 0.0;
         std::uint64_t gpu_cache_staging_bytes = 0;
@@ -160,6 +164,8 @@ public:
         std::uint64_t gpu_incremental_host_device_bytes = 0;
         std::uint64_t gpu_resident_cache_bytes = 0;
         std::uint64_t gpu_resident_workspace_bytes = 0;
+        std::uint64_t gpu_fused_kv_tiles = 0;
+        std::uint64_t gpu_fused_query_tiles = 0;
     };
 
     OscarLiveMixedReferenceCache(std::uint32_t max_context, std::uint64_t sequence_id,
@@ -199,11 +205,16 @@ public:
     void record_full_attention_us(double value) noexcept;
     void record_gpu_mixed_kernel_us(double value) noexcept;
     void record_gpu_recovery_us(double value) noexcept;
+    void record_gpu_fused_kernel_us(double value) noexcept;
     void record_gpu_phase_full_attention_us(bool prefill, double value) noexcept;
     void record_gpu_incremental_host_device_bytes(std::uint64_t value) noexcept;
     void record_gpu_prefill_batch(std::uint32_t query_count) noexcept;
     void record_gpu_decode_batch(std::uint32_t query_count) noexcept;
+    void refresh_live_reference_taps();
     [[nodiscard]] const ProfileTotals& profile_totals() const noexcept { return profile_; }
+    [[nodiscard]] bool gpu_resident_mode_enabled() const noexcept {
+        return gpu_resident_enabled_;
+    }
     [[nodiscard]] const std::shared_ptr<const OscarRotationSet>& rotations() const noexcept {
         return rotations_;
     }
@@ -236,10 +247,12 @@ private:
     };
 
     bool gpu_resident_enabled_ = false;
+    bool gpu_fused_enabled_ = false;
     bool gpu_host_oracle_enabled_ = false;
     std::array<GpuResidentLayer, 16> gpu_resident_layers_{};
     DeviceBuffer gpu_resident_scores_;
     DeviceBuffer gpu_resident_softmax_;
+    DeviceBuffer gpu_resident_fused_decode_workspace_;
     std::uint64_t gpu_resident_cache_bytes_ = 0;
     std::uint64_t gpu_resident_workspace_bytes_ = 0;
     std::uint32_t gpu_prefill_query_block_size_ = 64;

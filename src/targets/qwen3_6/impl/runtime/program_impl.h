@@ -62,12 +62,14 @@ std::vector<TokenId> oscar_forced_decode_tokens_from_environment() {
         const char* d43_harness = std::getenv("NINFER_OSCAR_D4_3_LIVE");
         const char* d44_harness = std::getenv("NINFER_OSCAR_D4_4_LIVE");
         const char* d45_harness = std::getenv("NINFER_OSCAR_D4_5_LIVE");
+        const char* d46_harness = std::getenv("NINFER_OSCAR_D4_6_LIVE");
         const bool qualified_harness =
             (d23_harness != nullptr && std::string_view(d23_harness) == "1") ||
             (d31_harness != nullptr && std::string_view(d31_harness) == "1") ||
             (d43_harness != nullptr && std::string_view(d43_harness) == "1") ||
             (d44_harness != nullptr && std::string_view(d44_harness) == "1") ||
-            (d45_harness != nullptr && std::string_view(d45_harness) == "1");
+            (d45_harness != nullptr && std::string_view(d45_harness) == "1") ||
+            (d46_harness != nullptr && std::string_view(d46_harness) == "1");
         if (!qualified_harness) {
             throw std::invalid_argument(
                 "NINFER_OSCAR_D2_3B_FORCED_DECODE_TOKENS requires a qualified OSCAR harness");

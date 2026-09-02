@@ -15,13 +15,22 @@ struct OscarMixedKernelResources {
     int score_registers = 0;
     int softmax_registers = 0;
     int av_registers = 0;
+    int fused_registers = 0;
     std::size_t score_static_shared_bytes = 0;
     std::size_t softmax_static_shared_bytes = 0;
     std::size_t av_static_shared_bytes = 0;
+    std::size_t fused_dynamic_shared_bytes = 0;
     int score_max_threads = 0;
     int softmax_max_threads = 0;
     int av_max_threads = 0;
+    int fused_max_threads = 0;
 };
+
+inline constexpr int kOscarMixedFusedDecodeSplits = 4;
+inline constexpr std::size_t kOscarMixedFusedDecodeWorkspaceBytes =
+    static_cast<std::size_t>(kOscarMixedFusedDecodeSplits * 4 * 6 * 256 +
+                             kOscarMixedFusedDecodeSplits * 4 * 6 * 2) *
+    sizeof(float);
 
 // Persistent device-side cache view used by the D4.4 resident path.  Historical rows remain
 // packed INT2 plus FP32 metadata; prefix/recent rows remain BF16.  The view is intentionally
@@ -73,6 +82,35 @@ void oscar_int2_g128_mixed_attention_launch_batch_ring(
     std::int32_t recent_ring_head, std::int32_t query_start, std::int32_t query_count,
     std::int32_t workspace_stride, float attention_scale, float* scores, float* softmax,
     float* output, cudaStream_t stream);
+
+// Fused resident reader. One block owns one KV head and a small query tile, then walks the
+// logical prefix/history/recent sequence once per 32-token K/V tile. K and V are decoded into a
+// reused shared-memory slab, consumed by an online stable softmax + AV update, and discarded
+// before the next tile. A one-query call uses the decode-specialized 64-row variant.
+// query_start is the absolute logical position of q_rotated column zero; query_count columns are
+// contiguous.  The compressed resident cache remains the only historical representation.
+void oscar_int2_g128_mixed_attention_launch_fused_batch_ring(
+    const float* q_rotated, const std::uint16_t* prefix_k_bf16,
+    const std::uint16_t* prefix_v_bf16, std::int32_t prefix_tokens,
+    const std::uint8_t* historical_k_packed, const float* historical_k_metadata,
+    const std::uint8_t* historical_v_packed, const float* historical_v_metadata,
+    std::int32_t historical_tokens, const std::uint16_t* recent_k_bf16,
+    const std::uint16_t* recent_v_bf16, std::int32_t recent_tokens,
+    std::int32_t recent_ring_head, std::int32_t query_start, std::int32_t query_count,
+    float attention_scale, float* output, cudaStream_t stream);
+
+// Split-KV decode variant. Each split independently computes online-softmax partials over a
+// disjoint logical history interval; a fixed-size merge combines those partials. The workspace
+// is constant-sized and contains no history-proportional score/probability tensor.
+void oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
+    const float* q_rotated, const std::uint16_t* prefix_k_bf16,
+    const std::uint16_t* prefix_v_bf16, std::int32_t prefix_tokens,
+    const std::uint8_t* historical_k_packed, const float* historical_k_metadata,
+    const std::uint8_t* historical_v_packed, const float* historical_v_metadata,
+    std::int32_t historical_tokens, const std::uint16_t* recent_k_bf16,
+    const std::uint16_t* recent_v_bf16, std::int32_t recent_tokens,
+    std::int32_t recent_ring_head, std::int32_t query_token, std::int32_t split_count,
+    float attention_scale, float* partial_workspace, float* output, cudaStream_t stream);
 
 // Device append primitives for the D4.4 cache.  Input K/V are the actual rotated FP32 runtime
 // tensors in [head_dim, kv_heads, tokens] order.  The write primitive publishes only new

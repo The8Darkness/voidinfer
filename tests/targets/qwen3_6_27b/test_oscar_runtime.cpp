@@ -132,6 +132,7 @@ RunRecord run_one(std::string_view variant, std::size_t tokens,
     const bool d43 = required_environment("NINFER_OSCAR_D4_3_LIVE") != nullptr;
     const bool d44 = required_environment("NINFER_OSCAR_D4_4_LIVE") != nullptr;
     const bool d45 = required_environment("NINFER_OSCAR_D4_5_LIVE") != nullptr;
+    const bool d46 = required_environment("NINFER_OSCAR_D4_6_LIVE") != nullptr;
     const bool d43_perf_only = required_environment("NINFER_OSCAR_D4_3_PERF_ONLY") != nullptr;
     const bool d44_perf_no_oracle =
         required_environment("NINFER_OSCAR_D4_4_PERF_NO_ORACLE") != nullptr;
@@ -166,7 +167,7 @@ RunRecord run_one(std::string_view variant, std::size_t tokens,
         throw std::runtime_error("could not set forced D1.3 decode tokens");
     }
     if (_putenv_s("NINFER_OSCAR_D2_3B_FORCED_DECODE_TOKENS",
-                  (d23 || d31 || d43 || d44 || d45)
+                  (d23 || d31 || d43 || d44 || d45 || d46)
                       ? "997,1001,1003,1005,1007,1009,1011,1013,1015"
                       : "") != 0) {
         throw std::runtime_error("could not set forced D2.3b decode tokens");
@@ -180,8 +181,10 @@ RunRecord run_one(std::string_view variant, std::size_t tokens,
         throw std::runtime_error("could not set D4.4 reference validation mode");
     }
     if (_putenv_s("NINFER_OSCAR_D4_5_VALIDATE_REFERENCE",
-                  (d45 && gpu && !d43_perf_only && !d45_perf_no_oracle) ? "1" : "") != 0) {
-        throw std::runtime_error("could not set D4.5 reference validation mode");
+                  (d45 && gpu && !d43_perf_only && !d45_perf_no_oracle) ? "1" : "") != 0 ||
+        _putenv_s("NINFER_OSCAR_D4_6_VALIDATE_REFERENCE",
+                  (d46 && gpu && !d43_perf_only && !d45_perf_no_oracle) ? "1" : "") != 0) {
+        throw std::runtime_error("could not set OSCAR fused reference validation mode");
     }
     const std::string prefix =
         (diagnostic_dir / std::string(variant) / std::to_string(tokens)).string();
@@ -197,7 +200,7 @@ RunRecord run_one(std::string_view variant, std::size_t tokens,
     }
     const std::filesystem::path tap_dir =
         diagnostic_dir / "live_reference_taps" / std::to_string(tokens);
-    if (live && (d23 || d44 || d45)) {
+    if (live && (d23 || d44 || d45 || d46)) {
         std::filesystem::create_directories(tap_dir);
         if (_putenv_s("NINFER_OSCAR_LIVE_REFERENCE_TAP_DIR", tap_dir.string().c_str()) != 0 ||
             _putenv_s("NINFER_OSCAR_LIVE_REFERENCE_TAP_LAYERS",
@@ -230,7 +233,7 @@ RunRecord run_one(std::string_view variant, std::size_t tokens,
     ninfer::Engine engine(std::move(options));
     ninfer::RequestOptions request;
     request.execution.requested_output_tokens =
-        (d13 || d23 || d31 || d43 || d44 || d45) ? 9 : (d41 ? 1 : 2);
+        (d13 || d23 || d31 || d43 || d44 || d45 || d46) ? 9 : (d41 ? 1 : 2);
     request.execution.sampling.temperature    = 0.0F;
     request.execution.sampling.top_k          = 1;
     request.execution.allow_prefix_reuse      = false;
@@ -493,6 +496,11 @@ int main() {
         const bool d43 = required_environment("NINFER_OSCAR_D4_3_LIVE") != nullptr;
         const bool d44 = required_environment("NINFER_OSCAR_D4_4_LIVE") != nullptr;
         const bool d45 = required_environment("NINFER_OSCAR_D4_5_LIVE") != nullptr;
+        const bool d46 = required_environment("NINFER_OSCAR_D4_6_LIVE") != nullptr;
+        const bool d44_perf_no_oracle =
+            required_environment("NINFER_OSCAR_D4_4_PERF_NO_ORACLE") != nullptr;
+        const bool d45_perf_no_oracle =
+            required_environment("NINFER_OSCAR_D4_5_PERF_NO_ORACLE") != nullptr;
         const bool d43_natural = required_environment("NINFER_OSCAR_D4_3_NATURAL") != nullptr;
         if (d43_natural) {
             _putenv_s("NINFER_OSCAR_D4_3_LIVE", "1");
@@ -613,13 +621,13 @@ int main() {
             std::cout << "OSCAR D3.1 fixed-token fidelity suite: COMPLETE\n";
             return 0;
         }
-        if (d43 || d44 || d45) {
+        if (d43 || d44 || d45 || d46) {
             // D4.3/D4.4 own their profiling switch so the GPU paths cannot accidentally fall
             // through the older scalar D4.1 harness. D4.4 selects the resident cache explicitly.
             _putenv_s("NINFER_OSCAR_D4_1_PROFILE", "1");
-            const std::string_view gpu_variant = d44 ? "oscar-int2-gpu-resident"
-                                                     : (d45 ? "oscar-int2-gpu-resident"
-                                                            : "oscar-int2-gpu");
+            const std::string_view gpu_variant = (d44 || d45 || d46)
+                                                     ? "oscar-int2-gpu-resident"
+                                                     : "oscar-int2-gpu";
             const std::vector<ninfer::TokenId> expected{
                 ninfer::TokenId{997},  ninfer::TokenId{1001}, ninfer::TokenId{1003},
                 ninfer::TokenId{1005}, ninfer::TokenId{1007}, ninfer::TokenId{1009},
@@ -671,10 +679,10 @@ int main() {
                     run_one("production-bf16", tokens, diagnostic_dir, artifact);
                 const RunRecord gpu = run_one(gpu_variant, tokens, diagnostic_dir, artifact);
                 if (control.generated != expected || gpu.generated != expected) {
-                    throw std::runtime_error("D4.3 forced continuation was not committed exactly");
+                    throw std::runtime_error("D4.6 forced continuation was not committed exactly");
                 }
                 print_gpu_comparison("production-bf16", control, gpu_variant, gpu, tokens);
-                if (tokens == 321) {
+                if (tokens == 321 && !d44_perf_no_oracle && !d45_perf_no_oracle) {
                     // One explicit scalar live run anchors the optimized mode to the
                     // already-qualified oscar-int2-reference-live contract. Larger scalar
                     // contexts are covered by the in-process attention oracle to avoid
@@ -689,7 +697,7 @@ int main() {
                 }
             }
 
-            if (d44 || d45) {
+            if (d44 || d45 || d46) {
                 const std::size_t tokens = 2048;
                 const RunRecord control =
                     run_one("production-bf16", tokens, diagnostic_dir, artifact);
@@ -706,11 +714,11 @@ int main() {
             }();
             const bool include_8k_d45 = [&] {
                 const char* value = std::getenv("NINFER_OSCAR_D4_5_INCLUDE_8K");
-                return d45 && value != nullptr && std::string_view(value) == "1";
+                return (d45 || d46) && value != nullptr && std::string_view(value) == "1";
             }();
             const bool include_16k_d45 = [&] {
                 const char* value = std::getenv("NINFER_OSCAR_D4_5_INCLUDE_16K");
-                return d45 && value != nullptr && std::string_view(value) == "1";
+                return (d45 || d46) && value != nullptr && std::string_view(value) == "1";
             }();
             const bool include_32k = [] {
                 const char* value = std::getenv("NINFER_OSCAR_D4_3_INCLUDE_32K");
@@ -731,9 +739,10 @@ int main() {
                 }
                 print_gpu_comparison("production-bf16", control, gpu_variant, gpu, tokens);
                 std::cout << std::setprecision(9)
-                          << (d45 ? "d4_5_gpu_profile case_tokens="
-                                  : (d44 ? "d4_4_gpu_profile case_tokens="
-                                         : "d4_3_gpu_profile case_tokens="))
+                          << (d46 ? "d4_6_gpu_profile case_tokens="
+                                  : (d45 ? "d4_5_gpu_profile case_tokens="
+                                         : (d44 ? "d4_4_gpu_profile case_tokens="
+                                                : "d4_3_gpu_profile case_tokens=")))
                           << tokens
                           << " verifier_ms=" << gpu.elapsed_ms
                           << " control_ms=" << control.elapsed_ms
@@ -742,17 +751,20 @@ int main() {
             _putenv_s("NINFER_OSCAR_D4_3_VALIDATE_REFERENCE", "");
             _putenv_s("NINFER_OSCAR_D4_4_VALIDATE_REFERENCE", "");
             _putenv_s("NINFER_OSCAR_D4_5_VALIDATE_REFERENCE", "");
+            _putenv_s("NINFER_OSCAR_D4_6_VALIDATE_REFERENCE", "");
             _putenv_s("NINFER_OSCAR_D4_4_PERF_NO_ORACLE", "");
             _putenv_s("NINFER_OSCAR_D4_5_PERF_NO_ORACLE", "");
             _putenv_s("NINFER_OSCAR_D4_3_LIVE", "");
             _putenv_s("NINFER_OSCAR_D4_4_LIVE", "");
             _putenv_s("NINFER_OSCAR_D4_5_LIVE", "");
+            _putenv_s("NINFER_OSCAR_D4_6_LIVE", "");
             _putenv_s("NINFER_OSCAR_D4_1_PROFILE", "");
             _putenv_s("NINFER_OSCAR_D2_3B_FORCED_DECODE_TOKENS", "");
             _putenv_s("NINFER_OSCAR_ROTATION_MODE", "");
             _putenv_s("NINFER_OSCAR_RUNTIME_DIAGNOSTIC_PREFIX", "");
-            std::cout << (d45 ? "OSCAR D4.5 batched live GPU runtime: COMPLETE\n"
-                              : "OSCAR D4.3 live GPU runtime: COMPLETE\n");
+            std::cout << (d46 ? "OSCAR D4.6 fused live GPU runtime: COMPLETE\n"
+                              : (d45 ? "OSCAR D4.5 batched live GPU runtime: COMPLETE\n"
+                                     : "OSCAR D4.3 live GPU runtime: COMPLETE\n"));
             return 0;
         }
         if (d41) {
