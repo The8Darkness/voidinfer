@@ -134,11 +134,10 @@ def main() -> int:
     parser.add_argument(
         "--artifact",
         type=Path,
-        default=repo_default.parent
-        / "voidinfer"
-        / "models"
-        / "Qwen3.8-27B-NVFP4-DFlash2-NInfer"
-        / "qwen3_8_27b_nvfp4.ninfer",
+        default=Path(
+            "C:/AI/voidinfer/models/Qwen3.8-27B-NVFP4-DFlash2-NInfer/"
+            "qwen3_8_27b_nvfp4.ninfer"
+        ),
     )
     parser.add_argument("--contexts", type=lambda value: parse_int_list(value, "contexts"),
                         default=list(DEFAULT_CONTEXTS))

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ArtifactPath = 'D:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer',
+    [string]$ArtifactPath = 'C:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer',
     [string]$BuildRoot = 'D:\AI\build-adaptive-dflash2',
     [string]$OutputDirectory = '',
     [string]$PythonExe = 'D:\AI\tools\oscar-calibration\.venv\Scripts\python.exe',

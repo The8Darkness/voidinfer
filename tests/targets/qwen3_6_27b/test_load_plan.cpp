@@ -36,6 +36,14 @@ std::filesystem::path artifact_path(const char* environment, const char* filenam
     return std::filesystem::path(NINFER_SOURCE_DIR) / "out" / filename;
 }
 
+std::filesystem::path dflash2_artifact_path() {
+    if (const char* value = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS");
+        value != nullptr && *value != '\0') {
+        return value;
+    }
+    return R"(C:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer)";
+}
+
 ninfer::targets::qwen3_6::StartupFeatures all_features() {
     return {
         .vision        = true,
@@ -344,8 +352,7 @@ int main() {
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =
         artifact_path("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS", "qwen3_6_27b_nvfp4.ninfer");
-    const std::filesystem::path nvfp4_dflash2 = artifact_path(
-        "NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS", "qwen3_8_27b_nvfp4_dflash2.ninfer");
+    const std::filesystem::path nvfp4_dflash2 = dflash2_artifact_path();
     const bool have_legacy_artifacts = std::filesystem::is_regular_file(groupwise) &&
                                        std::filesystem::is_regular_file(nvfp4);
     const bool have_dflash2_artifact = std::filesystem::is_regular_file(nvfp4_dflash2);

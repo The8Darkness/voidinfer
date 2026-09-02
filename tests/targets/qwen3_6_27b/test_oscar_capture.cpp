@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -11,6 +12,9 @@
 #include <vector>
 
 namespace {
+
+constexpr const char* kDefaultArtifactPath =
+    R"(C:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer)";
 
 const char* required_environment(const char* name) {
     const char* value = std::getenv(name);
@@ -54,16 +58,28 @@ std::int64_t nonnegative_environment(const char* name, std::int64_t fallback,
 } // namespace
 
 int main() {
-    if (required_environment("NINFER_OSCAR_QKV_CAPTURE_DIR") == nullptr ||
-        required_environment("NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS") == nullptr) {
-        std::cout << "skip: OSCAR capture directory and DFlash2 artifact environment are required\n";
+    const char* capture_dir = required_environment("NINFER_OSCAR_QKV_CAPTURE_DIR");
+    const char* artifact_env =
+        required_environment("NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS");
+    std::string default_artifact_path;
+    if (artifact_env == nullptr) {
+        default_artifact_path = kDefaultArtifactPath;
+        if (!std::filesystem::is_regular_file(default_artifact_path)) {
+            std::cout << "skip: default Qwen3.8 DFlash2 artifact not found at C: "
+                      << default_artifact_path
+                      << " (set NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS to override)\n";
+            return 77;
+        }
+        artifact_env = default_artifact_path.c_str();
+    }
+    if (capture_dir == nullptr) {
+        std::cout << "skip: OSCAR capture directory is required\n";
         return 77;
     }
 
     try {
         ninfer::EngineOptions options;
-        options.artifact_path                    =
-            required_environment("NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS");
+        options.artifact_path                    = artifact_env;
         options.max_context                      = 512;
         options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(512);
         options.max_concurrency                  = 1;

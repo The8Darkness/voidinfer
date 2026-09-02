@@ -24,6 +24,8 @@ namespace {
 constexpr std::string_view kArtifactEnv = "NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS";
 constexpr std::string_view kModelShaEnv = "NINFER_OSCAR_MODEL_SHA256";
 constexpr std::string_view kDiagnosticEnv = "NINFER_OSCAR_RUNTIME_DIAGNOSTIC_DIR";
+constexpr std::string_view kDefaultArtifactPath =
+    R"(C:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer)";
 
 const char* required_environment(std::string_view name) {
     std::string key(name);
@@ -477,11 +479,21 @@ void print_fixed_fidelity(std::size_t tokens, const RunRecord& bf16, const RunRe
 } // namespace
 
 int main() {
+    std::string default_artifact_path;
     const char* artifact_value = required_environment(kArtifactEnv);
+    if (artifact_value == nullptr) {
+        default_artifact_path = std::string(kDefaultArtifactPath);
+        if (!std::filesystem::is_regular_file(default_artifact_path)) {
+            std::cout << "skip: default Qwen3.8 DFlash2 artifact not found at C: "
+                      << default_artifact_path << " (set " << kArtifactEnv << " to override)\n";
+            return 77;
+        }
+        artifact_value = default_artifact_path.c_str();
+    }
     const char* model_sha       = required_environment(kModelShaEnv);
     const char* diagnostic_root = required_environment(kDiagnosticEnv);
-    if (artifact_value == nullptr || model_sha == nullptr || diagnostic_root == nullptr) {
-        std::cout << "skip: artifact, NINFER_OSCAR_MODEL_SHA256 and diagnostic directory are required\n";
+    if (model_sha == nullptr || diagnostic_root == nullptr) {
+        std::cout << "skip: NINFER_OSCAR_MODEL_SHA256 and diagnostic directory are required\n";
         return 77;
     }
     try {

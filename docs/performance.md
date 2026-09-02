@@ -109,7 +109,7 @@ references, not multiplicative speedup claims.
 
 ```powershell
 build-windows-hierarchical\bench\ninfer_qwen3_6_27b_dflash_round_bench.exe `
-  --artifact D:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer `
+  --artifact C:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer `
   --context 32768 --warmup 1 --reps 1 --prefill-chunk 1024 `
   --draft-tokens 7 --proposal-head full --kv-dtype vericache-nvfp4 `
   --hierarchical-vericache --vericache-host-snapshots `

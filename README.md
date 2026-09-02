@@ -148,7 +148,7 @@ Run the optimized local DFlash2 artifact:
 
 ```powershell
 & .\build-windows\apps\ninfer-serve.exe `
-  .\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer `
+  C:\AI\voidinfer\models\Qwen3.8-27B-NVFP4-DFlash2-NInfer\qwen3_8_27b_nvfp4.ninfer `
   --host 127.0.0.1 --port 8080 `
   --max-context 8192 --kv-capacity 8192 `
   --spec dflash --draft-tokens 7 --lm-head-draft `

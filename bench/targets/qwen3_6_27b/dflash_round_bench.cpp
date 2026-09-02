@@ -42,7 +42,7 @@ enum class Workload {
 
 struct Options {
     std::filesystem::path artifact =
-        "models/Qwen3.8-27B-NVFP4-DFlash2-NInfer/qwen3_8_27b_nvfp4.ninfer";
+        "C:/AI/voidinfer/models/Qwen3.8-27B-NVFP4-DFlash2-NInfer/qwen3_8_27b_nvfp4.ninfer";
     int device                     = 0;
     int warmup                     = 2;
     int repetitions                = 10;
