@@ -13,6 +13,7 @@ representation, fused arithmetic, prefill kernel, and GDN path are unchanged.
 - Repository: `D:\AI\voidinfer-adaptive-dflash2`
 - Branch: `codex/oscar-d4-7b-adaptive-split-kv-20260902`
 - D4.7A parent commit: `613ca48a474ebcb493ce55fa5a71a102337ea914`
+- D4.7B implementation commit: `c7c20398`
 - Build: `D:\AI\build-adaptive-dflash2`, `RelWithDebInfo`, Ninja
 - Target architecture: CUDA `120a` / SM120a
 - OS: Windows 11 x64, kernel `10.0.26200.9278` (25H2)
