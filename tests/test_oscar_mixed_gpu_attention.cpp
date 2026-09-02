@@ -6,13 +6,11 @@
 #include "ops/softmax_attention/oscar_mixed/launch.h"
 
 #include <cuda_runtime.h>
-#include <cuda_profiler_api.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -578,42 +576,6 @@ int main() {
                   << " softmax_smem=" << resources.softmax_static_shared_bytes << " av_smem="
                   << resources.av_static_shared_bytes << " fused_regs=" << resources.fused_registers
                   << " fused_dynamic_smem=" << resources.fused_dynamic_shared_bytes << "\n";
-
-        // Temporary D4.7A profiling selector. This is intentionally test-only and is removed
-        // after Nsight Systems collection; production dispatch and cache semantics are untouched.
-        if (const char* profile_context_text =
-                std::getenv("NINFER_OSCAR_D4_7A_PROFILE_CONTEXT")) {
-            char* end = nullptr;
-            const long parsed_context = std::strtol(profile_context_text, &end, 10);
-            if (end == profile_context_text || *end != '\0' || parsed_context < 64 ||
-                parsed_context > 32768) {
-                throw std::runtime_error("invalid D4.7A profile context");
-            }
-            int repetitions = 10;
-            if (const char* repetitions_text =
-                    std::getenv("NINFER_OSCAR_D4_7A_PROFILE_REPETITIONS")) {
-                end = nullptr;
-                const long parsed_repetitions = std::strtol(repetitions_text, &end, 10);
-                if (end == repetitions_text || *end != '\0' || parsed_repetitions <= 0 ||
-                    parsed_repetitions > 100) {
-                    throw std::runtime_error("invalid D4.7A profile repetitions");
-                }
-                repetitions = static_cast<int>(parsed_repetitions);
-            }
-            const int context = static_cast<int>(parsed_context);
-            const MixedFixture fixture = make_fixture(context, 3);
-            DeviceMixed device(fixture);
-            for (int warmup = 0; warmup < 3; ++warmup) launch_fused(fixture, device);
-            CUDA_CHECK(cudaProfilerStart());
-            for (int repetition = 0; repetition < repetitions; ++repetition) {
-                launch_fused(fixture, device);
-            }
-            CUDA_CHECK(cudaProfilerStop());
-            std::cout << "D4.7A profile context=" << context
-                      << " repetitions=" << repetitions
-                      << " fused_split_merge=PASS\n";
-            return 0;
-        }
 
         // Boundaries: no historical tier, first historical row, aging/partial historical page,
         // and the required mixed contexts. The cache-backed contexts also exercise the existing
