@@ -89,11 +89,18 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::Qwen38GroupwiseInt;
     }
+    if (identity.model_id == qwen3_8_model_id &&
+        identity.weights_id == "groupwise-int-dflash2") {
+        return WeightsProfile::Qwen38GroupwiseIntDflash2;
+    }
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen36Nvfp4;
     }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
+    }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-dflash2") {
+        return WeightsProfile::Qwen38Nvfp4Dflash2;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
@@ -117,14 +124,16 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::make_frontend(model.impl_->data.frontend,
-                                  qwen3_6::FrontendOptions{
-                                      .vision_enabled = model.impl_->data.runtime.features.vision,
-                                      .max_context    = options.max_context,
-                                      .media_cache_bytes        = options.media_cache_bytes,
-                                      .media_live_bytes         = options.media_live_bytes,
-                                      .media_preprocess_threads = options.media_preprocess_threads,
-                                  });
+    return qwen3_6::make_frontend(
+        model.impl_->data.frontend,
+        qwen3_6::FrontendOptions{
+            .vision_enabled                = model.impl_->data.runtime.features.vision,
+            .max_context                   = options.max_context,
+            .media_cache_bytes             = options.media_cache_bytes,
+            .media_live_bytes              = options.media_live_bytes,
+            .media_preprocess_threads      = options.media_preprocess_threads,
+            .max_cache_markers_per_request = *options.context_cache.max_cache_markers_per_request,
+        });
 }
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,

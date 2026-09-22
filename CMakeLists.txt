@@ -90,6 +90,26 @@ else()
     set(NINFER_CURL_TARGET PkgConfig::LIBCURL)
   endif()
 endif()
+
+# Windows executables that use the media decoder carry FFmpeg's import table. Keep their runtime
+# self-contained in the target output directory so direct smoke tests and CTest do not depend on
+# whichever unrelated build happens to be present on PATH.
+if(WIN32 AND FFMPEG_INCLUDE_DIRS)
+  list(GET FFMPEG_INCLUDE_DIRS 0 NINFER_FFMPEG_INCLUDE_ROOT)
+  get_filename_component(NINFER_FFMPEG_RUNTIME_ROOT
+    "${NINFER_FFMPEG_INCLUDE_ROOT}" DIRECTORY)
+endif()
+
+function(ninfer_copy_runtime_dlls target)
+  if(NOT WIN32 OR NOT NINFER_FFMPEG_RUNTIME_ROOT)
+    return()
+  endif()
+  add_custom_command(TARGET ${target} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+      "${NINFER_FFMPEG_RUNTIME_ROOT}/$<IF:$<CONFIG:Debug>,debug/bin,bin>"
+      "$<TARGET_FILE_DIR:${target}>"
+    COMMENT "Copying FFmpeg runtime DLLs for ${target}")
+endfunction()
 find_package(Threads REQUIRED)
 
 # --- Subdirectories ----------------------------------------------------------

@@ -207,6 +207,53 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     return failures;
 }
 
+int speculative_count_rollback_case() {
+    constexpr int token_domain = 8;
+    constexpr int columns = 4;
+    constexpr int batch = 2;
+    const std::vector<std::int32_t> licensed_tokens{1, 2, 2, 3, 4, 4, 5, 0};
+    const std::vector<std::int32_t> licensed_counts{4, 3};
+    const std::vector<std::int32_t> committed_counts{2, 0};
+    const std::vector<std::int32_t> row0_after_license{0, 1, 2, 1, 0, 0, 0, 0};
+    const std::vector<std::int32_t> row1_after_license{0, 0, 0, 0, 2, 1, 0, 0};
+    DeviceBuffer d_tokens = to_device(licensed_tokens);
+    DeviceBuffer d_licensed = to_device(licensed_counts);
+    DeviceBuffer d_committed = to_device(committed_counts);
+    DeviceBuffer d_row0 = to_device(row0_after_license);
+    DeviceBuffer d_row1 = to_device(row1_after_license);
+    std::vector<ops::SamplingConfig> configs(batch);
+    configs[0].temperature = 1.0f;
+    configs[0].token_counts = static_cast<std::int32_t*>(d_row0.p);
+    configs[1].temperature = 1.0f;
+    configs[1].token_counts = static_cast<std::int32_t*>(d_row1.p);
+    DeviceBuffer d_configs = to_device(configs);
+
+    Tensor tokens(d_tokens.p, DType::I32, {columns, batch});
+    Tensor licensed(d_licensed.p, DType::I32, {batch});
+    Tensor committed(d_committed.p, DType::I32, {batch});
+    ops::speculative_rollback_token_counts(
+        tokens, licensed, committed, token_domain,
+        static_cast<const ops::SamplingConfig*>(d_configs.p), nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact(
+        "speculative partial count rollback row0",
+        from_device<std::int32_t>(d_row0, token_domain), {0, 1, 1, 0, 0, 0, 0, 0});
+    failures += verify_exact(
+        "speculative cancellation count rollback row1",
+        from_device<std::int32_t>(d_row1, token_domain), {0, 0, 0, 0, 0, 0, 0, 0});
+    failures += verify_exact("speculative rollback tokens unchanged",
+                             from_device<std::int32_t>(d_tokens, licensed_tokens.size()),
+                             licensed_tokens);
+    failures += verify_exact("speculative rollback licensed counts unchanged",
+                             from_device<std::int32_t>(d_licensed, licensed_counts.size()),
+                             licensed_counts);
+    failures += verify_exact("speculative rollback committed counts unchanged",
+                             from_device<std::int32_t>(d_committed, committed_counts.size()),
+                             committed_counts);
+    return failures;
+}
+
 int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
     std::vector<std::int32_t> targets(static_cast<std::size_t>(k + 1));
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(k));
@@ -272,6 +319,62 @@ int deterministic_sampling_case() {
     return execute_accept_case("speculative sampling deterministic support", targets, logits_bits,
                                physical_rows, drafts, initial_length, token_domain, config,
                                token_counts, expected);
+}
+
+int greedy_accept_from_tokens_case() {
+    constexpr int k       = 5;
+    constexpr int batch   = 2;
+    constexpr int columns = k + 1;
+    const std::vector<std::int32_t> targets{10, 20, 30, 40, 50, 60,
+                                            11, 21, 31, 41, 51, 61};
+    const std::vector<std::int32_t> drafts{10, 20, 30, 99, 50,
+                                           11, 21, 31, 41, 51};
+    const std::vector<std::int32_t> extents{3, 5};
+    const std::vector<std::int32_t> lengths{100, 200};
+    const std::vector<std::int32_t> anchors{-1, -1};
+    const std::vector<std::int32_t> expected_tokens{10, 20, 30, 40, 0, 0,
+                                                    11, 21, 31, 41, 51, 61};
+
+    DeviceBuffer d_targets = to_device(targets);
+    DeviceBuffer d_drafts  = to_device(drafts);
+    DeviceBuffer d_extents = to_device(extents);
+    DeviceBuffer d_lengths = to_device(lengths);
+    DeviceBuffer d_anchors = to_device(anchors);
+    GuardedDeviceBuffer d_licensed(expected_tokens.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_counts(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_accepted(batch * sizeof(std::int32_t));
+    d_licensed.fill(0xcd);
+    d_counts.fill(0xcd);
+    d_accepted.fill(0xcd);
+
+    Tensor target_tensor(d_targets.p, DType::I32, {columns, batch});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor extent_tensor(d_extents.p, DType::I32, {batch});
+    Tensor length_tensor(d_lengths.p, DType::I32, {batch});
+    Tensor anchor_tensor(d_anchors.p, DType::I32, {batch});
+    Tensor licensed_tensor(d_licensed.data(), DType::I32, {columns, batch});
+    Tensor counts_tensor(d_counts.data(), DType::I32, {batch});
+    Tensor accepted_tensor(d_accepted.data(), DType::I32, {batch});
+    ops::speculative_accept_greedy_drafts_from_tokens(
+        target_tensor, draft_tensor, extent_tensor, length_tensor, anchor_tensor, licensed_tensor,
+        counts_tensor, accepted_tensor, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact("speculative token-only licensed",
+                                read<std::int32_t>(d_licensed, expected_tokens.size()),
+                                expected_tokens);
+    failures += verify_exact("speculative token-only counts", read<std::int32_t>(d_counts, batch),
+                             {4, 6});
+    failures += verify_exact("speculative token-only accepted",
+                             read<std::int32_t>(d_accepted, batch), {3, 5});
+    failures += verify_exact("speculative token-only lengths",
+                             from_device<std::int32_t>(d_lengths, batch), {104, 206});
+    failures += verify_exact("speculative token-only anchors",
+                             from_device<std::int32_t>(d_anchors, batch), {40, 61});
+    failures += d_licensed.verify_guards("speculative token-only licensed guards");
+    failures += d_counts.verify_guards("speculative token-only count guards");
+    failures += d_accepted.verify_guards("speculative token-only accepted guards");
+    return failures;
 }
 
 int batched_sampling_workspace_stride_case() {
@@ -440,6 +543,8 @@ int main() {
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
     failures += deterministic_sampling_case();
+    failures += speculative_count_rollback_case();
+    failures += greedy_accept_from_tokens_case();
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);

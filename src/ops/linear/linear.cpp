@@ -3,6 +3,7 @@
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
@@ -163,6 +164,43 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+}
+
+void linear_argmax(const Tensor& x, const Weight& w, Tensor& out, std::int32_t valid_rows,
+                   Tensor& scratch, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || out.dtype != DType::I32) {
+        throw std::invalid_argument("linear_argmax: x must be BF16 and out must be I32");
+    }
+    if (!x.is_contiguous() || !out.is_contiguous() || !scratch.is_contiguous() ||
+        x.data == nullptr || out.data == nullptr || scratch.data == nullptr) {
+        throw std::invalid_argument("linear_argmax: x/out/scratch must be contiguous and non-null");
+    }
+    if (x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != 1 || out.ne[2] != 1 || out.ne[3] != 1 ||
+        x.ne[0] != 5120 || out.ne[0] != x.ne[1] || x.ne[1] < 1 || x.ne[1] > 48) {
+        throw std::invalid_argument("linear_argmax: expected BF16 [5120,T] -> I32 [T], 1<=T<=48");
+    }
+    if (w.qtype != QType::FP8_E4M3FN_ROW_BF16S || w.n != 248320 || w.k != 5120) {
+        throw std::invalid_argument("linear_argmax: unsupported vocabulary weight");
+    }
+    if (valid_rows <= 0 || valid_rows > w.n) {
+        throw std::invalid_argument("linear_argmax: valid_rows is outside the vocabulary domain");
+    }
+    if (scratch.dtype != DType::BF16) {
+        throw std::invalid_argument("linear_argmax: scratch must be BF16");
+    }
+    constexpr std::size_t kPartialRows = 248320U / 16U;
+    const std::size_t partial_count = kPartialRows * static_cast<std::size_t>(x.ne[1]);
+    const std::size_t index_offset =
+        (partial_count * sizeof(std::uint16_t) + 15U) & ~std::size_t(15U);
+    const std::size_t required_bytes =
+        index_offset + partial_count * sizeof(std::int32_t);
+    if (scratch.bytes() < required_bytes) {
+        throw std::invalid_argument("linear_argmax: scratch is too small for row-tile winners");
+    }
+    if ((reinterpret_cast<std::uintptr_t>(x.data) & 15U) != 0U) {
+        throw std::invalid_argument("linear_argmax: x must be 16-byte aligned");
+    }
+    detail::launch_fp8_vocabulary_a16_small_t_argmax(x, w, out, valid_rows, scratch, stream);
 }
 
 } // namespace ninfer::ops

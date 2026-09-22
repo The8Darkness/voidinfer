@@ -1,10 +1,13 @@
 #pragma once
 
 #include <chrono>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -17,15 +20,27 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency = 8;
+inline constexpr std::uint32_t kMaximumConcurrency               = 8;
+inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
-inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
-inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
-inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
+inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
+inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
+inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
+inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    Fp8E4M3Row256,
+    // Packed E2M1 values with one positive E4M3 scale per 16-value group. This is an
+    // explicitly lossy draft-cache format; exact VeriCache promotion/verification owns the
+    // authoritative fallback rather than treating the packed cache as lossless.
+    Nvfp4,
+    // Exact target KV plus an NVFP4 MTP draft tier. The target cache remains BF16 and is the
+    // authoritative representation; its existing host context tier may evict and restore pages.
+    VeriCacheNvfp4,
+    Float16Host, // Pinned EXL3 package only: ordinary FP16 authoritative Host KV.
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -60,6 +75,7 @@ enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
     DFlash,
+    DFlash2,
 };
 
 struct SpeculativeOptions {
@@ -72,8 +88,101 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+struct ContextCacheOptions {
+    // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=C, L=2 and M=4; Engine::options() returns
+    // those effective values.
+    bool enabled = true;
+    // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
+    std::optional<std::uint32_t> device_state_slots;
+    // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
+    std::uint32_t host_state_slots     = kDefaultHostStateSlots;
+    std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // Bounded private/shared logical catalogs and per-continuation long-anchor count.
+    std::optional<std::uint32_t> max_private_continuations;
+    std::optional<std::uint32_t> max_shared_prefixes;
+    std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Input-complexity bound; this does not reserve checkpoint storage.
+    std::optional<std::uint32_t> max_cache_markers_per_request;
+};
+
+// Experimental hierarchical VeriCache control. The default keeps the stable cache route
+// unchanged. When enabled, compressed L0 execution remains speculative until an attached
+// verifier commits it; this option does not authorize an approximate result to bypass the exact
+// target. The horizon values are initial values and are adapted inside their corresponding
+// min/max bounds using observed disagreement and rollback.
+struct HierarchicalVeriCacheOptions {
+    bool enabled = false;
+
+    std::uint32_t l0_to_l1_horizon     = 32;
+    std::uint32_t l0_to_l1_min_horizon = 24;
+    std::uint32_t l0_to_l1_max_horizon = 64;
+
+    std::uint32_t l1_to_l2_horizon     = 512;
+    std::uint32_t l1_to_l2_min_horizon = 256;
+    std::uint32_t l1_to_l2_max_horizon = 2048;
+
+    // Optional fixed cadence for asynchronous host checkpoints. Zero follows the adaptive
+    // L1-to-L2 verifier horizon; a nonzero value is independent from verifier adaptation and is
+    // clamped to the configured L1-to-L2 bounds. This is a persistence policy, not permission for
+    // an approximate host snapshot to bypass the exact target.
+    std::uint32_t host_snapshot_horizon = 0;
+
+    // These are default protection classes. Prompt-derived vision/system/tool ranges are added
+    // by the runtime when their exact token spans are known.
+    // A 128-token BF16 recent sidecar is the measured Q2/DFlash acceptance knee on the RTX 5090;
+    // larger protection windows add memory without improving the short-context result.
+    std::uint32_t protected_recent_tokens = 128;
+    std::uint32_t protected_sink_tokens   = 4;
+    std::uint32_t protected_pivot_tokens  = 4;
+
+    // L0 is the resident OSCAR-Q2 device KV. Q4 is a pinned-host representation; sensitive
+    // ranges may additionally use the explicit BF16 protection sidecar.
+    // A disabled hierarchy must remain valid on the stable path. The research server explicitly
+    // selects OSCAR-Q2 when it enables hierarchical VeriCache.
+    std::uint8_t l0_bits = 4;
+    // Reserved for a future host-side live verifier. It must not cause a persistent Q4 device
+    // shadow to be allocated.
+    bool l1_live_verifier_primary = true;
+    bool direct_low_bit_attention = false;
+    // Opt-in asynchronous StateImage promotion. This materializes the existing compressed
+    // DFlash mirror plus authoritative GDN/recurrent state in pinned host memory at the adaptive
+    // L1->L2 boundary; it never replaces the exact GPU target or enters the hot verification path.
+    bool enable_host_tier_snapshots = false;
+    std::filesystem::path cold_store_path;
+};
+
+struct ContextCostOptions {
+    // Empty selects generic defaults plus any matching values compiled into the binary. A
+    // nonempty runtime preset independently overrides its matching machine transfer and
+    // artifact-prefill components; absent entries retain the preceding numerical layer.
+    std::filesystem::path preset_path;
+};
+
+// Optional secondary materialization source. If it is empty, the engine may discover an
+// equivalent C:/D: artifact at the same relative path. The dual modes read the same planned
+// byte ranges from two complete, equivalent artifacts.
+enum class ArtifactReadMode : std::uint8_t {
+    Single,
+    DualStaticAlternating,
+    DualDynamic,
+};
+
+struct PinnedExl3PackageOptions {
+    std::filesystem::path target_directory;
+    std::filesystem::path draft_directory;
+    std::filesystem::path verified_dual_manifest;
+};
+
 struct EngineOptions {
+    // Explicit typed package selection; never inferred from an artifact suffix.
+    std::optional<PinnedExl3PackageOptions> exl3_package;
     std::filesystem::path artifact_path;
+    std::filesystem::path secondary_artifact_path;
+    ArtifactReadMode artifact_read_mode    = ArtifactReadMode::Single;
+    // When a secondary artifact is supplied or discovered, dynamic dual-source loading is
+    // selected by default. Set this opt-out before Engine construction to keep the primary only.
+    bool disable_dual_artifact_loading = false;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
@@ -89,6 +198,9 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    ContextCacheOptions context_cache;
+    HierarchicalVeriCacheOptions hierarchical_vericache;
+    ContextCostOptions context_cost;
     LoadProgress load_progress;
 };
 
@@ -158,10 +270,18 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+struct ThinkingControlOptions {
+    // Positive maximum accepted model-origin tokens while the Qwen thinking phase remains open.
+    // Omitted means unlimited. Injected target-control tokens consume the total output budget but
+    // not this model-origin budget.
+    std::optional<std::uint32_t> budget;
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    ThinkingControlOptions thinking;
 };
 
 struct OutputOptions {
@@ -261,18 +381,59 @@ struct PromptOptions {
     std::vector<std::string> tool_jsons;
 };
 
+enum class CacheRetentionHint : std::uint8_t {
+    Default,
+    LiveSession,
+    Disposable,
+};
+
+enum class PromptCacheMarkerKind : std::uint8_t {
+    SharedStablePrefix,
+    PrivateLongAnchor,
+};
+
+enum class PromptCacheMarkerLocation : std::uint8_t {
+    MessageBoundary,
+    LeadingInstructionBoundary,
+    ToolBoundary,
+};
+
+struct PromptCacheMarker {
+    std::uint32_t after_message_count  = 0;
+    PromptCacheMarkerKind kind         = PromptCacheMarkerKind::SharedStablePrefix;
+    PromptCacheMarkerLocation location = PromptCacheMarkerLocation::MessageBoundary;
+    // Byte count within the untrimmed leading System/Developer message.
+    std::uint32_t leading_instruction_bytes = 0;
+    std::uint32_t after_tool_count          = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(PromptCacheMarker,
+                                                   PromptCacheMarker) noexcept = default;
+};
+
+struct ContextCacheHints {
+    std::optional<std::string> session_key;
+    CacheRetentionHint retention = CacheRetentionHint::Default;
+    std::vector<PromptCacheMarker> markers;
+    // Advance the named session lineage when session_key is present. This does not require an
+    // anonymous content-matched source to be retained.
+    bool update_session_index = true;
+};
+
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
+    ContextCacheHints context_cache;
 };
 
 enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
+    ThinkingBudgetCapacityInsufficient,
     MediaBudgetExceeded,
     Overloaded,
     QueueTimeout,
     Cancelled,
     Unavailable,
+    UnsupportedSampling,
 };
 
 class RequestError final : public std::invalid_argument {
@@ -306,6 +467,10 @@ struct PromptPreparationStats {
     std::size_t media_singleflight_waits = 0;
     std::size_t built_patch_bytes        = 0;
     std::size_t reused_patch_bytes       = 0;
+    // Per-input snapshot when preparation completed, deduplicated within that
+    // input. Includes payload objects and patch arrays, excludes allocator and
+    // shared_ptr control-block overhead. Do not sum across requests sharing media.
+    std::size_t retained_media_payload_bytes = 0;
 };
 
 struct MediaCacheSummary {
@@ -337,12 +502,20 @@ enum class FinishReason : std::uint8_t {
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
+    // Optional opaque lifetime retained by an Engine while this delivered
+    // message remains owned by the sink. Applications must not interpret it.
+    std::shared_ptr<const void> retained_owner;
 };
 
 class OutputSink {
 public:
     virtual ~OutputSink()                   = default;
     virtual void publish(OutputDelta delta) = 0;
+};
+
+enum class OutputConsumerMode : std::uint8_t {
+    Aggregate,
+    Streaming,
 };
 
 class CancellationView {
@@ -363,6 +536,10 @@ struct PreparationControl {
     CancellationView cancellation;
 };
 
+// Request-stage wall timings retained for end-to-end latency/rate reporting. Prefill/decode are
+// Program execution elapsed time and include Device completion waits; total also includes queueing
+// and other request lifetime. They are not Host-work phases. GenerationEngineTiming below is the
+// direct, mutually-exclusive Host observation contract.
 struct GenerationTimings {
     double prepare_seconds     = 0.0;
     double first_token_seconds = 0.0;
@@ -370,6 +547,25 @@ struct GenerationTimings {
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
     double total_seconds       = 0.0;
+};
+
+// Wall elapsed time directly observed in Engine-owned regions. "Exposed" values are latency
+// exposure: every active request delayed by one compact-batch unit observes that unit's full
+// elapsed time, so values from concurrent requests must not be summed. Device wait is reported
+// separately from Host-active work.
+struct GenerationEngineTiming {
+    double queue_wait_seconds                   = 0.0;
+    double engine_boundary_exposed_seconds      = 0.0;
+    double program_submit_exposed_seconds       = 0.0;
+    double program_post_exposed_seconds         = 0.0;
+    double engine_commit_output_exposed_seconds = 0.0;
+    double engine_maintenance_exposed_seconds   = 0.0;
+    double device_wait_exposed_seconds          = 0.0;
+    double decode_host_exposed_seconds          = 0.0;
+    double decode_device_wait_exposed_seconds   = 0.0;
+    std::uint64_t prefill_units                 = 0;
+    std::uint64_t decode_rounds                 = 0;
+    std::uint64_t control_units                 = 0;
 };
 
 struct SpeculativeStats {
@@ -380,14 +576,162 @@ struct SpeculativeStats {
     std::uint64_t drafted_tokens  = 0;
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
+    // Optional device-side phase telemetry. These remain zero unless the DFlash phase profiler
+    // is explicitly enabled; keeping them on the result makes benchmark and serving records
+    // comparable without imposing event overhead on the default decode path.
+    double draft_seconds    = 0.0;
+    double selector_seconds = 0.0;
+    double verifier_seconds = 0.0;
+    std::uint64_t verifier_calls = 0;
+    // Default-off exact repair checkpoint work. Captured bytes are charged per
+    // verifier attempt; reconstructed/fallback rows are target work, not tokens.
+    std::uint64_t repair_checkpoint_captured_bytes = 0;
+    std::uint64_t repair_checkpoint_restores = 0;
+    std::uint64_t repair_checkpoint_reconstructed_rows = 0;
+    std::uint64_t repair_checkpoint_fallback_rows = 0;
+    std::uint64_t device_seed_handoffs = 0;
+    std::uint64_t device_seed_host_fallbacks = 0;
+    std::uint64_t draft_local_topk_calls = 0;
+    std::uint64_t draft_dense_kmajor_launches = 0;
+    // Request-local eager OSCAR continuation-cohort routing. These distinguish
+    // actual candidate dispatch from an enabled flag and from exact fallback.
+    std::uint64_t oscar_eager_cohort_attempts = 0;
+    std::uint64_t oscar_eager_cohort_dispatches = 0;
+    std::uint64_t oscar_eager_cohort_latch_misses = 0;
+    std::uint64_t oscar_eager_cohort_boundary_fallbacks = 0;
+    std::uint64_t oscar_eager_cohort_malformed = 0;
+    std::uint64_t staged_b8_verifier_calls = 0;
+    std::uint64_t staged_b8_first_half_exits = 0;
+    std::uint64_t staged_b8_second_half_calls = 0;
+    std::uint64_t staged_b8_skipped_verification_rows = 0;
+    // Diagnostic request-local sequence of accepted draft rows for each
+    // published DFlash round. This is evidence for staged-verifier economics,
+    // not output and not a controller decision by itself.
+    std::vector<std::uint8_t> accepted_prefix_per_round;
+    // Diagnostic copy of the first request-local proposal. This lets exact
+    // target graph oracles replay the real draft-conditioned B8 without
+    // changing proposal, verification, or publication behavior.
+    std::vector<std::int64_t> first_proposed_tokens;
+    // Actual committed target-tap bytes copied device-to-device into draft
+    // ingestion. This is transport volume, not saved time or throughput.
+    std::uint64_t committed_tap_device_bytes = 0;
+    // Committed rows for which all five target-tap planes remained on device.
+    // This is an exercised-path counter, not a latency estimate.
+    std::uint64_t committed_tap_host_export_rows_avoided = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    // Number of rounds that actually proposed each speculative position. This can differ from
+    // the selected K near a request budget boundary, so controllers must use it for survival
+    // denominators instead of inferring proposals from the selected-K histogram.
+    std::vector<std::uint64_t> proposed_per_position;
+    std::vector<std::uint64_t> selected_k_histogram;
+    // Device verifier time accumulated separately for each selected K. This lets the adaptive
+    // controller learn the actual width/cost curve instead of assuming linear scaling.
+    std::vector<double> verifier_seconds_by_k;
+    // Physical B8 work reported by the EXL3 caller. These count successful
+    // neural attempts, not accepted output; other backends leave them zero.
+    std::uint64_t neural_input_rows=0,returned_suffix_rows=0,discarded_suffix_rows=0;
+    // Complete-route work remains distinct from useful output. Verified rows
+    // include original target checks; replayed rows are additional repair work.
+    // Per-request shared projection rows are deliberately absent because a C2
+    // physical dispatch has no truthful single-request attribution.
+    std::uint64_t proposed_rows=0,verified_rows=0,replayed_rows=0;
+    std::uint64_t committed_model_rows=0,externally_visible_model_rows=0;
+    std::uint64_t hidden_terminal_rows=0,diagnostic_rows=0;
+    std::optional<std::uint64_t> shared_projection_rows;
+};
+
+enum class VisionPatchStorage : std::uint8_t { BFloat16, Float16 };
+
+struct ThinkingBudgetStats {
+    std::optional<std::uint32_t> configured_budget;
+    // Model-origin tokens accepted while capped thinking remained open.
+    std::uint32_t model_thinking_tokens = 0;
+    // Complete tokenizer-derived target-control suffix committed by Engine.
+    std::uint32_t injected_tokens = 0;
+    bool applied                  = false;
+};
+
+// Per-result semantic token partition. Model tokens before an unpublished
+// terminal marker, injected target-control tokens and the hidden marker remain
+// distinct. Diagnostic state rows are intentionally outside result-token and
+// throughput conservation.
+struct GenerationTokenAccounting {
+    std::uint64_t visible_model_tokens = 0;
+    std::uint64_t injected_control_tokens = 0;
+    std::uint64_t hidden_terminal_tokens = 0;
+    std::uint64_t diagnostic_state_rows = 0;
+    [[nodiscard]] bool conserves_result_tokens(std::size_t result_tokens) const noexcept {
+        constexpr auto maximum=std::numeric_limits<std::uint64_t>::max();
+        if(visible_model_tokens>maximum-injected_control_tokens)return false;
+        const auto visible_and_control=visible_model_tokens+injected_control_tokens;
+        if(visible_and_control>maximum-hidden_terminal_tokens)return false;
+        return visible_and_control+hidden_terminal_tokens==result_tokens;
+    }
 };
 
 enum class PrefixReusePath : std::uint8_t {
-    FullReset,
-    AppendAtFrontier,
-    RestoreTurnCheckpoint,
-    RestoreResponseCheckpoint,
+    Root,
+    PrivateEndpoint,
+    PrivateTurnClosure,
+    PrivateResponseReplay,
+    PrivateLongAnchor,
+    SharedStablePrefix,
+};
+
+// Why pressure planning stopped for the materialization decision committed to one request.
+// "ModelOptimal" is relative to the configured target graph, canonical transaction order, and
+// numerical cost model; it is not a claim about globally optimal observed TTFT.
+enum class MaterializationStopReason : std::uint8_t {
+    NoPressure,
+    ModelOptimal,
+    QueueExhausted,
+    TargetBudget,
+    ExpansionCapacity,
+    TimeBudget,
+    ValueOfNextExpansion,
+};
+
+[[nodiscard]] inline constexpr const char*
+materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
+    switch (reason) {
+    case MaterializationStopReason::NoPressure:
+        return "no_pressure";
+    case MaterializationStopReason::ModelOptimal:
+        return "model_optimal";
+    case MaterializationStopReason::QueueExhausted:
+        return "queue_exhausted";
+    case MaterializationStopReason::TargetBudget:
+        return "target_budget";
+    case MaterializationStopReason::ExpansionCapacity:
+        return "expansion_capacity";
+    case MaterializationStopReason::TimeBudget:
+        return "time_budget";
+    case MaterializationStopReason::ValueOfNextExpansion:
+        return "value_of_next_expansion";
+    }
+    return "no_pressure";
+}
+
+struct MaterializationDiagnostics {
+    std::uint64_t predicted_now_ns              = 0;
+    std::uint64_t predicted_future_loss_ns      = 0;
+    std::uint64_t predicted_total_ns            = 0;
+    std::uint32_t targets_evaluated             = 0;
+    std::uint64_t projection_work               = 0;
+    std::uint64_t planning_elapsed_ns           = 0;
+    std::uint64_t search_elapsed_ns             = 0;
+    MaterializationStopReason stop_reason       = MaterializationStopReason::NoPressure;
+    bool model_optimal                          = true;
+    bool budget_exhausted                       = false;
+    std::uint64_t best_remaining_lower_bound_ns = 0;
+    std::uint64_t absolute_bound_gap_ns         = 0;
+    double relative_bound_gap                   = 0.0;
+    std::uint32_t selected_degradation_units    = 0;
+    bool selected_maximal_fallback              = false;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationDiagnostics&,
+               const MaterializationDiagnostics&) noexcept = default;
 };
 
 struct GenerationResult {
@@ -398,15 +742,42 @@ struct GenerationResult {
     std::uint32_t reasoning_tokens     = 0;
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
-    PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
+    MaterializationDiagnostics materialization;
     GenerationTimings timings;
+    GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
+    ThinkingBudgetStats thinking;
+    GenerationTokenAccounting token_accounting;
+};
+
+enum class GenerationPollState : std::uint8_t { Pending,Completed,Error };
+struct GenerationPollResult {
+    GenerationPollState state=GenerationPollState::Pending;
+    std::optional<GenerationResult> result;
+    std::exception_ptr error;
+    [[nodiscard]] bool terminal() const noexcept {
+        return state!=GenerationPollState::Pending;
+    }
 };
 
 struct ArenaMemorySummary {
     std::size_t capacity_bytes  = 0;
     std::size_t used_bytes      = 0;
     std::size_t peak_used_bytes = 0;
+};
+
+// Logical regions within the one physical workspace allocation. These byte values describe
+// layout and live extents and must not be added to workspace.capacity_bytes.
+struct VisionWorkspaceMemorySummary {
+    std::uint32_t aggregate_prompt_tokens = 0;
+    std::uint32_t max_item_tokens         = 0;
+    std::size_t general_capacity_bytes    = 0;
+    std::size_t encode_peak_bytes         = 0;
+    std::size_t handoff_offset_bytes      = 0;
+    std::size_t handoff_capacity_bytes    = 0;
+    std::size_t handoff_active_bytes      = 0;
+    std::size_t handoff_peak_bytes        = 0;
 };
 
 struct MemorySummary {
@@ -420,7 +791,7 @@ struct MemorySummary {
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
-    ArenaMemorySummary request_transient;
+    std::optional<VisionWorkspaceMemorySummary> vision_workspace;
     std::size_t minimum_runtime_reservation_bytes = 0;
     std::size_t kv_capacity_increment_bytes       = 0;
     std::size_t runtime_reservation_bytes         = 0;
@@ -430,24 +801,494 @@ struct MemorySummary {
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
-    std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+    std::uint32_t host_state_capacity_slots       = 0;
+    std::uint32_t host_state_occupied_slots       = 0;
+    std::size_t host_kv_capacity_bytes            = 0;
+    std::size_t host_kv_occupied_bytes            = 0;
 };
 
-// Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
-// interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
+// Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
+// device_wait_ns is blocked wall time and is intentionally excluded from their sum. Detail values
+// are subsets of a top-level phase and must not be added to Host-active time again.
+struct RuntimeHostWorkStats {
+    std::uint64_t engine_boundary_ns      = 0;
+    std::uint64_t program_submit_ns       = 0;
+    std::uint64_t program_post_ns         = 0;
+    std::uint64_t engine_commit_output_ns = 0;
+    std::uint64_t engine_maintenance_ns   = 0;
+    std::uint64_t device_wait_ns          = 0;
+
+    std::uint64_t decode_host_ns         = 0;
+    std::uint64_t decode_device_wait_ns  = 0;
+    std::uint64_t prefill_host_ns        = 0;
+    std::uint64_t prefill_device_wait_ns = 0;
+    std::uint64_t control_host_ns        = 0;
+    std::uint64_t control_device_wait_ns = 0;
+    std::uint64_t prefill_units          = 0;
+    std::uint64_t control_units          = 0;
+
+    std::uint64_t admission_policy_ns           = 0;
+    std::uint64_t context_progress_ns           = 0;
+    std::uint64_t stats_publication_ns          = 0;
+    std::uint64_t admission_policy_invocations  = 0;
+    std::uint64_t context_progress_invocations  = 0;
+    std::uint64_t stats_publication_invocations = 0;
+};
+
+// Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
+// decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
-    // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
+    RuntimeHostWorkStats host_work;
+    // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
+    // Partition of committed EXL3 result tokens. Diagnostic state rows are not
+    // included in any of these counters or in useful output throughput.
+    std::uint64_t visible_model_tokens = 0;
+    std::uint64_t injected_control_tokens = 0;
+    std::uint64_t hidden_terminal_tokens = 0;
     // Decode batch executions and the sum of their batch sizes.
-    std::uint64_t decode_rounds         = 0;
-    std::uint64_t decode_row_rounds     = 0;
-    std::uint32_t running_requests      = 0;
-    std::uint32_t prefilling_requests   = 0;
-    std::uint32_t decode_ready_requests = 0;
-    std::uint32_t waiting_requests      = 0;
+    std::uint64_t decode_rounds             = 0;
+    std::uint64_t decode_row_rounds         = 0;
+    std::uint32_t running_requests          = 0;
+    std::uint32_t prefilling_requests       = 0;
+    std::uint32_t decode_ready_requests     = 0;
+    std::uint32_t waiting_requests          = 0;
+    std::uint32_t materializing_requests    = 0;
+    std::uint32_t capture_pending_requests  = 0;
+    std::uint32_t terminal_pending_requests = 0;
+    std::uint64_t active_captures_completed = 0;
+    std::uint64_t active_captures_aborted   = 0;
+
+    std::uint64_t root_selections                    = 0;
+    std::uint64_t private_endpoint_selections        = 0;
+    std::uint64_t private_turn_closure_selections    = 0;
+    std::uint64_t private_response_replay_selections = 0;
+    std::uint64_t private_long_anchor_selections     = 0;
+    std::uint64_t shared_stable_prefix_selections    = 0;
+    std::uint64_t reused_prompt_tokens               = 0;
+    std::uint32_t last_selected_frontier_tokens      = 0;
+
+    std::uint64_t state_moves     = 0;
+    std::uint64_t state_forks     = 0;
+    std::uint64_t state_restores  = 0;
+    std::uint64_t state_d2h_count = 0;
+    std::uint64_t state_h2d_count = 0;
+    std::uint64_t state_d2d_count = 0;
+    std::uint64_t state_d2h_bytes = 0;
+    std::uint64_t state_h2d_bytes = 0;
+    std::uint64_t state_d2d_bytes = 0;
+    double state_d2h_seconds      = 0.0;
+    double state_h2d_seconds      = 0.0;
+    double state_d2d_seconds      = 0.0;
+
+    std::uint64_t main_kv_d2h_pages    = 0;
+    std::uint64_t main_kv_h2d_pages    = 0;
+    std::uint64_t main_kv_d2d_pages    = 0;
+    std::uint64_t main_kv_d2h_bytes    = 0;
+    std::uint64_t main_kv_h2d_bytes    = 0;
+    std::uint64_t main_kv_d2d_bytes    = 0;
+    double main_kv_d2h_seconds         = 0.0;
+    double main_kv_h2d_seconds         = 0.0;
+    double main_kv_d2d_seconds         = 0.0;
+    std::uint64_t backend_kv_d2h_pages = 0;
+    std::uint64_t backend_kv_h2d_pages = 0;
+    std::uint64_t backend_kv_d2d_pages = 0;
+    std::uint64_t backend_kv_d2h_bytes = 0;
+    std::uint64_t backend_kv_h2d_bytes = 0;
+    std::uint64_t backend_kv_d2d_bytes = 0;
+    double backend_kv_d2h_seconds      = 0.0;
+    double backend_kv_h2d_seconds      = 0.0;
+    double backend_kv_d2d_seconds      = 0.0;
+
+    std::uint64_t pressure_spill_pages                 = 0;
+    std::uint64_t partial_tail_cow_pages               = 0;
+    std::uint32_t device_state_occupied_slots          = 0;
+    std::uint32_t host_state_occupied_slots            = 0;
+    std::uint32_t device_main_kv_occupied_pages        = 0;
+    std::uint32_t device_backend_kv_occupied_pages     = 0;
+    std::size_t host_kv_occupied_bytes                 = 0;
+    std::uint64_t pressure_private_owners_degraded     = 0;
+    std::uint64_t pressure_private_owners_evicted      = 0;
+    std::uint64_t pressure_shared_owners_degraded      = 0;
+    std::uint64_t pressure_shared_owners_evicted       = 0;
+    std::uint64_t pressure_checkpoints_dropped         = 0;
+    std::uint64_t pressure_searches                    = 0;
+    std::uint64_t pressure_search_budget_exhaustions   = 0;
+    std::uint64_t pressure_maximal_fallback_selections = 0;
+    std::uint32_t shared_active_references             = 0;
+    std::uint64_t historical_fork_hits                 = 0;
+    double actual_context_transfer_seconds             = 0.0;
+
+    // Hierarchical VeriCache observations. L0/L1/L2 counters are zero until that verifier stage
+    // is actually attached; the current DFlash/MTP exact-target fallback is reported separately
+    // as speculative transaction activity.
+    bool hierarchical_vericache_enabled                = false;
+    std::uint32_t vericache_l0_to_l1_horizon            = 0;
+    std::uint32_t vericache_l1_to_l2_horizon            = 0;
+    std::uint64_t vericache_l0_l1_checks                = 0;
+    std::uint64_t vericache_l0_l1_proposed_tokens       = 0;
+    std::uint64_t vericache_l0_l1_accepted_tokens       = 0;
+    std::uint64_t vericache_l0_l1_disagreements         = 0;
+    std::uint64_t vericache_l1_l2_checks                = 0;
+    std::uint64_t vericache_l1_l2_proposed_tokens       = 0;
+    std::uint64_t vericache_l1_l2_accepted_tokens       = 0;
+    std::uint64_t vericache_l1_l2_disagreements         = 0;
+    // The current DFlash/MTP route still verifies against the exact target on the GPU. Keep that
+    // path separate from L0/L1 and L1/L2 host-tier verification until those consumers are attached.
+    std::uint64_t vericache_exact_target_checks          = 0;
+    std::uint64_t vericache_exact_target_proposed_tokens = 0;
+    std::uint64_t vericache_exact_target_accepted_tokens = 0;
+    std::uint64_t vericache_exact_target_disagreements   = 0;
+    std::uint64_t vericache_speculative_rounds          = 0;
+    std::uint64_t vericache_speculative_rollbacks       = 0;
+    std::uint64_t vericache_nested_commits              = 0;
+    std::uint64_t vericache_nested_rollbacks            = 0;
+    std::uint32_t vericache_max_nested_depth            = 0;
+    std::uint64_t vericache_gdn_state_restores          = 0;
+    std::uint64_t vericache_gdn_state_restore_bytes     = 0;
+    double vericache_gdn_state_restore_seconds          = 0.0;
+    std::uint64_t vericache_host_tier_snapshots         = 0;
+    std::uint64_t vericache_host_tier_snapshot_bytes    = 0;
+    std::uint64_t vericache_host_state_d2h_bytes        = 0;
+    std::uint64_t vericache_host_kv_d2h_pages           = 0;
+    std::uint64_t vericache_host_kv_d2h_bytes           = 0;
+    double vericache_host_kv_d2h_seconds                = 0.0;
+    std::size_t vericache_l0_bytes                      = 0;
+    // Temporary device-side source shadow used to produce independent OSCAR-Q4 host snapshots;
+    // it is not part of the resident L0 tier and is zero when Q4 is the resident format.
+    std::size_t vericache_l0_q4_shadow_bytes             = 0;
+    std::size_t vericache_l1_bytes                      = 0;
+    std::size_t vericache_l2_bytes                      = 0;
+    std::size_t vericache_l3_bytes                      = 0;
+    // Completed physical projection batches and independent rendezvous fallbacks;
+    // neither counter establishes token/state equivalence or a speedup.
+    std::uint64_t shared_target_projection_batches = 0;
+    std::uint64_t shared_target_projection_rows = 0;
+    std::uint64_t shared_target_projection_failures = 0;
+    std::uint64_t shared_target_projection_fallbacks = 0;
+    // Compact target reductions remain per request. These count only the bounded
+    // C2 result-transport gather and its independent one-row fallbacks.
+    std::uint64_t greedy_packet_transport_batches=0;
+    std::uint64_t greedy_packet_transport_rows=0;
+    std::uint64_t greedy_packet_transport_singles=0;
+    std::uint64_t greedy_packet_transport_cancellations=0;
+    std::uint64_t greedy_packet_transport_failures=0;
+    std::array<std::uint64_t,15> shared_target_projection_family_batches{}; // Q,K,V,draft Q,O,gate,up,down,head,draft K,draft V,draft O,draft down,draft gate,draft up
+    std::array<std::uint64_t,15> shared_target_projection_family_fallbacks{}; // eligible offers completed privately, same family order
+    std::array<std::uint64_t,64> shared_target_layer_batches{}; // excludes draft layers
+    std::uint64_t shared_target_reused_gather_bytes=0;
+    std::uint64_t shared_device_prefix_bytes=0;
+    std::uint64_t shared_device_prefix_hit_bytes=0,shared_device_prefix_busy_fallbacks=0;
+    // Request deltas for the lane-private represented-prefix cache. These are
+    // redundant device views; authoritative publication remains exact HostKV.
+    std::uint64_t private_device_prefix_hit_bytes=0,private_device_prefix_fill_bytes=0;
+    std::uint64_t private_device_prefix_segmented_bytes=0;
+    std::uint64_t private_device_prefix_forward_publish_forwards=0;
+    std::uint64_t private_device_prefix_partial_hit_bytes=0;
+    std::uint64_t private_device_prefix_forward_publish_bytes=0;
+    std::uint64_t host_kv_h2d_bytes=0,host_kv_d2h_bytes=0;
+    std::uint64_t host_kv_transfer_calls=0,host_kv_copy_submissions=0;
+    std::uint64_t host_kv_pinned_slot_waits=0;
+    std::uint64_t host_kv_pinned_staging_bytes=0;
+    std::uint64_t exact_kv_export_batched_calls=0;
+    std::uint64_t exact_kv_export_batched_ranges=0;
+    std::uint64_t exact_kv_export_batched_bytes=0;
+    std::uint64_t exact_kv_export_batched_fences=0;
+    std::uint64_t exact_kv_export_saved_fences=0;
+    std::uint64_t prefill_pinned_batch_plane_calls=0;
+    std::uint64_t prefill_pinned_batch_page_planes=0;
+    std::uint64_t prefill_pinned_batch_bytes=0;
+    std::uint64_t host_kv_banked_d2h_forwards=0,host_kv_banked_d2h_planes=0;
+    std::uint64_t host_kv_banked_d2h_rows=0,host_kv_banked_d2h_bytes=0;
+    std::uint64_t host_kv_banked_d2h_drains=0;
+    std::uint64_t registered_kv_upload_bytes=0,registered_kv_upload_fallbacks=0;
+    std::uint64_t registered_kv_retired_registrations=0;
+    std::uint64_t registered_kv_external_readers=0;
+    std::uint64_t registered_kv_external_reader_high_water=0;
+    // Same bytes partitioned by the two physical Engine lanes; not additive to total.
+    std::array<std::uint64_t,2> registered_kv_upload_lane_bytes{};
+    std::uint64_t registered_kv_upload_failures=0;
+    std::uint64_t registered_kv_upload_peak_pending=0;
+    std::uint64_t shared_device_page_fill_bytes=0,shared_device_page_copy_bytes=0;
+    std::uint64_t shared_device_page_attention_bytes=0;
+    std::uint64_t shared_device_page_attention_groups=0,shared_device_page_attention_pages=0;
+    // Actual query-pair dispatch attempts, including subsequently failed work.
+    // Rows count layer-query work, not distinct request or committed tokens.
+    std::uint64_t query_pair_launch_attempts=0,query_pair_row_attempts=0;
+    // Opted-in rows reaching dispatch; includes fallback and failed attempts.
+    // Difference from selected rows is not a physical-load or latency estimate.
+    std::uint64_t query_pair_requested_row_attempts=0;
+    // Exact six-head-score prefill route selected at the real layer dispatch.
+    // Attempts are layer-subbatch launches/rows, not completed requests.
+    std::uint64_t gqa_six_query_pair_score_launch_attempts=0;
+    std::uint64_t gqa_six_query_pair_score_row_attempts=0;
+    std::uint64_t gqa_six_score_k_tile64_launch_attempts=0;
+    std::uint64_t gqa_six_score_k_tile64_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_value_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_value_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_pair_dimensions_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_pair_dimensions_row_attempts=0;
+    std::uint64_t gqa_six_softmax_six_values_single_load_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_six_values_single_load_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_key_pair_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_key_pair_row_attempts=0;
+    // Staging upload bytes have been submitted; consumed bytes completed their
+    // D2D final-use event. Banks count completed K+V working-cache installs.
+    std::uint64_t attention_stage_upload_bytes=0,attention_stage_consumed_bytes=0,attention_stage_banks=0;
+    // Staged history represented directly to attention, without a working-plane copy.
+    std::uint64_t attention_stage_direct_bytes=0;
+    std::uint64_t attention_stage_device_bytes=0,attention_stage_metadata_bytes=0;
+    std::uint64_t reconstruction_device_bytes=0,reconstruction_metadata_bytes=0;
+    std::uint64_t reconstruction_budget_fallback_lanes=0;
+    // Complete projection submission chains; not GPU completions or committed tokens.
+    std::uint64_t reconstruction_submissions=0,reconstruction_submitted_rows=0;
+    std::uint64_t reconstruction_k6_submissions=0,reconstruction_k6_submitted_rows=0;
+    // Actual target-owned eager projection dispatches. These are invocation
+    // counters, not useful tokens, GPU durations, or accepted speculative rows.
+    std::uint64_t k6_stream_reduction_calls=0,extended_stream_reduction_calls=0;
+    std::uint64_t k6_gateup_warpgroup_async_calls=0;
+    std::uint64_t k6_gateup_n32_pair_cta_calls=0;
+    std::uint64_t k6_gateup_n32_pair_cta_rows=0;
+    std::uint64_t k6_fast_decode_calls=0;
+    std::uint64_t k6_fast_decode_rows=0;
+    std::uint64_t k6_rowpair_n64_calls=0;
+    std::uint64_t k6_rowpair_n64_rows=0;
+    std::uint64_t k6_down_rowpair_calls=0;
+    std::uint64_t k6_down_rowpair_rows=0;
+    std::uint64_t shape4_n64_calls=0;
+    std::uint64_t shape4_n64_rows=0;
+    std::uint64_t reduce_shfl_min_barrier_calls=0;
+    std::uint64_t reduce_shfl_min_barrier_rows=0;
+    std::uint64_t k7_tiles64_exact_splits_calls=0;
+    std::uint64_t target_k8_kv_prefill_async_a_calls=0;
+    std::uint64_t target_k8_kv_prefill_async_a_rows=0;
+    std::uint64_t target_down_k6_async_a_calls=0;
+    std::uint64_t target_gateup_k6_n16_calls=0;
+    // Compute-only exact-HostKV GDN segment graph setup/replay. Capture time is
+    // model/context startup work; replays are request deltas.
+    std::uint64_t host_kv_gdn_segment_graph_captures=0;
+    std::uint64_t host_kv_gdn_segment_graph_replays=0;
+    double host_kv_gdn_segment_graph_capture_seconds=0.0;
+    std::uint64_t host_kv_full_layer_graph_captures=0;
+    std::uint64_t host_kv_full_layer_graph_replays=0;
+    std::uint64_t host_kv_full_layer_graph_six_softmax_triple_captures=0;
+    std::uint64_t host_kv_full_layer_graph_k6_stream_reduction_captures=0;
+    std::uint64_t host_kv_full_layer_graph_extended_stream_reduction_captures=0;
+    std::uint64_t host_kv_full_layer_graph_target_down_k6_async_a_captures=0;
+    std::uint64_t host_kv_full_layer_graph_target_k6_small_m_async_a_captures=0;
+    std::uint64_t host_kv_full_layer_graph_target_k7_small_m_async_a_captures=0;
+    double host_kv_full_layer_graph_capture_seconds=0.0;
+    std::uint64_t host_kv_mlp_tail_graph_captures=0;
+    std::uint64_t host_kv_mlp_tail_graph_replays=0;
+    double host_kv_mlp_tail_graph_capture_seconds=0.0;
+    std::uint64_t host_kv_transaction_checkpoint_graph_captures=0;
+    std::uint64_t host_kv_transaction_checkpoint_graph_replays=0;
+    double host_kv_transaction_checkpoint_graph_capture_seconds=0.0;
+    std::uint64_t host_kv_transaction_recurrent_trace_alias_layers=0;
+    std::uint64_t host_kv_transaction_recurrent_trace_copy_bytes_saved=0;
+    std::uint64_t recurrent_export_calls=0;
+    std::uint64_t recurrent_export_bytes=0;
+    std::uint64_t recurrent_export_copy_submissions=0;
+    std::uint64_t recurrent_export_batched_copy_calls=0;
+    std::uint64_t recurrent_export_batched_copy_ranges=0;
+    double recurrent_export_seconds=0.0;
+    double recurrent_export_fence_seconds=0.0;
+    std::uint64_t target_k6_small_m_async_a_calls=0;
+    std::uint64_t target_k7_small_m_async_a_calls=0;
+    std::uint64_t target_k5_small_m_batch_calls=0;
+    std::uint64_t eager_mlp_gateup_concurrent_calls=0;
+    std::uint64_t prefill_qkv_concurrent_calls=0;
+    std::uint64_t prefill_qkv_concurrent_rows=0;
+    std::uint64_t prefill_projection_graph_captures=0;
+    std::uint64_t prefill_projection_graph_replays=0;
+    std::uint64_t prefill_projection_graph_binding_fallbacks=0;
+    std::uint64_t prefill_projection_chain_graph_captures=0;
+    std::uint64_t prefill_projection_chain_graph_replays=0;
+    std::uint64_t prefill_projection_chain_graph_fallbacks=0;
+    // Target prefill gate/up shared-A candidate. Attempts count eligible-owner
+    // consideration; calls/rows count only the exact common-SUH fused route.
+    std::uint64_t target_prefill_gate_up_pair_attempts=0;
+    std::uint64_t target_prefill_gate_up_pair_calls=0;
+    std::uint64_t target_prefill_gate_up_pair_rows=0;
+    std::uint64_t gqa_six_softmax_triple_v_tile_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_v_tile_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_full_cta_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_full_cta_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_threads128_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_threads128_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_score_tile_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_score_tile_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_scalar_dim_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_scalar_dim_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_two_query_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_two_query_row_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_fused_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_triple_fused_row_attempts=0;
+    std::uint64_t gqa_six_softmax_tile512_launch_attempts=0;
+    std::uint64_t gqa_six_softmax_tile512_row_attempts=0;
+    // Eager host submissions, including requests later cancelled/failed. Excludes
+    // graph capture/replay; paired count does not establish equal-scale hits.
+    std::uint64_t paired_transform_submissions=0,fused_gate_up_submissions=0;
+    // Eager host head submission chains only; excludes graph capture/replay.
+    std::uint64_t head_submitted_rows=0,head_omitted_rows=0;
+    // Logical decisions under explicitly supplied EXL3 horizon costs. These
+    // include attempts later aborted; they are not accepted tokens or GPU work.
+    std::uint64_t verifier_cost_menu_installations=0;
+    std::uint64_t conditional_second_block_calls=0;
+    // Successful packed draft dispatches containing one or two child-root lanes.
+    std::uint64_t conditional_shared_draft_batches=0,conditional_shared_draft_lanes=0;
+    std::array<std::uint64_t,15> conditional_shared_draft_families{};
+    // Index0: ordinary + conditional; index1: both conditional.
+    std::array<std::uint64_t,2> conditional_shared_draft_peers{};
+    std::uint64_t execution_retirement_metadata_bytes=0;
+    // Committed startup transactions only; excludes optional prefix caches,
+    // shared weights and subsequent dynamic growth.
+    std::uint64_t reserved_context_startup_lanes=0;
+    std::uint64_t reserved_context_startup_device_bytes=0;
+    std::uint64_t reserved_context_fixed_owner_metadata_bytes=0;
+    std::uint64_t reserved_continuation_startup_device_bytes=0;
+    std::uint64_t reserved_continuation_owner_metadata_bytes=0;
+    std::uint64_t reserved_repair_checkpoint_startup_device_bytes=0;
+    std::uint64_t reserved_repair_checkpoint_owner_metadata_bytes=0;
+    std::uint64_t repair_checkpoint_reservation_fallback_lanes=0;
+    // Subset transferred to continuation linear child lifetime on close.
+    std::uint64_t continuation_linear_owner_metadata_bytes=0;
+    std::uint64_t continuation_generic_owner_metadata_bytes=0;
+    // Subset of context allocation metadata transferred to base linear children.
+    std::uint64_t context_base_linear_owner_metadata_bytes=0;
+    std::uint64_t context_private_generic_owner_metadata_bytes=0;
+    std::uint64_t context_shared_generic_owner_metadata_bytes=0;
+    std::uint64_t context_shared_control_metadata_bytes=0;
+    std::uint64_t context_layer_linear_owner_metadata_bytes=0;
+    std::uint64_t reserved_lane_startup_device_bytes=0;
+    std::uint64_t reserved_lane_fixed_owner_metadata_bytes=0;
+    std::uint64_t reserved_engine_tap_device_bytes=0;
+    std::uint64_t reserved_engine_tap_metadata_bytes=0;
+    // Retained host wrappers only; excludes opaque CUDA driver allocations.
+    std::uint64_t execution_stream_metadata_bytes=0;
+    std::uint64_t cancellation_owner_metadata_bytes=0;
+    std::uint64_t target_allocation_owner_metadata_bytes=0;
+    std::uint64_t draft_weight_owner_metadata_bytes=0;
+    std::uint64_t draft_execution_owner_metadata_bytes=0;
+    // Subset of execution metadata transferred into linear child lifetimes.
+    std::uint64_t draft_linear_owner_metadata_bytes=0;
+    std::uint64_t draft_generic_owner_metadata_bytes=0;
+    std::uint64_t context_allocation_owner_metadata_bytes=0;
+    // Supplied startup observation minus exact live inventory. The remainder is
+    // explicitly driver-unknown; it is not classified as a leak or cache.
+    std::uint64_t inventoried_device_bytes=0;
+    std::uint64_t observed_device_used_bytes=0;
+    std::uint64_t driver_unknown_device_bytes=0;
+    bool driver_unknown_device_bytes_available=false;
+    // Completed packed dispatches, even if later completion bookkeeping fails.
+    // Does not estimate work partially submitted by a throwing dispatcher.
+    std::uint64_t shared_projection_completed_dispatches=0,shared_projection_completed_rows=0;
+    bool shared_projection_retains_claim_owners=false;
+    std::uint64_t shared_cost_policy_updates=0;
+    // Successful B8 neural attempts, including later-aborted proposals. Input
+    // rows include the seed; suffix counts are predictions, not accepted tokens.
+    std::uint64_t draft_neural_input_rows=0,draft_returned_suffix_rows=0,draft_discarded_suffix_rows=0;
+    std::uint64_t shared_underfilled_cost_accepts=0,shared_underfilled_cost_refusals=0;
+    // Live offers rejected before claim due to differing modality/route contracts.
+    // Included in total fallbacks; not a dispatched or completed batch count.
+    std::uint64_t shared_projection_contract_refusals=0;
+    // Preclaim pair refusals, each a subset of fallbacks, not failed GPU dispatches.
+    std::uint64_t shared_projection_geometry_refusals=0,shared_projection_authority_refusals=0;
+    std::uint64_t shared_projection_stage_refusals=0;
+    // Configured wait budgets at actual rendezvous offers, not elapsed time or GPU work.
+    std::uint64_t shared_policy_capped_waits=0,shared_policy_capped_wait_budget_us=0;
+    std::uint64_t suffix_selection_installations=0,suffix_selection_neural_fallbacks=0;
+    std::uint64_t suffix_proposal_calls=0,suffix_proposal_rows=0,suffix_proposal_misses=0;
+    std::uint64_t suffix_published_rounds=0,suffix_accepted_rows=0,suffix_repair_rows=0;
+    std::uint64_t suffix_skipped_neural_blocks=0;
+    std::array<std::uint64_t,9> supplied_verifier_horizon_decisions{};
+    std::uint64_t acquired_payload_preservations=0,acquired_full_resets=0;
+    std::uint64_t acquired_attachment_cancellations=0;
+    std::uint64_t acquired_draft_ring_preservations=0,acquired_draft_ring_restores=0;
+    // FIFO head assignments only. Affinity requires an idle lane with an exact
+    // resident-root witness; fallback never waits for a busy local lane.
+    std::uint64_t request_affinity_assignments=0,request_affinity_fallbacks=0;
+    // Decisions only; supplied copy bytes are hints and are never reported as
+    // observed transfer or memory. Fairness overrides restore oldest-first.
+    std::uint64_t ready_copy_hint_deferrals=0,ready_copy_hint_unknown_fallbacks=0;
+    std::uint64_t ready_copy_hint_fairness_overrides=0;
+    // Successful preparation returns, including requests that fail later.
+    // Joined fills and cache hits are distinct; these are not generated tokens
+    // or counts of numerical submissions by producers cancelled during a fill.
+    std::uint64_t prefix_preparation_returns=0,concurrent_prefix_preparation_returns=0;
+    std::uint64_t prefix_preparation_joins=0,prefix_preparation_cache_hits=0;
+    // Immutable host prefix-plan completions accepted before this request's
+    // first numerical operation.  Peer overlap counts plans completed while a
+    // different lane retained pending numerical ownership, not elapsed time.
+    std::uint64_t host_preparation_returns=0,host_preparation_peer_numeric_overlaps=0;
+    std::uint64_t host_preparation_cancelled_before_accept=0;
+    // Complete selected nondefault-stream command chains, not individual
+    // kernels or elapsed overlap. Failures retain graph owners until a drain.
+    std::uint64_t execution_dependency_graph_begins=0;
+    std::uint64_t execution_dependency_graph_submissions=0;
+    std::uint64_t execution_dependency_graph_completions=0;
+    std::uint64_t execution_dependency_graph_cancellations=0;
+    std::uint64_t execution_dependency_graph_failures=0;
+    // Startup-reserved flight objects/token buffers, already in host inventory.
+    std::uint64_t prefix_preparation_metadata_bytes=0;
+    std::uint64_t fused_residual_norm_submissions=0;
+    // Attribution within existing lane persistent inventory, not added charges.
+    std::uint64_t exact_attention_score_bytes=0,numeric_attention_scratch_bytes=0;
+    // Source allocation delta against the same uncoalesced layout, not free VRAM.
+    std::uint64_t coalesced_attention_layers=0,coalesced_attention_bytes_saved=0;
+    std::uint64_t shared_device_page_attention_max_pages=0;
+    std::uint64_t shared_device_page_fallbacks=0,shared_device_page_failures=0;
+    // Engine attachment decisions before cache lookup/fill; descendant/private
+    // pages may legitimately fail acquired-root ancestry and use private storage.
+    std::uint64_t shared_device_page_ancestor_accepts=0,shared_device_page_ancestor_fallbacks=0;
+    std::uint64_t completed_prefix_admissions=0;
+    // Requests newly cancelled by an Engine execution failure. Excludes the
+    // failing request and prior cancellation. Active means worker-owned until
+    // cleanup removes the request, including completion awaiting that cleanup.
+    std::uint64_t failure_cancelled_active_requests=0;
+    std::uint64_t failure_cancelled_queued_requests=0;
+    std::uint64_t shared_device_page_evictions=0;
+    // Registry accounting, distinct from cumulative traffic and CUDA free memory.
+    std::uint64_t shared_device_page_allocations=0,shared_device_page_resident_bytes=0;
+    std::uint64_t shared_device_page_ready_rows=0,shared_device_page_pending_fill_bytes=0;
+    // Source backing reachable from cache keys and tracked retired fill handles;
+    // overlaps host roots. Ready views prevent physical page retirement.
+    std::uint64_t shared_device_page_source_pages=0,shared_device_page_source_host_bytes=0;
+    std::uint64_t shared_device_page_in_flight_fill_bytes=0;
+    std::uint64_t shared_device_page_retained_readers=0,shared_device_page_metadata_records=0;
+    std::uint64_t shared_device_page_failed_allocations=0,shared_device_page_retiring_allocations=0;
+    std::uint64_t private_device_prefix_bytes=0;
+};
+
+enum class ContextCostPresetSource : std::uint8_t {
+    GenericDefault,
+    CompiledDefault,
+    External,
+};
+
+[[nodiscard]] inline constexpr const char*
+context_cost_preset_source_name(ContextCostPresetSource source) noexcept {
+    switch (source) {
+    case ContextCostPresetSource::GenericDefault:
+        return "generic-default";
+    case ContextCostPresetSource::CompiledDefault:
+        return "compiled-default";
+    case ContextCostPresetSource::External:
+        return "external";
+    }
+    return "unknown";
+}
+
+struct ContextCostSummary {
+    ContextCostPresetSource transfer_source = ContextCostPresetSource::GenericDefault;
+    ContextCostPresetSource prefill_source  = ContextCostPresetSource::GenericDefault;
+    std::string hardware_class;
+    std::string model_id;
+    std::string weights_id;
+    std::filesystem::path preset_path;
 };
 
 struct LoadSummary {
@@ -461,6 +1302,37 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;
+    // Optional startup bottleneck diagnostics; these extend rather than replace the stable
+    // summary fields above.
+    double reader_open_map_seconds            = 0.0;
+    double directory_parse_seconds            = 0.0;
+    double directory_validate_seconds         = 0.0;
+    double direct_read_seconds                = 0.0;
+    std::uint64_t direct_read_requests        = 0;
+    std::uint64_t direct_read_bytes           = 0;
+    std::uint64_t direct_read_min_bytes       = 0;
+    std::uint64_t direct_read_max_bytes       = 0;
+    std::uint32_t direct_read_max_outstanding = 0;
+    double device_allocation_seconds          = 0.0;
+    double host_staging_allocation_seconds    = 0.0;
+    double host_resource_copy_seconds         = 0.0;
+    double h2d_stream_seconds                 = 0.0;
+    double h2d_active_seconds                 = 0.0;
+    double materialization_sync_seconds       = 0.0;
+    double tensor_binding_seconds             = 0.0;
+    double planner_seconds                    = 0.0;
+    double instance_seconds                   = 0.0;
+    double startup_sync_seconds               = 0.0;
+    bool dual_source                           = false;
+    std::uint32_t dual_max_parallel_reads     = 0;
+    double dual_direct_read_wall_seconds       = 0.0;
+    std::uint64_t secondary_direct_read_bytes = 0;
+    std::uint64_t secondary_direct_read_requests = 0;
+    std::uint64_t secondary_direct_read_min_bytes = 0;
+    std::uint64_t secondary_direct_read_max_bytes = 0;
+    std::uint32_t secondary_direct_read_max_outstanding = 0;
+    double secondary_direct_read_seconds       = 0.0;
+    ContextCostSummary context_cost;
 };
 
 } // namespace ninfer

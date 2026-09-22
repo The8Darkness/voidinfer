@@ -46,7 +46,10 @@ tools/freq_corpus/fixtures/*
 .DS_Store
 profiles/
 .chatgpt/
+.codex/
+.mcp.json
 benchmark_results/
+results/
 
 # Local release products. Keep the publishing guide, upload archives as GitHub Release assets.
 dist/*

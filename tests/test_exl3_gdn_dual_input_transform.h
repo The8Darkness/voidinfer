@@ -1,0 +1,157 @@
+#pragma once
+
+void run_gdn_dual_input_transform_qualification(
+    Exl3TextModel& target,const std::vector<std::int64_t>& code,
+    const std::vector<std::int64_t>& prose) {
+    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    require(target.max_context()==4352,"GDN dual-transform context extent");
+    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","invalid");
+    bool invalid_rejected=false;
+    try { auto invalid=target.create_context(true); }
+    catch(const std::invalid_argument&) { invalid_rejected=true; }
+    require(invalid_rejected,"GDN dual-transform invalid flag accepted");
+
+    const auto greedy=[](Exl3TextContext& context) {
+        const auto logits=context.logits_host();
+        require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
+            [](float value){return !std::isfinite(value);}),
+            "GDN dual-transform finite logits");
+        return static_cast<std::int64_t>(
+            std::max_element(logits.begin(),logits.end())-logits.begin());
+    };
+    int cases=0;
+    for(const auto& fixture:std::array<
+        std::pair<const char*,const std::vector<std::int64_t>*>,2>{
+            std::pair{"code",&code},std::pair{"prose",&prose}}) {
+        require(fixture.second->size()>=512,"GDN dual-transform fixture extent");
+        _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","0");
+        auto control=target.create_context(true);control->prepare_continuation(8);
+        _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","1");
+        auto candidate=target.create_context(true);candidate->prepare_continuation(8);
+        for(const int prefix:std::array<int,3>{96,321,512}) {
+            const std::vector<std::int64_t> input(
+                fixture.second->begin(),fixture.second->begin()+prefix);
+            struct Result {
+                std::vector<std::int64_t> tokens;
+                std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+            };
+            const auto run=[&](Exl3TextContext& context) {
+                const auto request=Request::initialize(context,input,1024);
+                std::vector<std::int64_t> tokens;
+                for(int row=0;row<8;++row) {
+                    const auto token=greedy(context);
+                    tokens.push_back(token);
+                    context.decode(token);
+                }
+                return Result{std::move(tokens),context.export_exact_host_state()};
+            };
+            const auto baseline=run(*control),changed=run(*candidate);
+            require(baseline.tokens==changed.tokens&&
+                baseline.state->same_payload(*changed.state),
+                "GDN dual-transform token/state fixture="+
+                std::string(fixture.first)+" prefix="+std::to_string(prefix));
+            std::cout<<"GDN_DUAL_INPUT_TRANSFORM_CASE fixture="<<fixture.first
+                <<" prefix="<<prefix<<" decode_rows=8 exact_tokens_state=1"
+                <<std::endl;
+            ++cases;
+        }
+    }
+    std::cout<<"GDN_DUAL_INPUT_TRANSFORM PASS cases="<<cases
+        <<" fixtures=2 prefixes=96,321,512 decode_rows=8 reset_between_prefixes=1"
+        <<" exact_tokens_state=1 invalid_flag_rejected=1"
+        <<" control=separate candidate=paired"<<std::endl;
+}
+
+void run_gdn_dual_input_transform_route_screen(
+    Exl3TextModel& target,const std::vector<std::int64_t>& code,
+    const std::vector<std::int64_t>& prose) {
+    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    require(target.max_context()==4352,"GDN dual-transform route context extent");
+    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    const int measured_pairs=env_int("NINFER_T26_MEASURED_PAIRS",4);
+    require(measured_pairs>=1&&measured_pairs<=4,
+        "GDN dual-transform route measured pair extent");
+    const auto greedy=[](Exl3TextContext& context) {
+        const auto logits=context.logits_host();
+        require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
+            [](float value){return !std::isfinite(value);}),
+            "GDN dual-transform route finite logits");
+        return static_cast<std::int64_t>(
+            std::max_element(logits.begin(),logits.end())-logits.begin());
+    };
+    struct Result {
+        double prefill_ms=0;
+        double route_ms=0;
+        std::vector<std::int64_t> tokens;
+        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+    };
+    constexpr int prefix=4096;
+    for(const auto& fixture:std::array<
+        std::pair<const char*,const std::vector<std::int64_t>*>,2>{
+            std::pair{"code",&code},std::pair{"prose",&prose}}) {
+        require(fixture.second->size()>=prefix,
+            "GDN dual-transform route fixture extent");
+        const std::vector<std::int64_t> input(
+            fixture.second->begin(),fixture.second->begin()+prefix);
+        _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","0");
+        auto control=target.create_context(true);control->prepare_continuation(8);
+        _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","1");
+        auto candidate=target.create_context(true);candidate->prepare_continuation(8);
+        const auto run=[&](Exl3TextContext& context) {
+            const auto route_started=std::chrono::steady_clock::now();
+            const auto request=Request::initialize(context,input,1024);
+            const double prefill_ms=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-route_started).count();
+            std::vector<std::int64_t> tokens;
+            for(int row=0;row<8;++row) {
+                const auto token=greedy(context);
+                tokens.push_back(token);
+                context.decode(token);
+            }
+            const double route_ms=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-route_started).count();
+            return Result{prefill_ms,route_ms,std::move(tokens),
+                context.export_exact_host_state()};
+        };
+        const auto warm_control=run(*control),warm_candidate=run(*candidate);
+        require(warm_control.tokens==warm_candidate.tokens&&
+            warm_control.state->same_payload(*warm_candidate.state),
+            "GDN dual-transform route warmup token/state");
+        std::cout<<"GDN_DUAL_INPUT_TRANSFORM_ROUTE_WARMUP fixture="<<fixture.first
+            <<" prefix="<<prefix
+            <<" control_prefill_ms="<<warm_control.prefill_ms
+            <<" candidate_prefill_ms="<<warm_candidate.prefill_ms
+            <<" control_route_ms="<<warm_control.route_ms
+            <<" candidate_route_ms="<<warm_candidate.route_ms<<std::endl;
+        for(int rep=0;rep<measured_pairs;++rep) {
+            const std::array<bool,2> order=(rep&1)?
+                std::array{true,false}:std::array{false,true};
+            Result first,second;
+            for(int ordinal=0;ordinal<2;++ordinal) {
+                const bool changed=order[ordinal];
+                const auto result=run(changed?*candidate:*control);
+                if(ordinal==0) first=result;else second=result;
+                std::cout<<"GDN_DUAL_INPUT_TRANSFORM_ROUTE_CASE fixture="
+                    <<fixture.first<<" prefix="<<prefix<<" rep="<<rep
+                    <<" order="<<ordinal<<" arm="
+                    <<(changed?"paired":"separate")
+                    <<" prefill_ms="<<result.prefill_ms
+                    <<" route_ms="<<result.route_ms
+                    <<" prefill_tps="<<prefix*1000/result.prefill_ms
+                    <<std::endl;
+            }
+            require(first.tokens==second.tokens&&
+                first.state->same_payload(*second.state),
+                "GDN dual-transform route measured token/state");
+        }
+    }
+    std::cout<<"GDN_DUAL_INPUT_TRANSFORM_ROUTE_SCREEN PASS fixtures=2 prefix=4096"
+        <<" warmup_pairs=1 measured_pairs="<<measured_pairs
+        <<" decode_rows=8 exact_tokens_state=1"
+        <<" control=separate candidate=paired"<<std::endl;
+}

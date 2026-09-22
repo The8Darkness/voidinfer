@@ -1,0 +1,13 @@
+receipt,fixture,arm,metric,value,unit,disposition
+R610,code,cold,cpu_graph_submission_share,1.284,percent,diagnostic_only
+R610,code,reused,cpu_graph_submission_share,1.988,percent,diagnostic_only
+R610,prose,cold,cpu_graph_submission_share,1.355,percent,diagnostic_only
+R610,prose,reused,cpu_graph_submission_share,1.613,percent,diagnostic_only
+R611,code,cold,decode_change_vs_R610,-0.43,percent,noise_no_promotion
+R611,code,reused,decode_change_vs_R610,1.17,percent,noise_no_promotion
+R611,prose,cold,decode_change_vs_R610,-0.38,percent,noise_no_promotion
+R611,prose,reused,decode_change_vs_R610,1.05,percent,noise_no_promotion
+R612,code,cold,decode_change_vs_R611,19.05,percent,rejected_default_off
+R612,code,reused,decode_change_vs_R611,21.15,percent,rejected_default_off
+R612,prose,cold,decode_change_vs_R611,18.82,percent,rejected_default_off
+R612,prose,reused,decode_change_vs_R611,17.08,percent,rejected_default_off

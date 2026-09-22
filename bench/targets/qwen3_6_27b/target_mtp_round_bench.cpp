@@ -4,8 +4,8 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "runtime/engine/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
-#include "runtime/engine/request_memory.h"
 
 #include <cuda_runtime.h>
 
@@ -18,10 +18,12 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -35,13 +37,22 @@ struct Options {
     int repetitions                = 10;
     std::uint32_t draft_tokens     = 5;
     ninfer::ProposalHead proposal  = ninfer::ProposalHead::Optimized;
+    ninfer::KvCacheStorage kv_cache = ninfer::KvCacheStorage::BFloat16;
     bool use_cuda_graph            = true;
+    bool hierarchical_vericache    = false;
+    bool host_tier_snapshots       = false;
+    std::uint32_t l1_to_l2_horizon  = 512;
+    std::uint32_t host_snapshot_horizon = 0;
 };
 
 void print_usage(const char* executable) {
     std::cout << "usage: " << executable
               << " [--artifact <model.ninfer>] [--device <id>] [--warmup <n>] [--reps <n>]"
                  " [--draft-tokens <1..5>] [--proposal-head full|optimized]"
+                 " [--kv-dtype bf16|vericache-nvfp4]"
+                 " [--hierarchical-vericache] [--vericache-host-snapshots]"
+                 " [--vericache-l1-horizon <256..2048>]"
+                 " [--vericache-host-snapshot-horizon <256..2048>]"
                  " [--no-cuda-graph]\n";
 }
 
@@ -74,8 +85,28 @@ Options parse_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--proposal-head must be full or optimized");
             }
+        } else if (argument == "--kv-dtype") {
+            const std::string_view dtype(value("--kv-dtype"));
+            if (dtype == "bf16") {
+                options.kv_cache = ninfer::KvCacheStorage::BFloat16;
+            } else if (dtype == "vericache-nvfp4") {
+                options.kv_cache = ninfer::KvCacheStorage::VeriCacheNvfp4;
+            } else {
+                throw std::invalid_argument("--kv-dtype must be bf16 or vericache-nvfp4");
+            }
         } else if (argument == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (argument == "--hierarchical-vericache") {
+            options.hierarchical_vericache = true;
+        } else if (argument == "--vericache-host-snapshots") {
+            options.hierarchical_vericache = true;
+            options.host_tier_snapshots = true;
+        } else if (argument == "--vericache-l1-horizon") {
+            options.l1_to_l2_horizon =
+                static_cast<std::uint32_t>(std::stoul(value("--vericache-l1-horizon")));
+        } else if (argument == "--vericache-host-snapshot-horizon") {
+            options.host_snapshot_horizon = static_cast<std::uint32_t>(
+                std::stoul(value("--vericache-host-snapshot-horizon")));
         } else if (argument == "-h" || argument == "--help") {
             print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_6_27b_mtp_round_bench");
             std::exit(0);
@@ -89,6 +120,14 @@ Options parse_options(int argc, char** argv) {
     if (options.draft_tokens == 0 || options.draft_tokens > 5) {
         throw std::invalid_argument("--draft-tokens must be in [1,5]");
     }
+    if (options.l1_to_l2_horizon < 256 || options.l1_to_l2_horizon > 2048) {
+        throw std::invalid_argument("--vericache-l1-horizon must be in [256,2048]");
+    }
+    if (options.host_snapshot_horizon != 0 &&
+        (options.host_snapshot_horizon < 256 || options.host_snapshot_horizon > 2048)) {
+        throw std::invalid_argument(
+            "--vericache-host-snapshot-horizon must be 0 or in [256,2048]");
+    }
     return options;
 }
 
@@ -98,19 +137,20 @@ struct RoundMeasurement {
 };
 
 RoundMeasurement measure_round(target::Package::Program& program, ninfer::DeviceContext& device,
+                               target::Package::SequenceHandle sequence,
                                std::uint32_t draft_tokens) {
-    constexpr std::array<std::uint32_t, 1> lanes{0};
+    const std::array<target::Package::SequenceHandle, 1> sequences{sequence};
     const std::array<ninfer::runtime::RoundBudget, 1> budgets{
         ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1}};
     ninfer::CudaEventTimer timer(device);
     timer.start();
-    const auto round = program.decode_batch(lanes, budgets);
-    const std::uint32_t licensed =
-        round.row_counts.empty() ? 1U : static_cast<std::uint32_t>(round.row_counts.front());
-    const std::array<std::uint32_t, 1> accepted{licensed};
-    constexpr std::array<std::uint8_t, 1> terminal{0};
-    constexpr std::array<std::uint8_t, 1> cancelled{0};
-    program.resolve_pending_batch(lanes, accepted, terminal, cancelled);
+    auto pending                 = program.decode(sequences, budgets);
+    const std::uint32_t licensed = pending.row_counts().empty()
+                                       ? 1U
+                                       : static_cast<std::uint32_t>(pending.row_counts().front());
+    const std::array<ninfer::runtime::CommitDecision, 1> decisions{
+        ninfer::runtime::CommitDecision{.accepted_tokens = licensed}};
+    (void)program.commit(std::move(pending), decisions);
     const float milliseconds = timer.stop_ms();
     return RoundMeasurement{.milliseconds = milliseconds, .licensed_tokens = licensed};
 }
@@ -133,11 +173,23 @@ int run(const Options& options) {
                                                             2ULL * options.draft_tokens);
     engine.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(engine.max_context);
     engine.prefill_chunk       = 128;
-    engine.kv_cache            = ninfer::KvCacheStorage::BFloat16;
-    engine.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+    engine.kv_cache                 = options.kv_cache;
+    engine.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
+    engine.hierarchical_vericache.enabled = options.hierarchical_vericache;
+    engine.hierarchical_vericache.enable_host_tier_snapshots = options.host_tier_snapshots;
+    engine.hierarchical_vericache.l1_to_l2_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.l1_to_l2_min_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.l1_to_l2_max_horizon = options.l1_to_l2_horizon;
+    engine.hierarchical_vericache.host_snapshot_horizon = options.host_snapshot_horizon;
+    // The direct package benchmark does not pass through Engine option normalization. Keep
+    // no-host controls lightweight, while a short host-snapshot run has one active image and one
+    // spare plus enough typed KV space for the boundary-rotation experiment.
+    engine.context_cache.host_state_slots = options.host_tier_snapshots ? 2U : 0U;
+    engine.context_cache.host_kv_capacity_bytes =
+        options.host_tier_snapshots ? (512ULL << 20) : 0U;
 
     ninfer::DeviceContext device(options.device);
     ninfer::artifact::Reader reader(options.artifact);
@@ -154,36 +206,69 @@ int run(const Options& options) {
     auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
     const auto resolution = ninfer::runtime::resolve_kv_capacity(
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
-    auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
-    const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
-    auto program = target::Package::create_program(*model, std::move(sequence), device);
-    ninfer::runtime::RequestMemory request_memory(device, request_capacity);
+    auto sequence = std::move(planner).finalize(resolution.main_page_groups);
+    auto program  = target::Package::create_program(*model, std::move(sequence), device);
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
-    auto request_base                 = program->plan_request_base(prompt, execution);
-    auto request_plan                 = program->plan_request_for_lane(0, prompt, request_base);
-    request_memory.activate(request_plan.summary().transient_bytes,
-                            request_plan.summary().transient_alignment);
-    const auto first = program->start_prefill_lane(0, std::move(prompt), std::move(request_plan),
-                                                   request_memory.region());
-    request_memory.deactivate();
-    if (!first.complete || first.round.tokens.size() != 1) {
+    auto request_base                 = program->plan_request(prompt, execution);
+    const auto machine_cost           = ninfer::runtime::generic_context_machine_cost_model();
+    auto request_plan =
+        program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{0}, nullptr,
+                                   nullptr, std::nullopt, false, machine_cost);
+    if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
+    auto resource_plan = program->seal_identity(*request_plan, prompt);
+    if (!resource_plan) { throw std::runtime_error("benchmark root resources were not sealed"); }
+    const auto reserved =
+        program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
+    if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
+        throw std::runtime_error("benchmark root materialization was not reserved");
+    }
+    std::optional<target::Package::MaterializationResult> published;
+    for (;;) {
+        auto transaction = program->progress_context_transaction({});
+        if (std::holds_alternative<ninfer::runtime::ContextTransactionInProgress>(transaction)) {
+            continue;
+        }
+        if (!std::holds_alternative<target::Package::MaterializationResult>(transaction)) {
+            program->finalize_context_transaction();
+            throw std::runtime_error("benchmark root returned the wrong transaction result");
+        }
+        published.emplace(std::get<target::Package::MaterializationResult>(std::move(transaction)));
+        break;
+    }
+    if (published->status != ninfer::runtime::ContextTransactionStatus::Published ||
+        !published->published) {
+        program->finalize_context_transaction();
+        throw std::runtime_error("benchmark root materialization was not published");
+    }
+    auto started = std::move(*published->published);
+    program->finalize_context_transaction();
+    auto progress = program->advance_prefill(started.sequence);
+    if (!progress.complete || !progress.pending || progress.pending->tokens().size() != 1) {
         throw std::runtime_error("benchmark seed prefill did not complete in one scheduling unit");
     }
-    program->resolve_prefill_lane(0, false);
+    const std::array<ninfer::runtime::CommitDecision, 1> begin_decision{
+        ninfer::runtime::CommitDecision{.accepted_tokens = 1}};
+    (void)program->commit(std::move(*progress.pending), begin_decision);
+    const auto active_sequence = started.sequence;
 
-    const std::uint64_t rounds_before = program->speculative_stats_lane(0).rounds;
+    constexpr std::uint64_t rounds_before = 0;
     for (int iteration = 0; iteration < options.warmup; ++iteration) {
-        (void)measure_round(*program, device, options.draft_tokens);
+        (void)measure_round(*program, device, active_sequence, options.draft_tokens);
     }
 
     std::vector<RoundMeasurement> measurements;
     measurements.reserve(static_cast<std::size_t>(options.repetitions));
     for (int iteration = 0; iteration < options.repetitions; ++iteration) {
-        measurements.push_back(measure_round(*program, device, options.draft_tokens));
+        measurements.push_back(
+            measure_round(*program, device, active_sequence, options.draft_tokens));
     }
-    const ninfer::SpeculativeStats stats = program->speculative_stats_lane(0);
+    const auto aborted = program->abort(active_sequence);
+    if (aborted.status != ninfer::runtime::ConsumeStatus::Consumed) {
+        throw std::runtime_error("benchmark could not release its active sequence");
+    }
+    const ninfer::SpeculativeStats stats = aborted.speculative;
     if (stats.rounds - rounds_before != measured_rounds || stats.fallback_steps != 0) {
         throw std::runtime_error("benchmark did not stay on the native MTP proposal/verify path");
     }
@@ -204,6 +289,17 @@ int run(const Options& options) {
     std::cout << "format,ninfer_qwen3_6_27b_mtp_round_bench_v1\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
     std::cout << "device," << device.props.name << '\n';
+    std::cout << "kv_cache,"
+              << (options.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 ? "vericache-nvfp4"
+                                                                                : "bf16")
+              << '\n';
+    std::cout << "hierarchical_vericache,"
+              << (options.hierarchical_vericache ? "true" : "false") << '\n';
+    std::cout << "vericache_host_tier_snapshots_enabled,"
+              << (options.host_tier_snapshots ? "true" : "false") << '\n';
+    std::cout << "vericache_l1_to_l2_horizon_configured," << options.l1_to_l2_horizon << '\n';
+    std::cout << "vericache_host_snapshot_horizon_configured," << options.host_snapshot_horizon
+              << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "proposal_head,"
               << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
@@ -216,6 +312,30 @@ int run(const Options& options) {
     std::cout << "mtp_round_max_ms," << *maximum << '\n';
     std::cout << "mean_licensed_tokens," << mean_licensed << '\n';
     std::cout << "accepted_draft_tokens," << stats.accepted_tokens << '\n';
+    ninfer::RuntimeStats vericache_stats;
+    program->populate_hierarchical_vericache_stats(vericache_stats);
+    std::cout << "vericache_l0_to_l1_horizon," << vericache_stats.vericache_l0_to_l1_horizon
+              << '\n';
+    std::cout << "vericache_l1_to_l2_horizon," << vericache_stats.vericache_l1_to_l2_horizon
+              << '\n';
+    std::cout << "vericache_exact_target_checks," << vericache_stats.vericache_exact_target_checks
+              << '\n';
+    std::cout << "vericache_host_tier_snapshots," << vericache_stats.vericache_host_tier_snapshots
+              << '\n';
+    std::cout << "vericache_host_tier_snapshot_bytes,"
+              << vericache_stats.vericache_host_tier_snapshot_bytes << '\n';
+    std::cout << "vericache_host_state_d2h_bytes,"
+              << vericache_stats.vericache_host_state_d2h_bytes << '\n';
+    std::cout << "vericache_host_kv_d2h_pages," << vericache_stats.vericache_host_kv_d2h_pages
+              << '\n';
+    std::cout << "vericache_host_kv_d2h_bytes," << vericache_stats.vericache_host_kv_d2h_bytes
+              << '\n';
+    std::cout << "vericache_host_kv_d2h_seconds,"
+              << vericache_stats.vericache_host_kv_d2h_seconds << '\n';
+    std::cout << "vericache_l0_bytes," << vericache_stats.vericache_l0_bytes << '\n';
+    std::cout << "vericache_l1_bytes," << vericache_stats.vericache_l1_bytes << '\n';
+    std::cout << "vericache_l2_bytes," << vericache_stats.vericache_l2_bytes << '\n';
+    std::cout << "vericache_l3_bytes," << vericache_stats.vericache_l3_bytes << '\n';
     return 0;
 }
 

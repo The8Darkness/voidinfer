@@ -14,6 +14,8 @@ namespace ninfer::targets::qwen3_6::frontend_internal {
 struct MediaCacheKey {
     std::array<std::uint8_t, 32> digest{};
     Modality modality = Modality::Image;
+    VisionPatchStorage patch_storage = VisionPatchStorage::BFloat16;
+    qwen3_6::MediaPreprocessIdentity preprocess;
 
     [[nodiscard]] bool operator==(const MediaCacheKey&) const noexcept = default;
 };

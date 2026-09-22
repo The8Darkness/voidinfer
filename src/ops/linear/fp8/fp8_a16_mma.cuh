@@ -1,6 +1,6 @@
 #pragma once
 
-// Row-scaled E4M3 weight x BF16 activation Tensor Core mainloop.
+// Small-T row-scaled E4M3 weight x BF16 activation Tensor Core mainloop.
 //
 // A CTA owns sixteen output rows and splits K across compile-time-selected warps. Persistent E4M3
 // codes are widened exactly to BF16 MMA operands; the represented BF16 row multiplier is applied
@@ -8,38 +8,19 @@
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/linear/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
 
 #include <cstdint>
 
 namespace ninfer::ops::detail {
 
-__device__ __forceinline__ int fp8_a16_mma_swizzle_64(int row, int col) {
-    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
-}
-
-union Fp8A16MmaPairBits {
-    __nv_bfloat162 pair;
-    unsigned bits;
-};
-
-__device__ __forceinline__ unsigned fp8_e4m3x2_to_bf16x2_bits(unsigned packed) {
-    __nv_fp8x2_e4m3 fp8;
-    fp8.__x                 = static_cast<std::uint16_t>(packed);
-    const __half2 half_pair = static_cast<__half2>(fp8);
-    Fp8A16MmaPairBits result;
-    result.pair = __halves2bfloat162(__nv_bfloat16(__low2half(half_pair)),
-                                     __nv_bfloat16(__high2half(half_pair)));
-    return result.bits;
-}
-
 template <class Geometry, int ActiveTokens, class Schedule, class Output = Fp8ContiguousOutput>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_mma_kernel(
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_small_t_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
     const __nv_bfloat16* __restrict__ row_scales, Output output) {
     constexpr int kHidden     = Geometry::kInputRows;
@@ -56,18 +37,26 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     static_assert((kWarps & 1) == 0);
     constexpr unsigned kMask = 0xffffffffU;
 
-    union SharedStorage {
-        struct {
-            std::uint8_t codes[kRowsPerCta][kGroupK];
-            __nv_bfloat16 activations[kWarps][kTileTokens * kTileK];
-        } staging;
+    struct SharedStorage {
+        union {
+            struct {
+                std::uint8_t codes[kRowsPerCta][kGroupK];
+                __nv_bfloat16 activations[kWarps][kTileTokens * kTileK];
+            } staging;
 
-        float partial[kWarps * kTokenMmas * 32 * 4];
+            float partial[kWarps * kTokenMmas * 32 * 4];
+        };
+
+        float argmax_values[kTileTokens * kRowsPerCta];
     };
 
     __shared__ __align__(16) SharedStorage shared;
     auto& code_shared = shared.staging.codes;
     auto& x_shared    = shared.staging.activations;
+
+    if constexpr (Output::kNeedsBlockReduce) {
+        output.shared_values = shared.argmax_values;
+    }
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -78,15 +67,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 
     const auto stage_activation = [&](int group_k0) {
         constexpr auto kActivationCache =
-            Schedule::kActivationCache == Fp8A16MmaCache::Default ? Cache::ca : Cache::cg;
-        constexpr bool kPadded = Schedule::kActivationStage == Fp8A16MmaActivationStage::PaddedZero;
+            Schedule::kActivationCache == Fp8A16SmallTMmaCache::Default ? Cache::ca : Cache::cg;
+        constexpr bool kPadded =
+            Schedule::kActivationStage == Fp8A16SmallTMmaActivationStage::PaddedZero;
         constexpr int kStageTokens = kPadded ? kTileTokens : ActiveTokens;
         constexpr int kItems       = kStageTokens * (kTileK / 8);
         for (int item = lane; item < kItems; item += 32) {
             const int token = item / (kTileK / 8);
             const int k8    = item - token * (kTileK / 8);
             auto* destination =
-                &x_shared[warp][token * kTileK + fp8_a16_mma_swizzle_64(token, k8 * 8)];
+                &x_shared[warp][token * kTileK + fp8_a16_shared_col_64(token, k8 * 8)];
             if constexpr (!kPadded || ActiveTokens == kTileTokens) {
                 cp_async<16, kActivationCache>(destination,
                                                x + static_cast<std::int64_t>(token) * kHidden +
@@ -104,7 +94,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 
     const auto stage_codes = [&](int group_k0) {
         constexpr auto kWeightCache =
-            Schedule::kWeightCache == Fp8A16MmaCache::Default ? Cache::ca : Cache::cg;
+            Schedule::kWeightCache == Fp8A16SmallTMmaCache::Default ? Cache::ca : Cache::cg;
 #pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int row = warp * Schedule::kRowsPerLoaderWarp + row_item;
@@ -151,7 +141,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 const int row = token_mma * 8 + b_row;
                 ldmatrix_x2(
                     b0, b1,
-                    smem_addr(&x_shared[warp][row * kTileK + fp8_a16_mma_swizzle_64(
+                    smem_addr(&x_shared[warp][row * kTileK + fp8_a16_shared_col_64(
                                                                  row, k_step * 16 + b_k_offset)]));
                 mma_bf16(accumulators[token_mma][0], accumulators[token_mma][1],
                          accumulators[token_mma][2], accumulators[token_mma][3], a0, a1, a2, a3, b0,
@@ -226,17 +216,88 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 sum.z += value.z;
                 sum.w += value.w;
             }
-            const int token0 = token_mma * 8 + 2 * lid;
-            if (token0 < ActiveTokens) {
-                output.store(row0 + gid, token0, sum.x * top_scale);
-                output.store(row0 + gid + 8, token0, sum.z * bottom_scale);
+            accumulators[token_mma][0] = sum.x;
+            accumulators[token_mma][1] = sum.y;
+            accumulators[token_mma][2] = sum.z;
+            accumulators[token_mma][3] = sum.w;
+            if constexpr (!Output::kNeedsBlockReduce) {
+                const int token0 = token_mma * 8 + 2 * lid;
+                if (token0 < ActiveTokens) {
+                    output.store(row0 + gid, token0, sum.x * top_scale);
+                    output.store(row0 + gid + 8, token0, sum.z * bottom_scale);
+                }
+                if (token0 + 1 < ActiveTokens) {
+                    output.store(row0 + gid, token0 + 1, sum.y * top_scale);
+                    output.store(row0 + gid + 8, token0 + 1, sum.w * bottom_scale);
+                }
             }
-            if (token0 + 1 < ActiveTokens) {
-                output.store(row0 + gid, token0 + 1, sum.y * top_scale);
-                output.store(row0 + gid + 8, token0 + 1, sum.w * bottom_scale);
+        }
+
+        if constexpr (Output::kNeedsBlockReduce) {
+#pragma unroll
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                const float4 sum = make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
+                                               accumulators[token_mma][2], accumulators[token_mma][3]);
+                const int token0 = token_mma * 8 + 2 * lid;
+                if (token0 < ActiveTokens) {
+                    output.store(row0 + gid, token0, sum.x * top_scale);
+                    output.store(row0 + gid + 8, token0, sum.z * bottom_scale);
+                }
+                if (token0 + 1 < ActiveTokens) {
+                    output.store(row0 + gid, token0 + 1, sum.y * top_scale);
+                    output.store(row0 + gid + 8, token0 + 1, sum.w * bottom_scale);
+                }
             }
         }
     }
+
+    if constexpr (Output::kNeedsBlockReduce) {
+        // All lanes in warp 0 published one unique (row,token) value. The other warps must join
+        // before warp 0 consumes the shared reduction tile.
+        __syncthreads();
+        if (warp == 0) { output.finish(row0, ActiveTokens); }
+    }
+}
+
+// Reduce the one-winner-per-row-CTA tiles emitted by Fp8ArgmaxOutput. The reduction sees the
+// already BF16-rounded values, so it has the same tie and representation semantics as argmax().
+__launch_bounds__(256) __global__ void fp8_vocabulary_argmax_reduce_kernel(
+    const __nv_bfloat16* partial_values, const std::int32_t* partial_indices,
+    std::int32_t* tokens, std::int32_t partial_rows, std::int32_t active_tokens) {
+    const std::int32_t token = static_cast<std::int32_t>(blockIdx.x);
+    if (token >= active_tokens) { return; }
+
+    float best_value        = -CUDART_INF_F;
+    std::int32_t best_index = INT_MAX;
+    const std::int64_t base = static_cast<std::int64_t>(token) * partial_rows;
+    for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < partial_rows;
+         row += blockDim.x) {
+        const float value = __bfloat162float(partial_values[base + row]);
+        const std::int32_t index = partial_indices[base + row];
+        if (value > best_value || (value == best_value && index < best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+
+    __shared__ float values[256];
+    __shared__ std::int32_t indices[256];
+    values[threadIdx.x]  = best_value;
+    indices[threadIdx.x] = best_index;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float other_value        = values[threadIdx.x + stride];
+            const std::int32_t other_index = indices[threadIdx.x + stride];
+            if (other_value > values[threadIdx.x] ||
+                (other_value == values[threadIdx.x] && other_index < indices[threadIdx.x])) {
+                values[threadIdx.x]  = other_value;
+                indices[threadIdx.x] = other_index;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { tokens[token] = indices[0]; }
 }
 
 } // namespace ninfer::ops::detail

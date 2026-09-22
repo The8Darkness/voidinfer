@@ -16,6 +16,11 @@ namespace ninfer::ops::detail {
 namespace {
 
 using Geometry = Nvfp4MlpGateUpGeometry;
+// DFlash2 verifies a single short block (normally T=8 or 9).  The original
+// 48-token tile leaves most of its activation rows inactive at that width.  A
+// 16-token tile keeps the same W4A4 mainloop but cuts the inactive token work
+// and shared staging for the production short-T interval.
+using M16N64   = Nvfp4W4a4MmaSchedule<16, 64, 256, 1, 4, 2, 4>;
 using M48N64   = Nvfp4W4a4MmaSchedule<48, 64, 256, 3, 4, 2, 2>;
 
 constexpr int kIntermediate = Geometry::kOutputRows / 2;

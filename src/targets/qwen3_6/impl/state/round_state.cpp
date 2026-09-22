@@ -98,7 +98,10 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     rope_positions  = ingress_tensor(offsetof(OrdinaryDecodeIngress, rope_positions), DType::I32);
     text_kv_table_rows =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, text_kv_table_rows), DType::I32);
-    lanes    = ingress_tensor(offsetof(OrdinaryDecodeIngress, lanes), DType::I32);
+    state_source_slots =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
+    state_destination_slots =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
@@ -187,7 +190,11 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash append positions");
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
         decode.draft_tokens =
-            add_tensor(builder, DType::I32, {columns - 1, batch}, "DFlash proposal draft tokens");
+        add_tensor(builder, DType::I32, {columns - 1, batch}, "DFlash proposal draft tokens");
+        decode.q2_drafts = add_tensor(builder, DType::I32, {columns - 1, batch},
+                                      "DFlash Q2 verifier draft scratch");
+        decode.q2_l1_accepted =
+            add_tensor(builder, DType::I32, {batch}, "DFlash Q2 to Q4 accepted prefix");
         decode.verify_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash target verify ids");
         decode.target_argmax =
@@ -199,6 +206,22 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder, DType::BF16, {layout.spec.hidden, columns, batch}, "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
+        decode.adaptive_drafts = add_tensor(
+            builder, DType::I32, {columns - 1, batch}, "Adaptive DFlash dense draft scratch");
+        decode.adaptive_verify_ids = add_tensor(
+            builder, DType::I32, {columns, batch}, "Adaptive DFlash dense verify ids");
+        decode.adaptive_target_positions = add_tensor(
+            builder, DType::I32, {columns, batch}, "Adaptive DFlash dense target positions");
+        decode.adaptive_target_tokens = add_tensor(
+            builder, DType::I32, {columns, batch}, "Adaptive DFlash dense target tokens");
+        decode.adaptive_target_logits = add_tensor(
+            builder, DType::BF16, {layout.spec.output_rows, columns, batch},
+            "Adaptive DFlash dense target logits");
+        decode.adaptive_target_hidden = add_tensor(
+            builder, DType::BF16, {layout.spec.hidden, columns, batch},
+            "Adaptive DFlash dense target hidden");
+        decode.adaptive_licensed_tokens = add_tensor(
+            builder, DType::I32, {columns, batch}, "Adaptive DFlash dense licensed tokens");
     }
     layout.complete = true;
 }
@@ -251,7 +274,10 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
         ingress_tensor(offsetof(MtpDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     mtp_kv_table_rows =
         ingress_tensor(offsetof(MtpDecodeIngress, mtp_kv_table_rows), DType::I32, {batch});
-    lanes       = ingress_tensor(offsetof(MtpDecodeIngress, lanes), DType::I32, {batch});
+    state_source_slots =
+        ingress_tensor(offsetof(MtpDecodeIngress, state_source_slots), DType::I32, {batch});
+    state_destination_slots =
+        ingress_tensor(offsetof(MtpDecodeIngress, state_destination_slots), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
@@ -319,7 +345,11 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
-    lanes    = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
+    active_lanes = ingress_tensor(offsetof(DFlashDecodeIngress, active_lanes), DType::I32, {batch});
+    state_source_slots =
+        ingress_tensor(offsetof(DFlashDecodeIngress, state_source_slots), DType::I32, {batch});
+    state_destination_slots =
+        ingress_tensor(offsetof(DFlashDecodeIngress, state_destination_slots), DType::I32, {batch});
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
     licensed_tokens =
@@ -333,11 +363,20 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     append_positions           = layout.append_positions.bind(backing);
     append_counts              = layout.append_counts.bind(backing);
     draft_tokens               = layout.draft_tokens.bind(backing);
+    q2_drafts                  = layout.q2_drafts.bind(backing);
+    q2_l1_accepted              = layout.q2_l1_accepted.bind(backing);
     verify_ids                 = layout.verify_ids.bind(backing);
     target_argmax              = layout.target_argmax.bind(backing);
     target_logits              = layout.target_logits.bind(backing);
     target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+    adaptive_drafts           = layout.adaptive_drafts.bind(backing);
+    adaptive_verify_ids       = layout.adaptive_verify_ids.bind(backing);
+    adaptive_target_positions = layout.adaptive_target_positions.bind(backing);
+    adaptive_target_tokens    = layout.adaptive_target_tokens.bind(backing);
+    adaptive_target_logits    = layout.adaptive_target_logits.bind(backing);
+    adaptive_target_hidden    = layout.adaptive_target_hidden.bind(backing);
+    adaptive_licensed_tokens  = layout.adaptive_licensed_tokens.bind(backing);
 }
 
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
