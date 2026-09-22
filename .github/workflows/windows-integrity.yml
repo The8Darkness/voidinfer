@@ -2,9 +2,9 @@ name: Windows integrity
 
 on:
   push:
-    branches: [master]
+    branches: [master, main]
   pull_request:
-    branches: [master]
+    branches: [master, main]
 
 permissions:
   contents: read
@@ -18,10 +18,32 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Select review range
+        id: range
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          $empty = git hash-object -t tree NUL
+          if ($env:EVENT_NAME -eq 'pull_request' -and $env:BASE_SHA) {
+            $base = $env:BASE_SHA
+          } elseif ($env:BEFORE_SHA -and $env:BEFORE_SHA -notmatch '^0+$') {
+            git cat-file -e "$env:BEFORE_SHA^{commit}" 2>$null
+            $base = if ($LASTEXITCODE -eq 0) { $env:BEFORE_SHA } else { $empty }
+          } else {
+            $base = $empty
+          }
+          "base=$base" >> $env:GITHUB_OUTPUT
+
       - name: Validate repository text
         shell: pwsh
+        env:
+          BASE: ${{ steps.range.outputs.base }}
         run: |
-          git diff --check HEAD^
+          git diff --check $env:BASE HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'Whitespace validation failed.' }
 
           $rules = [ordered]@{
             aws         = 'AKIA[0-9A-Z]{16}'
@@ -33,35 +55,26 @@ jobs:
           $findings = [System.Collections.Generic.List[string]]::new()
           foreach ($rule in $rules.GetEnumerator()) {
             $paths = @(git grep -I -l -E -- $rule.Value -- . 2>$null)
+            if ($LASTEXITCODE -gt 1) { throw "git grep failed for $($rule.Key)." }
             foreach ($path in $paths) { $findings.Add("$($rule.Key):$path") }
           }
           if ($findings.Count -ne 0) {
             $findings | Sort-Object -Unique | Write-Error
             throw 'High-confidence secret pattern detected.'
           }
-          exit 0
 
       - name: Reject local and generated artifacts
         shell: pwsh
         run: |
-          $pattern = '(?i)(^|/)(auth|credentials|tokens|oauth)\.json$|(^|/)\.env($|\.)|\.(ncu-rep|nsys-rep|dmp|trace|sqlite|db|ninfer|ckpt|onnx|pt|pth|npy|npz|safetensors|gguf)$'
+          $pattern = '(?i)(^|/)(\.codex|\.agents|sessions|memory|results)(/|$)|(^|/)\.mcp\.json$|(^|/)(auth|credentials|tokens|oauth)\.json$|(^|/)\.env($|\.)|\.(exe|dll|pdb|ncu-rep|nsys-rep|dmp|trace|sqlite|db|ninfer|ckpt|onnx|pt|pth|npy|npz|safetensors|gguf)$'
           $blocked = @(git ls-files | Where-Object { $_ -match $pattern })
           if ($blocked.Count -ne 0) {
             $blocked | Write-Error
-            throw 'Local, credential, model, or profiler artifact is tracked.'
+            throw 'Local, credential, model, result, binary, or profiler artifact is tracked.'
           }
 
-      - name: Validate MCP configuration
+      - name: Validate documentation links
         shell: pwsh
         run: |
-          $config = Get-Content -LiteralPath .mcp.json -Raw | ConvertFrom-Json
-          if ($config.mcpServers.'nvidia-cuda-docs'.auth -ne 'oauth') {
-            throw 'NVIDIA MCP must use OAuth.'
-          }
-          $github = $config.mcpServers.github
-          if ($github.command -notmatch 'github-mcp-server\.exe$') {
-            throw 'GitHub MCP must use the official local server.'
-          }
-          foreach ($required in @('--read-only', '--lockdown-mode')) {
-            if ($required -notin $github.args) { throw "GitHub MCP is missing $required." }
-          }
+          python tools/maintenance/check_markdown_links.py README.md docs evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Documentation link validation failed.' }
