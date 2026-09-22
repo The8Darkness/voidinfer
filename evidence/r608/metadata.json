@@ -1,0 +1,19 @@
+{
+  "receipt": "native-r608-dflash-untimed-4096x128-r1",
+  "date_utc": "2026-09-22",
+  "status": "PASS",
+  "exit_code": 0,
+  "source_path_count": 1283,
+  "source_content_sha256": "60d11dabfb0070902ec6a835a54009909c5103884182d977e2481d38d7b2b6e3",
+  "binary_sha256": "304073b3baa8e4344beaebf358f9d2b504566542ebea5133dfc9f80a7bcecf46",
+  "backend": "native same-weight ordinary FP16 device-KV DFlash2 C1",
+  "prefix_tokens": 4096,
+  "outputs_per_request": 128,
+  "requests_per_arm": 3,
+  "recorded_checks": 2822,
+  "passing_checks": 2822,
+  "run_rows": 12,
+  "exact_run_rows": 12,
+  "dflash_timing": false,
+  "device_working_state": true
+}

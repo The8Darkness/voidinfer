@@ -1,0 +1,5 @@
+fixture,pair,arm,requests,useful_outputs,wall_ms,context_constructions,final_exact,useful_tok_s
+code,0,cold,3,384,8504.60,3,1,45.15
+code,0,reused,3,384,8028.82,1,1,47.83
+prose,0,cold,3,384,14999.70,3,1,25.60
+prose,0,reused,3,384,14431.40,1,1,26.61
