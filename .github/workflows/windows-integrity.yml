@@ -33,7 +33,11 @@ jobs:
             git cat-file -e "$env:BEFORE_SHA^{commit}" 2>$null
             $base = if ($LASTEXITCODE -eq 0) { $env:BEFORE_SHA } else { $empty }
           } else {
-            $base = $empty
+            # A new branch push has an all-zero before SHA. Review the tip commit
+            # when it has a parent; use the empty tree only for a true root commit.
+            git cat-file -e 'HEAD^{commit}' 2>$null
+            git cat-file -e 'HEAD^' 2>$null
+            $base = if ($LASTEXITCODE -eq 0) { git rev-parse 'HEAD^' } else { $empty }
           }
           "base=$base" >> $env:GITHUB_OUTPUT
 
