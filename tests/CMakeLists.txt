@@ -92,6 +92,7 @@ ninfer_add_test(ninfer_exl3_mtp_runner_test
   SOURCES test_exl3_mtp_runner.cpp
   LIBRARIES ninfer_exl3_format)
 ninfer_add_host_contract_test(ninfer_exl3_mtp_proposal_economics_test
+  NEEDS_CUDA_HEADERS
   SOURCES test_exl3_mtp_proposal_economics.cpp)
 ninfer_add_test(ninfer_exl3_single_linear_test
   SOURCES test_exl3_single_linear.cpp
