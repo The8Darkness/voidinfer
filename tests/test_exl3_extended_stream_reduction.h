@@ -253,4 +253,3 @@ void run_target_k6_small_m_async_qualification(
              <<" calls="<<candidate_calls<<" k7_calls="<<k7_candidate_calls
              <<" strict_flag=1 exact=1 repeat=1 guards=1 input_unchanged=1\n"<<std::flush;
 }
-

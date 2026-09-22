@@ -193,4 +193,3 @@ H6OracleStats target_down_k6_check_oracle_groups(
     }
     return stats;
 }
-

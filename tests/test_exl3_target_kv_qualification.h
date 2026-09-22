@@ -273,4 +273,3 @@ void run_target_kv_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& d
     std::ofstream f(check.directory/"result.txt");f << "PASS operators=32 widths=1..8 cases=256 selected_oracle_values_per_layer=8192 groups=0,1,2,3,4,5,6,7\n";
     require(f.good(),"K/V small-M result write");std::cout << "TARGET_KV_SMALL_M PASS operators=32 cases=256\n";
 }
-

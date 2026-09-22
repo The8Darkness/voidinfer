@@ -3595,7 +3595,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
     uint16_t* current = m.s.x_a;
     uint16_t* other = m.s.x_b;
-    
+
     // E5A2 first-divergence differential (env-gated, one-shot). Recomputes the
     // layer-0 o_proj module (4096->5120, K5, mul1) on the host with the qualified
     // EXL3 decode convention on the IDENTICAL real attention output, then compares

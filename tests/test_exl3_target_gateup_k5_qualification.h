@@ -137,4 +137,3 @@ void run_target_gateup_k5_qualification(Exl3TextModel& target, Exl3Dflash2DraftM
     std::ofstream f(check.directory/"result.txt");f << "PASS operators=30 widths=1..8 cases=240 selected_oracle_values_per_layer=3072 groups=0,67,135\n";
     require(f.good(),"gate/up K5 result write");std::cout << "TARGET_GATEUP_K5 PASS operators=30 cases=240\n";
 }
-

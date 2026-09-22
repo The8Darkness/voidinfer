@@ -148,4 +148,3 @@ void run_exact_host_state_qualification(Exl3TextModel& target,
               << " test_wall_ms=" << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-start).count()
               << " identity=vericache_exact_fp16_eager\n";
 }
-

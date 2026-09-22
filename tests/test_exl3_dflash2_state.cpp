@@ -15,9 +15,9 @@
  //   S6 propose wall latency legacy-vs-ring + env-gated phase breakdown (LAST)
  #include "exl3/text_model.h"
  #include "exl3/dflash2_draft.h"
- 
+
  #include <cuda_runtime.h>
- 
+
  #include <algorithm>
  #include <array>
  #include <chrono>
@@ -34,39 +34,39 @@
  #include <stdexcept>
  #include <string>
  #include <vector>
- 
+
  namespace {
- 
+
  using ninfer::exl3::Exl3TextModel;
  using ninfer::exl3::Exl3TextContext;
  using ninfer::exl3::Exl3Dflash2DraftModel;
  using ninfer::exl3::Exl3Dflash2TapHistory;
- 
+
  constexpr int kHidden = 5120;
  constexpr int kVocab = 248320;
  constexpr int kTapCount = 5;
  constexpr int kMaskToken = 248070;
  constexpr int kBlockLen = 8;
  constexpr std::array<int, kTapCount> kTapLayers = {5, 19, 33, 47, 61};
- 
+
  const std::vector<std::int64_t> kPrompt = {248045, 846, 198, 7734, 799, 11316, 883,
                                             12050, 13, 248046, 198, 248045, 74455, 198};
- 
+
  void require(bool ok, const std::string& message) {
      if (!ok) throw std::runtime_error(message);
  }
- 
+
  std::string env(const char* name) {
      const char* value = std::getenv(name);
      return value == nullptr ? std::string{} : std::string(value);
  }
- 
+
  void cuda_check(cudaError_t error, const char* operation) {
      if (error != cudaSuccess) {
          throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(error));
      }
  }
- 
+
  class DeviceBuffer {
  public:
      explicit DeviceBuffer(std::size_t bytes) : bytes_(bytes) {
@@ -80,12 +80,12 @@
      void* ptr_ = nullptr;
      std::size_t bytes_ = 0;
  };
- 
+
  int argmax_host(const std::vector<float>& values) {
      require(!values.empty(), "argmax on empty logits");
      return static_cast<int>(std::distance(values.begin(), std::max_element(values.begin(), values.end())));
  }
- 
+
  std::string digest_str(const std::array<std::uint64_t, 5>& digest) {
      std::ostringstream out;
      out << std::hex << std::setfill((char)48);
@@ -95,7 +95,7 @@
      }
      return out.str();
  }
- 
+
  // One greedy authoritative target step. Returns the chosen token id.
  std::int64_t greedy_step(Exl3TextContext& ctx) {
      const auto logits = ctx.logits_host();
@@ -103,13 +103,13 @@
      ctx.decode(token);
      return token;
  }
- 
+
  std::vector<std::int64_t> make_block(std::int64_t anchor, int len) {
      std::vector<std::int64_t> block(static_cast<std::size_t>(len), kMaskToken);
      block[0] = anchor;
      return block;
  }
- 
+
  void require_valid_proposals(const std::vector<std::int64_t>& proposals, int expect_rows,
                               const char* what) {
      require(proposals.size() == static_cast<std::size_t>(expect_rows),
@@ -121,7 +121,7 @@
                          [](std::int64_t token) { return token != 0; }),
              std::string(what) + ": proposals degenerate (all token 0)");
  }
- 
+
  } // namespace
  int main() {
      try {
