@@ -16,104 +16,103 @@ void log_cuda_error(const char* op, cudaError_t err) noexcept {
     }
 }
 
-void destroy_graph_exec(cudaGraphExec_t& exec) noexcept {
-    if (exec != nullptr) {
-        log_cuda_error("cudaGraphExecDestroy", cudaGraphExecDestroy(exec));
-        exec = nullptr;
-    }
-}
-
-void destroy_graph(cudaGraph_t& graph) noexcept {
-    if (graph != nullptr) {
-        log_cuda_error("cudaGraphDestroy", cudaGraphDestroy(graph));
-        graph = nullptr;
-    }
-}
-
-void discard_capture(cudaStream_t stream) noexcept {
-    cudaGraph_t discard = nullptr;
-    log_cuda_error("cudaStreamEndCapture(discard)", cudaStreamEndCapture(stream, &discard));
-    destroy_graph(discard);
-}
-
 } // namespace
 
 DecodeGraphDefinition::~DecodeGraphDefinition() { reset(); }
+DecodeGraphDefinition::DecodeGraphDefinition(Provider provider):provider_(provider) {
+    if(!provider_.begin || !provider_.end || !provider_.destroy)
+        throw std::invalid_argument("incomplete graph definition provider");
+}
 
 DecodeGraphDefinition::DecodeGraphDefinition(DecodeGraphDefinition&& other) noexcept
-    : graph_(other.graph_) {
+    : graph_(other.graph_),retirement_error_(other.retirement_error_),provider_(other.provider_) {
     other.graph_ = nullptr;
+    other.retirement_error_=cudaSuccess;
 }
 
 DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& other) noexcept {
     if (this == &other) { return *this; }
 
-    reset();
+    if(try_reset()!=cudaSuccess)return *this;
     graph_ = other.graph_;
+    provider_=other.provider_;
+    retirement_error_=other.retirement_error_;
 
     other.graph_ = nullptr;
+    other.retirement_error_=cudaSuccess;
     return *this;
 }
 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
-    reset();
+    CUDA_CHECK(try_reset());
 
-    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    CUDA_CHECK(provider_.begin(stream));
 
     try {
         body();
     } catch (...) {
-        discard_capture(stream);
+        log_cuda_error("cudaStreamEndCapture(discard)",provider_.end(stream,&graph_));
+        (void)try_reset(); // Preserve a failed destroy and the original body exception.
         throw;
     }
 
-    cudaGraph_t graph = nullptr;
-
-    cudaError_t err = cudaStreamEndCapture(stream, &graph);
+    cudaError_t err = provider_.end(stream, &graph_);
     if (err != cudaSuccess) {
-        destroy_graph(graph);
+        (void)try_reset();
         CUDA_CHECK(err);
     }
-
-    graph_ = graph;
 }
 
 bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }
 
-void DecodeGraphDefinition::reset() noexcept { destroy_graph(graph_); }
+cudaError_t DecodeGraphDefinition::try_reset() noexcept {
+    return detail::retire_decode_graph_handle_once(graph_,retirement_error_,provider_.destroy);
+}
+
+void DecodeGraphDefinition::reset() noexcept { log_cuda_error("cudaGraphDestroy",try_reset()); }
 
 DecodeGraphExecutable::~DecodeGraphExecutable() { reset(); }
+DecodeGraphExecutable::DecodeGraphExecutable(Provider provider):provider_(provider) {
+    if(!provider_.instantiate || !provider_.destroy || !provider_.upload ||
+       !provider_.launch)
+        throw std::invalid_argument("incomplete graph executable provider");
+}
 
 DecodeGraphExecutable::DecodeGraphExecutable(DecodeGraphExecutable&& other) noexcept
-    : exec_(other.exec_) {
+    : exec_(other.exec_),retirement_error_(other.retirement_error_),provider_(other.provider_) {
     other.exec_ = nullptr;
+    other.retirement_error_=cudaSuccess;
 }
 
 DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& other) noexcept {
     if (this == &other) { return *this; }
 
-    reset();
+    if(try_reset()!=cudaSuccess)return *this;
     exec_       = other.exec_;
+    provider_=other.provider_;
+    retirement_error_=other.retirement_error_;
     other.exec_ = nullptr;
+    other.retirement_error_=cudaSuccess;
     return *this;
 }
 
 void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition) {
+    CUDA_CHECK(definition.retirement_error_);
     if (!definition.ready()) {
         throw std::logic_error("cannot instantiate an empty CUDA Graph definition");
     }
-    reset();
+    CUDA_CHECK(try_reset());
 
-    cudaGraphExec_t exec  = nullptr;
-    const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
+    const cudaError_t err = provider_.instantiate(&exec_, definition.graph_);
     if (err != cudaSuccess) {
-        destroy_graph_exec(exec);
+        (void)try_reset();
         CUDA_CHECK(err);
     }
-    exec_ = exec;
 }
 
 void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
+    CUDA_CHECK(retirement_error_);
+    CUDA_CHECK(definition.retirement_error_);
     if (!ready() || !definition.ready()) {
         throw std::logic_error("CUDA Graph update requires a definition and executable");
     }
@@ -128,17 +127,23 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 }
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
+    CUDA_CHECK(retirement_error_);
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
-    CUDA_CHECK(cudaGraphUpload(exec_, stream));
+    CUDA_CHECK(provider_.upload(exec_, stream));
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {
+    CUDA_CHECK(retirement_error_);
     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
-    CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+    CUDA_CHECK(provider_.launch(exec_, stream));
 }
 
 bool DecodeGraphExecutable::ready() const noexcept { return exec_ != nullptr; }
 
-void DecodeGraphExecutable::reset() noexcept { destroy_graph_exec(exec_); }
+cudaError_t DecodeGraphExecutable::try_reset() noexcept {
+    return detail::retire_decode_graph_handle_once(exec_,retirement_error_,provider_.destroy);
+}
+
+void DecodeGraphExecutable::reset() noexcept { log_cuda_error("cudaGraphExecDestroy",try_reset()); }
 
 } // namespace ninfer

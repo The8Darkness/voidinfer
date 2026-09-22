@@ -1,0 +1,48 @@
+{
+  "schema": "ninfer.exl3.gdn-recurrent-oracle.v1",
+  "status": "future_external_artifact_required_not_generated",
+  "case": "basis2",
+  "rows": 2,
+  "precision": {
+    "q_k_v": "BF16 input bits",
+    "g_beta_state_normalized_alpha": "FP32",
+    "output": "BF16 round-to-nearest-even"
+  },
+  "constants": {
+    "normalization_epsilon": 0.000001,
+    "output_scale": "1/sqrt(128)"
+  },
+  "input_recipe": {
+    "default": "all unlisted elements are positive zero",
+    "state_before": "all FP32 positive zero",
+    "row0": "for every QK head set q[0]=1 and k[0]=1; for every value head set v[0]=1; g=0; beta=1",
+    "row1": "for every QK head set q[0]=1 q[1]=-1 and k[0]=1 k[1]=1; for every value head set v[0]=-1; g=0; beta=1"
+  },
+  "canonical_order": [
+    "rows chronological",
+    "FP32 state decay",
+    "key-dimension prediction reduction in ascending order",
+    "FP32 rank-one update",
+    "query reduction in ascending key-dimension order",
+    "BF16 output cast"
+  ],
+  "tensors": [
+    {"name":"basis2_q","dtype":"BF16","shape":[2,16,128]},
+    {"name":"basis2_k","dtype":"BF16","shape":[2,16,128]},
+    {"name":"basis2_v","dtype":"BF16","shape":[2,48,128]},
+    {"name":"basis2_g","dtype":"F32","shape":[2,48]},
+    {"name":"basis2_beta","dtype":"F32","shape":[2,48]},
+    {"name":"basis2_state_before","dtype":"F32","shape":[48,128,128]},
+    {"name":"basis2_state_after","dtype":"F32","shape":[48,128,128]},
+    {"name":"basis2_output","dtype":"BF16","shape":[2,48,128]},
+    {"name":"basis2_normalized_q","dtype":"F32","shape":[2,16,128]},
+    {"name":"basis2_normalized_k","dtype":"F32","shape":[2,16,128]},
+    {"name":"basis2_alpha","dtype":"F32","shape":[2,48]}
+  ],
+  "artifact_requirements": {
+    "producer": "independent canonical implementation, not this CUDA operator",
+    "input_definition": "sparse basis and cancellation-sensitive second row",
+    "required_metadata": ["producer revision", "generation command", "SHA-256", "host arithmetic mode"],
+    "comparison": "exact tensor bytes at each declared cast boundary"
+  }
+}

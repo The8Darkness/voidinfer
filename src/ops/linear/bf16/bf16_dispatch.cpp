@@ -9,7 +9,11 @@
 namespace ninfer::ops::detail {
 
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
+    // Qwen3.8 DFlash2 adds BF16 conv kernel projections [1280,5120] and a
+    // selector hidden projection [256,5120] to the existing text profiles.
+    const bool supported_problem =
+        (n == 14336 && k == 5120) || (n == 5120 && k == 6144) || (n == 1280 && k == 5120) ||
+        (n == 256 && k == 5120);
     if (!supported_problem || t <= 0) {
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
     }

@@ -118,4 +118,16 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
+/**
+ * @brief Computes the exact greedy argmax of the Qwen3.8 FP8 vocabulary projection.
+ *
+ * This specialized epilogue keeps the A16 FP8 MMA math and BF16 rounding of `linear()` but
+ * reduces each row tile directly to one token id. It is intentionally limited to the registered
+ * `[248320,5120]` vocabulary head and `T=1..48`; callers with other shapes must use linear()+
+ * argmax(). `scratch` is caller-owned BF16 storage (typically the existing target-logit buffer)
+ * and is reused for compact per-row-tile winners; no additional allocation is required.
+ */
+void linear_argmax(const Tensor& x, const Weight& w, Tensor& out, std::int32_t valid_rows,
+                   Tensor& scratch, cudaStream_t stream);
+
 } // namespace ninfer::ops

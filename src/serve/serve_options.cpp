@@ -49,6 +49,9 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
+    if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
+    if (value == "nvfp4") { return KvCacheStorage::Nvfp4; }
+    if (value == "vericache-nvfp4") { return KvCacheStorage::VeriCacheNvfp4; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -59,6 +62,17 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
 }
 
+std::uint32_t parse_u32_range(const char* text, const char* label, std::uint32_t minimum,
+                              std::uint32_t maximum) {
+    const std::uint64_t value = parse_u64(text, label);
+    if (value < minimum || value > maximum) {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + text +
+                                    " (expected " + std::to_string(minimum) + ".." +
+                                    std::to_string(maximum) + ")");
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -67,17 +81,31 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
+           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--max-private-continuations N] [--max-shared-prefixes N] "
+           "[--max-long-anchors-per-continuation N] [--max-cache-markers-per-request N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
-           "[--default-max-tokens N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|vericache-nvfp4] "
+           "[--spec mtp|dflash --draft-tokens N] [--no-spec] "
+           "[--hierarchical-vericache | --no-hierarchical-vericache] "
+           "[--vericache-host-snapshots | --no-vericache-host-snapshots] "
+           "[--vericache-l0-horizon 24..64] [--vericache-l1-horizon 256..2048] "
+           "[--vericache-host-snapshot-horizon 256..2048] "
+           "[--vericache-protected-recent N] [--vericache-protected-sinks N] "
+           "[--vericache-protected-pivots N] "
+           "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--webui | --webui-dir DIR] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy]\n"
+           "[--frequency-penalty F] [--seed N] [--greedy] [--no-dual-load]\n"
+           "       EXL3 selection: --exl3-target DIR --exl3-draft DIR [--exl3-dual-manifest FILE]\n"
+           "       explicit EXL3: C1 or --max-concurrency 2/eager/FP16 HostKV/DFlash2 K7; --temperature 0 required,\n"
+           "       greedy text and exact prefix reuse; positive sampling and media are rejected\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -96,6 +124,20 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       hierarchical VeriCache + DFlash2 K7 are the default research serving profile;\n"
+           "       --hierarchical-vericache enables the L0/L1/L2 route explicitly and\n"
+           "       --no-hierarchical-vericache returns to the stable cache fallback\n"
+           "       --vericache-host-snapshots promotes compressed KV plus authoritative GDN state\n"
+           "       at configured host-checkpoint boundaries; --no-vericache-host-snapshots disables promotion\n"
+           "       VeriCache horizons default to adaptive L0->L1=24..64 and L1->L2=256..2048\n"
+           "       host snapshot cadence defaults to 2048 on the research server; set it explicitly\n"
+           "       to keep persistence cadence independent from a future host-tier verifier\n"
+           "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
+           "shared=concurrency, anchors=2, markers=4; Host state=8 slots, Host KV=8192 MiB\n"
+           "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
+           "--host-kv-mib uses MiB\n"
+           "       --default-thinking-budget caps model-origin thinking for enabled requests; "
+           "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -121,19 +163,35 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool context_capacity_explicit   = false;
+    bool kv_dtype_explicit           = false;
+    bool speculative_explicit        = false;
+    bool draft_tokens_explicit       = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
     }
     if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
-    options.artifact_path = argv[1];
-    for (int i = 2; i < argc; ++i) {
+    int first_option=2;
+    if(std::string_view(argv[1])=="--exl3-target") {
+        if(argc<3)throw std::invalid_argument("--exl3-target requires a pinned directory");
+        options.exl3_package.emplace();options.exl3_package->target_directory=argv[2];
+        options.hierarchical_vericache={};options.use_cuda_graph=false;
+        first_option=3;
+    } else options.artifact_path = argv[1];
+    for (int i = first_option; i < argc; ++i) {
         const std::string arg    = argv[i];
         const auto require_value = [&](const char* flag) -> const char* {
             if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
             return argv[i];
         };
-        if (arg == "--host") {
+        if (arg == "--exl3-draft") {
+            if(!options.exl3_package)throw std::invalid_argument("--exl3-draft requires --exl3-target selection");
+            options.exl3_package->draft_directory=require_value("--exl3-draft");
+        } else if(arg=="--exl3-dual-manifest") {
+            if(!options.exl3_package)throw std::invalid_argument("EXL3 manifest requires package selection");
+            options.exl3_package->verified_dual_manifest=require_value("--exl3-dual-manifest");
+        } else if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
@@ -162,6 +220,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--context-cost-presets") {
+            options.context_cost_presets = require_value("--context-cost-presets");
+            if (options.context_cost_presets.empty()) {
+                throw std::invalid_argument("--context-cost-presets must not be empty");
+            }
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -193,6 +256,41 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--media-preprocess-threads must be in [0,64]");
             }
             options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
+        } else if (arg == "--device-state-slots") {
+            options.context_cache.device_state_slots = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
+            context_capacity_explicit = true;
+        } else if (arg == "--host-state-slots") {
+            options.context_cache.host_state_slots = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
+            context_capacity_explicit = true;
+        } else if (arg == "--host-kv-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-kv-mib is out of range");
+            }
+            options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
+            context_capacity_explicit                    = true;
+        } else if (arg == "--max-private-continuations") {
+            options.context_cache.max_private_continuations =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--max-private-continuations"), "max-private-continuations"));
+            context_capacity_explicit = true;
+        } else if (arg == "--max-shared-prefixes") {
+            options.context_cache.max_shared_prefixes =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--max-shared-prefixes"), "max-shared-prefixes"));
+            context_capacity_explicit = true;
+        } else if (arg == "--max-long-anchors-per-continuation") {
+            options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
+                                      "max-long-anchors-per-continuation"));
+            context_capacity_explicit = true;
+        } else if (arg == "--max-cache-markers-per-request") {
+            options.context_cache.max_cache_markers_per_request = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
+                                      "max-cache-markers-per-request"));
+            context_capacity_explicit = true;
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
@@ -216,24 +314,79 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+            kv_dtype_explicit = true;
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
+            speculative_explicit = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+            speculative_explicit  = true;
+            draft_tokens_explicit = true;
+        } else if (arg == "--no-spec") {
+            options.speculative = {};
+            if (!kv_dtype_explicit) { options.kv_cache = KvCacheStorage::BFloat16; }
+            options.hierarchical_vericache.enabled                    = false;
+            options.hierarchical_vericache.enable_host_tier_snapshots = false;
+            options.hierarchical_vericache.l0_bits                    = 4;
+            speculative_explicit = true;
+        } else if (arg == "--hierarchical-vericache") {
+            options.hierarchical_vericache.enabled = true;
+        } else if (arg == "--no-hierarchical-vericache") {
+            options.hierarchical_vericache.enabled                    = false;
+            options.hierarchical_vericache.enable_host_tier_snapshots = false;
+            options.hierarchical_vericache.l0_bits                    = 4;
+        } else if (arg == "--vericache-host-snapshots") {
+            options.hierarchical_vericache.enable_host_tier_snapshots = true;
+        } else if (arg == "--no-vericache-host-snapshots") {
+            options.hierarchical_vericache.enable_host_tier_snapshots = false;
+        } else if (arg == "--vericache-l0-horizon") {
+            options.hierarchical_vericache.l0_to_l1_horizon =
+                parse_u32_range(require_value("--vericache-l0-horizon"),
+                                "vericache-l0-horizon", 24, 64);
+        } else if (arg == "--vericache-l1-horizon") {
+            options.hierarchical_vericache.l1_to_l2_horizon =
+                parse_u32_range(require_value("--vericache-l1-horizon"),
+                                "vericache-l1-horizon", 256, 2048);
+        } else if (arg == "--vericache-host-snapshot-horizon") {
+            options.hierarchical_vericache.host_snapshot_horizon = parse_u32_range(
+                require_value("--vericache-host-snapshot-horizon"),
+                "vericache-host-snapshot-horizon", 256, 2048);
+        } else if (arg == "--vericache-protected-recent") {
+            options.hierarchical_vericache.protected_recent_tokens = parse_u32_range(
+                require_value("--vericache-protected-recent"), "vericache-protected-recent", 0,
+                2048);
+        } else if (arg == "--vericache-protected-sinks") {
+            options.hierarchical_vericache.protected_sink_tokens = parse_u32_range(
+                require_value("--vericache-protected-sinks"), "vericache-protected-sinks", 0,
+                2048);
+        } else if (arg == "--vericache-protected-pivots") {
+            options.hierarchical_vericache.protected_pivot_tokens = parse_u32_range(
+                require_value("--vericache-protected-pivots"), "vericache-protected-pivots", 0,
+                2048);
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
             default_max_tokens_explicit = true;
+        } else if (arg == "--default-thinking-budget") {
+            const std::uint64_t budget =
+                parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
+            if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--default-thinking-budget is out of range");
+            }
+            options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--no-dual-load") {
+            options.disable_dual_artifact_loading = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+            speculative_explicit              = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
@@ -273,8 +426,44 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
+    if(options.exl3_package) {
+        if(options.exl3_package->draft_directory.empty())throw std::invalid_argument("EXL3 selection needs --exl3-draft");
+        if(kv_dtype_explicit)throw std::invalid_argument("EXL3 package fixes ordinary FP16 Host KV");
+        options.kv_cache=KvCacheStorage::Float16Host;
+        if(!speculative_explicit)options.speculative={SpeculativeBackend::DFlash2,7,ProposalHead::Full};
+        if(options.hierarchical_vericache.enabled || options.hierarchical_vericache.enable_host_tier_snapshots)
+            throw std::invalid_argument("EXL3 text milestone does not enable optional hierarchy/snapshot serving");
+    }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (!options.allow_prefix_reuse) {
+        if (context_capacity_explicit) {
+            throw std::invalid_argument(
+                "--no-prefix-reuse cannot be combined with context-cache capacity options");
+        }
+        options.context_cache.enabled                = false;
+        options.context_cache.host_state_slots       = 0;
+        options.context_cache.host_kv_capacity_bytes = 0;
+    }
+    if (options.hierarchical_vericache.enable_host_tier_snapshots &&
+        !options.hierarchical_vericache.enabled) {
+        throw std::invalid_argument(
+            "--vericache-host-snapshots requires --hierarchical-vericache");
+    }
+    if (speculative_explicit && options.speculative.backend == SpeculativeBackend::Mtp &&
+        !draft_tokens_explicit) {
+        options.speculative.draft_tokens = 5;
+    }
+    if (options.enable_vision && options.speculative.backend == SpeculativeBackend::DFlash) {
+        if (!speculative_explicit) {
+            // DFlash's fused multimodal path is not qualified here. An implicit media request
+            // therefore uses the protected MTP/BF16-compatible route.
+            options.speculative.backend      = SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens = 5;
+        } else {
+            throw std::invalid_argument("--spec dflash cannot be combined with --vision");
+        }
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
@@ -300,8 +489,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
-        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
+    if (options.kv_cache == KvCacheStorage::VeriCacheNvfp4 &&
+        options.speculative.backend != SpeculativeBackend::Mtp &&
+        options.speculative.backend != SpeculativeBackend::DFlash) {
+        throw std::invalid_argument(
+            "--kv-dtype vericache-nvfp4 requires --spec mtp|dflash --draft-tokens N");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

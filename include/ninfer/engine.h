@@ -44,12 +44,18 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
 
+    // Nonblocking consumption. Pending leaves this handle live. Completed or
+    // Error consumes it; Error carries the exception without invoking callbacks
+    // while an Engine/request coordination lock is held.
+    GenerationPollResult poll(OutputSink* sink = nullptr,
+                              const CancellationView& cancellation = {});
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 
 private:
     class Impl;
     explicit GenerationHandle(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
+    bool poll_active_=false;
 
     friend class Engine;
 };
@@ -77,10 +83,13 @@ public:
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
-    // Establishes queue membership synchronously. Destroying an unconsumed handle cancels its
-    // request; wait() owns result consumption and may run independently from GPU execution.
+    // Establishes queue membership synchronously with a fixed output consumer mode. Destroying an
+    // unconsumed handle cancels its request; wait() owns result consumption and may run
+    // independently from GPU execution. Streaming mode requires a non-null sink in wait();
+    // Aggregate mode requires a null sink.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
+           OutputConsumerMode consumer_mode                       = OutputConsumerMode::Aggregate,
            std::chrono::steady_clock::time_point pending_deadline = {});
 
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,

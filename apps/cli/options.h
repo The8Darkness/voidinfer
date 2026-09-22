@@ -27,10 +27,12 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    bool disable_dual_artifact_loading = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;
     bool enable_thinking = true;
+    std::optional<std::uint32_t> thinking_budget;
     std::optional<ReasoningEffort> reasoning_effort;
 
     std::vector<TokenId> stop_token_ids;

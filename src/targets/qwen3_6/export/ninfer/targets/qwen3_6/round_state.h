@@ -33,7 +33,8 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> cache_positions{};
     std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -53,7 +54,8 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency * kMtpDecodeMaximumWidth> target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
@@ -77,7 +79,9 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -85,6 +89,9 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    // Host-visible result of the live OSCAR-Q2 -> OSCAR-Q4 prefix intersection. It is copied
+    // after the normal target egress so the target's licensed-token ABI remains unchanged.
+    std::array<std::int32_t, kMaximumConcurrency> l0_l1_accepted{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -133,11 +140,21 @@ struct DFlashDecodeStateLayout {
     TensorRegion append_positions;
     TensorRegion append_counts;
     TensorRegion draft_tokens;
+    TensorRegion q2_drafts;
+    TensorRegion q2_l1_accepted;
     TensorRegion verify_ids;
     TensorRegion target_argmax;
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    // Dense scratch storage for eager Adaptive DFlash2 short verification widths.
+    TensorRegion adaptive_drafts;
+    TensorRegion adaptive_verify_ids;
+    TensorRegion adaptive_target_positions;
+    TensorRegion adaptive_target_tokens;
+    TensorRegion adaptive_target_logits;
+    TensorRegion adaptive_target_hidden;
+    TensorRegion adaptive_licensed_tokens;
 };
 
 struct RoundStateLayout {
@@ -164,7 +181,8 @@ struct OrdinaryDecodeState {
     Tensor cache_positions;
     Tensor rope_positions;
     Tensor text_kv_table_rows;
-    Tensor lanes;
+    Tensor state_source_slots;
+    Tensor state_destination_slots;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;
@@ -212,7 +230,8 @@ struct MtpDecodeState {
     Tensor target_rope_positions;
     Tensor text_kv_table_rows;
     Tensor mtp_kv_table_rows;
-    Tensor lanes;
+    Tensor state_source_slots;
+    Tensor state_destination_slots;
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
@@ -226,6 +245,16 @@ struct MtpDecodeState {
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    // Eager Adaptive DFlash2 uses these as densely packed [K,B] / [V,K,B] scratch tensors when
+    // the fixed-width proposal is verified at a shorter runtime K. They are separate from the
+    // graph-shaped frame tensors because slicing a wider [Kmax,B] allocation is strided.
+    Tensor adaptive_drafts;
+    Tensor adaptive_verify_ids;
+    Tensor adaptive_target_positions;
+    Tensor adaptive_target_tokens;
+    Tensor adaptive_target_logits;
+    Tensor adaptive_target_hidden;
+    Tensor adaptive_licensed_tokens;
     Tensor proposal_logits;
     Tensor alignment_ids;
     Tensor alignment_hidden;
@@ -250,7 +279,9 @@ struct DFlashDecodeState {
     Tensor target_valid_columns;
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
-    Tensor lanes;
+    Tensor active_lanes;
+    Tensor state_source_slots;
+    Tensor state_destination_slots;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;
@@ -260,11 +291,20 @@ struct DFlashDecodeState {
     Tensor append_positions;
     Tensor append_counts;
     Tensor draft_tokens;
+    Tensor q2_drafts;
+    Tensor q2_l1_accepted;
     Tensor verify_ids;
     Tensor target_argmax;
     Tensor target_logits;
     Tensor target_hidden;
     Tensor target_continuation_hidden;
+    Tensor adaptive_drafts;
+    Tensor adaptive_verify_ids;
+    Tensor adaptive_target_positions;
+    Tensor adaptive_target_tokens;
+    Tensor adaptive_target_logits;
+    Tensor adaptive_target_hidden;
+    Tensor adaptive_licensed_tokens;
 
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,

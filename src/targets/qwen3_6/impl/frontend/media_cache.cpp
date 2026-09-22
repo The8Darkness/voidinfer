@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <bit>
 #include <condition_variable>
 #include <exception>
 #include <limits>
@@ -26,7 +27,20 @@ struct KeyHash {
         for (std::uint8_t byte : key.digest) {
             value ^= static_cast<std::size_t>(byte) + 0x9e3779b9U + (value << 6U) + (value >> 2U);
         }
-        return value ^ static_cast<std::size_t>(key.modality);
+        const auto mix=[&](std::uint64_t field) {
+            value^=static_cast<std::size_t>(field)+0x9e3779b97f4a7c15ULL+
+                (value<<6U)+(value>>2U);
+        };
+        mix(static_cast<std::uint8_t>(key.modality));
+        mix(static_cast<std::uint8_t>(key.patch_storage));
+        mix(key.preprocess.schema_revision);mix(key.preprocess.minimum_pixels);
+        mix(key.preprocess.maximum_pixels);mix(key.preprocess.spatial_patch);
+        mix(key.preprocess.temporal_patch);mix(key.preprocess.merge);
+        mix(key.preprocess.normalization_revision);
+        mix(std::bit_cast<std::uint64_t>(key.preprocess.video_fps));
+        mix(static_cast<std::uint32_t>(key.preprocess.video_min_frames));
+        mix(static_cast<std::uint32_t>(key.preprocess.video_max_frames));
+        return value;
     }
 };
 
@@ -311,6 +325,13 @@ PendingMedia MediaPreprocessCache::begin_prepare(const MediaCacheKey& key,
                 try {
                     built = builder();
                     check_preparation_control(control);
+                    if(!built.payload || built.item.modality!=key.modality ||
+                       built.item.patch_storage!=key.patch_storage ||
+                       built.payload->storage!=key.patch_storage ||
+                       built.item.preprocess!=key.preprocess ||
+                       built.payload->preprocess!=key.preprocess)
+                        throw std::invalid_argument(
+                            "prepared media result does not match its cache configuration identity");
                     const std::size_t bytes = payload_bytes(built);
                     {
                         std::lock_guard lock(state->mutex);

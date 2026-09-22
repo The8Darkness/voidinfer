@@ -24,15 +24,20 @@ add_library(ninfer_core STATIC
   core/host_worker_pool.cpp
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
+  core/host_kv_arena.cpp
   core/paged_kv_cache.cpp
+  core/oscar_mixed_cache_layout.cpp
+  core/oscar_mixed_state_transitions.cpp
+  core/oscar_mixed_attention_reference.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
   runtime/engine/admission_policy.cpp
+  runtime/engine/context_cost.cpp
+  runtime/engine/context_cost_defaults.cpp
   runtime/engine/kv_capacity.cpp
-  runtime/engine/public_types.cpp
-  runtime/engine/request_memory.cpp)
+  runtime/engine/public_types.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads)
@@ -47,6 +52,36 @@ add_library(ninfer_artifact STATIC
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 
+# Read-only native safetensors framing inspection for the isolated EXL3 bring-up.
+# This library deliberately has no model registration, tensor materialization, or CUDA
+# EXL3 compute path; the qualified .ninfer route remains the production boundary.
+add_library(ninfer_exl3_format STATIC
+  exl3/safetensors.cpp
+  exl3/linear_reference.cpp
+  exl3/mtp_manifest.cpp)
+ninfer_internal_includes(ninfer_exl3_format)
+
+# Isolated E2B native CUDA leaf. This target is intentionally separate from both the
+# qualified NVFP4/OSCAR route and the E2 CPU/reference implementation.
+add_library(ninfer_exl3_cuda STATIC
+  exl3/linear_cuda.cu
+  exl3/mtp_runner.cu
+  exl3/prefill_attention_chain_graph.cu
+  exl3/prefill_projection_chain_graph.cu
+  exl3/target_projection_timing.cu
+  exl3/full_attention_layer.cu)
+add_library(ninfer_exl3_oscar STATIC
+  exl3/oscar_runtime.cu)
+ninfer_internal_includes(ninfer_exl3_oscar)
+ninfer_cuda_archive(ninfer_exl3_oscar)
+target_link_libraries(ninfer_exl3_oscar PUBLIC ninfer_ops ${NINFER_CUDART_TARGET})
+ninfer_internal_includes(ninfer_exl3_cuda)
+ninfer_cuda_archive(ninfer_exl3_cuda)
+target_include_directories(ninfer_exl3_cuda PUBLIC
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_exl3_cuda PUBLIC ninfer_exl3_oscar ${NINFER_CUDART_TARGET}
+  PRIVATE CUDA::cublas)
+
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
 # discard that contract, so this self-contained kernel is intentionally compiled in a
@@ -58,9 +93,6 @@ ninfer_internal_includes(ninfer_nvfp4_tma)
 set_target_properties(ninfer_nvfp4_tma PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-if(WIN32)
-  set_target_properties(ninfer_nvfp4_tma PROPERTIES CUDA_RUNTIME_LIBRARY Static)
-endif()
 target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
 
@@ -71,14 +103,13 @@ add_library(ninfer_ops STATIC
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
+  ops/launcher/dflash2_dynamic_conv.cu
+  ops/launcher/dflash2_qkv_proj.cu
+  ops/launcher/dflash2_predecessor_ids.cu
+  ops/launcher/dflash2_selector_lattice.cu
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
-  ops/launcher/bidirectional_gqa_attention.cu
-  ops/launcher/swa.cu
-  ops/launcher/gqa_attention_decode.cu
-  ops/launcher/gqa_attention_prefill.cu
-  ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
@@ -95,8 +126,26 @@ add_library(ninfer_ops STATIC
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
-  ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
+  # Softmax Attention and KV-cache state transitions.
+  ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+  ops/softmax_attention/dense/causal_cache/small_t.cu
+  ops/softmax_attention/dense/causal_cache/small_t_fp8.cu
+  ops/softmax_attention/dense/causal_cache/nvfp4.cu
+  ops/softmax_attention/dense/causal_cache/prompt.cu
+  ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
+  ops/softmax_attention/dense/packed/packed_softmax_attention.cpp
+  ops/softmax_attention/dense/packed/launch.cu
+  ops/softmax_attention/dense/context/context_softmax_attention.cpp
+  ops/softmax_attention/dense/context/launch.cu
+  ops/softmax_attention/oscar_mixed/launch.cu
+  ops/softmax_attention/oscar_history/launch.cu
+  ops/softmax_attention/sliding_window/sliding_window_attention.cpp
+  ops/softmax_attention/sliding_window/launch.cu
+  ops/kv_cache/append/kv_cache_append.cpp
+  ops/kv_cache/append/launch.cu
+  ops/kv_cache/oscar_int2_g128.cpp
+  ops/kv_cache/oscar_conversion.cu
   # Gated DeltaNet Linear Attention core.
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp
@@ -158,6 +207,7 @@ add_library(ninfer_ops STATIC
   ops/linear/fp8/fp8_gemv.cu
   ops/linear/fp8/fp8_small_t.cu
   ops/linear/fp8/fp8_a16_mma.cu
+  ops/linear/fp8/fp8_a16_gemm_mma.cu
   ops/linear/fp8/fp8_a8.cu
   ops/linear/fp8/fp8_dispatch.cpp
   ops/linear/nvfp4/nvfp4_format.cpp
@@ -234,15 +284,15 @@ add_library(ninfer_ops STATIC
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
+  ops/wrapper/dflash2_dynamic_conv.cpp
+  ops/wrapper/dflash2_qkv_proj.cpp
+  ops/wrapper/dflash2_predecessor_ids.cpp
+  ops/wrapper/dflash2_selector_lattice.cpp
   ops/wrapper/embedding.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp
   ops/wrapper/gelu.cpp
-  ops/wrapper/bidirectional_gqa_attention.cpp
-  ops/wrapper/swa.cpp
-  ops/wrapper/gqa_attention.cpp
-  ops/wrapper/kv_cache_append_prefix.cpp
   ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp
@@ -264,11 +314,45 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sigmoid_mul.cpp
   ops/wrapper/silu_mul.cpp
   ops/wrapper/sparse_moe.cpp
-  ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
+
+# Native EXL3 Qwen3.5 GDN layer milestone.  Kept separate from the qualified
+# full-attention leaf so this phase cannot alter the existing EXL3 surface.
+add_library(ninfer_exl3_gdn STATIC
+  exl3/gdn_layer.cu)
+ninfer_internal_includes(ninfer_exl3_gdn)
+ninfer_cuda_archive(ninfer_exl3_gdn)
+target_link_libraries(ninfer_exl3_gdn PUBLIC ninfer_exl3_cuda ninfer_ops)
+
+# E4A complete native Qwen3.5 text-model assembly.  This remains isolated from
+# the product engine and the qualified D4.8B/NVFP4 route.
+add_library(ninfer_exl3_text_model STATIC
+  exl3/text_model.cu)
+ninfer_internal_includes(ninfer_exl3_text_model)
+ninfer_cuda_archive(ninfer_exl3_text_model)
+target_include_directories(ninfer_exl3_text_model PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_exl3_text_model PUBLIC ninfer_exl3_gdn ninfer_exl3_format ninfer_ops)
+
+# Explicit V6 numerical bring-up; not linked into the serving Engine yet.
+add_library(ninfer_exl3_vision STATIC exl3/vision_model.cu)
+ninfer_internal_includes(ninfer_exl3_vision)
+ninfer_cuda_archive(ninfer_exl3_vision)
+target_include_directories(ninfer_exl3_vision PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_exl3_vision PUBLIC ninfer_exl3_cuda ninfer_exl3_format ninfer_core PRIVATE CUDA::cublas)
+# E5A2 minimal native DFlash2 draft adapter. Separate 5-layer draft model bound to
+# the qualified EXL3 Qwen3.8-27B target taps/head. Correctness-first and isolated
+# from the product engine; not part of the E4C1 qualified target decode path.
+
+
+add_library(ninfer_exl3_dflash2 STATIC
+  exl3/dflash2_draft.cu)
+ninfer_internal_includes(ninfer_exl3_dflash2)
+ninfer_cuda_archive(ninfer_exl3_dflash2)
+target_link_libraries(ninfer_exl3_dflash2 PUBLIC ninfer_exl3_text_model ${NINFER_CUDART_TARGET})
+
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
@@ -310,6 +394,9 @@ endif()
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
 # directories contribute their sources directly to this single compile owner below.
 add_library(ninfer_engine STATIC
+  exl3/prepared_request.cpp
+  exl3/exl3_frontend_resources.cpp
+  exl3/exl3_engine_core.cpp
   targets/registry.cpp
   runtime/contract/sampling.cpp
   runtime/engine/engine.cpp)
@@ -322,6 +409,8 @@ add_subdirectory(targets/qwen3_6_35b_a3b)
 
 target_link_libraries(ninfer_engine
   PRIVATE
+    ninfer_exl3_dflash2
+    ninfer_exl3_vision
     ninfer_artifact
     ninfer_core
     ninfer_ops

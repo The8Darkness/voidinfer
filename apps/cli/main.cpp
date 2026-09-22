@@ -93,7 +93,15 @@ std::string format_finish(ninfer::FinishReason reason) {
 }
 
 std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
+    switch (storage) {
+    case ninfer::KvCacheStorage::BFloat16:
+        return "bf16";
+    case ninfer::KvCacheStorage::Int8Group64:
+        return "int8-group64";
+    case ninfer::KvCacheStorage::Fp8E4M3Row256:
+        return "fp8-e4m3-row256";
+    }
+    return "unknown";
 }
 
 std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
@@ -142,11 +150,36 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_stage("load", "engine construction", wall_seconds);
     print_stage("load", "artifact/materialize", load.load_seconds);
     print_stage("load", "host to device", load.upload_seconds);
+    print_stage("load", "reader open/map", load.reader_open_map_seconds);
+    print_stage("load", "directory parse", load.directory_parse_seconds);
+    print_stage("load", "directory validate", load.directory_validate_seconds);
+    print_stage("load", "direct file reads", load.direct_read_seconds);
+    print_stage("load", "device allocation", load.device_allocation_seconds);
+    print_stage("load", "host staging alloc", load.host_staging_allocation_seconds);
+    print_stage("load", "host resource copy", load.host_resource_copy_seconds);
+    print_stage("load", "H2D stream span", load.h2d_stream_seconds);
+    print_stage("load", "H2D active", load.h2d_active_seconds);
+    print_stage("load", "materialize sync", load.materialization_sync_seconds);
+    print_stage("load", "tensor binding", load.tensor_binding_seconds);
+    print_stage("load", "planner", load.planner_seconds);
+    print_stage("load", "instance init", load.instance_seconds);
+    print_stage("load", "startup sync", load.startup_sync_seconds);
     print_metric("target", load.target);
     print_metric("weights", load.weights_id);
     print_metric("artifact file read", format_bytes(load.artifact_bytes_read));
+    print_metric("direct read bytes", format_bytes(load.direct_read_bytes));
     print_metric("weight H2D", format_bytes(load.host_to_device_bytes));
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
+    print_metric("direct read requests", std::to_string(load.direct_read_requests));
+    print_metric("read request range",
+                 format_bytes(load.direct_read_min_bytes) + " .. " +
+                     format_bytes(load.direct_read_max_bytes));
+    print_metric("max read depth", std::to_string(load.direct_read_max_outstanding));
+    if (load.direct_read_seconds > 0.0) {
+        print_metric("direct read rate",
+                     format_rate(static_cast<double>(load.direct_read_bytes),
+                                 load.direct_read_seconds));
+    }
     print_metric("tensors/resources",
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
 }
@@ -169,6 +202,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("prompt tokens", std::to_string(result.prompt.prompt_tokens));
     print_metric("reused prompt tokens", std::to_string(result.reused_prompt_tokens));
     print_metric("generated tokens", std::to_string(generated));
+    if (result.thinking.configured_budget) {
+        print_metric("thinking budget", std::to_string(*result.thinking.configured_budget));
+        print_metric("model thinking tokens",
+                     std::to_string(result.thinking.model_thinking_tokens));
+        print_metric("thinking control tokens", std::to_string(result.thinking.injected_tokens));
+        print_metric("thinking control", result.thinking.applied ? "applied" : "not applied");
+    }
     print_metric("model elapsed", format_seconds(model_seconds));
     print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
                                               result.timings.prefill_seconds));
@@ -195,8 +235,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
     print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
-    print_metric("CUDA Graph memory", format_bytes(memory.cuda_graph_observed_bytes) + " / " +
-                                          format_bytes(memory.cuda_graph_allowance_bytes));
+    print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
     print_metric("planned device total", format_bytes(reserved));
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
@@ -249,6 +288,7 @@ int main(int argc, char** argv) {
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
+        request.execution.thinking.budget         = cli.thinking_budget;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
@@ -266,7 +306,13 @@ int main(int argc, char** argv) {
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
-        engine_options.load_progress  = load_progress.callback();
+        engine_options.disable_dual_artifact_loading = cli.disable_dual_artifact_loading;
+        // One CLI invocation owns exactly one request, so retained cross-request context has no
+        // consumer and must not reserve an extra Device StateImage or run terminal capture.
+        engine_options.context_cache.enabled                = false;
+        engine_options.context_cache.host_state_slots       = 0;
+        engine_options.context_cache.host_kv_capacity_bytes = 0;
+        engine_options.load_progress                        = load_progress.callback();
 
         const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));
@@ -277,7 +323,8 @@ int main(int argc, char** argv) {
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
-        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request));
+        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
+                                                            ninfer::OutputConsumerMode::Streaming);
         const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
         const ninfer::GenerationResult result             = generation.wait(&sink);
         sink.finish_streams();

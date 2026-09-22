@@ -1,0 +1,866 @@
+#include "core/host_kv_arena.h"
+
+#include "core/dtype.h"
+#include "ops/kv_cache/d256_profile.h"
+
+#include <algorithm>
+#include <exception>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+namespace ninfer {
+namespace {
+
+constexpr std::size_t kHostKVAlignment = 256;
+
+std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
+    if (b > std::numeric_limits<std::size_t>::max() - a) { throw std::overflow_error(label); }
+    return a + b;
+}
+
+std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
+    if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
+        throw std::overflow_error(label);
+    }
+    return a * b;
+}
+
+std::size_t align_up(std::size_t value, std::size_t alignment, const char* label) {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        throw std::invalid_argument(std::string(label) + " alignment must be a power of two");
+    }
+    const std::size_t mask = alignment - 1;
+    if (value > std::numeric_limits<std::size_t>::max() - mask) {
+        throw std::overflow_error(std::string(label) + " alignment overflow");
+    }
+    return (value + mask) & ~mask;
+}
+
+void increment_generation(std::uint32_t& generation) noexcept {
+    ++generation;
+    if (generation == 0) { ++generation; }
+}
+
+} // namespace
+
+namespace {
+
+HostKVPageLayout plan_host_kv_page_layout_impl(const KVPageGeometry& geometry,
+                                               std::span<const DType> storage_dtypes,
+                                               HostKVStorageFormat storage_format =
+                                                   HostKVStorageFormat::Native) {
+    if (geometry.page_tokens == 0 || geometry.planes.empty()) {
+        throw std::invalid_argument("Host KV page geometry is empty");
+    }
+    if (storage_format == HostKVStorageFormat::OscarQ4AndFp16) {
+        if (geometry.page_tokens != kPagedKVPageSize || geometry.planes.size() % 4U != 0U) {
+            throw std::invalid_argument("Hierarchical OSCAR host layout has invalid plane groups");
+        }
+
+        HostKVPageLayout out;
+        out.geometry       = geometry;
+        out.storage_format = storage_format;
+        out.l1_offset      = 0;
+        out.planes.reserve((geometry.planes.size() / 4U) * 6U);
+        out.storage_dtypes.reserve((geometry.planes.size() / 4U) * 6U);
+
+        const auto append_plane = [&](DType dtype, std::int32_t leading_extent,
+                                      std::int32_t head_extent, std::size_t& cursor,
+                                      const char* label) {
+            if (leading_extent <= 0 || head_extent <= 0) {
+                throw std::invalid_argument("Hierarchical OSCAR host plane geometry is invalid");
+            }
+            cursor = align_up(cursor, kHostKVAlignment, label);
+            const std::size_t head_bytes = checked_mul(
+                checked_mul(static_cast<std::size_t>(leading_extent), geometry.page_tokens,
+                            "Hierarchical OSCAR host head payload overflow"),
+                dtype_size(dtype), "Hierarchical OSCAR host head payload overflow");
+            const std::size_t page_bytes = checked_mul(
+                head_bytes, static_cast<std::size_t>(head_extent),
+                "Hierarchical OSCAR host plane payload overflow");
+            out.planes.push_back(HostKVPlaneLayout{
+                .offset             = cursor,
+                .page_payload_bytes = page_bytes,
+                .head_payload_bytes = head_bytes,
+            });
+            out.storage_dtypes.push_back(dtype);
+            cursor = checked_add(cursor, page_bytes,
+                                 "Hierarchical OSCAR host page payload overflow");
+        };
+
+        std::size_t cursor = 0;
+        for (std::size_t layer = 0; layer < geometry.planes.size() / 4U; ++layer) {
+            const KVPlaneGeometry& source_code_k = geometry.planes[layer * 4U];
+            const KVPlaneGeometry& source_code_v = geometry.planes[layer * 4U + 1U];
+            const KVPlaneGeometry& source_scale_k = geometry.planes[layer * 4U + 2U];
+            const KVPlaneGeometry& source_scale_v = geometry.planes[layer * 4U + 3U];
+            if (source_code_k.dtype != DType::U8 || source_code_v.dtype != DType::U8 ||
+                source_scale_k.dtype != DType::BF16 || source_scale_v.dtype != DType::BF16 ||
+                source_code_k.leading_extent != ops::kD256OscarCodeExtent ||
+                source_code_v.leading_extent != ops::kD256OscarCodeExtent ||
+                source_scale_k.leading_extent != ops::kD256OscarScaleExtent ||
+                source_scale_v.leading_extent != ops::kD256OscarScaleExtent ||
+                source_code_k.head_extent != source_code_v.head_extent ||
+                source_code_k.head_extent != source_scale_k.head_extent ||
+                source_code_k.head_extent != source_scale_v.head_extent) {
+                throw std::invalid_argument(
+                    "Hierarchical OSCAR host layout requires Q2 U8/BF16 source planes");
+            }
+            const std::int32_t heads = source_code_k.head_extent;
+            // L1: packed OSCAR-Q4 K/V plus independent BF16 affine metadata.
+            append_plane(DType::U8, ops::kD256OscarCodeExtent * 2, heads, cursor,
+                         "Hierarchical OSCAR Q4 code plane");
+            append_plane(DType::U8, ops::kD256OscarCodeExtent * 2, heads, cursor,
+                         "Hierarchical OSCAR Q4 code plane");
+            append_plane(DType::BF16, ops::kD256OscarScaleExtent, heads, cursor,
+                         "Hierarchical OSCAR Q4 scale plane");
+            append_plane(DType::BF16, ops::kD256OscarScaleExtent, heads, cursor,
+                         "Hierarchical OSCAR Q4 scale plane");
+        }
+        out.l1_page_payload_bytes = cursor;
+        out.l2_offset             = align_up(cursor, kHostKVAlignment,
+                                             "Hierarchical OSCAR FP16 section");
+        cursor                    = out.l2_offset;
+        for (std::size_t layer = 0; layer < geometry.planes.size() / 4U; ++layer) {
+            const std::int32_t heads = geometry.planes[layer * 4U].head_extent;
+            // L2: original-coordinate FP16 K/V.  The source OSCAR rotation is inverted while
+            // the host record is built, so a restore can re-encode Q2 from this authority.
+            append_plane(DType::FP16, ops::kD256KVCacheHeadDim, heads, cursor,
+                         "Hierarchical OSCAR FP16 plane");
+            append_plane(DType::FP16, ops::kD256KVCacheHeadDim, heads, cursor,
+                         "Hierarchical OSCAR FP16 plane");
+        }
+        out.l2_page_payload_bytes = cursor - out.l2_offset;
+        out.page_stride            = align_up(cursor, kHostKVAlignment,
+                                              "Hierarchical OSCAR host page record");
+        if (!storage_dtypes.empty()) {
+            if (storage_dtypes.size() != out.storage_dtypes.size() ||
+                !std::equal(storage_dtypes.begin(), storage_dtypes.end(),
+                            out.storage_dtypes.begin(), out.storage_dtypes.end())) {
+                throw std::invalid_argument(
+                    "Hierarchical OSCAR host storage dtype inventory is inconsistent");
+            }
+        }
+        return out;
+    }
+    if (!storage_dtypes.empty() && storage_dtypes.size() != geometry.planes.size()) {
+        throw std::invalid_argument("Host KV storage dtype inventory is inconsistent");
+    }
+
+    HostKVPageLayout out;
+    out.geometry = geometry;
+    if (!storage_dtypes.empty()) {
+        out.storage_dtypes.assign(storage_dtypes.begin(), storage_dtypes.end());
+        bool converted = false;
+        for (std::size_t index = 0; index < geometry.planes.size(); ++index) {
+            converted = converted || storage_dtypes[index] != geometry.planes[index].dtype;
+        }
+        out.storage_format = converted ? HostKVStorageFormat::BFloat16AsFp16
+                                       : HostKVStorageFormat::Native;
+    }
+    out.planes.reserve(geometry.planes.size());
+    std::size_t cursor = 0;
+    for (std::size_t index = 0; index < geometry.planes.size(); ++index) {
+        const KVPlaneGeometry& plane = geometry.planes[index];
+        if (plane.leading_extent <= 0 || plane.head_extent <= 0) {
+            throw std::invalid_argument("Host KV plane geometry must be positive");
+        }
+        const DType storage_dtype = storage_dtypes.empty() ? plane.dtype : storage_dtypes[index];
+        if (storage_dtype != plane.dtype &&
+            !(plane.dtype == DType::BF16 && storage_dtype == DType::FP16)) {
+            throw std::invalid_argument(
+                "Host KV only supports BF16-to-FP16 authoritative storage conversion");
+        }
+        // Device slab alignment is not part of the canonical packed Host representation.
+        cursor = align_up(cursor, kHostKVAlignment, "Host KV plane");
+        const std::size_t head_bytes =
+            checked_mul(checked_mul(static_cast<std::size_t>(plane.leading_extent),
+                                    geometry.page_tokens, "Host KV head payload overflow"),
+                        dtype_size(storage_dtype), "Host KV head payload overflow");
+        const std::size_t page_bytes =
+            checked_mul(head_bytes, static_cast<std::size_t>(plane.head_extent),
+                        "Host KV plane payload overflow");
+        out.planes.push_back(HostKVPlaneLayout{
+            .offset             = cursor,
+            .page_payload_bytes = page_bytes,
+            .head_payload_bytes = head_bytes,
+        });
+        cursor = checked_add(cursor, page_bytes, "Host KV page payload overflow");
+    }
+    out.page_stride = align_up(cursor, kHostKVAlignment, "Host KV page record");
+    return out;
+}
+
+} // namespace
+
+HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry) {
+    return plan_host_kv_page_layout_impl(geometry, {});
+}
+
+HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry, DType storage_dtype) {
+    const std::vector<DType> storage_dtypes(geometry.planes.size(), storage_dtype);
+    return plan_host_kv_page_layout_impl(geometry, storage_dtypes);
+}
+
+HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry,
+                                          HostKVStorageFormat storage_format) {
+    if (storage_format == HostKVStorageFormat::Native) {
+        return plan_host_kv_page_layout(geometry);
+    }
+    return plan_host_kv_page_layout_impl(geometry, {}, storage_format);
+}
+
+TransferWork plan_host_kv_transfer_work(const HostKVPageLayout& layout, std::uint32_t pages,
+                                        std::uint32_t contiguous_runs) {
+    if (pages == 0) { return {}; }
+    if (contiguous_runs == 0 || contiguous_runs > pages || layout.planes.empty()) {
+        throw std::invalid_argument("Host KV transfer geometry is invalid");
+    }
+
+    if (layout.storage_format == HostKVStorageFormat::OscarQ4AndFp16) {
+        std::size_t source_bytes_per_page = 0;
+        for (const KVPlaneGeometry& plane : layout.geometry.planes) {
+            const std::size_t head_bytes = checked_mul(
+                checked_mul(static_cast<std::size_t>(plane.leading_extent),
+                            layout.geometry.page_tokens, "Host KV source payload overflow"),
+                dtype_size(plane.dtype), "Host KV source payload overflow");
+            source_bytes_per_page = checked_add(
+                source_bytes_per_page,
+                checked_mul(head_bytes, static_cast<std::size_t>(plane.head_extent),
+                            "Host KV source payload overflow"),
+                "Host KV source payload overflow");
+        }
+        const std::size_t payload = checked_mul(
+            source_bytes_per_page, pages, "Host KV hierarchical transfer payload overflow");
+        const std::size_t operations = checked_mul(
+            layout.geometry.planes.size(), contiguous_runs,
+            "Host KV hierarchical transfer operation count overflow");
+        if (operations > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("Host KV transfer operation count exceeds uint32");
+        }
+        return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
+                            .copy_operations = static_cast<std::uint32_t>(operations)};
+    }
+    if (layout.planes.size() != layout.geometry.planes.size()) {
+        throw std::invalid_argument("Host KV transfer geometry is invalid");
+    }
+
+    std::size_t bytes_per_page     = 0;
+    std::size_t operations_per_run = 0;
+    for (std::size_t index = 0; index < layout.planes.size(); ++index) {
+        bytes_per_page = checked_add(bytes_per_page, layout.planes[index].page_payload_bytes,
+                                     "Host KV transfer payload overflow");
+        const KVPlaneGeometry& plane = layout.geometry.planes[index];
+        const std::size_t operations =
+            layout.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor
+                ? 1U
+                : static_cast<std::size_t>(plane.head_extent);
+        operations_per_run = checked_add(operations_per_run, operations,
+                                         "Host KV transfer operation count overflow");
+    }
+
+    const std::size_t payload =
+        checked_mul(bytes_per_page, pages, "Host KV transfer payload overflow");
+    const std::size_t operations = checked_mul(operations_per_run, contiguous_runs,
+                                               "Host KV transfer operation count overflow");
+    if (operations > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("Host KV transfer operation count exceeds uint32");
+    }
+    return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
+                        .copy_operations = static_cast<std::uint32_t>(operations)};
+}
+
+TransferWork plan_device_kv_copy_work(const HostKVPageLayout& layout, std::uint32_t pages) {
+    if (pages == 0) { return {}; }
+    if (layout.planes.empty()) {
+        throw std::invalid_argument("Device KV copy geometry is invalid");
+    }
+
+    if (layout.storage_format == HostKVStorageFormat::OscarQ4AndFp16) {
+        std::size_t bytes_per_page = 0;
+        for (const KVPlaneGeometry& plane : layout.geometry.planes) {
+            const std::size_t head_bytes = checked_mul(
+                checked_mul(static_cast<std::size_t>(plane.leading_extent),
+                            layout.geometry.page_tokens, "Device KV source payload overflow"),
+                dtype_size(plane.dtype), "Device KV source payload overflow");
+            bytes_per_page = checked_add(
+                bytes_per_page,
+                checked_mul(head_bytes, static_cast<std::size_t>(plane.head_extent),
+                            "Device KV source payload overflow"),
+                "Device KV source payload overflow");
+        }
+        const std::size_t payload = checked_mul(
+            bytes_per_page, pages, "Device KV hierarchical restore payload overflow");
+        const std::size_t operations = checked_mul(
+            layout.geometry.planes.size(), pages,
+            "Device KV hierarchical restore operation count overflow");
+        if (operations > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("Device KV copy operation count exceeds uint32");
+        }
+        return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
+                            .copy_operations = static_cast<std::uint32_t>(operations)};
+    }
+    if (layout.planes.size() != layout.geometry.planes.size()) {
+        throw std::invalid_argument("Device KV copy geometry is invalid");
+    }
+
+    std::size_t bytes_per_page = 0;
+    for (const HostKVPlaneLayout& plane : layout.planes) {
+        bytes_per_page = checked_add(bytes_per_page, plane.page_payload_bytes,
+                                     "Device KV copy payload overflow");
+    }
+    const std::size_t payload =
+        checked_mul(bytes_per_page, pages, "Device KV copy payload overflow");
+    const std::size_t operations =
+        checked_mul(layout.planes.size(), pages, "Device KV copy operation count overflow");
+    if (operations > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("Device KV copy operation count exceeds uint32");
+    }
+    return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
+                        .copy_operations = static_cast<std::uint32_t>(operations)};
+}
+
+bool HostKVAllocationView::valid() const noexcept {
+    return handle_.owner_ != nullptr && handle_.owner_->valid_handle(handle_);
+}
+
+const HostKVPageLayout& HostKVAllocationView::layout() const {
+    if (!valid() || layout_ == nullptr) { throw std::logic_error("Host KV view is stale"); }
+    return *layout_;
+}
+
+HostKVAllocationView HostKVAllocationView::subview(std::uint32_t begin, std::uint32_t count) const {
+    if (!valid() || count == 0 || begin > page_count_ || count > page_count_ - begin) {
+        throw std::out_of_range("Host KV subview is outside its allocation");
+    }
+    return HostKVAllocationView(
+        handle_, data_ + static_cast<std::size_t>(begin) * layout_->page_stride, layout_, count);
+}
+
+bool HostKVAllocationConstView::valid() const noexcept {
+    return handle_.owner_ != nullptr && handle_.owner_->valid_handle(handle_);
+}
+
+const HostKVPageLayout& HostKVAllocationConstView::layout() const {
+    if (!valid() || layout_ == nullptr) { throw std::logic_error("Host KV view is stale"); }
+    return *layout_;
+}
+
+HostKVAllocationConstView HostKVAllocationConstView::subview(std::uint32_t begin,
+                                                             std::uint32_t count) const {
+    if (!valid() || count == 0 || begin > page_count_ || count > page_count_ - begin) {
+        throw std::out_of_range("Host KV subview is outside its allocation");
+    }
+    return HostKVAllocationConstView(
+        handle_, data_ + static_cast<std::size_t>(begin) * layout_->page_stride, layout_, count);
+}
+
+HostKVAllocation::~HostKVAllocation() { (void)release(); }
+
+HostKVAllocation::HostKVAllocation(HostKVAllocation&& other) noexcept
+    : owner_(other.owner_), descriptor_(other.descriptor_), generation_(other.generation_) {
+    other.disarm();
+}
+
+HostKVAllocation& HostKVAllocation::operator=(HostKVAllocation&& other) noexcept {
+    if (this == &other) { return *this; }
+    (void)release();
+    owner_      = other.owner_;
+    descriptor_ = other.descriptor_;
+    generation_ = other.generation_;
+    other.disarm();
+    return *this;
+}
+
+HostKVAllocationHandle HostKVAllocation::handle() const noexcept {
+    return valid() ? HostKVAllocationHandle(owner_, descriptor_, generation_)
+                   : HostKVAllocationHandle();
+}
+
+std::uint32_t HostKVAllocation::page_count() const noexcept {
+    if (!valid() || descriptor_ >= owner_->descriptors_.size()) { return 0; }
+    const HostKVArena::Descriptor& descriptor = owner_->descriptors_[descriptor_];
+    return descriptor.active && descriptor.generation == generation_ ? descriptor.pages : 0;
+}
+
+bool HostKVAllocation::release() noexcept {
+    if (!valid()) { return false; }
+    const bool released = owner_->release_descriptor(descriptor_, generation_);
+    disarm();
+    return released;
+}
+
+void HostKVAllocation::disarm() noexcept {
+    owner_      = nullptr;
+    descriptor_ = 0;
+    generation_ = 0;
+}
+
+HostKVArena::HostKVArena(std::size_t capacity_bytes,
+                         std::span<const HostKVPageLayout> supported_layouts)
+    : capacity_bytes_(capacity_bytes),
+      layouts_(supported_layouts.begin(), supported_layouts.end()) {
+    for (std::size_t index = 0; index < layouts_.size(); ++index) {
+        const HostKVPageLayout planned =
+            plan_host_kv_page_layout_impl(layouts_[index].geometry,
+                                          layouts_[index].storage_dtypes,
+                                          layouts_[index].storage_format);
+        if (planned != layouts_[index]) {
+            throw std::invalid_argument("Host KV arena received an inconsistent page layout");
+        }
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (layouts_[previous].geometry == layouts_[index].geometry) {
+                throw std::invalid_argument("Host KV arena contains a duplicate page layout");
+            }
+        }
+    }
+    if (capacity_bytes_ == 0) { return; }
+    if (layouts_.empty()) {
+        throw std::invalid_argument("Non-empty Host KV arena requires supported page layouts");
+    }
+
+    backing_.emplace(capacity_bytes_);
+    const auto smallest = std::min_element(
+        layouts_.begin(), layouts_.end(), [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
+            return a.page_stride < b.page_stride;
+        });
+    const std::size_t maximum_descriptors = capacity_bytes_ / smallest->page_stride;
+    if (maximum_descriptors > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("Host KV arena descriptor capacity exceeds uint32");
+    }
+    descriptors_.resize(maximum_descriptors);
+    free_descriptors_.reserve(maximum_descriptors);
+    for (std::size_t index = maximum_descriptors; index > 0; --index) {
+        free_descriptors_.push_back(static_cast<std::uint32_t>(index - 1));
+    }
+    free_extents_.reserve(maximum_descriptors + 1);
+    free_extents_.push_back({0, capacity_bytes_});
+}
+
+std::optional<std::uint32_t>
+HostKVArena::find_layout(const HostKVPageLayout& layout) const noexcept {
+    const auto it = std::find_if(layouts_.begin(), layouts_.end(), [&](const HostKVPageLayout& candidate) {
+        // Storage dtype is an implementation detail of the arena's canonical layout. Callers
+        // written before the FP16 host-tier extension still pass the source-dtype plan; accept
+        // that equivalent geometry and return the arena-owned layout for the actual copy format.
+        return candidate.geometry == layout.geometry &&
+               candidate.storage_format == layout.storage_format &&
+               candidate.storage_dtypes == layout.storage_dtypes &&
+               candidate.planes == layout.planes && candidate.page_stride == layout.page_stride &&
+               candidate.l1_offset == layout.l1_offset &&
+               candidate.l1_page_payload_bytes == layout.l1_page_payload_bytes &&
+               candidate.l2_offset == layout.l2_offset &&
+               candidate.l2_page_payload_bytes == layout.l2_page_payload_bytes;
+    });
+    if (it == layouts_.end()) { return std::nullopt; }
+    return static_cast<std::uint32_t>(it - layouts_.begin());
+}
+
+const HostKVPageLayout* HostKVArena::layout_for(const KVPageGeometry& geometry) const noexcept {
+    const auto layout =
+        std::find_if(layouts_.begin(), layouts_.end(), [&](const HostKVPageLayout& candidate) {
+            return candidate.geometry == geometry;
+        });
+    return layout == layouts_.end() ? nullptr : &*layout;
+}
+
+std::optional<std::size_t> HostKVArena::find_free_extent(std::size_t bytes) const noexcept {
+    for (std::size_t index = 0; index < free_extents_.size(); ++index) {
+        if (free_extents_[index].bytes >= bytes) { return index; }
+    }
+    return std::nullopt;
+}
+
+bool HostKVArena::can_allocate(const HostKVPageLayout& layout, std::uint32_t pages) const noexcept {
+    if (pages == 0 || free_descriptors_.empty() || !find_layout(layout) ||
+        layout.page_stride > std::numeric_limits<std::size_t>::max() / pages) {
+        return false;
+    }
+    return find_free_extent(layout.page_stride * static_cast<std::size_t>(pages)).has_value();
+}
+
+std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& layout,
+                                                      std::uint32_t pages) noexcept {
+    const std::optional<std::uint32_t> layout_index = find_layout(layout);
+    if (!layout_index || pages == 0 || free_descriptors_.empty() ||
+        layout.page_stride > std::numeric_limits<std::size_t>::max() / pages) {
+        return std::nullopt;
+    }
+    const std::size_t bytes = layout.page_stride * static_cast<std::size_t>(pages);
+    const std::optional<std::size_t> free_index = find_free_extent(bytes);
+    if (!free_index) { return std::nullopt; }
+
+    const std::uint32_t descriptor_index = take_descriptor();
+    if (descriptor_index == std::numeric_limits<std::uint32_t>::max()) { return std::nullopt; }
+    FreeExtent& free         = free_extents_[*free_index];
+    const std::size_t offset = free.offset;
+    free.offset += bytes;
+    free.bytes -= bytes;
+    if (free.bytes == 0) {
+        free_extents_.erase(free_extents_.begin() + static_cast<std::ptrdiff_t>(*free_index));
+    }
+
+    Descriptor& descriptor = descriptors_[descriptor_index];
+    descriptor.offset      = offset;
+    descriptor.bytes       = bytes;
+    descriptor.layout      = *layout_index;
+    descriptor.pages       = pages;
+    descriptor.active      = true;
+    occupied_bytes_ += bytes;
+    bump_revision();
+    return HostKVAllocation(*this, descriptor_index, descriptor.generation);
+}
+
+std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
+    std::span<const HostKVAllocationHandle> proposed_releases,
+    std::span<const HostKVAllocationRequest> target_allocations) const {
+    if (proposed_releases.empty() && target_allocations.empty()) { return std::nullopt; }
+    if (target_allocations.size() > free_descriptors_.size() + proposed_releases.size()) {
+        return std::nullopt;
+    }
+
+    HostKVAllocationRecipe recipe;
+    recipe.owner_          = this;
+    recipe.arena_revision_ = revision_;
+    recipe.releases_.reserve(proposed_releases.size());
+    recipe.targets_.reserve(target_allocations.size());
+
+    std::vector<FreeExtent> simulated = free_extents_;
+    const auto insert_extent          = [&](FreeExtent extent) {
+        const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
+                                                        [](const FreeExtent& candidate, std::size_t offset) {
+                                                   return candidate.offset < offset;
+                                               });
+        auto inserted       = simulated.insert(position, extent);
+        if (inserted != simulated.begin()) {
+            auto previous = inserted - 1;
+            if (previous->offset + previous->bytes == inserted->offset) {
+                previous->bytes += inserted->bytes;
+                inserted = simulated.erase(inserted);
+                inserted = previous;
+            }
+        }
+        const auto next = inserted + 1;
+        if (next != simulated.end() && inserted->offset + inserted->bytes == next->offset) {
+            inserted->bytes += next->bytes;
+            simulated.erase(next);
+        }
+    };
+
+    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
+        const HostKVAllocationHandle handle = proposed_releases[index];
+        if (!valid_handle(handle) ||
+            std::find(proposed_releases.begin(),
+                      proposed_releases.begin() + static_cast<std::ptrdiff_t>(index),
+                      handle) != proposed_releases.begin() + static_cast<std::ptrdiff_t>(index)) {
+            return std::nullopt;
+        }
+        const Descriptor& descriptor = descriptors_[handle.descriptor_];
+        insert_extent({descriptor.offset, descriptor.bytes});
+        recipe.releases_.push_back(handle);
+    }
+
+    for (const HostKVAllocationRequest& request : target_allocations) {
+        if (request.layout == nullptr || request.pages == 0) { return std::nullopt; }
+        const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
+        if (!layout_index ||
+            request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
+            return std::nullopt;
+        }
+        const std::size_t bytes =
+            request.layout->page_stride * static_cast<std::size_t>(request.pages);
+        const auto extent =
+            std::find_if(simulated.begin(), simulated.end(),
+                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
+        if (extent == simulated.end()) { return std::nullopt; }
+        const std::size_t offset = extent->offset;
+        extent->offset += bytes;
+        extent->bytes -= bytes;
+        if (extent->bytes == 0) { simulated.erase(extent); }
+        recipe.targets_.push_back(HostKVAllocationRecipe::Target{
+            .layout = *layout_index,
+            .pages  = request.pages,
+            .offset = offset,
+            .bytes  = bytes,
+        });
+    }
+    return recipe;
+}
+
+bool HostKVArena::can_allocate_after_suballocation_releases(
+    std::span<const HostKVSuballocationRelease> proposed_releases,
+    std::span<const HostKVAllocationRequest> target_allocations) const {
+    if (proposed_releases.empty() && target_allocations.empty()) { return true; }
+
+    std::vector<FreeExtent> simulated = free_extents_;
+    const auto insert_extent          = [&](FreeExtent extent) {
+        const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
+                                                        [](const FreeExtent& candidate, std::size_t offset) {
+                                                   return candidate.offset < offset;
+                                               });
+        auto inserted       = simulated.insert(position, extent);
+        if (inserted != simulated.begin()) {
+            auto previous = inserted - 1;
+            if (previous->offset + previous->bytes == inserted->offset) {
+                previous->bytes += inserted->bytes;
+                inserted = simulated.erase(inserted);
+                inserted = previous;
+            }
+        }
+        const auto next = inserted + 1;
+        if (next != simulated.end() && inserted->offset + inserted->bytes == next->offset) {
+            inserted->bytes += next->bytes;
+            simulated.erase(next);
+        }
+    };
+
+    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
+        const HostKVSuballocationRelease& release = proposed_releases[index];
+        if (!valid_handle(release.allocation) || release.page_count == 0) { return false; }
+        const Descriptor& descriptor = descriptors_[release.allocation.descriptor_];
+        if (release.begin_page > descriptor.pages ||
+            release.page_count > descriptor.pages - release.begin_page) {
+            return false;
+        }
+        const std::uint32_t end = release.begin_page + release.page_count;
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            const HostKVSuballocationRelease& other = proposed_releases[prior];
+            if (other.allocation != release.allocation) { continue; }
+            const std::uint32_t other_end = other.begin_page + other.page_count;
+            if (release.begin_page < other_end && other.begin_page < end) { return false; }
+        }
+        const std::size_t stride = layouts_[descriptor.layout].page_stride;
+        insert_extent(FreeExtent{
+            .offset = checked_add(descriptor.offset,
+                                  checked_mul(static_cast<std::size_t>(release.begin_page), stride,
+                                              "Host KV suballocation release offset overflow"),
+                                  "Host KV suballocation release offset overflow"),
+            .bytes  = checked_mul(static_cast<std::size_t>(release.page_count), stride,
+                                  "Host KV suballocation release size overflow"),
+        });
+    }
+
+    std::size_t available_descriptors = free_descriptors_.size();
+    std::size_t required_descriptors  = target_allocations.size();
+    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
+        const HostKVAllocationHandle allocation = proposed_releases[index].allocation;
+        bool first                              = true;
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            if (proposed_releases[prior].allocation == allocation) {
+                first = false;
+                break;
+            }
+        }
+        if (!first) { continue; }
+
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> intervals;
+        for (const HostKVSuballocationRelease& release : proposed_releases) {
+            if (release.allocation == allocation) {
+                intervals.emplace_back(release.begin_page, release.begin_page + release.page_count);
+            }
+        }
+        std::sort(intervals.begin(), intervals.end());
+        const Descriptor& descriptor = descriptors_[allocation.descriptor_];
+        std::uint32_t cursor         = 0;
+        std::size_t retained_runs    = 0;
+        for (const auto [begin, end] : intervals) {
+            if (begin > cursor) { ++retained_runs; }
+            cursor = end;
+        }
+        if (cursor < descriptor.pages) { ++retained_runs; }
+        if (retained_runs == 0) {
+            ++available_descriptors;
+        } else if (retained_runs > 1) {
+            required_descriptors += retained_runs - 1U;
+        }
+    }
+    if (required_descriptors > available_descriptors) { return false; }
+
+    for (const HostKVAllocationRequest& request : target_allocations) {
+        if (request.layout == nullptr || request.pages == 0) { return false; }
+        const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
+        if (!layout_index ||
+            request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
+            return false;
+        }
+        const std::size_t bytes =
+            request.layout->page_stride * static_cast<std::size_t>(request.pages);
+        const auto extent =
+            std::find_if(simulated.begin(), simulated.end(),
+                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
+        if (extent == simulated.end()) { return false; }
+        extent->offset += bytes;
+        extent->bytes -= bytes;
+        if (extent->bytes == 0) { simulated.erase(extent); }
+    }
+    return true;
+}
+
+bool HostKVArena::apply_recipe(HostKVAllocationRecipe&& recipe,
+                               std::span<HostKVAllocation* const> proposed_releases,
+                               std::span<HostKVAllocation> target_allocations) noexcept {
+    if (recipe.owner_ != this || recipe.arena_revision_ != revision_ ||
+        recipe.releases_.size() != proposed_releases.size() ||
+        recipe.targets_.size() != target_allocations.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
+        const HostKVAllocation* allocation = proposed_releases[index];
+        if (allocation == nullptr || allocation->handle() != recipe.releases_[index] ||
+            !valid_handle(recipe.releases_[index])) {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < target_allocations.size(); ++index) {
+        const HostKVAllocationRecipe::Target& target = recipe.targets_[index];
+        if (target_allocations[index].valid() || target.layout >= layouts_.size() ||
+            target.pages == 0 ||
+            layouts_[target.layout].page_stride >
+                std::numeric_limits<std::size_t>::max() / target.pages ||
+            layouts_[target.layout].page_stride * static_cast<std::size_t>(target.pages) !=
+                target.bytes) {
+            return false;
+        }
+    }
+
+    // All generations and outputs are validated before the first mutation. The recipe was minted
+    // from this exact revision, so every operation below is an invariant-preserving adoption.
+    for (HostKVAllocation* allocation : proposed_releases) {
+        if (!allocation->release()) { std::terminate(); }
+    }
+    for (std::size_t index = 0; index < recipe.targets_.size(); ++index) {
+        const HostKVAllocationRecipe::Target& target = recipe.targets_[index];
+        std::optional<HostKVAllocation> allocation =
+            allocate(layouts_[target.layout], target.pages);
+        if (!allocation) { std::terminate(); }
+        const Descriptor& descriptor = descriptors_[allocation->descriptor_];
+        if (descriptor.offset != target.offset || descriptor.bytes != target.bytes) {
+            std::terminate();
+        }
+        target_allocations[index] = std::move(*allocation);
+    }
+    recipe.owner_          = nullptr;
+    recipe.arena_revision_ = 0;
+    recipe.releases_.clear();
+    recipe.targets_.clear();
+    return true;
+}
+
+std::pair<HostKVAllocation, HostKVAllocation> HostKVArena::split(HostKVAllocation&& allocation,
+                                                                 std::uint32_t page_offset) {
+    if (!valid_handle(allocation.handle())) {
+        throw std::invalid_argument("Cannot split a stale Host KV allocation");
+    }
+    Descriptor& original = descriptors_[allocation.descriptor_];
+    if (page_offset == 0 || page_offset >= original.pages) {
+        throw std::out_of_range("Host KV split must leave two non-empty allocations");
+    }
+    const std::uint32_t right_index = take_descriptor();
+    if (right_index == std::numeric_limits<std::uint32_t>::max()) {
+        throw std::logic_error("Host KV descriptor capacity invariant was violated");
+    }
+
+    const std::size_t stride        = layouts_[original.layout].page_stride;
+    const std::uint32_t right_pages = original.pages - page_offset;
+    Descriptor& right               = descriptors_[right_index];
+    right.offset = original.offset + static_cast<std::size_t>(page_offset) * stride;
+    right.bytes  = static_cast<std::size_t>(right_pages) * stride;
+    right.layout = original.layout;
+    right.pages  = right_pages;
+    right.active = true;
+
+    increment_generation(original.generation);
+    original.pages                       = page_offset;
+    original.bytes                       = static_cast<std::size_t>(page_offset) * stride;
+    const std::uint32_t left_generation  = original.generation;
+    const std::uint32_t right_generation = right.generation;
+    const std::uint32_t left_index       = allocation.descriptor_;
+    allocation.disarm();
+    bump_revision();
+    return {HostKVAllocation(*this, left_index, left_generation),
+            HostKVAllocation(*this, right_index, right_generation)};
+}
+
+HostKVAllocationView HostKVArena::writable_view(HostKVAllocation& allocation) {
+    if (!valid_handle(allocation.handle())) {
+        throw std::invalid_argument("Cannot view a stale Host KV allocation");
+    }
+    const Descriptor& descriptor = descriptors_[allocation.descriptor_];
+    return HostKVAllocationView(allocation.handle(), allocation_data(descriptor),
+                                &layouts_[descriptor.layout], descriptor.pages);
+}
+
+HostKVAllocationConstView HostKVArena::view(const HostKVAllocation& allocation) const {
+    if (!valid_handle(allocation.handle())) {
+        throw std::invalid_argument("Cannot view a stale Host KV allocation");
+    }
+    const Descriptor& descriptor = descriptors_[allocation.descriptor_];
+    return HostKVAllocationConstView(allocation.handle(), allocation_data(descriptor),
+                                     &layouts_[descriptor.layout], descriptor.pages);
+}
+
+bool HostKVArena::valid_handle(HostKVAllocationHandle handle) const noexcept {
+    if (handle.owner_ != this || handle.descriptor_ >= descriptors_.size()) { return false; }
+    const Descriptor& descriptor = descriptors_[handle.descriptor_];
+    return descriptor.active && descriptor.generation == handle.generation_;
+}
+
+std::uint32_t HostKVArena::take_descriptor() noexcept {
+    if (free_descriptors_.empty()) { return std::numeric_limits<std::uint32_t>::max(); }
+    const std::uint32_t out = free_descriptors_.back();
+    free_descriptors_.pop_back();
+    return out;
+}
+
+bool HostKVArena::release_descriptor(std::uint32_t descriptor_index,
+                                     std::uint32_t generation) noexcept {
+    if (descriptor_index >= descriptors_.size()) { return false; }
+    Descriptor& descriptor = descriptors_[descriptor_index];
+    if (!descriptor.active || descriptor.generation != generation) { return false; }
+
+    const FreeExtent released{descriptor.offset, descriptor.bytes};
+    occupied_bytes_ -= descriptor.bytes;
+    descriptor.active = false;
+    descriptor.offset = 0;
+    descriptor.bytes  = 0;
+    descriptor.pages  = 0;
+    increment_generation(descriptor.generation);
+    free_descriptors_.push_back(descriptor_index);
+    insert_free_extent(released);
+    bump_revision();
+    return true;
+}
+
+void HostKVArena::insert_free_extent(FreeExtent extent) noexcept {
+    const auto position = std::lower_bound(
+        free_extents_.begin(), free_extents_.end(), extent.offset,
+        [](const FreeExtent& candidate, std::size_t offset) { return candidate.offset < offset; });
+    auto inserted = free_extents_.insert(position, extent);
+    if (inserted != free_extents_.begin()) {
+        auto previous = inserted - 1;
+        if (previous->offset + previous->bytes == inserted->offset) {
+            previous->bytes += inserted->bytes;
+            inserted = free_extents_.erase(inserted);
+            inserted = previous;
+        }
+    }
+    auto next = inserted + 1;
+    if (next != free_extents_.end() && inserted->offset + inserted->bytes == next->offset) {
+        inserted->bytes += next->bytes;
+        free_extents_.erase(next);
+    }
+}
+
+std::byte* HostKVArena::allocation_data(const Descriptor& descriptor) const noexcept {
+    if (!backing_) { return nullptr; }
+    return static_cast<std::byte*>(backing_->data()) + descriptor.offset;
+}
+
+void HostKVArena::bump_revision() noexcept {
+    ++revision_;
+    if (revision_ == 0) { ++revision_; }
+}
+
+} // namespace ninfer

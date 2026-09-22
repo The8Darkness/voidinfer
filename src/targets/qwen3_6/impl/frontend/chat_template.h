@@ -76,6 +76,7 @@ struct ChatRenderOptions {
     std::optional<bool> preserve_thinking;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    std::vector<PromptCacheMarker> cache_markers;
 };
 
 struct RewriteCheckpointByteSpec {
@@ -83,9 +84,24 @@ struct RewriteCheckpointByteSpec {
     std::size_t offset         = 0;
 };
 
+struct RenderedMediaByteRange {
+    std::size_t begin = 0;
+    std::size_t count = 0;
+};
+
 struct RenderedChat {
     std::string text;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::vector<std::size_t> rewrite_execution_boundaries;
+    // Index n is the exact byte frontier after serializing the first n input messages. A missing
+    // value means the template has no independent boundary there (for example, before a leading
+    // instruction message folded into the system preamble).
+    std::vector<std::optional<std::size_t>> message_boundaries;
+    // One rendered byte boundary per requested cache marker.
+    std::vector<std::optional<std::size_t>> cache_boundaries;
+    // Complete canonical expansions, in input-media order. Streaming preparation
+    // may move these ranges atomically but may not split or relabel them.
+    std::vector<RenderedMediaByteRange> media_ranges;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

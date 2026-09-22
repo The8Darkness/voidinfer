@@ -4,5 +4,8 @@ CompileFlags:
     - --generate-code=*
     - -rdc=true
   Add:
+    - -std=c++20
     - --cuda-gpu-arch=sm_120a
-    - --cuda-path=/usr/local/cuda-13.1
+    - -Iinclude
+    - -Isrc
+    - -Ithird_party

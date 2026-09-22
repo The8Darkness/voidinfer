@@ -15,11 +15,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <deque>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -37,10 +40,17 @@ namespace fi = frontend_internal;
 
 constexpr std::size_t kPatchFeatures   = 1536;
 constexpr std::string_view kThinkClose = "</think>";
-constexpr double kRescaleFactor        = 1.0 / 255.0;
-constexpr double kVideoFps             = 2.0;
-constexpr int kVideoMinFrames          = 4;
-constexpr int kVideoMaxFrames          = 768;
+constexpr std::string_view kThinkingControl =
+    "\n\n Considering the limited time by the user, I have to give the solution based on the "
+    "thinking directly now.\n</think>\n\n";
+constexpr double kRescaleFactor                       = 1.0 / 255.0;
+constexpr double kVideoFps                            = 2.0;
+constexpr int kVideoMinFrames                         = 4;
+constexpr int kVideoMaxFrames                         = 768;
+constexpr std::uint64_t kRegisteredImageMinimumPixels = 65'536;
+constexpr std::uint64_t kRegisteredImageMaximumPixels = 16'777'216;
+constexpr std::uint64_t kRegisteredVideoMinimumPixels = 4'096;
+constexpr std::uint64_t kRegisteredVideoMaximumPixels = 25'165'824;
 
 constexpr std::array<std::pair<std::string_view, TokenId>, 4> kVisionSpecialTokens = {{
     {"<|vision_start|>", 248053},
@@ -180,6 +190,16 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     return options;
 }
 
+void validate_registered_processor(const fi::ProcessorOptions& options) {
+    if (options.image_min_pixels != kRegisteredImageMinimumPixels ||
+        options.image_max_pixels != kRegisteredImageMaximumPixels ||
+        options.video_min_pixels != kRegisteredVideoMinimumPixels ||
+        options.video_max_pixels != kRegisteredVideoMaximumPixels) {
+        throw std::invalid_argument(
+            "registered processor pixel bounds do not match the compiled Vision item capacity");
+    }
+}
+
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
@@ -214,8 +234,15 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
     switch (error.kind()) {
     case fi::ProcessorErrorKind::BudgetExceeded:
         throw RequestError(RequestErrorKind::MediaBudgetExceeded, error.what());
+    case fi::ProcessorErrorKind::ContextLengthExceeded:
+        throw RequestError(RequestErrorKind::ContextLengthExceeded, error.what());
     }
     throw std::logic_error("unknown Qwen3.6 processor error kind");
+}
+
+[[noreturn]] void throw_context_length_exceeded(std::uint32_t max_context) {
+    throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                       "prepared prompt exceeds Engine max_context " + std::to_string(max_context));
 }
 
 void validate_registered_tokenizer(const fi::Tokenizer& tokenizer) {
@@ -277,13 +304,16 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     return result;
 }
 
-fi::ChatRenderOptions render_options(const PromptOptions& options) {
-    return fi::ChatRenderOptions{.add_generation_prompt = options.add_generation_prompt,
-                                 .enable_thinking       = options.enable_thinking,
-                                 .reasoning_effort      = options.reasoning_effort,
-                                 .preserve_thinking     = options.preserve_thinking,
-                                 .add_vision_id         = options.add_vision_id,
-                                 .tool_jsons            = options.tool_jsons};
+fi::ChatRenderOptions render_options(const PromptOptions& options,
+                                     std::span<const PromptCacheMarker> cache_markers = {}) {
+    fi::ChatRenderOptions rendered{.add_generation_prompt = options.add_generation_prompt,
+                                   .enable_thinking       = options.enable_thinking,
+                                   .reasoning_effort      = options.reasoning_effort,
+                                   .preserve_thinking     = options.preserve_thinking,
+                                   .add_vision_id         = options.add_vision_id,
+                                   .tool_jsons            = options.tool_jsons};
+    rendered.cache_markers.assign(cache_markers.begin(), cache_markers.end());
+    return rendered;
 }
 
 std::uint32_t checked_token_count(std::size_t count) {
@@ -319,7 +349,9 @@ VisionItem convert_vision_item(fi::VisionItem item) {
     result.patch_begin    = item.patch_begin;
     result.patch_count    = item.patch_count;
     result.content_digest = item.content_digest;
+    result.preprocess     = item.preprocess;
     result.timestamps     = std::move(item.timestamps);
+    result.patch_storage  = item.patch_storage;
     result.token_spans.reserve(item.token_spans.size());
     for (const fi::TokenSpan span : item.token_spans) {
         result.token_spans.push_back(TokenSpan{.begin = span.begin, .count = span.count});
@@ -363,13 +395,8 @@ std::size_t channel_index(OutputChannel channel) noexcept {
     return channel == OutputChannel::Reasoning ? 0 : 1;
 }
 
-void append_delta(PublishedOutput& output, OutputChannel channel, std::string text) {
-    if (text.empty()) { return; }
-    if (!output.empty() && output.back().channel == channel) {
-        output.back().text += text;
-    } else {
-        output.push_back(OutputDelta{.channel = channel, .text = std::move(text)});
-    }
+void append_delta(PublishedOutput& output, OutputChannel channel, std::string_view text) {
+    output.append(channel,text);
 }
 
 std::size_t valid_utf8_prefix_size(std::string_view bytes) {
@@ -426,6 +453,9 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
 }
 
 struct DecoderState {
+    std::string decoded_scratch;
+    std::string channel_scratch;
+    bool fixed_pending_storage = false;
     std::string utf8_pending;
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
@@ -436,12 +466,78 @@ struct DecoderState {
     std::uint32_t reasoning_tokens = 0;
 };
 
+struct SemanticThinkingState {
+    bool fixed_pending_storage = false;
+    std::optional<std::uint32_t> budget;
+    std::string close_pending;
+    std::uint32_t model_thinking_tokens = 0;
+    std::uint32_t injected_tokens       = 0;
+    bool in_reasoning                   = false;
+    bool control_pending                = false;
+    bool applied                        = false;
+};
+
+void require_pending_append(bool fixed,const std::string& target,std::size_t bytes) {
+    if(fixed && (target.size()>target.capacity() || bytes>target.capacity()-target.size()))
+        throw std::logic_error("output pending append exceeds preallocated capacity");
+}
+void copy_decoder_state(DecoderState& destination,const DecoderState& source) {
+    if(&destination==&source)return;
+    const std::array<std::pair<std::string*,const std::string*>,6> strings{{
+        {&destination.decoded_scratch,&source.decoded_scratch},
+        {&destination.channel_scratch,&source.channel_scratch},
+        {&destination.utf8_pending,&source.utf8_pending},
+        {&destination.think_marker_pending,&source.think_marker_pending},
+        {&destination.stop_pending[0],&source.stop_pending[0]},
+        {&destination.stop_pending[1],&source.stop_pending[1]}}};
+    if(destination.fixed_pending_storage) {
+        if(!source.fixed_pending_storage)throw std::logic_error("decoder snapshot would remove fixed storage policy");
+        for(const auto& [to,from]:strings)if(from->size()>to->capacity())
+            throw std::logic_error("decoder snapshot exceeds preallocated capacity");
+    }
+    for(const auto& [to,from]:strings)to->assign(*from);
+    destination.fixed_pending_storage=source.fixed_pending_storage;
+    destination.in_reasoning=source.in_reasoning;
+    destination.strip_content_leading=source.strip_content_leading;
+    destination.terminal=source.terminal;
+    destination.decoded_bytes=source.decoded_bytes;
+    destination.reasoning_tokens=source.reasoning_tokens;
+}
+void copy_semantic_state(SemanticThinkingState& destination,const SemanticThinkingState& source) {
+    if(&destination==&source)return;
+    if(destination.fixed_pending_storage && (!source.fixed_pending_storage ||
+        source.close_pending.size()>destination.close_pending.capacity()))
+        throw std::logic_error("semantic snapshot exceeds fixed storage policy");
+    destination.close_pending.assign(source.close_pending);
+    destination.fixed_pending_storage=source.fixed_pending_storage;
+    destination.budget=source.budget;
+    destination.model_thinking_tokens=source.model_thinking_tokens;
+    destination.injected_tokens=source.injected_tokens;
+    destination.in_reasoning=source.in_reasoning;
+    destination.control_pending=source.control_pending;
+    destination.applied=source.applied;
+}
+
+void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
+    if (!state.in_reasoning || bytes.empty()) { return; }
+    require_pending_append(state.fixed_pending_storage,state.close_pending,bytes.size());
+    state.close_pending.append(bytes);
+    if (state.close_pending.find(kThinkClose) != std::string::npos) {
+        state.close_pending.clear();
+        state.in_reasoning    = false;
+        state.control_pending = false;
+        return;
+    }
+    const std::size_t hold = longest_suffix_prefix(state.close_pending, kThinkClose, true);
+    state.close_pending.erase(0, state.close_pending.size() - hold);
+}
+
 struct StopMatch {
     bool found                      = false;
     std::uint32_t committed_tokens  = 0;
     std::uint64_t byte_cut          = 0;
     std::uint32_t declaration_order = 0;
-    PublishedOutput output;
+    PublishedOutput* output=nullptr;
 };
 
 bool stop_match_precedes(std::uint32_t committed_tokens, std::uint64_t byte_cut,
@@ -467,7 +563,13 @@ void feed_channel(DecoderState& state, OutputChannel channel, std::string_view t
                   const StopPolicy& policy, PublishedOutput& emitted,
                   std::uint32_t committed_tokens, StopMatch* best_match) {
     if (text.empty()) { return; }
-    std::string combined          = state.stop_pending[channel_index(channel)];
+    auto& combined=state.channel_scratch;
+    const auto& pending=state.stop_pending[channel_index(channel)];
+    if(state.fixed_pending_storage && (pending.size()>combined.capacity() ||
+        text.size()>combined.capacity()-pending.size()))
+        throw std::logic_error("output stop scratch exceeds preallocated capacity");
+    combined.assign(pending);
+    struct ClearScratch {std::string& value;~ClearScratch(){value.clear();}} clear_scratch{combined};
     const std::size_t old_pending = combined.size();
     combined.append(text);
     const std::uint64_t combined_start = state.decoded_bytes - old_pending;
@@ -482,37 +584,41 @@ void feed_channel(DecoderState& state, OutputChannel channel, std::string_view t
             const auto order             = static_cast<std::uint32_t>(declaration);
             if (!stop_match_precedes(committed_tokens, byte_cut, order, *best_match)) { continue; }
 
-            PublishedOutput candidate = emitted;
-            append_delta(candidate, channel, combined.substr(0, found));
+            if(!best_match->output)throw std::logic_error("stop match missing candidate workspace");
+            auto& candidate=*best_match->output;
+            candidate.copy_reusing_storage(emitted);
+            append_delta(candidate, channel, std::string_view(combined).substr(0, found));
             if (stop.include_in_output) { append_delta(candidate, channel, stop.text); }
             *best_match = StopMatch{.found             = true,
                                     .committed_tokens  = committed_tokens,
                                     .byte_cut          = byte_cut,
                                     .declaration_order = order,
-                                    .output            = std::move(candidate)};
+                                    .output            = &candidate};
         }
     }
 
     const std::size_t hold = stop_hold_size(combined, channel, policy);
-    append_delta(emitted, channel, combined.substr(0, combined.size() - hold));
-    state.stop_pending[channel_index(channel)] = combined.substr(combined.size() - hold);
+    if(state.fixed_pending_storage && hold>state.stop_pending[channel_index(channel)].capacity())
+        throw std::logic_error("output stop suffix exceeds preallocated capacity");
+    append_delta(emitted, channel, std::string_view(combined).substr(0, combined.size() - hold));
+    state.stop_pending[channel_index(channel)].assign(combined.data()+combined.size()-hold,hold);
     state.decoded_bytes += text.size();
 }
 
 void close_channel(DecoderState& state, OutputChannel channel, PublishedOutput& emitted) {
     std::string& pending = state.stop_pending[channel_index(channel)];
-    append_delta(emitted, channel, std::move(pending));
+    append_delta(emitted, channel, pending);
     pending.clear();
 }
 
-void feed_content(DecoderState& state, std::string text, const StopPolicy& policy,
+void feed_content(DecoderState& state, std::string_view text, const StopPolicy& policy,
                   PublishedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
     if (state.strip_content_leading) {
         std::size_t begin = 0;
         while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
             ++begin;
         }
-        text.erase(0, begin);
+        text.remove_prefix(begin);
         if (!text.empty()) { state.strip_content_leading = false; }
     }
     feed_channel(state, OutputChannel::Content, text, policy, emitted, committed_tokens,
@@ -523,10 +629,11 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
     if (!state.in_reasoning) {
-        feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
+        feed_content(state, text, policy, emitted, committed_tokens, best_match);
         return;
     }
 
+    require_pending_append(state.fixed_pending_storage,state.think_marker_pending,text.size());
     state.think_marker_pending.append(text);
     const std::size_t marker = state.think_marker_pending.find(kThinkClose);
     if (marker != std::string::npos) {
@@ -534,11 +641,11 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
                      std::string_view(state.think_marker_pending).substr(0, marker), policy,
                      emitted, committed_tokens, best_match);
         close_channel(state, OutputChannel::Reasoning, emitted);
-        std::string content = state.think_marker_pending.substr(marker + kThinkClose.size());
-        state.think_marker_pending.clear();
+        const auto content = std::string_view(state.think_marker_pending).substr(marker + kThinkClose.size());
         state.in_reasoning          = false;
         state.strip_content_leading = true;
-        feed_content(state, std::move(content), policy, emitted, committed_tokens, best_match);
+        feed_content(state, content, policy, emitted, committed_tokens, best_match);
+        state.think_marker_pending.clear();
         return;
     }
 
@@ -550,13 +657,18 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     state.think_marker_pending.erase(0, safe);
 }
 
-void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& policy,
+void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPolicy& policy,
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
-    state.utf8_pending += bytes;
+    require_pending_append(state.fixed_pending_storage,state.utf8_pending,bytes.size());
+    state.utf8_pending.append(bytes);
     const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
     if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
+    auto& text=state.decoded_scratch;
+    if(state.fixed_pending_storage && valid>text.capacity())
+        throw std::logic_error("decoded output scratch exceeds preallocated capacity");
+    text.assign(state.utf8_pending.data(),valid);
+    struct ClearDecoded {std::string& value;~ClearDecoded(){value.clear();}} clear_decoded{text};
     state.utf8_pending.erase(0, valid);
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
@@ -578,17 +690,270 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
     } else {
         close_channel(state, OutputChannel::Content, emitted);
     }
-    state.stop_pending = {};
+    for(auto& pending:state.stop_pending)pending.clear();
     state.terminal     = true;
 }
 
 DecoderState terminal_state(DecoderState state) {
     state.utf8_pending.clear();
     state.think_marker_pending.clear();
-    state.stop_pending = {};
+    for(auto& pending:state.stop_pending)pending.clear();
     state.terminal     = true;
     return state;
 }
+
+std::optional<std::uint32_t> automatic_stable_boundary(std::span<const ChatRole> roles,
+                                                       bool has_tools) {
+    std::uint32_t leading = 0;
+    while (leading < roles.size() &&
+           (roles[leading] == ChatRole::System || roles[leading] == ChatRole::Developer)) {
+        ++leading;
+    }
+    return has_tools || leading != 0 ? std::optional<std::uint32_t>(leading) : std::nullopt;
+}
+
+PreparedContextCache
+prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
+                      std::span<const std::optional<std::uint32_t>> message_boundaries,
+                      std::span<const std::optional<std::uint32_t>> cache_boundaries,
+                      std::optional<std::uint32_t> automatic_boundary,
+                      std::uint32_t maximum_markers) {
+    if (hints.markers.size() > maximum_markers) {
+        throw std::invalid_argument("context cache marker count exceeds Engine capacity");
+    }
+    if (cache_boundaries.size() != hints.markers.size()) {
+        throw std::logic_error("rendered cache marker count changed during preparation");
+    }
+
+    PreparedContextCache out;
+    if (hints.session_key) {
+        if (hints.session_key->empty() || hints.session_key->size() > kPreparedSessionKeyCapacity) {
+            throw std::invalid_argument("context cache session_key must contain 1 to 256 bytes");
+        }
+        PreparedSessionKey key;
+        key.size = static_cast<std::uint16_t>(hints.session_key->size());
+        std::copy(hints.session_key->begin(), hints.session_key->end(), key.bytes.begin());
+        out.session_key = key;
+    }
+    switch (hints.retention) {
+    case CacheRetentionHint::Default:
+        out.retention = out.session_key ? runtime::RetentionClass::LiveSession
+                                        : runtime::RetentionClass::RecentPrivate;
+        break;
+    case CacheRetentionHint::LiveSession:
+        if (!out.session_key) {
+            throw std::invalid_argument("LiveSession retention requires a session_key");
+        }
+        out.retention = runtime::RetentionClass::LiveSession;
+        break;
+    case CacheRetentionHint::Disposable:
+        out.retention = runtime::RetentionClass::Disposable;
+        break;
+    default:
+        throw std::invalid_argument("context cache retention hint is invalid");
+    }
+    out.update_session_index = hints.update_session_index;
+
+    std::vector<PromptCacheMarker> markers;
+    markers.reserve(hints.markers.size() +
+                    static_cast<std::size_t>(automatic_boundary.has_value()));
+    for (const PromptCacheMarker marker : hints.markers) {
+        switch (marker.kind) {
+        case PromptCacheMarkerKind::SharedStablePrefix:
+        case PromptCacheMarkerKind::PrivateLongAnchor:
+            break;
+        default:
+            throw std::invalid_argument("context cache marker kind is invalid");
+        }
+        switch (marker.location) {
+        case PromptCacheMarkerLocation::MessageBoundary:
+            if (marker.after_message_count > message_count ||
+                marker.leading_instruction_bytes != 0 || marker.after_tool_count != 0) {
+                throw std::invalid_argument("context cache message marker is invalid");
+            }
+            break;
+        case PromptCacheMarkerLocation::LeadingInstructionBoundary:
+            if (marker.after_message_count != 0 || marker.leading_instruction_bytes == 0 ||
+                marker.after_tool_count != 0) {
+                throw std::invalid_argument("context cache leading-instruction marker is invalid");
+            }
+            break;
+        case PromptCacheMarkerLocation::ToolBoundary:
+            if (marker.after_message_count != 0 || marker.leading_instruction_bytes != 0 ||
+                marker.after_tool_count == 0) {
+                throw std::invalid_argument("context cache tool marker is invalid");
+            }
+            break;
+        default:
+            throw std::invalid_argument("context cache marker location is invalid");
+        }
+        if (std::find(markers.begin(), markers.end(), marker) == markers.end()) {
+            markers.push_back(marker);
+        }
+    }
+    const bool has_explicit_shared =
+        std::any_of(markers.begin(), markers.end(), [](const PromptCacheMarker& marker) {
+            return marker.kind == PromptCacheMarkerKind::SharedStablePrefix;
+        });
+    if (automatic_boundary && !has_explicit_shared && markers.size() < maximum_markers) {
+        const PromptCacheMarker automatic{.after_message_count = *automatic_boundary,
+                                          .kind = PromptCacheMarkerKind::SharedStablePrefix};
+        if (std::find(markers.begin(), markers.end(), automatic) == markers.end()) {
+            markers.push_back(automatic);
+        }
+    }
+
+    out.opportunities.reserve(markers.size());
+    for (std::size_t index = 0; index < markers.size(); ++index) {
+        const PromptCacheMarker marker = markers[index];
+        const bool automatic =
+            std::find(hints.markers.begin(), hints.markers.end(), marker) == hints.markers.end();
+        std::optional<std::uint32_t> resolved;
+        if (marker.location == PromptCacheMarkerLocation::MessageBoundary) {
+            if (marker.after_message_count < message_boundaries.size()) {
+                resolved = message_boundaries[marker.after_message_count];
+            }
+        } else {
+            const auto original = std::find(hints.markers.begin(), hints.markers.end(), marker);
+            if (original != hints.markers.end()) {
+                const std::size_t original_index =
+                    static_cast<std::size_t>(std::distance(hints.markers.begin(), original));
+                if (original_index < cache_boundaries.size()) {
+                    resolved = cache_boundaries[original_index];
+                }
+            }
+        }
+        if (!resolved) {
+            if (automatic) { continue; }
+            throw std::invalid_argument(
+                "context cache marker is not an exact serialized token boundary");
+        }
+        const std::uint32_t frontier = *resolved;
+        if (frontier == 0) {
+            if (automatic) { continue; }
+            throw std::invalid_argument("context cache marker has an empty token prefix");
+        }
+        const auto duplicate = std::find_if(
+            out.opportunities.begin(), out.opportunities.end(), [&](const auto& existing) {
+                return existing.kind == marker.kind && existing.frontier == frontier;
+            });
+        if (duplicate == out.opportunities.end()) {
+            out.opportunities.push_back(
+                PreparedCacheOpportunity{.kind        = marker.kind,
+                                         .frontier    = frontier,
+                                         .input_order = static_cast<std::uint32_t>(index)});
+        }
+    }
+    return out;
+}
+
+// Text-only render/tokenize entries never cross a Frontend::Impl, so artifact,
+// tokenizer and compiled-template identity is enforced by cache ownership. The
+// key below is a full exact serialization, retained for equality comparison;
+// no digest or token-only match can produce a hit.
+class ExactTextPreparationCache {
+    struct Entry {
+        std::string key;
+        std::shared_ptr<const PreparedPromptData> prepared;
+        std::size_t retained_bytes=0;
+    };
+    static constexpr std::size_t capacity=64;
+    static constexpr std::size_t retained_limit=64ULL<<20;
+    static constexpr std::size_t key_limit=1ULL<<20;
+
+    static void append_u64(std::string& out,std::uint64_t value) {
+        for(unsigned byte=0;byte<8;++byte)
+            out.push_back(static_cast<char>(value>>(byte*8)));
+    }
+    static void append_bool(std::string& out,bool value) {
+        out.push_back(value?'\1':'\0');
+    }
+    static void append_string(std::string& out,std::string_view value) {
+        append_u64(out,value.size());out.append(value);
+    }
+public:
+    static std::optional<std::string> key(const PromptInput& input) {
+        std::string out;append_u64(out,input.messages.size());
+        for(const auto& message:input.messages) {
+            append_u64(out,static_cast<std::uint64_t>(message.role));
+            append_u64(out,message.parts.size());
+            for(const auto& part:message.parts) {
+                if(part.kind==MessagePartKind::Media)return std::nullopt;
+                append_u64(out,static_cast<std::uint64_t>(part.kind));
+                append_string(out,part.text);
+            }
+            append_string(out,message.reasoning_content);
+            append_u64(out,message.tool_calls.size());
+            for(const auto& call:message.tool_calls) {
+                append_string(out,call.id);append_string(out,call.name);
+                append_string(out,call.arguments_json);
+            }
+            append_string(out,message.tool_call_id);
+        }
+        append_bool(out,input.options.add_generation_prompt);
+        append_bool(out,input.options.enable_thinking);
+        append_bool(out,input.options.reasoning_effort.has_value());
+        if(input.options.reasoning_effort)
+            append_u64(out,static_cast<std::uint64_t>(*input.options.reasoning_effort));
+        append_bool(out,input.options.preserve_thinking);
+        append_bool(out,input.options.add_vision_id);
+        append_u64(out,input.options.tool_jsons.size());
+        for(const auto& tool:input.options.tool_jsons)append_string(out,tool);
+        append_bool(out,input.context_cache.session_key.has_value());
+        if(input.context_cache.session_key)append_string(out,*input.context_cache.session_key);
+        append_u64(out,static_cast<std::uint64_t>(input.context_cache.retention));
+        append_bool(out,input.context_cache.update_session_index);
+        append_u64(out,input.context_cache.markers.size());
+        for(const auto& marker:input.context_cache.markers) {
+            append_u64(out,marker.after_message_count);
+            append_u64(out,static_cast<std::uint64_t>(marker.kind));
+            append_u64(out,static_cast<std::uint64_t>(marker.location));
+            append_u64(out,marker.leading_instruction_bytes);
+            append_u64(out,marker.after_tool_count);
+        }
+        if(out.size()>key_limit)return std::nullopt;
+        return out;
+    }
+
+    std::unique_ptr<PreparedPromptData> lookup(std::string_view key) const {
+        std::shared_ptr<const PreparedPromptData> retained;
+        {
+            std::lock_guard lock(mutex_);
+            for(const auto& entry:entries_)if(entry.key==key) {
+                retained=entry.prepared;break;
+            }
+        }
+        return retained?std::make_unique<PreparedPromptData>(*retained):nullptr;
+    }
+
+    std::optional<std::uint32_t> lookup_token_count(std::string_view key) const {
+        std::lock_guard lock(mutex_);
+        for(const auto& entry:entries_)if(entry.key==key)
+            return checked_token_count(entry.prepared->token_ids.size());
+        return std::nullopt;
+    }
+
+    void publish(std::string key,const PreparedPromptData& prepared) {
+        const auto prepared_bytes=prepared.retained_storage_bytes();
+        if(key.capacity()>std::numeric_limits<std::size_t>::max()-prepared_bytes)
+            return;
+        const auto bytes=key.capacity()+prepared_bytes;
+        if(bytes>retained_limit)return;
+        auto retained=std::make_shared<const PreparedPromptData>(prepared);
+        std::lock_guard lock(mutex_);
+        for(const auto& entry:entries_)if(entry.key==key)return;
+        while(!entries_.empty() && (entries_.size()==capacity ||
+              bytes>retained_limit-retained_bytes_)) {
+            retained_bytes_-=entries_.front().retained_bytes;entries_.pop_front();
+        }
+        retained_bytes_+=bytes;
+        entries_.push_back({std::move(key),std::move(retained),bytes});
+    }
+private:
+    mutable std::mutex mutex_;
+    std::deque<Entry> entries_;
+    std::size_t retained_bytes_=0;
+};
 
 } // namespace
 
@@ -600,13 +965,16 @@ public:
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
+          processor(processor_options(resources)), vision_enabled(options.vision_enabled),
+          max_context(options.max_context),
+          max_cache_markers_per_request(options.max_cache_markers_per_request) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
         const std::uint64_t vision_tokens =
-            std::min<std::uint64_t>(options.max_context, kMaximumVisionTokens);
+            std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;
+        processor.patch_storage = options.vision_patch_storage;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
         if (vision_enabled) {
             const std::uint64_t minimum_live =
@@ -619,7 +987,10 @@ public:
                 options.media_cache_bytes, options.media_live_bytes,
                 options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
         }
-        if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
+        if (registered_checkpoint) {
+            validate_registered_processor(processor);
+            validate_registered_tokenizer(*tokenizer);
+        }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
                 throw std::invalid_argument(
@@ -627,6 +998,27 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
+        std::vector<TokenId> encoded = tokenizer->encode(kThinkingControl);
+        if (encoded.empty()) {
+            throw std::invalid_argument(
+                "Qwen tokenizer cannot encode the canonical thinking control suffix");
+        }
+        const std::string exact =
+            tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
+        const std::string presented =
+            tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = true});
+        if (exact != kThinkingControl || presented.find(kThinkClose) == std::string::npos) {
+            throw std::invalid_argument(
+                "Qwen tokenizer cannot present the canonical thinking control suffix");
+        }
+        for (const TokenId token : encoded) {
+            if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
+                defaults.token_ids.end()) {
+                throw std::invalid_argument(
+                    "canonical thinking control suffix contains a default terminal token");
+            }
+        }
+        thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
     }
 
     fi::CompiledChatTemplate chat_template;
@@ -634,25 +1026,55 @@ public:
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
-    bool vision_enabled = true;
+    std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    mutable ExactTextPreparationCache text_preparation_cache;
+    bool vision_enabled                         = true;
+    std::uint32_t max_context                   = 0;
+    std::uint32_t max_cache_markers_per_request = 0;
 };
 
 class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning)
+         bool starts_in_reasoning, ThinkingControlOptions thinking,
+         std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
-          preserve_special(output.raw || output.preserve_special_tokens) {
-        state.in_reasoning = starts_in_reasoning && !output.raw;
+          thinking_control_tokens(std::move(thinking_control_tokens_)),
+          preserve_special(output.raw || output.preserve_special_tokens),
+          split_reasoning(starts_in_reasoning && !output.raw),
+          capture_only(std::getenv("NINFER_OSCAR_QKV_CAPTURE_ONLY") != nullptr &&
+                       std::string_view(std::getenv("NINFER_OSCAR_QKV_CAPTURE_ONLY")) == "1") {
+        if (thinking.budget && *thinking.budget == 0) {
+            throw std::invalid_argument("thinking budget must be positive");
+        }
+        state.in_reasoning = split_reasoning;
+        semantic.budget    = thinking.budget;
+        // The presentation decoder already tracks normal reasoning output. Keep the independent
+        // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
+        // decode every model token twice.
+        semantic.in_reasoning = starts_in_reasoning && thinking.budget.has_value();
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
+    std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool preserve_special = false;
+    bool split_reasoning  = false;
+    bool capture_only     = false;
     DecoderState state;
     DecoderState preview_state;
+    DecoderState before_stop_state;
+    SemanticThinkingState semantic;
+    SemanticThinkingState preview_semantic;
     PublishedOutput preview_output;
+    PublishedOutput stop_candidate;
+    PublishedOutput before_stop_output;
     bool preview_ready = false;
+    bool generation_started = false;
+    bool completed_chat_turn = false;
+    bool preview_completed_chat_turn = false;
+    std::optional<std::size_t> fixed_output_limit;
+    std::size_t output_slot_budget=0;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -696,24 +1118,40 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
         .media_singleflight_waits      = stats.media_singleflight_waits,
         .built_patch_bytes             = stats.built_patch_bytes,
         .reused_patch_bytes            = stats.reused_patch_bytes,
+        .retained_media_payload_bytes  = stats.retained_media_payload_bytes,
     };
 }
 
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
-    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
+    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)),text_limit_(other.text_limit_) {}
+
+PublishedOutput::PublishedOutput(const PublishedOutput& other) {
+    if(other.text_limit_)preallocate_text(*other.text_limit_);
+    values_=other.values_;size_=other.size_;
+}
+PublishedOutput& PublishedOutput::operator=(const PublishedOutput& other) {
+    if(this!=&other){PublishedOutput copy(other);*this=std::move(copy);}
+    return *this;
+}
+void PublishedOutput::preallocate_text(std::size_t limit) {
+    if(size_)throw std::logic_error("output slot preallocation requires empty output");
+    for(auto& value:values_)value.text.reserve(limit);
+    text_limit_=limit;
+}
 
 PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
     if (this != &other) {
         values_ = std::move(other.values_);
         size_   = std::exchange(other.size_, 0);
+        text_limit_=other.text_limit_;
     }
     return *this;
 }
 
 void PublishedOutput::clear() noexcept {
-    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
+    for (auto& value:values_)value.text.clear();
     size_ = 0;
 }
 
@@ -721,26 +1159,166 @@ void PublishedOutput::push_back(OutputDelta value) {
     if (size_ == values_.size()) {
         throw std::logic_error("output decoder produced more than two channel transitions");
     }
-    values_[size_++] = std::move(value);
+    if(text_limit_) {
+        if(value.text.size()>*text_limit_ || value.text.size()>values_[size_].text.capacity())
+            throw std::logic_error("published output exceeds preallocated slot");
+        values_[size_].text.assign(value.text);values_[size_].channel=value.channel;++size_;
+    } else values_[size_++] = std::move(value);
 }
 
 OutputSession::OutputSession() noexcept                           = default;
 OutputSession::~OutputSession()                                   = default;
+
+void OutputSession::discard_preview() noexcept {
+    if(impl_){impl_->preview_ready=false;impl_->preview_output.clear();}
+}
+std::size_t PublishedOutput::retained_text_capacity_bytes() const {
+    std::size_t total=0;
+    for(const auto& value:values_) {
+        if(value.text.capacity()>=std::numeric_limits<std::size_t>::max()-total)
+            throw std::overflow_error("published output capacity overflow");
+        total+=value.text.capacity()+1;
+    }
+    return total;
+}
+void PublishedOutput::append(OutputChannel channel,std::string_view text) {
+    if(text.empty())return;
+    const bool coalesce=size_ && values_[size_-1].channel==channel;
+    const auto slot=coalesce?size_-1:size_;
+    if(slot==values_.size())throw std::logic_error("output decoder produced more than two channel transitions");
+    const auto used=coalesce?values_[slot].text.size():0;
+    if(text_limit_ && (used>*text_limit_ || text.size()>*text_limit_-used ||
+        used>values_[slot].text.capacity() || text.size()>values_[slot].text.capacity()-used))
+        throw std::logic_error("published output exceeds preallocated slot");
+    if(size_ && values_[size_-1].channel==channel){values_[size_-1].text.append(text);return;}
+    if(size_==values_.size())throw std::logic_error("output decoder produced more than two channel transitions");
+    values_[size_].text.assign(text);
+    values_[size_].channel=channel;
+    ++size_;
+}
+void PublishedOutput::copy_reusing_storage(const PublishedOutput& source) {
+    if(this==&source)return;
+    clear();
+    for(const auto& delta:source)append(delta.channel,delta.text);
+}
+bool PublishedOutput::has_fixed_storage(std::size_t limit) const noexcept {
+    if(!text_limit_ || *text_limit_!=limit)return false;
+    for(const auto& value:values_)if(value.text.capacity()<limit)return false;
+    return true;
+}
+void OutputSession::recycle_output(PublishedOutput output) {
+    if(!impl_)throw std::logic_error("output session is empty");
+    if(impl_->preview_ready || !impl_->preview_output.empty())
+        throw std::logic_error("output buffer recycling requires no active preview");
+    if(impl_->fixed_output_limit && !output.has_fixed_storage(*impl_->fixed_output_limit))
+        throw std::invalid_argument("recycled output does not match fixed session storage");
+    if(impl_->fixed_output_limit) {
+        const auto candidate=impl_->stop_candidate.retained_text_capacity_bytes();
+        const auto snapshot=impl_->before_stop_output.retained_text_capacity_bytes();
+        const auto returned=output.retained_text_capacity_bytes();
+        if(candidate>impl_->output_slot_budget || snapshot>impl_->output_slot_budget-candidate ||
+            returned>impl_->output_slot_budget-candidate-snapshot)
+            throw std::invalid_argument("recycled output exceeds reserved slot extent");
+    }
+    output.clear();
+    impl_->preview_output=std::move(output);
+}
+void OutputSession::preallocate_output_storage(std::size_t limit) {
+    if(!impl_)throw std::logic_error("output session is empty");
+    if(impl_->generation_started)throw std::logic_error("output slot allocation must precede generation");
+    impl_->preview_output.preallocate_text(limit);
+    impl_->stop_candidate.preallocate_text(limit);
+    impl_->before_stop_output.preallocate_text(limit);
+    std::size_t budget=0;
+    for(const auto* slots:{&impl_->preview_output,&impl_->stop_candidate,&impl_->before_stop_output}) {
+        const auto bytes=slots->retained_text_capacity_bytes();
+        if(bytes>std::numeric_limits<std::size_t>::max()-budget)
+            throw std::overflow_error("output slot reservation extent overflow");
+        budget+=bytes;
+    }
+    impl_->output_slot_budget=budget;
+    impl_->fixed_output_limit=limit;
+}
+void OutputSession::exceed_private_storage_for_test(std::size_t reserved_bytes) {
+    if(!impl_)throw std::logic_error("output session is empty");
+    if(reserved_bytes==std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("output storage fault extent overflow");
+    impl_->before_stop_state.channel_scratch.reserve(reserved_bytes+1);
+}
+
+std::size_t OutputSession::retained_storage_bytes() const {
+    if(!impl_)return 0;
+    std::size_t total=sizeof(Impl);
+    const auto add=[&](std::size_t count,std::size_t width) {
+        if(count>(std::numeric_limits<std::size_t>::max()-total)/width)
+            throw std::overflow_error("output session storage extent overflow");
+        total+=count*width;
+    };
+    const auto text=[&](const std::string& value){add(value.capacity(),1);add(1,1);};
+    add(impl_->policy.token_ids.capacity(),sizeof(TokenId));
+    add(impl_->policy.strings.capacity(),sizeof(StopString));
+    for(const auto& stop:impl_->policy.strings)text(stop.text);
+    const auto decoder=[&](const DecoderState& state) {
+        text(state.decoded_scratch);
+        text(state.channel_scratch);
+        text(state.utf8_pending);text(state.think_marker_pending);
+        for(const auto& pending:state.stop_pending)text(pending);
+    };
+    decoder(impl_->state);decoder(impl_->preview_state);decoder(impl_->before_stop_state);
+    text(impl_->semantic.close_pending);text(impl_->preview_semantic.close_pending);
+    add(impl_->preview_output.retained_text_capacity_bytes(),1);
+    add(impl_->stop_candidate.retained_text_capacity_bytes(),1);
+    add(impl_->before_stop_output.retained_text_capacity_bytes(),1);
+    return total;
+}
+void OutputSession::preallocate_pending_storage() {
+    if(!impl_)throw std::logic_error("output session is empty");
+    if(impl_->generation_started)
+        throw std::logic_error("output pending storage must precede generation");
+    const auto width=impl_->tokenizer->maximum_decoded_token_bytes();
+    const auto checked_sum=[](std::size_t a,std::size_t b) {
+        if(b>std::numeric_limits<std::size_t>::max()-a)
+            throw std::overflow_error("output pending storage extent overflow");
+        return a+b;
+    };
+    const auto utf8=checked_sum(width,3);
+    const auto marker=checked_sum(utf8,kThinkClose.size());
+    std::array<std::size_t,2> stop_bytes{};
+    for(const auto& stop:impl_->policy.strings)
+        stop_bytes[channel_index(stop.channel)]=std::max(stop_bytes[channel_index(stop.channel)],stop.text.size());
+    const auto reserve_decoder=[&](DecoderState& state) {
+        state.decoded_scratch.reserve(utf8);
+        state.channel_scratch.reserve(checked_sum(std::max(stop_bytes[0],stop_bytes[1]),marker));
+        state.utf8_pending.reserve(utf8);
+        state.think_marker_pending.reserve(marker);
+        for(std::size_t i=0;i<stop_bytes.size();++i)state.stop_pending[i].reserve(stop_bytes[i]);
+        state.fixed_pending_storage=true;
+    };
+    reserve_decoder(impl_->state);reserve_decoder(impl_->preview_state);reserve_decoder(impl_->before_stop_state);
+    impl_->semantic.close_pending.reserve(marker);
+    impl_->preview_semantic.close_pending.reserve(marker);
+    impl_->semantic.fixed_pending_storage=true;
+    impl_->preview_semantic.fixed_pending_storage=true;
+}
 OutputSession::OutputSession(OutputSession&&) noexcept            = default;
 OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
 
 OutputSession::OutputSession(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
-runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
-                                               std::uint32_t budget_remaining,
-                                               FinishReason limit_reason) {
+runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> tokens,
+                                                     std::uint32_t total_budget_remaining,
+                                                     FinishReason limit_reason) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    impl_->generation_started=true;
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
     if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    if (impl_->semantic.control_pending) {
+        throw std::logic_error("model output cannot advance while thinking control is pending");
+    }
     if (tokens.empty()) {
         throw std::invalid_argument("cannot preview an empty generated-token round");
     }
-    if (tokens.size() > budget_remaining) {
+    if (tokens.size() > total_budget_remaining) {
         throw std::invalid_argument("generated-token round exceeds the remaining budget");
     }
     if (limit_reason != FinishReason::OutputLimit &&
@@ -748,73 +1326,182 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         throw std::invalid_argument("generated-token budget has an invalid limit reason");
     }
 
-    impl_->preview_state = impl_->state;
+    copy_decoder_state(impl_->preview_state,impl_->state);
+    copy_semantic_state(impl_->preview_semantic,impl_->semantic);
+    impl_->preview_completed_chat_turn=impl_->completed_chat_turn;
     impl_->preview_output.clear();
 
-    const auto complete = [&](std::uint32_t count, FinishReason reason) {
+    const auto complete = [&](std::uint32_t count, FinishReason reason,
+                              runtime::ContinuationAction continuation =
+                                  runtime::ContinuationAction::Decode) {
+        if (reason != FinishReason::None) { impl_->preview_semantic.control_pending = false; }
         impl_->preview_ready = true;
-        return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
+        return runtime::OutputDecision{
+            .accepted_tokens = count, .finish_reason = reason, .continuation = continuation};
     };
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
-        const std::uint32_t count = static_cast<std::uint32_t>(index + 1);
-        const TokenId token       = tokens[index];
-        if (!impl_->tokenizer->is_valid_token(token)) {
-            throw std::out_of_range("generated token is outside the checkpoint vocabulary: " +
-                                    std::to_string(token));
+        const std::uint32_t count          = static_cast<std::uint32_t>(index + 1);
+        const TokenId token                = tokens[index];
+        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        if (impl_->capture_only) {
+            continue;
         }
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        if (impl_->preview_semantic.in_reasoning) {
+            ++impl_->preview_semantic.model_thinking_tokens;
+            if (impl_->preview_semantic.budget &&
+                impl_->preview_semantic.model_thinking_tokens > *impl_->preview_semantic.budget) {
+                throw std::logic_error("model output exceeded the licensed thinking budget");
+            }
+            feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
+        }
 
         const bool stop_token =
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
             impl_->policy.token_ids.end();
-        DecoderState before_state;
-        PublishedOutput before_output;
         if (stop_token && !impl_->policy.publish_stop_token) {
-            before_state  = impl_->preview_state;
-            before_output = impl_->preview_output;
+            copy_decoder_state(impl_->before_stop_state,impl_->preview_state);
+            impl_->before_stop_output.copy_reusing_storage(impl_->preview_output);
         }
 
-        StopMatch match;
-        const std::string bytes =
-            impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
+        impl_->stop_candidate.clear();
+        StopMatch match{.output=&impl_->stop_candidate};
+        // A hidden terminal token still participates in caller-declared text
+        // stop matching. The pre-stop snapshot below prevents its bytes from
+        // becoming visible when no string match wins.
+        const std::string_view bytes = !impl_->preserve_special && decoded.special && !stop_token
+            ? std::string_view{} : decoded.bytes;
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match);
 
         if (match.found) {
             impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
-            impl_->preview_output = std::move(match.output);
+            std::swap(impl_->preview_output,impl_->stop_candidate);
+            impl_->stop_candidate.clear();
             return complete(match.committed_tokens, FinishReason::StopString);
         }
 
         if (stop_token) {
             if (!impl_->policy.publish_stop_token) {
-                impl_->preview_state  = std::move(before_state);
-                impl_->preview_output = std::move(before_output);
+                std::swap(impl_->preview_state,impl_->before_stop_state);
+                std::swap(impl_->preview_output,impl_->before_stop_output);
+                impl_->before_stop_output.clear();
             }
+            impl_->preview_completed_chat_turn=
+                decoded.special && decoded.bytes=="<|im_end|>";
             terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
             return complete(count, FinishReason::StopToken);
         }
     }
 
     const auto count = static_cast<std::uint32_t>(tokens.size());
-    if (tokens.size() == budget_remaining) {
+    if (tokens.size() == total_budget_remaining) {
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
         return complete(count, limit_reason);
+    }
+    if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
+        impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget) {
+        impl_->preview_semantic.control_pending = true;
+        return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
     }
     return complete(count, FinishReason::None);
 }
 
+std::uint32_t
+OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
+    if (impl_ == nullptr || !impl_->semantic.budget || !impl_->semantic.in_reasoning ||
+        impl_->semantic.applied) {
+        return total_budget_remaining;
+    }
+    if (impl_->semantic.control_pending ||
+        impl_->semantic.model_thinking_tokens >= *impl_->semantic.budget) {
+        return 0;
+    }
+    return std::min(total_budget_remaining,
+                    *impl_->semantic.budget - impl_->semantic.model_thinking_tokens);
+}
+
+std::span<const TokenId> OutputSession::pending_control_tokens() const noexcept {
+    if (impl_ == nullptr || !impl_->semantic.control_pending || !impl_->thinking_control_tokens) {
+        return {};
+    }
+    return *impl_->thinking_control_tokens;
+}
+
+runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> tokens,
+                                                       std::uint32_t total_budget_remaining) {
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    impl_->generation_started=true;
+    if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    const std::span<const TokenId> expected = pending_control_tokens();
+    if (expected.empty() || tokens.size() != expected.size() ||
+        !std::equal(tokens.begin(), tokens.end(), expected.begin())) {
+        throw std::invalid_argument("thinking control preview requires the exact pending span");
+    }
+    if (tokens.size() > total_budget_remaining) {
+        throw std::invalid_argument("thinking control span exceeds the remaining output budget");
+    }
+
+    copy_decoder_state(impl_->preview_state,impl_->state);
+    copy_semantic_state(impl_->preview_semantic,impl_->semantic);
+    impl_->preview_completed_chat_turn=impl_->completed_chat_turn;
+    impl_->preview_output.clear();
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        const TokenId token                = tokens[index];
+        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
+        const std::string_view presentation_bytes =
+            !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
+        feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
+                         impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
+    }
+    if (impl_->preview_semantic.in_reasoning) {
+        throw std::logic_error("canonical thinking control did not close the thinking phase");
+    }
+    if (impl_->split_reasoning && impl_->preview_state.in_reasoning) {
+        throw std::logic_error("canonical thinking control did not close the reasoning channel");
+    }
+    impl_->preview_semantic.control_pending = false;
+    impl_->preview_semantic.applied         = true;
+    impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
+    impl_->preview_ready                    = true;
+    return runtime::OutputDecision{.accepted_tokens = static_cast<std::uint32_t>(tokens.size())};
+}
+
+void OutputSession::validate_generation_capacity(std::uint32_t effective_output_tokens) const {
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    if (!impl_->semantic.budget || !impl_->semantic.in_reasoning ||
+        effective_output_tokens <= *impl_->semantic.budget) {
+        return;
+    }
+    const std::uint64_t remaining =
+        static_cast<std::uint64_t>(effective_output_tokens) - *impl_->semantic.budget;
+    const std::uint64_t required =
+        static_cast<std::uint64_t>(impl_->thinking_control_tokens->size()) + 1U;
+    if (remaining < required) {
+        throw std::invalid_argument(
+            "effective output capacity after the thinking budget must fit the complete control "
+            "suffix and one post-close model token");
+    }
+}
+
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    impl_->generation_started=true;
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
     if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
     if (reason == FinishReason::None || reason == FinishReason::StopString ||
         reason == FinishReason::StopToken) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
-    impl_->preview_state = impl_->state;
+    copy_decoder_state(impl_->preview_state,impl_->state);
+    copy_semantic_state(impl_->preview_semantic,impl_->semantic);
+    impl_->preview_completed_chat_turn=impl_->completed_chat_turn;
+    impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     impl_->preview_ready = true;
@@ -825,6 +1512,8 @@ PublishedOutput OutputSession::commit_preview() noexcept {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
+    swap(impl_->semantic, impl_->preview_semantic);
+    swap(impl_->completed_chat_turn,impl_->preview_completed_chat_turn);
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
@@ -833,6 +1522,16 @@ PublishedOutput OutputSession::commit_preview() noexcept {
 
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
     return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
+}
+
+ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
+    if (impl_ == nullptr) { return {}; }
+    return ThinkingBudgetStats{
+        .configured_budget     = impl_->semantic.budget,
+        .model_thinking_tokens = impl_->semantic.model_thinking_tokens,
+        .injected_tokens       = impl_->semantic.injected_tokens,
+        .applied               = impl_->semantic.applied,
+    };
 }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -851,7 +1550,12 @@ Frontend FrontendTestAccess::create_component(const FrontendResources& resources
                                               bool vision_enabled) {
     FrontendOptions options;
     options.vision_enabled = vision_enabled;
-    options.max_context    = static_cast<std::uint32_t>(kMaximumVisionTokens);
+    options.max_context    = std::numeric_limits<std::uint32_t>::max();
+    return create_component(resources, options);
+}
+
+Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
+                                              FrontendOptions options) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, false, options));
 }
 
@@ -872,8 +1576,28 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
-    const auto start                      = Clock::now();
-    const PromptOptions options           = input.options;
+    const auto start              = Clock::now();
+    const PromptOptions options   = input.options;
+    auto text_cache_key=ExactTextPreparationCache::key(input);
+    ContextCacheHints cache_hints = std::move(input.context_cache);
+    if (cache_hints.markers.size() > impl_->max_cache_markers_per_request) {
+        throw std::invalid_argument("context cache marker count exceeds Engine capacity");
+    }
+    if(text_cache_key)if(auto cached=impl_->text_preparation_cache.lookup(*text_cache_key)) {
+        fi::check_preparation_control(control,"text preparation cache");
+        cached->prepare.frontend_cache_hits=1;
+        cached->prepare.frontend_cache_misses=0;
+        cached->prepare.reused_token_bytes=cached->token_ids.size()*sizeof(TokenId);
+        cached->prepare.tokenize_seconds=0;
+        cached->prepare.seconds=std::chrono::duration<double>(Clock::now()-start).count();
+        return PreparedPrompt(std::move(cached));
+    }
+    std::vector<ChatRole> message_roles;
+    message_roles.reserve(input.messages.size());
+    for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
+    const std::optional<std::uint32_t> automatic_boundary =
+        automatic_stable_boundary(message_roles, !options.tool_jsons.empty());
+    const std::size_t message_count       = input.messages.size();
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
@@ -884,18 +1608,29 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
+    std::vector<std::optional<std::uint32_t>> message_boundaries;
+    std::vector<std::optional<std::uint32_t>> cache_boundaries;
     if (has_media) {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
                                 impl_->media_cache);
         fi::ProcessedInput processed;
         try {
-            processed = processor.process(std::move(messages), render_options(options), control);
+            processed =
+                processor.process(std::move(messages), render_options(options, cache_hints.markers),
+                                  control, impl_->max_context);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.token_types    = std::move(processed.token_types);
         result.positions      = std::move(processed.positions);
         result.rope_delta     = processed.rope_delta;
         result.media_payloads = std::move(processed.media_payloads);
+        result.visit_media_payload_allocations([&](const void*, std::size_t bytes) {
+            auto& retained = result.prepare.retained_media_payload_bytes;
+            if (bytes > std::numeric_limits<std::size_t>::max() - retained) {
+                throw std::overflow_error("prepared media retained byte count overflows size_t");
+            }
+            retained += bytes;
+        });
         result.vision_items.reserve(processed.vision_items.size());
         for (fi::VisionItem& item : processed.vision_items) {
             result.vision_items.push_back(convert_vision_item(std::move(item)));
@@ -916,27 +1651,53 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             processed.stats.media_preprocess_work_seconds;
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
+        result.identity.rewrite_execution_frontiers =
+            std::move(processed.rewrite_execution_frontiers);
+        message_boundaries = std::move(processed.message_boundaries);
+        cache_boundaries   = std::move(processed.cache_boundaries);
     } else {
         const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+            impl_->chat_template.render(messages, render_options(options, cache_hints.markers));
         const auto tokenize_started = Clock::now();
-        fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+        const auto segments=fi::canonical_rendered_prompt_segments(rendered);
+        fi::RenderedPromptStream stream(rendered,1);
+        for(const auto& segment:segments)stream.append(segment.kind,
+            std::string_view(rendered.text).substr(segment.begin,segment.count),control);
+        fi::EncodedChat encoded=stream.finish(
+            *impl_->tokenizer,control,static_cast<std::size_t>(impl_->max_context)+1U);
         result.prepare.tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
-        fi::check_preparation_control(control, "tokenization");
+        if (encoded.input_ids.size() > impl_->max_context) {
+            throw_context_length_exceeded(impl_->max_context);
+        }
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
+        result.identity.rewrite_execution_frontiers =
+            std::move(encoded.rewrite_execution_frontiers);
+        message_boundaries = std::move(encoded.message_boundaries);
+        cache_boundaries   = std::move(encoded.cache_boundaries);
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
-    result.identity.reusable   = true;
+    result.identity.reusable = true;
+    result.context_cache     = prepare_context_cache(
+        std::move(cache_hints), message_count, message_boundaries, cache_boundaries,
+        automatic_boundary, impl_->max_cache_markers_per_request);
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
+    if(text_cache_key)result.prepare.frontend_cache_misses=1;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
+    if(text_cache_key)impl_->text_preparation_cache.publish(
+        std::move(*text_cache_key),result);
     return PreparedPrompt(std::move(prepared));
 }
 
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
+    if(const auto key=ExactTextPreparationCache::key(input))
+        if(const auto count=impl_->text_preparation_cache.lookup_token_count(*key)) {
+            fi::check_preparation_control(control,"text preparation cache");
+            return *count;
+        }
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
@@ -958,8 +1719,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
                             impl_->media_cache);
     try {
         return checked_token_count(
-            processor.process(std::move(messages), render_options(options), control)
-                .input_ids.size());
+            processor.count_tokens(std::move(messages), render_options(options), control));
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }
 
@@ -991,6 +1751,9 @@ MediaCacheSummary Frontend::media_cache_summary() const {
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
                                         bool allow_prefix_identity) const {
     const auto start = Clock::now();
+    if (token_ids.size() > impl_->max_context) {
+        throw_context_length_exceeded(impl_->max_context);
+    }
     (void)checked_token_count(token_ids.size());
     for (const TokenId token : token_ids) {
         if (!impl_->tokenizer->is_valid_token(token)) {
@@ -1002,21 +1765,79 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
     assign_text_positions(result);
-    result.identity.reusable = allow_prefix_identity;
-    result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
+    result.identity.reusable                  = allow_prefix_identity;
+    result.context_cache.retention            = runtime::RetentionClass::RecentPrivate;
+    result.context_cache.update_session_index = false;
+    result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
-                                            const OutputOptions& output) const {
+                                            const OutputOptions& output,
+                                            const ThinkingControlOptions& thinking) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
-        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning));
+        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
+        impl_->thinking_control_tokens));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+std::span<const TokenId> Frontend::thinking_control_tokens() const noexcept {
+    return impl_->thinking_control_tokens?std::span<const TokenId>(*impl_->thinking_control_tokens):std::span<const TokenId>{};
+}
+
+bool OutputSession::completed_chat_turn() const noexcept {
+    return impl_!=nullptr && impl_->completed_chat_turn;
+}
+std::size_t Frontend::output_session_storage_ceiling(const StopPolicy& caller,std::size_t output_bytes) const {
+    const auto maximum=std::numeric_limits<std::size_t>::max();
+    const auto sum=[&](std::size_t a,std::size_t b) {
+        if(b>maximum-a)throw std::overflow_error("output session ceiling overflow");
+        return a+b;
+    };
+    // Explicit allocator acceptance policy, not an STL growth guarantee.
+    const auto capacity=[&](std::size_t size) {
+        if(size>(maximum-32)/2)throw std::overflow_error("output session ceiling overflow");
+        return size*2+32;
+    };
+    std::size_t total=sizeof(OutputSession::Impl);
+    const auto add=[&](std::size_t count,std::size_t width) {
+        if(count>(maximum-total)/width)throw std::overflow_error("output session ceiling overflow");
+        total+=count*width;
+    };
+    const auto string=[&](std::size_t requested){add(sum(capacity(requested),1),1);};
+    auto tokens=caller.token_ids.size();
+    if(caller.include_model_defaults)tokens=sum(tokens,impl_->tokenizer->default_stop_token_ids().size());
+    add(capacity(tokens),sizeof(TokenId));
+    add(capacity(caller.strings.size()),sizeof(StopString));
+    std::array<std::size_t,2> stops{};
+    for(const auto& stop:caller.strings) {
+        string(stop.text.size());
+        auto& longest=stops[channel_index(stop.channel)];longest=std::max(longest,stop.text.size());
+    }
+    const auto utf8=sum(impl_->tokenizer->maximum_decoded_token_bytes(),3);
+    const auto marker=sum(utf8,kThinkClose.size());
+    const auto channel=sum(std::max(stops[0],stops[1]),marker);
+    for(unsigned state=0;state<3;++state) {
+        string(utf8);string(channel); // Decoded and combined-stop scratch.
+        string(utf8);string(marker); // Decoder pending text.
+        string(stops[0]);string(stops[1]);
+    }
+    string(marker);string(marker); // Two semantic close-marker buffers.
+    string(output_bytes);string(output_bytes); // Preallocated preview output slots.
+    string(output_bytes);string(output_bytes); // Retained stop-match candidate slots.
+    string(output_bytes);string(output_bytes); // Hidden-stop output snapshot slots.
+    return total;
+}
+std::size_t Frontend::output_text_byte_bound(std::uint32_t token_allowance) const {
+    const auto width=impl_->tokenizer->maximum_decoded_token_bytes();
+    constexpr std::size_t repair_bytes=3; // One terminal replacement character.
+    if(token_allowance && width>(std::numeric_limits<std::size_t>::max()-repair_bytes)/token_allowance)
+        throw std::overflow_error("output text byte bound overflow");
+    return width*token_allowance+repair_bytes;
+}
 
 } // namespace ninfer::targets::qwen3_6
