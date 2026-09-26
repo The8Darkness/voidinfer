@@ -62,6 +62,29 @@ constexpr std::size_t kCoherentDownK7SharedBytes =
 constexpr std::size_t kCoherentOK7SharedBytes =
     2u * 256u * sizeof(half) + 2u * 8u * 16u * 7u * sizeof(std::uint16_t) +
     16u * 128u * sizeof(float);
+// Coherent 128-column packed producers with a DeepStages cp.async ring.
+constexpr std::size_t coherent_deep_shared_bytes(int bits, int stages) {
+    return static_cast<std::size_t>(stages) * 256u * sizeof(half) +
+           static_cast<std::size_t>(stages) * 8u * 16u *
+               static_cast<std::size_t>(bits) * sizeof(std::uint16_t) +
+           16u * 128u * sizeof(float);
+}
+// The coherent K6/K7 packed producers run 128-column CTAs whose grid is too
+// small to cover DRAM latency with a two-stage ring. Four stages (default) is
+// the measured selection; NINFER_EXL3_COHERENT_DEEP_PIPELINE=0 restores the
+// two-stage ring and 8 is retained for comparison. Numerically identical.
+int coherent_deep_pipeline_stages() {
+    static const int stages = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_DEEP_PIPELINE");
+        if (!value) return 4;
+        if (std::strcmp(value, "0") == 0) return 0;
+        if (std::strcmp(value, "4") == 0) return 4;
+        if (std::strcmp(value, "8") == 0) return 8;
+        throw std::invalid_argument(
+            "NINFER_EXL3_COHERENT_DEEP_PIPELINE must be 0, 4 or 8");
+    }();
+    return stages;
+}
 constexpr std::size_t kShape4SharedBytes =
     256u * sizeof(half) + 2u * 32u * 80u * sizeof(std::uint16_t) +
     16u * 512u * sizeof(float);
@@ -141,6 +164,13 @@ __device__ __forceinline__ void exl3_cp_async_commit() {
 
 __device__ __forceinline__ void exl3_cp_async_wait() {
     asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+// Wait until at most Pending committed cp.async groups remain in flight.
+template <int Pending>
+__device__ __forceinline__ void exl3_cp_async_wait_pending() {
+    static_assert(Pending >= 0 && Pending <= 8, "bounded cp.async pipeline depth");
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(Pending));
 }
 
 template <int Groups>
@@ -1841,7 +1871,8 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool AsyncA = false, bool PartialOnly = false,
            bool K7ThreeWord = false, bool PredecodedB = false,
            bool FastK6Decode = false, bool Fp16Accumulate = false,
-           bool RegisterPipeline = false, bool GlobalSlices = false>
+           bool RegisterPipeline = false, bool GlobalSlices = false,
+           int DeepStages = 0>
 __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
@@ -1865,9 +1896,16 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     static_assert(!GlobalSlices ||
                       (!SingleSplit && AsyncA && PartialOnly),
                   "global slices require async-A partial-only accumulation");
+    // DeepStages keeps DeepStages-1 packed tiles in flight per CTA. It changes
+    // only copy scheduling; every output sees the same MMA sequence.
+    static_assert(DeepStages == 0 ||
+                      (DeepStages >= 3 && DeepStages <= 8 && AsyncA &&
+                       !RegisterPipeline && !Fp16Accumulate),
+                  "deep cp.async staging requires the async-A FP32 path");
     constexpr int tile_half = PredecodedB ? 256 : 16 * Bits;
     constexpr int raw_stage_half = output_tiles_per_block * tile_half;
-    constexpr int raw_stage_count = RegisterPipeline ? 4 : 2;
+    constexpr int raw_stage_count =
+        RegisterPipeline ? 4 : (DeepStages ? DeepStages : 2);
     extern __shared__ half shared[];
     half* sh_a = shared;
     auto* sh_raw = reinterpret_cast<std::uint16_t*>(
@@ -1922,7 +1960,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
         exl3_cp_async_commit();
     };
 
-    if constexpr (!RegisterPipeline) {
+    if constexpr (!RegisterPipeline && DeepStages == 0) {
         prefetch(tile_k_begin, 0);
         exl3_cp_async_wait();
         __syncthreads();
@@ -2036,6 +2074,58 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
             }
         }
         exl3_cp_async_wait_group<0>();
+        __syncthreads();
+    } else if constexpr (DeepStages > 0) {
+        constexpr int stages = DeepStages;
+        // One committed group per issued tile slot, including empty tail
+        // slots, so wait_pending<stages-2> always completes the current tile.
+        auto issue = [&](int tile_k, int stage) {
+            if (tile_k < tile_k_end) prefetch(tile_k, stage);
+            else exl3_cp_async_commit();
+        };
+        #pragma unroll
+        for (int preload = 0; preload < stages - 1; ++preload)
+            issue(tile_k_begin + preload, preload);
+        for (int tile_k = tile_k_begin; tile_k < tile_k_end; ++tile_k) {
+            const int relative = tile_k - tile_k_begin;
+            const int stage = relative % stages;
+            exl3_cp_async_wait_pending<stages - 2>();
+            // Also orders the previous iteration's shared reads before the
+            // refill of its stage below.
+            __syncthreads();
+            issue(tile_k + stages - 1, (relative + stages - 1) % stages);
+
+            Exl3FragA a;
+            const int r = (lane % 8) + 8 * ((lane / 8) % 2);
+            const int base_c = lane / 16;
+            const int c_swizzled = base_c ^ ((r >> 2) & 1);
+            exl3_ldsm4(a, sh_a + stage * 256 + r * 16 + c_swizzled * 8);
+            #pragma unroll
+            for (int n2 = 0; n2 < fragments_per_warp; n2 += 2) {
+                const int sub_n2 = warp * (fragments_per_warp / 2) + n2 / 2;
+                const auto* packed = reinterpret_cast<const std::uint32_t*>(
+                    sh_raw + stage * raw_stage_half + sub_n2 * tile_half);
+                Exl3FragB b0, b1;
+                if constexpr (PredecodedB) {
+                    const auto* values = reinterpret_cast<const half2*>(packed) +
+                        lane * 4;
+                    b0.values[0] = values[0]; b0.values[1] = values[1];
+                    b1.values[0] = values[2]; b1.values[1] = values[3];
+                } else if constexpr (FastK6Decode) {
+                    static_assert(Bits==6,"fast M1 lane-window decoder is K6-only");
+                    exl3_dq4_k6_lane_window(packed,lane<<3,b0,mul1_multiplier);
+                    exl3_dq4_k6_lane_window(packed,(lane<<3)+4,b1,mul1_multiplier);
+                } else {
+                    exl3_dq4_generic<Bits, K7ThreeWord>(
+                        packed, lane << 3, b0, mul1_multiplier);
+                    exl3_dq4_generic<Bits, K7ThreeWord>(
+                        packed, (lane << 3) + 4, b1, mul1_multiplier);
+                }
+                exl3_mma_m16n8k16(a, b0, c[n2]);
+                exl3_mma_m16n8k16(a, b1, c[n2 + 1]);
+            }
+        }
+        exl3_cp_async_wait();
         __syncthreads();
     } else {
         for (int tile_k = tile_k_begin; tile_k < tile_k_end; ++tile_k) {
@@ -9488,6 +9578,38 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
     return "unsupported";
 }
 
+// Coherent 128-column packed producer (K6 down, K7 down/O, wide K6) with the
+// selected cp.async depth; the default keeps the established two-stage ring.
+template <int Bits>
+static void launch_coherent_packed_partials(
+    int grid, std::size_t two_stage_bytes, cudaStream_t stream,
+    const std::uint16_t* transformed, const std::uint16_t* trellis,
+    const std::int32_t* mul1, float* accum, int rows, int input_features,
+    int output_features, int split_count) {
+    switch (coherent_deep_pipeline_stages()) {
+    case 4:
+        exl3_gemm_m1_generic_mma_kernel<Bits, false, 8, true, true, false,
+            false, false, false, false, false, 4><<<
+            dim3(grid), dim3(kThreads), coherent_deep_shared_bytes(Bits, 4), stream>>>(
+                transformed, trellis, mul1, accum, rows, input_features,
+                output_features, split_count);
+        break;
+    case 8:
+        exl3_gemm_m1_generic_mma_kernel<Bits, false, 8, true, true, false,
+            false, false, false, false, false, 8><<<
+            dim3(grid), dim3(kThreads), coherent_deep_shared_bytes(Bits, 8), stream>>>(
+                transformed, trellis, mul1, accum, rows, input_features,
+                output_features, split_count);
+        break;
+    default:
+        exl3_gemm_m1_generic_mma_kernel<Bits, false, 8, true, true><<<
+            dim3(grid), dim3(kThreads), two_stage_bytes, stream>>>(
+                transformed, trellis, mul1, accum, rows, input_features,
+                output_features, split_count);
+        break;
+    }
+}
+
 void Exl3CudaLinearWorkspace::forward_from_transformed(
     const Exl3CudaLinearWeights& weights,
     const Exl3CudaLinearMetadata& metadata,
@@ -9533,11 +9655,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         // One packed-MMA producer instantiation serves M1 and M2..8. Each
         // K/N tile's B decode is reused across active independent row C
         // fragments; inactive physical M16 rows are zero and never stored.
-        exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true><<<
-            dim3(output_blocks * split_count), dim3(kThreads),
-            kCoherentDownK6SharedBytes, stream>>>(
-                transformed_input, weights.trellis, weights.mul1, accum_,
-                rows, in_features_, out_features_, split_count);
+        launch_coherent_packed_partials<6>(
+            output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down shared-row partials");
         prefill_reduce_output_kernel<false><<<
@@ -9555,11 +9676,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         constexpr int output_blocks = 5120 / 128;
         constexpr int split_count =
             static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
-        exl3_gemm_m1_generic_mma_kernel<7, false, 8, true, true><<<
-            dim3(output_blocks * split_count), dim3(kThreads),
-            kCoherentDownK7SharedBytes, stream>>>(
-                transformed_input, weights.trellis, weights.mul1, accum_,
-                rows, in_features_, out_features_, split_count);
+        launch_coherent_packed_partials<7>(
+            output_blocks * split_count, kCoherentDownK7SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down shared-row partials");
         prefill_reduce_output_kernel<false><<<
@@ -9577,11 +9697,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         constexpr int output_blocks = 5120 / 128;
         constexpr int split_count =
             static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
-        exl3_gemm_m1_generic_mma_kernel<7, false, 8, true, true><<<
-            dim3(output_blocks * split_count), dim3(kThreads),
-            kCoherentOK7SharedBytes, stream>>>(
-                transformed_input, weights.trellis, weights.mul1, accum_,
-                rows, in_features_, out_features_, split_count);
+        launch_coherent_packed_partials<7>(
+            output_blocks * split_count, kCoherentOK7SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O shared-row partials");
         prefill_reduce_output_kernel<false><<<
@@ -9598,11 +9717,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (coherent_wide_k6_candidate(metadata, rows, admission)) {
         const int output_blocks = out_features_ / kHadamard;
         const int split_count = coherent_wide_k6_split_count(rows);
-        exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true><<<
-            dim3(output_blocks * split_count), dim3(kThreads),
-            kCoherentWideK6SharedBytes, stream>>>(
-                transformed_input, weights.trellis, weights.mul1, accum_,
-                rows, in_features_, out_features_, split_count);
+        launch_coherent_packed_partials<6>(
+            output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 shared-row partials");
         prefill_reduce_output_kernel<false><<<
