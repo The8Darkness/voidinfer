@@ -307,6 +307,11 @@ struct Exl3EngineCore::Request::Storage {
 struct Exl3EngineCore::Impl {
     std::shared_ptr<Request::CancellationOwner> cancellation_owner;
     bool coherent_device=false;
+    // Admission of the ordinary graph families (each still selected by its
+    // own switch) into the coherent-device context.  Qualified for GDN-segment
+    // and full-layer graphs; NINFER_EXL3_COHERENT_ORDINARY_GRAPHS=0 selects the
+    // eager fallback.
+    bool coherent_ordinary_graphs=false;
     EngineOptions options;
     bool public_media_enabled=false;
     std::optional<Exl3VerifierHorizonPolicy::CostMenu> verifier_cost_menu;
@@ -427,7 +432,13 @@ struct Exl3EngineCore::Impl {
     explicit Impl(const EngineOptions& value,unsigned shared_allocation_fault,unsigned draft_clone_fault,unsigned first_draft_fault,unsigned context_startup_fault,
         Exl3DeviceAvailability::Provider supplied_availability):
         coherent_device(value.exl3_package->round_implementation==
-            Exl3RoundImplementation::CoherentDevice),options(value),
+            Exl3RoundImplementation::CoherentDevice),
+        coherent_ordinary_graphs(coherent_device && [] {
+            const char* value=std::getenv("NINFER_EXL3_COHERENT_ORDINARY_GRAPHS");
+            if(value && std::string_view(value)!="0" && std::string_view(value)!="1")
+                throw std::invalid_argument("coherent ordinary graphs must be 0 or 1");
+            return !value || std::string_view(value)=="1";
+        }()),options(value),
         public_media_enabled(
             !coherent_device && Exl3PublicMediaQualification::evaluate_current(
                 Exl3PublicMediaModality::image).media_allowed() &&
@@ -996,13 +1007,13 @@ struct Exl3EngineCore::Impl {
                 });
                 streams[i]=std::move(stream_owner);
                 stats.execution_stream_metadata_bytes+=bounded_shared_allocation_bytes<ExecutionStream>();
-                // The linked Engine image has scalar mismatches on ordinary
-                // full-layer and GDN-segment graph replay. Keep this coherent
-                // route on the scalar-checked eager layer path.
+                // The coherent route admits the ordinary graph families unless
+                // the eager fallback is selected.  The families themselves are
+                // selected by their own switches and captured at context creation.
                 auto context=target->create_context_reserved(coordinator,true,
                     context_startup_fault>=90 && context_startup_fault<=100?context_startup_fault-73:
                     (context_startup_fault==88?16:(context_startup_fault==86?11:(fault<=4?fault:0))),
-                    public_media_enabled,!coherent_device);
+                    public_media_enabled,!coherent_device || coherent_ordinary_graphs);
                 const auto base_context_bytes=context->persistent_bytes();
                 context->prepare_continuation_reserved(coordinator,8,
                     context_startup_fault==89?6:(context_startup_fault==87?5:(fault>=5 && fault<=7?fault-4:0)));
@@ -2163,6 +2174,13 @@ struct Exl3EngineCore::Impl {
                 coordinator.cancel_device_logical(*device_lease,true);
                 device_lease.reset();
             }
+            // Test-only semantic final-state witness, observed after all timed
+            // work and publication so graph and eager policies can be compared.
+            if(const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_FINAL_STATE_HASH");
+               value && std::string_view(value)=="1")
+                std::fprintf(stderr,"COHERENT_DEVICE_ENGINE_FINAL_STATE output=%zu hash=%llu\n",
+                    result.generated_token_ids.size(),static_cast<unsigned long long>(
+                        context->export_exact_host_state(stream)->represented_payload_hash_for_test()));
             std::lock_guard lock(mutex);
             stats.committed_decode_tokens+=result.generated_token_ids.size();
             stats.visible_model_tokens+=result.token_accounting.visible_model_tokens;

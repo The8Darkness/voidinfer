@@ -7,6 +7,7 @@
 #include "exl3/fast_device_round.h"
 #include "exl3/branch_reference.h"
 #include "exl3/linear_cuda.h"
+#include "exl3/text_model.h"
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <cuda_runtime.h>
@@ -153,7 +154,27 @@ int main() {
             direct_binary_probe(path,target,draft,options.max_context,
                 "COHERENT_DEVICE_DIRECT_BINARY_PRE");
         }
+        // Dispatches recorded while the Engine constructs its context include
+        // ordinary graph capture; replay bypasses host-side dispatch counters.
+        using Linear=ninfer::exl3::Exl3CudaLinearWorkspace;
+        const auto dispatch_snapshot=[] {
+            std::array<std::uint64_t,7> value{Linear::process_coherent_down_k7_calls_for_test(),
+                Linear::process_coherent_o_k7_calls_for_test()};
+            for(int operation=0;operation<5;++operation)
+                value[2+operation]=Linear::coherent_wide_k6_calls_for_test(operation);
+            return value;
+        };
+        auto construction_dispatch=dispatch_snapshot();
         auto engine=std::make_unique<Engine>(options);
+        {
+            const auto after=dispatch_snapshot();
+            for(std::size_t index=0;index<after.size();++index)
+                construction_dispatch[index]=after[index]-construction_dispatch[index];
+        }
+        std::cout<<"COHERENT_DEVICE_ENGINE_CONSTRUCTION_DISPATCH down_k7="<<construction_dispatch[0]
+                 <<" o_k7="<<construction_dispatch[1]<<" wide_q="<<construction_dispatch[2]
+                 <<" wide_qkv="<<construction_dispatch[3]<<" wide_z="<<construction_dispatch[4]
+                 <<" wide_o="<<construction_dispatch[5]<<" wide_gate_up="<<construction_dispatch[6]<<'\n';
         std::size_t free_bytes=0,total_bytes=0;
         if(cudaMemGetInfo(&free_bytes,&total_bytes)!=cudaSuccess)
             throw std::runtime_error("device Engine witness memory query failed");
@@ -410,14 +431,40 @@ int main() {
                     ninfer::exl3::Exl3CudaLinearWorkspace::
                         coherent_wide_k6_rows_for_test(operation);
             }
+            const bool coherent_ordinary_graphs=[] {
+                const auto* option=std::getenv("NINFER_EXL3_COHERENT_ORDINARY_GRAPHS");
+                return !option || std::string_view(option)=="1";
+            }();
+            const auto graphs_before=ninfer::exl3::Exl3TextContext::
+                ordinary_graph_process_stats_for_test();
             const auto long_result=engine->generate(std::move(long_prepared),request);
+            const auto graphs_after=ninfer::exl3::Exl3TextContext::
+                ordinary_graph_process_stats_for_test();
+            const auto gdn_replays=graphs_after.gdn_segment_replays-graphs_before.gdn_segment_replays;
+            const auto full_replays=graphs_after.full_layer_replays-graphs_before.full_layer_replays;
+            const auto mlp_replays=graphs_after.mlp_tail_replays-graphs_before.mlp_tail_replays;
+            std::cout<<"COHERENT_DEVICE_ENGINE_GRAPHS policy="<<coherent_ordinary_graphs
+                     <<" gdn_segment_captures="<<graphs_after.gdn_segment_captures
+                     <<" full_layer_captures="<<graphs_after.full_layer_captures
+                     <<" mlp_tail_captures="<<graphs_after.mlp_tail_captures
+                     <<" gdn_segment_replays="<<gdn_replays
+                     <<" full_layer_replays="<<full_replays
+                     <<" mlp_tail_replays="<<mlp_replays<<'\n';
+            if(!coherent_ordinary_graphs && (gdn_replays || full_replays || mlp_replays))
+                throw std::runtime_error("device Engine ordinary graph guard leaked replays");
+            // A kernel reached only through replayed graphs has no host-side
+            // request delta; it must then have been dispatched during capture.
+            const bool graphs_replayed=gdn_replays || full_replays || mlp_replays;
+            const auto captured_only=[&](std::uint64_t request_calls,std::size_t index) {
+                return graphs_replayed && request_calls==0 && construction_dispatch[index]>0;
+            };
             const auto down_k7_calls=ninfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_down_k7_calls_for_test()-down_k7_calls_before;
             const auto down_k7_rows=ninfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_down_k7_rows_for_test()-down_k7_rows_before;
             std::cout<<"COHERENT_DEVICE_ENGINE_DOWN_K7 enabled="<<coherent_down_k7
                      <<" calls="<<down_k7_calls<<" rows="<<down_k7_rows<<'\n';
-            if((coherent_down_k7 && (down_k7_calls==0 ||
+            if((coherent_down_k7 && !captured_only(down_k7_calls,0) && (down_k7_calls==0 ||
                     down_k7_rows<static_cast<std::uint64_t>(long_outputs))) ||
                (!coherent_down_k7 && (down_k7_calls!=0 || down_k7_rows!=0)))
                 throw std::runtime_error("device Engine K7 down dispatch mismatch");
@@ -427,7 +474,7 @@ int main() {
                 process_coherent_o_k7_rows_for_test()-o_k7_rows_before;
             std::cout<<"COHERENT_DEVICE_ENGINE_O_K7 enabled="<<coherent_o_k7
                      <<" calls="<<o_k7_calls<<" rows="<<o_k7_rows<<'\n';
-            if((coherent_o_k7 && (o_k7_calls==0 ||
+            if((coherent_o_k7 && !captured_only(o_k7_calls,1) && (o_k7_calls==0 ||
                     o_k7_rows<static_cast<std::uint64_t>(long_outputs))) ||
                (!coherent_o_k7 && (o_k7_calls!=0 || o_k7_rows!=0)))
                 throw std::runtime_error("device Engine K7 O dispatch mismatch");
@@ -442,7 +489,9 @@ int main() {
                 std::cout<<"COHERENT_DEVICE_ENGINE_WIDE_K6 op="
                          <<wide_names[operation]<<" enabled="<<coherent_wide_k6
                          <<" calls="<<calls<<" rows="<<rows<<'\n';
-                if(coherent_wide_k6 ? calls==0 || rows<calls :
+                if(coherent_wide_k6 ?
+                        !captured_only(calls,2+static_cast<std::size_t>(operation)) &&
+                            (calls==0 || rows<calls) :
                         calls!=0 || rows!=0)
                     throw std::runtime_error(
                         "device Engine coherent wide K6 dispatch mismatch");

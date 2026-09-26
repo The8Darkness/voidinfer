@@ -78,6 +78,17 @@ bool fast_device_kv_transaction_enabled() {
     return value && std::strcmp(value,"1")==0;
 }
 std::atomic<std::size_t> hostkv_quarantined_contexts{0};
+// Process-wide ordinary device-KV graph witnesses.  Engine-owned contexts are
+// not reachable from linked qualification tests, so capture/replay counts are
+// mirrored here to prove which graph families actually executed.
+struct OrdinaryGraphProcessCounters {
+    std::atomic<std::uint64_t> gdn_segment_captures{0},gdn_segment_replays{0};
+    std::atomic<std::uint64_t> full_layer_captures{0},full_layer_replays{0};
+    std::atomic<std::uint64_t> mlp_tail_captures{0},mlp_tail_replays{0};
+} ordinary_graph_process_counters;
+void count_ordinary_graph(std::atomic<std::uint64_t>& counter) noexcept {
+    counter.fetch_add(1,std::memory_order_relaxed);
+}
 
 void cuda_check(cudaError_t error, const char* operation) {
     if (error != cudaSuccess) {
@@ -2611,6 +2622,8 @@ struct Exl3TextContext::Impl {
                     entry.executable.instantiate(entry.definition);
                     entry.executable.upload(capture_stream);
                     ++host_kv_gdn_segment_graph_captures;
+                    if(ordinary)count_ordinary_graph(
+                        ordinary_graph_process_counters.gdn_segment_captures);
                 }
             }
             cuda_check(cudaStreamSynchronize(capture_stream),
@@ -2809,6 +2822,7 @@ struct Exl3TextContext::Impl {
                 entry.executable.instantiate(entry.definition);
                 entry.executable.upload(capture_stream);
                 ++ordinary_full_layer_graph_captures;
+                count_ordinary_graph(ordinary_graph_process_counters.full_layer_captures);
             }
             cuda_check(cudaStreamSynchronize(capture_stream),
                 "complete ordinary full-layer graph preparation");
@@ -2876,6 +2890,8 @@ struct Exl3TextContext::Impl {
                     entry.executable.instantiate(entry.definition);
                     entry.executable.upload(capture_stream);
                     ++host_kv_mlp_tail_graph_captures;
+                    if(ordinary)count_ordinary_graph(
+                        ordinary_graph_process_counters.mlp_tail_captures);
                 }
             }
             cuda_check(cudaStreamSynchronize(capture_stream),
@@ -3105,6 +3121,8 @@ struct Exl3TextContext::Impl {
                     static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now()-launch_started).count());
                 ++host_kv_gdn_segment_graph_replays;
+                if(!host_kv.enabled)count_ordinary_graph(
+                    ordinary_graph_process_counters.gdn_segment_replays);
                 const bool arm_retained=rows>1 && continuation_reference &&
                     arm_captured_transaction_prefix;
                 if(arm_retained)for(int captured=layer;captured<layer+3;++captured)
@@ -3346,6 +3364,7 @@ struct Exl3TextContext::Impl {
                     full_layers[layer]->invalidate_retained_prefix();
                     graph.executable.launch(stream);
                     ++ordinary_full_layer_graph_replays;
+                    count_ordinary_graph(ordinary_graph_process_counters.full_layer_replays);
                     if (rows==1 &&
                         std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                         std::fprintf(stderr,
@@ -3390,7 +3409,11 @@ struct Exl3TextContext::Impl {
                     full_layers[layer]->forward(
                         current,next,rows,position,stream,false,
                         continuation_reference,wide_prefill,mlp_tail_graph);
-                    if(mlp_tail_graph)++host_kv_mlp_tail_graph_replays;
+                    if(mlp_tail_graph) {
+                        ++host_kv_mlp_tail_graph_replays;
+                        if(!host_kv.enabled)count_ordinary_graph(
+                            ordinary_graph_process_counters.mlp_tail_replays);
+                    }
                 }
                 if(direct_staged_history) {
                     // Both planes remain leased through the complete attention
@@ -6673,6 +6696,16 @@ Exl3TextContext::ordinary_full_layer_graph_stats() const noexcept {
     return {impl_->ordinary_full_layer_graph_captures,
         impl_->ordinary_full_layer_graph_replays,
         impl_->ordinary_full_layer_graph_capture_ms};
+}
+Exl3TextContext::OrdinaryGraphProcessStats
+Exl3TextContext::ordinary_graph_process_stats_for_test() noexcept {
+    const auto& c=ordinary_graph_process_counters;
+    return {c.gdn_segment_captures.load(std::memory_order_relaxed),
+        c.gdn_segment_replays.load(std::memory_order_relaxed),
+        c.full_layer_captures.load(std::memory_order_relaxed),
+        c.full_layer_replays.load(std::memory_order_relaxed),
+        c.mlp_tail_captures.load(std::memory_order_relaxed),
+        c.mlp_tail_replays.load(std::memory_order_relaxed)};
 }
 Exl3TextContext::HostKVMlpTailGraphStats
 Exl3TextContext::host_kv_mlp_tail_graph_stats() const noexcept {

@@ -685,6 +685,14 @@ public:
         double capture_ms=0.0;
     };
     OrdinaryFullLayerGraphStats ordinary_full_layer_graph_stats() const noexcept;
+    // Process-wide ordinary device-KV graph capture/replay counts for linked
+    // qualification of Engine-owned contexts.
+    struct OrdinaryGraphProcessStats {
+        std::uint64_t gdn_segment_captures=0,gdn_segment_replays=0;
+        std::uint64_t full_layer_captures=0,full_layer_replays=0;
+        std::uint64_t mlp_tail_captures=0,mlp_tail_replays=0;
+    };
+    static OrdinaryGraphProcessStats ordinary_graph_process_stats_for_test() noexcept;
     struct HostKVMlpTailGraphStats {
         std::uint64_t captures=0,replays=0;
         double capture_ms=0.0;
