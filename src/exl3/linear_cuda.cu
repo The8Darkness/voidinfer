@@ -1872,7 +1872,7 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool K7ThreeWord = false, bool PredecodedB = false,
            bool FastK6Decode = false, bool Fp16Accumulate = false,
            bool RegisterPipeline = false, bool GlobalSlices = false,
-           int DeepStages = 0, int Warps = 8>
+           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1>
 __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
@@ -1913,8 +1913,11 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
                   "deep cp.async staging requires the async-A FP32 path");
     constexpr int tile_half = PredecodedB ? 256 : 16 * Bits;
     constexpr int raw_stage_half = output_tiles_per_block * tile_half;
+    static_assert(TilesPerStage == 1 ||
+                      (DeepStages && (TilesPerStage == 2 || TilesPerStage == 4)),
+                  "multi-tile stages require the deep cp.async ring");
     constexpr int raw_stage_count =
-        RegisterPipeline ? 4 : (DeepStages ? DeepStages : 2);
+        RegisterPipeline ? 4 : (DeepStages ? DeepStages * TilesPerStage : 2);
     extern __shared__ half shared[];
     half* sh_a = shared;
     auto* sh_raw = reinterpret_cast<std::uint16_t*>(
@@ -1935,7 +1938,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     const int tile_k_end = min(tile_k_begin + tiles_per_split, tiles_k);
     const std::uint32_t mul1_multiplier = static_cast<std::uint32_t>(*mul1);
 
-    auto prefetch = [&](int tile_k, int stage) {
+    auto prefetch = [&](int tile_k, int stage, bool commit = true) {
         if (tile_k >= tile_k_end) return;
         const std::size_t offset =
             (static_cast<std::size_t>(tile_k) * tiles_n + tile_base) *
@@ -1966,7 +1969,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
                 }
             }
         }
-        exl3_cp_async_commit();
+        if (commit) exl3_cp_async_commit();
     };
 
     if constexpr (!RegisterPipeline && DeepStages == 0) {
@@ -2086,24 +2089,30 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
         __syncthreads();
     } else if constexpr (DeepStages > 0) {
         constexpr int stages = DeepStages;
-        // One committed group per issued tile slot, including empty tail
-        // slots, so wait_pending<stages-2> always completes the current tile.
-        auto issue = [&](int tile_k, int stage) {
-            if (tile_k < tile_k_end) prefetch(tile_k, stage);
-            else exl3_cp_async_commit();
+        constexpr int per = TilesPerStage;
+        // One committed group per stage of `per` consecutive k-tiles,
+        // including empty tail groups, so wait_pending<stages-2> always
+        // completes the current stage. Tiles are consumed in ascending k.
+        auto issue = [&](int group, int stage) {
+            #pragma unroll
+            for (int t = 0; t < per; ++t)
+                prefetch(tile_k_begin + group * per + t, stage * per + t, false);
+            exl3_cp_async_commit();
         };
         #pragma unroll
         for (int preload = 0; preload < stages - 1; ++preload)
-            issue(tile_k_begin + preload, preload);
-        for (int tile_k = tile_k_begin; tile_k < tile_k_end; ++tile_k) {
-            const int relative = tile_k - tile_k_begin;
-            const int stage = relative % stages;
+            issue(preload, preload);
+        const int groups = (tile_k_end - tile_k_begin + per - 1) / per;
+        for (int group = 0; group < groups; ++group) {
             exl3_cp_async_wait_pending<stages - 2>();
             // Also orders the previous iteration's shared reads before the
             // refill of its stage below.
             __syncthreads();
-            issue(tile_k + stages - 1, (relative + stages - 1) % stages);
-
+            issue(group + stages - 1, (group + stages - 1) % stages);
+          #pragma unroll
+          for (int t = 0; t < per; ++t) {
+            if (tile_k_begin + group * per + t >= tile_k_end) break;
+            const int stage = (group % stages) * per + t;
             Exl3FragA a;
             const int r = (lane % 8) + 8 * ((lane / 8) % 2);
             const int base_c = lane / 16;
@@ -2133,6 +2142,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
                 exl3_mma_m16n8k16(a, b0, c[n2]);
                 exl3_mma_m16n8k16(a, b1, c[n2 + 1]);
             }
+          }
         }
         exl3_cp_async_wait();
         __syncthreads();
@@ -9590,20 +9600,20 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
 // Coherent packed producer (K6 down, K7 down/O, wide K6) with the selected
 // cp.async depth and CTA width. Every warp keeps 16 output columns and the
 // full split K range, so narrower CTAs only enlarge the grid.
-template <int Bits, int Stages, int Warps>
+template <int Bits, int Stages, int Warps, int Per = 1>
 static void launch_coherent_packed_variant(
     cudaStream_t stream, const std::uint16_t* transformed,
     const std::uint16_t* trellis, const std::int32_t* mul1, float* accum,
     int rows, int input_features, int output_features, int split_count) {
     constexpr int tiles = Warps;
-    constexpr int stage_count = Stages ? Stages : 2;
+    constexpr int stage_count = (Stages ? Stages : 2) * Per;
     const std::size_t shared =
         static_cast<std::size_t>(stage_count) * 256u * sizeof(half) +
         static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t) +
         16u * tiles * 16u * sizeof(float);
     const int grid = output_features / (16 * tiles) * split_count;
     exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
-        false, false, false, false, false, Stages, Warps><<<
+        false, false, false, false, false, Stages, Warps, Per><<<
         dim3(grid), dim3(Warps * 32), shared, stream>>>(
             transformed, trellis, mul1, accum, rows, input_features,
             output_features, split_count);
@@ -9621,6 +9631,19 @@ int coherent_packed_warps() {
         throw std::invalid_argument("NINFER_EXL3_COHERENT_WARPS must be 8, 4 or 2");
     }();
     return warps;
+}
+
+// NINFER_EXL3_COHERENT_TILES_PER_STAGE: k-tiles per coherent cp.async stage.
+int coherent_tiles_per_stage() {
+    static const int per = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_TILES_PER_STAGE");
+        if (!value || std::strcmp(value, "4") == 0) return 4;  // measured default
+        if (std::strcmp(value, "1") == 0) return 1;
+        if (std::strcmp(value, "2") == 0) return 2;
+        throw std::invalid_argument(
+            "NINFER_EXL3_COHERENT_TILES_PER_STAGE must be 1, 2 or 4");
+    }();
+    return per;
 }
 
 // Small-grid M1 cooperative GEMVs use narrow CTAs by default (measured);
@@ -9644,6 +9667,21 @@ static void launch_coherent_packed_partials(
     int output_features, int split_count) {
     const int stages = coherent_deep_pipeline_stages();
     const int warps = coherent_packed_warps();
+    if (const int per = coherent_tiles_per_stage(); per != 1) {
+        if (stages != 4)
+            throw std::invalid_argument("multi-tile coherent stages require 4 pipeline stages");
+        if (warps == 4 && per == 2) {
+            launch_coherent_packed_variant<Bits, 4, 4, 2>(stream, transformed, trellis,
+                mul1, accum, rows, input_features, output_features, split_count);
+            return;
+        }
+        if (warps == 4 && per == 4) {
+            launch_coherent_packed_variant<Bits, 4, 4, 4>(stream, transformed, trellis,
+                mul1, accum, rows, input_features, output_features, split_count);
+            return;
+        }
+        throw std::invalid_argument("unsupported coherent multi-tile variant");
+    }
     if (warps == 8 && stages == 0) {
         exl3_gemm_m1_generic_mma_kernel<Bits, false, 8, true, true><<<
             dim3(grid), dim3(kThreads), two_stage_bytes, stream>>>(
