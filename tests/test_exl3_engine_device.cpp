@@ -266,13 +266,26 @@ int main() {
                first.speculative.hidden_terminal_rows ||
            first.timings.prefill_seconds<=0 || first.timings.decode_seconds<=0)
             throw std::runtime_error("device Engine output/accounting contract failed");
+        // Warm-only mode serves matched timing arms: the first full-prefix
+        // request above still checks the output contract and warms every
+        // kernel at the measured shape; the repeat and ring-edge gates run in
+        // the dedicated gate invocation instead of every timing arm.
+        const bool warm_only=[] {
+            const auto* option=std::getenv("NINFER_TEST_ENGINE_DEVICE_WARM_ONLY");
+            return option && std::string_view(option)=="1";
+        }();
+        if(warm_only)
+            std::cout<<"COHERENT_DEVICE_ENGINE_WARM_ONLY prompt="<<count
+                     <<" first_output="<<first.generated_token_ids.size()<<'\n';
+        if(!warm_only) {
         const auto again=engine->generate(engine->prepare(prompt),request);
         if(again.generated_token_ids!=first.generated_token_ids ||
            again.reused_prompt_tokens!=0 ||
            !again.token_accounting.conserves_result_tokens(
                again.generated_token_ids.size()))
             throw std::runtime_error("device Engine sequential request isolation failed");
-        if(prefix==4096) {
+        }
+        if(prefix==4096 && !warm_only) {
             auto edge_prompt=prompt;
             const auto edge_count_for=[&](int repeats) {
                 auto& text=edge_prompt.messages.back().parts.front().text;
@@ -579,7 +592,7 @@ int main() {
                  <<" verified="<<first.speculative.verified_rows
                  <<" prefill_seconds="<<first.timings.prefill_seconds
                  <<" decode_seconds="<<first.timings.decode_seconds
-                 <<" repeats_equal=1\n";
+                 <<" repeats_equal="<<(warm_only?"skipped":"1")<<'\n';
         if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_FIRST_IDS_OUT")) {
             engine.reset();
             direct_binary_probe(path,target,draft,options.max_context,
