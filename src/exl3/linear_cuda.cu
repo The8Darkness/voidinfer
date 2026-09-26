@@ -1872,7 +1872,7 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool K7ThreeWord = false, bool PredecodedB = false,
            bool FastK6Decode = false, bool Fp16Accumulate = false,
            bool RegisterPipeline = false, bool GlobalSlices = false,
-           int DeepStages = 0>
+           int DeepStages = 0, int Warps = 8>
 __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
@@ -1882,8 +1882,17 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
                                                  int output_features,
                                                  int split_count) {
     constexpr int output_tiles_per_block = OutputTilesPerBlock;
-    constexpr int fragments_per_warp = output_tiles_per_block / 4;
-    static_assert(output_tiles_per_block == 8 || output_tiles_per_block == 16 ||
+    // Each warp owns fragments_per_warp N8 fragments over the CTA's complete
+    // K range. Narrower CTAs (fewer warps, fewer tiles) keep that per-warp
+    // work and MMA sequence unchanged while multiplying the grid.
+    constexpr int threads = Warps * 32;
+    constexpr int fragments_per_warp = output_tiles_per_block * 2 / Warps;
+    static_assert(Warps == 8 || Warps == 4 || Warps == 2,
+                  "EXL3 packed producer uses 2, 4 or 8 warps");
+    static_assert(output_tiles_per_block * 2 % Warps == 0,
+                  "EXL3 output tiles must divide across warps");
+    static_assert(output_tiles_per_block == 2 || output_tiles_per_block == 4 ||
+                      output_tiles_per_block == 8 || output_tiles_per_block == 16 ||
                       output_tiles_per_block == 32 || output_tiles_per_block == 64,
                   "EXL3 output topology must use a proven tile width");
     static_assert(fragments_per_warp == 2 || fragments_per_warp == 4 ||
@@ -1933,7 +1942,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
             static_cast<std::size_t>(tile_half);
         auto* destination = sh_raw + stage * raw_stage_half;
         const auto* source = trellis + offset;
-        for (int chunk = thread; chunk < raw_stage_half / 8; chunk += kThreads) {
+        for (int chunk = thread; chunk < raw_stage_half / 8; chunk += threads) {
             exl3_cp_async_16(destination + chunk * 8, source + chunk * 8);
         }
         if constexpr (AsyncA) {
@@ -2130,7 +2139,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     } else {
         for (int tile_k = tile_k_begin; tile_k < tile_k_end; ++tile_k) {
             if constexpr (!AsyncA) {
-                for (int i = thread; i < 256; i += kThreads) {
+                for (int i = thread; i < 256; i += threads) {
                     const int row = i / 16;
                     const int column = i % 16;
                     const int source_column =
@@ -2227,7 +2236,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
         const bool first = split == split_count - 1;
         const bool last = split == 0;
         exl3_global_slice_acquire(locks + block % output_blocks, lock_stage);
-        for (int i = thread; i < rows * output_tile_elements; i += kThreads) {
+        for (int i = thread; i < rows * output_tile_elements; i += threads) {
             const int row = i / output_tile_elements;
             const int column = i % output_tile_elements;
             float* destination = accum + row * output_features +
@@ -2240,7 +2249,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
         exl3_global_slice_release(locks + block % output_blocks,
                                   lock_stage + 1, last);
     } else {
-        for (int i = thread; i < rows * output_tile_elements; i += kThreads) {
+        for (int i = thread; i < rows * output_tile_elements; i += threads) {
             const int row = i / output_tile_elements;
             const int column = i % output_tile_elements;
             if constexpr (SingleSplit) {
@@ -2257,7 +2266,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     }
     if constexpr (!SingleSplit && !PartialOnly) {
       if (split == 0) {
-        for (int i = thread; i < rows * output_tile_elements; i += kThreads) {
+        for (int i = thread; i < rows * output_tile_elements; i += threads) {
             const int row = i / output_tile_elements;
             const int column = i % output_tile_elements;
             float value = sh_c[i];
@@ -9578,36 +9587,83 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
     return "unsupported";
 }
 
-// Coherent 128-column packed producer (K6 down, K7 down/O, wide K6) with the
-// selected cp.async depth; the default keeps the established two-stage ring.
+// Coherent packed producer (K6 down, K7 down/O, wide K6) with the selected
+// cp.async depth and CTA width. Every warp keeps 16 output columns and the
+// full split K range, so narrower CTAs only enlarge the grid.
+template <int Bits, int Stages, int Warps>
+static void launch_coherent_packed_variant(
+    cudaStream_t stream, const std::uint16_t* transformed,
+    const std::uint16_t* trellis, const std::int32_t* mul1, float* accum,
+    int rows, int input_features, int output_features, int split_count) {
+    constexpr int tiles = Warps;
+    constexpr int stage_count = Stages ? Stages : 2;
+    const std::size_t shared =
+        static_cast<std::size_t>(stage_count) * 256u * sizeof(half) +
+        static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t) +
+        16u * tiles * 16u * sizeof(float);
+    const int grid = output_features / (16 * tiles) * split_count;
+    exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
+        false, false, false, false, false, Stages, Warps><<<
+        dim3(grid), dim3(Warps * 32), shared, stream>>>(
+            transformed, trellis, mul1, accum, rows, input_features,
+            output_features, split_count);
+}
+
+// NINFER_EXL3_COHERENT_WARPS selects the CTA width: 4 warps (64 columns,
+// measured default), 8 (the former 128-column CTA) or 2.
+int coherent_packed_warps() {
+    static const int warps = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_WARPS");
+        if (!value || std::strcmp(value, "4") == 0) return 4;
+        if (std::strcmp(value, "8") == 0) return 8;
+        if (std::strcmp(value, "4") == 0) return 4;
+        if (std::strcmp(value, "2") == 0) return 2;
+        throw std::invalid_argument("NINFER_EXL3_COHERENT_WARPS must be 8, 4 or 2");
+    }();
+    return warps;
+}
+
+// Small-grid M1 cooperative GEMVs use narrow CTAs by default (measured);
+// NINFER_EXL3_GENERIC_NARROW=0 restores the 512-column CTAs.
+bool generic_narrow_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_GENERIC_NARROW");
+        if (!value) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        throw std::invalid_argument("NINFER_EXL3_GENERIC_NARROW must be 0 or 1");
+    }();
+    return enabled;
+}
+
 template <int Bits>
 static void launch_coherent_packed_partials(
     int grid, std::size_t two_stage_bytes, cudaStream_t stream,
     const std::uint16_t* transformed, const std::uint16_t* trellis,
     const std::int32_t* mul1, float* accum, int rows, int input_features,
     int output_features, int split_count) {
-    switch (coherent_deep_pipeline_stages()) {
-    case 4:
-        exl3_gemm_m1_generic_mma_kernel<Bits, false, 8, true, true, false,
-            false, false, false, false, false, 4><<<
-            dim3(grid), dim3(kThreads), coherent_deep_shared_bytes(Bits, 4), stream>>>(
-                transformed, trellis, mul1, accum, rows, input_features,
-                output_features, split_count);
-        break;
-    case 8:
-        exl3_gemm_m1_generic_mma_kernel<Bits, false, 8, true, true, false,
-            false, false, false, false, false, 8><<<
-            dim3(grid), dim3(kThreads), coherent_deep_shared_bytes(Bits, 8), stream>>>(
-                transformed, trellis, mul1, accum, rows, input_features,
-                output_features, split_count);
-        break;
-    default:
+    const int stages = coherent_deep_pipeline_stages();
+    const int warps = coherent_packed_warps();
+    if (warps == 8 && stages == 0) {
         exl3_gemm_m1_generic_mma_kernel<Bits, false, 8, true, true><<<
             dim3(grid), dim3(kThreads), two_stage_bytes, stream>>>(
                 transformed, trellis, mul1, accum, rows, input_features,
                 output_features, split_count);
-        break;
+        return;
     }
+#define NINFER_COHERENT_VARIANT(S, W)                                          \
+    if (stages == S && warps == W) {                                           \
+        launch_coherent_packed_variant<Bits, S, W>(stream, transformed,        \
+            trellis, mul1, accum, rows, input_features, output_features,       \
+            split_count);                                                      \
+        return;                                                                \
+    }
+    NINFER_COHERENT_VARIANT(4, 8) NINFER_COHERENT_VARIANT(8, 8)
+    NINFER_COHERENT_VARIANT(0, 4) NINFER_COHERENT_VARIANT(4, 4)
+    NINFER_COHERENT_VARIANT(8, 4) NINFER_COHERENT_VARIANT(0, 2)
+    NINFER_COHERENT_VARIANT(4, 2) NINFER_COHERENT_VARIANT(8, 2)
+#undef NINFER_COHERENT_VARIANT
+    throw std::logic_error("unsupported coherent packed producer variant");
 }
 
 void Exl3CudaLinearWorkspace::forward_from_transformed(
@@ -11138,7 +11194,53 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             if(target_k6_small_m_async_a)++target_k6_small_m_async_a_calls_;
             return;
         }
-        if (metadata.K == 6 && target_m1_k6_n32_async_a) {
+        // Narrow M1 CTAs for small grids: each warp keeps 16 output columns
+        // and the same split partition/in-kernel reduction, so results are
+        // unchanged while the grid covers the SMs.
+        const int narrow_warps = rows == 1 && generic_narrow_enabled() &&
+            output_blocks * split_count < 340
+            ? (out_features_ <= 2048 ? 2 : 4) : 0;
+        void* narrow_kernel = nullptr;
+        if (narrow_warps) {
+            const bool k7_async = metadata.K == 7 && target_m1_k7_n32_async_a;
+            const bool k7_three = metadata.K == 7 && target_m1_k7_three_word;
+// Narrow variants also stage A with cp.async and keep three packed tiles in
+// flight; A values and the MMA sequence are unchanged.
+#define NINFER_NARROW(B, A, T, W)                                             \
+    reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<B, false, W, true,  \
+        false, T, false, false, false, false, false, 4, W>)
+            if (metadata.K == 5 && !draft_k5_async_a)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(5, false, false, 2)
+                                                  : NINFER_NARROW(5, false, false, 4);
+            else if (metadata.K == 8)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(8, false, false, 2)
+                                                  : NINFER_NARROW(8, false, false, 4);
+            else if (metadata.K == 7 && k7_async && k7_three)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, true, true, 2)
+                                                  : NINFER_NARROW(7, true, true, 4);
+            else if (metadata.K == 7 && !k7_async && k7_three)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, false, true, 2)
+                                                  : NINFER_NARROW(7, false, true, 4);
+            else if (metadata.K == 7 && !k7_async && !k7_three)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, false, false, 2)
+                                                  : NINFER_NARROW(7, false, false, 4);
+#undef NINFER_NARROW
+        }
+        if (narrow_kernel) {
+            const std::size_t narrow_shared =
+                4u * 256u * sizeof(half) +
+                4u * static_cast<std::size_t>(narrow_warps) * 16u *
+                    static_cast<std::size_t>(metadata.K) * sizeof(std::uint16_t) +
+                16u * static_cast<std::size_t>(narrow_warps) * 16u * sizeof(float);
+            const int narrow_grid = out_features_ / (16 * narrow_warps) * split_count;
+            cuda_check(cudaLaunchCooperativeKernel(narrow_kernel, dim3(narrow_grid),
+                           dim3(narrow_warps * 32), kernel_args, narrow_shared, stream),
+                       "launch EXL3 narrow cooperative split GEMV");
+            static std::atomic<unsigned> reported{0};
+            if (reported.fetch_or(1u << metadata.K) & (1u << metadata.K)) {}
+            else std::fprintf(stderr, "EXL3_GENERIC_NARROW K=%d in=%d out=%d warps=%d grid=%d\n",
+                              metadata.K, in_features_, out_features_, narrow_warps, narrow_grid);
+        } else if (metadata.K == 6 && target_m1_k6_n32_async_a) {
             cuda_check(cudaLaunchCooperativeKernel(
                            reinterpret_cast<void*>(
                                exl3_gemm_m1_generic_mma_kernel<6, false, 32, true>),
