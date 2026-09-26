@@ -678,7 +678,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
-                                                                request, e.error()));
+                                                                request, e.error(),
+                                                                selected_exl3_round(service_->engine_options())));
         write_error(res, e.error());
         return;
     } catch (const std::exception& e) {
@@ -687,7 +688,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         error.type    = "internal_error";
         error.message = e.what();
         log_request_rejected(
-            make_request_rejection_log_context(req_id, "openai_chat_completions", request, error));
+            make_request_rejection_log_context(req_id, "openai_chat_completions", request, error,
+                                               selected_exl3_round(service_->engine_options())));
         write_error(res, error);
         return;
     }
@@ -697,7 +699,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::string model    = request.model;
 
     const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_chat_completions", request, prepared);
+        make_request_log_context(req_id, "openai_chat_completions", request, prepared,
+                                 selected_exl3_round(service_->engine_options()));
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -891,7 +894,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         log_request_rejected(
-            make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));
+            make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error(),
+                                               selected_exl3_round(service_->engine_options())));
         write_messages_error(res, e.error());
         return;
     } catch (const std::exception& e) {
@@ -900,7 +904,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         error.type    = "internal_error";
         error.message = e.what();
         log_request_rejected(
-            make_request_rejection_log_context(req_id, "anthropic_messages", request, error));
+            make_request_rejection_log_context(req_id, "anthropic_messages", request, error,
+                                               selected_exl3_round(service_->engine_options())));
         write_messages_error(res, error);
         return;
     }
@@ -910,7 +915,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const int input_tokens  = prepared.prompt_tokens;
 
     const RequestLogContext log_context =
-        make_request_log_context(req_id, "anthropic_messages", request, prepared);
+        make_request_log_context(req_id, "anthropic_messages", request, prepared,
+                                 selected_exl3_round(service_->engine_options()));
     log_request_start(log_context);
 
     if (!request.stream) {

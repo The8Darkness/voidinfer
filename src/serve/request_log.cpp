@@ -143,6 +143,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "vericache-nvfp4";
     case ninfer::KvCacheStorage::Float16Host:
         return "fp16-host";
+    case ninfer::KvCacheStorage::Float16Device:
+        return "fp16-device";
     }
     return "unknown";
 }
@@ -218,10 +220,16 @@ Json overrides_json(const ninfer::SamplingOverrides& overrides) {
     return result;
 }
 
+Json selected_exl3_round_json(std::optional<Exl3RoundImplementation> implementation) {
+    return implementation ? Json(std::string(exl3_round_implementation_name(*implementation)))
+                          : Json(nullptr);
+}
+
 Json request_json(const RequestLogContext& context) {
     Json thinking_budget = nullptr;
     if (context.thinking_budget) { thinking_budget = *context.thinking_budget; }
     return Json{{"request_id", context.id},
+                {"selected_exl3_round", selected_exl3_round_json(context.selected_exl3_round)},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -262,6 +270,7 @@ Json preparation_json(const RequestLogContext& context) {
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
     return Json{{"request_id", context.id},
+                {"selected_exl3_round", selected_exl3_round_json(context.selected_exl3_round)},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -480,11 +489,19 @@ std::string speculative_str(const GenerationMetrics& metrics) {
 
 } // namespace
 
+std::optional<Exl3RoundImplementation>
+selected_exl3_round(const ninfer::EngineOptions& engine_options) noexcept {
+    if (!engine_options.exl3_package) { return std::nullopt; }
+    return engine_options.exl3_package->round_implementation;
+}
+
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
-                                           const PreparedRequest& prepared) {
+                                           const PreparedRequest& prepared,
+                                           std::optional<Exl3RoundImplementation> selected_round) {
     RequestLogContext context;
     context.id                                 = id;
+    context.selected_exl3_round                = selected_round;
     context.protocol                           = std::move(protocol);
     context.model                              = request.model;
     context.stream                             = request.stream;
@@ -508,9 +525,11 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
 RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               std::string protocol,
                                                               const GenerationRequest& request,
-                                                              ApiError error) {
+                                                              ApiError error,
+                                                              std::optional<Exl3RoundImplementation> selected_round) {
     RequestRejectionLogContext context;
     context.id                                 = id;
+    context.selected_exl3_round                = selected_round;
     context.protocol                           = std::move(protocol);
     context.model                              = request.model;
     context.stream                             = request.stream;
@@ -538,6 +557,10 @@ std::string format_request_start(const RequestLogContext& context) {
         << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
         << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
         << " sampler=[" << sampler_str(context.sampling) << ']';
+    if (context.selected_exl3_round) {
+        out << " selected_exl3_round="
+            << exl3_round_implementation_name(*context.selected_exl3_round);
+    }
     if (context.thinking_budget) { out << " thinking_budget=" << *context.thinking_budget; }
     if (context.media_item_count != 0) {
         out << " prepare=" << seconds_str(context.preparation.seconds)
@@ -559,6 +582,10 @@ std::string format_request_rejected(const RequestRejectionLogContext& context) {
         << (context.stream ? "stream" : "non-stream") << " msgs=" << context.message_count
         << " media=" << context.media_item_count << " tools=" << context.tool_count
         << " status=" << context.error.status;
+    if (context.selected_exl3_round) {
+        out << " selected_exl3_round="
+            << exl3_round_implementation_name(*context.selected_exl3_round);
+    }
     if (!context.error.code.empty()) { out << " code=" << context.error.code; }
     out << " message=" << context.error.message;
     return out.str();
@@ -715,6 +742,7 @@ std::string format_server_start_json(
         cache.device_state_slots.value();
     record["engine"] = Json{
         {"device", engine_options.device},
+        {"selected_exl3_round", selected_exl3_round_json(selected_exl3_round(engine_options))},
         {"max_context", engine_options.max_context},
         {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
         {"kv_capacity", memory.kv_capacity},

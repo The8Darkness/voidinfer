@@ -77,6 +77,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
     require(prefix>=16 && prefix+outputs<=target.max_context() && outputs>=8 && pairs>=1,"real DFlash extents");
     std::filesystem::create_directories(output);
     std::ofstream checks(output/"checks.csv"),runs(output/"runs.csv"),gaps(output/"releases.csv"),workloads(output/"workloads.csv");
+    std::ofstream gopt(output/"gopt.csv");
+    gopt<<"fixture,pair,arm,request,id,target_context_submissions,draft_request_submissions\n";
     workloads<<"fixture,pair,arm,requests,useful_outputs,wall_ms,context_constructions,final_exact\n";
     checks<<"fixture,case,pass\n";
     runs<<"fixture,pair,arm,wall_ms,construct_ms,acquire_ms,decode_ms,release_ms,teardown_ms,proposal_calls,proposed_rows,verified_rows,replayed_rows,accepted_rows,committed_rows,publications,first_release_ms,proposal_ms,l2_ms,registry_ms,persistent_bytes,h2d,d2h,suffix_calls,suffix_rows,suffix_misses,suffix_metadata_bytes,horizon_policy_enabled,final_horizon,observed_suffix,failed_suffix,censored_suffix,selector_batched_anchor_chain_calls,fast_mia_parity_w1_settlements,gdn_graph_replays,gdn_graph_launch_cpu_ns,full_layer_graph_replays,full_layer_graph_launch_cpu_ns,exact\n";
@@ -2352,6 +2354,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         return;
     }
     struct Result {
+        ninfer::exl3::GoptSubmissions gaming_target{},gaming_draft{};
         Root root;std::vector<std::int64_t> tokens;std::vector<int> partitions;
         std::array<std::vector<std::uint16_t>,5> taps;
         double wall=0,construct=0,acquire=0,decode=0,release=0,teardown=0,first=0,registry=0;
@@ -2481,6 +2484,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             return token_equal && state_equal && taps_equal && ring_equal;
         };
         const auto run=[&](bool reuse,bool correct,int pair){
+            const auto gopt_draft_before=draft.gaming_submissions();
             Result r;std::unique_ptr<Lane> cold;const auto begin=Clock::now();
             std::unique_ptr<ninfer::NvtxRange> request_range;
             if(decode_nvtx_enabled && !correct)request_range=std::make_unique<ninfer::NvtxRange>(
@@ -2640,6 +2644,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 if(!correct)gaps<<name<<','<<pair<<','<<(reuse?"reused":"cold")<<','<<r.partitions.size()<<','<<published.tokens.size()<<','<<ms(begin,Clock::now())<<'\n';
             }
             r.decode=ms(decode,Clock::now());r.root=lane.lease().root;r.bytes=lane.persistent_bytes();
+            r.gaming_target=lane.context().gaming_submissions();
+            r.gaming_draft=draft.gaming_submissions();
+            for(unsigned i=0;i<r.gaming_draft.size();++i)r.gaming_draft[i]-=gopt_draft_before[i];
             r.policy=lane.verifier_horizon_policy().counters();r.horizon=lane.verifier_horizon_policy().horizon(8);
             const auto transfer1=lane.context().host_kv_stats();r.h2d=transfer1.h2d_bytes-transfer0.h2d_bytes;r.d2h=transfer1.d2h_bytes-transfer0.d2h_bytes;
             const auto gdn_graph1=lane.context().host_kv_gdn_segment_graph_stats();
@@ -3718,6 +3725,10 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             const bool final_exact=equal(results.back(),false);
             workloads<<name<<','<<pair<<','<<(reuse?"reused":"cold")<<",3,"<<3*outputs<<','<<workload_wall<<','<<(reuse?1:3)<<','<<final_exact<<'\n';workloads.flush();
             for(int request=0;request<3;++request){const auto& r=results[request];const bool exact=r.tokens==expected && final_exact;
+            for(unsigned i=0;i<r.gaming_target.size();++i)
+                gopt<<name<<','<<pair<<','<<(reuse?"reused":"cold")<<','<<request<<','<<i+1<<','
+                    <<r.gaming_target[i]<<','<<r.gaming_draft[i]<<'\n';
+            gopt.flush();
             const bool candidate_telemetry_exact=
                 (env("NINFER_DFLASH2_FUSED_SELECTOR")=="1" ?
                     r.selector_batched_anchor_chain_calls==0 :

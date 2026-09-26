@@ -1,24 +1,5 @@
 #pragma once
 
-class TargetGateupK7EnvironmentRestore {
-public:
-    TargetGateupK7EnvironmentRestore()
-        : k6_(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M")),
-          k7_(env("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M")),
-          m1_k7_async_(env("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A")),
-          splits_(env("NINFER_EXL3_GENERIC_SPLITS")) {}
-    ~TargetGateupK7EnvironmentRestore() {
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", k6_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M", k7_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", m1_k7_async_.c_str());
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", splits_.c_str());
-    }
-private:
-    std::string k6_;
-    std::string k7_;
-    std::string m1_k7_async_;
-    std::string splits_;
-};
 
 void run_target_gateup_k7_qualification(
     Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
@@ -29,7 +10,11 @@ void run_target_gateup_k7_qualification(
     require(oscar, "target gate/up K7 qualification requires canonical OSCAR");
     require(env("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M") == "0",
             "target gate/up K7 qualification must start at explicit flag0");
-    TargetGateupK7EnvironmentRestore restore;
+    ninfer::test::ScopedEnvironmentRestore restore{
+        "NINFER_EXL3_TARGET_GATEUP_SMALL_M",
+        "NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M",
+        "NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A",
+        "NINFER_EXL3_GENERIC_SPLITS"};
     _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "0");
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "5");
     _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");

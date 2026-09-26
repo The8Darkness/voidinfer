@@ -17,11 +17,13 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 17;
+inline constexpr int kRequestLogSchemaVersion        = 18;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
     std::uint64_t id = 0;
+    // Selected package configuration, not proof that a round dispatched.
+    std::optional<Exl3RoundImplementation> selected_exl3_round;
     std::string protocol;
     std::string model;
     bool stream                             = false;
@@ -46,6 +48,7 @@ struct RequestLogContext {
 // resolved when preparation rejects the request.
 struct RequestRejectionLogContext {
     std::uint64_t id = 0;
+    std::optional<Exl3RoundImplementation> selected_exl3_round;
     std::string protocol;
     std::string model;
     bool stream                             = false;
@@ -81,13 +84,18 @@ struct ThroughputReport {
     ninfer::RuntimeStats current;
 };
 
+[[nodiscard]] std::optional<Exl3RoundImplementation>
+selected_exl3_round(const ninfer::EngineOptions& engine_options) noexcept;
+
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
-                                           const PreparedRequest& prepared);
+                                           const PreparedRequest& prepared,
+                                           std::optional<Exl3RoundImplementation> selected_round = std::nullopt);
 RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               std::string protocol,
                                                               const GenerationRequest& request,
-                                                              ApiError error);
+                                                              ApiError error,
+                                                              std::optional<Exl3RoundImplementation> selected_round = std::nullopt);
 
 // Compact console records retained for operator visibility.
 std::string format_request_start(const RequestLogContext& context);

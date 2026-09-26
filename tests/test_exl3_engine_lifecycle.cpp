@@ -30,6 +30,7 @@
 #include "exl3/vericache_request.h"
 #include "test_exl3_registered_kv_preflight.h"
 #include "test_exl3_future_context_matrix.h"
+#include "test_exl3_device_logical_lease.h"
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -58,6 +59,12 @@ struct CancellingSink : OutputSink {
     void publish(OutputDelta d)override{text+=d.text;cancel=true;}
 };
 int main(){try{
+    if(const auto* mode=std::getenv("NINFER_TEST_DEVICE_LOGICAL_HOST");
+       mode && std::string_view(mode)=="1") {
+        run_device_logical_invalid_handle_host_only();
+        std::cout<<"DEVICE_LOGICAL_HOST_COMPLETE device_execution=0\n";
+        return 0;
+    }
     if(const auto* mode=std::getenv("NINFER_TEST_GRAPH_NUMERICAL_BOUNDARY");
        mode && std::string_view(mode)=="1") {
         using Boundary=ninfer::exl3::Exl3GraphNumericalBoundary;
@@ -1748,6 +1755,12 @@ int main(){try{
     }
     const auto* target=std::getenv("NINFER_EXL3_TARGET_PATH");const auto* draft=std::getenv("NINFER_EXL3_DFLASH2_PATH");
     if(!target || !draft)return 77;
+    if(const auto* mode=std::getenv("NINFER_TEST_DEVICE_LOGICAL_MODEL");
+       mode && std::string_view(mode)=="1") {
+        run_device_logical_model_contract(target,draft);
+        std::cout<<"DEVICE_LOGICAL_MODEL_COMPLETE\n";
+        return 0;
+    }
     if(const auto* mode=std::getenv("NINFER_TEST_PREFIX_CONSTRUCTOR_CREDITS");mode && *mode) {
         using namespace ninfer::exl3;using Cache=Exl3DevicePrefixCache;
         const std::string_view selector(mode);
@@ -8904,7 +8917,10 @@ int main(){try{
             auto first=engine.generate(std::move(prepared),request);
             need(first.speculative.drafted_tokens>0 && !first.content.empty(),"real draft output missing");
             const auto require_complete_route=[](const GenerationResult& value) {
-                need(value.speculative.proposed_rows==value.speculative.drafted_tokens &&
+                // The complete proposal includes one target seed per published
+                // round; drafted_tokens counts only the generated continuation.
+                need(value.speculative.proposed_rows==
+                        value.speculative.drafted_tokens+value.speculative.rounds &&
                     value.speculative.verified_rows>=value.speculative.committed_model_rows &&
                     value.speculative.replayed_rows<=value.speculative.verified_rows &&
                     value.speculative.committed_model_rows==

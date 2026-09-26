@@ -33,19 +33,6 @@ void capture_draft_small_projection(
     captured.push_back(std::move(item));
 }
 
-class DraftSmallEnvironmentRestore {
-public:
-    DraftSmallEnvironmentRestore()
-        : candidate_(env("NINFER_EXL3_DRAFT_SMALL_M")),
-          splits_(env("NINFER_EXL3_GENERIC_SPLITS")) {}
-    ~DraftSmallEnvironmentRestore() {
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", candidate_.c_str());
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", splits_.c_str());
-    }
-private:
-    std::string candidate_;
-    std::string splits_;
-};
 
 struct DraftSmallGraph {
     cudaGraph_t graph = nullptr;
@@ -263,7 +250,9 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
     require(oscar, "draft-small qualification requires canonical OSCAR routing");
     require(env("NINFER_EXL3_DRAFT_SMALL_M") == "0",
             "draft-small real capture must start from explicit flag0 baseline");
-    DraftSmallEnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment{
+        "NINFER_EXL3_DRAFT_SMALL_M",
+        "NINFER_EXL3_GENERIC_SPLITS"};
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
     int device = 0;
     cudaDeviceProp device_properties{};

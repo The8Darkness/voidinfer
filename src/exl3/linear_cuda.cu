@@ -1,4 +1,5 @@
 #include "exl3/linear_cuda.h"
+#include "exl3/environment_options.h"
 #include "exl3/projection_lifetime.h"
 #include "exl3/paired_transform_extent.h"
 #include "exl3/reconstruction_stream.h"
@@ -9,6 +10,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cooperative_groups.h>
 #include "exl3/mia_exllamav3/quant/exl3_gemv_int8_kernel.cuh"
 #include "exl3/mia_exllamav3/quant/native_persistent_gemm_inner.cuh"
@@ -45,6 +47,21 @@ constexpr std::uint16_t kMul1BiasHalf = 0xc931u;
 constexpr int kShape4OutputBlocks = kTilesN / 32;
 constexpr int kShape4Splits = Exl3LinearWorkspaceRequirements::accumulation_splits;
 constexpr int kShape4CooperativeGrid = kShape4OutputBlocks * kShape4Splits;
+// N8 x M16 scratch for the shared K6 down arithmetic. M1 and M2..8 use the
+// same packed decode, FP32 row accumulators, K partitions, and output epilogue.
+// The same packed N8/M16 producer serves each reached wide K6 target shape.
+constexpr std::size_t kCoherentWideK6SharedBytes =
+    2u * 256u * sizeof(half) + 2u * 8u * 16u * 6u * sizeof(std::uint16_t) +
+    16u * 128u * sizeof(float);
+constexpr std::size_t kCoherentDownK6SharedBytes =
+    2u * 256u * sizeof(half) + 2u * 8u * 16u * 6u * sizeof(std::uint16_t) +
+    16u * 128u * sizeof(float);
+constexpr std::size_t kCoherentDownK7SharedBytes =
+    2u * 256u * sizeof(half) + 2u * 8u * 16u * 7u * sizeof(std::uint16_t) +
+    16u * 128u * sizeof(float);
+constexpr std::size_t kCoherentOK7SharedBytes =
+    2u * 256u * sizeof(half) + 2u * 8u * 16u * 7u * sizeof(std::uint16_t) +
+    16u * 128u * sizeof(float);
 constexpr std::size_t kShape4SharedBytes =
     256u * sizeof(half) + 2u * 32u * 80u * sizeof(std::uint16_t) +
     16u * 512u * sizeof(float);
@@ -882,6 +899,43 @@ __global__ void output_hadamard_fp16_inplace_kernel(
         __half_as_ushort(__hmul(normalized, scale));
 }
 
+// Bulk down projections already write the GEMM destination as FP16.
+// Preserve its represented down value before performing the same FP32-add,
+// FP16-store boundary as GDN's separate residual kernel. The final diagnostic
+// rows have a separate owner because the normal output aliases down.
+__global__ void output_hadamard_fp16_residual_kernel(
+    std::uint16_t* output, const std::uint16_t* svh,
+    const std::uint16_t* residual, std::uint16_t* down_trace,
+    int trace_row_base, int rows, int output_features) {
+    __shared__ float values[kHadamard];
+    const int row = static_cast<int>(blockIdx.x);
+    const int block = static_cast<int>(blockIdx.y);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kHadamard) return;
+    const int offset = block * kHadamard + lane;
+    const auto index = static_cast<std::size_t>(row) * output_features + offset;
+    values[lane] = __half2float(__ushort_as_half(output[index]));
+    __syncthreads();
+    for (int width = 1; width < kHadamard; width *= 2) {
+        if ((lane % (2 * width)) < width) {
+            const float left = values[lane];
+            const float right = values[lane + width];
+            values[lane] = left + right;
+            values[lane + width] = left - right;
+        }
+        __syncthreads();
+    }
+    const auto normalized = __float2half_rn(values[lane] * kHadamardScale);
+    const auto scale = __ushort_as_half(svh[offset]);
+    const auto down_half = __hmul(normalized, scale);
+    if (down_trace && row >= trace_row_base)
+        down_trace[static_cast<std::size_t>(row - trace_row_base) *
+                   output_features + offset] = __half_as_ushort(down_half);
+    output[index] = __half_as_ushort(__float2half_rn(
+        __half2float(__ushort_as_half(residual[index])) +
+        __half2float(down_half)));
+}
+
 // Ascending split reduction followed by the unchanged output Hadamard.
 // V6 donor reconstruction uses the destination dtype for the GEMM result as
 // well as the Hadamard. Keep this separate from the historical T69 candidate.
@@ -913,7 +967,7 @@ __global__ void v6_output_hadamard_kernel(const float* accum,
 }
 
 template<bool ShuffleLocal=false,bool MinimalBarriers=false,
-         bool PrefetchSplitPlanes=false>
+         bool PrefetchSplitPlanes=false,bool Fp16GemmDestination=false>
 __global__ void prefill_reduce_output_kernel(const float* accum,
                                        const std::uint16_t* svh,
                                        std::uint16_t* output,
@@ -944,6 +998,11 @@ __global__ void prefill_reduce_output_kernel(const float* accum,
         for (int split = 1; split < split_count; ++split)
             value += accum[split * stride + index];
     }
+    // The reached K5 bulk-MLP comparator writes its FP32-compute GEMM result
+    // to FP16 before SVH/Hadamard. Retain that represented boundary when the
+    // packed MMA leaf writes its partial into this FP32 scratch plane.
+    if constexpr(Fp16GemmDestination)
+        value=__half2float(__float2half_rn(value));
     float transformed_value;
     if constexpr(ShuffleLocal) {
         // Widths 1..16 are warp-local. Every lane computes the same output
@@ -2119,6 +2178,120 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
             accum[row * output_features + tile_base * 16 + column] = value;
         }
       }
+    }
+}
+
+// One CTA owns a complete 128-column Hadamard group for up to eight rows.
+// Unlike the split small-M path, its packed MMA result stays in shared memory
+// through the output transform: no global FP32 partials or reduction launch.
+// The bounded K6 down shape is the first admitted owner of this dataflow.
+__global__ void exl3_small_m_down_fused_output_kernel(
+    const std::uint16_t* transformed, const std::uint16_t* trellis,
+    const std::int32_t* mul1, const std::uint16_t* svh,
+    std::uint16_t* output, int rows, int input_features,
+    int output_features) {
+    constexpr int output_tiles = 8;
+    constexpr int raw_stage_half = output_tiles * 16 * 6;
+    __shared__ half sh_a[256];
+    __shared__ std::uint16_t sh_raw[2 * raw_stage_half];
+    __shared__ float sh_c[16 * kHadamard];
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / 32;
+    const int lane = thread & 31;
+    const int tile_base = static_cast<int>(blockIdx.x) * output_tiles;
+    const int tiles_n = output_features / 16;
+    const int tiles_k = input_features / 16;
+    const std::uint32_t multiplier = static_cast<std::uint32_t>(*mul1);
+    auto prefetch = [&](int tile_k, int stage) {
+        if (tile_k >= tiles_k) return;
+        const std::size_t offset =
+            (static_cast<std::size_t>(tile_k) * tiles_n + tile_base) * 16u * 6u;
+        auto* destination = sh_raw + stage * raw_stage_half;
+        const auto* source = trellis + offset;
+        for (int chunk = thread; chunk < raw_stage_half / 8; chunk += kThreads)
+            exl3_cp_async_16(destination + chunk * 8, source + chunk * 8);
+        exl3_cp_async_commit();
+    };
+    prefetch(0, 0);
+    exl3_cp_async_wait();
+    __syncthreads();
+    Exl3FragC c[2];
+    #pragma unroll
+    for (auto& fragment : c)
+        for (float& value : fragment.values) value = 0.0f;
+    int raw_stage = 0;
+    for (int tile_k = 0; tile_k < tiles_k; ++tile_k) {
+        for (int i = thread; i < 256; i += kThreads) {
+            const int row = i / 16;
+            const int column = i % 16;
+            const int source_column =
+                (column / 8 ^ ((row >> 2) & 1)) * 8 + column % 8;
+            sh_a[i] = row < rows
+                ? __ushort_as_half(transformed[row * input_features +
+                                               tile_k * 16 + source_column])
+                : __float2half_rn(0.0f);
+        }
+        __syncthreads();
+        prefetch(tile_k + 1, 1 - raw_stage);
+        Exl3FragA a;
+        const int r = (lane % 8) + 8 * ((lane / 8) % 2);
+        const int base_c = lane / 16;
+        const int c_swizzled = base_c ^ ((r >> 2) & 1);
+        exl3_ldsm4(a, sh_a + r * 16 + c_swizzled * 8);
+        const auto* packed = reinterpret_cast<const std::uint32_t*>(
+            sh_raw + raw_stage * raw_stage_half + warp * 16 * 6);
+        Exl3FragB b0, b1;
+        exl3_dq4_generic<6>(packed, lane << 3, b0, multiplier);
+        exl3_dq4_generic<6>(packed, (lane << 3) + 4, b1, multiplier);
+        exl3_mma_m16n8k16(a, b0, c[0]);
+        exl3_mma_m16n8k16(a, b1, c[1]);
+        if (tile_k + 1 < tiles_k) {
+            exl3_cp_async_wait();
+            __syncthreads();
+        }
+        raw_stage = 1 - raw_stage;
+    }
+    const int r0 = lane / 4;
+    const int r1 = r0 + 8;
+    const int column = (lane % 4) * 2;
+    #pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        if (r0 < rows) {
+            float* destination = sh_c + r0 * kHadamard + warp * 16 + n * 8 + column;
+            destination[0] = c[n].values[0];
+            destination[1] = c[n].values[1];
+        }
+        if (r1 < rows) {
+            float* destination = sh_c + r1 * kHadamard + warp * 16 + n * 8 + column;
+            destination[0] = c[n].values[2];
+            destination[1] = c[n].values[3];
+        }
+    }
+    __syncthreads();
+    // Two 128-thread groups transform one row each, four passes for M=8.
+    const int row_lane = thread & (kHadamard - 1);
+    const int row_group = thread / kHadamard;
+    for (int row_base = 0; row_base < rows; row_base += 2) {
+        const int row = row_base + row_group;
+        for (int width = 1; width < kHadamard; width *= 2) {
+            if (row < rows && row_lane % (2 * width) < width) {
+                const int index = row * kHadamard + row_lane;
+                const float left = sh_c[index];
+                const float right = sh_c[index + width];
+                sh_c[index] = left + right;
+                sh_c[index + width] = left - right;
+            }
+            __syncthreads();
+        }
+        if (row < rows) {
+            const int offset = static_cast<int>(blockIdx.x) * kHadamard + row_lane;
+            const float value = sh_c[row * kHadamard + row_lane];
+            const auto normalized = __float2half_rn(value * kHadamardScale);
+            const auto scale = __ushort_as_half(svh[offset]);
+            output[row * output_features + offset] =
+                __half_as_ushort(__hmul(normalized, scale));
+        }
+        __syncthreads();
     }
 }
 
@@ -3457,10 +3630,9 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
        (transformed.data!=nullptr && transformed.bytes<requirement.transformed_bytes))
         throw std::invalid_argument("EXL3 borrowed transform capacity");
     requirement.require_disjoint_borrowed_views(transformed.data,accumulation.data);
-    const char* stream_reduce=std::getenv("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION");
-    if(stream_reduce && std::strcmp(stream_reduce,"0")!=0 && std::strcmp(stream_reduce,"1")!=0)
-        throw std::invalid_argument("K6 small-M stream reduction must be0 or1");
-    k6_stream_reduction_enabled_=target_wide_prefill_owner && stream_reduce && std::strcmp(stream_reduce,"1")==0;
+    const bool stream_reduce = read_binary_option("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",
+        "K6 small-M stream reduction must be0 or1");
+    k6_stream_reduction_enabled_ = target_wide_prefill_owner && stream_reduce;
     const char* extended=std::getenv("NINFER_EXL3_EXTENDED_STREAM_REDUCTION");
     if(extended&&std::strcmp(extended,"0")!=0&&std::strcmp(extended,"1")!=0)
         throw std::invalid_argument("extended target stream reduction must be0 or1");
@@ -3474,10 +3646,9 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
          std::strcmp(host_kv_gdn_segment_graphs,"1")==0) ||
         (host_kv_mlp_tail_graphs &&
          std::strcmp(host_kv_mlp_tail_graphs,"1")==0);
-    const char* kv_stream=std::getenv("NINFER_EXL3_KV_K7_STREAM_REDUCTION");
-    if(kv_stream && std::strcmp(kv_stream,"0")!=0 && std::strcmp(kv_stream,"1")!=0)
-        throw std::invalid_argument("K7 KV stream reduction must be 0 or 1");
-    kv_k7_stream_reduction_enabled_=target_kv_owner && kv_stream && std::strcmp(kv_stream,"1")==0;
+    const bool kv_stream = read_binary_option("NINFER_EXL3_KV_K7_STREAM_REDUCTION",
+        "K7 KV stream reduction must be 0 or 1");
+    kv_k7_stream_reduction_enabled_ = target_kv_owner && kv_stream;
     // Widen only explicit staged target prefill, with construction-latched opt-in.
     const char* wide64 = std::getenv("NINFER_EXL3_PREFILL_WIDE64");
     target_wide64_enabled_ = wide64 && std::strcmp(wide64, "1") == 0;
@@ -3500,14 +3671,10 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     // kernels; it never selects an alternate arithmetic route.
     prefill_projection_graph_enabled_ = target_wide_prefill_owner &&
         projection_graphs && std::strcmp(projection_graphs,"1") == 0;
-    const char* persisting_l2=
-        std::getenv("NINFER_EXL3_PREFILL_PERSISTING_L2");
-    if(persisting_l2 && std::strcmp(persisting_l2,"0")!=0 &&
-       std::strcmp(persisting_l2,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_PERSISTING_L2 must be 0 or 1");
-    prefill_persisting_l2_enabled_=target_wide_prefill_owner &&
-        persisting_l2 && std::strcmp(persisting_l2,"1")==0;
+    const bool persisting_l2 = read_binary_option("NINFER_EXL3_PREFILL_PERSISTING_L2",
+        "NINFER_EXL3_PREFILL_PERSISTING_L2 must be 0 or 1");
+    prefill_persisting_l2_enabled_ = target_wide_prefill_owner &&
+        persisting_l2;
     if(prefill_persisting_l2_enabled_) {
         int device=0,maximum=0;
         if(cudaGetDevice(&device)==cudaSuccess &&
@@ -3665,28 +3832,49 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     fast_same_weights_fp16_accum_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_accum &&
         std::strcmp(fast_same_weights_fp16_accum, "1") == 0;
-    const char* fast_same_weights_fp16_m1 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1");
-    if (fast_same_weights_fp16_m1 &&
-        std::strcmp(fast_same_weights_fp16_m1, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16_m1, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1 must be 0 or 1");
-    }
+    const bool fast_same_weights_fp16_m1 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1 must be 0 or 1");
     fast_same_weights_fp16_m1_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16_m1 &&
-        std::strcmp(fast_same_weights_fp16_m1, "1") == 0;
-    const char* fast_same_weights_fp16_m1_n16 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16");
-    if (fast_same_weights_fp16_m1_n16 &&
-        std::strcmp(fast_same_weights_fp16_m1_n16, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16_m1_n16, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16 must be 0 or 1");
-    }
+        fast_same_weights_fp16_m1;
+    fast_fp16_m2_8_down_enabled_ = target_down_owner &&
+        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_DOWN_K6",
+            "fast FP16 M2-8 down K6 must be 0 or 1");
+    fast_fp16_m2_8_fused_down_enabled_ = target_down_owner &&
+        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6",
+            "fast FP16 M2-8 fused down K6 must be 0 or 1");
+    const bool coherent_wide_k6_requested =
+        read_binary_option("NINFER_EXL3_TARGET_COHERENT_WIDE_K6",
+            "coherent wide K6 must be 0 or 1");
+    coherent_wide_k6_operation_ =
+        target_q_k6_owner && in_features_ == 5120 && out_features_ == 12288 ? 0 :
+        target_qkv_k6_owner && in_features_ == 5120 && out_features_ == 10240 ? 1 :
+        target_z_k6_owner && in_features_ == 5120 && out_features_ == 6144 ? 2 :
+        target_o_k7_owner && in_features_ == 6144 && out_features_ == 5120 ? 3 :
+        target_gateup_owner && in_features_ == 5120 && out_features_ == 17408 ? 4 : -1;
+    coherent_wide_k6_enabled_ = coherent_wide_k6_requested &&
+        coherent_wide_k6_operation_ >= 0;
+    coherent_wide_k6_split10_enabled_ = coherent_wide_k6_enabled_ &&
+        read_binary_option("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",
+            "coherent wide K6 split10 must be 0 or 1");
+    coherent_down_k6_enabled_ = target_down_owner &&
+        read_binary_option("NINFER_EXL3_COHERENT_DOWN_K6",
+            "coherent K6 down must be 0 or 1");
+    coherent_down_k7_enabled_ = target_down_owner &&
+        read_binary_option("NINFER_EXL3_COHERENT_DOWN_K7",
+            "coherent K7 down must be 0 or 1");
+    coherent_o_k7_enabled_ = target_o_k7_owner &&
+        read_binary_option("NINFER_EXL3_COHERENT_O_K7",
+            "coherent K7 O must be 0 or 1");
+    fast_fp16_m2_8_all_enabled_ = target_m1_owner &&
+        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8",
+            "fast FP16 M2-8 must be 0 or 1");
+    fast_fp16_m2_8_async_a_enabled_ = target_m1_owner &&
+        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_ASYNC_A",
+            "fast FP16 M2-8 async A must be 0 or 1");
+    const bool fast_same_weights_fp16_m1_n16 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16 must be 0 or 1");
     fast_same_weights_fp16_m1_n16_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_n16 &&
-        std::strcmp(fast_same_weights_fp16_m1_n16, "1") == 0;
+        fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_n16;
     const char* fast_same_weights_fp16_m1_k6_register_pipeline =
         std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_K6_REGISTER_PIPELINE");
     if (fast_same_weights_fp16_m1_k6_register_pipeline &&
@@ -3783,28 +3971,13 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         std::strcmp(fast_native_persistent_m1_only, "6") == 0 ? 6 :
         fast_native_persistent_m1_only &&
         std::strcmp(fast_native_persistent_m1_only, "7") == 0 ? 7 : 0;
-    const char* fast_same_weights_fp16_m1_wide =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE");
-    if (fast_same_weights_fp16_m1_wide &&
-        std::strcmp(fast_same_weights_fp16_m1_wide, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16_m1_wide, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE must be 0 or 1");
-    }
+    const bool fast_same_weights_fp16_m1_wide = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE must be 0 or 1");
     fast_same_weights_fp16_m1_wide_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_wide &&
-        std::strcmp(fast_same_weights_fp16_m1_wide, "1") == 0;
-    const char* fast_same_weights_fp16_m1_wide_n32 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32");
-    if (fast_same_weights_fp16_m1_wide_n32 &&
-        std::strcmp(fast_same_weights_fp16_m1_wide_n32, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16_m1_wide_n32, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32 must be 0 or 1");
-    }
-    fast_same_weights_fp16_m1_wide_n32_enabled_ =
-        fast_same_weights_fp16_m1_wide_enabled_ && fast_same_weights_fp16_m1_wide_n32 &&
-        std::strcmp(fast_same_weights_fp16_m1_wide_n32, "1") == 0;
+        fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_wide;
+    const bool fast_same_weights_fp16_m1_wide_n32 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32 must be 0 or 1");
+    fast_same_weights_fp16_m1_wide_n32_enabled_ = fast_same_weights_fp16_m1_wide_enabled_ && fast_same_weights_fp16_m1_wide_n32;
     const char* fast_same_weights_fp16_m1_wide_k5 =
         std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_K5");
     if (fast_same_weights_fp16_m1_wide_k5 &&
@@ -3846,17 +4019,10 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     fast_same_weights_fp16_m1_n64_k5_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_m1_n64_k5 &&
         std::strcmp(fast_same_weights_fp16_m1_n64_k5, "1") == 0;
-    const char* fast_same_weights_int8_gemv =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV");
-    if (fast_same_weights_int8_gemv &&
-        std::strcmp(fast_same_weights_int8_gemv, "0") != 0 &&
-        std::strcmp(fast_same_weights_int8_gemv, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV must be 0 or 1");
-    }
+    const bool fast_same_weights_int8_gemv = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV must be 0 or 1");
     fast_same_weights_int8_gemv_enabled_ = target_m1_owner &&
-        fast_same_weights_int8_gemv &&
-        std::strcmp(fast_same_weights_int8_gemv, "1") == 0;
+        fast_same_weights_int8_gemv;
     const char* fast_same_weights_int8_gemv_k7 =
         std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_K7");
     if (fast_same_weights_int8_gemv_k7 &&
@@ -3890,50 +4056,22 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     fast_same_weights_int8_gemv_down_k7_enabled_ = target_m1_owner &&
         fast_same_weights_int8_gemv_down_k7 &&
         std::strcmp(fast_same_weights_int8_gemv_down_k7, "1") == 0;
-    const char* fast_same_weights_int8_mia_policy =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY");
-    if (fast_same_weights_int8_mia_policy &&
-        std::strcmp(fast_same_weights_int8_mia_policy, "0") != 0 &&
-        std::strcmp(fast_same_weights_int8_mia_policy, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY must be 0 or 1");
-    }
+    const bool fast_same_weights_int8_mia_policy = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY must be 0 or 1");
     fast_same_weights_int8_mia_policy_enabled_ = target_m1_owner &&
-        fast_same_weights_int8_mia_policy &&
-        std::strcmp(fast_same_weights_int8_mia_policy, "1") == 0;
-    const char* fast_same_weights_int8_gemv_occupancy_grid =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID");
-    if (fast_same_weights_int8_gemv_occupancy_grid &&
-        std::strcmp(fast_same_weights_int8_gemv_occupancy_grid, "0") != 0 &&
-        std::strcmp(fast_same_weights_int8_gemv_occupancy_grid, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID must be 0 or 1");
-    }
+        fast_same_weights_int8_mia_policy;
+    const bool fast_same_weights_int8_gemv_occupancy_grid = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID must be 0 or 1");
     fast_same_weights_int8_gemv_occupancy_grid_enabled_ = target_m1_owner &&
-        fast_same_weights_int8_gemv_occupancy_grid &&
-        std::strcmp(fast_same_weights_int8_gemv_occupancy_grid, "1") == 0;
-    const char* fast_same_weights_fp16kv_m1_mgemm_pair = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR");
-    if (fast_same_weights_fp16kv_m1_mgemm_pair &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_pair, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_pair, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR must be 0 or 1");
-    }
+        fast_same_weights_int8_gemv_occupancy_grid;
+    const bool fast_same_weights_fp16kv_m1_mgemm_pair = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR must be 0 or 1");
     fast_same_weights_fp16kv_m1_mgemm_pair_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16kv_m1_mgemm_pair &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_pair, "1") == 0;
-    const char* fast_same_weights_fp16kv_m1_mgemm_policy = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY");
-    if (fast_same_weights_fp16kv_m1_mgemm_policy &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_policy, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_policy, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY must be 0 or 1");
-    }
+        fast_same_weights_fp16kv_m1_mgemm_pair;
+    const bool fast_same_weights_fp16kv_m1_mgemm_policy = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY must be 0 or 1");
     fast_same_weights_fp16kv_m1_mgemm_policy_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16kv_m1_mgemm_policy &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_policy, "1") == 0;
+        fast_same_weights_fp16kv_m1_mgemm_policy;
     target_k5_small_m_batch_enabled_ = target_m1_owner &&
         target_k5_small_m_batch &&
         std::strcmp(target_k5_small_m_batch, "1") == 0;
@@ -3980,28 +4118,14 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     native_k6_critical_path_enabled_ = target_m1_owner &&
         native_k6_critical_path &&
         std::strcmp(native_k6_critical_path, "1") == 0;
-    const char* native_k6_global_slices =
-        std::getenv("NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES");
-    if (native_k6_global_slices &&
-        std::strcmp(native_k6_global_slices, "0") != 0 &&
-        std::strcmp(native_k6_global_slices, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES must be 0 or 1");
-    }
+    const bool native_k6_global_slices = read_binary_option("NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES",
+        "NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES must be 0 or 1");
     native_k6_global_slices_enabled_ = target_m1_owner &&
-        native_k6_critical_path_enabled_ && native_k6_global_slices &&
-        std::strcmp(native_k6_global_slices, "1") == 0;
-    const char* native_k6_register_pipeline =
-        std::getenv("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE");
-    if (native_k6_register_pipeline &&
-        std::strcmp(native_k6_register_pipeline, "0") != 0 &&
-        std::strcmp(native_k6_register_pipeline, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE must be 0 or 1");
-    }
+        native_k6_critical_path_enabled_ && native_k6_global_slices;
+    const bool native_k6_register_pipeline = read_binary_option("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE",
+        "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE must be 0 or 1");
     native_k6_register_pipeline_enabled_ = target_m1_owner &&
-        native_k6_critical_path_enabled_ && native_k6_register_pipeline &&
-        std::strcmp(native_k6_register_pipeline, "1") == 0;
+        native_k6_critical_path_enabled_ && native_k6_register_pipeline;
     const char* native_k6_shape4_register_pipeline =
         std::getenv("NINFER_EXL3_NATIVE_K6_SHAPE4_REGISTER_PIPELINE");
     if (native_k6_shape4_register_pipeline &&
@@ -4019,17 +4143,10 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         in_features_ == 5120 && out_features_ == 17408 &&
         native_k6_shape4_register_pipeline &&
         std::strcmp(native_k6_shape4_register_pipeline, "1") == 0;
-    const char* native_k6_register_pipeline_n16 =
-        std::getenv("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16");
-    if (native_k6_register_pipeline_n16 &&
-        std::strcmp(native_k6_register_pipeline_n16, "0") != 0 &&
-        std::strcmp(native_k6_register_pipeline_n16, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16 must be 0 or 1");
-    }
+    const bool native_k6_register_pipeline_n16 = read_binary_option("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16",
+        "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16 must be 0 or 1");
     native_k6_register_pipeline_n16_enabled_ = target_m1_owner &&
-        native_k6_register_pipeline_enabled_ && native_k6_register_pipeline_n16 &&
-        std::strcmp(native_k6_register_pipeline_n16, "1") == 0;
+        native_k6_register_pipeline_enabled_ && native_k6_register_pipeline_n16;
     const char* target_m1_k7_n32_async_a =
         std::getenv("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A");
     if (target_m1_k7_n32_async_a &&
@@ -4098,64 +4215,34 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     target_direct_tiles64_=target_direct_async_a_ &&
         (direct_tiles64 ? std::strcmp(direct_tiles64,"1")==0
                         : qualified_default_group);
-    const char* k6_fast_decode=
-        std::getenv("NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE");
-    if(k6_fast_decode && std::strcmp(k6_fast_decode,"0")!=0 &&
-       std::strcmp(k6_fast_decode,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE must be 0 or 1");
-    target_k6_fast_decode_=target_wide_prefill_owner && k6_fast_decode &&
-        std::strcmp(k6_fast_decode,"1")==0;
-    const char* k6_rowpair_n64=
-        std::getenv("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64");
-    if(k6_rowpair_n64 && std::strcmp(k6_rowpair_n64,"0")!=0 &&
-       std::strcmp(k6_rowpair_n64,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_ROWPAIR_N64 must be 0 or 1");
-    target_k6_rowpair_n64_=target_wide_prefill_owner && k6_rowpair_n64 &&
-        std::strcmp(k6_rowpair_n64,"1")==0;
-    const char* k6_down_rowpair=
-        std::getenv("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR");
-    if(k6_down_rowpair && std::strcmp(k6_down_rowpair,"0")!=0 &&
-       std::strcmp(k6_down_rowpair,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR must be 0 or 1");
-    target_k6_down_rowpair_=target_down_owner && target_wide_prefill_owner &&
-        k6_down_rowpair && std::strcmp(k6_down_rowpair,"1")==0;
-    const char* shape4_n64=std::getenv("NINFER_EXL3_PREFILL_SHAPE4_N64");
-    if(shape4_n64 && std::strcmp(shape4_n64,"0")!=0 &&
-       std::strcmp(shape4_n64,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_SHAPE4_N64 must be 0 or 1");
-    target_shape4_n64_=specialized_shape_ && target_wide_prefill_owner &&
-        shape4_n64 && std::strcmp(shape4_n64,"1")==0;
-    const char* gateup_warpgroup =
-        std::getenv("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC");
-    if (gateup_warpgroup && std::strcmp(gateup_warpgroup,"0")!=0 &&
-        std::strcmp(gateup_warpgroup,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC must be 0 or 1");
+    const bool k6_fast_decode = read_binary_option("NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE",
+        "NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE must be 0 or 1");
+    target_k6_fast_decode_ = target_wide_prefill_owner && k6_fast_decode;
+    const bool k6_rowpair_n64 = read_binary_option("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64",
+        "NINFER_EXL3_PREFILL_K6_ROWPAIR_N64 must be 0 or 1");
+    target_k6_rowpair_n64_ = target_wide_prefill_owner && k6_rowpair_n64;
+    const bool k6_down_rowpair = read_binary_option("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR",
+        "NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR must be 0 or 1");
+    target_k6_down_rowpair_ = target_down_owner && target_wide_prefill_owner &&
+        k6_down_rowpair;
+    const bool shape4_n64 = read_binary_option("NINFER_EXL3_PREFILL_SHAPE4_N64",
+        "NINFER_EXL3_PREFILL_SHAPE4_N64 must be 0 or 1");
+    target_shape4_n64_ = specialized_shape_ && target_wide_prefill_owner &&
+        shape4_n64;
+    const bool gateup_warpgroup = read_binary_option("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC",
+        "NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC must be 0 or 1");
     target_k6_gateup_warpgroup_async_ = target_gateup_owner &&
-        gateup_warpgroup && std::strcmp(gateup_warpgroup,"1")==0;
-    const char* gateup_n32_pair_cta =
-        std::getenv("NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA");
-    if (gateup_n32_pair_cta && std::strcmp(gateup_n32_pair_cta,"0")!=0 &&
-        std::strcmp(gateup_n32_pair_cta,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA must be 0 or 1");
+        gateup_warpgroup;
+    const bool gateup_n32_pair_cta = read_binary_option("NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA",
+        "NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA must be 0 or 1");
     target_k6_gateup_n32_pair_cta_ = target_gateup_owner &&
-        gateup_n32_pair_cta && std::strcmp(gateup_n32_pair_cta,"1")==0;
+        gateup_n32_pair_cta;
     if(target_k6_gateup_n32_pair_cta_ && target_k6_gateup_warpgroup_async_)
         throw std::invalid_argument(
             "K6 gate/up N32-pair CTA and warp-group candidates are mutually exclusive");
-    const char* gate_up_pair=std::getenv(
-        "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR");
-    if(gate_up_pair && std::strcmp(gate_up_pair,"0")!=0 &&
-       std::strcmp(gate_up_pair,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR must be 0 or 1");
-    target_prefill_gate_up_pair_=target_gateup_owner && gate_up_pair &&
-        std::strcmp(gate_up_pair,"1")==0;
+    const bool gate_up_pair = read_binary_option("NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR",
+        "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR must be 0 or 1");
+    target_prefill_gate_up_pair_ = target_gateup_owner && gate_up_pair;
     const char* k7_tiles64_exact_splits =
         std::getenv("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS");
     if (k7_tiles64_exact_splits &&
@@ -4166,14 +4253,9 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     target_k7_tiles64_exact_splits_ = target_wide_prefill_owner &&
         k7_tiles64_exact_splits &&
         std::strcmp(k7_tiles64_exact_splits,"1")==0;
-    const char* k8_kv_async_a =
-        std::getenv("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A");
-    if (k8_kv_async_a && std::strcmp(k8_kv_async_a,"0")!=0 &&
-        std::strcmp(k8_kv_async_a,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K8_KV_ASYNC_A must be 0 or 1");
-    target_k8_kv_prefill_async_a_ = target_kv_owner && k8_kv_async_a &&
-        std::strcmp(k8_kv_async_a,"1")==0;
+    const bool k8_kv_async_a = read_binary_option("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A",
+        "NINFER_EXL3_PREFILL_K8_KV_ASYNC_A must be 0 or 1");
+    target_k8_kv_prefill_async_a_ = target_kv_owner && k8_kv_async_a;
     const char* reduce_shfl=std::getenv("NINFER_EXL3_PREFILL_REDUCE_SHFL");
     if(reduce_shfl && std::strcmp(reduce_shfl,"0")!=0 &&
        std::strcmp(reduce_shfl,"1")!=0)
@@ -4181,22 +4263,15 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     target_reduce_shfl_=target_wide_prefill_owner &&
         (reduce_shfl ? std::strcmp(reduce_shfl,"1")==0
                      : qualified_default_group);
-    const char* reduce_min_barriers=
-        std::getenv("NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS");
-    if(reduce_min_barriers && std::strcmp(reduce_min_barriers,"0")!=0 &&
-       std::strcmp(reduce_min_barriers,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS must be 0 or 1");
-    target_reduce_shfl_min_barriers_=target_reduce_shfl_ &&
-        reduce_min_barriers && std::strcmp(reduce_min_barriers,"1")==0;
+    const bool reduce_min_barriers = read_binary_option("NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS",
+        "NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS must be 0 or 1");
+    target_reduce_shfl_min_barriers_ = target_reduce_shfl_ &&
+        reduce_min_barriers;
     const char* rowpair=std::getenv("NINFER_EXL3_PREFILL_ROWPAIR_K6");
     target_rowpair_k6_=target_wide_prefill_owner && rowpair && std::strcmp(rowpair,"1")==0;
-    const char* rowpair_k7=std::getenv("NINFER_EXL3_PREFILL_ROWPAIR_K7");
-    if(rowpair_k7 && std::strcmp(rowpair_k7,"0")!=0 &&
-       std::strcmp(rowpair_k7,"1")!=0)
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_ROWPAIR_K7 must be 0 or 1");
-    target_rowpair_k7_=target_wide_prefill_owner && rowpair_k7 &&
-        std::strcmp(rowpair_k7,"1")==0;
+    const bool rowpair_k7 = read_binary_option("NINFER_EXL3_PREFILL_ROWPAIR_K7",
+        "NINFER_EXL3_PREFILL_ROWPAIR_K7 must be 0 or 1");
+    target_rowpair_k7_ = target_wide_prefill_owner && rowpair_k7;
     const char* direct_partials=std::getenv("NINFER_EXL3_PREFILL_DIRECT_PARTIALS");
     target_direct_partials_=direct_partials
         ? std::strcmp(direct_partials,"1")==0 : qualified_default_group;
@@ -4234,6 +4309,54 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         cudaDeviceProp properties{};
         cuda_check(cudaGetDeviceProperties(&properties, device),
                    "query EXL3 generic device properties");
+        if (coherent_wide_k6_enabled_) {
+            int active = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active,
+                exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true>,
+                kThreads, kCoherentWideK6SharedBytes),
+                "query coherent wide K6 occupancy");
+            cudaFuncAttributes attributes{};
+            cuda_check(cudaFuncGetAttributes(&attributes,
+                exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true>),
+                "query coherent wide K6 kernel resources");
+            coherent_wide_k6_resident_capacity_ =
+                active * properties.multiProcessorCount;
+            coherent_wide_k6_registers_per_thread_ = attributes.numRegs;
+        }
+        if (coherent_down_k6_enabled_ && in_features_ == 17408 &&
+            out_features_ == 5120) {
+            int active = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active,
+                exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true>,
+                kThreads, kCoherentDownK6SharedBytes),
+                "query coherent K6 down shared-row occupancy");
+            coherent_down_k6_resident_capacity_ =
+                active * properties.multiProcessorCount;
+        }
+        if (coherent_down_k7_enabled_ && in_features_ == 17408 &&
+            out_features_ == 5120) {
+            int active = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active,
+                exl3_gemm_m1_generic_mma_kernel<7, false, 8, true, true>,
+                kThreads, kCoherentDownK7SharedBytes),
+                "query coherent K7 down shared-row occupancy");
+            coherent_down_k7_resident_capacity_ =
+                active * properties.multiProcessorCount;
+        }
+        if (coherent_o_k7_enabled_ && in_features_ == 6144 &&
+            out_features_ == 5120) {
+            int active = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active,
+                exl3_gemm_m1_generic_mma_kernel<7, false, 8, true, true>,
+                kThreads, kCoherentOK7SharedBytes),
+                "query coherent K7 O shared-row occupancy");
+            coherent_o_k7_resident_capacity_ =
+                active * properties.multiProcessorCount;
+        }
         const std::size_t static_bytes = 256u * sizeof(half) +
             16u * 512u * sizeof(float);
         const std::size_t shared_bytes[3] = {
@@ -4796,7 +4919,8 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         };
         query_large_down_candidate(6, large_down_candidate_capacity_[0]);
         query_large_down_candidate(7, large_down_candidate_capacity_[1]);
-        if (fast_same_weights_fp16_m1_enabled_) {
+        if (fast_same_weights_fp16_m1_enabled_ || fast_fp16_m2_8_down_enabled_ ||
+            fast_fp16_m2_8_all_enabled_) {
             const std::size_t k6_wide_bytes =
                 512u * sizeof(half) +
                 2u * 32u * 16u * 6u * sizeof(std::uint16_t) +
@@ -5183,6 +5307,23 @@ void Exl3CudaLinearWorkspace::retire_owned(std::unique_ptr<Exl3CudaLinearWorkspa
 }
 
 struct Exl3CudaReconstructGemmWorkspace::Impl {
+    struct ReuseSlot {
+        std::uint16_t* data = nullptr;
+        std::size_t capacity = 0;
+        const std::uint16_t* trellis = nullptr;
+        const std::int32_t* mul1 = nullptr;
+        const std::uint16_t* suh = nullptr;
+        const std::uint16_t* svh = nullptr;
+        int in_features = 0;
+        int out_features = 0;
+        int K = 0;
+        bool original_basis = false;
+        bool assigned = false;
+        bool valid = false;
+        bool prefetch_pending = false;
+        cudaEvent_t prefetch_fork = nullptr;
+        cudaEvent_t prefetch_ready = nullptr;
+    };
     int in_features = 0;
     int out_features = 0;
     int max_rows = 0;
@@ -5193,14 +5334,36 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     float* accum = nullptr;
     void* cublas_workspace = nullptr;
     cublasHandle_t handle = nullptr;
+    cublasLtHandle_t lt_handle = nullptr;
+    struct LtPlan {
+        cublasLtMatmulDesc_t operation = nullptr;
+        cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+        cublasLtMatmulAlgo_t algorithm{};
+        std::size_t workspace_bytes = 0;
+    };
+    std::unordered_map<std::uint64_t,LtPlan> lt_plans;
+    bool k5_lt_enabled = false;
+    bool large_lt_enabled = false;
     bool fused_original_enabled = false;
+    bool original_gdn_mlp_cache_enabled = false;
     bool fp16_compute_enabled = false;
+    bool k5_layer_prefill_enabled = false;
+    bool k5_scope_enabled = false;
     bool packed_direct_k6_enabled = false;
+    bool packed_direct_k5_enabled = false;
     bool persistent_prefill_enabled = false;
     bool mia_prefill_fp16_enabled = false;
     int persistent_prefill_capacity[6] = {};
     std::size_t bytes = 0;
     Exl3ReconstructGemmStats stats{};
+    std::vector<ReuseSlot> reuse_slots;
+    cudaStream_t weight_prefetch_stream = nullptr;
+    std::size_t reuse_budget = 0;
+    std::size_t reuse_capacity = 0;
+    std::size_t reuse_used = 0;
+    bool reuse_active = false;
+    std::size_t reuse_scope_count = 0;
+    int diagnostic_remaining = 0;
 };
 
 std::size_t Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
@@ -5248,6 +5411,15 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->fused_original_enabled = accept_all_model_shapes && fused_original &&
         std::strcmp(fused_original, "1") == 0;
+    const char* original_gdn_mlp=std::getenv(
+        "NINFER_EXL3_FAST_ORIGINAL_GDN_MLP_CACHE");
+    if(original_gdn_mlp && std::strcmp(original_gdn_mlp,"0")!=0 &&
+       std::strcmp(original_gdn_mlp,"1")!=0) {
+        delete impl_;impl_=nullptr;
+        throw std::invalid_argument("original-basis GDN MLP cache must be 0 or 1");
+    }
+    impl_->original_gdn_mlp_cache_enabled=accept_all_model_shapes &&
+        original_gdn_mlp && std::strcmp(original_gdn_mlp,"1")==0;
     const char* fp16_compute = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GEMM_FP16_COMPUTE");
     if (fp16_compute && std::strcmp(fp16_compute, "0") != 0 &&
@@ -5258,6 +5430,30 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->fp16_compute_enabled = accept_all_model_shapes && fp16_compute &&
         std::strcmp(fp16_compute, "1") == 0;
+    const char* k5_layer_prefill=std::getenv(
+        "NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
+    if(k5_layer_prefill && std::strcmp(k5_layer_prefill,"0")!=0 &&
+       std::strcmp(k5_layer_prefill,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("layer-major K5 reconstruction must be 0 or 1");
+    }
+    impl_->k5_layer_prefill_enabled=accept_all_model_shapes &&
+        k5_layer_prefill && std::strcmp(k5_layer_prefill,"1")==0;
+    const char* k5_lt=std::getenv("NINFER_EXL3_FAST_PREFILL_K5_CUBLAS_LT");
+    if(k5_lt && std::strcmp(k5_lt,"0")!=0 && std::strcmp(k5_lt,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("K5 prefill cuBLASLt must be 0 or 1");
+    }
+    impl_->k5_lt_enabled=accept_all_model_shapes && k5_lt &&
+        std::strcmp(k5_lt,"1")==0;
+    const char* large_lt=std::getenv("NINFER_EXL3_FAST_PREFILL_LARGE_CUBLAS_LT");
+    if(large_lt && std::strcmp(large_lt,"0")!=0 &&
+        std::strcmp(large_lt,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("large prefill cuBLASLt must be 0 or 1");
+    }
+    impl_->large_lt_enabled=accept_all_model_shapes && large_lt &&
+        std::strcmp(large_lt,"1")==0;
     const char* packed_direct_k6 = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_PACKED_DIRECT_K6");
     if (packed_direct_k6 && std::strcmp(packed_direct_k6, "0") != 0 &&
@@ -5268,6 +5464,15 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->packed_direct_k6_enabled = accept_all_model_shapes &&
         packed_direct_k6 && std::strcmp(packed_direct_k6, "1") == 0;
+    const char* packed_direct_k5 = std::getenv(
+        "NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5");
+    if (packed_direct_k5 && std::strcmp(packed_direct_k5, "0") != 0 &&
+        std::strcmp(packed_direct_k5, "1") != 0) {
+        delete impl_; impl_ = nullptr;
+        throw std::invalid_argument("GDN bulk packed K5 must be 0 or 1");
+    }
+    impl_->packed_direct_k5_enabled = accept_all_model_shapes &&
+        packed_direct_k5 && std::strcmp(packed_direct_k5, "1") == 0;
     const char* persistent_prefill = std::getenv(
         "NINFER_EXL3_FAST_NATIVE_PERSISTENT_PREFILL");
     if (persistent_prefill && std::strcmp(persistent_prefill, "0") != 0 &&
@@ -5365,12 +5570,16 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
         cuda_check(cudaMalloc(&impl_->cublas_workspace, cublas_bytes),
                    "T69 allocate cuBLAS workspace");
         cublas_check(cublasCreate(&impl_->handle), "T69 create cuBLAS handle");
+        if (impl_->k5_lt_enabled || impl_->large_lt_enabled)
+            cublas_check(cublasLtCreate(&impl_->lt_handle),
+                         "create K5 prefill cuBLASLt handle");
         cublas_check(cublasSetPointerMode(impl_->handle, CUBLAS_POINTER_MODE_HOST),
                      "T69 set cuBLAS host pointer mode");
         cublas_check(cublasSetWorkspace(impl_->handle, impl_->cublas_workspace,
                                         cublas_bytes),
                      "T69 bind cuBLAS workspace");
     } catch (...) {
+        if (impl_->lt_handle) cublasLtDestroy(impl_->lt_handle);
         if (impl_->handle) cublasDestroy(impl_->handle);
         if (impl_->cublas_workspace) cudaFree(impl_->cublas_workspace);
         if (impl_->accum) cudaFree(impl_->accum);
@@ -5385,6 +5594,22 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
 
 Exl3CudaReconstructGemmWorkspace::~Exl3CudaReconstructGemmWorkspace() {
     if (!impl_) return;
+    if (impl_->weight_prefetch_stream)
+        (void)cudaStreamSynchronize(impl_->weight_prefetch_stream);
+    for (auto& [key, plan] : impl_->lt_plans) {
+        if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+        if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+        if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+        if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+    }
+    if (impl_->lt_handle) cublasLtDestroy(impl_->lt_handle);
+    for (auto& slot : impl_->reuse_slots) {
+        if (slot.prefetch_fork) (void)cudaEventDestroy(slot.prefetch_fork);
+        if (slot.prefetch_ready) (void)cudaEventDestroy(slot.prefetch_ready);
+        if (slot.data) cudaFree(slot.data);
+    }
+    if (impl_->weight_prefetch_stream)
+        (void)cudaStreamDestroy(impl_->weight_prefetch_stream);
     if (impl_->handle) cublasDestroy(impl_->handle);
     if (impl_->cublas_workspace) cudaFree(impl_->cublas_workspace);
     if (impl_->accum) cudaFree(impl_->accum);
@@ -5401,6 +5626,127 @@ Exl3ReconstructGemmStats Exl3CudaReconstructGemmWorkspace::stats() const noexcep
     return impl_ ? impl_->stats : Exl3ReconstructGemmStats{};
 }
 
+void Exl3CudaReconstructGemmWorkspace::begin_layer_reuse(
+    std::size_t max_cached_bytes, bool allow_k5) {
+    if (!impl_ || impl_->reuse_active || !impl_->accept_all_model_shapes || !max_cached_bytes)
+        throw std::invalid_argument("layer-major weight reuse admission");
+    impl_->reuse_active = true;
+    impl_->k5_scope_enabled = allow_k5 && impl_->k5_layer_prefill_enabled;
+    impl_->reuse_budget = max_cached_bytes;
+    impl_->reuse_used = 0;
+    const char* profile=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
+    impl_->diagnostic_remaining = impl_->reuse_scope_count==0 && profile &&
+        std::strcmp(profile,"1")==0 ? 16 : 0;
+    ++impl_->reuse_scope_count;
+    for (auto& slot : impl_->reuse_slots) {
+        slot.assigned = false;
+        slot.valid = false;
+        slot.prefetch_pending = false;
+    }
+}
+
+void Exl3CudaReconstructGemmWorkspace::end_layer_reuse() noexcept {
+    if (!impl_) return;
+    if (impl_->weight_prefetch_stream) {
+        for (const auto& slot : impl_->reuse_slots) {
+            if (slot.prefetch_pending) {
+                (void)cudaStreamSynchronize(impl_->weight_prefetch_stream);
+                break;
+            }
+        }
+    }
+    impl_->reuse_active = false;
+    impl_->k5_scope_enabled = false;
+    impl_->reuse_used = 0;
+    impl_->diagnostic_remaining = 0;
+    for (auto& slot : impl_->reuse_slots) {
+        slot.assigned = false;
+        slot.valid = false;
+        slot.prefetch_pending = false;
+    }
+}
+
+bool Exl3CudaReconstructGemmWorkspace::prefetch_numeric_weight(
+    const Exl3CudaLinearWeights& weights,
+    const Exl3CudaLinearMetadata& metadata,int rows,cudaStream_t stream) {
+    if (!impl_ || !impl_->reuse_active || !impl_->k5_scope_enabled ||
+        metadata.K!=5 || rows<1024 || !supports(metadata,rows) ||
+        !weights.trellis || !weights.mul1 || !weights.suh || !weights.svh)
+        return false;
+    const std::size_t weight_bytes=static_cast<std::size_t>(metadata.in_features)*
+        static_cast<std::size_t>(metadata.out_features)*sizeof(std::uint16_t);
+    Impl::ReuseSlot* slot=nullptr;
+    for (std::size_t index=0;index<impl_->reuse_used;++index) {
+        auto& candidate=impl_->reuse_slots[index];
+        if (candidate.assigned && candidate.trellis==weights.trellis &&
+            candidate.mul1==weights.mul1 && candidate.suh==weights.suh &&
+            candidate.svh==weights.svh &&
+            candidate.in_features==metadata.in_features &&
+            candidate.out_features==metadata.out_features &&
+            candidate.K==metadata.K && !candidate.original_basis) {
+            slot=&candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        if (impl_->reuse_used==impl_->reuse_slots.size())
+            impl_->reuse_slots.emplace_back();
+        slot=&impl_->reuse_slots[impl_->reuse_used++];
+        slot->assigned=true;
+        slot->valid=false;
+        slot->trellis=weights.trellis;
+        slot->mul1=weights.mul1;
+        slot->suh=weights.suh;
+        slot->svh=weights.svh;
+        slot->in_features=metadata.in_features;
+        slot->out_features=metadata.out_features;
+        slot->K=metadata.K;
+        slot->original_basis=false;
+        if (slot->capacity<weight_bytes &&
+            impl_->reuse_capacity-slot->capacity+weight_bytes<=impl_->reuse_budget) {
+            if (slot->data) {
+                cuda_check(cudaFree(slot->data),"retire smaller prefetched weight slot");
+                impl_->reuse_capacity-=slot->capacity;
+                slot->data=nullptr;
+                slot->capacity=0;
+            }
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&slot->data),weight_bytes),
+                "allocate bounded prefetched weight slot");
+            slot->capacity=weight_bytes;
+            impl_->reuse_capacity+=weight_bytes;
+            impl_->stats.cached_weight_capacity_bytes=impl_->reuse_capacity;
+        }
+    }
+    if (!slot->data || slot->capacity<weight_bytes || slot->valid ||
+        slot->prefetch_pending)
+        return false;
+    if (!impl_->weight_prefetch_stream)
+        cuda_check(cudaStreamCreateWithFlags(&impl_->weight_prefetch_stream,
+            cudaStreamNonBlocking),"create K5 weight prefetch stream");
+    if (!slot->prefetch_fork)
+        cuda_check(cudaEventCreateWithFlags(&slot->prefetch_fork,
+            cudaEventDisableTiming),"create K5 prefetch fork event");
+    if (!slot->prefetch_ready)
+        cuda_check(cudaEventCreateWithFlags(&slot->prefetch_ready,
+            cudaEventDisableTiming),"create K5 prefetch ready event");
+    cuda_check(cudaEventRecord(slot->prefetch_fork,stream),
+        "record K5 weight prefetch fork");
+    cuda_check(cudaStreamWaitEvent(impl_->weight_prefetch_stream,
+        slot->prefetch_fork,0),"join K5 weight prefetch fork");
+    slot->prefetch_pending=true;
+    exl3_reconstruct_transformed_weight_kernel<5><<<
+        dim3(metadata.out_features/16,metadata.in_features/16),256,0,
+        impl_->weight_prefetch_stream>>>(weights.trellis,weights.mul1,
+            slot->data,metadata.in_features,metadata.out_features);
+    cuda_check(cudaGetLastError(),"launch K5 weight prefetch");
+    cuda_check(cudaEventRecord(slot->prefetch_ready,
+        impl_->weight_prefetch_stream),"record K5 weight prefetch ready");
+    ++impl_->stats.prefetched_weight_submissions;
+    ++impl_->stats.reconstructed_weight_calls;
+    impl_->stats.reconstructed_weight_bytes+=weight_bytes;
+    return true;
+}
+
 bool Exl3CudaReconstructGemmWorkspace::supports(
     const Exl3CudaLinearMetadata& metadata, int rows) const noexcept {
     if (!impl_ || rows <= 0 || rows > impl_->max_rows) return false;
@@ -5411,7 +5757,9 @@ bool Exl3CudaReconstructGemmWorkspace::supports(
             metadata.out_features <= impl_->out_features &&
             metadata.in_features % kHadamard == 0 &&
             metadata.out_features % kHadamard == 0;
-        return bounded_shape && (metadata.K == 6 || metadata.K == 7) &&
+        const bool k5_layer=metadata.K==5 &&
+            impl_->k5_scope_enabled && impl_->reuse_active && rows>=256;
+        return bounded_shape && (metadata.K == 6 || metadata.K == 7 || k5_layer) &&
             metadata.mul1 && !metadata.mcg && !metadata.has_bias;
     }
     const bool primary_shape =
@@ -5429,6 +5777,27 @@ bool Exl3CudaReconstructGemmWorkspace::accepts_all_model_shapes() const noexcept
     return impl_ && impl_->accept_all_model_shapes;
 }
 
+bool Exl3CudaReconstructGemmWorkspace::supports_fused_gate_up_down() const noexcept {
+    return accepts_all_model_shapes() && !impl_->fused_original_enabled &&
+        !impl_->original_gdn_mlp_cache_enabled;
+}
+
+void Exl3CudaReconstructGemmWorkspace::forward_numeric_gate_up_down(
+    const Exl3CudaLinearWeights& weights,
+    const Exl3CudaLinearMetadata& metadata,
+    const std::uint16_t* gate,
+    const std::uint16_t* up,
+    std::uint16_t* activation,
+    std::uint16_t* output,
+    int rows,
+    cudaStream_t stream) {
+    if (!supports_fused_gate_up_down() || !up || !activation ||
+        metadata.in_features != 17408 || metadata.out_features != 5120)
+        throw std::invalid_argument("GDN fused gate/up down admission");
+    forward_numeric_candidate(weights,metadata,gate,output,rows,stream,
+                              nullptr,up,activation);
+}
+
 void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const Exl3CudaLinearWeights& weights,
     const Exl3CudaLinearMetadata& metadata,
@@ -5436,31 +5805,85 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     std::uint16_t* output,
     int rows,
     cudaStream_t stream,
-    Exl3ReconstructGemmPhaseTiming* timing) {
+    Exl3ReconstructGemmPhaseTiming* timing,
+    const std::uint16_t* up,
+    std::uint16_t* activation,
+    const std::uint16_t* residual,
+    std::uint16_t* down_trace,
+    int trace_row_base) {
     if (!supports(metadata, rows) || !weights.trellis ||
-        !weights.suh || !weights.svh || !weights.mul1 || !input || !output) {
+        !weights.suh || !weights.svh || !weights.mul1 || !input || !output ||
+        ((up == nullptr) != (activation == nullptr)) ||
+        (down_trace && (!residual || trace_row_base < 0 ||
+                        trace_row_base >= rows))) {
         throw std::invalid_argument("T69 reconstruct GEMM contract");
     }
+    Exl3ReconstructGemmPhaseTiming diagnostic_timing{};
+    const bool diagnostic=timing==nullptr && impl_->reuse_active &&
+        impl_->diagnostic_remaining>0;
+    if (diagnostic) {
+        --impl_->diagnostic_remaining;
+        timing=&diagnostic_timing;
+    }
+    struct DiagnosticPrint {
+        bool active;
+        const Exl3CudaLinearMetadata& metadata;
+        int rows;
+        const Exl3ReconstructGemmPhaseTiming& value;
+        ~DiagnosticPrint() {
+            if (!active) return;
+            std::fprintf(stderr,
+                "LAYER_MAJOR_PROJECTION_SAMPLE K=%d in=%d out=%d rows=%d "
+                "input_us=%.2f reconstruct_us=%.2f gemm_us=%.2f output_us=%.2f total_us=%.2f\n",
+                metadata.K,metadata.in_features,metadata.out_features,rows,
+                value.input_transform_us,value.reconstruct_us,value.gemm_us,
+                value.output_transform_us,value.total_us);
+        }
+    } diagnostic_print{diagnostic,metadata,rows,diagnostic_timing};
     cudaEvent_t events[5]{};
     if (timing) {
         for (auto& event : events)
             cuda_check(cudaEventCreate(&event), "T69 create phase event");
         cuda_check(cudaEventRecord(events[0], stream), "T69 begin phase timing");
     }
-    const bool fused_original = impl_->fused_original_enabled && rows >= 1024 &&
+    const bool original_gdn_mlp=impl_->original_gdn_mlp_cache_enabled &&
+        impl_->reuse_active && rows>=1024 &&
+        ((metadata.in_features==5120 && metadata.out_features==17408) ||
+         (metadata.in_features==17408 && metadata.out_features==5120));
+    const bool fused_original = (impl_->fused_original_enabled || original_gdn_mlp) &&
+        metadata.K!=5 && rows >= 1024 &&
         metadata.in_features % kHadamard == 0 &&
         metadata.out_features % kHadamard == 0;
+    if (up && fused_original)
+        throw std::invalid_argument("original-basis GEMM cannot consume transformed gate/up input");
     const char* fast_same_weights_fp16kv = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
     const bool fast_fp16_destination = impl_->accept_all_model_shapes &&
         rows > 1 && fast_same_weights_fp16kv &&
         std::strcmp(fast_same_weights_fp16kv, "1") == 0;
+    if (residual && (metadata.in_features != 17408 ||
+                     metadata.out_features != 5120 || !fast_fp16_destination ||
+                     fused_original || up || activation || residual == output ||
+                     impl_->persistent_prefill_enabled ||
+                     impl_->mia_prefill_fp16_enabled ||
+                     impl_->packed_direct_k6_enabled))
+        throw std::invalid_argument("bulk down residual epilogue admission");
     const bool fp16_compute = impl_->fp16_compute_enabled &&
-        fast_fp16_destination && !fused_original;
+        fast_fp16_destination && !fused_original && metadata.K!=5;
     if (!fused_original) {
-        input_hadamard_kernel<kHadamard><<<
-            dim3(rows, metadata.in_features / kHadamard), dim3(kHadamard), 0, stream>>>(
-                input, weights.suh, impl_->transformed, rows, metadata.in_features);
+        if (up) {
+            input_hadamard_kernel<kHadamard,false,true><<<
+                dim3(rows, metadata.in_features / kHadamard),
+                dim3(kHadamard), 0, stream>>>(
+                    input,weights.suh,impl_->transformed,rows,
+                    metadata.in_features,up,activation);
+            ++impl_->stats.fused_gate_up_down_calls;
+            impl_->stats.fused_gate_up_down_rows += static_cast<std::uint64_t>(rows);
+        } else {
+            input_hadamard_kernel<kHadamard><<<
+                dim3(rows, metadata.in_features / kHadamard), dim3(kHadamard), 0, stream>>>(
+                    input, weights.suh, impl_->transformed, rows, metadata.in_features);
+        }
         cuda_check(cudaGetLastError(), "T69 input Hadamard");
     }
     if (timing) cuda_check(cudaEventRecord(events[1], stream), "T69 input event");
@@ -5676,6 +6099,74 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         return;
     }
 
+    // Only the reached target GDN bulk gate/up/down shapes may use this K5
+    // leaf. The packed tile is decoded in the same represented transformed
+    // basis as reconstruction, then each 16-row MMA group accumulates in FP32.
+    // The reduction/output kernel casts that GEMM destination to FP16 before
+    // the existing SVH/Hadamard boundary. No full FP16 weight slab is written.
+    const bool packed_direct_k5_gate_up =
+        metadata.in_features == 5120 && metadata.out_features == 17408;
+    const bool packed_direct_k5_down =
+        metadata.in_features == 17408 && metadata.out_features == 5120;
+    const bool packed_direct_k5_candidate =
+        impl_->packed_direct_k5_enabled && fast_fp16_destination &&
+        !fused_original && !residual && !up && !activation &&
+        rows >= 1024 && rows <= impl_->max_rows && metadata.K == 5 &&
+        !metadata.mcg && !metadata.has_bias && weights.trellis &&
+        weights.mul1 && weights.suh && weights.svh &&
+        (packed_direct_k5_gate_up || packed_direct_k5_down);
+    if (packed_direct_k5_candidate) {
+        constexpr int output_tiles_per_block = 64;
+        constexpr int split_count = 1;
+        const int output_blocks = metadata.out_features /
+            (16 * output_tiles_per_block);
+        const std::size_t shared_bytes = 512u * sizeof(half) +
+            2u * output_tiles_per_block * 16u * 5u * sizeof(std::uint16_t);
+        if (timing)
+            cuda_check(cudaEventRecord(events[2], stream),
+                       "K5 packed direct begin event");
+        exl3_prefill_direct_async_a_kernel<5, 64, 2><<<
+            dim3(output_blocks, (rows + 15) / 16), kThreads,
+            shared_bytes, stream>>>(
+                impl_->transformed, weights.trellis, weights.mul1,
+                impl_->accum, rows, metadata.in_features,
+                metadata.out_features, split_count);
+        cuda_check(cudaGetLastError(), "launch GDN bulk packed K5 GEMM");
+        if (timing)
+            cuda_check(cudaEventRecord(events[3], stream),
+                       "K5 packed direct GEMM event");
+        prefill_reduce_output_kernel<false, false, false, true><<<
+            dim3(rows, metadata.out_features / kHadamard), kHadamard,
+            0, stream>>>(impl_->accum, weights.svh, output, rows,
+                         metadata.out_features, split_count);
+        cuda_check(cudaGetLastError(), "launch GDN bulk packed K5 output");
+        ++impl_->stats.calls;
+        ++impl_->stats.k5_calls;
+        impl_->stats.rows += static_cast<std::uint64_t>(rows);
+        impl_->stats.packed_direct_k5_rows += static_cast<std::uint64_t>(rows);
+        if (packed_direct_k5_gate_up)
+            ++impl_->stats.packed_direct_k5_gate_up_calls;
+        else
+            ++impl_->stats.packed_direct_k5_down_calls;
+        if (timing) {
+            cuda_check(cudaEventRecord(events[4], stream),
+                       "K5 packed direct output event");
+            cuda_check(cudaEventSynchronize(events[4]),
+                       "resolve K5 packed direct timing");
+            float ms[4]{};
+            for (int i = 0; i < 4; ++i)
+                cuda_check(cudaEventElapsedTime(&ms[i], events[i], events[i + 1]),
+                           "resolve K5 packed direct phase");
+            timing->input_transform_us = ms[0] * 1000.0;
+            timing->reconstruct_us = 0.0;
+            timing->gemm_us = ms[2] * 1000.0;
+            timing->output_transform_us = ms[3] * 1000.0;
+            timing->total_us = (ms[0] + ms[1] + ms[2] + ms[3]) * 1000.0;
+            for (auto event : events) cudaEventDestroy(event);
+        }
+        return;
+    }
+
     // Same-weight Fast differential: consume the original packed K6 trellis
     // directly with the established async-A/MMA decoder. This is deliberately
     // narrower than the general reconstruct+cuBLAS candidate: only the 6-bpw
@@ -5755,34 +6246,111 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
 
     const dim3 reconstruct_grid(metadata.out_features / 16,
                                 metadata.in_features / 16);
-    if (fused_original) {
+    const std::size_t weight_bytes =
+        static_cast<std::size_t>(metadata.in_features) *
+        static_cast<std::size_t>(metadata.out_features) * sizeof(std::uint16_t);
+    std::uint16_t* reconstructed = impl_->reconstructed;
+    bool reconstruct_needed = true;
+    if (impl_->reuse_active && (!fused_original || original_gdn_mlp)) {
+        Impl::ReuseSlot* slot = nullptr;
+        for (std::size_t index = 0; index < impl_->reuse_used; ++index) {
+            auto& candidate = impl_->reuse_slots[index];
+            if (candidate.assigned && candidate.trellis == weights.trellis &&
+                candidate.mul1 == weights.mul1 &&
+                candidate.suh == weights.suh && candidate.svh == weights.svh &&
+                candidate.in_features == metadata.in_features &&
+                candidate.out_features == metadata.out_features &&
+                candidate.K == metadata.K &&
+                candidate.original_basis == fused_original) {
+                slot = &candidate;
+                break;
+            }
+        }
+        if (!slot) {
+            if (impl_->reuse_used == impl_->reuse_slots.size())
+                impl_->reuse_slots.emplace_back();
+            slot = &impl_->reuse_slots[impl_->reuse_used++];
+            slot->assigned = true;
+            slot->valid = false;
+            slot->trellis = weights.trellis;
+            slot->mul1 = weights.mul1;
+            slot->suh = weights.suh;
+            slot->svh = weights.svh;
+            slot->in_features = metadata.in_features;
+            slot->out_features = metadata.out_features;
+            slot->K = metadata.K;
+            slot->original_basis = fused_original;
+            if (slot->capacity < weight_bytes &&
+                impl_->reuse_capacity - slot->capacity + weight_bytes <=
+                    impl_->reuse_budget) {
+                if (slot->data) {
+                    cuda_check(cudaFree(slot->data),
+                               "retire smaller layer-major weight slot");
+                    impl_->reuse_capacity -= slot->capacity;
+                    slot->data = nullptr;
+                    slot->capacity = 0;
+                }
+                cuda_check(cudaMalloc(reinterpret_cast<void**>(&slot->data),
+                                      weight_bytes),
+                           "allocate bounded layer-major weight slot");
+                slot->capacity = weight_bytes;
+                impl_->reuse_capacity += weight_bytes;
+                impl_->stats.cached_weight_capacity_bytes = impl_->reuse_capacity;
+            }
+        }
+        if (slot->data && slot->capacity >= weight_bytes) {
+            reconstructed = slot->data;
+            if (slot->prefetch_pending) {
+                cuda_check(cudaStreamWaitEvent(stream,slot->prefetch_ready,0),
+                    "join prefetched K5 weight before GEMM");
+                slot->prefetch_pending=false;
+                slot->valid=true;
+                reconstruct_needed=false;
+                ++impl_->stats.prefetched_weight_hits;
+            } else if (slot->valid) {
+                reconstruct_needed = false;
+                ++impl_->stats.reused_weight_calls;
+                impl_->stats.reused_weight_bytes += weight_bytes;
+            } else slot->valid = true;
+        }
+    }
+    if (reconstruct_needed && fused_original) {
         const dim3 fused_grid(metadata.out_features / kHadamard,
                               metadata.in_features / kHadamard);
         if (metadata.K == 6) {
             exl3_fused_original_weight_reconstruct_kernel<6><<<
                 fused_grid, kThreads, 0, stream>>>(
-                impl_->reconstructed, weights.trellis, weights.suh,
+                reconstructed, weights.trellis, weights.suh,
                 weights.svh, metadata.out_features / 16);
         } else {
             exl3_fused_original_weight_reconstruct_kernel<7><<<
                 fused_grid, kThreads, 0, stream>>>(
-                impl_->reconstructed, weights.trellis, weights.suh,
+                reconstructed, weights.trellis, weights.suh,
                 weights.svh, metadata.out_features / 16);
         }
-    } else {
-        if (metadata.K == 6) {
+    } else if (reconstruct_needed) {
+        if (metadata.K == 5) {
+            exl3_reconstruct_transformed_weight_kernel<5><<<
+                reconstruct_grid, 256, 0, stream>>>(
+                    weights.trellis, weights.mul1, reconstructed,
+                    metadata.in_features, metadata.out_features);
+        } else if (metadata.K == 6) {
             exl3_reconstruct_transformed_weight_kernel<6><<<
                 reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, impl_->reconstructed,
+                    weights.trellis, weights.mul1, reconstructed,
                     metadata.in_features, metadata.out_features);
         } else {
             exl3_reconstruct_transformed_weight_kernel<7><<<
                 reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, impl_->reconstructed,
+                    weights.trellis, weights.mul1, reconstructed,
                     metadata.in_features, metadata.out_features);
         }
     }
-    cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
+    if (reconstruct_needed) {
+        cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
+        impl_->stats.reconstructed_weight_bytes += weight_bytes;
+        ++impl_->stats.reconstructed_weight_calls;
+    }
     if (timing) cuda_check(cudaEventRecord(events[2], stream), "T69 reconstruct event");
 
     cublas_check(cublasSetStream(impl_->handle, stream), "T69 set cuBLAS stream");
@@ -5801,28 +6369,118 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                                  : static_cast<void*>(impl_->accum));
     const cudaDataType output_type =
         (fused_original || fast_fp16_destination) ? CUDA_R_16F : CUDA_R_32F;
-    cublas_check(cublasGemmEx(
-        impl_->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-        metadata.out_features, rows, metadata.in_features,
-        fp16_compute ? static_cast<const void*>(&alpha_half)
-                     : static_cast<const void*>(&alpha),
-        impl_->reconstructed, CUDA_R_16F, metadata.out_features,
-        gemm_input, CUDA_R_16F, metadata.in_features,
-        fp16_compute ? static_cast<const void*>(&beta_half)
-                     : static_cast<const void*>(&beta),
-        gemm_output, output_type, metadata.out_features,
-        fp16_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-        fp16_compute ? "T69 same-weights FP16-compute GEMM"
-                     : (fused_original ? "T69 fused original-basis GEMM"
-                                        : "T69 FP32-compute GEMM"));
+    bool used_lt=false;
+    const bool large_lt_candidate=impl_->large_lt_enabled &&
+        (metadata.K==6 || metadata.K==7) && rows>=4096;
+    if (((impl_->k5_lt_enabled && metadata.K==5 && !fp16_compute) ||
+         (large_lt_candidate && fp16_compute)) &&
+        fast_fp16_destination && !fused_original) {
+        const std::uint64_t key=(fp16_compute?1ull<<63:0ull) |
+            (static_cast<std::uint64_t>(metadata.in_features)<<32) |
+            (static_cast<std::uint64_t>(metadata.out_features)<<16) |
+            static_cast<std::uint64_t>(rows);
+        auto found=impl_->lt_plans.find(key);
+        if (found==impl_->lt_plans.end()) {
+            Impl::LtPlan plan{};
+            cublasLtMatmulPreference_t preference=nullptr;
+            try {
+                cublas_check(cublasLtMatmulDescCreate(&plan.operation,
+                    fp16_compute?CUBLAS_COMPUTE_16F:CUBLAS_COMPUTE_32F,
+                    fp16_compute?CUDA_R_16F:CUDA_R_32F),"create prefill Lt operation");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.a,CUDA_R_16F,
+                    metadata.out_features,metadata.in_features,metadata.out_features),
+                    "create K5 Lt A layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.b,CUDA_R_16F,
+                    metadata.in_features,rows,metadata.in_features),
+                    "create K5 Lt B layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.c,CUDA_R_16F,
+                    metadata.out_features,rows,metadata.out_features),
+                    "create K5 Lt C layout");
+                cublas_check(cublasLtMatmulPreferenceCreate(&preference),
+                    "create K5 Lt preference");
+                constexpr std::size_t limit=16u*1024u*1024u;
+                cublas_check(cublasLtMatmulPreferenceSetAttribute(preference,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&limit,sizeof(limit)),
+                    "bound K5 Lt workspace");
+                cublasLtMatmulHeuristicResult_t candidates[4]{};
+                int count=0;
+                cublas_check(cublasLtMatmulAlgoGetHeuristic(impl_->lt_handle,
+                    plan.operation,plan.a,plan.b,plan.c,plan.c,preference,
+                    4,candidates,&count),"query K5 Lt algorithms");
+                bool selected=false;
+                for (int i=0;i<count;++i) {
+                    if (candidates[i].state==CUBLAS_STATUS_SUCCESS &&
+                        candidates[i].workspaceSize<=limit) {
+                        plan.algorithm=candidates[i].algo;
+                        plan.workspace_bytes=candidates[i].workspaceSize;
+                        selected=true;
+                        break;
+                    }
+                }
+                if (!selected)
+                    throw std::runtime_error("no supported K5 Lt plan");
+                cublasLtMatmulPreferenceDestroy(preference);
+                preference=nullptr;
+                found=impl_->lt_plans.emplace(key,plan).first;
+            } catch (...) {
+                if (preference) cublasLtMatmulPreferenceDestroy(preference);
+                if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+                if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+                if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+                if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+                throw;
+            }
+        }
+        const auto& plan=found->second;
+        cublas_check(cublasLtMatmul(impl_->lt_handle,plan.operation,
+            fp16_compute?static_cast<const void*>(&alpha_half):
+                static_cast<const void*>(&alpha),
+            reconstructed,plan.a,gemm_input,plan.b,
+            fp16_compute?static_cast<const void*>(&beta_half):
+                static_cast<const void*>(&beta),
+            gemm_output,plan.c,gemm_output,plan.c,&plan.algorithm,
+            impl_->cublas_workspace,plan.workspace_bytes,stream),
+            "K5 prefill cuBLASLt GEMM");
+        if(metadata.K==5) ++impl_->stats.k5_lt_calls;
+        else ++impl_->stats.large_lt_calls;
+        used_lt=true;
+    }
+    if (!used_lt) {
+        cublas_check(cublasGemmEx(
+            impl_->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            metadata.out_features, rows, metadata.in_features,
+            fp16_compute ? static_cast<const void*>(&alpha_half)
+                         : static_cast<const void*>(&alpha),
+            reconstructed, CUDA_R_16F, metadata.out_features,
+            gemm_input, CUDA_R_16F, metadata.in_features,
+            fp16_compute ? static_cast<const void*>(&beta_half)
+                         : static_cast<const void*>(&beta),
+            gemm_output, output_type, metadata.out_features,
+            fp16_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            fp16_compute ? "T69 same-weights FP16-compute GEMM"
+                         : (fused_original ? "T69 fused original-basis GEMM"
+                                            : "T69 FP32-compute GEMM"));
+    }
     if (timing) cuda_check(cudaEventRecord(events[3], stream), "T69 GEMM event");
 
     if (!fused_original) {
         if (fast_fp16_destination) {
-            output_hadamard_fp16_inplace_kernel<<<
-                dim3(rows, metadata.out_features / kHadamard), dim3(kHadamard), 0,
-                stream>>>(output, weights.svh, rows, metadata.out_features);
+            if (residual) {
+                output_hadamard_fp16_residual_kernel<<<
+                    dim3(rows, metadata.out_features / kHadamard),
+                    dim3(kHadamard), 0, stream>>>(
+                        output, weights.svh, residual, down_trace,
+                        trace_row_base, rows, metadata.out_features);
+                ++impl_->stats.fused_down_residual_calls;
+                impl_->stats.fused_down_residual_rows +=
+                    static_cast<std::uint64_t>(rows);
+            } else {
+                output_hadamard_fp16_inplace_kernel<<<
+                    dim3(rows, metadata.out_features / kHadamard),
+                    dim3(kHadamard), 0, stream>>>(
+                        output, weights.svh, rows, metadata.out_features);
+            }
         } else {
             output_hadamard_kernel<<<
                 dim3(rows, metadata.out_features / kHadamard), dim3(kHadamard), 0, stream>>>(
@@ -5832,7 +6490,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     }
     ++impl_->stats.calls;
     impl_->stats.rows += static_cast<std::uint64_t>(rows);
-    if (metadata.K == 6) ++impl_->stats.k6_calls;
+    if (metadata.K == 5) ++impl_->stats.k5_calls;
+    else if (metadata.K == 6) ++impl_->stats.k6_calls;
     else ++impl_->stats.k7_calls;
     if (fused_original) {
         ++impl_->stats.fused_original_calls;
@@ -6803,6 +7462,32 @@ void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
     if(admission==Exl3CudaLinearAdmission::target_continuation_head &&
        !target_head_small_m_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared head requires admitted H6 small-M workspace");
+    if (coherent_down_k6_candidate(metadata, rows, admission)) {
+        // This explicit policy wins over older M1-only INT8/fused-input probes.
+        // Scalar and verifier must not silently select different down math.
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
+    if (coherent_down_k7_candidate(metadata, rows, admission)) {
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
+    if (coherent_o_k7_candidate(metadata, rows, admission)) {
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
+    if (coherent_wide_k6_candidate(metadata, rows, admission)) {
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
     // Admission failure must precede the input-Hadamard scratch write. The
     // submission path reacquires and holds this guard through slab consumption.
     if(extended_stream_reduction_candidate(metadata,rows,admission)) {
@@ -7843,6 +8528,150 @@ bool Exl3CudaLinearWorkspace::target_fast_same_weights_fp16_m1_candidate(
     return output_blocks > 0 && output_blocks <= capacity;
 }
 
+bool Exl3CudaLinearWorkspace::fast_fp16_m2_8_down_candidate(
+    const Exl3CudaLinearMetadata& metadata,int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    // One M16 MMA consumes all proposal rows and decodes each packed B tile
+    // once. The K6 down projection owns this first bounded vertical slice.
+    return fast_fp16_m2_8_down_enabled_ && allow_generic_variants_ &&
+        rows>=2 && rows<=8 && rows<=max_rows_ &&
+        (admission==Exl3CudaLinearAdmission::target_continuation_down ||
+         admission==Exl3CudaLinearAdmission::ordinary) &&
+        in_features_==17408 && out_features_==5120 &&
+        metadata.in_features==in_features_ &&
+        metadata.out_features==out_features_ && metadata.K==6 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias &&
+        fast_same_weights_fp16_m1_capacity_[1]>=20;
+}
+
+bool Exl3CudaLinearWorkspace::fast_fp16_m2_8_fused_down_candidate(
+    const Exl3CudaLinearMetadata& metadata,int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    return fast_fp16_m2_8_fused_down_enabled_ && allow_generic_variants_ &&
+        rows>=2 && rows<=8 && rows<=max_rows_ &&
+        (admission==Exl3CudaLinearAdmission::target_continuation_down ||
+         admission==Exl3CudaLinearAdmission::ordinary) &&
+        in_features_==17408 && out_features_==5120 &&
+        metadata.in_features==in_features_ &&
+        metadata.out_features==out_features_ && metadata.K==6 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias;
+}
+
+std::size_t Exl3CudaLinearWorkspace::coherent_wide_k6_shared_bytes_for_test() noexcept {
+    return kCoherentWideK6SharedBytes;
+}
+
+bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    if (!coherent_wide_k6_enabled_ || !allow_generic_variants_ ||
+        coherent_wide_k6_resident_capacity_ <= 0 ||
+        rows < 1 || rows > 8 || rows > max_rows_ ||
+        metadata.in_features != in_features_ ||
+        metadata.out_features != out_features_ || metadata.K != 6 ||
+        metadata.mcg || !metadata.mul1 || metadata.has_bias)
+        return false;
+    constexpr Exl3CudaLinearAdmission continuation[5] = {
+        Exl3CudaLinearAdmission::target_continuation_q,
+        Exl3CudaLinearAdmission::target_continuation_qkv,
+        Exl3CudaLinearAdmission::target_continuation_z,
+        Exl3CudaLinearAdmission::target_continuation_o,
+        Exl3CudaLinearAdmission::target_continuation_gate_up};
+    return coherent_wide_k6_operation_ >= 0 &&
+        coherent_wide_k6_operation_ < 5 &&
+        (admission == Exl3CudaLinearAdmission::ordinary ||
+         admission == continuation[coherent_wide_k6_operation_]);
+}
+
+int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexcept {
+    constexpr int split10 = 10;
+    const auto required = static_cast<std::size_t>(rows) *
+        static_cast<std::size_t>(out_features_) * split10 * sizeof(float);
+    return coherent_wide_k6_split10_enabled_ &&
+        accumulation_capacity_bytes_ >= required ? split10 :
+        static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
+}
+
+bool Exl3CudaLinearWorkspace::coherent_down_k6_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    // One N8 CTA decodes each packed B tile once for all independent active
+    // rows of an M16 MMA tile. Scalar, verifier, and correction share this
+    // body and five disjoint K partitions.
+    return coherent_down_k6_enabled_ && allow_generic_variants_ &&
+        coherent_down_k6_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        rows <= max_rows_ &&
+        (admission == Exl3CudaLinearAdmission::ordinary ||
+         admission == Exl3CudaLinearAdmission::target_continuation_down) &&
+        in_features_ == 17408 && out_features_ == 5120 &&
+        metadata.in_features == in_features_ &&
+        metadata.out_features == out_features_ && metadata.K == 6 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias;
+}
+
+std::size_t Exl3CudaLinearWorkspace::coherent_down_k7_shared_bytes_for_test() noexcept {
+    return kCoherentDownK7SharedBytes;
+}
+
+bool Exl3CudaLinearWorkspace::coherent_down_k7_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    return coherent_down_k7_enabled_ && allow_generic_variants_ &&
+        coherent_down_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        rows <= max_rows_ &&
+        (admission == Exl3CudaLinearAdmission::ordinary ||
+         admission == Exl3CudaLinearAdmission::target_continuation_down) &&
+        in_features_ == 17408 && out_features_ == 5120 &&
+        metadata.in_features == in_features_ &&
+        metadata.out_features == out_features_ && metadata.K == 7 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias;
+}
+
+bool Exl3CudaLinearWorkspace::coherent_o_k7_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    return coherent_o_k7_enabled_ && allow_generic_variants_ &&
+        coherent_o_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        rows <= max_rows_ &&
+        (admission == Exl3CudaLinearAdmission::ordinary ||
+         admission == Exl3CudaLinearAdmission::target_continuation_o) &&
+        in_features_ == 6144 && out_features_ == 5120 &&
+        metadata.in_features == in_features_ &&
+        metadata.out_features == out_features_ && metadata.K == 7 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias;
+}
+
+bool Exl3CudaLinearWorkspace::fast_fp16_m2_8_all_candidate(
+    const Exl3CudaLinearMetadata& metadata,int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    if(!fast_fp16_m2_8_all_enabled_ || !allow_generic_variants_ ||
+       rows<2 || rows>8 || rows>max_rows_ || metadata.mcg ||
+       !metadata.mul1 || metadata.has_bias ||
+       metadata.in_features!=in_features_ ||
+       metadata.out_features!=out_features_ ||
+       (in_features_!=5120 && in_features_!=17408) ||
+       out_features_==248320 || (metadata.K!=6 && metadata.K!=7))
+        return false;
+    switch(admission) {
+    case Exl3CudaLinearAdmission::ordinary:
+    case Exl3CudaLinearAdmission::target_continuation_gate_up:
+    case Exl3CudaLinearAdmission::target_continuation_down:
+    case Exl3CudaLinearAdmission::target_continuation_q:
+    case Exl3CudaLinearAdmission::target_continuation_qkv:
+    case Exl3CudaLinearAdmission::target_continuation_z:
+    case Exl3CudaLinearAdmission::target_continuation_kv:
+    case Exl3CudaLinearAdmission::target_continuation_o:
+        break;
+    default:return false;
+    }
+    const bool down=in_features_==17408 && out_features_==5120;
+    const int tiles=metadata.K==7?32:(down?16:32);
+    const int blocks=out_features_/(16*tiles);
+    const int capacity=fast_same_weights_fp16_m1_capacity_[
+        metadata.K==7?2:(down?1:0)];
+    return out_features_% (16*tiles)==0 && blocks>0 && blocks<=capacity;
+}
+
 bool Exl3CudaLinearWorkspace::fast_native_persistent_m1_candidate(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
@@ -8463,6 +9292,29 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
     // Diagnostic mirror of the forward_from_transformed() branch order.
+    if (coherent_down_k6_candidate(metadata, rows, admission))
+        return "coherent_down_k6_shared_rows_n8_split5";
+    if (coherent_down_k7_candidate(metadata, rows, admission))
+        return "coherent_down_k7_shared_rows_n8_split5";
+    if (coherent_o_k7_candidate(metadata, rows, admission))
+        return "coherent_o_k7_shared_rows_n8_split5";
+    if (coherent_wide_k6_candidate(metadata, rows, admission)) {
+        constexpr const char* names[5] = {
+            "coherent_wide_k6_q_n8_m16_split5",
+            "coherent_wide_k6_qkv_n8_m16_split5",
+            "coherent_wide_k6_z_n8_m16_split5",
+            "coherent_wide_k6_o_n8_m16_split5",
+            "coherent_wide_k6_gate_up_n8_m16_split5"};
+        constexpr const char* split10_names[5] = {
+            "coherent_wide_k6_q_n8_m16_split10",
+            "coherent_wide_k6_qkv_n8_m16_split10",
+            "coherent_wide_k6_z_n8_m16_split10",
+            "coherent_wide_k6_o_n8_m16_split10",
+            "coherent_wide_k6_gate_up_n8_m16_split10"};
+        if (coherent_wide_k6_split_count(rows) == 10)
+            return split10_names[coherent_wide_k6_operation_];
+        return names[coherent_wide_k6_operation_];
+    }
     if (native_mtp_one_step_candidate(metadata, rows, admission))
         return "native_mtp_one_step_mma64";
     if (native_mtp_wide_prefill_candidate(metadata, rows, admission))
@@ -8501,6 +9353,12 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
             "fast_same_weights_int8_gemv_down_k7";
     if(target_m1_k7_int8_candidate(metadata,rows,admission))
         return "fast_same_weights_int8_gemv_k7";
+    if (fast_fp16_m2_8_fused_down_candidate(metadata,rows,admission))
+        return "fast_fp16_m2_8_fused_down_k6";
+    if (fast_fp16_m2_8_all_candidate(metadata,rows,admission))
+        return "fast_fp16_m2_8_k6k7";
+    if (fast_fp16_m2_8_down_candidate(metadata,rows,admission))
+        return "fast_fp16_m2_8_down_k6";
     if (target_fast_same_weights_fp16_m1_candidate(metadata, rows, admission)) {
         const bool k6_down = metadata.K == 6 && metadata.in_features == 17408 &&
             metadata.out_features == 5120;
@@ -8667,6 +9525,162 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     // contract before any reconstructed or ordinary dispatch can run.
     Exl3LinearWorkspaceRequirements::derive(in_features_,out_features_,rows,true,true)
         .require_disjoint_borrowed_views(transformed_input,accum_);
+
+    if (coherent_down_k6_candidate(metadata, rows, admission)) {
+        constexpr int output_blocks = 5120 / 128;
+        constexpr int split_count =
+            static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
+        // One packed-MMA producer instantiation serves M1 and M2..8. Each
+        // K/N tile's B decode is reused across active independent row C
+        // fragments; inactive physical M16 rows are zero and never stored.
+        exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true><<<
+            dim3(output_blocks * split_count), dim3(kThreads),
+            kCoherentDownK6SharedBytes, stream>>>(
+                transformed_input, weights.trellis, weights.mul1, accum_,
+                rows, in_features_, out_features_, split_count);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K6 down shared-row partials");
+        prefill_reduce_output_kernel<false><<<
+            dim3(rows, output_blocks), dim3(kHadamard), 0, stream>>>(
+                accum_, weights.svh, output, rows, out_features_, split_count);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K6 down row reduction/output");
+        process_coherent_down_k6_calls_.fetch_add(1, std::memory_order_relaxed);
+        process_coherent_down_k6_rows_.fetch_add(
+            static_cast<std::uint64_t>(rows), std::memory_order_relaxed);
+        return;
+    }
+
+    if (coherent_down_k7_candidate(metadata, rows, admission)) {
+        constexpr int output_blocks = 5120 / 128;
+        constexpr int split_count =
+            static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
+        exl3_gemm_m1_generic_mma_kernel<7, false, 8, true, true><<<
+            dim3(output_blocks * split_count), dim3(kThreads),
+            kCoherentDownK7SharedBytes, stream>>>(
+                transformed_input, weights.trellis, weights.mul1, accum_,
+                rows, in_features_, out_features_, split_count);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K7 down shared-row partials");
+        prefill_reduce_output_kernel<false><<<
+            dim3(rows, output_blocks), dim3(kHadamard), 0, stream>>>(
+                accum_, weights.svh, output, rows, out_features_, split_count);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K7 down row reduction/output");
+        process_coherent_down_k7_calls_.fetch_add(1, std::memory_order_relaxed);
+        process_coherent_down_k7_rows_.fetch_add(
+            static_cast<std::uint64_t>(rows), std::memory_order_relaxed);
+        return;
+    }
+
+    if (coherent_o_k7_candidate(metadata, rows, admission)) {
+        constexpr int output_blocks = 5120 / 128;
+        constexpr int split_count =
+            static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
+        exl3_gemm_m1_generic_mma_kernel<7, false, 8, true, true><<<
+            dim3(output_blocks * split_count), dim3(kThreads),
+            kCoherentOK7SharedBytes, stream>>>(
+                transformed_input, weights.trellis, weights.mul1, accum_,
+                rows, in_features_, out_features_, split_count);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K7 O shared-row partials");
+        prefill_reduce_output_kernel<false><<<
+            dim3(rows, output_blocks), dim3(kHadamard), 0, stream>>>(
+                accum_, weights.svh, output, rows, out_features_, split_count);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K7 O row reduction/output");
+        process_coherent_o_k7_calls_.fetch_add(1, std::memory_order_relaxed);
+        process_coherent_o_k7_rows_.fetch_add(
+            static_cast<std::uint64_t>(rows), std::memory_order_relaxed);
+        return;
+    }
+
+    if (coherent_wide_k6_candidate(metadata, rows, admission)) {
+        const int output_blocks = out_features_ / kHadamard;
+        const int split_count = coherent_wide_k6_split_count(rows);
+        exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true><<<
+            dim3(output_blocks * split_count), dim3(kThreads),
+            kCoherentWideK6SharedBytes, stream>>>(
+                transformed_input, weights.trellis, weights.mul1, accum_,
+                rows, in_features_, out_features_, split_count);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent wide K6 shared-row partials");
+        prefill_reduce_output_kernel<false><<<
+            dim3(rows, output_blocks), dim3(kHadamard), 0, stream>>>(
+                accum_, weights.svh, output, rows, out_features_, split_count);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent wide K6 row reduction/output");
+        coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(
+            1, std::memory_order_relaxed);
+        coherent_wide_k6_rows_[coherent_wide_k6_operation_].fetch_add(
+            static_cast<std::uint64_t>(rows), std::memory_order_relaxed);
+        if (split_count == 10)
+            coherent_wide_k6_split10_calls_[coherent_wide_k6_operation_].fetch_add(
+                1, std::memory_order_relaxed);
+        return;
+    }
+
+    if (fast_fp16_m2_8_fused_down_candidate(metadata,rows,admission)) {
+        exl3_small_m_down_fused_output_kernel<<<
+            dim3(out_features_/kHadamard),dim3(kThreads),0,stream>>>(
+                transformed_input,weights.trellis,weights.mul1,weights.svh,
+                output,rows,in_features_,out_features_);
+        cuda_check(cudaGetLastError(),
+            "launch fused-output packed FP16 M2-8 down projection");
+        process_fast_fp16_m2_8_fused_down_calls_.fetch_add(
+            1,std::memory_order_relaxed);
+        return;
+    }
+    if(fast_fp16_m2_8_all_candidate(metadata,rows,admission) ||
+       fast_fp16_m2_8_down_candidate(metadata,rows,admission)) {
+        const bool down=in_features_==17408 && out_features_==5120;
+        const int output_tiles_per_block=metadata.K==7?32:(down?16:32);
+        const int output_blocks=out_features_/(16*output_tiles_per_block);
+        const int capacity=fast_same_weights_fp16_m1_capacity_[
+            metadata.K==7?2:(down?1:0)];
+        int split_count=std::min(5,capacity/output_blocks);
+        if(const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+           requested && *requested)
+            split_count=std::min(split_count,std::max(1,std::atoi(requested)));
+        if(split_count<1)throw std::runtime_error(
+            "fast FP16 M2-8 down lacks resident capacity");
+        // The prior small-M path loaded every A tile synchronously and
+        // introduced an extra CTA barrier per K step. Stage A alongside the
+        // already double-buffered packed B tile when explicitly requested.
+        const bool async_a=fast_fp16_m2_8_async_a_enabled_;
+        const std::size_t shared_bytes=(async_a?512u:256u)*sizeof(half)+
+            2u*output_tiles_per_block*16u*metadata.K*sizeof(std::uint16_t)+
+            16u*output_tiles_per_block*16u*sizeof(float);
+        const std::uint16_t* trellis=weights.trellis;
+        const std::int32_t* mul1=weights.mul1;
+        float* accum=accum_;
+        int input_features=in_features_,output_features=out_features_;
+        void* args[]={&transformed_input,&trellis,&mul1,&accum,&rows,
+            &input_features,&output_features,&split_count};
+        void* kernel=metadata.K==7?
+            (async_a?reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<7,false,32,true,true,true>):
+                reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<7,false,32,false,true,true>)):
+            down?(async_a?reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<6,false,16,true,true>):
+                reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<6,false,16,false,true>)):
+                (async_a?reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<6,false,32,true,true>):
+                reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<6,false,32,false,true>));
+        cuda_check(cudaLaunchKernel(
+            kernel,
+            dim3(output_blocks*split_count),dim3(kThreads),args,shared_bytes,
+            stream),"launch packed FP16 M2-8 target projection");
+        prefill_reduce_output_kernel<false><<<
+            dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+                accum_,weights.svh,output,rows,out_features_,split_count);
+        cuda_check(cudaGetLastError(),"reduce packed FP16 M2-8 target projection");
+        process_fast_fp16_m2_8_down_calls_.fetch_add(1,std::memory_order_relaxed);
+        return;
+    }
 
     // The opt-in native MGEMM policy must be evaluated before the established
     // rows==1 target selectors below.  Those selectors are intentionally kept

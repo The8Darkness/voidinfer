@@ -62,6 +62,14 @@ function(ninfer_add_op_test name)
   endif()
 endfunction()
 
+# Gaming-preparation campaign: CPU contract executable has no CUDA linkage.
+ninfer_add_host_contract_test(ninfer_exl3_gaming_contract_test
+  SOURCES test_exl3_gaming_contract.cpp)
+# Phase B only: explicit GPU leaf differentials and represented-state fixtures.
+ninfer_add_test(ninfer_exl3_gaming_operators_test
+  SOURCES test_exl3_gaming_operators.cu
+  LIBRARIES ninfer_exl3_dflash2)
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}
@@ -560,6 +568,12 @@ target_include_directories(ninfer_exl3_engine_lifecycle_test PRIVATE
 target_link_options(ninfer_exl3_engine_lifecycle_test PRIVATE
   $<$<CXX_COMPILER_ID:MSVC>:/STACK:8388608>)
 set_tests_properties(ninfer_exl3_engine_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_exl3_engine_device_test
+  SOURCES test_exl3_engine_device.cpp
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_exl3_engine_device_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_exl3_engine_device_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_exl3_frontend_reference_test
   SOURCES test_exl3_frontend_reference.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -643,6 +657,10 @@ ninfer_add_host_contract_test(ninfer_exl3_physical_resource_attribution_test
   SOURCES test_exl3_physical_resource_attribution.cpp)
 ninfer_add_host_contract_test(ninfer_exl3_candidate_contracts_test
   SOURCES test_exl3_candidate_contracts.cpp)
+if(WIN32)
+  ninfer_add_host_contract_test(ninfer_exl3_environment_options_test
+    SOURCES test_exl3_environment_options.cpp)
+endif()
 ninfer_add_host_contract_test(ninfer_exl3_continuation_graph_drain_policy_test
   SOURCES test_exl3_continuation_graph_drain_policy.cpp)
 ninfer_add_host_contract_test(ninfer_exl3_resource_inventory_test

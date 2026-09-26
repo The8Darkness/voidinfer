@@ -1,4 +1,5 @@
 #pragma once
+#include "exl3/gaming_optimizations.h"
 
 #include "exl3/linear_cuda.h"
 #include "exl3/layer_buffer_retirement.h"
@@ -171,7 +172,7 @@ struct Exl3GdnStageFusionFixtureView {
 
 void exl3_gdn_stage_fusion_fixture(
     const Exl3GdnStageFusionFixtureView& view,
-    cudaStream_t stream=nullptr);
+    cudaStream_t stream=nullptr,bool pair_columns=false);
 
 // Owning read-only slice of the most recent supported M1-topology recurrent
 // history. `storage_owner` must keep the context/layer allocations alive;
@@ -478,6 +479,7 @@ struct Exl3GdnWideScratchView {
 
 class Exl3GdnLayer {
 public:
+    GoptSubmissions gaming_submissions() const noexcept { return gaming_submissions_; }
     // Successful host submissions outside graph capture; not replay or GPU completion counts.
     std::uint64_t paired_transform_submissions() const noexcept { return paired_transform_submissions_; }
     std::uint64_t fused_gate_up_submissions() const noexcept { return fused_gate_up_submissions_; }
@@ -516,12 +518,38 @@ public:
     Exl3GdnLayer& operator=(const Exl3GdnLayer&) = delete;
 
     void reset(cudaStream_t stream = nullptr);
+    struct BulkPrefillBuffers {
+        std::uint16_t* h = nullptr;
+        std::uint16_t* qkv = nullptr;
+        std::uint16_t* z = nullptr;
+        int rows = 0;
+    };
+    struct DeferredMlpBuffers {
+        std::uint16_t* post = nullptr;
+        std::uint16_t* mlp_input = nullptr;
+        int rows = 0;
+    };
+    bool supports_bulk_prefill() const noexcept;
+    void prepare_bulk_prefill(const std::uint16_t* input,
+                             BulkPrefillBuffers buffers,
+                             cudaStream_t stream);
+    bool supports_bulk_mlp(int rows) const noexcept;
+    void forward_before_bulk_mlp(const std::uint16_t* input,
+                                 DeferredMlpBuffers buffers,
+                                 cudaStream_t stream);
+    void finish_bulk_mlp(DeferredMlpBuffers buffers,
+                         std::uint16_t* gate,std::uint16_t* up,
+                         std::uint16_t* act,std::uint16_t* down,
+                         std::uint16_t* output,
+                         cudaStream_t stream,bool preserve_trace=false);
     void forward(const std::uint16_t* input, std::uint16_t* output, int rows,
                  cudaStream_t stream = nullptr, bool profile = false,
                  // Explicit target-verifier mode; nonlinear staging remains
                  // batched while every packed projection retains its M1 path.
                  bool preserve_m1_topology = false,
-                 bool wide_prefill = false);
+                 bool wide_prefill = false,
+                 const BulkPrefillBuffers* prepared = nullptr,
+                 const DeferredMlpBuffers* deferred_mlp = nullptr);
     // Qualification-only T0a topology oracle. One host thread submits a fixed
     // projection-by-projection schedule for two independent real layer
     // instances. Each lane retains the authoritative fixed-B8 projection
@@ -736,6 +764,8 @@ private:
         int first_row,int rows) const;
     Exl3GdnLayerWeights weights_{};
     int max_rows_ = 0;
+    Exl3GamingOptions gaming_ = Exl3GamingOptions::from_environment();
+    GoptSubmissions gaming_submissions_{};
     bool prefill_resident_ = false;
     bool prefill_resident_pair_columns_ = false;
     bool prefill_resident_pair_vector_io_ = false;
@@ -743,6 +773,9 @@ private:
     bool dual_input_transform_ = false;
     bool fused_gate_up_transform_ = false;
     bool small_m_fused_gate_up_transform_ = false;
+    bool bulk_mlp_fused_down_ = false;
+    bool bulk_mlp_fused_residual_ = false;
+    bool bulk_mlp_weight_prefetch_ = false;
     bool fused_residual_norm_ = false;
     bool fast_same_weights_fp16kv_gdn_decode_conv_ = false;
     bool fast_same_weights_fp16kv_gdn_m1_gate_up_pair_ = false;

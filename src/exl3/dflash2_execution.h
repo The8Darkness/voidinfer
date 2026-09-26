@@ -1447,6 +1447,9 @@ public:
     bool repair_checkpoint_enabled() const noexcept {return repair_checkpoint_enabled_;}
     bool suffix_proposals_enabled() const noexcept {return suffix_!=nullptr;}
     Exl3TextContext& context() {return *context_;}
+    std::shared_ptr<Exl3TextContext> context_owner_for_device_round() const noexcept {
+        return context_;
+    }
     std::size_t persistent_bytes() const {return context_->persistent_bytes()+5ULL*16*5120*2;}
     // Construction snapshot only: excludes the context supplied by the caller.
     // Later dynamic context growth is inventoried by its own transition.

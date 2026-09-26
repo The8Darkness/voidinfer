@@ -262,13 +262,6 @@ H6OracleStats h6_check_oracle_groups(
     return stats;
 }
 
-class H6EnvironmentRestore {
-public:
-    H6EnvironmentRestore() : original_(env("NINFER_EXL3_H6_SMALL_M")) {}
-    ~H6EnvironmentRestore() { _putenv_s("NINFER_EXL3_H6_SMALL_M", original_.c_str()); }
-private:
-    std::string original_;
-};
 
 struct H6Graph {
     cudaGraph_t graph = nullptr;
@@ -295,7 +288,8 @@ void run_h6qualification(Exl3TextModel& target, std::ostream& out) {
     auto* base = static_cast<std::uint16_t*>(output.get());
     auto* dst = base + guard;
     auto* ref_dst = static_cast<std::uint16_t*>(reference.get());
-    H6EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment{
+        "NINFER_EXL3_H6_SMALL_M"};
     _putenv_s("NINFER_EXL3_H6_SMALL_M", "1");
     Exl3CudaLinearWorkspace ws(kHidden, kVocab, 8);
     require(std::string(ws.dispatch_name(metadata, 1)) == "h6_single_split",

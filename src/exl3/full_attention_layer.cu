@@ -1,4 +1,5 @@
 #include "exl3/full_attention_layer.h"
+#include "exl3/environment_options.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/linear_workspace_requirements.h"
 
@@ -44,12 +45,14 @@ std::atomic<std::uint64_t> prefill_shared_score_parallel_softmax_counter{0};
 std::atomic<std::uint64_t> prefill_shared_score_head_split256_counter{0};
 std::atomic<std::uint64_t> prefill_shared_score_dimension_split256_counter{0};
 std::atomic<std::uint64_t> fast_fused_flash_attention_counter{0};
+std::atomic<std::uint64_t> fast_fused_flash_multirow_attention_counter{0};
 std::atomic<std::uint64_t> fast_whole_context_fused_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_tiled_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_rows4_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_rows8_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_wmma_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_wmma32_attention_counter{0};
+std::atomic<std::uint64_t> fast_prefill_wmma64_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_rows2_attention_counter{0};
 std::atomic<std::uint64_t> fast_online_decode_attention_counter{0};
 std::atomic<std::uint64_t> fast_cublas_attention_counter{0};
@@ -2855,16 +2858,29 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
 }
 
 __global__ void attention_cached_gqa_six_fused_flash_merge_kernel(
-    const float* workspace,std::uint16_t* output,int rows,int segments) {
+    const float* workspace,std::uint16_t* output,int rows,int segments,
+    int position,int capacity,int keys,const int* position_device,
+    int query_offset) {
     const int block=static_cast<int>(blockIdx.x);
     const int query=block/kKVHeads;
     const int kv_head=block%kKVHeads;
     const int tid=threadIdx.x;
     if(query>=rows || tid>=kHeadDim) return;
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int count=base+query+1;
+    if(count<1 || count>capacity) {
+        for(int head=0;head<kFastFusedFlashHeads;++head)
+            output[(query*kQHeads+kv_head*kFastFusedFlashHeads+head)*kHeadDim+tid]=0;
+        return;
+    }
+    // A graph may launch the capacity-sized grid before the live frontier
+    // reaches its final tile. Producers for those tiles return without writing
+    // scratch; the merge must never consume their old contents.
+    const int live_segments=min(segments,(count+keys-1)/keys);
     __shared__ float global_max[kFastFusedFlashHeads];
     if(tid<kFastFusedFlashHeads) {
         float value=-3.402823466e+38F;
-        for(int segment=0;segment<segments;++segment) {
+        for(int segment=0;segment<live_segments;++segment) {
             const float* slot=workspace+
                 ((static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments+segment)*
                     kFastFusedFlashStride;
@@ -2875,7 +2891,7 @@ __global__ void attention_cached_gqa_six_fused_flash_merge_kernel(
     __syncthreads();
     for(int head=0;head<kFastFusedFlashHeads;++head) {
         float denominator=0.0f,numerator=0.0f;
-        for(int segment=0;segment<segments;++segment) {
+        for(int segment=0;segment<live_segments;++segment) {
             const float* slot=workspace+
                 ((static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments+segment)*
                     kFastFusedFlashStride;
@@ -3480,7 +3496,7 @@ __global__ void attention_cached_gqa_six_wmma_prefill_kernel(
                     #pragma unroll
                     for(int group=0;group<kValueGroups;++group) {
                         nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,
-                            nvcuda::wmma::col_major> b;
+                            nvcuda::wmma::row_major> b;
                         nvcuda::wmma::load_matrix_sync(
                             b,&v_tile[n_base][k_base+group*16],kHeadDim);
                         nvcuda::wmma::mma_sync(c[group],a,b,c[group]);
@@ -3514,17 +3530,22 @@ __global__ void attention_cached_gqa_six_wmma_prefill_kernel(
 // within the physical-C1 limit while reusing each K/V tile across 32 rows. It is
 // construction-latched and default-off: the exact score/value path remains
 // the fallback for every unsupported or disabled configuration.
+template<int TileStride,int SplitCount=1,int BlockM=32>
 __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,std::uint16_t* output,int rows,
-    int position,int capacity,const int* position_device,int query_offset) {
-    constexpr int BlockM=32;
+    int position,int capacity,const int* position_device,int query_offset,
+    float* split_output,float* split_stats) {
+    static_assert(BlockM==32 || BlockM==64);
     constexpr int BlockN=32;
     constexpr int HeadsPerBlock=1;
-    constexpr int kValueGroups=kHeadDim/64;
+    constexpr int ActiveWarps=BlockM==64?8:4;
+    constexpr int kValueGroups=kHeadDim/(ActiveWarps*16);
     const int query_base=static_cast<int>(blockIdx.x)*BlockM;
     const int kv_head=static_cast<int>(blockIdx.y);
-    const int head_group=static_cast<int>(blockIdx.z);
+    static_assert(SplitCount==1 || SplitCount==2 || SplitCount==4);
+    const int head_group=static_cast<int>(blockIdx.z)/SplitCount;
+    const int split=static_cast<int>(blockIdx.z)%SplitCount;
     const int tid=static_cast<int>(threadIdx.x);
     const int warp=tid/32;
     constexpr int kHeadsPerKV=kQHeads/kKVHeads;
@@ -3535,10 +3556,18 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
     const int base=(position_device?*position_device:position)+query_offset;
     const int maximum_count=base+query_base+active_rows;
     if(base+query_base+1<1 || maximum_count>capacity) return;
+    const int segment_tiles=(maximum_count+SplitCount*BlockN-1)/
+        (SplitCount*BlockN);
+    const int first_begin=SplitCount==1?0:
+        min(split*segment_tiles*BlockN,maximum_count);
+    const int first_end=SplitCount==1?maximum_count:
+        min((split+1)*segment_tiles*BlockN,maximum_count);
 
-    __shared__ half q_tile[HeadsPerBlock][BlockM][kHeadDim];
-    __shared__ half k_tile[BlockN][kHeadDim];
-    __shared__ half v_tile[BlockN][kHeadDim];
+    // M64 streams Q from its original row-major positions and overlays K/V.
+    // That keeps the FP32 online output accumulator within SM120 shared memory.
+    __shared__ half q_tile[HeadsPerBlock][BlockM==64?1:BlockM][TileStride];
+    __shared__ half k_tile[BlockN][TileStride];
+    __shared__ half v_tile[BlockM==64?1:BlockN][TileStride];
     __shared__ float score_tile[HeadsPerBlock][BlockM][BlockN];
     __shared__ half probability_tile[HeadsPerBlock][BlockM][BlockN];
     __shared__ float accumulated[HeadsPerBlock][BlockM][kHeadDim];
@@ -3551,9 +3580,10 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
         const int rem=index%(BlockM*kHeadDim);
         const int row=rem/kHeadDim;
         const int dim=rem%kHeadDim;
-        q_tile[head][row][dim]=row<active_rows?
-            __ushort_as_half(q[((query_base+row)*kQHeads+q_head_base+head)*
-                kHeadDim+dim]):__float2half(0.0f);
+        if constexpr(BlockM==32)
+            q_tile[head][row][dim]=row<active_rows?
+                __ushort_as_half(q[((query_base+row)*kQHeads+q_head_base+head)*
+                    kHeadDim+dim]):__float2half(0.0f);
         accumulated[head][row][dim]=0.0f;
     }
     for(int index=tid;index<HeadsPerBlock*BlockM;index+=blockDim.x) {
@@ -3565,29 +3595,31 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
     }
     __syncthreads();
 
-    for(int first=0;first<maximum_count;first+=BlockN) {
+    for(int first=first_begin;first<first_end;first+=BlockN) {
         for(int index=tid;index<BlockN*kHeadDim;index+=blockDim.x) {
             const int key_offset=index/kHeadDim;
             const int dim=index%kHeadDim;
             const int key=first+key_offset;
-            if(key<maximum_count && key<capacity) {
+            if(key<first_end && key<capacity) {
                 k_tile[key_offset][dim]=__ushort_as_half(
                     k_cache[(static_cast<std::size_t>(key)*kKVHeads+
                         kv_head)*kHeadDim+dim]);
-                v_tile[key_offset][dim]=__ushort_as_half(
-                    v_cache[(static_cast<std::size_t>(key)*kKVHeads+
-                        kv_head)*kHeadDim+dim]);
+                if constexpr(BlockM==32)
+                    v_tile[key_offset][dim]=__ushort_as_half(
+                        v_cache[(static_cast<std::size_t>(key)*kKVHeads+
+                            kv_head)*kHeadDim+dim]);
             } else {
                 k_tile[key_offset][dim]=__float2half(0.0f);
-                v_tile[key_offset][dim]=__float2half(0.0f);
+                if constexpr(BlockM==32)
+                    v_tile[key_offset][dim]=__float2half(0.0f);
             }
         }
         __syncthreads();
 
-        // Four warps cover one head x two M tiles x two N tiles.
-        if(warp<HeadsPerBlock*4) {
-            const int head=warp/4;
-            const int task=warp%4;
+        // M64 assigns all eight warps to four M tiles x two N tiles.
+        if(warp<HeadsPerBlock*(BlockM/16)*2) {
+            const int head=warp/((BlockM/16)*2);
+            const int task=warp%((BlockM/16)*2);
             const int m_base=(task/2)*16;
             const int n_base=(task%2)*16;
             nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,
@@ -3598,10 +3630,16 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
             nvcuda::wmma::fill_fragment(c,0.0f);
             #pragma unroll
             for(int k_tile_base=0;k_tile_base<kHeadDim;k_tile_base+=16) {
+                if constexpr(BlockM==64)
+                    nvcuda::wmma::load_matrix_sync(a,
+                        reinterpret_cast<const half*>(q)+
+                        ((query_base+m_base)*kQHeads+q_head_base+head)*
+                            kHeadDim+k_tile_base,kQHeads*kHeadDim);
+                else
+                    nvcuda::wmma::load_matrix_sync(
+                        a,&q_tile[head][m_base][k_tile_base],TileStride);
                 nvcuda::wmma::load_matrix_sync(
-                    a,&q_tile[head][m_base][k_tile_base],kHeadDim);
-                nvcuda::wmma::load_matrix_sync(
-                    b,&k_tile[n_base][k_tile_base],kHeadDim);
+                    b,&k_tile[n_base][k_tile_base],TileStride);
                 nvcuda::wmma::mma_sync(c,a,b,c);
             }
             nvcuda::wmma::store_matrix_sync(
@@ -3615,7 +3653,7 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
                 float tile_max=-3.402823466e+38F;
                 for(int offset=0;offset<BlockN;++offset) {
                     const int key=first+offset;
-                    if(tid<active_rows && offset<maximum_count-first &&
+                    if(tid<active_rows && offset<first_end-first &&
                        key<=base+query_base+tid)
                         tile_max=fmaxf(tile_max,
                             score_tile[head][tid][offset]*0.0625f);
@@ -3633,7 +3671,7 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
                 const int offset=index%BlockN;
                 const int key=first+offset;
                 const bool valid=row<active_rows &&
-                    offset<maximum_count-first &&
+                    offset<first_end-first &&
                     key<=base+query_base+row;
                 const float score=score_tile[head][row][offset]*0.0625f;
                 probability_tile[head][row][offset]=__float2half(
@@ -3644,7 +3682,7 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
 
             if(tid<BlockM) {
                 float tile_sum=0.0f;
-                const int extent=min(BlockN,maximum_count-first);
+                const int extent=min(BlockN,first_end-first);
                 for(int offset=0;offset<extent;++offset)
                     tile_sum+=__half2float(probability_tile[head][tid][offset]);
                 denominator[head][tid]=denominator[head][tid]*
@@ -3659,9 +3697,25 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
             }
             __syncthreads();
 
-            const int head_warp=warp-head*4;
-            if(head_warp>=0 && head_warp<4) {
-                const int k_base=head_warp*64;
+            if constexpr(BlockM==64) {
+                // QK is complete. Reuse the K tile as V storage before PV.
+                for(int index=tid;index<BlockN*kHeadDim;index+=blockDim.x) {
+                    const int key_offset=index/kHeadDim;
+                    const int dim=index%kHeadDim;
+                    const int key=first+key_offset;
+                    k_tile[key_offset][dim]=key<first_end && key<capacity?
+                        __ushort_as_half(v_cache[
+                            (static_cast<std::size_t>(key)*kKVHeads+
+                                kv_head)*kHeadDim+dim]):__float2half(0.0f);
+                }
+                __syncthreads();
+            }
+
+            const int head_warp=warp-head*ActiveWarps;
+            if(head_warp>=0 && head_warp<ActiveWarps) {
+                const int k_base=head_warp*(kHeadDim/ActiveWarps);
+                const half* value_tile=BlockM==64?
+                    &k_tile[0][0]:&v_tile[0][0];
                 for(int m_base=0;m_base<BlockM;m_base+=16) {
                     nvcuda::wmma::fragment<
                         nvcuda::wmma::accumulator,16,16,16,float> c[kValueGroups];
@@ -3681,9 +3735,10 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
                         for(int group=0;group<kValueGroups;++group) {
                             nvcuda::wmma::fragment<
                                 nvcuda::wmma::matrix_b,16,16,16,half,
-                                nvcuda::wmma::col_major> b;
+                                nvcuda::wmma::row_major> b;
                             nvcuda::wmma::load_matrix_sync(
-                                b,&v_tile[n_base][k_base+group*16],kHeadDim);
+                                b,value_tile+n_base*TileStride+
+                                    k_base+group*16,TileStride);
                             nvcuda::wmma::mma_sync(c[group],a,b,c[group]);
                         }
                     }
@@ -3703,11 +3758,308 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
         const int rem=index%(BlockM*kHeadDim);
         const int row=rem/kHeadDim;
         const int dim=rem%kHeadDim;
-        if(row<active_rows)
-            output[((query_base+row)*kQHeads+q_head_base+head)*kHeadDim+dim]=
-                __half_as_ushort(__float2half_rn(
-                    accumulated[head][row][dim]/denominator[head][row]));
+        if(row<active_rows) {
+            const int element=((query_base+row)*kQHeads+q_head_base+head)*
+                kHeadDim+dim;
+            const float normalized=denominator[head][row]>0.0f?
+                accumulated[head][row][dim]/denominator[head][row]:0.0f;
+            if constexpr(SplitCount>1)
+                split_output[static_cast<std::size_t>(split)*rows*kQHeads*
+                    kHeadDim+element]=normalized;
+            else
+                output[element]=__half_as_ushort(__float2half_rn(normalized));
+        }
     }
+    if constexpr(SplitCount>1) {
+        for(int index=tid;index<HeadsPerBlock*active_rows;index+=blockDim.x) {
+            const int head=index/active_rows;
+            const int row=index%active_rows;
+            const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+
+                (query_base+row)*kQHeads+q_head_base+head)*2;
+            split_stats[stat]=running_max[head][row];
+            split_stats[stat+1]=denominator[head][row];
+        }
+    }
+}
+
+// Separate numeric candidate: a warp owns 16 query rows x 128 value columns
+// across the entire key scan. Unlike the selected WMMA64 path, its FP32 output
+// fragments stay in registers until the final store. A CTA-wide maximum gives
+// every fragment one rescale factor without assuming a WMMA fragment lane map.
+// The changed FP16 probability range requires an independent quality gate.
+template<int TileStride,int SplitCount,int HeadsPerCTA=1,int BlockN=32>
+__global__ void attention_cached_gqa_six_wmma64_register_prefill_kernel(
+    const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,std::uint16_t* output,int rows,
+    int position,int capacity,const int* position_device,int query_offset,
+    float* split_output,float* split_stats) {
+    static_assert(SplitCount==1 || SplitCount==2);
+    static_assert(HeadsPerCTA==1 || HeadsPerCTA==2);
+    static_assert(BlockN==32 || BlockN==64);
+    constexpr int BlockM=64/HeadsPerCTA;
+    constexpr int ValueColumnsPerWarp=128,WarpsPerHead=8/HeadsPerCTA;
+    constexpr int KeyStage=32;
+    constexpr int FinalColumns=BlockN==64?64:ValueColumnsPerWarp;
+    const int query_base=static_cast<int>(blockIdx.x)*BlockM;
+    const int kv_head=static_cast<int>(blockIdx.y);
+    constexpr int heads_per_kv=kQHeads/kKVHeads;
+    const int head_group=static_cast<int>(blockIdx.z)/SplitCount;
+    const int split=static_cast<int>(blockIdx.z)%SplitCount;
+    const int q_head_base=kv_head*heads_per_kv+head_group*HeadsPerCTA;
+    const int tid=static_cast<int>(threadIdx.x);
+    const int warp=tid/32;
+    const int lane=tid%32;
+    if(query_base+BlockM>rows || kv_head>=kKVHeads ||
+       head_group*HeadsPerCTA>=heads_per_kv) return;
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int maximum_count=base+query_base+BlockM;
+    if(base+query_base+1<1 || maximum_count>capacity) return;
+    const int segment_tiles=(maximum_count+SplitCount*BlockN-1)/
+        (SplitCount*BlockN);
+    const int first_begin=SplitCount==1?0:
+        min(split*segment_tiles*BlockN,maximum_count);
+    const int first_end=SplitCount==1?maximum_count:
+        min((split+1)*segment_tiles*BlockN,maximum_count);
+
+    __shared__ __align__(16) half key_value_tile[KeyStage][TileStride];
+    __shared__ __align__(16) float scores[HeadsPerCTA][BlockM][BlockN];
+    __shared__ __align__(16) half probabilities[HeadsPerCTA][BlockM][BlockN];
+    __shared__ float denominator[HeadsPerCTA][BlockM];
+    __shared__ float tile_row_max[HeadsPerCTA][BlockM];
+    __shared__ float current_max[HeadsPerCTA],rescale[HeadsPerCTA];
+    __shared__ __align__(16) float final_tile[16][FinalColumns];
+    if(tid<HeadsPerCTA*BlockM)
+        denominator[tid/BlockM][tid%BlockM]=0.0f;
+    if(tid<HeadsPerCTA) current_max[tid]=-3.402823466e+38F;
+    using Accumulator=nvcuda::wmma::fragment<
+        nvcuda::wmma::accumulator,16,16,16,float>;
+    Accumulator value[ValueColumnsPerWarp/16];
+    #pragma unroll
+    for(int group=0;group<ValueColumnsPerWarp/16;++group)
+        nvcuda::wmma::fill_fragment(value[group],0.0f);
+    __syncthreads();
+
+    for(int first=first_begin;first<first_end;first+=BlockN) {
+        const int head=warp/WarpsPerHead;
+        const int task=warp%WarpsPerHead;
+        const int m_base=(task/2)*16;
+        // A 64-key statistics tile uses two bounded 32-key K/V stages. The
+        // larger score plane halves online-max and rescale iterations without
+        // doubling shared K/V storage or changing register-owned output.
+        for(int key_window=0;key_window<BlockN;key_window+=KeyStage) {
+            for(int index=tid;index<KeyStage*kHeadDim;index+=blockDim.x) {
+                const int key_offset=index/kHeadDim;
+                const int dimension=index%kHeadDim;
+                const int key=first+key_window+key_offset;
+                key_value_tile[key_offset][dimension]=
+                    key<first_end && key<capacity?
+                    __ushort_as_half(k_cache[
+                        (static_cast<std::size_t>(key)*kKVHeads+kv_head)*
+                            kHeadDim+dimension]):__float2half(0.0f);
+            }
+            __syncthreads();
+            const int n_base=key_window+(task%2)*16;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,
+                nvcuda::wmma::row_major> query_fragment;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,
+                nvcuda::wmma::col_major> key_fragment;
+            Accumulator score_fragment;
+            nvcuda::wmma::fill_fragment(score_fragment,0.0f);
+            #pragma unroll
+            for(int dimension=0;dimension<kHeadDim;dimension+=16) {
+                nvcuda::wmma::load_matrix_sync(query_fragment,
+                    reinterpret_cast<const half*>(q)+
+                    ((query_base+m_base)*kQHeads+q_head_base+head)*
+                        kHeadDim+dimension,
+                    kQHeads*kHeadDim);
+                nvcuda::wmma::load_matrix_sync(key_fragment,
+                    &key_value_tile[(task%2)*16][dimension],TileStride);
+                nvcuda::wmma::mma_sync(score_fragment,query_fragment,
+                    key_fragment,score_fragment);
+            }
+            nvcuda::wmma::store_matrix_sync(&scores[head][m_base][n_base],
+                score_fragment,BlockN,nvcuda::wmma::mem_row_major);
+            __syncthreads();
+        }
+
+        if(tid<HeadsPerCTA*BlockM) {
+            const int score_head=tid/BlockM;
+            const int row=tid%BlockM;
+            float maximum=-3.402823466e+38F;
+            #pragma unroll
+            for(int offset=0;offset<BlockN;++offset) {
+                const int key=first+offset;
+                if(key<first_end && key<=base+query_base+row)
+                    maximum=fmaxf(maximum,
+                        scores[score_head][row][offset]*0.0625f);
+            }
+            tile_row_max[score_head][row]=maximum;
+        }
+        __syncthreads();
+        if(tid<HeadsPerCTA) {
+            float next_max=current_max[tid];
+            #pragma unroll
+            for(int row=0;row<BlockM;++row)
+                next_max=fmaxf(next_max,tile_row_max[tid][row]);
+            rescale[tid]=next_max==current_max[tid]?1.0f:
+                (current_max[tid]< -1.0e30f?0.0f:
+                    exp2f((current_max[tid]-next_max)*
+                        1.4426950408889634f));
+            current_max[tid]=next_max;
+        }
+        __syncthreads();
+        for(int index=tid;index<HeadsPerCTA*BlockM*BlockN;
+            index+=blockDim.x) {
+            const int probability_head=index/(BlockM*BlockN);
+            const int row=(index/BlockN)%BlockM;
+            const int offset=index%BlockN;
+            const int key=first+offset;
+            const bool valid=key<first_end && key<=base+query_base+row;
+            probabilities[probability_head][row][offset]=__float2half_rn(
+                valid?exp2f((scores[probability_head][row][offset]*
+                    0.0625f-current_max[probability_head])*
+                    1.4426950408889634f):0.0f);
+        }
+        __syncthreads();
+        if(tid<HeadsPerCTA*BlockM) {
+            const int probability_head=tid/BlockM;
+            const int row=tid%BlockM;
+            float sum=0.0f;
+            const int extent=min(BlockN,first_end-first);
+            for(int offset=0;offset<extent;++offset)
+                sum+=__half2float(
+                    probabilities[probability_head][row][offset]);
+            denominator[probability_head][row]=
+                denominator[probability_head][row]*
+                    rescale[probability_head]+sum;
+        }
+        #pragma unroll
+        for(int group=0;group<ValueColumnsPerWarp/16;++group)
+            #pragma unroll
+            for(int element=0;element<value[group].num_elements;++element)
+                value[group].x[element]*=rescale[warp/WarpsPerHead];
+        __syncthreads();
+
+        const int value_head=warp/WarpsPerHead;
+        const int value_m_base=((warp%WarpsPerHead)/2)*16;
+        const int value_d_base=(warp%2)*ValueColumnsPerWarp;
+        // QK has consumed the key stage. Reuse it for the matching V half.
+        for(int key_window=0;key_window<BlockN;key_window+=KeyStage) {
+            for(int index=tid;index<KeyStage*kHeadDim;index+=blockDim.x) {
+                const int key_offset=index/kHeadDim;
+                const int dimension=index%kHeadDim;
+                const int key=first+key_window+key_offset;
+                key_value_tile[key_offset][dimension]=
+                    key<first_end && key<capacity?
+                    __ushort_as_half(v_cache[
+                        (static_cast<std::size_t>(key)*kKVHeads+kv_head)*
+                            kHeadDim+dimension]):__float2half(0.0f);
+            }
+            __syncthreads();
+            #pragma unroll
+            for(int probability_offset=0;probability_offset<KeyStage;
+                probability_offset+=16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,
+                    nvcuda::wmma::row_major> probability_fragment;
+                nvcuda::wmma::load_matrix_sync(probability_fragment,
+                    &probabilities[value_head][value_m_base]
+                        [key_window+probability_offset],BlockN);
+                #pragma unroll
+                for(int group=0;group<ValueColumnsPerWarp/16;++group) {
+                    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,
+                        nvcuda::wmma::row_major> v_fragment;
+                    nvcuda::wmma::load_matrix_sync(v_fragment,
+                        &key_value_tile[probability_offset]
+                            [value_d_base+group*16],TileStride);
+                    nvcuda::wmma::mma_sync(value[group],probability_fragment,
+                        v_fragment,value[group]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Reuse one 16 x 128 tile across warps only once, after the key scan.
+    // Every warp participates in the CTA barriers, even on an empty split.
+    for(int owner=0;owner<8;++owner) {
+        for(int part=0;part<ValueColumnsPerWarp/FinalColumns;++part) {
+            if(warp==owner) {
+                #pragma unroll
+                for(int group=0;group<FinalColumns/16;++group)
+                    nvcuda::wmma::store_matrix_sync(
+                        &final_tile[0][group*16],
+                        value[part*(FinalColumns/16)+group],
+                        FinalColumns,nvcuda::wmma::mem_row_major);
+            }
+            __syncthreads();
+            if(warp==owner) {
+                const int output_head=warp/WarpsPerHead;
+                const int m_base=((warp%WarpsPerHead)/2)*16;
+                const int d_base=(warp%2)*ValueColumnsPerWarp+part*FinalColumns;
+                for(int index=lane;index<16*FinalColumns;index+=32) {
+                    const int row=m_base+index/FinalColumns;
+                    const int dimension=d_base+index%FinalColumns;
+                    const int element=((query_base+row)*kQHeads+
+                        q_head_base+output_head)*kHeadDim+dimension;
+                    const float result=denominator[output_head][row]>0.0f?
+                        final_tile[index/FinalColumns]
+                            [index%FinalColumns]/
+                                denominator[output_head][row]:0.0f;
+                    if constexpr(SplitCount==2)
+                        split_output[static_cast<std::size_t>(split)*rows*
+                            kQHeads*kHeadDim+element]=result;
+                    else
+                        output[element]=__half_as_ushort(__float2half_rn(result));
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if constexpr(SplitCount==2) {
+        if(tid<HeadsPerCTA*BlockM) {
+            const int output_head=tid/BlockM;
+            const int row=tid%BlockM;
+            const std::size_t stat=(static_cast<std::size_t>(split)*rows*
+                kQHeads+(query_base+row)*kQHeads+q_head_base+
+                output_head)*2;
+            split_stats[stat]=current_max[output_head];
+            split_stats[stat+1]=denominator[output_head][row];
+        }
+    }
+}
+
+template<int SplitCount>
+__global__ void attention_wmma32_split_merge_kernel(
+    const float* split_output,const float* split_stats,
+    std::uint16_t* output,int rows) {
+    const int element=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;
+    const int elements=rows*kQHeads*kHeadDim;
+    if(element>=elements) return;
+    const int head_row=element/kHeadDim;
+    float maximum=-3.402823466e+38F;
+    #pragma unroll
+    for(int split=0;split<SplitCount;++split) {
+        const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+
+            head_row)*2;
+        if(split_stats[stat+1]>0.0f)
+            maximum=fmaxf(maximum,split_stats[stat]);
+    }
+    float numerator=0.0f,denominator=0.0f;
+    #pragma unroll
+    for(int split=0;split<SplitCount;++split) {
+        const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+
+            head_row)*2;
+        const float sum=split_stats[stat+1];
+        if(sum>0.0f) {
+            const float scale=sum*exp2f((split_stats[stat]-maximum)*
+                1.4426950408889634f);
+            numerator+=split_output[static_cast<std::size_t>(split)*elements+
+                element]*scale;
+            denominator+=scale;
+        }
+    }
+    const float value=numerator/denominator;
+    output[element]=__half_as_ushort(__float2half_rn(value));
 }
 
 // T72 diagnostic candidate. One CTA owns a query/KV-head pair and scans the
@@ -4919,6 +5271,209 @@ exl3_prefill_attention_shared_score_global_snapshot() noexcept {
 std::uint64_t exl3_fast_fused_flash_attention_calls_for_test() noexcept {
     return fast_fused_flash_attention_counter.load(std::memory_order_relaxed);
 }
+std::uint64_t exl3_fast_fused_flash_multirow_attention_calls_for_test() noexcept {
+    return fast_fused_flash_multirow_attention_counter.load(std::memory_order_relaxed);
+}
+
+void fast_wmma_attention_fixture(bool rows32,const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    int rows,int position,int capacity,const int* position_device,
+    int query_offset,cudaStream_t stream,bool padded) {
+    if(rows32 && padded)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16><<<
+            dim3((rows+31)/32,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                nullptr,nullptr);
+    else if(rows32)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim><<<
+            dim3((rows+31)/32,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                nullptr,nullptr);
+    else
+        attention_cached_gqa_six_wmma_prefill_kernel<<<
+            dim3((rows+15)/16,kKVHeads,kQHeads/(kKVHeads*2)),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset);
+    cuda_check(cudaGetLastError(),"WMMA attention fixture launch");
+}
+
+void fast_wmma_split2_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,cudaStream_t stream,bool padded) {
+    if(padded)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,2><<<
+            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                split_output,split_stats);
+    else
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,2><<<
+            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                split_output,split_stats);
+    cuda_check(cudaGetLastError(),"WMMA split2 attention fixture launch");
+    attention_wmma32_split_merge_kernel<2><<<
+        (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            split_output,split_stats,output,rows);
+    cuda_check(cudaGetLastError(),"WMMA split2 attention fixture merge");
+}
+
+void fast_wmma_split4_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,cudaStream_t stream,bool padded) {
+    if(padded)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,4><<<
+            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                split_output,split_stats);
+    else
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,4><<<
+            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                split_output,split_stats);
+    cuda_check(cudaGetLastError(),"WMMA split4 attention fixture launch");
+    attention_wmma32_split_merge_kernel<4><<<
+        (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            split_output,split_stats,output,rows);
+    cuda_check(cudaGetLastError(),"WMMA split4 attention fixture merge");
+}
+
+void fast_wmma64_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,cudaStream_t stream,
+    bool padded,bool split2,bool register_owned,bool shared_heads,
+    bool keys64) {
+    if(keys64 && (!register_owned || shared_heads))
+        throw std::invalid_argument("WMMA64 keys64 fixture requires one-head register route");
+    // Partial blocks retain the repaired WMMA32 path; no Q fragment may read
+    // beyond the represented query span.
+    if(rows%64) {
+        if(split2)
+            fast_wmma_split2_attention_fixture(q,k,v,output,split_output,
+                split_stats,rows,position,capacity,position_device,
+                query_offset,stream,padded);
+        else
+            fast_wmma_attention_fixture(true,q,k,v,output,rows,position,
+                capacity,position_device,query_offset,stream,padded);
+        return;
+    }
+    if(split2) {
+        if(shared_heads && padded)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim+16,2,2><<<
+                dim3(rows/32,kKVHeads,2*kQHeads/(kKVHeads*2)),
+                256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(shared_heads)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim,2,2><<<
+                dim3(rows/32,kKVHeads,2*kQHeads/(kKVHeads*2)),
+                256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(keys64 && padded)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim+16,2,1,64><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(keys64)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim,2,1,64><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(register_owned && padded)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim+16,2><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(register_owned)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim,2><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(padded)
+            attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,2,64><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else
+            attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,2,64><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        cuda_check(cudaGetLastError(),"WMMA64 split2 fixture partials");
+        attention_wmma32_split_merge_kernel<2><<<
+            (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            split_output,split_stats,output,rows);
+    } else if(shared_heads && padded)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim+16,1,2><<<
+            dim3(rows/32,kKVHeads,kQHeads/(kKVHeads*2)),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(shared_heads)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim,1,2><<<
+            dim3(rows/32,kKVHeads,kQHeads/(kKVHeads*2)),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(keys64 && padded)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim+16,1,1,64><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(keys64)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim,1,1,64><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(register_owned && padded)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim+16,1><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(register_owned)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim,1><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(padded)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,1,64><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,1,64><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    cuda_check(cudaGetLastError(),"WMMA64 attention fixture launch");
+}
+
+void fast_fused_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,float* workspace,
+    std::uint16_t* output,int position,int capacity,int segments,
+    const int* position_device,cudaStream_t stream,int rows) {
+    if(rows<1 || rows>8 || position<0 || position+rows>capacity)
+        throw std::invalid_argument("fused attention fixture rows/frontier");
+    attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256><<<
+        rows*kKVHeads*segments,256,0,stream>>>(q,k,v,workspace,output,rows,position,
+            capacity,segments,position_device,0);
+    attention_cached_gqa_six_fused_flash_merge_kernel<<<
+        rows*kKVHeads,256,0,stream>>>(workspace,output,rows,segments,position,
+            capacity,kFastFusedFlashKeys256,position_device,0);
+    cuda_check(cudaGetLastError(),"fused attention fixture launch");
+}
 
 std::uint64_t exl3_fast_whole_context_fused_attention_calls_for_test() noexcept {
     return fast_whole_context_fused_attention_counter.load(std::memory_order_relaxed);
@@ -5056,127 +5611,78 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
     : weights_(weights), max_rows_(max_rows),
       reconstruct_gemm_(reconstruct_gemm) {
     coalesce_input_mlp_=coalesce_input_mlp;
-    const auto* small_m_fused_gate_up=std::getenv(
-        "NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM");
-    if(small_m_fused_gate_up && std::strcmp(small_m_fused_gate_up,"0")!=0 &&
-       std::strcmp(small_m_fused_gate_up,"1")!=0)
-        throw std::invalid_argument(
-            "small-M fused gate/up transform must be 0 or 1");
-    small_m_fused_gate_up_transform_=small_m_fused_gate_up &&
-        std::strcmp(small_m_fused_gate_up,"1")==0;
-    const auto* fused_flash=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH");
-    if(fused_flash && std::strcmp(fused_flash,"0")!=0 &&
-       std::strcmp(fused_flash,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV fused flash must be 0 or 1");
-    fast_fused_flash_attention_=fused_flash &&
-        std::strcmp(fused_flash,"1")==0;
-    const auto* fused_flash_keys256=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_KEYS256");
-    if(fused_flash_keys256 && std::strcmp(fused_flash_keys256,"0")!=0 &&
-       std::strcmp(fused_flash_keys256,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV fused flash keys256 must be 0 or 1");
-    fast_fused_flash_attention_keys256_=fused_flash_keys256 &&
-        std::strcmp(fused_flash_keys256,"1")==0;
-    const auto* cublas_attention=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_CUBLAS_ATTENTION");
-    if(cublas_attention && std::strcmp(cublas_attention,"0")!=0 &&
-       std::strcmp(cublas_attention,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV cuBLAS attention must be 0 or 1");
-    fast_cublas_attention_=cublas_attention &&
-        std::strcmp(cublas_attention,"1")==0;
-    const auto* online_decode_attention=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE");
-    if(online_decode_attention && std::strcmp(online_decode_attention,"0")!=0 &&
-       std::strcmp(online_decode_attention,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV online decode attention must be 0 or 1");
-    fast_online_decode_attention_=online_decode_attention &&
-        std::strcmp(online_decode_attention,"1")==0;
-    const auto* online_decode_warp_heads=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE_WARP_HEADS");
-    if(online_decode_warp_heads &&
-       std::strcmp(online_decode_warp_heads,"0")!=0 &&
-       std::strcmp(online_decode_warp_heads,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV online decode warp-heads must be 0 or 1");
-    fast_online_decode_attention_warp_heads_=online_decode_warp_heads &&
-        std::strcmp(online_decode_warp_heads,"1")==0;
-    const auto* whole_context_fused=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_WHOLE_CONTEXT");
-    if(whole_context_fused && std::strcmp(whole_context_fused,"0")!=0 &&
-       std::strcmp(whole_context_fused,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV whole-context fused attention must be 0 or 1");
-    fast_whole_context_fused_attention_=whole_context_fused &&
-        std::strcmp(whole_context_fused,"1")==0;
-    const auto* prefill_tiled=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED");
-    if(prefill_tiled && std::strcmp(prefill_tiled,"0")!=0 &&
-       std::strcmp(prefill_tiled,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV tiled prefill attention must be 0 or 1");
-    fast_prefill_tiled_attention_=prefill_tiled &&
-        std::strcmp(prefill_tiled,"1")==0;
-    const auto* prefill_rows4=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS4");
-    if(prefill_rows4 && std::strcmp(prefill_rows4,"0")!=0 &&
-       std::strcmp(prefill_rows4,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV four-row prefill attention must be 0 or 1");
-    fast_prefill_rows4_attention_=prefill_rows4 &&
-        std::strcmp(prefill_rows4,"1")==0;
-    const auto* prefill_rows8=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8");
-    if(prefill_rows8 && std::strcmp(prefill_rows8,"0")!=0 &&
-       std::strcmp(prefill_rows8,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV eight-row prefill attention must be 0 or 1");
-    fast_prefill_rows8_attention_=prefill_rows8 &&
-        std::strcmp(prefill_rows8,"1")==0;
-    const auto* prefill_rows8_threads128=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8_THREADS128");
-    if(prefill_rows8_threads128 && std::strcmp(prefill_rows8_threads128,"0")!=0 &&
-       std::strcmp(prefill_rows8_threads128,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV eight-row prefill 128-thread launch must be 0 or 1");
-    fast_prefill_rows8_threads128_=prefill_rows8_threads128 &&
-        std::strcmp(prefill_rows8_threads128,"1")==0;
-    const auto* prefill_wmma=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA");
-    if(prefill_wmma && std::strcmp(prefill_wmma,"0")!=0 &&
-       std::strcmp(prefill_wmma,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV WMMA prefill must be 0 or 1");
-    fast_prefill_wmma_attention_=prefill_wmma &&
-        std::strcmp(prefill_wmma,"1")==0;
-    const auto* prefill_wmma32=std::getenv(
+    small_m_fused_gate_up_transform_ = read_binary_option("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",
+        "small-M fused gate/up transform must be 0 or 1");
+    fast_fused_flash_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH",
+        "FAST same-weight FP16-KV fused flash must be 0 or 1");
+    fast_fused_flash_attention_keys256_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_KEYS256",
+        "FAST same-weight FP16-KV fused flash keys256 must be 0 or 1");
+    fast_fused_flash_multirow_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW",
+        "FAST same-weight FP16-KV fused flash multirow must be 0 or 1");
+    fast_cublas_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_CUBLAS_ATTENTION",
+        "FAST same-weight FP16-KV cuBLAS attention must be 0 or 1");
+    fast_online_decode_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE",
+        "FAST same-weight FP16-KV online decode attention must be 0 or 1");
+    fast_online_decode_attention_warp_heads_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE_WARP_HEADS",
+        "FAST same-weight FP16-KV online decode warp-heads must be 0 or 1");
+    fast_whole_context_fused_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_WHOLE_CONTEXT",
+        "FAST same-weight FP16-KV whole-context fused attention must be 0 or 1");
+    fast_prefill_tiled_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED",
+        "FAST same-weight FP16-KV tiled prefill attention must be 0 or 1");
+    fast_prefill_rows4_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS4",
+        "FAST same-weight FP16-KV four-row prefill attention must be 0 or 1");
+    fast_prefill_rows8_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8",
+        "FAST same-weight FP16-KV eight-row prefill attention must be 0 or 1");
+    fast_prefill_rows8_threads128_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8_THREADS128",
+        "FAST same-weight FP16-KV eight-row prefill 128-thread launch must be 0 or 1");
+    fast_prefill_wmma_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA",
+        "FAST same-weight FP16-KV WMMA prefill must be 0 or 1");
+    const char* explicit_wmma32 = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32");
-    if(prefill_wmma32 && std::strcmp(prefill_wmma32,"0")!=0 &&
-       std::strcmp(prefill_wmma32,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV WMMA32 prefill must be 0 or 1");
-    fast_prefill_wmma32_attention_=prefill_wmma32 &&
-        std::strcmp(prefill_wmma32,"1")==0;
-    const auto* prefill_rows2=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS2");
-    if(prefill_rows2 && std::strcmp(prefill_rows2,"0")!=0 &&
-       std::strcmp(prefill_rows2,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV two-row prefill attention must be 0 or 1");
-    fast_prefill_rows2_attention_=prefill_rows2 &&
-        std::strcmp(prefill_rows2,"1")==0;
-    const auto* m1_gate_up_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR");
-    if(m1_gate_up_pair && std::strcmp(m1_gate_up_pair,"0")!=0 &&
-       std::strcmp(m1_gate_up_pair,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV M1 gate/up pair must be 0 or 1");
-    fast_same_weights_fp16kv_m1_gate_up_pair_=m1_gate_up_pair &&
-        std::strcmp(m1_gate_up_pair,"1")==0;
+    const char* fast_prefill_scope = std::getenv(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+    fast_prefill_wmma32_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32",
+        "FAST same-weight FP16-KV WMMA32 prefill must be 0 or 1") ||
+        (!explicit_wmma32 && fast_prefill_scope &&
+         std::strcmp(fast_prefill_scope, "1") == 0);
+    fast_prefill_wmma64_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64",
+        "FAST same-weight FP16-KV WMMA64 prefill must be 0 or 1");
+    if (fast_prefill_wmma64_attention_ && !fast_prefill_wmma32_attention_)
+        throw std::invalid_argument("WMMA64 requires WMMA32 prefill policy");
+    fast_prefill_wmma64_register_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER",
+        "FAST same-weight FP16-KV WMMA64 register prefill must be 0 or 1");
+    if (fast_prefill_wmma64_register_attention_ &&
+        !fast_prefill_wmma64_attention_)
+        throw std::invalid_argument("WMMA64 register candidate requires WMMA64");
+    fast_prefill_wmma64_register_keys64_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER_KEYS64",
+        "FAST same-weight FP16-KV WMMA64 register keys64 must be 0 or 1");
+    if (fast_prefill_wmma64_register_keys64_attention_ &&
+        !fast_prefill_wmma64_register_attention_)
+        throw std::invalid_argument("WMMA64 keys64 requires register candidate");
+    fast_prefill_wmma64_shared_heads_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_HEADS2",
+        "FAST same-weight FP16-KV WMMA64 shared heads must be 0 or 1");
+    if (fast_prefill_wmma64_shared_heads_attention_ &&
+        !fast_prefill_wmma64_register_attention_)
+        throw std::invalid_argument("WMMA64 shared heads requires register candidate");
+    if (fast_prefill_wmma64_register_keys64_attention_ &&
+        fast_prefill_wmma64_shared_heads_attention_)
+        throw std::invalid_argument("WMMA64 keys64 excludes shared heads");
+    fast_prefill_wmma32_padded_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32_PADDED",
+        "FAST same-weight FP16-KV WMMA32 padded tile must be 0 or 1");
+    if (fast_prefill_wmma32_padded_attention_ &&
+        !fast_prefill_wmma32_attention_)
+        throw std::invalid_argument("padded WMMA32 requires WMMA32 prefill");
+    fast_prefill_rows2_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS2",
+        "FAST same-weight FP16-KV two-row prefill attention must be 0 or 1");
+    fast_same_weights_fp16kv_m1_gate_up_pair_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR",
+        "FAST same-weight FP16-KV M1 gate/up pair must be 0 or 1");
     const auto* m1_kv_pair=std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
     if(m1_kv_pair && std::strcmp(m1_kv_pair,"0")!=0 &&
@@ -5185,23 +5691,11 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
             "FAST same-weight FP16-KV M1 K/V pair must be 0 or 1");
     fast_same_weights_fp16kv_m1_kv_pair_=m1_kv_pair &&
         std::strcmp(m1_kv_pair,"1")==0;
-    const auto* m1_kv_wide_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR");
-    if(m1_kv_wide_pair && std::strcmp(m1_kv_wide_pair,"0")!=0 &&
-       std::strcmp(m1_kv_wide_pair,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV M1 wide K/V pair must be 0 or 1");
-    fast_same_weights_fp16kv_m1_kv_wide_pair_=m1_kv_wide_pair &&
-        std::strcmp(m1_kv_wide_pair,"1")==0;
-    const auto* m1_kv_pair_graph=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR_GRAPH");
-    if(m1_kv_pair_graph && std::strcmp(m1_kv_pair_graph,"0")!=0 &&
-       std::strcmp(m1_kv_pair_graph,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV M1 K/V graph pair must be 0 or 1");
-    fast_same_weights_fp16kv_m1_kv_pair_graph_ =
-        fast_same_weights_fp16kv_m1_kv_pair_ && m1_kv_pair_graph &&
-        std::strcmp(m1_kv_pair_graph,"1")==0;
+    fast_same_weights_fp16kv_m1_kv_wide_pair_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR",
+        "FAST same-weight FP16-KV M1 wide K/V pair must be 0 or 1");
+    const bool m1_kv_pair_graph = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR_GRAPH",
+        "FAST same-weight FP16-KV M1 K/V graph pair must be 0 or 1");
+    fast_same_weights_fp16kv_m1_kv_pair_graph_ = fast_same_weights_fp16kv_m1_kv_pair_ && m1_kv_pair_graph;
     if(fast_fused_flash_attention_ && fast_whole_context_fused_attention_)
         throw std::invalid_argument(
             "FAST segmented and whole-context fused attention are mutually exclusive");
@@ -5225,126 +5719,34 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
        exact_attention_gqa_six_query_pair_scores_)
         throw std::invalid_argument(
             "exact attention K-tile64 and query-pair scores are mutually exclusive");
-    const auto* triple_values_v_tile=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE");
-    if(triple_values_v_tile && std::strcmp(triple_values_v_tile,"0")!=0 &&
-       std::strcmp(triple_values_v_tile,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values V tile must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_v_tile_=
-        triple_values_v_tile && std::strcmp(triple_values_v_tile,"1")==0;
-    const auto* triple_values_v_tile64=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64");
-    if(triple_values_v_tile64 && std::strcmp(triple_values_v_tile64,"0")!=0 &&
-       std::strcmp(triple_values_v_tile64,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values V tile64 must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_v_tile64_=
-        triple_values_v_tile64 && std::strcmp(triple_values_v_tile64,"1")==0;
-    const auto* triple_values_full_cta=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA");
-    if(triple_values_full_cta && std::strcmp(triple_values_full_cta,"0")!=0 &&
-       std::strcmp(triple_values_full_cta,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values full CTA must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_full_cta_=
-        triple_values_full_cta && std::strcmp(triple_values_full_cta,"1")==0;
-    const auto* triple_values_threads128=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128");
-    if(triple_values_threads128 && std::strcmp(triple_values_threads128,"0")!=0 &&
-       std::strcmp(triple_values_threads128,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values threads128 must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_threads128_=
-        triple_values_threads128 && std::strcmp(triple_values_threads128,"1")==0;
-    const auto* triple_values_score_tile=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE");
-    if(triple_values_score_tile && std::strcmp(triple_values_score_tile,"0")!=0 &&
-       std::strcmp(triple_values_score_tile,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values score tile must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_score_tile_=
-        triple_values_score_tile && std::strcmp(triple_values_score_tile,"1")==0;
-    const auto* triple_values_key_pair_pipeline=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE");
-    if(triple_values_key_pair_pipeline &&
-       std::strcmp(triple_values_key_pair_pipeline,"0")!=0 &&
-       std::strcmp(triple_values_key_pair_pipeline,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA triple-values key-pair pipeline must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_key_pair_pipeline_=
-        triple_values_key_pair_pipeline &&
-        std::strcmp(triple_values_key_pair_pipeline,"1")==0;
-    const auto* triple_values_warp_score_broadcast=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST");
-    if(triple_values_warp_score_broadcast &&
-       std::strcmp(triple_values_warp_score_broadcast,"0")!=0 &&
-       std::strcmp(triple_values_warp_score_broadcast,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA triple-values warp score broadcast must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_warp_score_broadcast_=
-        triple_values_warp_score_broadcast &&
-        std::strcmp(triple_values_warp_score_broadcast,"1")==0;
-    const auto* triple_values_pair_dimensions=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS");
-    if(triple_values_pair_dimensions &&
-       std::strcmp(triple_values_pair_dimensions,"0")!=0 &&
-       std::strcmp(triple_values_pair_dimensions,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values pair-dimensions must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_pair_dimensions_=
-        triple_values_pair_dimensions &&
-        std::strcmp(triple_values_pair_dimensions,"1")==0;
-    const auto* six_values_single_load=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD");
-    if(six_values_single_load && std::strcmp(six_values_single_load,"0")!=0 &&
-       std::strcmp(six_values_single_load,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax six-values single-load must be 0 or 1");
-    exact_attention_gqa_six_softmax_six_values_single_load_=
-        six_values_single_load && std::strcmp(six_values_single_load,"1")==0;
-    const auto* six_values_scalar_single_load=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD");
-    if(six_values_scalar_single_load &&
-       std::strcmp(six_values_scalar_single_load,"0")!=0 &&
-       std::strcmp(six_values_scalar_single_load,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax six-values scalar single-load must be 0 or 1");
-    exact_attention_gqa_six_softmax_six_values_scalar_single_load_=
-        six_values_scalar_single_load &&
-        std::strcmp(six_values_scalar_single_load,"1")==0;
-    const auto* triple_values_scalar_dim=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM");
-    if(triple_values_scalar_dim && std::strcmp(triple_values_scalar_dim,"0")!=0 &&
-       std::strcmp(triple_values_scalar_dim,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values scalar-dim must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_scalar_dim_=
-        triple_values_scalar_dim && std::strcmp(triple_values_scalar_dim,"1")==0;
-    const auto* triple_values_two_query=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY");
-    if(triple_values_two_query && std::strcmp(triple_values_two_query,"0")!=0 &&
-       std::strcmp(triple_values_two_query,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values two-query must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_two_query_=
-        triple_values_two_query && std::strcmp(triple_values_two_query,"1")==0;
-    const auto* triple_values_fused=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED");
-    if(triple_values_fused && std::strcmp(triple_values_fused,"0")!=0 &&
-       std::strcmp(triple_values_fused,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values fused must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_fused_=
-        triple_values_fused && std::strcmp(triple_values_fused,"1")==0;
-    const auto* fused_scalar_values=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_FUSED_SCALAR_VALUES");
-    if(fused_scalar_values && std::strcmp(fused_scalar_values,"0")!=0 &&
-       std::strcmp(fused_scalar_values,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax fused scalar values must be 0 or 1");
-    exact_attention_gqa_six_softmax_fused_scalar_values_=
-        fused_scalar_values && std::strcmp(fused_scalar_values,"1")==0;
+    exact_attention_gqa_six_softmax_triple_values_v_tile_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
+        "exact attention GQA six-softmax triple-values V tile must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_v_tile64_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
+        "exact attention GQA six-softmax triple-values V tile64 must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_full_cta_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
+        "exact attention GQA six-softmax triple-values full CTA must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_threads128_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
+        "exact attention GQA six-softmax triple-values threads128 must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_score_tile_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
+        "exact attention GQA six-softmax triple-values score tile must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_key_pair_pipeline_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE",
+        "exact attention GQA triple-values key-pair pipeline must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_warp_score_broadcast_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
+        "exact attention GQA triple-values warp score broadcast must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_pair_dimensions_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
+        "exact attention GQA six-softmax triple-values pair-dimensions must be 0 or 1");
+    exact_attention_gqa_six_softmax_six_values_single_load_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
+        "exact attention GQA six-softmax six-values single-load must be 0 or 1");
+    exact_attention_gqa_six_softmax_six_values_scalar_single_load_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
+        "exact attention GQA six-softmax six-values scalar single-load must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_scalar_dim_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
+        "exact attention GQA six-softmax triple-values scalar-dim must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_two_query_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
+        "exact attention GQA six-softmax triple-values two-query must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_fused_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
+        "exact attention GQA six-softmax triple-values fused must be 0 or 1");
+    exact_attention_gqa_six_softmax_fused_scalar_values_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_FUSED_SCALAR_VALUES",
+        "exact attention GQA six-softmax fused scalar values must be 0 or 1");
     const auto* decode_fused=std::getenv(
         "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_DECODE_FUSED");
     if(decode_fused && std::strcmp(decode_fused,"0")!=0 &&
@@ -5353,14 +5755,8 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
             "exact attention GQA six decode-fused route must be 0 or 1");
     exact_attention_gqa_six_decode_fused_=decode_fused &&
         std::strcmp(decode_fused,"1")==0;
-    const auto* softmax_tile512=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TILE512");
-    if(softmax_tile512 && std::strcmp(softmax_tile512,"0")!=0 &&
-       std::strcmp(softmax_tile512,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six softmax tile512 must be 0 or 1");
-    exact_attention_gqa_six_softmax_tile512_=softmax_tile512 &&
-        std::strcmp(softmax_tile512,"1")==0;
+    exact_attention_gqa_six_softmax_tile512_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TILE512",
+        "exact attention GQA six softmax tile512 must be 0 or 1");
     if(exact_attention_gqa_six_softmax_tile512_ &&
        (exact_attention_gqa_six_softmax_triple_values_fused_ ||
         exact_attention_gqa_six_softmax_fused_scalar_values_))
@@ -6248,6 +6644,38 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     }
     launch(cudaGetLastError(), "launch EXL3 RoPE"); end(5);
 
+    const char* attention_core_sample_option=std::getenv(
+        "NINFER_EXL3_TEST_ATTENTION_CORE_SAMPLE");
+    static std::atomic<int> attention_core_samples{0};
+    const int attention_core_sample_index=rows>=256 && wide_prefill &&
+        !capture_active_ && attention_core_sample_option &&
+        std::strcmp(attention_core_sample_option,"1")==0 ?
+        attention_core_samples.fetch_add(1,std::memory_order_relaxed):-1;
+    const bool attention_core_sample=rows>=256 && wide_prefill &&
+        !capture_active_ && attention_core_sample_index>=0 &&
+        attention_core_sample_index<16;
+    if(attention_core_sample && attention_core_sample_index==0) {
+        int max_shared=0;
+        cuda_check(cudaDeviceGetAttribute(&max_shared,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin,0),
+            "query SM120 shared-memory ceiling");
+        cudaFuncAttributes attributes{};
+        cuda_check(cudaFuncGetAttributes(&attributes,
+            attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16>),
+            "query WMMA32 kernel resources");
+        std::fprintf(stderr,
+            "ATTENTION_RESOURCE_SAMPLE optin_shared_bytes=%d wmma32_static_shared_bytes=%zu wmma32_registers_per_thread=%d\n",
+            max_shared,attributes.sharedSizeBytes,attributes.numRegs);
+    }
+    cudaEvent_t attention_core_start{},attention_core_end{};
+    if(attention_core_sample) {
+        cuda_check(cudaEventCreate(&attention_core_start),
+            "create attention core sample start");
+        cuda_check(cudaEventCreate(&attention_core_end),
+            "create attention core sample end");
+        cuda_check(cudaEventRecord(attention_core_start,stream),
+            "record attention core sample start");
+    }
     begin(6);
     if (oscar_ != nullptr && capture_active_ && preserve_m1_topology && rows > 1) {
         if (rows <= 8 && oscar_->continuation_cohort_b8_enabled()) {
@@ -6359,19 +6787,220 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 exact_attention_gqa_six_softmax_fused_scalar_values_ ? 1 : 0,
                 profile ? 1 : 0, position);
         }
+        // The guarded verifier route uses the same fused attention reduction
+        // for scalar seeds and B2..B8 proposals.  The older tiled prefill
+        // branch otherwise intercepts those small batches first.
+        const bool fused_flash_eligible=fast_fused_flash_attention_ &&
+            (rows==1 || (fast_fused_flash_multirow_ && rows>=2 && rows<=8)) &&
+            position>0 && (!capture_active_ || ordinary_full_layer_graph_capture_) &&
+            !direct_staged_rows_ && !exact_prefix_rows_ &&
+            !exact_page_ranges_.count &&
+            exact_scores_ && exact_score_rows_>=rows &&
+            exact_attention_gqa_six_scores_ &&
+            exact_attention_gqa_six_softmax_triple_values_ &&
+            !exact_attention_gqa_six_softmax_fused_scalar_values_;
         if ((fast_prefill_wmma32_attention_ || fast_prefill_wmma_attention_) &&
             fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
-            !exact_page_ranges_.count && !numeric_attention_splitk_) {
+            !exact_page_ranges_.count && !numeric_attention_splitk_ &&
+            !fused_flash_eligible) {
             // T77 is selected explicitly when requested; T75 remains the
             // fallback WMMA candidate under its original gate.
-            if (fast_prefill_wmma32_attention_) {
-                attention_cached_gqa_six_wmma32_prefill_kernel<<<
+            if (fast_wmma32_split2_output_ && fast_prefill_wmma32_attention_ &&
+                position+rows>=8192) {
+                if(!fast_wmma32_split2_stats_ ||
+                   fast_wmma32_split2_capacity_rows_<rows)
+                    throw std::logic_error("WMMA32 split2 workspace extent");
+                if(fast_prefill_wmma64_attention_ && rows%64==0 &&
+                   fast_wmma32_split_count_==2) {
+                    if(fast_prefill_wmma64_shared_heads_attention_ &&
+                       fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim+16,2,2><<<
+                            dim3(rows/32,kKVHeads,2*kQHeads/(kKVHeads*2)),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_shared_heads_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim,2,2><<<
+                            dim3(rows/32,kKVHeads,2*kQHeads/(kKVHeads*2)),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_register_keys64_attention_ &&
+                            fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim+16,2,1,64><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_register_keys64_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim,2,1,64><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_register_attention_ &&
+                       fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim+16,2><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_register_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim,2><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,2,64><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,2,64><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    if(fast_prefill_wmma64_attention_counter.fetch_add(
+                           1,std::memory_order_relaxed)==0)
+                        std::fprintf(stderr,
+                            "WMMA64_PREFILL_DISPATCH split=2 rows=%d register=%d heads=%d keys=%d\n",
+                            rows,fast_prefill_wmma64_register_attention_?1:0,
+                            fast_prefill_wmma64_shared_heads_attention_?2:1,
+                            fast_prefill_wmma64_register_keys64_attention_?64:32);
+                } else if(fast_wmma32_split_count_==4) {
+                    if(fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,4><<<
+                            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,4><<<
+                            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                } else {
+                    if(fast_wmma32_split_count_!=2)
+                        throw std::logic_error("WMMA32 split count");
+                    if(fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,2><<<
+                            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,2><<<
+                            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                }
+                launch(cudaGetLastError(),"launch WMMA32 split2 partials");
+                if(fast_wmma32_split_count_==4)
+                    attention_wmma32_split_merge_kernel<4><<<
+                        (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                        fast_wmma32_split2_output_,fast_wmma32_split2_stats_,
+                        attn,rows);
+                else
+                    attention_wmma32_split_merge_kernel<2><<<
+                        (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                        fast_wmma32_split2_output_,fast_wmma32_split2_stats_,
+                        attn,rows);
+            } else if (fast_prefill_wmma64_attention_ && rows%64==0) {
+                if(fast_prefill_wmma64_shared_heads_attention_ &&
+                   fast_prefill_wmma32_padded_attention_ &&
+                   position+rows>=8192)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim+16,1,2><<<
+                        dim3(rows/32,kKVHeads,kQHeads/(kKVHeads*2)),
+                        256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_shared_heads_attention_)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim,1,2><<<
+                        dim3(rows/32,kKVHeads,kQHeads/(kKVHeads*2)),
+                        256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_register_keys64_attention_ &&
+                   fast_prefill_wmma32_padded_attention_ &&
+                   position+rows>=8192)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim+16,1,1,64><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_register_keys64_attention_)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim,1,1,64><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_register_attention_ &&
+                   fast_prefill_wmma32_padded_attention_ &&
+                   position+rows>=8192)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim+16,1><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_register_attention_)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim,1><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma32_padded_attention_ && position+rows>=8192)
+                    attention_cached_gqa_six_wmma32_prefill_kernel<
+                        kHeadDim+16,1,64><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else
+                    attention_cached_gqa_six_wmma32_prefill_kernel<
+                        kHeadDim,1,64><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                if(fast_prefill_wmma64_attention_counter.fetch_add(
+                       1,std::memory_order_relaxed)==0)
+                    std::fprintf(stderr,
+                        "WMMA64_PREFILL_DISPATCH split=1 rows=%d register=%d heads=%d keys=%d\n",
+                        rows,fast_prefill_wmma64_register_attention_?1:0,
+                        fast_prefill_wmma64_shared_heads_attention_?2:1,
+                        fast_prefill_wmma64_register_keys64_attention_?64:32);
+            } else if (fast_prefill_wmma32_padded_attention_ &&
+                position+rows>=8192) {
+                attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16><<<
                     dim3((rows + 31) / 32, kKVHeads,
                          kQHeads / kKVHeads), 256, 0, stream>>>(
                     qr, attention_k, attention_v, attn, rows, position,
-                    cache_capacity_, nullptr, 0);
+                    cache_capacity_, nullptr, 0,nullptr,nullptr);
+            } else if (fast_prefill_wmma32_attention_) {
+                attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim><<<
+                    dim3((rows + 31) / 32, kKVHeads,
+                         kQHeads / kKVHeads), 256, 0, stream>>>(
+                    qr, attention_k, attention_v, attn, rows, position,
+                    cache_capacity_, nullptr, 0,nullptr,nullptr);
             } else {
                 attention_cached_gqa_six_wmma_prefill_kernel<<<
                     dim3((rows + 15) / 16, kKVHeads,
@@ -6393,7 +7022,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if (fast_prefill_rows8_attention_ && fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
-            !exact_page_ranges_.count && !numeric_attention_splitk_) {
+            !exact_page_ranges_.count && !numeric_attention_splitk_ &&
+            !fused_flash_eligible) {
             // T74 numerical candidate: eight adjacent causal rows share the
             // represented K/V load.  Its smaller key tile keeps the larger
             // query block below the physical-C1 shared-memory limit; the
@@ -6417,7 +7047,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if (fast_prefill_rows2_attention_ && fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
-            !exact_page_ranges_.count && !numeric_attention_splitk_) {
+            !exact_page_ranges_.count && !numeric_attention_splitk_ &&
+            !fused_flash_eligible) {
             attention_cached_gqa_six_online_rows_kernel<2><<<
                 ((rows + 1) / 2) * kKVHeads, 256, 0, stream>>>(
                     qr, attention_k, attention_v, attn, rows, position,
@@ -6431,7 +7062,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if (fast_prefill_rows4_attention_ && fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
-            !exact_page_ranges_.count && !numeric_attention_splitk_) {
+            !exact_page_ranges_.count && !numeric_attention_splitk_ &&
+            !fused_flash_eligible) {
             // T73 numerical candidate: four adjacent causal rows share each
             // represented K/V load within one CTA. Keep the established T71
             // counter as the umbrella Fast-prefill dispatch and expose the
@@ -6449,7 +7081,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if (fast_prefill_tiled_attention_ && rows > 1 && rows <= 1024 &&
                    !capture_active_ && !direct_staged_rows_ &&
                    !exact_prefix_rows_ && !exact_page_ranges_.count &&
-                   !numeric_attention_splitk_) {
+                   !numeric_attention_splitk_ && !fused_flash_eligible) {
             // Numerical Fast prefill candidate. T71 qualified this online
             // softmax/value organization against the exact represented-input
             // route; it is explicitly excluded from the exact/reference lane.
@@ -6576,14 +7208,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                    "launch FAST whole-context same-weight FP16-KV attention");
             fast_whole_context_fused_attention_counter.fetch_add(
                 1,std::memory_order_relaxed);
-        } else if(fast_fused_flash_attention_ && rows==1 && position>0 &&
-                  (!capture_active_ || ordinary_full_layer_graph_capture_) &&
-                  !direct_staged_rows_ &&
-                  !exact_prefix_rows_ && !exact_page_ranges_.count &&
-                  exact_scores_ && exact_score_rows_>=rows &&
-                  exact_attention_gqa_six_scores_ &&
-                  exact_attention_gqa_six_softmax_triple_values_ &&
-                  !exact_attention_gqa_six_softmax_fused_scalar_values_) {
+        } else if(fused_flash_eligible) {
             if (ordinary_full_layer_graph_capture_ &&
                 std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                 std::fprintf(stderr,
@@ -6613,10 +7238,13 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                         cache_capacity_,segments,position_device_,0);
             attention_cached_gqa_six_fused_flash_merge_kernel<<<
                 rows*kKVHeads,256,0,stream>>>(
-                    exact_scores_,attn,rows,segments);
+                    exact_scores_,attn,rows,segments,position,cache_capacity_,
+                    fused_keys,position_device_,0);
             launch(cudaGetLastError(),
                    "launch FAST same-weight FP16-KV fused flash attention");
             fast_fused_flash_attention_counter.fetch_add(
+                1,std::memory_order_relaxed);
+            if(rows>1)fast_fused_flash_multirow_attention_counter.fetch_add(
                 1,std::memory_order_relaxed);
         } else if(numeric_attention_splitk_) {
             const std::size_t required=exl3_numeric_attention_splitk_workspace_bytes(
@@ -7211,6 +7839,21 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     sigmoid_mul_kernel<<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(gp, attn,
         rows * kQHeads * kHeadDim);
     launch(cudaGetLastError(), "launch EXL3 attention output gate"); end(6);
+    if(attention_core_sample) {
+        cuda_check(cudaEventRecord(attention_core_end,stream),
+            "record attention core sample end");
+        cuda_check(cudaEventSynchronize(attention_core_end),
+            "resolve attention core sample");
+        float attention_core_ms=0.0f;
+        cuda_check(cudaEventElapsedTime(&attention_core_ms,
+            attention_core_start,attention_core_end),
+            "read attention core sample");
+        std::fprintf(stderr,
+            "ATTENTION_CORE_SAMPLE layer=%d rows=%d position=%d ms=%.6f\n",
+            model_layer_,rows,position,attention_core_ms);
+        cudaEventDestroy(attention_core_start);
+        cudaEventDestroy(attention_core_end);
+    }
 
     begin(7);
     const bool shared_o=can_share_target && target_o_executor_enabled_ &&

@@ -1107,6 +1107,61 @@ public:
         return result;
     }
 
+    // Terminal boundaries for a request whose target and draft stayed device
+    // resident through its generated windows. The caller has already completed
+    // both streams and exported one matching pair of immutable host snapshots.
+    // These factories never execute or re-label speculative model work.
+    static std::shared_ptr<const Exl3VeriCacheRequest> initialize_device_root(
+        Exl3TextContext& exact,Exl3Dflash2DraftModel& draft,
+        std::span<const std::int64_t> prompt,cudaStream_t stream=nullptr) {
+        if(prompt.empty() || prompt.size()>static_cast<std::size_t>(exact.max_context()) ||
+           exact.position()!=static_cast<int>(prompt.size()) ||
+           draft.ring_base_abs()+draft.ring_count()!=exact.position())
+            throw std::invalid_argument("device root target/draft/prompt frontier");
+        for(const auto token:prompt)
+            if(token<0 || token>=248320)
+                throw std::invalid_argument("device root prompt token extent");
+        const auto& reserve=exact.request_metadata_reservation();
+        auto target_state=exact.export_exact_host_state(stream);
+        auto draft_ring=draft.export_host_ring(stream,true,reserve);
+        if(draft_ring->position()!=target_state->position())
+            throw std::logic_error("device root snapshot frontier changed");
+        auto result=create_planned(nullptr,0,false,reserve,reserve);
+        result->history_=Exl3TokenHistory{}.append(prompt,reserve);
+        result->state_=std::move(target_state);
+        result->projected_=std::move(draft_ring);
+        return result;
+    }
+
+    std::shared_ptr<const Exl3VeriCacheRequest> append_device_terminal(
+        Exl3TextContext& exact,Exl3Dflash2DraftModel& draft,
+        std::span<const std::int64_t> committed_suffix,
+        cudaStream_t stream=nullptr) const {
+        if(!state_ || !projected_ || prepared_identity_ ||
+           committed_suffix.empty() ||
+           exact.model_identity()!=state_->model_identity() ||
+           exact.position()!=state_->position()+
+               static_cast<int>(committed_suffix.size()) ||
+           draft.ring_base_abs()+draft.ring_count()!=exact.position())
+            throw std::invalid_argument("device terminal target/draft lineage");
+        for(const auto token:committed_suffix)
+            if(token<0 || token>=248320)
+                throw std::invalid_argument("device terminal token extent");
+        const auto& reserve=exact.request_metadata_reservation();
+        auto target_state=exact.export_exact_host_state(stream);
+        auto draft_ring=draft.export_host_ring(stream,true,reserve);
+        if(draft_ring->position()!=target_state->position())
+            throw std::logic_error("device terminal snapshot frontier changed");
+        auto result=create_planned(this,0,false,reserve,reserve);
+        result->parent_revision_=revision_;
+        result->replay_anchor_revision_=
+            replay_anchor_revision_?replay_anchor_revision_:revision_;
+        result->history_=history_.append(committed_suffix,reserve);
+        result->state_=std::move(target_state);
+        result->projected_=std::move(draft_ring);
+        return result;
+    }
+
     // User-supplied prompt suffix, distinct from speculative token publication.
     // Forks the exact root, preserving only proven shared-prefix ownership.
     std::shared_ptr<const Exl3VeriCacheRequest> append_prompt(

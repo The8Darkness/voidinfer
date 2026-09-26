@@ -41,6 +41,7 @@ enum class KvCacheStorage : std::uint8_t {
     // authoritative representation; its existing host context tier may evict and restore pages.
     VeriCacheNvfp4,
     Float16Host, // Pinned EXL3 package only: ordinary FP16 authoritative Host KV.
+    Float16Device, // Pinned EXL3 coherent round: ordinary FP16 authoritative Device KV.
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -168,11 +169,27 @@ enum class ArtifactReadMode : std::uint8_t {
     DualDynamic,
 };
 
+enum class Exl3RoundImplementation : std::uint8_t {
+    Established,
+    CoherentDevice,
+};
+
 struct PinnedExl3PackageOptions {
     std::filesystem::path target_directory;
     std::filesystem::path draft_directory;
     std::filesystem::path verified_dual_manifest;
+    // Explicit package-local round identity. The established implementation remains the default.
+    Exl3RoundImplementation round_implementation = Exl3RoundImplementation::Established;
 };
+
+[[nodiscard]] inline constexpr std::string_view exl3_round_implementation_name(
+    Exl3RoundImplementation implementation) noexcept {
+    switch (implementation) {
+    case Exl3RoundImplementation::Established: return "established";
+    case Exl3RoundImplementation::CoherentDevice: return "coherent-device";
+    }
+    return "unknown";
+}
 
 struct EngineOptions {
     // Explicit typed package selection; never inferred from an artifact suffix.

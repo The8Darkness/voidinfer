@@ -1,3 +1,4 @@
+#include "exl3/gaming_operator_fixture.h"
 #include "exl3/gdn_layer.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/linear_workspace_requirements.h"
@@ -13,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -130,6 +132,14 @@ __global__ void transpose_bf16_to_f16_kernel(const std::uint16_t* input, std::ui
         __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(input)[index])));
 }
 
+__global__ void gopt_gdn_output_pack_kernel(const std::uint16_t* core,
+    const std::uint16_t* norm,std::uint16_t* trace,std::uint16_t* projection,int count) {
+    const int i=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i>=count)return;
+    trace[i]=core[i];
+    projection[i]=__half_as_ushort(__float2half_rn(bf16_value(norm[i])));
+}
+
 __global__ void transpose_f32_to_row_major_kernel(const float* input, float* output, int rows, int features) {
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * features) return;
@@ -192,9 +202,11 @@ __global__ void pack_heads_bf16_kernel(const std::uint16_t* input, std::uint16_t
 // The checkpoint stores the depthwise filter as [channel, kernel].  This local
 // kernel keeps that representation and the [channel, history] state layout
 // explicit, avoiding an ambiguous transpose at the public convolution API.
+template<bool Trace=false>
 __global__ void gdn_conv_kernel(const std::uint16_t* input, const std::uint16_t* weight,
                                 std::uint16_t* state, std::uint16_t* q, std::uint16_t* k,
-                                std::uint16_t* v, int rows) {
+                                std::uint16_t* v, int rows,
+                                std::uint16_t* state_trace=nullptr) {
     const int channel = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (channel >= kQkv) return;
     float s0 = bf16_value(state[channel * kConvStorage + 0]);
@@ -223,6 +235,12 @@ __global__ void gdn_conv_kernel(const std::uint16_t* input, const std::uint16_t*
     state_out[channel * kConvStorage + 1] = __float2bfloat16_rn(s1);
     state_out[channel * kConvStorage + 2] = __float2bfloat16_rn(s2);
     state_out[channel * kConvStorage + 3] = __float2bfloat16_rn(s3);
+    if constexpr(Trace) {
+        auto* trace=reinterpret_cast<__nv_bfloat16*>(state_trace);
+        trace[channel*3+0]=__float2bfloat16_rn(s0);
+        trace[channel*3+1]=__float2bfloat16_rn(s1);
+        trace[channel*3+2]=__float2bfloat16_rn(s2);
+    }
 }
 
 // Same-weight FP16-KV decode candidate.  The ordinary decode route submits a
@@ -237,11 +255,13 @@ __global__ void gdn_conv_kernel(const std::uint16_t* input, const std::uint16_t*
 // The source weights and activations are unchanged; this only removes staging
 // launches and their intermediate global-memory reread.  Prefill deliberately
 // does not use this kernel because its direct row-major reads are strided.
+template<bool Trace=false>
 __global__ void gdn_conv_f16_decode_fused_kernel(
     const std::uint16_t* input_f16, const std::uint16_t* weight,
     std::uint16_t* state, std::uint16_t* conv_input_bf16,
     std::uint16_t* q, std::uint16_t* k, std::uint16_t* v,
-    std::uint16_t* packed_output_bf16, int rows) {
+    std::uint16_t* packed_output_bf16, int rows,
+    std::uint16_t* state_trace=nullptr) {
     const int channel = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (channel >= kQkv) return;
     float s0 = bf16_value(state[channel * kConvStorage + 0]);
@@ -284,6 +304,27 @@ __global__ void gdn_conv_f16_decode_fused_kernel(
     state_out[channel * kConvStorage + 1] = __float2bfloat16_rn(s1);
     state_out[channel * kConvStorage + 2] = __float2bfloat16_rn(s2);
     state_out[channel * kConvStorage + 3] = __float2bfloat16_rn(s3);
+    if constexpr(Trace) {
+        auto* trace=reinterpret_cast<__nv_bfloat16*>(state_trace);
+        trace[channel*3+0]=__float2bfloat16_rn(s0);
+        trace[channel*3+1]=__float2bfloat16_rn(s1);
+        trace[channel*3+2]=__float2bfloat16_rn(s2);
+    }
+}
+
+// Select specialized leaves on the host: all-off convolution has no trace
+// branch or candidate stores, matching the inherited operation sequence.
+void launch_gopt_conv(bool trace,bool decode,const std::uint16_t* input,
+    const std::uint16_t* weight,std::uint16_t* state,std::uint16_t* conv_input,
+    std::uint16_t* q,std::uint16_t* k,std::uint16_t* v,std::uint16_t* packed,
+    std::uint16_t* state_trace,int rows,cudaStream_t stream) {
+    if(decode) {
+        if(trace)gdn_conv_f16_decode_fused_kernel<true><<<(kQkv+255)/256,256,0,stream>>>(input,weight,state,conv_input,q,k,v,packed,rows,state_trace);
+        else gdn_conv_f16_decode_fused_kernel<false><<<(kQkv+255)/256,256,0,stream>>>(input,weight,state,conv_input,q,k,v,packed,rows);
+    } else {
+        if(trace)gdn_conv_kernel<true><<<(kQkv+255)/256,256,0,stream>>>(conv_input,weight,state,q,k,v,rows,state_trace);
+        else gdn_conv_kernel<false><<<(kQkv+255)/256,256,0,stream>>>(conv_input,weight,state,q,k,v,rows);
+    }
 }
 
 __global__ void copy_conv_state_trace_kernel(const std::uint16_t* state, std::uint16_t* trace) {
@@ -843,9 +884,78 @@ __global__ void control_fused_kernel(const std::uint16_t* input,
     }
 }
 
+// Two verifier rows share each represented coefficient load. Each row keeps
+// the canonical per-thread FMA and warp/CTA reduction order.
+__global__ void control_fused_row_pair_kernel(const std::uint16_t* input,
+                                     const std::uint16_t* a_weight,
+                                     const std::uint16_t* b_weight,
+                                     const float* a_log, const float* dt_bias,
+                                     float* a_output, float* b_output,
+                                     float* beta_trace, float* g_trace, int rows) {
+    __shared__ float partial_a[2][4], partial_b[2][4];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int head = static_cast<int>(blockIdx.x) % kHeads;
+    const int first = (static_cast<int>(blockIdx.x) / kHeads) * 2;
+    const int count = min(2, rows - first);
+    const int weight_base = head * kHidden;
+    float asum0 = 0.0f, bsum0 = 0.0f;
+    float asum1 = 0.0f, bsum1 = 0.0f;
+    for (int d = static_cast<int>(threadIdx.x); d < kHidden; d += 128) {
+        const float aw = half_value(a_weight[weight_base + d]);
+        const float bw = half_value(b_weight[weight_base + d]);
+        const float x0 = half_value(input[first * kHidden + d]);
+        asum0 = fmaf(x0, aw, asum0);
+        bsum0 = fmaf(x0, bw, bsum0);
+        if (count == 2) {
+            const float x1 = half_value(input[(first + 1) * kHidden + d]);
+            asum1 = fmaf(x1, aw, asum1);
+            bsum1 = fmaf(x1, bw, bsum1);
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        asum0 += __shfl_down_sync(0xffffffffu, asum0, offset);
+        bsum0 += __shfl_down_sync(0xffffffffu, bsum0, offset);
+        asum1 += __shfl_down_sync(0xffffffffu, asum1, offset);
+        bsum1 += __shfl_down_sync(0xffffffffu, bsum1, offset);
+    }
+    if (lane == 0) {
+        partial_a[0][warp] = asum0; partial_b[0][warp] = bsum0;
+        partial_a[1][warp] = asum1; partial_b[1][warp] = bsum1;
+    }
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        for (int r = 0; r < count; ++r) {
+            float asum = 0.0f, bsum = 0.0f;
+            for (int w = 0; w < 4; ++w) {
+                asum += partial_a[r][w]; bsum += partial_b[r][w];
+            }
+            const int index = (first + r) * kHeads + head;
+            a_output[index] = asum; b_output[index] = bsum;
+            const float beta_f = 1.0f / (1.0f + expf(-bsum));
+            const float av = asum + dt_bias[head];
+            const float softplus = av > 20.0f ? av : log1pf(expf(av));
+            beta_trace[index] = __bfloat162float(__float2bfloat16_rn(beta_f));
+            g_trace[index] = -expf(a_log[head]) * softplus;
+        }
+    }
+}
+
 void record(cudaEvent_t event, cudaStream_t stream) { check(cudaEventRecord(event, stream), "record EXL3 GDN timing event"); }
 
 } // namespace
+
+void gopt_gdn_control_row_pair_fixture(bool paired,const std::uint16_t* input,
+    const std::uint16_t* a_weight,const std::uint16_t* b_weight,
+    const float* a_log,const float* dt_bias,float* a_output,float* b_output,
+    float* beta_trace,float* g_trace,int rows,cudaStream_t stream) {
+    if(rows<1 || rows>16) throw std::invalid_argument("GOPT control fixture rows");
+    if(paired) control_fused_row_pair_kernel<<<((rows+1)/2)*kHeads,128,0,stream>>>(
+        input,a_weight,b_weight,a_log,dt_bias,a_output,b_output,beta_trace,g_trace,rows);
+    else control_fused_kernel<<<rows*kHeads,128,0,stream>>>(
+        input,a_weight,b_weight,a_log,dt_bias,a_output,b_output,beta_trace,g_trace,rows);
+    check(cudaGetLastError(),"GOPT control fixture launch");
+}
 
 void exl3_gdn_residual_norm(const std::uint16_t* left,const std::uint16_t* right,
     const std::uint16_t* weight,std::uint16_t* residual,std::uint16_t* normalized,
@@ -866,7 +976,7 @@ void exl3_gdn_residual_norm(const std::uint16_t* left,const std::uint16_t* right
 }
 
 void exl3_gdn_stage_fusion_fixture(
-    const Exl3GdnStageFusionFixtureView& view,cudaStream_t stream) {
+    const Exl3GdnStageFusionFixtureView& view,cudaStream_t stream,bool pair_columns) {
     if(!view.valid())
         throw std::invalid_argument("GDN stage-fusion fixture extent");
     gdn_recurrence_sm120_kernel<<<kHeads*(kHeadDim/4),4*32,0,stream>>>(
@@ -876,11 +986,37 @@ void exl3_gdn_stage_fusion_fixture(
     gdn_prefill_normalize_kernel<<<view.rows*kKeyHeads,32,0,stream>>>(
         view.q,view.k,view.g,view.normalized_q,view.normalized_k,view.alpha);
     check(cudaGetLastError(),"launch normalized GDN stage-fusion fixture");
-    gdn_recurrence_prefill_resident_kernel<<<
+    if(pair_columns)
+        gdn_recurrence_prefill_resident_pair_columns_kernel<false><<<
+            kHeads*(kHeadDim/8),128,0,stream>>>(view.normalized_q,view.normalized_k,
+                view.v,view.alpha,view.beta,view.fused_state,view.fused_output,view.rows);
+    else gdn_recurrence_prefill_resident_kernel<<<
         kHeads*(kHeadDim/4),4*32,0,stream>>>(
         view.normalized_q,view.normalized_k,view.v,view.alpha,view.beta,
         view.fused_state,view.fused_output,view.rows);
     check(cudaGetLastError(),"launch resident GDN stage-fusion fixture");
+}
+
+void gopt_gdn_conv_fixture(bool fused,const std::uint16_t* input,
+    const std::uint16_t* weight,std::uint16_t* state,std::uint16_t* conv_input,
+    std::uint16_t* q,std::uint16_t* k,std::uint16_t* v,std::uint16_t* packed,
+    std::uint16_t* trace,int rows,cudaStream_t stream,bool decode_fused) {
+    if(!decode_fused)transpose_f16_to_bf16_kernel<<<(rows*kQkv+255)/256,256,0,stream>>>(input,conv_input,rows,kQkv);
+    launch_gopt_conv(fused,decode_fused,input,weight,state,conv_input,q,k,v,packed,trace,rows,stream);
+    if(!decode_fused)pack_qkv_bf16_kernel<<<(rows*kQkv+255)/256,256,0,stream>>>(q,k,v,packed,rows);
+    check(cudaGetLastError(),"GOPT conv fixture");
+    if(!fused)copy_conv_state_trace_kernel<<<(kQkv*3+255)/256,256,0,stream>>>(state,trace);
+    check(cudaGetLastError(),"GOPT conv trace fixture");
+}
+void gopt_gdn_pack_fixture(bool fused,const std::uint16_t* core,
+    const std::uint16_t* norm,std::uint16_t* trace,std::uint16_t* projection,
+    int rows,cudaStream_t stream) {
+    if(fused)gopt_gdn_output_pack_kernel<<<(rows*kZ+255)/256,256,0,stream>>>(core,norm,trace,projection,rows*kZ);
+    else {
+        pack_heads_bf16_kernel<<<(rows*kZ+255)/256,256,0,stream>>>(core,trace,rows);
+        transpose_bf16_to_f16_kernel<<<(rows*kZ+255)/256,256,0,stream>>>(norm,projection,rows,kZ);
+    }
+    check(cudaGetLastError(),"GOPT output pack fixture");
 }
 
 std::size_t Exl3GdnLayer::shared_scratch_bytes(int rows) {
@@ -1000,6 +1136,29 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
             "small-M fused gate/up transform must be 0 or 1");
     small_m_fused_gate_up_transform_=small_m_fused_gate_up &&
         std::strcmp(small_m_fused_gate_up,"1")==0;
+    const char* bulk_mlp_fused_down=std::getenv(
+        "NINFER_EXL3_FAST_GDN_BULK_MLP_FUSED_DOWN");
+    if(bulk_mlp_fused_down && std::strcmp(bulk_mlp_fused_down,"0")!=0 &&
+       std::strcmp(bulk_mlp_fused_down,"1")!=0)
+        throw std::invalid_argument("GDN bulk MLP fused down must be 0 or 1");
+    bulk_mlp_fused_down_=bulk_mlp_fused_down &&
+        std::strcmp(bulk_mlp_fused_down,"1")==0;
+    const char* bulk_mlp_fused_residual=std::getenv(
+        "NINFER_EXL3_FAST_GDN_BULK_MLP_FUSED_RESIDUAL");
+    if(bulk_mlp_fused_residual &&
+       std::strcmp(bulk_mlp_fused_residual,"0")!=0 &&
+       std::strcmp(bulk_mlp_fused_residual,"1")!=0)
+        throw std::invalid_argument("GDN bulk MLP fused residual must be 0 or 1");
+    bulk_mlp_fused_residual_=bulk_mlp_fused_residual &&
+        std::strcmp(bulk_mlp_fused_residual,"1")==0;
+    const char* bulk_mlp_weight_prefetch=std::getenv(
+        "NINFER_EXL3_FAST_GDN_BULK_MLP_WEIGHT_PREFETCH");
+    if (bulk_mlp_weight_prefetch &&
+        std::strcmp(bulk_mlp_weight_prefetch,"0")!=0 &&
+        std::strcmp(bulk_mlp_weight_prefetch,"1")!=0)
+        throw std::invalid_argument("GDN bulk MLP weight prefetch must be 0 or 1");
+    bulk_mlp_weight_prefetch_=bulk_mlp_weight_prefetch &&
+        std::strcmp(bulk_mlp_weight_prefetch,"1")==0;
     const char* fused_residual=std::getenv("NINFER_EXL3_GDN_FUSED_RESIDUAL_NORM");
     if(fused_residual && std::strcmp(fused_residual,"0")!=0 && std::strcmp(fused_residual,"1")!=0)
         throw std::invalid_argument("GDN fused residual norm must be 0 or 1");
@@ -1099,7 +1258,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
     }
     std::array<std::size_t,kHalfBufferFeatures.size()> half_bytes{};
     const auto required_workspace_bytes=workspace_bytes_required(max_rows_,accumulation.data!=nullptr,
-        transformed.data!=nullptr,scratch.data!=nullptr,split_wide_storage_,prefill_resident_);
+        transformed.data!=nullptr,scratch.data!=nullptr,split_wide_storage_,prefill_resident_ || gaming_[Gopt::GdnSmallResident]);
     for(std::size_t i=0;i<half_bytes.size();++i) {
         const auto rows=split_wide_storage_ && is_split_half(i)?private_row_capacity_:max_rows_;
         half_bytes[i]=static_cast<std::size_t>(rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t);
@@ -1108,7 +1267,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
     const auto control_bytes=static_cast<std::size_t>(max_rows_)*kHeads*sizeof(float);
     const auto normalized_bytes=static_cast<std::size_t>(max_rows_)*(2*kKeyHeads*kHeadDim+kHeads)*sizeof(float);
     float_buffer_bytes_.fill(control_bytes);
-    prefill_normalized_bytes_=prefill_resident_?normalized_bytes:0;
+    prefill_normalized_bytes_=(prefill_resident_ || gaming_[Gopt::GdnSmallResident])?normalized_bytes:0;
     constexpr std::size_t op_capacity=1u<<20;
     try {
         for (std::size_t i = 0; i < linear_workspaces_.size(); ++i) {
@@ -1173,7 +1332,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
                 float_buffer_owned_[i]=true;workspace_bytes_+=bytes;
             }
         }
-        if (prefill_resident_) {
+        if (prefill_resident_ || gaming_[Gopt::GdnSmallResident]) {
             const auto bytes=normalized_bytes;
             if(scratch.data) {
                 prefill_normalized_=reinterpret_cast<float*>(borrow(bytes));
@@ -1576,10 +1735,138 @@ void Exl3GdnLayer::complete_prefill_projection_chain_graph_after_drain(
         throw std::logic_error("GDN prefill projection-chain completion");
 }
 
+bool Exl3GdnLayer::supports_bulk_prefill() const noexcept {
+    return reconstruct_gemm_ && reconstruct_gemm_->accepts_all_model_shapes() &&
+        !capture_active_ && !projection_timing_ && !projection_observer_ &&
+        weights_.qkv_metadata.mul1 && weights_.z_metadata.mul1 &&
+        !weights_.qkv_metadata.mcg && !weights_.z_metadata.mcg &&
+        !weights_.qkv_metadata.has_bias && !weights_.z_metadata.has_bias &&
+        (weights_.qkv_metadata.K==6 || weights_.qkv_metadata.K==7) &&
+        (weights_.z_metadata.K==6 || weights_.z_metadata.K==7);
+}
+
+void Exl3GdnLayer::prepare_bulk_prefill(const std::uint16_t* input,
+    BulkPrefillBuffers buffers,cudaStream_t stream) {
+    if (!supports_bulk_prefill() || !input || !buffers.h || !buffers.qkv ||
+        !buffers.z || buffers.rows<=0 || buffers.rows>4096 ||
+        !reconstruct_gemm_->supports(weights_.qkv_metadata,buffers.rows) ||
+        !reconstruct_gemm_->supports(weights_.z_metadata,buffers.rows))
+        throw std::invalid_argument("GDN bulk prefill admission");
+    rms_norm_f16_kernel<><<<buffers.rows,512,512*sizeof(float),stream>>>(
+        input,weights_.input_norm,buffers.h,buffers.rows,kHidden);
+    check(cudaGetLastError(),"launch GDN bulk input RMSNorm");
+    reconstruct_gemm_->forward_numeric_candidate(weights_.qkv,
+        weights_.qkv_metadata,buffers.h,buffers.qkv,buffers.rows,stream);
+    reconstruct_gemm_->forward_numeric_candidate(weights_.z,
+        weights_.z_metadata,buffers.h,buffers.z,buffers.rows,stream);
+}
+
+bool Exl3GdnLayer::supports_bulk_mlp(int rows) const noexcept {
+    return reconstruct_gemm_ && reconstruct_gemm_->accepts_all_model_shapes() &&
+        !capture_active_ && !projection_timing_ && !projection_observer_ &&
+        rows>=256 && rows<=8192 &&
+        reconstruct_gemm_->supports(weights_.gate_metadata,rows) &&
+        reconstruct_gemm_->supports(weights_.up_metadata,rows) &&
+        reconstruct_gemm_->supports(weights_.down_metadata,rows) &&
+        weights_.gate_metadata.in_features==kHidden &&
+        weights_.up_metadata.in_features==kHidden &&
+        weights_.gate_metadata.out_features==kIntermediate &&
+        weights_.up_metadata.out_features==kIntermediate &&
+        weights_.down_metadata.in_features==kIntermediate &&
+        weights_.down_metadata.out_features==kHidden;
+}
+
+void Exl3GdnLayer::forward_before_bulk_mlp(const std::uint16_t* input,
+    DeferredMlpBuffers buffers,cudaStream_t stream) {
+    if (!buffers.post || !buffers.mlp_input || buffers.rows<=0 ||
+        buffers.rows>max_rows_)
+        throw std::invalid_argument("GDN bulk MLP prefix extent");
+    forward(input,buffers.post,buffers.rows,stream,false,true,true,nullptr,&buffers);
+    if (bulk_mlp_weight_prefetch_)
+        (void)reconstruct_gemm_->prefetch_numeric_weight(weights_.gate,
+            weights_.gate_metadata,1024,stream);
+}
+
+void Exl3GdnLayer::finish_bulk_mlp(DeferredMlpBuffers buffers,
+    std::uint16_t* gate,std::uint16_t* up,std::uint16_t* act,
+    std::uint16_t* down,
+    std::uint16_t* output,cudaStream_t stream,bool preserve_trace) {
+    if (!supports_bulk_mlp(buffers.rows) || !buffers.post ||
+        !buffers.mlp_input || !gate || !up || !act || !down || !output)
+        throw std::invalid_argument("GDN bulk MLP completion admission");
+    if (bulk_mlp_weight_prefetch_)
+        (void)reconstruct_gemm_->prefetch_numeric_weight(weights_.up,
+            weights_.up_metadata,buffers.rows,stream);
+    reconstruct_gemm_->forward_numeric_candidate(weights_.gate,
+        weights_.gate_metadata,buffers.mlp_input,gate,buffers.rows,stream);
+    reconstruct_gemm_->forward_numeric_candidate(weights_.up,
+        weights_.up_metadata,buffers.mlp_input,up,buffers.rows,stream);
+    const int final_offset=((buffers.rows-1)/1024)*1024;
+    const int final_rows=buffers.rows-final_offset;
+    if(preserve_trace && act==gate)
+        check(cudaMemcpyAsync(half_buffers_[16],
+            gate+static_cast<std::size_t>(final_offset)*kIntermediate,
+            static_cast<std::size_t>(final_rows)*kIntermediate*sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice,stream),
+            "preserve final GDN bulk gate trace");
+    bool fused_down_residual=false;
+    if(bulk_mlp_fused_down_ && reconstruct_gemm_->supports_fused_gate_up_down()) {
+        reconstruct_gemm_->forward_numeric_gate_up_down(weights_.down,
+            weights_.down_metadata,gate,up,act,down,buffers.rows,stream);
+    } else {
+        silu_mul_kernel<<<(buffers.rows*kIntermediate+255)/256,256,0,stream>>>(
+            gate,up,act,buffers.rows*kIntermediate);
+        check(cudaGetLastError(),"launch GDN bulk MLP activation");
+        fused_down_residual=bulk_mlp_fused_residual_ && down==output;
+        reconstruct_gemm_->forward_numeric_candidate(weights_.down,
+            weights_.down_metadata,act,down,buffers.rows,stream,
+            nullptr,nullptr,nullptr,
+            fused_down_residual?buffers.post:nullptr,
+            fused_down_residual && preserve_trace?half_buffers_[19]:nullptr,
+            final_offset);
+    }
+    if(!fused_down_residual && preserve_trace && down==output)
+        check(cudaMemcpyAsync(half_buffers_[19],
+            down+static_cast<std::size_t>(final_offset)*kHidden,
+            static_cast<std::size_t>(final_rows)*kHidden*sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice,stream),
+            "preserve final GDN bulk down trace");
+    if(!fused_down_residual) {
+        residual_kernel<<<(buffers.rows*kHidden+255)/256,256,0,stream>>>(
+            buffers.post,down,output,buffers.rows*kHidden);
+        check(cudaGetLastError(),"launch GDN bulk final residual");
+    }
+    trace_.post_attention_residual=buffers.post+
+        static_cast<std::size_t>(final_offset)*kHidden;
+    trace_.mlp_input=buffers.mlp_input+
+        static_cast<std::size_t>(final_offset)*kHidden;
+    trace_.gate_projection=preserve_trace && act==gate?half_buffers_[16]:
+        gate+static_cast<std::size_t>(final_offset)*kIntermediate;
+    trace_.up_projection=up+
+        static_cast<std::size_t>(final_offset)*kIntermediate;
+    trace_.activated_mlp=act+
+        static_cast<std::size_t>(final_offset)*kIntermediate;
+    trace_.down_projection=preserve_trace && down==output?half_buffers_[19]:
+        down+static_cast<std::size_t>(final_offset)*kHidden;
+    trace_.layer_output=output+
+        static_cast<std::size_t>(final_offset)*kHidden;
+}
+
 void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, int rows,
                            cudaStream_t stream, bool profile, bool preserve_m1_topology,
-                           bool wide_prefill) {
+                           bool wide_prefill,const BulkPrefillBuffers* prepared,
+                           const DeferredMlpBuffers* deferred_mlp) {
     if (!input || !output || rows <= 0 || rows > max_rows_) throw std::invalid_argument("invalid EXL3 GDN input/output/rows");
+    if (prepared && (!wide_prefill || prepared->rows!=rows ||
+        !prepared->h || !prepared->qkv || !prepared->z ||
+        !supports_bulk_prefill()))
+        throw std::invalid_argument("GDN prepared chunk contract");
+    if (deferred_mlp && (!wide_prefill || profile ||
+        deferred_mlp->rows!=rows || !deferred_mlp->post ||
+        !deferred_mlp->mlp_input || projection_timing_ ||
+        projection_observer_ ||
+        std::getenv("NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE")))
+        throw std::invalid_argument("GDN deferred MLP contract");
     invalidate_continuation_history();
     const std::uint64_t base_checkpoint_generation = current_checkpoint_generation_;
     const cudaStream_t base_checkpoint_stream = current_checkpoint_stream_;
@@ -1610,14 +1897,23 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     current_checkpoint_stream_ = nullptr;
     current_checkpoint_recurrent_ = nullptr;
     current_checkpoint_conv_ = nullptr;
+    static std::atomic<int> prefill_stage_samples{0};
+    const char* stage_sample_option=std::getenv(
+        "NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
+    const bool stage_sample=rows==1024 && wide_prefill &&
+        stage_sample_option && std::strcmp(stage_sample_option,"1")==0 &&
+        prefill_stage_samples.fetch_add(1,std::memory_order_relaxed)<2;
+    const bool collect_stage_events=profile || stage_sample;
     cudaEvent_t starts[12]{}, ends[12]{}, total_end{};
-    if (profile) {
+    if (collect_stage_events) {
         for (int i = 0; i < 12; ++i) { check(cudaEventCreate(&starts[i]), "create GDN start event"); check(cudaEventCreate(&ends[i]), "create GDN end event"); }
         check(cudaEventCreate(&total_end), "create GDN total event");
     }
-    const auto begin = [&](int i) { if (profile) record(starts[i], stream); };
-    const auto end = [&](int i) { if (profile) record(ends[i], stream); };
-    auto* h = half_buffers_[0]; auto* qkv = half_buffers_[1]; auto* z = half_buffers_[2];
+    const auto begin = [&](int i) { if (collect_stage_events) record(starts[i], stream); };
+    const auto end = [&](int i) { if (collect_stage_events) record(ends[i], stream); };
+    auto* h = prepared?prepared->h:half_buffers_[0];
+    auto* qkv = prepared?prepared->qkv:half_buffers_[1];
+    auto* z = prepared?prepared->z:half_buffers_[2];
     auto* conv_input = reinterpret_cast<std::uint16_t*>(use_wide_slab ? wide_half_buffers_[0] : half_buffers_[3]);
     auto* q = use_wide_slab ? wide_half_buffers_[1] : half_buffers_[4];
     auto* k = use_wide_slab ? wide_half_buffers_[2] : half_buffers_[5];
@@ -1625,11 +1921,28 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     auto* conv_output = half_buffers_[7]; auto* z_bf16 = half_buffers_[8];
     auto* core = use_wide_slab ? wide_half_buffers_[4] : half_buffers_[9];
     auto* gdn_norm_input = half_buffers_[10]; auto* gdn_norm = half_buffers_[11]; auto* o_input = half_buffers_[12];
-    auto* o = half_buffers_[13]; auto* post = half_buffers_[14]; auto* mlp_input = half_buffers_[15];
+    auto* o = half_buffers_[13];
+    auto* post = deferred_mlp?deferred_mlp->post:half_buffers_[14];
+    auto* mlp_input = deferred_mlp?deferred_mlp->mlp_input:half_buffers_[15];
     auto* gate = half_buffers_[16]; auto* up = half_buffers_[17]; auto* act = half_buffers_[18]; auto* down = half_buffers_[19];
     auto* final_output = half_buffers_[20]; auto* head_trace = half_buffers_[21];
     float* b = float_buffers_[0]; float* a = float_buffers_[1]; float* beta = float_buffers_[2]; float* g = float_buffers_[3];
     float* beta_trace = float_buffers_[4]; float* g_trace = float_buffers_[5];
+    const bool control_pair = gaming_[Gopt::GdnControlRowPair] &&
+        rows >= 2 && rows <= 8 && !wide_prefill;
+    const auto launch_control = [&] {
+        if (control_pair) {
+            control_fused_row_pair_kernel<<<((rows+1)/2)*kHeads,128,0,stream>>>(
+                h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
+                a,b,beta_trace,g_trace,rows);
+            gopt_record(gaming_submissions_,Gopt::GdnControlRowPair);
+        } else {
+            control_fused_kernel<<<rows*kHeads,128,0,stream>>>(
+                h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
+                a,b,beta_trace,g_trace,rows);
+        }
+        check(cudaGetLastError(),"launch fused GDN control projections");
+    };
     const auto project_on = [&](Exl3CudaLinearWorkspace* workspace,
                              const Exl3CudaLinearWeights& weights,
                              const Exl3CudaLinearMetadata& metadata,
@@ -1706,7 +2019,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
              target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
              metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
              ((reconstruct_gemm_->accepts_all_model_shapes() &&
-               (metadata.K == 6 || metadata.K == 7) && rows >= 256) ||
+               (metadata.K == 5 || metadata.K == 6 || metadata.K == 7) && rows >= 256) ||
               ((operation == Exl3TargetProjectionOperator::gate ||
                 operation == Exl3TargetProjectionOperator::up) &&
                metadata.K == 6 && metadata.in_features == kHidden &&
@@ -1714,6 +2027,17 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
               (operation == Exl3TargetProjectionOperator::down &&
                metadata.K == 7 && metadata.in_features == kIntermediate &&
                metadata.out_features == kHidden && rows >= 256)));
+        static std::atomic<int> prefill_projection_route_samples{0};
+        if(stage_sample_option &&
+           std::strcmp(stage_sample_option,"1")==0 &&
+           rows==1024 && wide_prefill &&
+           prefill_projection_route_samples.fetch_add(1,std::memory_order_relaxed)<6)
+            std::fprintf(stderr,
+                "GDN_PREFILL_ROUTE layer=%d op=%s K=%d in=%d out=%d rows=%d numeric=%d wide=%d dispatch=%s\n",
+                model_layer_,target_projection_operator_name(operation),metadata.K,
+                metadata.in_features,metadata.out_features,rows,
+                numeric_reconstruct_candidate?1:0,target_wide_candidate?1:0,
+                workspace->dispatch_name(metadata,rows));
         bool observed_projection = false;
         const bool observe_prefill = !rowwise && rows == 16 &&
             projection_observer_selection_ ==
@@ -1864,7 +2188,13 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                    stream, transformed_input);
     };
 
-    begin(0); rms_norm_f16_kernel<><<<rows, 512, 512 * sizeof(float), stream>>>(input, weights_.input_norm, h, rows, kHidden); check(cudaGetLastError(), "launch GDN input RMSNorm"); end(0);
+    begin(0);
+    if(!prepared) {
+        rms_norm_f16_kernel<><<<rows, 512, 512 * sizeof(float), stream>>>(
+            input,weights_.input_norm,h,rows,kHidden);
+        check(cudaGetLastError(),"launch GDN input RMSNorm");
+    }
+    end(0);
     const bool concurrent_qkvz = capture_active_ && preserve_m1_topology && rows == 8 &&
         graph_qkvz_concurrency_.complete();
     const bool dual_transform = exl3_paired_transform_admission(
@@ -1886,7 +2216,11 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         !profile && !projection_timing_ && !projection_observer_ &&
         preserve_m1_topology && wide_prefill && rows==1024 &&
         !dual_transform && !concurrent_qkvz;
-    if(projection_chain) {
+    if(prepared) {
+        begin(1); end(1);
+        begin(2); end(2);
+        begin(3); launch_control(); end(3);
+    } else if(projection_chain) {
         std::array<Exl3GraphBufferIdentity,16> buffers{};
         std::array<Exl3GraphBoundResource,16> resources{};
         std::size_t count=0;
@@ -1936,10 +2270,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         check(cudaGetLastError(),"launch prefill projection-chain GDN QKV/Z graph");
         end(1);
         begin(3);
-        control_fused_kernel<<<rows * kHeads, 128, 0, stream>>>(
-            h, weights_.a_weight, weights_.b_weight, weights_.a_log, weights_.dt_bias,
-            a, b, beta_trace, g_trace, rows);
-        check(cudaGetLastError(), "launch fused GDN control projections"); end(3);
+        launch_control(); end(3);
     } else if (dual_transform) {
         exl3_transform_input_pair(
             weights_.qkv, weights_.qkv_metadata, weights_.z, weights_.z_metadata,
@@ -1950,10 +2281,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         begin(2); project(linear_workspaces_[1], weights_.z, weights_.z_metadata,
                           h, z, Exl3TargetProjectionOperator::z, down); end(2);
         begin(3);
-        control_fused_kernel<<<rows * kHeads, 128, 0, stream>>>(
-            h, weights_.a_weight, weights_.b_weight, weights_.a_log, weights_.dt_bias,
-            a, b, beta_trace, g_trace, rows);
-        check(cudaGetLastError(), "launch fused GDN control projections"); end(3);
+        launch_control(); end(3);
     } else if (concurrent_qkvz) {
         check(cudaEventRecord(graph_qkvz_concurrency_.fork, stream),
               "record fixed-B8 GDN QKV/Z projection fork");
@@ -1974,10 +2302,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                     Exl3TargetProjectionOperator::qkv);
             end(1);
             begin(3);
-            control_fused_kernel<<<rows * kHeads, 128, 0, stream>>>(
-                h, weights_.a_weight, weights_.b_weight, weights_.a_log, weights_.dt_bias,
-                a, b, beta_trace, g_trace, rows);
-            check(cudaGetLastError(), "launch fused GDN control projections");
+            launch_control();
             end(3);
             check(cudaStreamWaitEvent(stream, graph_qkvz_concurrency_.z_done, 0),
                   "join fixed-B8 GDN Z projection stream");
@@ -1995,30 +2320,50 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         begin(2); project(linear_workspaces_[1], weights_.z, weights_.z_metadata, h, z,
                           Exl3TargetProjectionOperator::z); end(2);
         begin(3);
-        control_fused_kernel<<<rows * kHeads, 128, 0, stream>>>(
-            h, weights_.a_weight, weights_.b_weight, weights_.a_log, weights_.dt_bias,
-            a, b, beta_trace, g_trace, rows);
-        check(cudaGetLastError(), "launch fused GDN control projections"); end(3);
+        launch_control(); end(3);
     }
     begin(4);
     const bool fast_same_weights_fp16kv_gdn_decode_conv =
         fast_same_weights_fp16kv_gdn_decode_conv_ && rows >= 1 && rows <= 8 &&
         !wide_prefill;
     if (fast_same_weights_fp16kv_gdn_decode_conv) {
-        gdn_conv_f16_decode_fused_kernel<<<(kQkv + 255) / 256, 256, 0, stream>>>(
-            qkv, weights_.conv_weight, conv_state_, conv_input, q, k, v,
-            conv_output, rows);
+        launch_gopt_conv(gaming_[Gopt::GdnConvTrace],true,qkv,weights_.conv_weight,
+            conv_state_,conv_input,q,k,v,conv_output,conv_state_trace_,rows,stream);
+        if(gaming_[Gopt::GdnConvTrace]) {
+            check(cudaGetLastError(), "launch GOPT convolution trace");
+            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
+        }
         ++fast_same_weights_fp16kv_gdn_decode_conv_calls_;
     } else {
         transpose_f16_to_bf16_kernel<<<(rows * kQkv + 255) / 256, 256, 0, stream>>>(qkv, conv_input, rows, kQkv);
-        gdn_conv_kernel<<<(kQkv + 255) / 256, 256, 0, stream>>>(conv_input, weights_.conv_weight, conv_state_, q, k, v, rows);
+        launch_gopt_conv(gaming_[Gopt::GdnConvTrace],false,qkv,weights_.conv_weight,
+            conv_state_,conv_input,q,k,v,conv_output,conv_state_trace_,rows,stream);
+        if(gaming_[Gopt::GdnConvTrace]) {
+            check(cudaGetLastError(),"launch GOPT ordinary conv trace");
+            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
+        }
     }
-    copy_conv_state_trace_kernel<<<(kConvStateElements + 255) / 256, 256, 0, stream>>>(conv_state_, conv_state_trace_);
+    if(!gaming_[Gopt::GdnConvTrace])
+        copy_conv_state_trace_kernel<<<(kConvStateElements + 255) / 256, 256, 0, stream>>>(conv_state_, conv_state_trace_);
     if (!fast_same_weights_fp16kv_gdn_decode_conv)
         pack_qkv_bf16_kernel<<<(rows * kQkv + 255) / 256, 256, 0, stream>>>(q, k, v, conv_output, rows);
     convert_f16_to_bf16_kernel<<<(rows * kZ + 255) / 256, 256, 0, stream>>>(z, z_bf16, rows * kZ);
     check(cudaGetLastError(), "launch GDN convolution staging"); end(4);
     begin(5);
+    // Diagnostic only: sample the reached recurrence on the unchanged Fast90
+    // route. The synchronizing event result is never used as request timing.
+    static std::atomic<int> prefill_recurrence_samples{0};
+    const char* recurrence_sample_option=std::getenv(
+        "NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
+    const bool recurrence_sample=rows==1024 && wide_prefill &&
+        recurrence_sample_option &&
+        std::strcmp(recurrence_sample_option,"1")==0 &&
+        prefill_recurrence_samples.fetch_add(1,std::memory_order_relaxed)<16;
+    cudaEvent_t recurrence_start=nullptr,recurrence_end=nullptr;
+    if(recurrence_sample) {
+        check(cudaEventCreate(&recurrence_start),"create GDN recurrence sample start");
+        check(cudaEventCreate(&recurrence_end),"create GDN recurrence sample end");
+    }
     // A verifier transaction may already have saved this exact root in the
     // state-before trace. Preserve it for rollback/accepted-prefix repair and
     // avoid submitting the duplicate full recurrent-state copy.
@@ -2030,7 +2375,9 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     const Exl3GdnStageFusionContract stage_fusion{
         static_cast<std::size_t>(rows),prefill_resident_,wide_prefill,
         preserve_m1_topology};
-    if (stage_fusion.exact_route_supported()) {
+    const bool small_resident=gaming_[Gopt::GdnSmallResident] &&
+        gopt_small_gdn(rows,preserve_m1_topology,wide_prefill,prefill_normalized_!=nullptr);
+    if (small_resident || stage_fusion.exact_route_supported()) {
         float* normalized_q = prefill_normalized_;
         float* normalized_k = normalized_q + max_rows_ * kKeyHeads * kHeadDim;
         float* alpha = normalized_k + max_rows_ * kKeyHeads * kHeadDim;
@@ -2046,7 +2393,16 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             Exl3GdnRecurrentLayout::value_columns};
         const bool vector_pair_supported=prefill_resident_pair_vector_io_ &&
             vector_access.pair_columns_supported();
-        if(prefill_resident_quad_columns_)
+        if(recurrence_sample)
+            check(cudaEventRecord(recurrence_start,stream),
+                  "record GDN recurrence sample start");
+        if(small_resident) {
+            gdn_recurrence_prefill_resident_pair_columns_kernel<false><<<
+                kHeads*(kHeadDim/(4*2)),4*32,0,stream>>>(
+                normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
+            check(cudaGetLastError(),"launch GOPT small-M resident GDN");
+            gopt_record(gaming_submissions_,Gopt::GdnSmallResident);
+        } else if(prefill_resident_quad_columns_)
             gdn_recurrence_prefill_resident_quad_columns_kernel<<<
                 kHeads*(kHeadDim/(4*4)),4*32,0,stream>>>(
                 normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
@@ -2069,21 +2425,50 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             gdn_recurrence_prefill_resident_kernel<<<kHeads * (kHeadDim / 4), 4 * 32, 0, stream>>>(
                 normalized_q, normalized_k, v, alpha, beta_trace, recurrent_state_, core, rows);
     } else {
+        if(recurrence_sample)
+            check(cudaEventRecord(recurrence_start,stream),
+                  "record GDN recurrence sample start");
         gdn_recurrence_sm120_kernel<<<kHeads * (kHeadDim / 4), 4 * 32, 0, stream>>>(
             q, k, v, g_trace, beta_trace, recurrent_state_, core, rows);
     }
     check(cudaGetLastError(), "launch GDN recurrence"); end(5);
+    if(recurrence_sample) {
+        check(cudaEventRecord(recurrence_end,stream),
+              "record GDN recurrence sample end");
+        check(cudaEventSynchronize(recurrence_end),
+              "synchronize GDN recurrence sample");
+        float elapsed_ms=0.0f;
+        check(cudaEventElapsedTime(&elapsed_ms,recurrence_start,recurrence_end),
+              "read GDN recurrence sample");
+        std::fprintf(stderr,
+            "GDN_PREFILL_RECURRENCE_SAMPLE layer=%d rows=%d gpu_ms=%.6f\n",
+            model_layer_,rows,elapsed_ms);
+        cudaEventDestroy(recurrence_start);
+        cudaEventDestroy(recurrence_end);
+    }
     begin(6);
     Tensor tz(z_bf16, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tcore(core, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tnorm(gdn_norm, DType::BF16, {kHeadDim, kHeads, rows});
     Tensor nw(const_cast<std::uint16_t*>(weights_.gdn_norm), DType::BF16, {kHeadDim});
     ninfer::ops::gated_rmsnorm(tcore, nw, tz, kRmsEps, tnorm, stream);
-    pack_heads_bf16_kernel<<<(rows * kZ + 255) / 256, 256, 0, stream>>>(core, head_trace, rows);
-    transpose_bf16_to_f16_kernel<<<(rows * kZ + 255) / 256, 256, 0, stream>>>(gdn_norm, o_input, rows, kZ);
+    if(gaming_[Gopt::GdnOutputPack]) {
+        gopt_gdn_output_pack_kernel<<<(rows*kZ+255)/256,256,0,stream>>>(
+            core,gdn_norm,head_trace,o_input,rows*kZ);
+        check(cudaGetLastError(),"launch GOPT GDN output packing");
+        gopt_record(gaming_submissions_,Gopt::GdnOutputPack);
+    } else {
+        pack_heads_bf16_kernel<<<(rows * kZ + 255) / 256, 256, 0, stream>>>(core, head_trace, rows);
+        transpose_bf16_to_f16_kernel<<<(rows * kZ + 255) / 256, 256, 0, stream>>>(gdn_norm, o_input, rows, kZ);
+    }
     check(cudaGetLastError(), "launch GDN gated norm staging"); end(6);
     begin(7); project(linear_workspaces_[2], weights_.o, weights_.o_metadata, o_input, o,
                       Exl3TargetProjectionOperator::o); end(7);
     begin(8);
-    if(fused_residual_norm_ && wide_prefill && rows>=1 && rows<=1024 && !capture_active_ && !profile &&
+    const bool gopt_residual=gaming_[Gopt::GdnVerifierResidualNorm] &&
+        rows>=1 && rows<=8 && !wide_prefill && preserve_m1_topology;
+    if(gopt_residual) {
+        exl3_gdn_residual_norm(input,o,weights_.post_attention_norm,post,mlp_input,rows,true,stream);
+        gopt_record(gaming_submissions_,Gopt::GdnVerifierResidualNorm);
+    } else if(fused_residual_norm_ && wide_prefill && rows>=1 && rows<=1024 && !capture_active_ && !profile &&
        !projection_timing_ && !projection_observer_) {
         exl3_gdn_residual_norm(input,o,weights_.post_attention_norm,post,mlp_input,rows,true,stream);
         ++fused_residual_norm_submissions_;
@@ -2092,6 +2477,12 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         rms_norm_f16_kernel<><<<rows,512,512*sizeof(float),stream>>>(post,weights_.post_attention_norm,mlp_input,rows,kHidden);
     }
     check(cudaGetLastError(), "launch GDN residual/norm"); end(8);
+    if (deferred_mlp) {
+        trace_={input,h,qkv,z,b,a,conv_input,conv_output,beta_trace,g_trace,
+            recurrent_state_before_,recurrent_state_,core,core,o_input,o_input,
+            o,post,mlp_input,nullptr,nullptr,nullptr,nullptr,nullptr};
+        return;
+    }
     begin(9);
     const char* gdn_mgemm_pair = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR");
@@ -2215,10 +2606,18 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                        Exl3TargetProjectionOperator::down,
                        fused_gate_up?linear_workspaces_[5]->transformed_device():nullptr); residual_kernel<<<(rows * kHidden + 255) / 256, 256, 0, stream>>>(post, down, final_output, rows * kHidden); check(cudaGetLastError(), "launch GDN final residual"); end(11);
     if (output != final_output) check(cudaMemcpyAsync(output, final_output, static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream), "copy GDN output");
-    if (profile) {
+    if (collect_stage_events) {
         record(total_end, stream); check(cudaEventSynchronize(total_end), "synchronize GDN timing");
-        float ms = 0.0f; check(cudaEventElapsedTime(&ms, starts[0], total_end), "read GDN total timing"); timings_.total_microseconds = ms * 1000.0;
-        for (int i = 0; i < 12; ++i) { check(cudaEventElapsedTime(&ms, starts[i], ends[i]), "read GDN timing"); timings_.microseconds[i] = ms * 1000.0; cudaEventDestroy(starts[i]); cudaEventDestroy(ends[i]); }
+        float ms = 0.0f; check(cudaEventElapsedTime(&ms, starts[0], total_end), "read GDN total timing");
+        if(profile)timings_.total_microseconds = ms * 1000.0;
+        if(stage_sample)std::fprintf(stderr,"GDN_PREFILL_STAGE_SAMPLE layer=%d rows=%d total_gpu_ms=%.6f",model_layer_,rows,ms);
+        for (int i = 0; i < 12; ++i) {
+            check(cudaEventElapsedTime(&ms, starts[i], ends[i]), "read GDN timing");
+            if(profile)timings_.microseconds[i] = ms * 1000.0;
+            if(stage_sample)std::fprintf(stderr," stage%d_ms=%.6f",i,ms);
+            cudaEventDestroy(starts[i]); cudaEventDestroy(ends[i]);
+        }
+        if(stage_sample)std::fprintf(stderr,"\n");
         cudaEventDestroy(total_end);
     }
     trace_ = {input, h, qkv, z, b, a, conv_input, conv_output, beta_trace, g_trace, recurrent_state_before_, recurrent_state_, core, core, o_input, o_input, o, post, mlp_input, gate, up, act, down, final_output};

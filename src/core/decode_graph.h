@@ -99,6 +99,7 @@ private:
     cudaGraphExec_t exec_ = nullptr;
     cudaError_t retirement_error_ = cudaSuccess;
     Provider provider_;
+    bool custom_provider_ = false;
 };
 
 } // namespace ninfer

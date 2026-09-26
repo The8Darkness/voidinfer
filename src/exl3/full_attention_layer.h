@@ -168,6 +168,7 @@ exl3_prefill_attention_shared_score_global_snapshot() noexcept;
 // FP16-KV fused-flash candidate.  The counter records submitted launches and
 // does not by itself establish numerical or completion validity.
 std::uint64_t exl3_fast_fused_flash_attention_calls_for_test() noexcept;
+std::uint64_t exl3_fast_fused_flash_multirow_attention_calls_for_test() noexcept;
 
 // Process-wide real-caller dispatch seam for the separately gated native
 // whole-context FP16-KV fused attention candidate.  The counter records one
@@ -633,6 +634,13 @@ public:
         numeric_attention_splitk_workspace_bytes_=workspace_bytes;
         numeric_attention_splitk_=enabled;
     }
+    void set_fast_wmma32_split2_workspace(float* output,float* stats,
+                                           int capacity_rows,int split_count=2) noexcept {
+        fast_wmma32_split2_output_=output;
+        fast_wmma32_split2_stats_=stats;
+        fast_wmma32_split2_capacity_rows_=capacity_rows;
+        fast_wmma32_split_count_=split_count;
+    }
 
     // Decode-only graph path: kernels read the current position through this
     // stable device pointer instead of a captured host scalar.
@@ -940,6 +948,7 @@ private:
     std::uint64_t gqa_six_score_k_tile64_row_attempts_=0;
     bool fast_fused_flash_attention_ = false;
     bool fast_fused_flash_attention_keys256_ = false;
+    bool fast_fused_flash_multirow_ = false;
     bool fast_whole_context_fused_attention_ = false;
     bool fast_prefill_tiled_attention_ = false;
     bool fast_prefill_rows4_attention_ = false;
@@ -947,6 +956,11 @@ private:
     bool fast_prefill_rows8_threads128_ = false;
     bool fast_prefill_wmma_attention_ = false;
     bool fast_prefill_wmma32_attention_ = false;
+    bool fast_prefill_wmma64_attention_ = false;
+    bool fast_prefill_wmma64_register_attention_ = false;
+    bool fast_prefill_wmma64_register_keys64_attention_ = false;
+    bool fast_prefill_wmma64_shared_heads_attention_ = false;
+    bool fast_prefill_wmma32_padded_attention_ = false;
     bool fast_prefill_rows2_attention_ = false;
     bool fast_online_decode_attention_ = false;
     bool fast_online_decode_attention_warp_heads_ = false;
@@ -964,6 +978,10 @@ private:
     float* numeric_attention_splitk_workspace_ = nullptr;
     std::size_t numeric_attention_splitk_workspace_bytes_ = 0;
     bool numeric_attention_splitk_ = false;
+    float* fast_wmma32_split2_output_ = nullptr;
+    float* fast_wmma32_split2_stats_ = nullptr;
+    int fast_wmma32_split2_capacity_rows_ = 0;
+    int fast_wmma32_split_count_ = 0;
     const int* position_device_ = nullptr;
     const int* mrope_positions_ = nullptr;
     int rope_offset_ = 0;

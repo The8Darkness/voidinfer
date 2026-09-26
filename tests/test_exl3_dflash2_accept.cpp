@@ -17,16 +17,19 @@
 //
 // Modes (NINFER_E5A4_MODE) include "accept" (default), "h6sweep", and the
 // focused "transactionqual" gate.
+#include "scoped_environment.h"
 #include "exl3/text_model.h"
 #include "exl3/device_prefix_cache.h"
 #include "exl3/branch_reference.h"
 #include "exl3/exact_outer_reference.h"
+#include "exl3/fast_device_round.h"
 #include "exl3/hierarchical_exact.h"
 #include "exl3/turboangle_host.h"
 #include "exl3/turboangle_l1.h"
 #include "exl3/vericache_request.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/dflash2_execution.h"
+#include "exl3/device_horizon_cost_policy.h"
 #include "exl3/vericache_queue.h"
 #include <bit>
 #include <nlohmann/json.hpp>
@@ -76,6 +79,7 @@
 #include <limits>
 #include <locale>
 #include <memory>
+#include <map>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -351,6 +355,70 @@ struct CommitSink {
     DraftPrefillOverlapRoute* overlap = nullptr;
 };
 
+constexpr int layer_major_retained_start(int total) {
+    int retained_start=0;
+    for (int forward=0;forward<total;) {
+        const int forward_rows=forward==0?16:std::min(1024,total-forward);
+        for (int first=0;first<forward_rows;first+=16) {
+            const int rows=std::min(16,forward_rows-first);
+            if (forward+first+rows<=total-2048)
+                retained_start=forward+first+rows;
+        }
+        forward+=forward_rows;
+    }
+    return retained_start;
+}
+static_assert(layer_major_retained_start(4096)==2048);
+static_assert(layer_major_retained_start(16384)==14336);
+static_assert(layer_major_retained_start(4097)==2048); // crossing call halo
+
+void diagnose_fast_device_prefill(Exl3TextContext& ctx,
+    Exl3Dflash2DraftModel& draft,int total,bool fresh_window) {
+    if (env("NINFER_E5A4_MODE") != "fastdevicetxn" ||
+        env("NINFER_EXL3_TEST_FAST_DEVICE_REAL_DFLASH") != "1" ||
+        env("NINFER_EXL3_TEST_FAST_DEVICE_ROUND_STATE") != "1") return;
+    const auto status=draft.fresh_prefill_status();
+    const auto submitted=status.submitted_rows?status.submitted_rows:total;
+    const auto encoded=status.submitted_rows?status.encoded_rows:total;
+    require(!status.active && !status.failed && submitted==total &&
+            encoded+status.skipped_rows==submitted,
+            "real draft prefill diagnostic coverage");
+    const auto digest=draft.ring_digest();
+    const auto width=std::stoi(env("NINFER_EXL3_TEST_FAST_DEVICE_REAL_WIDTH"));
+    std::array<std::int64_t,8> block{};
+    block.fill(248070);
+    block[0]=ninfer::exl3::exl3_branch_greedy(ctx);
+    const auto proposed=draft.propose_cached_view(
+        std::span<const std::int64_t>(block).first(width),total,
+        ctx.target_embedding(),ctx.target_lm_head_weights(),
+        ctx.target_lm_head_metadata(),248070);
+    require(proposed.size()==static_cast<std::size_t>(width-1),
+            "real draft prefill diagnostic first proposal extent");
+    std::cout<<"FAST_DEVICE_REAL_DFLASH_PREFILL_EQ window="
+             <<(fresh_window?1:0)
+             <<" submitted="<<submitted<<" encoded="<<encoded
+             <<" skipped="<<status.skipped_rows
+             <<" ring_base="<<draft.ring_base_abs()
+             <<" ring_count="<<draft.ring_count()
+             <<" ring_bytes="<<draft.ring_bytes()
+             <<" target_hash="<<ctx.export_exact_host_state()->represented_payload_hash_for_test();
+    for(std::size_t i=0;i<digest.size();++i)
+        std::cout<<" ring_digest"<<i<<'='<<digest[i];
+    std::cout<<" first_proposal="<<block[0];
+    for(const auto token:proposed)std::cout<<','<<token;
+    std::cout<<'\n';
+    const auto ring_path=env("NINFER_EXL3_TEST_FAST_DEVICE_PREFILL_RING_OUT");
+    require(!ring_path.empty(),"real draft prefill ring output path");
+    const auto represented=draft.export_host_ring(nullptr,false);
+    const auto written=represented->write_represented_payload_for_test(ring_path);
+    require(written==sizeof(std::uint64_t)+sizeof(long long)+sizeof(int)+
+            static_cast<std::size_t>(draft.ring_count())*5*2*2048,
+            "real draft complete represented ring bytes");
+    std::cout<<"FAST_DEVICE_REAL_DFLASH_RING_DUMP bytes="<<written
+             <<" base="<<represented->base()
+             <<" count="<<represented->count()<<'\n';
+}
+
 // Preserve the qualified initial16 prefill. The reference suffix uses teacher
 // M1 decodes; the explicit chunk8 option uses native append_prefill, retaining
 // continuation/M1 layer topology and only final-row logits. Commit every
@@ -367,7 +435,12 @@ double ingest_prefix(Exl3TextContext& ctx, const std::vector<std::int64_t>& pref
     require(total >= 32, "E5A4 prefix too short for a window plus anchor");
     const auto t0 = std::chrono::steady_clock::now();
     const bool fresh_window = sink.draft && env("NINFER_DFLASH2_PREFILL_WINDOW") == "1";
+    const bool layer_major = env("NINFER_EXL3_FAST_LAYER_MAJOR_PREFILL") == "1";
     require(!fresh_window || chunked, "fresh draft prefill window requires chunked suffix");
+    require(!layer_major || !sink.draft ||
+            (sink.stage && fresh_window && wide_rows==1024 &&
+             (total==4096 || total==16384) && !sink.overlap),
+            "layer-major draft bridge requires scoped 4K/16K wide1024");
     if (sink.overlap) {
         require(sink.draft && sink.stage && fresh_window && wide_rows == 1024 &&
                     total == 4096 && env("NINFER_DFLASH2_PREFILL_BATCH") == "1" &&
@@ -418,10 +491,72 @@ double ingest_prefix(Exl3TextContext& ctx, const std::vector<std::int64_t>& pref
     TtftTrace::mark("initial16_begin", ctx.position());
     ctx.prefill(std::span<const std::int64_t>(prefix.data(), static_cast<std::size_t>(c0)));
     require(ctx.position() == c0, "E5A4 position after first prefill chunk");
-    if (sink.draft != nullptr) commit_current_rows(ctx, *sink.draft, *sink.stage, c0, 0);
+    if (sink.draft != nullptr) {
+        if (layer_major) sink.draft->skip_fresh_prefill_block(c0, 0);
+        else commit_current_rows(ctx, *sink.draft, *sink.stage, c0, 0);
+    }
     TtftTrace::mark("initial16_complete", ctx.position(), -1, true);
     TtftTrace::mark(wide_rows==1024 ? "chunk1024_suffix_begin" : wide_rows==512 ? "chunk512_suffix_begin" : wide_rows==256 ? "chunk256_suffix_begin" : wide_rows==128 ? "chunk128_suffix_begin" : wide_rows==64 ? "chunk64_suffix_begin" : wide_rows==32 ? "chunk32_suffix_begin" : wide ? "chunk16_suffix_begin" : chunked ? "chunk8_suffix_begin" : "m1_suffix_begin", ctx.position());
-    for (int i = c0; i < total;) {
+    if (layer_major) {
+        require(wide_rows == 1024 && total > 1040 && !sink.overlap &&
+                (!sink.draft || (sink.stage && fresh_window &&
+                  (total == 4096 || total == 16384))),
+                "layer-major prefill requires target-only or scoped real-draft wide1024");
+        const auto suffix=std::span<const std::int64_t>(prefix.data()+c0,total-c0);
+        if (!sink.draft) ctx.append_prefill_layer_major(suffix);
+        else {
+            // Reproduce the original initial16 + 1024/tail forward partitions,
+            // each split into <=16-row draft calls. Retain the crossing call too.
+            const int retained_start=layer_major_retained_start(total);
+            const int retained_rows=total-retained_start;
+            require(retained_start>=c0 && retained_rows>=2048 && retained_rows<=2063,
+                    "layer-major draft retained partition halo");
+            const auto bytes=static_cast<std::size_t>(kTapCount)*retained_rows*
+                             kHidden*sizeof(std::uint16_t);
+            DeviceBuffer retained_arena(bytes);
+            Exl3TextContext::RetainedTapTail retained{
+                static_cast<std::uint16_t*>(retained_arena.get()),bytes,
+                retained_start,retained_rows};
+            try {
+                ctx.append_prefill_layer_major(suffix,nullptr,&retained);
+                require(ctx.position()==total,"layer-major target prefix position");
+                for (int forward=c0;forward<total;) {
+                    const int forward_rows=std::min(1024,total-forward);
+                    for (int first=0;first<forward_rows;first+=16) {
+                        const int rows=std::min(16,forward_rows-first);
+                        const int absolute=forward+first;
+                        if (absolute+rows<=total-2048) {
+                            sink.draft->skip_fresh_prefill_block(rows,absolute);
+                        } else {
+                            require(absolute>=retained_start &&
+                                    absolute+rows<=total,
+                                    "layer-major encoded partition outside retained taps");
+                            const std::uint16_t* taps[kTapCount];
+                            for (int tap=0;tap<kTapCount;++tap)
+                                taps[tap]=retained.device+
+                                    (static_cast<std::size_t>(tap)*retained_rows+
+                                     absolute-retained_start)*kHidden;
+                            sink.draft->commit_prefill_block(taps,rows,absolute);
+                        }
+                    }
+                    forward+=forward_rows;
+                }
+                sink.draft->finish_fresh_prefill();
+                cuda_check(cudaStreamSynchronize(nullptr),
+                           "complete retained draft ring before releasing tap arena");
+                std::cout << "FAST_DEVICE_REAL_DFLASH_LAYER_MAJOR_TAP_TAIL"
+                          << " first=" << retained_start
+                          << " rows=" << retained_rows
+                          << " bytes=" << bytes << '\n';
+            } catch (...) {
+                cudaStreamSynchronize(nullptr);
+                try {sink.draft->reset();} catch (...) {}
+                throw;
+            }
+        }
+        require(ctx.position()==total,"layer-major target prefix position");
+    }
+    for (int i = c0; !layer_major && i < total;) {
         const int rows = chunked ? std::min(wide ? wide_rows : 8, total - i) : 1;
         if (chunked) {
             const auto tokens = std::span<const std::int64_t>(prefix.data() + i, rows);
@@ -436,11 +571,12 @@ double ingest_prefix(Exl3TextContext& ctx, const std::vector<std::int64_t>& pref
         i += rows;
     }
     require(ctx.position() == total, "E5A4 position after ingest");
-    if (fresh_window) sink.draft->finish_fresh_prefill(nullptr);
+    if (fresh_window && !layer_major) sink.draft->finish_fresh_prefill(nullptr);
     // Complete target work and ordered ring commits inside the prefill timer;
     // the subsequent seed timer measures logits retrieval and sampling only.
     cuda_check(cudaStreamSynchronize(nullptr), "E5A4 completed prefix timing");
-    TtftTrace::mark(wide_rows==1024 ? "chunk1024_suffix_complete" : wide_rows==512 ? "chunk512_suffix_complete" : wide_rows==256 ? "chunk256_suffix_complete" : wide_rows==128 ? "chunk128_suffix_complete" : wide_rows==64 ? "chunk64_suffix_complete" : wide_rows==32 ? "chunk32_suffix_complete" : wide ? "chunk16_suffix_complete" : chunked ? "chunk8_suffix_complete" : "m1_suffix_complete", ctx.position());
+    if(sink.draft)diagnose_fast_device_prefill(ctx,*sink.draft,total,fresh_window);
+    TtftTrace::mark(layer_major ? "layer_major_suffix_complete" : wide_rows==1024 ? "chunk1024_suffix_complete" : wide_rows==512 ? "chunk512_suffix_complete" : wide_rows==256 ? "chunk256_suffix_complete" : wide_rows==128 ? "chunk128_suffix_complete" : wide_rows==64 ? "chunk64_suffix_complete" : wide_rows==32 ? "chunk32_suffix_complete" : wide ? "chunk16_suffix_complete" : chunked ? "chunk8_suffix_complete" : "m1_suffix_complete", ctx.position());
     return std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - t0).count();
 }
@@ -1157,7 +1293,7 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
         PendingRoundResult round;
         if (out.transaction_route) {
             if (spec->target_projection_timing_enabled())
-                spec->begin_target_projection_timing_round(r);
+                spec->begin_target_projection_timing_round(r, verification_stream);
             const TransactionRoundResult transaction = verify_pending_round_transactional(
                 *spec, draft, stage, pending, proposals, abs_pos,
                 verification_stream, -1, 0x7e00u,
@@ -1238,6 +1374,8 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
                 env("NINFER_EXL3_TARGET_KV_SMALL_M") == "1";
             const bool target_gateup_k5_small_m_requested =
                 env("NINFER_EXL3_TARGET_GATEUP_K5_SMALL_M") == "1";
+            const bool target_k5_small_m_batch_requested =
+                env("NINFER_EXL3_TARGET_K5_SMALL_M_BATCH") == "1";
             const bool target_gateup_small_m_requested =
                 env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1";
             const bool target_gateup_k7_small_m_requested =
@@ -1311,18 +1449,40 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
                 const bool kv_candidate_eligible = attempt && target_kv_small_m_requested &&
                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::k || timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::v) &&
                     (timing.K == 7 || timing.K == 8) && timing.in_features == 5120 && timing.out_features == 1024;
+                const bool k5_batch_candidate_eligible = attempt &&
+                    target_k5_small_m_batch_requested && timing.K == 5 &&
+                    ((timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::q &&
+                      timing.in_features == 5120 && timing.out_features == 12288) ||
+                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::qkv &&
+                      timing.in_features == 5120 && timing.out_features == 10240) ||
+                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::z &&
+                      timing.in_features == 5120 && timing.out_features == 6144) ||
+                     ((timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::k ||
+                       timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::v) &&
+                      timing.in_features == 5120 && timing.out_features == 1024) ||
+                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::o &&
+                      timing.in_features == 6144 && timing.out_features == 5120) ||
+                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::down &&
+                      timing.in_features == 17408 && timing.out_features == 5120));
                 const bool candidate_eligible =
                     gateup_candidate_eligible || down_candidate_eligible ||
                     o_k7_candidate_eligible || o_k6_candidate_eligible || down_k7_candidate_eligible ||
                     z_k6_candidate_eligible || qkv_k6_candidate_eligible ||
-                    q_k6_candidate_eligible || kv_candidate_eligible;
+                    q_k6_candidate_eligible || kv_candidate_eligible ||
+                    k5_batch_candidate_eligible;
                 const bool candidate_reported =
                     timing.topology ==
                     Exl3TargetProjectionTopology::small_m_mma_split;
                 if (candidate_reported) {
                     require(candidate_eligible && timing.rows == block_len &&
                                 timing.calls == 1,
-                            "target projection timing candidate topology mismatch");
+                            "target projection timing candidate topology mismatch layer=" +
+                                std::to_string(timing.layer) + " op=" +
+                                std::to_string(static_cast<int>(timing.operation)) +
+                                " K=" + std::to_string(timing.K) + " rows=" +
+                                std::to_string(timing.rows) + " calls=" +
+                                std::to_string(timing.calls) + " phase=" +
+                                std::to_string(static_cast<int>(timing.phase)));
                 } else {
                     // An eligible group may retain this path when cooperative
                     // capacity is insufficient.  The external proof checker
@@ -1850,6 +2010,7 @@ void write_target_projection_timing(const std::string& family, int ctx,
 #include "test_exl3_k5_oracle.h"
 #include "test_exl3_draft_small_m_qualification.h"
 #include "test_exl3_target_transaction.h"
+#include "test_exl3_fast_device_transaction.h"
 #include "test_exl3_pending_qualification.h"
 #include "test_exl3_target_continuation.h"
 #include "test_exl3_context_isolation.h"
@@ -2029,11 +2190,18 @@ int main() {
         std::string targetrequest_summary_path, targetrequest_tokens_path,
             targetrequest_rounds_path;
         if (mode == "targetrequest") {
+            const bool decode_projection_diagnostic=
+                !env("NINFER_E5A4_TARGETREQUEST_DECODE_PROJECTION_PROFILE").empty();
             for (const auto* name : {"NINFER_E5A4_TTFT_OUT", "NINFER_E5A4_HANDOFF_PROFILE_PREFIX",
                  "NINFER_EXL3_TARGET_PROJECTION_TIMING_OUT", "NINFER_E5A4_RING_CHECK_OUT",
                  "NINFER_E5A5H_CAPTURE"})
                 require(env(name).empty(), "targetrequest forbids profiling outputs");
-            for (const auto* name : {"NINFER_EXL3_TARGET_PROJECTION_TIMING", "NINFER_E5A4_GRAPH",
+            require(decode_projection_diagnostic?
+                    env("NINFER_EXL3_TARGET_PROJECTION_TIMING")=="1":
+                    (env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty() ||
+                     env("NINFER_EXL3_TARGET_PROJECTION_TIMING")=="0"),
+                "targetrequest projection timing requires its explicit diagnostic output");
+            for (const auto* name : {"NINFER_E5A4_GRAPH",
                  "NINFER_EXL3_GRAPH", "NINFER_E5A4_NVTX"})
                 require(env(name).empty() || env(name) == "0", "targetrequest eager uninstrumented only");
             const auto ordinary_fp16=env("NINFER_TARGETREQUEST_ORDINARY_FP16");
@@ -2224,7 +2392,7 @@ int main() {
         }
         if (target_path.empty() ||
              (draft_path.empty() && mode != "targetownerretirement" && mode != "packedqprojection" && mode != "hostkvbatchmetadata" && mode != "targettxn" && mode != "targetcontinue" &&
-             mode != "prefixretain" && mode != "prefixretainodd" && mode != "verifywidth" && mode != "ttfttarget" && mode != "targetrequest" && mode != "hostkvgdngraphoracle" && mode != "hostkvmlptailgraphoracle" && mode != "hostkvrecurrenttraceoracle" && mode != "t79targetc2" && mode != "t80fp16serving" && mode != "t82fp16c2" && mode != "t83fp16c8" && mode != "t84servingcoord" && mode != "t85fp16q4" && mode != "t86coordc8" && mode != "t87batchadmit" && mode != "t88unequaltails" && mode != "t89residentprofile" && mode != "t90allocationchurn" && mode != "t92turnover" && mode != "t95atomicturnover" && mode != "t97concurrentprep" && mode != "t98pipelinedturnover" && mode != "t101multiturn" && mode != "contextisolation" && mode != "graphcurrentstate" && mode != "graphcurrentreplay" && mode != "prefillgateup" && mode != "prefillk6gateupwarpgroup" && mode != "prefillk6gateupn32paircta" && mode != "prefillk7tiles64exact" && mode != "initial16ops" && mode != "projectionorderedc2screen" && mode != "projectionroutematrixscreen" && mode != "gdnstageoracle" && mode != "targetgraphc2screen" && mode != "targetgraphc2lifecycle" && mode != "targetgraphresetreuse" && mode != "prefixindex" && mode != "prefixservingt72" && mode != "prefixservingt72t1" && mode != "t78cachedc2" && mode != "contextreuse" && mode != "contextreuset1")) {
+             mode != "prefixretain" && mode != "prefixretainodd" && mode != "verifywidth" && mode != "ttfttarget" && mode != "targetrequest" && mode != "qualitylogits" && mode != "layermajorfailure" && mode != "k5prefilloperator" && mode != "fastdevicetxn" && mode != "hostkvgdngraphoracle" && mode != "hostkvmlptailgraphoracle" && mode != "hostkvrecurrenttraceoracle" && mode != "t79targetc2" && mode != "t80fp16serving" && mode != "t82fp16c2" && mode != "t83fp16c8" && mode != "t84servingcoord" && mode != "t85fp16q4" && mode != "t86coordc8" && mode != "t87batchadmit" && mode != "t88unequaltails" && mode != "t89residentprofile" && mode != "t90allocationchurn" && mode != "t92turnover" && mode != "t95atomicturnover" && mode != "t97concurrentprep" && mode != "t98pipelinedturnover" && mode != "t101multiturn" && mode != "contextisolation" && mode != "graphcurrentstate" && mode != "graphcurrentreplay" && mode != "prefillgateup" && mode != "prefillk6gateupwarpgroup" && mode != "prefillk6gateupn32paircta" && mode != "prefillk7tiles64exact" && mode != "initial16ops" && mode != "projectionorderedc2screen" && mode != "projectionroutematrixscreen" && mode != "gdnstageoracle" && mode != "targetgraphc2screen" && mode != "targetgraphc2lifecycle" && mode != "targetgraphresetreuse" && mode != "prefixindex" && mode != "prefixservingt72" && mode != "prefixservingt72t1" && mode != "t78cachedc2" && mode != "contextreuse" && mode != "contextreuset1")) {
             std::cerr << "E5A4 skipped: set NINFER_EXL3_TARGET_PATH"
                       << ((mode == "targettxn" || mode == "targetcontinue" ||
                            mode == "prefixretain" || mode == "prefixretainodd")
@@ -2277,6 +2445,46 @@ int main() {
                   << " upload_ms=" << load_stats.upload_ms
                   << " staged_transfer_ms=" << load_stats.staged_transfer_ms
                   << " staging_host_bytes=" << load_stats.staging_host_bytes << '\n';
+        if (mode == "layermajorfailure") {
+            require(!oscar_requested &&
+                    env("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER") == "2" &&
+                    env("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL") == "1",
+                    "layer-major failure gate requires ordinary Fast90 and layer2 fault");
+            const auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+            require(ids.size()>=2065,"layer-major failure fixture extent");
+            auto context=target->create_context(true);
+            context->prefill(std::span<const std::int64_t>(ids.data(),16));
+            bool fault_seen=false,decode_rejected=false;
+            try {
+                context->append_prefill_layer_major(
+                    std::span<const std::int64_t>(ids.data()+16,2048));
+            } catch (const std::exception& error) {
+                fault_seen=std::string(error.what()).find(
+                    "injected layer-major partial-layer failure")!=std::string::npos;
+            }
+            try { context->decode(ids[2064]); }
+            catch (const std::exception& error) {
+                decode_rejected=std::string(error.what()).find(
+                    "failed layer-major prefill requires context reset")!=std::string::npos;
+            }
+            require(fault_seen && decode_rejected && context->position()==16,
+                    "partial layer-major failure escaped or changed public position");
+            require(_putenv_s("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER","")==0,
+                    "clear one-shot layer-major test fault");
+            context->reset();
+            context->prefill(std::span<const std::int64_t>(ids.data(),16));
+            context->append_prefill_layer_major(
+                std::span<const std::int64_t>(ids.data()+16,2048));
+            require(context->position()==2064,
+                    "reset did not restore layer-major prefill admission");
+            context->decode(ids[2064]);
+            require(context->position()==2065,
+                    "post-reset layer-major decode position");
+            cuda_check(cudaDeviceSynchronize(),
+                       "complete layer-major failure/reset gate");
+            std::cout << "LAYER_MAJOR_FAILURE PASS\n";
+            return 0;
+        }
         if (mode == "t79targetc2") {
             const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
             const auto prose_file = env("NINFER_TEST_PROSE_FILE");
@@ -2466,6 +2674,129 @@ int main() {
                 load_ids(prose_file), output);
             return 0;
         }
+        if (mode == "qualitylogits") {
+            const bool coherent_o_k7=env("NINFER_EXL3_COHERENT_O_K7")=="1";
+            const bool coherent_down_k7=env("NINFER_EXL3_COHERENT_DOWN_K7")=="1";
+            const bool coherent_wide_k6=
+                env("NINFER_EXL3_TARGET_COHERENT_WIDE_K6")=="1";
+            std::uint64_t coherent_wide_calls_before[5]{},
+                coherent_wide_rows_before[5]{};
+            for(int operation=0;operation<5;++operation) {
+                coherent_wide_calls_before[operation]=
+                    Exl3CudaLinearWorkspace::coherent_wide_k6_calls_for_test(operation);
+                coherent_wide_rows_before[operation]=
+                    Exl3CudaLinearWorkspace::coherent_wide_k6_rows_for_test(operation);
+            }
+            const auto coherent_down_k7_calls_before=
+                Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test();
+            const auto coherent_down_k7_rows_before=
+                Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test();
+            const auto coherent_o_calls_before=
+                Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test();
+            const auto coherent_o_rows_before=
+                Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test();
+            const auto input_path=env("NINFER_QUALITY_INPUT");
+            const auto csv_path=env("NINFER_QUALITY_OUTPUT");
+            const auto binary_path=env("NINFER_QUALITY_LOGITS_OUTPUT");
+            require(!input_path.empty() && !csv_path.empty() && !binary_path.empty() &&
+                    !std::filesystem::exists(csv_path) && !std::filesystem::exists(binary_path),
+                    "qualitylogits requires new separate output files");
+            const auto ids=load_ids(input_path);
+            const int prefix_rows=env_int("NINFER_QUALITY_PREFIX",3072);
+            const int scored_rows=env_int("NINFER_QUALITY_LABELS",128);
+            require(prefix_rows>=32 && scored_rows>=1 &&
+                    static_cast<std::size_t>(prefix_rows+scored_rows)<=ids.size() &&
+                    prefix_rows+scored_rows<=max_ctx,"qualitylogits fixed common-history extent");
+            for(int i=0;i<prefix_rows+scored_rows;++i)
+                require(ids[static_cast<std::size_t>(i)]>=0 &&
+                        ids[static_cast<std::size_t>(i)]<kVocab,
+                        "qualitylogits vocabulary extent");
+            auto context=target->create_context(true);
+            std::vector<std::int64_t> prefix(ids.begin(),ids.begin()+prefix_rows);
+            ingest_prefix(*context,prefix,CommitSink{});
+            std::ofstream csv(csv_path),binary(binary_path,std::ios::binary);
+            csv.imbue(std::locale::classic());
+            csv << "ordinal,label,nll,top1,top2_margin,label_logit,logsumexp\n";
+            double total_nll=0.0;
+            for(int row=0;row<scored_rows;++row) {
+                const auto logits=context->logits_host();
+                require(logits.size()==kVocab,"qualitylogits vector extent");
+                binary.write(reinterpret_cast<const char*>(logits.data()),
+                             static_cast<std::streamsize>(logits.size()*sizeof(float)));
+                const int label=static_cast<int>(ids[static_cast<std::size_t>(prefix_rows+row)]);
+                double maximum=-std::numeric_limits<double>::infinity();
+                double top1=-std::numeric_limits<double>::infinity();
+                double top2=-std::numeric_limits<double>::infinity();
+                int best=-1;
+                for(std::size_t j=0;j<logits.size();++j) {
+                    const double value=logits[j];
+                    require(std::isfinite(value) || value==-std::numeric_limits<float>::infinity(),
+                            "qualitylogits nonfinite unmasked logit");
+                    if(value>maximum)maximum=value;
+                    if(value>top1){top2=top1;top1=value;best=static_cast<int>(j);}
+                    else if(value>top2)top2=value;
+                }
+                require(std::isfinite(maximum) && std::isfinite(logits[label]),
+                        "qualitylogits label or normalizer nonfinite");
+                double sum=0.0;
+                for(const float value:logits)sum+=std::exp(static_cast<double>(value)-maximum);
+                const double logsumexp=maximum+std::log(sum);
+                const double nll=logsumexp-static_cast<double>(logits[label]);
+                total_nll+=nll;
+                csv << row << ',' << label << ',' << std::setprecision(12) << nll << ','
+                    << best << ',' << (top1-top2) << ',' << logits[label] << ',' << logsumexp << '\n';
+                if(row+1<scored_rows)context->decode(label);
+            }
+            csv.close();binary.close();
+            require(csv.good() && binary.good(),"qualitylogits output write");
+            const auto coherent_o_calls=
+                Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test()-
+                coherent_o_calls_before;
+            const auto coherent_o_rows=
+                Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test()-
+                coherent_o_rows_before;
+            std::cout<<"QUALITY_COHERENT_O_K7 enabled="<<coherent_o_k7
+                     <<" calls="<<coherent_o_calls
+                     <<" rows="<<coherent_o_rows<<'\n';
+            require(coherent_o_k7 ? coherent_o_calls>0 &&
+                    coherent_o_rows>=static_cast<std::uint64_t>(scored_rows-1)
+                    : coherent_o_calls==0 && coherent_o_rows==0,
+                    "quality coherent K7 O dispatch mismatch");
+            const auto coherent_down_k7_calls=
+                Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test()-
+                coherent_down_k7_calls_before;
+            const auto coherent_down_k7_rows=
+                Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test()-
+                coherent_down_k7_rows_before;
+            std::cout<<"QUALITY_COHERENT_DOWN_K7 enabled="<<coherent_down_k7
+                     <<" calls="<<coherent_down_k7_calls
+                     <<" rows="<<coherent_down_k7_rows<<'\n';
+            require(coherent_down_k7 ? coherent_down_k7_calls>0 &&
+                    coherent_down_k7_rows>=static_cast<std::uint64_t>(scored_rows-1)
+                    : coherent_down_k7_calls==0 && coherent_down_k7_rows==0,
+                    "quality coherent K7 down dispatch mismatch");
+            constexpr const char* coherent_wide_names[5]={
+                "q","qkv","z","o","gate_up"};
+            for(int operation=0;operation<5;++operation) {
+                const auto calls=Exl3CudaLinearWorkspace::
+                    coherent_wide_k6_calls_for_test(operation)-
+                    coherent_wide_calls_before[operation];
+                const auto rows=Exl3CudaLinearWorkspace::
+                    coherent_wide_k6_rows_for_test(operation)-
+                    coherent_wide_rows_before[operation];
+                std::cout<<"QUALITY_COHERENT_WIDE_K6 op="
+                         <<coherent_wide_names[operation]
+                         <<" enabled="<<coherent_wide_k6
+                         <<" calls="<<calls<<" rows="<<rows<<'\n';
+                require(coherent_wide_k6 ? calls>0 && rows>=calls :
+                        calls==0 && rows==0,
+                    "quality coherent wide K6 dispatch mismatch");
+            }
+            std::cout << "QUALITY_LOGITS PASS prefix=" << prefix_rows
+                      << " labels=" << scored_rows << " mean_nll="
+                      << total_nll/scored_rows << '\n';
+            return 0;
+        }
         if (mode == "targetrequest") {
             if (targetrequest_context_mode) {
                 run_targetrequest_contexts(*target, targetrequest_prefix,
@@ -2488,6 +2819,12 @@ int main() {
                         graph_targetrequest_value == "1",
                     "targetrequest graph flag must be 0 or 1");
             const bool graph_targetrequest = graph_targetrequest_value == "1";
+            const auto decode_projection_profile_path =
+                env("NINFER_E5A4_TARGETREQUEST_DECODE_PROJECTION_PROFILE");
+            require(decode_projection_profile_path.empty() ||
+                        (!graph_targetrequest &&
+                         env("NINFER_EXL3_TARGET_PROJECTION_TIMING") == "1"),
+                    "targetrequest decode projection profile requires eager projection timing");
             require(!graph_targetrequest || !targetrequest_exact_host_kv,
                     "targetrequest graph is incompatible with exact HostKV");
             const std::string graph_lifecycle_value =
@@ -2504,10 +2841,16 @@ int main() {
                 Exl3CudaLinearWorkspace::process_fast_native_mia_target_prefill_fp16_calls_for_test();
             const auto prefill_shared_score_before =
                 ninfer::exl3::exl3_prefill_attention_shared_score_global_snapshot();
+            std::size_t free_before_context=0,device_total=0;
+            std::size_t free_after_context=0,free_after_prefill=0;
+            cuda_check(cudaMemGetInfo(&free_before_context,&device_total),
+                       "targetrequest memory before context");
             const auto resident_begin = std::chrono::steady_clock::now();
             auto ctx = target->create_context(
                 targetrequest_exact_host_kv || targetrequest_ordinary_fp16);
             const auto context_end = std::chrono::steady_clock::now();
+            cuda_check(cudaMemGetInfo(&free_after_context,&device_total),
+                       "targetrequest memory after context");
             if(!targetrequest_ordinary_fp16 && !targetrequest_exact_host_kv)
                 require(ctx->try_enable_oscar_from_environment(), "targetrequest canonical OSCAR attachment");
             const auto fast_prefill_tiled_attention_prefill_before=
@@ -2550,6 +2893,14 @@ int main() {
             const auto ingest_begin = std::chrono::steady_clock::now();
             ingest_targetrequest_prefix(*ctx);
             const auto ingest_end = std::chrono::steady_clock::now();
+            if(!decode_projection_profile_path.empty())
+                ctx->prepare_target_projection_timing();
+            cuda_check(cudaMemGetInfo(&free_after_prefill,&device_total),
+                       "targetrequest memory after completed prefill");
+            std::cout << "TARGETREQUEST_MEMORY device_total_bytes=" << device_total
+                      << " free_before_context_bytes=" << free_before_context
+                      << " free_after_context_bytes=" << free_after_context
+                      << " free_after_prefill_bytes=" << free_after_prefill << '\n';
             const auto fast_native_mia_target_prefill_fp16_calls =
                 Exl3CudaLinearWorkspace::process_fast_native_mia_target_prefill_fp16_calls_for_test() -
                 fast_native_mia_target_prefill_fp16_before;
@@ -2704,11 +3055,47 @@ int main() {
                 ctx->exact_attention_gqa_six_decode_fused_calls();
             const auto decode_begin = std::chrono::steady_clock::now();
             for (int i = 1; i < outputs; ++i) {
+                if(i==1 && !decode_projection_profile_path.empty())
+                    ctx->begin_target_projection_timing_round(1);
                 if (graph_targetrequest) ctx->decode_graph(tokens.back(), graph_stream);
                 else ctx->decode(tokens.back());
                 tokens.push_back(sample_target(*ctx, graph_stream));
+                if(i==1 && !decode_projection_profile_path.empty()) {
+                    cuda_check(cudaDeviceSynchronize(),
+                        "targetrequest decode projection profile completion");
+                    const auto records=
+                        ctx->finish_target_projection_timing_round_after_synchronize();
+                    require(records.size()==Exl3TargetProjectionTiming::kGroupsPerPass,
+                        "targetrequest decode projection inventory");
+                    std::ofstream projections(decode_projection_profile_path);
+                    require(projections.good(),
+                        "targetrequest decode projection output open");
+                    projections.imbue(std::locale::classic());
+                    projections<<"layer,operator,rows,K,in_features,out_features,topology,calls,microseconds\n";
+                    for(const auto& record:records)
+                        projections<<record.layer<<','<<
+                            target_projection_operator_name(record.operation)<<','<<
+                            record.rows<<','<<record.K<<','<<
+                            record.in_features<<','<<record.out_features<<','<<
+                            target_projection_topology_name(record.topology)<<','<<
+                            record.calls<<','<<std::fixed<<std::setprecision(3)<<
+                            record.microseconds<<'\n';
+                    projections.flush();
+                    require(projections.good(),
+                        "targetrequest decode projection output write");
+                    std::cout<<"TARGETREQUEST_DECODE_PROJECTION_PROFILE PASS rows="<<
+                        records.size()<<'\n';
+                }
             }
             const auto last_output = std::chrono::steady_clock::now();
+            if(env("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR")=="1") {
+                const auto submissions=
+                    ctx->fast_same_weights_fp16kv_gdn_m1_gate_up_pair_submissions();
+                std::cout<<"TARGETREQUEST_GDN_M1_GATE_UP_PAIR submissions="<<
+                    submissions<<" submissions_include_capture=1 graph_replays_not_counted=1\n";
+                require(submissions>0,
+                    "targetrequest GDN M1 gate/up pair flag did not dispatch");
+            }
             const auto target_m1_k6_n16_calls=
                 Exl3CudaLinearWorkspace::process_target_m1_k6_n16_calls_for_test()-
                 target_m1_k6_n16_before;
@@ -2900,7 +3287,7 @@ int main() {
             const auto numeric_prefill_stats =
                 ctx->numeric_prefill_projection_stats();
             std::ofstream summary(summary_path); summary.imbue(std::locale::classic());
-             summary << "mode,execution,kv_mode,ingested,emitted,target_decodes,position,pending_token,state_payload_hash,target_m1_k6_n16_calls,target_m1_k7_three_word_calls,target_k5_small_m_batch_calls,native_k6_critical_path_calls,native_k6_register_pipeline_calls,fast_same_weights_fp16_accum_calls,fast_same_weights_fp16_m1_calls,fast_same_weights_fp16_m1_wide_n32_calls,fast_same_weights_fp16_m1_n16_calls,fast_native_persistent_m1_calls,fast_native_mia_target_prefill_fp16_calls,prefill_shared_score_launches,prefill_shared_score_rows,prefill_shared_score_bytes,prefill_shared_score_threads256_calls,prefill_shared_score_parallel_softmax_calls,prefill_shared_score_head_split256_calls,prefill_shared_score_dimension_split256_calls,fast_same_weights_fp16kv_m1_gate_up_pair_calls,fast_same_weights_fp16kv_m1_kv_pair_calls,fast_same_weights_fp16_m1_n64_calls,fast_same_weights_fp16_m1_n64_k5_calls,fast_same_weights_int8_gemv_calls,fast_same_weights_int8_gemv_k7_calls,fast_same_weights_int8_gemv_down_k6_calls,fast_same_weights_int8_gemv_down_k7_calls,fast_fused_flash_attention_calls,fast_whole_context_fused_attention_calls,fast_prefill_tiled_attention_calls,fast_prefill_tiled_attention_prefill_calls,fast_prefill_rows4_attention_calls,fast_prefill_rows4_attention_prefill_calls,fast_prefill_rows8_attention_calls,fast_prefill_rows8_attention_prefill_calls,fast_prefill_wmma_attention_calls,fast_prefill_wmma_attention_prefill_calls,fast_prefill_wmma32_attention_calls,fast_prefill_wmma32_attention_prefill_calls,fast_prefill_rows2_attention_calls,fast_prefill_rows2_attention_prefill_calls,fast_online_decode_attention_calls,fast_cublas_attention_calls,fast_same_weights_fp16kv_gdn_decode_conv_calls,fast_wide_prefill_gemm_calls,fast_wide_prefill_gemm_rows,exact_attention_scalar_calls,exact_attention_scalar_rows,exact_attention_gqa_six_decode_fused_calls,numeric_prefill_workspace_bytes,numeric_prefill_calls,numeric_prefill_k6_calls,numeric_prefill_k7_calls,numeric_prefill_rows,numeric_prefill_fused_original_calls,numeric_prefill_fused_original_rows,numeric_prefill_fp16_compute_calls,numeric_prefill_fp16_compute_rows,numeric_prefill_packed_direct_k6_calls,numeric_prefill_packed_direct_k6_rows,numeric_prefill_mia_prefill_fp16_calls,numeric_prefill_mia_prefill_fp16_rows,executable_main_first_token_available_ms,executable_main_last_token_available_ms,resident_first_token_available_ms,resident_last_token_available_ms,context_create_ms,oscar_attach_ms,ingestion_wall_ms,seed_wall_ms,graph_capture_ms,subsequent_decode_wall_ms,decode_execution_wall_ms,lifecycle_pass,host_kv_gdn_segment_graph_captures,host_kv_gdn_segment_graph_replays,host_kv_gdn_segment_graph_capture_ms,host_kv_full_layer_graph_captures,host_kv_full_layer_graph_replays,host_kv_full_layer_graph_capture_ms,host_kv_full_layer_graph_six_softmax_triple_captures,host_kv_full_layer_graph_k6_stream_reduction_captures,host_kv_full_layer_graph_extended_stream_reduction_captures,host_kv_full_layer_graph_target_down_k6_async_a_captures,host_kv_full_layer_graph_target_k6_small_m_async_a_captures,ordinary_full_layer_graph_captures,ordinary_full_layer_graph_replays,ordinary_full_layer_graph_capture_ms,host_kv_mlp_tail_graph_captures,host_kv_mlp_tail_graph_replays,host_kv_mlp_tail_graph_capture_ms,token_ids\n";
+             summary << "mode,execution,kv_mode,ingested,emitted,target_decodes,position,pending_token,state_payload_hash,target_m1_k6_n16_calls,target_m1_k7_three_word_calls,target_k5_small_m_batch_calls,native_k6_critical_path_calls,native_k6_register_pipeline_calls,fast_same_weights_fp16_accum_calls,fast_same_weights_fp16_m1_calls,fast_same_weights_fp16_m1_wide_n32_calls,fast_same_weights_fp16_m1_n16_calls,fast_native_persistent_m1_calls,fast_native_mia_target_prefill_fp16_calls,prefill_shared_score_launches,prefill_shared_score_rows,prefill_shared_score_bytes,prefill_shared_score_threads256_calls,prefill_shared_score_parallel_softmax_calls,prefill_shared_score_head_split256_calls,prefill_shared_score_dimension_split256_calls,fast_same_weights_fp16kv_m1_gate_up_pair_calls,fast_same_weights_fp16kv_m1_kv_pair_calls,fast_same_weights_fp16_m1_n64_calls,fast_same_weights_fp16_m1_n64_k5_calls,fast_same_weights_int8_gemv_calls,fast_same_weights_int8_gemv_k7_calls,fast_same_weights_int8_gemv_down_k6_calls,fast_same_weights_int8_gemv_down_k7_calls,fast_fused_flash_attention_calls,fast_whole_context_fused_attention_calls,fast_prefill_tiled_attention_calls,fast_prefill_tiled_attention_prefill_calls,fast_prefill_rows4_attention_calls,fast_prefill_rows4_attention_prefill_calls,fast_prefill_rows8_attention_calls,fast_prefill_rows8_attention_prefill_calls,fast_prefill_wmma_attention_calls,fast_prefill_wmma_attention_prefill_calls,fast_prefill_wmma32_attention_calls,fast_prefill_wmma32_attention_prefill_calls,fast_prefill_rows2_attention_calls,fast_prefill_rows2_attention_prefill_calls,fast_online_decode_attention_calls,fast_cublas_attention_calls,fast_same_weights_fp16kv_gdn_decode_conv_calls,fast_wide_prefill_gemm_calls,fast_wide_prefill_gemm_rows,exact_attention_scalar_calls,exact_attention_scalar_rows,exact_attention_gqa_six_decode_fused_calls,numeric_prefill_workspace_bytes,numeric_prefill_calls,numeric_prefill_k6_calls,numeric_prefill_k7_calls,numeric_prefill_rows,numeric_prefill_fused_original_calls,numeric_prefill_fused_original_rows,numeric_prefill_fp16_compute_calls,numeric_prefill_fp16_compute_rows,numeric_prefill_packed_direct_k6_calls,numeric_prefill_packed_direct_k6_rows,numeric_prefill_mia_prefill_fp16_calls,numeric_prefill_mia_prefill_fp16_rows,executable_main_first_token_available_ms,executable_main_last_token_available_ms,resident_first_token_available_ms,resident_last_token_available_ms,context_create_ms,oscar_attach_ms,ingestion_wall_ms,seed_wall_ms,graph_capture_ms,subsequent_decode_wall_ms,decode_execution_wall_ms,lifecycle_pass,host_kv_gdn_segment_graph_captures,host_kv_gdn_segment_graph_replays,host_kv_gdn_segment_graph_capture_ms,host_kv_full_layer_graph_captures,host_kv_full_layer_graph_replays,host_kv_full_layer_graph_capture_ms,host_kv_full_layer_graph_six_softmax_triple_captures,host_kv_full_layer_graph_k6_stream_reduction_captures,host_kv_full_layer_graph_extended_stream_reduction_captures,host_kv_full_layer_graph_target_down_k6_async_a_captures,host_kv_full_layer_graph_target_k6_small_m_async_a_captures,host_kv_full_layer_graph_target_k7_small_m_async_a_captures,ordinary_full_layer_graph_captures,ordinary_full_layer_graph_replays,ordinary_full_layer_graph_capture_ms,host_kv_mlp_tail_graph_captures,host_kv_mlp_tail_graph_replays,host_kv_mlp_tail_graph_capture_ms,token_ids\n";
             summary << std::fixed << std::setprecision(9) << "targetrequest,"
                     << (graph_targetrequest ? "graph" : "eager") << ','
                     << (targetrequest_ordinary_fp16 ? "ordinary_fp16_device" :
@@ -2996,6 +3383,26 @@ int main() {
                     << host_kv_mlp_tail_graph_stats.capture_ms << ','
                     << ids.str() << '\n';
             summary.flush(); require(summary.good(), "targetrequest summary output failed");
+            std::cout << "TARGETREQUEST_RECON reconstructed_weight_calls="
+                      << numeric_prefill_stats.reconstructed_weight_calls
+                      << " reconstructed_weight_bytes="
+                      << numeric_prefill_stats.reconstructed_weight_bytes
+                      << " reused_weight_calls="
+                      << numeric_prefill_stats.reused_weight_calls
+                      << " reused_weight_bytes="
+                      << numeric_prefill_stats.reused_weight_bytes
+                      << " large_lt_calls="
+                      << numeric_prefill_stats.large_lt_calls
+                      << " cached_weight_capacity_bytes="
+                      << numeric_prefill_stats.cached_weight_capacity_bytes << '\n';
+            std::cout << "TARGETREQUEST_GDN_PACKED_K5 enabled="
+                      << (env("NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5")=="1")
+                      << " gate_up_calls="
+                      << numeric_prefill_stats.packed_direct_k5_gate_up_calls
+                      << " down_calls="
+                      << numeric_prefill_stats.packed_direct_k5_down_calls
+                      << " rows="
+                      << numeric_prefill_stats.packed_direct_k5_rows << '\n';
             std::cout << "TARGETREQUEST PASS ingested=" << count << " emitted=" << outputs
                       << " target_decodes=" << outputs-1 << " pending=" << tokens.back()
                       << " target_down_k6_async_a_calls="
@@ -3062,6 +3469,56 @@ int main() {
                       << " ordinary_full_layer_graph_replays="
                       << ordinary_full_layer_graph_stats.replays
                       << "\nTARGET_REQUEST_DONE\n";
+            const bool coherent_o_k7=env("NINFER_EXL3_COHERENT_O_K7")=="1";
+            const auto coherent_o_calls=Exl3CudaLinearWorkspace::
+                process_coherent_o_k7_calls_for_test();
+            const auto coherent_o_rows=Exl3CudaLinearWorkspace::
+                process_coherent_o_k7_rows_for_test();
+            std::cout<<"TARGETREQUEST_COHERENT_O_K7 enabled="<<coherent_o_k7
+                     <<" calls="<<coherent_o_calls
+                     <<" rows="<<coherent_o_rows<<'\n';
+            require(!coherent_o_k7 ||
+                (coherent_o_calls>0 && coherent_o_rows>=static_cast<std::uint64_t>(outputs-1)),
+                "coherent K7 O did not dispatch during target-only decode");
+            const bool coherent_down_k7=env("NINFER_EXL3_COHERENT_DOWN_K7")=="1";
+            const auto coherent_down_k7_calls=Exl3CudaLinearWorkspace::
+                process_coherent_down_k7_calls_for_test();
+            const auto coherent_down_k7_rows=Exl3CudaLinearWorkspace::
+                process_coherent_down_k7_rows_for_test();
+            std::cout<<"TARGETREQUEST_COHERENT_DOWN_K7 enabled="<<coherent_down_k7
+                     <<" calls="<<coherent_down_k7_calls
+                     <<" rows="<<coherent_down_k7_rows<<'\n';
+            require(coherent_down_k7 ? coherent_down_k7_calls>0 &&
+                    coherent_down_k7_rows>=static_cast<std::uint64_t>(outputs-1)
+                    : coherent_down_k7_calls==0 && coherent_down_k7_rows==0,
+                "coherent K7 down target-only dispatch mismatch");
+            const bool coherent_wide_k6=
+                env("NINFER_EXL3_TARGET_COHERENT_WIDE_K6")=="1";
+            const bool coherent_wide_split10=
+                env("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10")=="1";
+            constexpr const char* coherent_wide_names[5]={
+                "q","qkv","z","o","gate_up"};
+            for(int operation=0;operation<5;++operation) {
+                const auto calls=Exl3CudaLinearWorkspace::
+                    coherent_wide_k6_calls_for_test(operation);
+                const auto rows=Exl3CudaLinearWorkspace::
+                    coherent_wide_k6_rows_for_test(operation);
+                const auto split10_calls=Exl3CudaLinearWorkspace::
+                    coherent_wide_k6_split10_calls_for_test(operation);
+                std::cout<<"TARGETREQUEST_COHERENT_WIDE_K6 op="
+                         <<coherent_wide_names[operation]
+                         <<" enabled="<<coherent_wide_k6
+                         <<" calls="<<calls<<" rows="<<rows
+                         <<" split10_calls="<<split10_calls<<'\n';
+                require(coherent_wide_k6 ?
+                        calls>0 && rows>=calls :
+                        calls==0 && rows==0,
+                    "coherent wide K6 target-only dispatch mismatch");
+                require(coherent_wide_split10 ?
+                        split10_calls>0 && split10_calls==calls :
+                        split10_calls==0,
+                    "coherent wide K6 split10 target-only dispatch mismatch");
+            }
             return 0;
         }
         if (mode == "contextisolation") {
@@ -4199,6 +4656,16 @@ int main() {
                 *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
+        if (mode == "k5prefilloperator") {
+            run_k5_prefill_operator(
+                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            return 0;
+        }
+        if (mode == "k5directbulkoperator") {
+            run_k5_direct_bulk_operator(
+                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            return 0;
+        }
         if (mode == "projectionreconstructroute") {
             run_projection_reconstruct_route_t69b(
                 *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
@@ -4219,6 +4686,26 @@ int main() {
         }
         if (mode == "targettxn") {
             run_target_transaction(*target);
+            return 0;
+        }
+        if (mode == "fastdevicetxn") {
+            if(env("NINFER_EXL3_TEST_FAST_DEVICE_REAL_DFLASH")=="1") {
+                require(!draft_path.empty(),
+                    "real device DFlash probe requires pinned draft model");
+                auto real_draft=Exl3Dflash2DraftModel::load(draft_path);
+                const auto prompt_ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+                if(env("NINFER_EXL3_TEST_FAST_DEVICE_WORKER_THREAD")=="1") {
+                    std::exception_ptr failure;
+                    std::thread worker([&] {
+                        try {
+                            run_fast_device_real_dflash(*target,*real_draft,prompt_ids);
+                        } catch(...) {failure=std::current_exception();}
+                    });
+                    worker.join();
+                    if(failure)std::rethrow_exception(failure);
+                } else run_fast_device_real_dflash(*target,*real_draft,prompt_ids);
+            } else run_fast_device_transaction(*target,
+                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "targetcontinue") {

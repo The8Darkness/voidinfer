@@ -1,4 +1,5 @@
 #include "exl3/exl3_engine_core.h"
+#include "exl3/environment_options.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/reconstruction_control_allocator.h"
 #include "exl3/output_delivery.h"
@@ -13,6 +14,7 @@
 #include "exl3/reconstruction_config.h"
 #include "exl3/exl3_frontend_resources.h"
 #include "exl3/dflash2_execution.h"
+#include "exl3/fast_device_round.h"
 #include "exl3/engine_scratch_requirements.h"
 #include "exl3/resource_availability.h"
 #include "exl3/engine_target_q.h"
@@ -41,6 +43,7 @@
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <charconv>
+#include <cstdio>
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -177,6 +180,31 @@ void require_exact_profile(){
             Exl3NumericalRouteClass::exact,"host-kv-fp16","fp16",true,false},
             "host-kv-fp16","fp16");
 }
+void require_coherent_device_profile(const EngineOptions& options) {
+    if(options.max_concurrency!=1 || options.enable_vision || options.use_cuda_graph ||
+       options.max_context<2048 || options.max_context>32768)
+        throw std::invalid_argument(
+            "coherent-device EXL3 requires C1 greedy text and context 2048..32768");
+    const auto equals=[](const char* name,std::string_view expected) {
+        const auto* actual=std::getenv(name);
+        if(!actual || std::string_view(actual)!=expected)
+            throw std::invalid_argument(std::string("coherent-device EXL3 requires ")+
+                name+"="+std::string(expected));
+    };
+    equals("NINFER_EXL3_EXACT_HOST_KV","0");
+    equals("NINFER_OSCAR_EXL3","0");
+    equals("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION","1");
+    equals("NINFER_EXL3_DEVICE_GREEDY","1");
+    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL","1");
+    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED","1");
+    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32","1");
+    equals("NINFER_EXL3_FAST_LAYER_MAJOR_PREFILL","1");
+    equals("NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT","0");
+    equals("NINFER_DFLASH2_PREFILL_WINDOW","1");
+    equals("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
+    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW","1");
+    equals("NINFER_EXL3_COHERENT_DOWN_K6","1");
+}
 Exl3PublicMediaModality public_media_modality(
     const targets::qwen3_6::PreparedPromptData& prepared) noexcept {
     bool image=false,video=false;
@@ -278,6 +306,7 @@ struct Exl3EngineCore::Request::Storage {
 };
 struct Exl3EngineCore::Impl {
     std::shared_ptr<Request::CancellationOwner> cancellation_owner;
+    bool coherent_device=false;
     EngineOptions options;
     bool public_media_enabled=false;
     std::optional<Exl3VerifierHorizonPolicy::CostMenu> verifier_cost_menu;
@@ -396,9 +425,11 @@ struct Exl3EngineCore::Impl {
     std::atomic<unsigned> attachment_restore_cancel_layer{0},attachment_restore_cancel_hit{0};
 
     explicit Impl(const EngineOptions& value,unsigned shared_allocation_fault,unsigned draft_clone_fault,unsigned first_draft_fault,unsigned context_startup_fault,
-        Exl3DeviceAvailability::Provider supplied_availability):options(value),
+        Exl3DeviceAvailability::Provider supplied_availability):
+        coherent_device(value.exl3_package->round_implementation==
+            Exl3RoundImplementation::CoherentDevice),options(value),
         public_media_enabled(
-            Exl3PublicMediaQualification::evaluate_current(
+            !coherent_device && Exl3PublicMediaQualification::evaluate_current(
                 Exl3PublicMediaModality::image).media_allowed() &&
             Exl3PublicMediaQualification::evaluate_current(
                 Exl3PublicMediaModality::video).media_allowed()),
@@ -406,11 +437,13 @@ struct Exl3EngineCore::Impl {
         frontend(targets::qwen3_6::make_frontend(resources,targets::qwen3_6::FrontendOptions{
             .vision_enabled=public_media_enabled,.max_context=value.max_context,
             .max_cache_markers_per_request=value.context_cache.max_cache_markers_per_request.value_or(4)})),
-        identity{"exl3-engine-epoch-1","SC_6.00bpw_H6_V6","0997f410-c3cf9e34","ordinary-FP16-B8-greedy",
+        identity{"exl3-engine-epoch-1","SC_6.00bpw_H6_V6","0997f410-c3cf9e34",
+            coherent_device?"coherent-device-P1-K6-B8-greedy":"ordinary-FP16-B8-greedy",
             public_media_enabled?"text+qualified-v6-media":"text"},
         cache(Exl3VeriCacheServingPrefixCache::Policy{std::max(1U,value.context_cache.max_shared_prefixes.value_or(1)),64,std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30},identity),
         coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
-        require_exact_profile();
+        if(coherent_device)require_coherent_device_profile(value);
+        else require_exact_profile();
         const auto flag=[](const char* name) {
             const auto* value=std::getenv(name);
             if(value && std::string_view(value)!="0" && std::string_view(value)!="1")
@@ -428,10 +461,8 @@ struct Exl3EngineCore::Impl {
         Exl3NativeContextExtent::require_native64k_engine(value.max_context,
             native64k,candidate128k,exact_host,oscar_only,
             value.max_concurrency,value.context_cache.host_kv_capacity_bytes);
-        const auto* conditional_option=std::getenv("NINFER_EXL3_ENGINE_CONDITIONAL_B8");
-        if(conditional_option && std::string_view(conditional_option)!="0" && std::string_view(conditional_option)!="1")
-            throw std::invalid_argument("NINFER_EXL3_ENGINE_CONDITIONAL_B8 must be 0 or 1");
-        conditional_b8=conditional_option && std::string_view(conditional_option)=="1";
+        conditional_b8 = read_binary_option("NINFER_EXL3_ENGINE_CONDITIONAL_B8",
+            "NINFER_EXL3_ENGINE_CONDITIONAL_B8 must be 0 or 1");
         const bool device_taps_only=flag("NINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
         if(device_taps_only &&
            (!flag("NINFER_EXL3_COMMITTED_TAP_D2D") ||
@@ -446,42 +477,26 @@ struct Exl3EngineCore::Impl {
                 "device-only committed taps are incompatible with staged B8");
         const bool reconstruction_fallback=exl3_reconstruction_budget_fallback(
             std::getenv("NINFER_EXL3_RECONSTRUCTION_BUDGET_FALLBACK"));
-        const auto* preparation_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_PREPARATION");
-        if(preparation_option && std::string_view(preparation_option)!="0" &&
-            std::string_view(preparation_option)!="1")
-            throw std::invalid_argument("NINFER_EXL3_ENGINE_SHARED_PREPARATION must be 0 or 1");
-        concurrent_prefix_preparation=preparation_option && std::string_view(preparation_option)=="1";
-        const auto* declared_option=std::getenv("NINFER_EXL3_ENGINE_DECLARED_PREFIX");
-        if(declared_option && std::string_view(declared_option)!="0" && std::string_view(declared_option)!="1")
-            throw std::invalid_argument("NINFER_EXL3_ENGINE_DECLARED_PREFIX must be 0 or 1");
-        declared_prefix_preparation=declared_option && std::string_view(declared_option)=="1";
-        const auto* affinity_option=std::getenv("NINFER_EXL3_REQUEST_AFFINITY");
-        if(affinity_option && std::string_view(affinity_option)!="0" &&
-            std::string_view(affinity_option)!="1")
-            throw std::invalid_argument("NINFER_EXL3_REQUEST_AFFINITY must be 0 or 1");
-        request_affinity=affinity_option && std::string_view(affinity_option)=="1";
+        concurrent_prefix_preparation = read_binary_option("NINFER_EXL3_ENGINE_SHARED_PREPARATION",
+            "NINFER_EXL3_ENGINE_SHARED_PREPARATION must be 0 or 1");
+        declared_prefix_preparation = read_binary_option("NINFER_EXL3_ENGINE_DECLARED_PREFIX",
+            "NINFER_EXL3_ENGINE_DECLARED_PREFIX must be 0 or 1");
+        request_affinity = read_binary_option("NINFER_EXL3_REQUEST_AFFINITY",
+            "NINFER_EXL3_REQUEST_AFFINITY must be 0 or 1");
         const auto* preserve_option=std::getenv("NINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
         if(request_affinity && (!preserve_option || std::string_view(preserve_option)!="1"))
             throw std::invalid_argument("request affinity requires acquired-root preservation");
-        const auto* shared_prefix_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_DEVICE_PREFIX");
-        if(shared_prefix_option && std::string_view(shared_prefix_option)!="0" && std::string_view(shared_prefix_option)!="1")
-            throw std::invalid_argument("Engine shared device prefix must be0 or1");
-        const bool share_prefix=shared_prefix_option && std::string_view(shared_prefix_option)=="1" && value.max_concurrency==2;
+        const bool share_prefix = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PREFIX",
+            "Engine shared device prefix must be0 or1") && value.max_concurrency==2;
         if(share_prefix) {
             const auto* cache=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
             if(!cache || std::string_view(cache)!="1")
                 throw std::invalid_argument("Engine shared prefix requires represented device prefix option");
         }
-        const auto* shared_q_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_TARGET_Q");
-        if(shared_q_option && std::string_view(shared_q_option)!="0" && std::string_view(shared_q_option)!="1")
-            throw std::invalid_argument("Engine shared target Q must be0 or1");
-        const bool share_q=shared_q_option && std::string_view(shared_q_option)=="1" && value.max_concurrency==2;
-        const auto* greedy_batch_option=std::getenv("NINFER_EXL3_ENGINE_BATCHED_GREEDY_PACKET");
-        if(greedy_batch_option && std::string_view(greedy_batch_option)!="0" &&
-           std::string_view(greedy_batch_option)!="1")
-            throw std::invalid_argument("Engine batched greedy packet must be0 or1");
-        const bool batch_greedy=greedy_batch_option &&
-            std::string_view(greedy_batch_option)=="1";
+        const bool share_q = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_Q",
+            "Engine shared target Q must be0 or1") && value.max_concurrency==2;
+        const bool batch_greedy = read_binary_option("NINFER_EXL3_ENGINE_BATCHED_GREEDY_PACKET",
+            "Engine batched greedy packet must be0 or1");
         const bool device_greedy=exl3_device_greedy_enabled();
         if(batch_greedy && value.max_concurrency!=2)
             throw std::invalid_argument("Engine batched greedy packet requires physical C2");
@@ -489,18 +504,12 @@ struct Exl3EngineCore::Impl {
             if(!device_greedy)
                 throw std::invalid_argument("Engine batched greedy packet requires device greedy");
         }
-        const auto* shared_kv_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_TARGET_KV");
-        if(shared_kv_option && std::string_view(shared_kv_option)!="0" && std::string_view(shared_kv_option)!="1")
-            throw std::invalid_argument("Engine shared target KV must be0 or1");
-        const bool share_kv=shared_kv_option && std::string_view(shared_kv_option)=="1" && value.max_concurrency==2;
-        const auto* shared_o_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_TARGET_O");
-        if(shared_o_option && std::string_view(shared_o_option)!="0" && std::string_view(shared_o_option)!="1")
-            throw std::invalid_argument("Engine shared target O must be0 or1");
-        const bool share_o=shared_o_option && std::string_view(shared_o_option)=="1" && value.max_concurrency==2;
-        const auto* shared_gateup_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_TARGET_GATEUP");
-        if(shared_gateup_option && std::string_view(shared_gateup_option)!="0" && std::string_view(shared_gateup_option)!="1")
-            throw std::invalid_argument("Engine shared gate/up must be0 or1");
-        const bool share_gateup=shared_gateup_option && std::string_view(shared_gateup_option)=="1" && value.max_concurrency==2;
+        const bool share_kv = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_KV",
+            "Engine shared target KV must be0 or1") && value.max_concurrency==2;
+        const bool share_o = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_O",
+            "Engine shared target O must be0 or1") && value.max_concurrency==2;
+        const bool share_gateup = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_GATEUP",
+            "Engine shared gate/up must be0 or1") && value.max_concurrency==2;
         if(share_gateup) {
             const auto* k5=std::getenv("NINFER_EXL3_TARGET_GATEUP_K5_SMALL_M");
             const auto* k6=std::getenv("NINFER_EXL3_TARGET_GATEUP_SMALL_M");
@@ -509,10 +518,8 @@ struct Exl3EngineCore::Impl {
                 (!k6 || std::string_view(k6)!="1") && (!k7 || std::string_view(k7)!="1")))
                 throw std::invalid_argument("Engine shared gate/up requires shared Q and explicit gate/up small-M route");
         }
-        const auto* shared_down_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_TARGET_DOWN");
-        if(shared_down_option && std::string_view(shared_down_option)!="0" && std::string_view(shared_down_option)!="1")
-            throw std::invalid_argument("Engine shared down must be0 or1");
-        const bool share_down=shared_down_option && std::string_view(shared_down_option)=="1" && value.max_concurrency==2;
+        const bool share_down = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_DOWN",
+            "Engine shared down must be0 or1") && value.max_concurrency==2;
         if(share_down) {
             const auto* k6=std::getenv("NINFER_EXL3_TARGET_DOWN_SMALL_M");
             const auto* k7=std::getenv("NINFER_EXL3_TARGET_DOWN_K7_SMALL_M");
@@ -521,27 +528,21 @@ struct Exl3EngineCore::Impl {
             // Family-specific 16-k6/16-k7 selections fall back for the other K.
             // The workspace retains the existing split and async-A policy.
         }
-        const auto* head_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_HEAD");
-        if(head_option && std::string_view(head_option)!="0" && std::string_view(head_option)!="1")
-            throw std::invalid_argument("Engine shared head must be0 or1");
-        const bool share_head=head_option && std::string_view(head_option)=="1" && value.max_concurrency==2;
+        const bool share_head = read_binary_option("NINFER_EXL3_ENGINE_SHARED_HEAD",
+            "Engine shared head must be0 or1") && value.max_concurrency==2;
         const auto* h6=std::getenv("NINFER_EXL3_H6_SMALL_M");
         if(share_head && (!share_q || (h6 && std::string_view(h6)=="0")))
             throw std::invalid_argument("Engine shared head requires shared Q and enabled H6 small-M");
-        const auto* gather_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_GATHER_REUSE");
-        if(gather_option && std::string_view(gather_option)!="0" && std::string_view(gather_option)!="1")
-            throw std::invalid_argument("Engine gather reuse must be0 or1");
-        const bool share_gather=gather_option && std::string_view(gather_option)=="1" && value.max_concurrency==2;
+        const bool share_gather = read_binary_option("NINFER_EXL3_ENGINE_SHARED_GATHER_REUSE",
+            "Engine gather reuse must be0 or1") && value.max_concurrency==2;
         if(share_o) {
             const auto* k6=std::getenv("NINFER_EXL3_TARGET_O_K6_SMALL_M");
             const auto* k7=std::getenv("NINFER_EXL3_TARGET_O_K7_SMALL_M");
             if(!share_q || ((!k6 || std::string_view(k6)!="1") && (!k7 || std::string_view(k7)!="1")))
                 throw std::invalid_argument("Engine shared O requires shared Q owner and explicit O small-M route");
         }
-        const auto* shared_draft_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_DRAFT_Q_M16");
-        if(shared_draft_option && std::string_view(shared_draft_option)!="0" && std::string_view(shared_draft_option)!="1")
-            throw std::invalid_argument("Engine shared draft Q M16 must be0 or1");
-        const bool share_draft=shared_draft_option && std::string_view(shared_draft_option)=="1" && value.max_concurrency==2;
+        const bool share_draft = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_Q_M16",
+            "Engine shared draft Q M16 must be0 or1") && value.max_concurrency==2;
         if(share_draft) {
             const auto* route=std::getenv("NINFER_EXL3_DRAFT_SMALL_M");
             if(route && std::string_view(route)!="1")
@@ -550,25 +551,17 @@ struct Exl3EngineCore::Impl {
         // Target and private-draft families share one bounded rendezvous owner,
         // but neither family is a prerequisite for executing the other.
         const bool share_projection_owner=share_q || share_draft;
-        const auto* draft_kv_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_DRAFT_KV_M16");
-        if(draft_kv_option && std::string_view(draft_kv_option)!="0" && std::string_view(draft_kv_option)!="1")
-            throw std::invalid_argument("Engine draft KV must be0 or1");
-        const bool share_draft_kv=draft_kv_option && std::string_view(draft_kv_option)=="1" && value.max_concurrency==2;
+        const bool share_draft_kv = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_KV_M16",
+            "Engine draft KV must be0 or1") && value.max_concurrency==2;
         if(share_draft_kv && !share_draft)throw std::invalid_argument("Engine draft KV requires shared draft Q M16");
-        const auto* draft_o_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_DRAFT_O_M16");
-        if(draft_o_option && std::string_view(draft_o_option)!="0" && std::string_view(draft_o_option)!="1")
-            throw std::invalid_argument("Engine draft O must be0 or1");
-        const bool share_draft_o=draft_o_option && std::string_view(draft_o_option)=="1" && value.max_concurrency==2;
+        const bool share_draft_o = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_O_M16",
+            "Engine draft O must be0 or1") && value.max_concurrency==2;
         if(share_draft_o && !share_draft)throw std::invalid_argument("Engine draft O requires shared draft Q M16");
-        const auto* draft_down_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_DRAFT_DOWN_M16");
-        if(draft_down_option && std::string_view(draft_down_option)!="0" && std::string_view(draft_down_option)!="1")
-            throw std::invalid_argument("Engine draft down must be0 or1");
-        const bool share_draft_down=draft_down_option && std::string_view(draft_down_option)=="1" && value.max_concurrency==2;
+        const bool share_draft_down = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_DOWN_M16",
+            "Engine draft down must be0 or1") && value.max_concurrency==2;
         if(share_draft_down && !share_draft)throw std::invalid_argument("Engine draft down requires shared draft Q M16");
-        const auto* draft_gateup_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_DRAFT_GATEUP_M16");
-        if(draft_gateup_option && std::string_view(draft_gateup_option)!="0" && std::string_view(draft_gateup_option)!="1")
-            throw std::invalid_argument("Engine shared draft gate/up M16 option requires 0 or 1");
-        const bool share_draft_gateup=draft_gateup_option && std::string_view(draft_gateup_option)=="1";
+        const bool share_draft_gateup = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_GATEUP_M16",
+            "Engine shared draft gate/up M16 option requires 0 or 1");
         if(share_draft_gateup && !share_draft)
             throw std::invalid_argument("Engine draft gate/up requires C2 shared draft Q M16");
         if(share_gather && !share_gateup && !share_draft_gateup)
@@ -591,11 +584,8 @@ struct Exl3EngineCore::Impl {
         if(shared_allocation_fault && (!share_projection_owner || shared_allocation_fault>4U+unsigned(share_kv)+unsigned(share_draft)+unsigned(share_o)+unsigned(share_gateup)+unsigned(share_down)+unsigned(share_head)+unsigned(share_draft_kv)+unsigned(share_draft_o)+unsigned(share_draft_down)+unsigned(share_draft_gateup)))
             throw std::invalid_argument("shared allocation fault outside selected startup menu");
         std::uint64_t device_reserve=0;
-        const auto* registered_upload_option=std::getenv("NINFER_EXL3_ENGINE_REGISTERED_KV_UPLOAD");
-        if(registered_upload_option && std::string_view(registered_upload_option)!="0" &&
-            std::string_view(registered_upload_option)!="1")
-            throw std::invalid_argument("Engine registered KV upload must be0 or1");
-        const bool registered_upload=registered_upload_option && std::string_view(registered_upload_option)=="1";
+        const bool registered_upload = read_binary_option("NINFER_EXL3_ENGINE_REGISTERED_KV_UPLOAD",
+            "Engine registered KV upload must be0 or1");
         const auto* registered_upload_slots_option=
             std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
         if(registered_upload_slots_option &&
@@ -606,18 +596,12 @@ struct Exl3EngineCore::Impl {
         const unsigned registered_upload_slots=
             registered_upload_slots_option &&
             std::string_view(registered_upload_slots_option)=="32"?32:2;
-        const auto* shared_pages_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_DEVICE_PAGES");
-        if(shared_pages_option && std::string_view(shared_pages_option)!="0" && std::string_view(shared_pages_option)!="1")
-            throw std::invalid_argument("Engine shared device pages must be0 or1");
-        const bool share_pages=shared_pages_option && std::string_view(shared_pages_option)=="1";
-        const auto* attention_option=std::getenv("NINFER_EXL3_ENGINE_SHARED_DEVICE_PAGE_ATTENTION");
-        if(attention_option && std::string_view(attention_option)!="0" && std::string_view(attention_option)!="1")
-            throw std::invalid_argument("shared page attention option must be 0 or 1");
-        const bool share_attention=attention_option && std::string_view(attention_option)=="1";
-        const auto* staging_option=std::getenv("NINFER_EXL3_ENGINE_ATTENTION_STAGING");
-        if(staging_option && std::string_view(staging_option)!="0" && std::string_view(staging_option)!="1")
-            throw std::invalid_argument("attention staging option must be 0 or 1");
-        const bool attention_staging=staging_option && std::string_view(staging_option)=="1";
+        const bool share_pages = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PAGES",
+            "Engine shared device pages must be0 or1");
+        const bool share_attention = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PAGE_ATTENTION",
+            "shared page attention option must be 0 or 1");
+        const bool attention_staging = read_binary_option("NINFER_EXL3_ENGINE_ATTENTION_STAGING",
+            "attention staging option must be 0 or 1");
         if(attention_staging && (share_pages || share_prefix))
             throw std::invalid_argument("attention staging and shared cache routes are exclusive");
         if(share_attention && !share_pages)throw std::invalid_argument("shared page attention requires shared device pages");
@@ -642,17 +626,31 @@ struct Exl3EngineCore::Impl {
         const auto selected=[](const char* name) {
             const auto* value=std::getenv(name);return value && std::string_view(value)=="1";
         };
-        require_candidate_option_compatibility({
-            value.max_concurrency,value.max_context,
-            parsed_prefix_rows,
-            exact_host,oscar_only,native64k,candidate128k,
-            selected("NINFER_EXL3_NATIVE_CONTINUATION16"),device_prefix,share_prefix,
-            registered_upload,share_pages,share_attention,attention_staging,
-            share_q,share_kv,share_o,share_gateup,share_down,share_head,share_gather,
-            selected("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION") ||
-                selected("NINFER_EXL3_EXTENDED_STREAM_REDUCTION"),
-            share_draft,share_draft_kv,share_draft_o,share_draft_down,
-            share_draft_gateup,device_greedy,batch_greedy});
+        if(coherent_device) {
+            if(native64k || candidate128k ||
+               selected("NINFER_EXL3_NATIVE_CONTINUATION16") || device_prefix ||
+               share_prefix || registered_upload || share_pages || share_attention ||
+               attention_staging || share_projection_owner || share_kv || share_o ||
+               share_gateup || share_down || share_head || share_gather ||
+               share_draft_kv || share_draft_o || share_draft_down ||
+               share_draft_gateup || batch_greedy || conditional_b8 ||
+               concurrent_prefix_preparation || declared_prefix_preparation ||
+               request_affinity)
+                throw std::invalid_argument(
+                    "coherent-device EXL3 cannot compose with host-KV Engine candidates");
+        } else {
+            require_candidate_option_compatibility({
+                value.max_concurrency,value.max_context,
+                parsed_prefix_rows,
+                exact_host,oscar_only,native64k,candidate128k,
+                selected("NINFER_EXL3_NATIVE_CONTINUATION16"),device_prefix,share_prefix,
+                registered_upload,share_pages,share_attention,attention_staging,
+                share_q,share_kv,share_o,share_gateup,share_down,share_head,share_gather,
+                selected("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION") ||
+                    selected("NINFER_EXL3_EXTENDED_STREAM_REDUCTION"),
+                share_draft,share_draft_kv,share_draft_o,share_draft_down,
+                share_draft_gateup,device_greedy,batch_greedy});
+        }
         const auto host_metadata_limit=exl3_host_metadata_limit(std::getenv("NINFER_EXL3_ENGINE_HOST_METADATA_LIMIT_BYTES"));
         if(!share_pages && prefix_rows&&std::string(prefix_rows)=="16384"&&value.max_concurrency!=1)
             throw std::invalid_argument("EXL3 Engine device prefix rows16384 require physicalC1");
@@ -764,7 +762,8 @@ struct Exl3EngineCore::Impl {
         load.target="qwen3.8-27b/exl3";load.model_id="SC_6.00bpw_H6_V6";load.weights_id="SC_6.00bpw_H6_V6";
         load.load_seconds=seconds(begin);const auto& transfer=target->load_stats();
         load.artifact_bytes_read=transfer.source_bytes[0]+transfer.source_bytes[1];load.peak_staging_bytes=transfer.staging_host_bytes;
-        memory.device=value.device;memory.max_context=value.max_context;memory.kv_cache=KvCacheStorage::Float16Host;
+        memory.device=value.device;memory.max_context=value.max_context;
+        memory.kv_cache=value.kv_cache;
         const auto shared_weight_bytes=target->model_bytes()+drafts[0]->weight_bytes()+
             (vision_model?vision_model->device_bytes():0);
         memory.weights={shared_weight_bytes,shared_weight_bytes,shared_weight_bytes};
@@ -997,10 +996,13 @@ struct Exl3EngineCore::Impl {
                 });
                 streams[i]=std::move(stream_owner);
                 stats.execution_stream_metadata_bytes+=bounded_shared_allocation_bytes<ExecutionStream>();
+                // The linked Engine image has scalar mismatches on ordinary
+                // full-layer and GDN-segment graph replay. Keep this coherent
+                // route on the scalar-checked eager layer path.
                 auto context=target->create_context_reserved(coordinator,true,
                     context_startup_fault>=90 && context_startup_fault<=100?context_startup_fault-73:
                     (context_startup_fault==88?16:(context_startup_fault==86?11:(fault<=4?fault:0))),
-                    public_media_enabled);
+                    public_media_enabled,!coherent_device);
                 const auto base_context_bytes=context->persistent_bytes();
                 context->prepare_continuation_reserved(coordinator,8,
                     context_startup_fault==89?6:(context_startup_fault==87?5:(fault>=5 && fault<=7?fault-4:0)));
@@ -1271,6 +1273,15 @@ struct Exl3EngineCore::Impl {
         stats.reserved_engine_tap_device_bytes=taps.units[static_cast<unsigned>(Domain::device)];
         stats.reserved_engine_tap_metadata_bytes=taps.units[static_cast<unsigned>(Domain::host_metadata)];
         scratch+=stats.reserved_engine_tap_device_bytes;
+        const bool skip_context_hooks=[] {
+            const auto* skip=std::getenv("NINFER_EXL3_TEST_ENGINE_SKIP_CONTEXT_HOOKS");
+            if(!skip || std::string_view(skip)!="1")return false;
+            const auto* root=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+            if(!root || std::string_view(root)!="1")
+                throw std::invalid_argument("skip context hooks requires diagnostic root probe");
+            return true;
+        }();
+        if(!skip_context_hooks) {
         for(std::uint32_t i=0;i<value.max_concurrency;++i)
             lanes[i]->context().set_snapshot_metadata_reservation([this,i](std::uint64_t bytes) {
                 const auto request=active[i];
@@ -1427,6 +1438,7 @@ struct Exl3EngineCore::Impl {
                     throw std::logic_error("recurrent borrower lifetime transfer refused");
                 return borrowed;
             });
+        }
         if(share_projection_owner) {
             const auto requirement=Exl3EngineTargetQ::requirement(share_kv,share_draft,share_o,share_gateup,share_down,share_head,share_draft_kv,share_draft_o,share_draft_down,share_draft_gateup);
             std::shared_ptr<Exl3EngineTargetQ> prepared_shared;
@@ -1850,7 +1862,341 @@ struct Exl3EngineCore::Impl {
             throw;
         }
     }
+    void execute_coherent_device(Request& request,std::size_t lane_index) {
+        auto& lane=lanes[lane_index];
+        auto& draft=*drafts[lane_index];
+        auto& result=request.result;
+        auto& output=request.output;
+        const auto& prepared=targets::qwen3_6::PreparedPromptAccess::view(request.prompt);
+        const auto ids=request.ready_work.input_tokens();
+        if(lane_index!=0 || prepared.has_media() || ids.size()<2048 ||
+           ids.size()>options.max_context || request.sampling ||
+           !request.options.stop.strings.empty() ||
+           request.options.execution.thinking.budget.has_value() ||
+           request.options.execution.sampling.temperature!=0 ||
+           request.options.execution.sampling.presence_penalty!=0 ||
+           request.options.execution.sampling.frequency_penalty!=0)
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires C1 greedy text with saturated draft ring");
+        if(request.cancelled) {result.finish_reason=FinishReason::Cancelled;return;}
+        if(Clock::now()>=request.deadline)
+            throw RequestError(RequestErrorKind::QueueTimeout,
+                "EXL3 request queue deadline expired");
+        auto context=lane->context_owner_for_device_round();
+        const auto stream=streams[lane_index]->value;
+        const auto prefill=Clock::now();
+        std::optional<Exl3VeriCacheServingCoordinator::Lease> host_lease;
+        std::optional<Exl3VeriCacheServingCoordinator::DeviceLogicalLease> device_lease;
+        std::unique_ptr<Exl3FastDeviceRound> round;
+        std::optional<std::uint64_t> pending_ticket;
+        std::vector<std::int64_t> committed;
+        auto root=Root{};
+        std::vector<std::int64_t> terminal_tokens;
+        if(request.options.stop.include_model_defaults)
+            for(const auto token:frontend.default_stop_policy().token_ids)
+                terminal_tokens.push_back(token);
+        for(const auto token:request.options.stop.token_ids)
+            terminal_tokens.push_back(token);
+        if(const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+           value && std::string_view(value)=="1") {
+            std::fprintf(stderr,"COHERENT_DEVICE_ENGINE_TERMINAL ids=");
+            for(const auto token:terminal_tokens)
+                std::fprintf(stderr,"%lld,",static_cast<long long>(token));
+            std::fprintf(stderr,"\n");
+        }
+        try {
+            (void)context->reset_for_request(identity.contract());
+            const auto epoch=context->request_generation();
+            {
+                Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
+                    1,epoch,false,stream);
+                fresh.begin_fresh(ids,true);
+            }
+            const bool root_diagnostic=[] {
+                const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+                return value && std::string_view(value)=="1";
+            }();
+            if(root_diagnostic) {
+                const auto diagnostic_root=context->export_exact_host_state(stream);
+                const auto first=exl3_branch_greedy(*context,stream);
+                context->decode(first,stream);
+                const auto second=exl3_branch_greedy(*context,stream);
+                const auto host_logits=context->logits_host(stream);
+                const auto host_second=static_cast<std::int64_t>(
+                    std::max_element(host_logits.begin(),host_logits.end())-
+                        host_logits.begin());
+                context->restore_exact_host_state(*diagnostic_root,stream);
+                const auto restored_first=exl3_branch_greedy(*context,stream);
+                context->decode(restored_first,stream);
+                const auto restored_second=exl3_branch_greedy(*context,stream);
+                context->restore_exact_host_state(*diagnostic_root,stream);
+                const auto restored_hash=context->export_exact_host_state(stream)->
+                    represented_payload_hash_for_test();
+                if(restored_hash!=diagnostic_root->represented_payload_hash_for_test())
+                    throw std::logic_error("coherent device diagnostic root restore");
+                std::fprintf(stderr,
+                    "COHERENT_DEVICE_ENGINE_ROOT prompt=%zu hash=%llu transaction_prepared=%d scalar_pair=%lld,%lld host_second=%lld restored_pair=%lld,%lld\n",
+                    ids.size(),static_cast<unsigned long long>(restored_hash),
+                    static_cast<int>(context->transaction_prepared()),
+                    static_cast<long long>(first),static_cast<long long>(second),
+                    static_cast<long long>(host_second),
+                    static_cast<long long>(restored_first),
+                    static_cast<long long>(restored_second));
+            }
+            {
+                std::lock_guard lock(mutex);
+                stats.computed_prefill_tokens+=ids.size();
+                stats.last_selected_frontier_tokens=0;
+                ++stats.root_selections;
+                ++stats.prefix_preparation_returns;
+            }
+            result.reused_prompt_tokens=0;
+            result.prefix_reuse_path=PrefixReusePath::Root;
+            result.timings.prefill_seconds=seconds(prefill);
+            if(request.cancelled) {
+                result.finish_reason=FinishReason::Cancelled;
+                output.preview_terminal(FinishReason::Cancelled);
+                publish_preview(request);
+                return;
+            }
+            if(ids.size()==options.max_context) {
+                result.finish_reason=FinishReason::ContextCapacity;
+                output.preview_terminal(result.finish_reason);
+                publish_preview(request);
+                return;
+            }
+            const auto allowance=std::min<std::uint32_t>(
+                request.options.execution.requested_output_tokens,
+                options.max_context-static_cast<std::uint32_t>(ids.size()));
+            const auto limit=allowance<request.options.execution.requested_output_tokens?
+                FinishReason::ContextCapacity:FinishReason::OutputLimit;
+            output.validate_generation_capacity(allowance);
+            committed.reserve(allowance);
+            root=Exl3VeriCacheRequest::initialize_device_root(*context,draft,ids,stream);
+            {
+                std::lock_guard admission(admission_mutex);
+                const auto ticket=coordinator.admit(root);
+                host_lease=coordinator.acquire();
+                if(!host_lease || host_lease->ticket.request_id!=ticket.request_id)
+                    throw std::logic_error("coherent-device physical/coordinator acquisition");
+            }
+            draft.bind_ring_scope(host_lease->acquisition,epoch);
+            round=std::make_unique<Exl3FastDeviceRound>(context,draft,
+                staging_owners[lane_index]->pointers,host_lease->acquisition,
+                epoch,false,stream);
+            round->begin_prefilled();
+            device_lease=coordinator.enter_device_logical(*host_lease,
+                std::static_pointer_cast<const void>(lane),context->position(),
+                allowance,options.max_context);
+            host_lease.reset();
+            if(acquired_root_observer)acquired_root_observer(root);
+            result.speculative.enabled=true;
+            result.speculative.backend=SpeculativeBackend::DFlash2;
+            result.speculative.draft_window=7;
+            const auto decode=Clock::now();
+            std::uint32_t remaining=allowance;
+            Exl3CompleteRouteCounters route;
+            while(remaining && !request.cancelled) {
+                if(!output.pending_control_tokens().empty())
+                    throw std::invalid_argument(
+                        "coherent-device EXL3 does not admit injected control tokens");
+                const auto budget=output.model_token_budget_remaining(remaining);
+                if(!budget)throw std::logic_error(
+                    "coherent-device output has no model budget or control path");
+                const auto width=static_cast<int>(std::min<std::uint32_t>(8,budget));
+                const auto boundary=request.publication_boundary.begin(
+                    device_lease->acquisition,epoch,
+                    Exl3ControlPublicationBoundary::Kind::model);
+                const auto prepared_round=round->prepare_device_pending(width,
+                    terminal_tokens);
+                pending_ticket=prepared_round.ticket;
+                const auto& candidate=prepared_round.candidate;
+                if(root_diagnostic && result.speculative.rounds==0) {
+                    std::fprintf(stderr,"COHERENT_DEVICE_ENGINE_FIRST accepted=%zu committed=",
+                        candidate.verification.accepted);
+                    for(const auto token:candidate.committed_tokens)
+                        std::fprintf(stderr,"%lld,",static_cast<long long>(token));
+                    std::fprintf(stderr," proposal=");
+                    for(int row=0;row<candidate.width;++row)
+                        std::fprintf(stderr,"%lld,",
+                            static_cast<long long>(candidate.proposal[row]));
+                    std::fprintf(stderr,"\n");
+                }
+                route.record_attempt(candidate.width,0,0);
+                route.record_target_work(candidate.verification.verification_rows,
+                    candidate.verification.replay_rows);
+                if(result.speculative.first_proposed_tokens.empty())
+                    for(int row=0;row<candidate.width;++row)
+                        result.speculative.first_proposed_tokens.push_back(
+                            static_cast<TokenId>(candidate.proposal[row]));
+                if(!request.publication_boundary.numerical_ready(boundary))
+                    throw std::logic_error("coherent-device numerical readiness ordering");
+                if(request.cancelled) {
+                    round->cancel_device_pending(*pending_ticket);
+                    pending_ticket.reset();
+                    if(!request.publication_boundary.abandon_private(boundary))
+                        throw std::logic_error("coherent-device cancellation ordering");
+                    break;
+                }
+                auto tokens=request.round_tokens.assign(candidate.committed_tokens);
+                const auto decision=output.preview_model(tokens.span(),remaining,limit);
+                if(!request.publication_boundary.prepare_output(boundary))
+                    throw std::logic_error("coherent-device output preview ordering");
+                request.require_output_storage();
+                if(!decision.accepted_tokens || request.cancelled) {
+                    round->cancel_device_pending(*pending_ticket);
+                    pending_ticket.reset();
+                    if(!request.publication_boundary.abandon_private(boundary))
+                        throw std::logic_error("coherent-device empty preview ordering");
+                    if(request.cancelled) {output.discard_preview();break;}
+                    publish_preview(request);
+                    ++result.speculative.rounds;
+                    if(decision.finished()) {
+                        result.finish_reason=decision.finish_reason;
+                        break;
+                    }
+                    continue;
+                }
+                if(decision.accepted_tokens!=tokens.size())
+                    tokens=request.round_tokens.truncate(decision.accepted_tokens);
+                const auto selected=request.round_tokens.repair().span();
+                if(selected.size()>remaining)
+                    throw std::logic_error("coherent-device selected output exceeds allowance");
+                request.require_result_slots(selected.size());
+                if(!request.publication_boundary.resume_numerical(boundary))
+                    throw std::logic_error("coherent-device settlement ordering");
+                Exl3FastDeviceRound::Step settled;
+                try {
+                    settled=round->settle_device_pending(*pending_ticket,
+                        selected.size(),[&](const Exl3FastDeviceRound::Step&) {
+                            if(request.cancelled)throw RequestError(
+                                RequestErrorKind::Cancelled,
+                                "coherent-device request cancelled before numerical commit");
+                        });
+                } catch(...) {
+                    pending_ticket.reset();
+                    throw;
+                }
+                pending_ticket.reset();
+                if(!request.publication_boundary.numerical_ready(boundary) ||
+                   !request.publication_boundary.prepare_output(boundary) ||
+                   !request.publication_boundary.begin_publication(boundary))
+                    throw std::logic_error("coherent-device resident publication ordering");
+                const auto publication=coordinator.publish_device_logical_window(
+                    *device_lease,selected);
+                device_lease=publication.lease;
+                if(!request.publication_boundary.resident_committed(boundary))
+                    throw std::logic_error("coherent-device logical commit ordering");
+                committed.insert(committed.end(),selected.begin(),selected.end());
+                result.generated_token_ids.insert(
+                    result.generated_token_ids.end(),tokens.begin(),tokens.end());
+                remaining-=static_cast<std::uint32_t>(selected.size());
+                const bool hidden_terminal=decision.finish_reason==FinishReason::StopToken &&
+                    !request.options.stop.publish_stop_token;
+                if(hidden_terminal)++result.token_accounting.hidden_terminal_tokens;
+                result.token_accounting.visible_model_tokens+=
+                    selected.size()-(hidden_terminal?1u:0u);
+                route.record_publication(selected.size(),
+                    selected.size()-(hidden_terminal?1u:0u),hidden_terminal?1u:0u);
+                if(result.timings.first_token_seconds==0)
+                    result.timings.first_token_seconds=
+                        seconds(request.submitted)+result.timings.prepare_seconds;
+                publish_preview(request,boundary);
+                ++result.speculative.rounds;
+                result.speculative.accepted_tokens+=settled.verification.accepted;
+                result.speculative.accepted_prefix_per_round.push_back(
+                    static_cast<std::uint8_t>(settled.verification.accepted));
+                if(decision.finished()) {
+                    result.finish_reason=decision.finish_reason;
+                    break;
+                }
+            }
+            if(request.cancelled && result.finish_reason==FinishReason::None) {
+                result.finish_reason=FinishReason::Cancelled;
+                output.preview_terminal(FinishReason::Cancelled);
+                publish_preview(request);
+            } else if(result.finish_reason==FinishReason::None) {
+                result.finish_reason=limit;
+                output.preview_terminal(limit);
+                publish_preview(request);
+            }
+            round->finish();
+            if(!result.token_accounting.conserves_result_tokens(
+                result.generated_token_ids.size()))
+                throw std::logic_error("coherent-device result token accounting");
+            result.timings.decode_seconds=seconds(decode);
+            result.reasoning_tokens=output.reasoning_tokens();
+            result.thinking=output.thinking_stats();
+            const auto totals=round->totals();
+            const auto route_snapshot=route.snapshot();
+            result.speculative.drafted_tokens=
+                route_snapshot.proposed_rows-result.speculative.rounds;
+            result.speculative.verifier_calls=totals.rounds;
+            result.speculative.proposed_rows=route_snapshot.proposed_rows;
+            result.speculative.verified_rows=route_snapshot.verified_rows;
+            result.speculative.replayed_rows=route_snapshot.replayed_rows;
+            result.speculative.committed_model_rows=route_snapshot.committed_model_rows;
+            result.speculative.externally_visible_model_rows=
+                route_snapshot.externally_visible_model_rows;
+            result.speculative.hidden_terminal_rows=route_snapshot.hidden_terminal_rows;
+            if(!committed.empty()) {
+                auto child=root->append_device_terminal(*context,draft,committed,stream);
+                host_lease=coordinator.materialize_device_logical(*device_lease,
+                    std::move(child));
+                device_lease.reset();
+                if(terminal_root_observer)terminal_root_observer(host_lease->root);
+                if(options.context_cache.enabled &&
+                   request.options.execution.allow_prefix_reuse &&
+                   !request.cancelled && prepared.identity.reusable &&
+                   output.completed_chat_turn() &&
+                   host_lease->root->state()->position()>=64) {
+                    const auto admitted=cache.admit_completed_authority(
+                        host_lease->root,available());
+                    if(admitted.admitted) {
+                        std::lock_guard lock(mutex);
+                        ++stats.completed_prefix_admissions;
+                    }
+                }
+                coordinator.complete(*host_lease);
+                host_lease.reset();
+            } else {
+                coordinator.cancel_device_logical(*device_lease,true);
+                device_lease.reset();
+            }
+            std::lock_guard lock(mutex);
+            stats.committed_decode_tokens+=result.generated_token_ids.size();
+            stats.visible_model_tokens+=result.token_accounting.visible_model_tokens;
+            stats.hidden_terminal_tokens+=result.token_accounting.hidden_terminal_tokens;
+            stats.decode_rounds+=result.speculative.rounds;
+        } catch(...) {
+            const bool uncertain_publication=
+                request.publication_boundary.snapshot().phase==
+                    Exl3ControlPublicationBoundary::Phase::publication_pending;
+            request.publication_boundary.fail_active();
+            bool numerical_safe=!round || !round->poisoned();
+            if(pending_ticket && round) {
+                try {round->cancel_device_pending(*pending_ticket);}
+                catch(...) {numerical_safe=false;}
+            }
+            if(numerical_safe) {
+                try {
+                    if(device_lease)coordinator.cancel_device_logical(*device_lease,true);
+                    else if(host_lease)coordinator.cancel(host_lease->ticket,true);
+                } catch(...) {numerical_safe=false;}
+            }
+            if(!numerical_safe || uncertain_publication) {
+                lane->poison_shared_completion();
+                std::lock_guard lock(mutex);
+                failed=true;
+            }
+            throw;
+        }
+    }
     void execute(Request& request,std::size_t lane_index){
+        if(coherent_device) {
+            execute_coherent_device(request,lane_index);
+            return;
+        }
         auto& lane=lanes[lane_index];auto& draft=drafts[lane_index];auto& staging=staging_owners[lane_index]->pointers;
         auto& result=request.result;
         if(request.cancelled){result.finish_reason=FinishReason::Cancelled;return;}

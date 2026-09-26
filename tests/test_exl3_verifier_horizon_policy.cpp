@@ -1,4 +1,5 @@
 #include "exl3/verifier_horizon_policy.h"
+#include "exl3/device_horizon_cost_policy.h"
 #include <iostream>
 #include <limits>
 using Policy=ninfer::exl3::Exl3VerifierHorizonPolicy;
@@ -166,5 +167,27 @@ int main(){try{
     bool refused=false;try{p.observe({8,9,0,1,false,false});}catch(const std::invalid_argument&){refused=true;}
     require(refused && p.counters().published_rounds==1,"invalid observation changed policy");
     p.reset();require(p.counters().published_rounds==0 && p.horizon(8)==8,"request reset leaked policy");
+    {
+        ninfer::exl3::Exl3DeviceHorizonCostPolicy cost;
+        require(cost.select(8)==8 && cost.select(3)==3,
+            "device policy initial B8/tail admission");
+        for(int i=0;i<4;++i)cost.observe(8,3,200.0);
+        require(cost.select(8)==4,"device policy did not calibrate B4");
+        for(int i=0;i<4;++i)cost.observe(4,3,160.0);
+        require(cost.select(8)==4 && cost.snapshot(4).useful_per_ms>
+            cost.snapshot(8).useful_per_ms,
+            "device policy ignored measured complete-round useful rate");
+        for(int i=0;i<4;++i)cost.observe(4,3,160.0);
+        require(cost.select(8)==8,"device policy did not probe opposing arm");
+        cost.observe(8,8,100.0);
+        require(cost.select(8)==8,"device policy ignored changed B8 evidence");
+        bool invalid=false;
+        try{cost.observe(8,9,1.0);}catch(const std::invalid_argument&){invalid=true;}
+        require(invalid && cost.observed()==13,
+            "invalid device cost observation mutated request history");
+        ninfer::exl3::Exl3DeviceHorizonCostPolicy fresh;
+        require(fresh.select(8)==8 && fresh.observed()==0,
+            "device horizon history crossed requests");
+    }
     std::cout<<"VERIFIER_HORIZON_POLICY PASS\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

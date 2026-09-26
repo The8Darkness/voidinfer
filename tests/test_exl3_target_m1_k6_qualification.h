@@ -4,26 +4,12 @@
 // The target model used for capture is constructed with the candidate disabled;
 // borrowed weights remain valid while the local control/candidate workspaces run.
 
-class TargetM1K6EnvironmentRestore {
-public:
-    TargetM1K6EnvironmentRestore()
-        : candidate_(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")),
-          n16_(env("NINFER_EXL3_TARGET_M1_K6_N16")),
-          splits_(env("NINFER_EXL3_GENERIC_SPLITS")),
-          int8_(env("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV")) {}
-    ~TargetM1K6EnvironmentRestore() {
-        _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", candidate_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", n16_.c_str());
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", splits_.c_str());
-        _putenv_s("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV", int8_.c_str());
-    }
-private:
-    std::string candidate_;
-    std::string n16_;
-    std::string splits_;
-    std::string int8_;
-};
 
+constexpr std::initializer_list<const char*> kTargetM1K6EnvironmentOptions{
+    "NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A",
+    "NINFER_EXL3_TARGET_M1_K6_N16",
+    "NINFER_EXL3_GENERIC_SPLITS",
+    "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV"};
 void capture_target_m1_k6_projection(
     const ninfer::exl3::Exl3TargetProjectionObservation& observation,
     void* user) {
@@ -170,7 +156,7 @@ void run_target_m1_k6_qualification(
     const std::vector<std::int64_t>& prompt, bool oscar, std::ostream& out) {
     require(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A") == "0",
             "target M1 K6 capture requires explicit candidate flag0");
-    TargetM1K6EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
     _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "0");
     auto captured = run_target_m1_k6_capture(target, draft, prompt, oscar);
@@ -485,7 +471,7 @@ void run_fast_same_weights_int8_qualification(
     const std::vector<std::int64_t>& prompt, bool oscar, std::ostream& out) {
     require(env("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV") == "0",
             "FAST_SAME_WEIGHTS INT8 qualification requires explicit flag0 capture");
-    TargetM1K6EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
     _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "0");
     auto captured = run_target_m1_k6_capture(target, draft, prompt, oscar);
@@ -627,7 +613,7 @@ void run_target_m1_predecoded_discriminator(
     const std::vector<std::int64_t>& prompt,bool oscar) {
     require(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
             "predecoded M1 discriminator requires explicit N32 flag0 capture");
-    TargetM1K6EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS","");
     _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","0");
     auto captured=run_target_m1_k6_capture(target,draft,prompt,oscar);
@@ -786,7 +772,7 @@ void run_target_m1_gate_up_pair_discriminator(
     const std::vector<std::int64_t>& prompt,bool oscar) {
     require(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
         "target M1 gate/up pair discriminator requires flag0 capture");
-    TargetM1K6EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS","");
     _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","0");
     auto captured=run_target_m1_k6_capture(target,draft,prompt,oscar);
@@ -924,7 +910,7 @@ void run_target_m1_fast_decode_discriminator(
     const std::vector<std::int64_t>& prompt,bool oscar) {
     require(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
         "fast-decode M1 discriminator requires flag0 capture");
-    TargetM1K6EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS","");
     _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","0");
     auto captured=run_target_m1_k6_capture(target,draft,prompt,oscar);

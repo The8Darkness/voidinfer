@@ -70,6 +70,13 @@ constexpr int kGdnQkv = 10240;
 constexpr int kGdnZ = 6144;
 constexpr std::array<int, 5> kTapLayers = {5, 19, 33, 47, 61};
 std::atomic<std::uint64_t> next_exact_residency_id{1};
+
+bool fast_device_kv_transaction_enabled() {
+    const char* value=std::getenv("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION");
+    if(value && std::strcmp(value,"0")!=0 && std::strcmp(value,"1")!=0)
+        throw std::invalid_argument("fast device-KV transaction must be 0 or 1");
+    return value && std::strcmp(value,"1")==0;
+}
 std::atomic<std::size_t> hostkv_quarantined_contexts{0};
 
 void cuda_check(cudaError_t error, const char* operation) {
@@ -974,6 +981,8 @@ struct Exl3TextModel::Impl {
 };
 
 struct Exl3TextContext::Impl {
+    Exl3GamingOptions gaming = Exl3GamingOptions::from_environment();
+    GoptSubmissions gaming_submissions{};
     // Declared first so it outlives every device/graph member during teardown.
     std::shared_ptr<const void> execution_stream_owner;
     cudaStream_t owned_execution_stream=nullptr;
@@ -1006,6 +1015,7 @@ struct Exl3TextContext::Impl {
         bool checkpoint_graph_active = false;
         bool active = false;
         bool host_kv = false;
+        bool device_kv = false;
         std::size_t host_kv_page_count = 0;
         std::shared_ptr<const Exl3ExactKVPage> host_kv_tail;
     };
@@ -1143,6 +1153,10 @@ struct Exl3TextContext::Impl {
     std::uint64_t host_kv_mlp_tail_graph_replays=0;
     double host_kv_mlp_tail_graph_capture_ms=0.0;
     bool host_kv_transaction_checkpoint_graph_enabled=false;
+    bool device_transaction_checkpoint_graph_enabled=false;
+    std::uint64_t device_transaction_checkpoint_graph_captures=0;
+    std::uint64_t device_transaction_checkpoint_graph_replays=0;
+    double device_transaction_checkpoint_graph_capture_ms=0.0;
     bool host_kv_transaction_recurrent_trace_enabled=false;
 
     std::shared_ptr<const Exl3TextModel::Impl> model;
@@ -1176,6 +1190,13 @@ struct Exl3TextContext::Impl {
     bool host_kv_banked_d2h = false;
     bool oscar_only = false;
     bool host_kv_failed = false;
+    bool fast_prefill_failed = false;
+    bool gdn_bulk_prefill_enabled = false;
+    bool gdn_bulk_mlp_enabled = false;
+    bool gdn_bulk_mlp_short_k5_enabled = false;
+    bool fast_wmma32_split2_enabled = false;
+    int fast_wmma32_split_count = 0;
+    int gdn_bulk_capacity = 0;
     std::shared_ptr<DeviceAllocation> host_layer_k, host_layer_v;
     std::shared_ptr<Exl3AttentionStageStorage> attention_stage_storage;
     std::shared_ptr<Exl3AttentionStage> attention_stages;
@@ -1348,6 +1369,15 @@ struct Exl3TextContext::Impl {
     std::array<std::unique_ptr<DeviceAllocation>, kTapLayers.size()> taps{};
     std::uint16_t* hidden_a = nullptr;
     std::uint16_t* hidden_b = nullptr;
+    std::uint16_t* gdn_bulk_h = nullptr;
+    std::uint16_t* gdn_bulk_qkv = nullptr;
+    std::uint16_t* gdn_bulk_z = nullptr;
+    std::uint16_t* gdn_mlp_post = nullptr;
+    std::uint16_t* gdn_mlp_input = nullptr;
+    std::uint16_t* gdn_mlp_gate = nullptr;
+    std::uint16_t* gdn_mlp_up = nullptr;
+    float* fast_wmma32_split2_output = nullptr;
+    float* fast_wmma32_split2_stats = nullptr;
     // Source of the most recent target final-normalized hidden row(s), before
     // the H6 head. It is only a transient source; native MTP callers must use
     // target_hidden_handoff(), which copies it into owned storage. The row
@@ -2746,12 +2776,10 @@ struct Exl3TextContext::Impl {
             // attention-layer launch chain while position_device_ keeps the
             // live cache frontier dynamic at replay.
             constexpr int rows=1;
-            // The fused segmented attention candidate freezes its segment
-            // count in the graph. Capture at the last frontier of the
-            // established 4096-token/128-output fixture, and refuse graph
-            // replay beyond that extent rather than silently truncating a
-            // later workload.
-            ordinary_full_layer_graph_capture_position=std::min(max_context-1,4223);
+            // The segmented fused attention grid is frozen during capture.
+            // Size it for this context's full capacity; the merge reads only
+            // live segments from position_device_ during replay.
+            ordinary_full_layer_graph_capture_position=max_context-1;
             require(ordinary_full_layer_graph_capture_position>0 &&
                     ordinary_full_layer_graph_capture_position+rows<=max_context,
                 "ordinary full-layer graph capture frontier");
@@ -2903,11 +2931,26 @@ struct Exl3TextContext::Impl {
                       bool continuation_reference = false,
                       bool projection_timing_prevalidated = false,
                        bool final_row_only = false,
-                       bool wide_prefill = false,const int* positions_xyz=nullptr) {
+                       bool wide_prefill = false,const int* positions_xyz=nullptr,
+                       int layer_begin=0,int layer_end=kLayers,
+                       std::uint16_t* initial_hidden=nullptr,
+                       std::uint16_t* alternate_hidden=nullptr,
+                       bool skip_head=false,
+                       const Exl3GdnLayer::BulkPrefillBuffers* gdn_prepared=nullptr) {
+        require(!fast_prefill_failed,
+                "failed layer-major prefill requires context reset");
+        require(layer_begin>=0 && layer_begin<=layer_end && layer_end<=kLayers &&
+                (!alternate_hidden || initial_hidden),
+                "layer-major forward range and buffer contract");
+        require(!gdn_prepared ||
+                (layer_end==layer_begin+1 && gdn_layers[layer_begin] &&
+                 gdn_prepared->rows==rows && !include_embedding),
+                "bulk GDN prepared input requires one layer and matching rows");
         retain_host_kv_forward_stream(stream);
         const bool fast_same_weights_wide_candidate =
             fast_same_weights_fp16kv_prefill_enabled && wide_prefill && rows>=256 &&
-            !graph_capture_active && !graph_active;
+            !graph_capture_active && !graph_active &&
+            layer_begin==0 && layer_end==kLayers;
         FastSameWeightsPrefillTelemetryScope fast_same_weights_telemetry(
             *this,fast_same_weights_wide_candidate);
         if(fast_same_weights_telemetry.active)
@@ -2991,7 +3034,7 @@ struct Exl3TextContext::Impl {
                 tap_rows = rows;
             }
         }
-        std::uint16_t* current = hidden_a;
+        std::uint16_t* current = initial_hidden ? initial_hidden : hidden_a;
         if (events) record(events->layer_stack_start, stream, "record E4B1 layer stack start");
         int host_bank=0;
         const bool stage_history=Exl3AttentionStageRoute{attention_staging_enabled,
@@ -3038,7 +3081,7 @@ struct Exl3TextContext::Impl {
                 layer_observer ? 1 : 0,target_projection_timing ? 1 : 0,
                 target_projection_observer ? 1 : 0,eager_mlp_gateup_concurrent ? 1 : 0,
                 continuation_reference ? 1 : 0,native_mtp_hidden_capture_active() ? 1 : 0);
-    const bool use_host_kv_mlp_tail_graphs=
+        const bool use_host_kv_mlp_tail_graphs=
             ((host_kv_mlp_tail_graphs_enabled && host_kv.enabled) ||
              (ordinary_mlp_tail_graphs_enabled && !host_kv.enabled)) && !oscar &&
             !graph_active && !graph_capture_active && !events &&
@@ -3047,7 +3090,7 @@ struct Exl3TextContext::Impl {
             !eager_mlp_gateup_concurrent &&
             rows>=1 && rows<=host_kv_full_graph_row_shapes &&
             (rows==1 || continuation_reference);
-        for (int layer = 0; layer < kLayers; ++layer) {
+        for (int layer = layer_begin; layer < layer_end; ++layer) {
             if(use_host_kv_gdn_segment_graphs && layer%4==0) {
                 const int segment=layer/4;
                 auto& graph=host_kv_gdn_segment_graph(rows,segment);
@@ -3071,7 +3114,8 @@ struct Exl3TextContext::Impl {
                 layer+=2;
                 continue;
             }
-            std::uint16_t* next = current == hidden_a ? hidden_b : hidden_a;
+            std::uint16_t* next = alternate_hidden
+                ? alternate_hidden : (current == hidden_a ? hidden_b : hidden_a);
             std::unique_ptr<NvtxRange> layer_range;
             if (events) {
                 record(events->layer_start[layer], stream, "record E4B1 layer start");
@@ -3468,7 +3512,8 @@ struct Exl3TextContext::Impl {
             } else {
                 gdn_layers[layer]->set_capture_active(graph_capture_active);
                 gdn_layers[layer]->forward(current, next, rows, stream, false,
-                                            continuation_reference, wide_prefill);
+                                            continuation_reference, wide_prefill,
+                                            gdn_prepared);
             }
             if (layer_observer) {
                 require(!graph_capture_active && !graph_active,
@@ -3499,6 +3544,12 @@ struct Exl3TextContext::Impl {
             current = next;
         }
         if (events) record(events->layer_stack_end, stream, "record E4B1 layer stack end");
+        if (skip_head) {
+            require(!host_kv.enabled && !forward_publish_device_prefix &&
+                    !events && !graph_active && !graph_capture_active,
+                    "layer-major partial forward requires ordinary eager ownership");
+            return;
+        }
         if(forward_publish_device_prefix) {
             // Join the copy stream once, after all 16 layer publications.  The
             // existing final forward synchronize then proves represented bytes
@@ -3741,7 +3792,8 @@ std::unique_ptr<Exl3TextContext> Exl3TextModel::create_context(bool capture_taps
 }
 std::shared_ptr<Exl3TextContext> Exl3TextModel::create_context_reserved(
     Exl3VeriCacheServingCoordinator& authority,bool capture_taps,
-    unsigned startup_fault_for_test,bool enable_qualified_media) const {
+    unsigned startup_fault_for_test,bool enable_qualified_media,
+    bool allow_ordinary_graphs) const {
     Exl3ResourceInventory::Requirement initial;initial.configuration=0x4354585354415254;
     initial.add(Exl3ResourceInventory::Domain::host_metadata,1,Exl3TextContext::fixed_owner_metadata_bytes());
     ContextConstruction prepared;
@@ -3750,7 +3802,7 @@ std::shared_ptr<Exl3TextContext> Exl3TextModel::create_context_reserved(
         require(configuration==initial.configuration,"context planning reservation identity");
         Exl3ResourceInventory actual;
         prepared=create_context_impl(capture_taps,false,true,&authority,startup_fault_for_test,
-            extend,&actual,enable_qualified_media);
+            extend,&actual,enable_qualified_media,allow_ordinary_graphs);
         return actual;
     },[&]() noexcept {
         const auto before=Exl3TextContext::retirement_quarantine_witness();
@@ -3769,7 +3821,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     bool capture_taps,bool allocate_device_prefix,bool defer_reconstruction,
     Exl3VeriCacheServingCoordinator* authority,unsigned startup_fault,
     const std::function<void(const Exl3ResourceInventory::Requirement&)>& extend,
-    Exl3ResourceInventory* actual_result,bool enable_qualified_media) const {
+    Exl3ResourceInventory* actual_result,bool enable_qualified_media,
+    bool allow_ordinary_graphs) const {
     require((startup_fault<=4 || (startup_fault>=6 && startup_fault<=27)) && (!startup_fault || authority),
         "context startup fault requires reserved stage1..4 or6..19");
     require(hostkv_quarantined_contexts.load(std::memory_order_acquire)==0,
@@ -3844,7 +3897,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(ordinary_gdn_segment_graphs,"0")==0 ||
             std::strcmp(ordinary_gdn_segment_graphs,"1")==0,
         "ordinary device-KV GDN segment graphs must be 0 or 1");
-    impl->ordinary_gdn_segment_graphs_enabled=ordinary_gdn_segment_graphs &&
+    impl->ordinary_gdn_segment_graphs_enabled=allow_ordinary_graphs &&
+        ordinary_gdn_segment_graphs &&
         std::strcmp(ordinary_gdn_segment_graphs,"1")==0;
     require(!impl->ordinary_gdn_segment_graphs_enabled ||
             (!impl->host_kv.enabled && !impl->host_kv_full_layer_graphs_enabled &&
@@ -3868,7 +3922,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(ordinary_mlp_tail_graphs,"0")==0 ||
             std::strcmp(ordinary_mlp_tail_graphs,"1")==0,
         "ordinary device-KV MLP-tail graphs must be 0 or 1");
-    impl->ordinary_mlp_tail_graphs_enabled=ordinary_mlp_tail_graphs &&
+    impl->ordinary_mlp_tail_graphs_enabled=allow_ordinary_graphs &&
+        ordinary_mlp_tail_graphs &&
         std::strcmp(ordinary_mlp_tail_graphs,"1")==0;
     require(!impl->ordinary_mlp_tail_graphs_enabled ||
             (!impl->host_kv.enabled && !impl->host_kv_full_layer_graphs_enabled &&
@@ -3880,7 +3935,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(ordinary_full_layer_graphs,"0")==0 ||
             std::strcmp(ordinary_full_layer_graphs,"1")==0,
         "ordinary device-KV full-layer graphs must be 0 or 1");
-    impl->ordinary_full_layer_graphs_enabled=ordinary_full_layer_graphs &&
+    impl->ordinary_full_layer_graphs_enabled=allow_ordinary_graphs &&
+        ordinary_full_layer_graphs &&
         std::strcmp(ordinary_full_layer_graphs,"1")==0;
     require(!impl->ordinary_full_layer_graphs_enabled ||
             (!impl->host_kv.enabled && !impl->host_kv_full_layer_graphs_enabled &&
@@ -3893,7 +3949,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(ordinary_full_layer_graph_extended_replay,"0")==0 ||
             std::strcmp(ordinary_full_layer_graph_extended_replay,"1")==0,
         "ordinary device-KV full-layer graph extended replay must be 0 or 1");
-    impl->ordinary_full_layer_graph_extended_replay=
+    impl->ordinary_full_layer_graph_extended_replay=allow_ordinary_graphs &&
         ordinary_full_layer_graph_extended_replay &&
         std::strcmp(ordinary_full_layer_graph_extended_replay,"1")==0;
     require(!impl->ordinary_full_layer_graph_extended_replay ||
@@ -3911,6 +3967,19 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->host_kv_transaction_checkpoint_graph_enabled ||
             (impl->host_kv.enabled && !impl->continuation_graph_b8_enabled),
         "HostKV transaction checkpoint graph requires exact HostKV ownership");
+    const char* device_transaction_checkpoint_graph=std::getenv(
+        "NINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH");
+    require(!device_transaction_checkpoint_graph ||
+            std::strcmp(device_transaction_checkpoint_graph,"0")==0 ||
+            std::strcmp(device_transaction_checkpoint_graph,"1")==0,
+        "device-KV transaction checkpoint graph must be 0 or 1");
+    impl->device_transaction_checkpoint_graph_enabled=
+        device_transaction_checkpoint_graph &&
+        std::strcmp(device_transaction_checkpoint_graph,"1")==0;
+    require(!impl->device_transaction_checkpoint_graph_enabled ||
+            (!impl->host_kv.enabled && !impl->oscar &&
+             fast_device_kv_transaction_enabled()),
+        "device-KV transaction checkpoint graph requires guarded device KV");
     const char* host_kv_transaction_recurrent_trace=std::getenv(
         "NINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE");
     require(!host_kv_transaction_recurrent_trace ||
@@ -4263,6 +4332,57 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         !impl->oscar_only && !impl->continuation_graph_b8_enabled &&
         (!oscar_requested || std::strcmp(oscar_requested, "0") == 0);
     impl->fast_same_weights_fp16kv_prefill_enabled = fast_same_weights_fp16kv_scope;
+    const char* gdn_bulk=std::getenv("NINFER_EXL3_FAST_GDN_BULK_PREFILL");
+    require(!gdn_bulk || std::strcmp(gdn_bulk,"0")==0 ||
+            std::strcmp(gdn_bulk,"1")==0,
+            "GDN bulk prefill must be 0 or 1");
+    impl->gdn_bulk_prefill_enabled=fast_same_weights_fp16kv_scope &&
+        gdn_bulk && std::strcmp(gdn_bulk,"1")==0;
+    const char* gdn_bulk_mlp=std::getenv("NINFER_EXL3_FAST_GDN_BULK_MLP");
+    require(!gdn_bulk_mlp || std::strcmp(gdn_bulk_mlp,"0")==0 ||
+            std::strcmp(gdn_bulk_mlp,"1")==0,
+            "GDN bulk MLP must be 0 or 1");
+    impl->gdn_bulk_mlp_enabled=fast_same_weights_fp16kv_scope &&
+        gdn_bulk_mlp && std::strcmp(gdn_bulk_mlp,"1")==0;
+    const char* gdn_bulk_mlp_short_k5=std::getenv(
+        "NINFER_EXL3_FAST_GDN_BULK_MLP_SHORT_K5");
+    require(!gdn_bulk_mlp_short_k5 ||
+            std::strcmp(gdn_bulk_mlp_short_k5,"0")==0 ||
+            std::strcmp(gdn_bulk_mlp_short_k5,"1")==0,
+            "GDN bulk MLP short K5 must be 0 or 1");
+    impl->gdn_bulk_mlp_short_k5_enabled=impl->gdn_bulk_mlp_enabled &&
+        gdn_bulk_mlp_short_k5 &&
+        std::strcmp(gdn_bulk_mlp_short_k5,"1")==0;
+    require(!gdn_bulk_mlp_short_k5 ||
+            std::strcmp(gdn_bulk_mlp_short_k5,"1")!=0 ||
+            impl->gdn_bulk_mlp_short_k5_enabled,
+            "GDN bulk MLP short K5 requires Fast90 bulk MLP admission");
+    const char* gdn_bulk_mlp_rows=std::getenv("NINFER_EXL3_FAST_GDN_BULK_MLP_ROWS");
+    require(!gdn_bulk_mlp_rows || std::strcmp(gdn_bulk_mlp_rows,"4096")==0 ||
+            std::strcmp(gdn_bulk_mlp_rows,"8192")==0,
+            "GDN bulk MLP rows must be 4096 or 8192");
+    const char* wmma_split2=std::getenv("NINFER_EXL3_FAST_WMMA32_SPLIT2");
+    require(!wmma_split2 || std::strcmp(wmma_split2,"0")==0 ||
+            std::strcmp(wmma_split2,"1")==0,
+            "WMMA32 split2 option must be 0 or 1");
+    impl->fast_wmma32_split2_enabled=fast_same_weights_fp16kv_scope &&
+        wmma_split2 && std::strcmp(wmma_split2,"1")==0;
+    const char* wmma_split4=std::getenv("NINFER_EXL3_FAST_WMMA32_SPLIT4");
+    require(!wmma_split4 || std::strcmp(wmma_split4,"0")==0 ||
+            std::strcmp(wmma_split4,"1")==0,
+            "WMMA32 split4 option must be 0 or 1");
+    const bool split4_enabled=fast_same_weights_fp16kv_scope &&
+        wmma_split4 && std::strcmp(wmma_split4,"1")==0;
+    require(!split4_enabled || !impl->fast_wmma32_split2_enabled,
+            "WMMA32 split2 and split4 are exclusive");
+    impl->fast_wmma32_split_count=split4_enabled?4:
+        (impl->fast_wmma32_split2_enabled?2:0);
+    require(!impl->gdn_bulk_prefill_enabled || !impl->gdn_bulk_mlp_enabled,
+            "GDN bulk prefix and MLP are isolated candidates");
+    impl->gdn_bulk_capacity=impl->gdn_bulk_mlp_enabled
+        ? std::min(gdn_bulk_mlp_rows && std::strcmp(gdn_bulk_mlp_rows,"8192")==0
+                       ? 8192 : 4096,max_context_)
+        : (impl->gdn_bulk_prefill_enabled ? std::min(4096,max_context_) : 0);
     impl->fast_same_weights_fp16kv_prefill_stats.enabled = fast_same_weights_fp16kv_scope;
     require(!numeric_prefill_workspace_enabled ||
             ((numeric_prefill_projection_enabled || numeric_prefill_k7_enabled) &&
@@ -4326,6 +4446,37 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     const auto visit_base_allocations=[&](auto&& allocate) {
         allocate(hidden_bytes,reinterpret_cast<void**>(&impl->hidden_a),"allocate E4A hidden A");
         allocate(hidden_bytes,reinterpret_cast<void**>(&impl->hidden_b),"allocate E4A hidden B");
+        if (impl->gdn_bulk_prefill_enabled) {
+            const auto bulk_rows=static_cast<std::size_t>(impl->gdn_bulk_capacity);
+            allocate(bulk_rows*kHidden*sizeof(std::uint16_t),
+                reinterpret_cast<void**>(&impl->gdn_bulk_h),"allocate GDN bulk normalized input");
+            allocate(bulk_rows*10240*sizeof(std::uint16_t),
+                reinterpret_cast<void**>(&impl->gdn_bulk_qkv),"allocate GDN bulk QKV");
+            allocate(bulk_rows*6144*sizeof(std::uint16_t),
+                reinterpret_cast<void**>(&impl->gdn_bulk_z),"allocate GDN bulk Z");
+        }
+        if (impl->gdn_bulk_mlp_enabled) {
+            const auto bulk_rows=static_cast<std::size_t>(impl->gdn_bulk_capacity);
+            allocate(bulk_rows*kHidden*sizeof(std::uint16_t),
+                reinterpret_cast<void**>(&impl->gdn_mlp_post),"allocate GDN bulk post residual");
+            allocate(bulk_rows*kHidden*sizeof(std::uint16_t),
+                reinterpret_cast<void**>(&impl->gdn_mlp_input),"allocate GDN bulk MLP input");
+            allocate(bulk_rows*17408*sizeof(std::uint16_t),
+                reinterpret_cast<void**>(&impl->gdn_mlp_gate),"allocate GDN bulk gate");
+            allocate(bulk_rows*17408*sizeof(std::uint16_t),
+                reinterpret_cast<void**>(&impl->gdn_mlp_up),"allocate GDN bulk up");
+        }
+        if (impl->fast_wmma32_split_count) {
+            constexpr std::size_t rows=1024;
+            allocate(static_cast<std::size_t>(impl->fast_wmma32_split_count)*
+                rows*kQHeads*kHeadDim*sizeof(float),
+                reinterpret_cast<void**>(&impl->fast_wmma32_split2_output),
+                "allocate WMMA32 split FP32 partial output");
+            allocate(static_cast<std::size_t>(impl->fast_wmma32_split_count)*
+                rows*kQHeads*2*sizeof(float),
+                reinterpret_cast<void**>(&impl->fast_wmma32_split2_stats),
+                "allocate WMMA32 split FP32 max and sum");
+        }
         allocate(kHidden*sizeof(std::uint16_t),reinterpret_cast<void**>(&impl->final_norm),"allocate E4A final norm");
         allocate(kVocab*sizeof(std::uint16_t),reinterpret_cast<void**>(&impl->logits),"allocate E4A logits");
         allocate(token_bytes,reinterpret_cast<void**>(&impl->token_ids),"allocate E4A token ids");
@@ -4758,7 +4909,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         fast_same_weights_all_model_shapes || !numeric_prefill_k7_enabled;
     const auto numeric_requirement=numeric_prefill_workspace_enabled?
         Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
-            numeric_workspace_in,numeric_workspace_out,impl->prefill_capacity,
+            numeric_workspace_in,numeric_workspace_out,
+            impl->gdn_bulk_capacity ? impl->gdn_bulk_capacity : impl->prefill_capacity,
             numeric_workspace_transpose):0;
     const auto materialize_numeric=[&] {
       if(numeric_requirement) {
@@ -4767,7 +4919,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         impl->numeric_prefill_projection_workspace =
             std::make_unique<Exl3CudaReconstructGemmWorkspace>(
                 numeric_workspace_in,numeric_workspace_out,
-                impl->prefill_capacity,numeric_workspace_transpose,
+                impl->gdn_bulk_capacity ? impl->gdn_bulk_capacity : impl->prefill_capacity,
+                numeric_workspace_transpose,
                 fast_same_weights_all_model_shapes);
         require(impl->numeric_prefill_projection_workspace->workspace_bytes()==numeric_requirement,
             "target numeric projection requirement mismatch");
@@ -4804,8 +4957,9 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     };
     const auto head_requirement=Exl3LinearWorkspaceRequirements::derive(kHidden,kVocab,1);
     const auto* resident_option=std::getenv("NINFER_EXL3_PREFILL_GDN_RESIDENT");
-    const bool resident_required=resident_option?std::strcmp(resident_option,"1")==0:
-        (qualified_default_group && scratch.bytes!=0);
+    const bool resident_required=impl->gaming[Gopt::GdnSmallResident] ||
+        (resident_option?std::strcmp(resident_option,"1")==0:
+        (qualified_default_group && scratch.bytes!=0));
     std::array<std::size_t,kLayers> layer_requirements{};
     auto required_layer_group=head_requirement.owned_bytes;
     for(int layer=0;layer<kLayers;++layer) {
@@ -5035,6 +5189,11 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 numeric_attention_splitk_workspace,
                 numeric_attention_splitk_workspace_bytes,
                 numeric_attention_splitk_enabled);
+            if(impl->fast_wmma32_split_count)
+                impl->full_layers[layer]->set_fast_wmma32_split2_workspace(
+                    impl->fast_wmma32_split2_output,
+                    impl->fast_wmma32_split2_stats,1024,
+                    impl->fast_wmma32_split_count);
         } else {
             const auto layer_requirement=layer_requirements[layer];
             const auto expected_layer_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
@@ -5898,6 +6057,12 @@ std::uint64_t Exl3TextContext::fast_same_weights_fp16kv_gdn_decode_conv_calls() 
         result+=layer->fast_same_weights_fp16kv_gdn_decode_conv_calls();
     return result;
 }
+std::uint64_t Exl3TextContext::fast_same_weights_fp16kv_gdn_m1_gate_up_pair_submissions() const noexcept {
+    std::uint64_t result=0;
+    for(const auto& layer:impl_->gdn_layers)if(layer)
+        result+=layer->fast_same_weights_fp16kv_gdn_m1_gate_up_pair_submissions();
+    return result;
+}
 std::uint64_t Exl3TextContext::fast_wide_prefill_gemm_calls() const noexcept {
     std::uint64_t result=0;
     for(const auto& layer:impl_->full_layers)if(layer)
@@ -6440,6 +6605,16 @@ std::uint64_t Exl3TextContext::Impl::allocation_owner_metadata_bytes() const {
         requirement.add(Domain::host_metadata,1,layer->fixed_owner_metadata_bytes());
     return requirement.units[static_cast<unsigned>(Domain::host_metadata)];
 }
+GoptSubmissions Exl3TextContext::gaming_submissions() const noexcept {
+    if(!impl_)return {};
+    auto result=impl_->gaming_submissions;
+    for(const auto& layer:impl_->gdn_layers)if(layer) {
+        const auto values=layer->gaming_submissions();
+        for(unsigned i=0;i<result.size();++i)result[i]+=values[i];
+    }
+    return result;
+}
+
 Exl3HostKVStats Exl3TextContext::host_kv_stats() const noexcept {
     auto result=impl_->host_kv;
     for(const auto& layer:impl_->full_layers) if(layer) {
@@ -6679,13 +6854,17 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     last_decode_h2d_ = 0;
     impl_->qkv_trace_valid = false;
     if (impl_->transaction) impl_->transaction->rollback_required = false;
+    impl_->fast_prefill_failed = false;
 }
 
 std::size_t Exl3TextContext::transaction_bytes_required() const {
     if (impl_->transaction) return 0;
     const bool host_kv = impl_->host_kv.enabled && impl_->oscar == nullptr;
-    require(host_kv || (impl_->oscar != nullptr && impl_->oscar->graph_class() == 0),
-            "P2 target transaction requires eager canonical OSCAR or exact HostKV");
+    const bool device_kv = !impl_->host_kv.enabled && impl_->oscar == nullptr &&
+        fast_device_kv_transaction_enabled();
+    require(host_kv || device_kv ||
+            (impl_->oscar != nullptr && impl_->oscar->graph_class() == 0),
+            "P2 target transaction requires eager OSCAR, HostKV or guarded device KV");
     std::size_t bytes = 0;
     for (const auto& layer : impl_->gdn_layers) {
         if (!layer) continue;
@@ -6698,7 +6877,7 @@ std::size_t Exl3TextContext::transaction_bytes_required() const {
     // need an OSCAR-cache image because its ordinary K/V rows are already in
     // the authoritative cache and rows beyond the repaired cursor are inert.
     bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
-        bytes, host_kv ? 1 : impl_->oscar->checkpoint_device_bytes());
+        bytes, (host_kv || device_kv) ? 1 : impl_->oscar->checkpoint_device_bytes());
     bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
         bytes, kVocab * sizeof(std::uint16_t));
     bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
@@ -6729,8 +6908,11 @@ void Exl3TextContext::prepare_transaction_impl(
             "P2 target transaction startup fault requires reserved stage1..5");
     if (impl_->transaction) return;
     const bool host_kv = impl_->host_kv.enabled && impl_->oscar == nullptr;
-    require(host_kv || (impl_->oscar != nullptr && impl_->oscar->graph_class() == 0),
-            "P2 target transaction requires eager canonical OSCAR or exact HostKV");
+    const bool device_kv = !impl_->host_kv.enabled && impl_->oscar == nullptr &&
+        fast_device_kv_transaction_enabled();
+    require(host_kv || device_kv ||
+            (impl_->oscar != nullptr && impl_->oscar->graph_class() == 0),
+            "P2 target transaction requires eager OSCAR, HostKV or guarded device KV");
     require(impl_->capture_taps,
             "P2 target transaction requires captured taps");
     require(!impl_->graph_active && !impl_->graph_capture_active,
@@ -6740,6 +6922,7 @@ void Exl3TextContext::prepare_transaction_impl(
     const auto construct = [&] {
         auto prepared = make_bounded_shared<Impl::Transaction>();
         prepared->host_kv = host_kv;
+        prepared->device_kv = device_kv;
         const auto allocate = [&](std::size_t bytes, const char* label) {
             if (!authority)
                 return std::make_unique<DeviceAllocation>(bytes, label);
@@ -6787,8 +6970,8 @@ void Exl3TextContext::prepare_transaction_impl(
             conv += conv_size;
         }
         prepared->oscar_cache = allocate(
-            host_kv ? 1 : impl_->oscar->checkpoint_device_bytes(),
-            host_kv ? "allocate P2 target HostKV transaction sentinel" :
+            (host_kv || device_kv) ? 1 : impl_->oscar->checkpoint_device_bytes(),
+            (host_kv || device_kv) ? "allocate P2 target KV transaction sentinel" :
                       "allocate P2 target OSCAR checkpoint");
         prepared->oscar_checkpoint.cache_device = prepared->oscar_cache->ptr;
         prepared->oscar_checkpoint.cache_capacity_bytes =
@@ -6895,7 +7078,9 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
     require(!transaction.active, "P2 target transaction is already active");
     const bool host_kv = transaction.host_kv && impl_->host_kv.enabled &&
         impl_->oscar == nullptr;
-    require((host_kv || (impl_->oscar != nullptr &&
+    const bool device_kv=transaction.device_kv && !impl_->host_kv.enabled &&
+        impl_->oscar == nullptr;
+    require((host_kv || device_kv || (impl_->oscar != nullptr &&
                 impl_->oscar->graph_class() == 0)) &&
                 !impl_->graph_active && !impl_->graph_capture_active,
             "P2 target transaction begin requires its eager OSCAR or exact HostKV mode");
@@ -6949,17 +7134,28 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                                    cudaMemcpyDeviceToDevice,stream),
                    "save P2 target embedding checkpoint");
     };
+    // The ordinary device-KV probe has B2..B8 continuation frontiers. Capture
+    // the eight-row allocation extent once so the same graph can checkpoint
+    // any such frontier; transaction metadata still records the valid rows.
+    // HostKV keeps its existing exact one-row graph and copy extent.
+    const bool device_checkpoint_graph_eligible=
+        impl_->device_transaction_checkpoint_graph_enabled && device_kv &&
+        impl_->tap_rows<=8 && impl_->prefill_capacity>=8;
     const bool checkpoint_graph_eligible=
-        impl_->host_kv_transaction_checkpoint_graph_enabled && host_kv &&
-        impl_->tap_rows==1 && impl_->embedding_rows==1 && impl_->last_rows==1;
+        (impl_->host_kv_transaction_checkpoint_graph_enabled && host_kv &&
+         impl_->tap_rows==1) || device_checkpoint_graph_eligible;
     if(checkpoint_graph_eligible) {
+        const std::size_t graph_copy_rows=device_checkpoint_graph_eligible?
+            8:static_cast<std::size_t>(impl_->tap_rows);
+        const std::size_t graph_copy_bytes=
+            graph_copy_rows*kHidden*sizeof(std::uint16_t);
         if(!transaction.checkpoint_graph_active) {
             impl_->bind_graph_device();
             const auto started=std::chrono::steady_clock::now();
             cudaStream_t capture_stream=nullptr;
             cuda_check(cudaStreamCreateWithFlags(
                     &capture_stream,cudaStreamNonBlocking),
-                "create HostKV transaction checkpoint graph capture stream");
+                "create transaction checkpoint graph capture stream");
             try {
                 transaction.checkpoint_graph_definition.capture(
                     capture_stream,[&] {
@@ -6979,11 +7175,11 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                         cuda_check(cudaMemcpyAsync(
                                 tap_destination+tap*impl_->prefill_capacity*kHidden*
                                     sizeof(std::uint16_t),
-                                impl_->taps[tap]->ptr,tap_bytes,
+                                impl_->taps[tap]->ptr,graph_copy_bytes,
                                 cudaMemcpyDeviceToDevice,capture_stream),
                             "capture P2 target hidden tap checkpoint");
                     cuda_check(cudaMemcpyAsync(transaction.embedding->ptr,
-                            impl_->embedding_trace->ptr,embedding_bytes,
+                            impl_->embedding_trace->ptr,graph_copy_bytes,
                             cudaMemcpyDeviceToDevice,capture_stream),
                         "capture P2 target embedding checkpoint");
                     });
@@ -6991,25 +7187,30 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                     transaction.checkpoint_graph_definition);
                 transaction.checkpoint_graph_executable.upload(capture_stream);
                 cuda_check(cudaStreamSynchronize(capture_stream),
-                    "complete HostKV transaction checkpoint graph preparation");
+                    "complete transaction checkpoint graph preparation");
             } catch(...) {
                 (void)cudaStreamSynchronize(capture_stream);
                 (void)cudaStreamDestroy(capture_stream);
                 throw;
             }
             cuda_check(cudaStreamDestroy(capture_stream),
-                "destroy HostKV transaction checkpoint graph capture stream");
+                "destroy transaction checkpoint graph capture stream");
             transaction.checkpoint_graph_stream=stream;
             transaction.checkpoint_graph_active=true;
-            ++impl_->host_kv.transaction_checkpoint_graph_captures;
-            impl_->host_kv.transaction_checkpoint_graph_capture_ms+=
-                std::chrono::duration<double,std::milli>(
-                    std::chrono::steady_clock::now()-started).count();
+            const double capture_ms=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-started).count();
+            if(device_checkpoint_graph_eligible) {
+                ++impl_->device_transaction_checkpoint_graph_captures;
+                impl_->device_transaction_checkpoint_graph_capture_ms+=capture_ms;
+            } else {
+                ++impl_->host_kv.transaction_checkpoint_graph_captures;
+                impl_->host_kv.transaction_checkpoint_graph_capture_ms+=capture_ms;
+            }
         }
         require(transaction.checkpoint_graph_stream==stream &&
                     transaction.checkpoint_graph_definition.ready() &&
                     transaction.checkpoint_graph_executable.ready(),
-                "HostKV transaction checkpoint graph stream/handle mismatch");
+                "transaction checkpoint graph stream/handle mismatch");
         std::array<std::uint64_t,kLayers> generations{};
         for(int layer=0;layer<kLayers;++layer)
             if(impl_->gdn_layers[layer])
@@ -7022,13 +7223,16 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                 impl_->gdn_layers[layer]->publish_checkpoint_graph_replay(
                     transaction.gdn_checkpoints[layer],position_,
                     generations[layer],stream);
-        ++impl_->host_kv.transaction_checkpoint_graph_replays;
+        if(device_checkpoint_graph_eligible)
+            ++impl_->device_transaction_checkpoint_graph_replays;
+        else
+            ++impl_->host_kv.transaction_checkpoint_graph_replays;
     } else {
         for (int layer = 0; layer < kLayers; ++layer)
             if (impl_->gdn_layers[layer])
                 impl_->gdn_layers[layer]->save_checkpoint(
                     transaction.gdn_checkpoints[layer],position_,stream);
-        if (!host_kv)
+        if (!host_kv && !device_kv)
             impl_->oscar->save_checkpoint(transaction.oscar_checkpoint, stream);
         submit_non_gdn_checkpoint_copies();
     }
@@ -7079,7 +7283,9 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
         if (layer) layer->invalidate_retained_prefix();
     const bool host_kv = transaction.host_kv && impl_->host_kv.enabled &&
         impl_->oscar == nullptr;
-    require((host_kv || (impl_->oscar != nullptr &&
+    const bool device_kv=transaction.device_kv && !impl_->host_kv.enabled &&
+        impl_->oscar == nullptr;
+    require((host_kv || device_kv || (impl_->oscar != nullptr &&
                 impl_->oscar->graph_class() == 0)) &&
                 !impl_->graph_active && !impl_->graph_capture_active,
             "P2 target transaction rollback requires its eager OSCAR or exact HostKV mode");
@@ -7091,7 +7297,7 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
             impl_->gdn_layers[layer]->restore_checkpoint(transaction.gdn_checkpoints[layer], stream);
         }
     }
-    if (!host_kv)
+    if (!host_kv && !device_kv)
         impl_->oscar->restore_checkpoint(transaction.oscar_checkpoint, stream);
     cuda_check(cudaMemcpyAsync(impl_->logits, transaction.logits->ptr, transaction.logits->bytes,
                                cudaMemcpyDeviceToDevice, stream),
@@ -7141,7 +7347,9 @@ void Exl3TextContext::commit_transaction() {
     const auto& transaction=*impl_->transaction;
     const bool host_kv = transaction.host_kv && impl_->host_kv.enabled &&
         impl_->oscar == nullptr;
-    require((host_kv || (impl_->oscar != nullptr &&
+    const bool device_kv=transaction.device_kv && !impl_->host_kv.enabled &&
+        impl_->oscar == nullptr;
+    require((host_kv || device_kv || (impl_->oscar != nullptr &&
                 impl_->oscar->graph_class() == 0)) &&
                 !impl_->graph_active && !impl_->graph_capture_active,
             "P2 target transaction commit requires its eager OSCAR or exact HostKV mode");
@@ -7496,6 +7704,7 @@ void Exl3TextContext::set_layer_observer_for_test(
 
 void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStream_t stream) {
     Impl::require_host_kv_retirement_admission();
+    require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     require(!impl_->host_kv_failed,"HostKV prefill requires intact transfer lineage");
     require(!impl_->deferred_reconstruction_bytes,"reconstruction startup reservation not installed");
     require(!impl_->transaction || !impl_->transaction->rollback_required,
@@ -7527,6 +7736,7 @@ void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStrea
 
 void Exl3TextContext::decode(std::int64_t token_id, cudaStream_t stream) {
     Impl::require_host_kv_retirement_admission();
+    require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     require(!impl_->host_kv_failed,"HostKV decode requires intact transfer lineage");
     require(!impl_->deferred_reconstruction_bytes,"reconstruction startup reservation not installed");
     require(!impl_->transaction || !impl_->transaction->rollback_required,
@@ -7560,6 +7770,7 @@ void Exl3TextContext::append_prefill_wide(std::span<const std::int64_t> token_id
 void Exl3TextContext::append_prefill_impl(std::span<const std::int64_t> token_ids,
                                         cudaStream_t stream, bool wide, bool exact) {
     Impl::require_host_kv_retirement_admission();
+    require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     require(!impl_->host_kv_failed,"HostKV append requires intact transfer lineage");
     require(!impl_->deferred_reconstruction_bytes,"reconstruction startup reservation not installed");
     require(!impl_->transaction ||
@@ -7608,6 +7819,356 @@ void Exl3TextContext::append_prefill_impl(std::span<const std::int64_t> token_id
                                cudaMemcpyHostToDevice, stream), "publish chunked prefill position");
     position_ += rows;
     ++last_decode_h2d_;
+}
+
+Exl3TextContext::DeviceTransactionCheckpointGraphStats
+Exl3TextContext::device_transaction_checkpoint_graph_stats() const noexcept {
+    return {impl_->device_transaction_checkpoint_graph_captures,
+        impl_->device_transaction_checkpoint_graph_replays,
+        impl_->device_transaction_checkpoint_graph_capture_ms};
+}
+
+void Exl3TextContext::append_prefill_layer_major(
+    std::span<const std::int64_t> token_ids, cudaStream_t stream,
+    const RetainedTapTail* retained_taps) {
+    Impl::require_host_kv_retirement_admission();
+    require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
+    require(impl_->fast_same_weights_fp16kv_prefill_enabled &&
+            impl_->numeric_prefill_projection_workspace &&
+            impl_->prefill_capacity == 1024 && !impl_->host_kv.enabled &&
+            !impl_->oscar && !impl_->oscar_only && !impl_->device_prefix &&
+            !impl_->graph_active && !impl_->graph_capture_active &&
+            !impl_->layer_observer && !impl_->target_projection_timing &&
+            !impl_->target_projection_observer &&
+            !impl_->native_mtp_hidden_capture_active() &&
+            (!impl_->transaction ||
+             (!impl_->transaction->active && !impl_->transaction->rollback_required)),
+            "layer-major prefill requires an idle Fast90 ordinary device-KV context");
+    require(position_ > 0 && impl_->last_rows > 0 &&
+            token_ids.size() > 1024 &&
+            token_ids.size() <= static_cast<std::size_t>(impl_->max_context-position_) &&
+            std::all_of(token_ids.begin(),token_ids.end(),[](std::int64_t token) {
+                return token >= 0 && token < kVocab;
+            }), "layer-major prefill suffix extent and token contract");
+    if (retained_taps) {
+        require(impl_->capture_taps && retained_taps->device &&
+                retained_taps->rows >= 1 && retained_taps->rows <= 2063 &&
+                retained_taps->first_abs >= position_ &&
+                static_cast<long long>(retained_taps->first_abs) + retained_taps->rows ==
+                    static_cast<long long>(position_) + token_ids.size() &&
+                retained_taps->bytes == static_cast<std::size_t>(retained_taps->rows) *
+                    5 * kHidden * sizeof(std::uint16_t),
+                "layer-major retained tap tail extent");
+        cudaPointerAttributes attributes{};
+        cuda_check(cudaPointerGetAttributes(&attributes, retained_taps->device),
+                   "layer-major retained tap arena attributes");
+        int device = -1;
+        cuda_check(cudaGetDevice(&device), "layer-major retained tap device");
+        require(attributes.type == cudaMemoryTypeDevice && attributes.device == device,
+                "layer-major retained tap arena must be local device memory");
+    }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    cuda_check(cudaStreamIsCapturing(stream,&capture_status),
+               "query layer-major prefill stream capture");
+    require(capture_status == cudaStreamCaptureStatusNone,
+            "layer-major prefill rejects external graph capture");
+    impl_->validate_target_projection_execution(stream);
+    impl_->retain_host_kv_forward_stream(stream);
+    std::size_t free_bytes=0,total_bytes=0;
+    cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes),
+               "budget layer-major projection cache");
+    // The guarded device transaction has already retained its physical target
+    // and draft owners. Keep a smaller, still explicit free-space reserve for
+    // its bounded projection reuse; ordinary routes retain their 2 GiB floor.
+    const std::size_t reserve_bytes=fast_device_kv_transaction_enabled()?
+        1536ull*1024*1024:2ull*1024*1024*1024;
+    constexpr std::size_t cache_limit=1536ull*1024*1024;
+    constexpr std::size_t minimum_cache=256ull*1024*1024;
+    auto& workspace=*impl_->numeric_prefill_projection_workspace;
+    const auto existing_cache=workspace.stats().cached_weight_capacity_bytes;
+    if(free_bytes<reserve_bytes ||
+       existing_cache>cache_limit ||
+       existing_cache+free_bytes-reserve_bytes<minimum_cache)
+        throw std::runtime_error(
+            "layer-major projection cache lacks bounded device headroom: free_mib="+
+            std::to_string(free_bytes/(1024*1024))+
+            " retained_cache_mib="+
+            std::to_string(existing_cache/(1024*1024))+
+            " free_reserve_mib="+
+            std::to_string(reserve_bytes/(1024*1024)));
+    const std::size_t cache_budget=std::min(cache_limit,
+        existing_cache+free_bytes-reserve_bytes);
+    require(workspace.stats().cached_weight_capacity_bytes<=cache_budget,
+            "retained layer-major cache exceeds current device budget");
+    const char* injected_layer=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
+    const int fail_after_layer=injected_layer ? std::atoi(injected_layer) : -1;
+    require(!injected_layer ||
+            (fail_after_layer>=0 && fail_after_layer<kLayers &&
+             std::to_string(fail_after_layer)==injected_layer),
+            "layer-major test fault index must be a model layer");
+    struct LayerProfileEvents {
+        std::vector<cudaEvent_t> events;
+        ~LayerProfileEvents() {
+            for (auto event : events) if (event) cudaEventDestroy(event);
+        }
+    } layer_profile;
+    const char* profile_option=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
+    if (profile_option && std::strcmp(profile_option,"1")==0) {
+        layer_profile.events.resize(kLayers+1,nullptr);
+        for (auto& event : layer_profile.events)
+            cuda_check(cudaEventCreate(&event),"create layer-major profile event");
+    }
+    // From this point, a failure may leave different layers at different
+    // frontiers. The context is invalid until reset, including if a CUDA
+    // submission fails after some of the layer work was enqueued.
+    try {
+    if (impl_->continuation) impl_->continuation->rows = 0;
+
+    const int base_position = position_;
+    const int total = static_cast<int>(token_ids.size());
+    const int chunks = (total+1023)/1024;
+    const int final_offset = (chunks-1)*1024;
+    const int final_rows = total-final_offset;
+    cuda_check(cudaMemcpyAsync(impl_->token_ids,token_ids.data(),
+                               token_ids.size_bytes(),cudaMemcpyHostToDevice,stream),
+               "upload layer-major prefill IDs");
+    for (int offset=0;offset<total;offset+=1024) {
+        const int rows=std::min(1024,total-offset);
+        embedding_lookup_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(
+            impl_->token_ids+offset,impl_->model->embedding,
+            impl_->hidden_a+static_cast<std::size_t>(offset)*kHidden,rows);
+        cuda_check(cudaGetLastError(),"embed layer-major prefill rows");
+    }
+    if (impl_->capture_taps) {
+        cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,
+            impl_->hidden_a+static_cast<std::size_t>(final_offset)*kHidden,
+            static_cast<std::size_t>(final_rows)*kHidden*sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice,stream),
+            "capture final layer-major embedding rows");
+        impl_->embedding_rows=final_rows;
+        impl_->tap_rows=final_rows;
+    }
+
+    const auto before=workspace.stats();
+    std::uint64_t gdn_bulk_calls=0,gdn_bulk_rows=0;
+    std::uint64_t gdn_bulk_mlp_blocks=0,gdn_bulk_mlp_rows=0;
+    if (!layer_profile.events.empty())
+        cuda_check(cudaEventRecord(layer_profile.events[0],stream),
+                   "record layer-major profile start");
+    for (int layer=0;layer<kLayers;++layer) {
+        workspace.begin_layer_reuse(cache_budget,
+            base_position+total>=8192 ||
+            impl_->gdn_bulk_mlp_short_k5_enabled);
+        const auto execute_chunk=[&](int offset,
+                const Exl3GdnLayer::BulkPrefillBuffers* prepared) {
+                const int rows=std::min(1024,total-offset);
+                const int logical_position=base_position+offset;
+                cuda_check(cudaMemcpyAsync(impl_->position_device,&logical_position,
+                    sizeof(logical_position),cudaMemcpyHostToDevice,stream),
+                    "publish layer-major causal position");
+                auto* input=(layer%2==0 ? impl_->hidden_a : impl_->hidden_b)+
+                    static_cast<std::size_t>(offset)*kHidden;
+                auto* output=(layer%2==0 ? impl_->hidden_b : impl_->hidden_a)+
+                    static_cast<std::size_t>(offset)*kHidden;
+                impl_->process_rows(nullptr,rows,logical_position,stream,
+                    nullptr,false,rows>1,true,true,true,nullptr,
+                    layer,layer+1,input,output,true,prepared);
+        };
+        const bool bulk_mlp=impl_->gdn_bulk_mlp_enabled &&
+            impl_->gdn_layers[layer];
+        const bool bulk=impl_->gdn_bulk_prefill_enabled &&
+            impl_->gdn_layers[layer] &&
+            impl_->gdn_layers[layer]->supports_bulk_prefill();
+        if (bulk_mlp) {
+            const int batch_rows=impl_->gdn_bulk_capacity;
+            for(int block=0;block<total;block+=batch_rows) {
+                const int count=std::min(batch_rows,total-block);
+                if(count<256 ||
+                   !impl_->gdn_layers[layer]->supports_bulk_mlp(count)) {
+                    for(int offset=block;offset<block+count;offset+=1024)
+                        execute_chunk(offset,nullptr);
+                    continue;
+                }
+                require(count<=impl_->gdn_bulk_capacity,
+                        "GDN bulk MLP arena capacity");
+                auto* input_base=(layer%2==0?impl_->hidden_a:impl_->hidden_b)+
+                    static_cast<std::size_t>(block)*kHidden;
+                auto* output_base=(layer%2==0?impl_->hidden_b:impl_->hidden_a)+
+                    static_cast<std::size_t>(block)*kHidden;
+                for(int relative=0;relative<count;relative+=1024) {
+                    const int rows=std::min(1024,count-relative);
+                    const int logical_position=base_position+block+relative;
+                    cuda_check(cudaMemcpyAsync(impl_->position_device,
+                        &logical_position,sizeof(logical_position),
+                        cudaMemcpyHostToDevice,stream),
+                        "publish GDN bulk MLP causal position");
+                    Exl3GdnLayer::DeferredMlpBuffers slice{
+                        impl_->gdn_mlp_post+
+                            static_cast<std::size_t>(relative)*kHidden,
+                        impl_->gdn_mlp_input+
+                            static_cast<std::size_t>(relative)*kHidden,rows};
+                    impl_->gdn_layers[layer]->forward_before_bulk_mlp(
+                        input_base+static_cast<std::size_t>(relative)*kHidden,
+                        slice,stream);
+                }
+                Exl3GdnLayer::DeferredMlpBuffers ready{
+                    impl_->gdn_mlp_post,impl_->gdn_mlp_input,count};
+                impl_->gdn_layers[layer]->finish_bulk_mlp(ready,
+                    impl_->gdn_mlp_gate,impl_->gdn_mlp_up,
+                    impl_->gdn_mlp_gate,output_base,
+                    output_base,stream,block+count==total);
+                ++gdn_bulk_mlp_blocks;
+                gdn_bulk_mlp_rows+=static_cast<std::uint64_t>(count);
+                const int tap=impl_->tap_index(layer);
+                if(impl_->capture_taps && tap>=0 && block+count==total)
+                    cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,
+                        output_base+static_cast<std::size_t>(count-final_rows)*kHidden,
+                        static_cast<std::size_t>(final_rows)*kHidden*
+                            sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
+                        "capture final GDN bulk MLP hidden tap");
+            }
+        } else if (bulk) {
+            constexpr int bulk_rows=4096;
+            for (int block=0;block<total;block+=bulk_rows) {
+                const int count=std::min(bulk_rows,total-block);
+                require(count<=impl_->gdn_bulk_capacity,
+                        "GDN bulk arena capacity");
+                if (count<256) {
+                    execute_chunk(block,nullptr);
+                    continue;
+                }
+                auto* input=(layer%2==0?impl_->hidden_a:impl_->hidden_b)+
+                    static_cast<std::size_t>(block)*kHidden;
+                Exl3GdnLayer::BulkPrefillBuffers buffers{
+                    impl_->gdn_bulk_h,impl_->gdn_bulk_qkv,impl_->gdn_bulk_z,count};
+                impl_->gdn_layers[layer]->prepare_bulk_prefill(input,buffers,stream);
+                ++gdn_bulk_calls;
+                gdn_bulk_rows+=static_cast<std::uint64_t>(count);
+                for(int offset=block;offset<block+count;offset+=1024) {
+                    const int relative=offset-block;
+                    Exl3GdnLayer::BulkPrefillBuffers slice{
+                        buffers.h+static_cast<std::size_t>(relative)*kHidden,
+                        buffers.qkv+static_cast<std::size_t>(relative)*10240,
+                        buffers.z+static_cast<std::size_t>(relative)*6144,
+                        std::min(1024,total-offset)};
+                    execute_chunk(offset,&slice);
+                }
+            }
+        } else {
+            for(int offset=0;offset<total;offset+=1024)
+                execute_chunk(offset,nullptr);
+        }
+        const int tap=impl_->tap_index(layer);
+        if (retained_taps && tap>=0) {
+            const auto relative=static_cast<std::size_t>(retained_taps->first_abs-base_position);
+            const auto* completed=(layer%2==0?impl_->hidden_b:impl_->hidden_a)+
+                relative*kHidden;
+            auto* plane=retained_taps->device+
+                static_cast<std::size_t>(tap)*retained_taps->rows*kHidden;
+            cuda_check(cudaMemcpyAsync(plane,completed,
+                static_cast<std::size_t>(retained_taps->rows)*kHidden*sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice,stream),
+                "retain completed layer-major tap tail");
+        }
+        workspace.end_layer_reuse();
+        if (!layer_profile.events.empty())
+            cuda_check(cudaEventRecord(layer_profile.events[layer+1],stream),
+                       "record layer-major profile layer end");
+        if (layer==fail_after_layer)
+            throw std::runtime_error("injected layer-major partial-layer failure");
+    }
+    const auto after=workspace.stats();
+    if (impl_->gdn_bulk_prefill_enabled)
+        std::fprintf(stderr,"GDN_BULK_PREFILL prepares=%llu rows=%llu arena_bytes=%llu\n",
+            static_cast<unsigned long long>(gdn_bulk_calls),
+            static_cast<unsigned long long>(gdn_bulk_rows),
+            static_cast<unsigned long long>(
+                static_cast<std::size_t>(impl_->gdn_bulk_capacity)*
+                (kHidden+10240+6144)*sizeof(std::uint16_t)));
+    if (impl_->gdn_bulk_mlp_enabled)
+        std::fprintf(stderr,"GDN_BULK_MLP blocks=%llu rows=%llu arena_bytes=%llu "
+            "fused_down_calls=%llu prefetch_submissions=%llu prefetch_hits=%llu "
+            "fused_residual_calls=%llu fused_residual_rows=%llu "
+            "packed_k5_gate_up_calls=%llu packed_k5_down_calls=%llu "
+            "packed_k5_rows=%llu\n",
+            static_cast<unsigned long long>(gdn_bulk_mlp_blocks),
+            static_cast<unsigned long long>(gdn_bulk_mlp_rows),
+            static_cast<unsigned long long>(
+                static_cast<std::size_t>(impl_->gdn_bulk_capacity)*
+                (2*kHidden+2*17408)*sizeof(std::uint16_t)),
+            static_cast<unsigned long long>(
+                after.fused_gate_up_down_calls-before.fused_gate_up_down_calls),
+            static_cast<unsigned long long>(
+                after.prefetched_weight_submissions-
+                before.prefetched_weight_submissions),
+            static_cast<unsigned long long>(
+                after.prefetched_weight_hits-before.prefetched_weight_hits),
+            static_cast<unsigned long long>(
+                after.fused_down_residual_calls-before.fused_down_residual_calls),
+            static_cast<unsigned long long>(
+                after.fused_down_residual_rows-before.fused_down_residual_rows),
+            static_cast<unsigned long long>(
+                after.packed_direct_k5_gate_up_calls-
+                before.packed_direct_k5_gate_up_calls),
+            static_cast<unsigned long long>(
+                after.packed_direct_k5_down_calls-
+                before.packed_direct_k5_down_calls),
+            static_cast<unsigned long long>(
+                after.packed_direct_k5_rows-before.packed_direct_k5_rows));
+    impl_->fast_same_weights_fp16kv_prefill_stats.wide_prefill_forwards+=chunks;
+    impl_->fast_same_weights_fp16kv_prefill_stats.wide_prefill_rows+=total;
+    impl_->fast_same_weights_fp16kv_prefill_stats.numeric_dispatch_calls+=
+        after.calls-before.calls;
+    impl_->fast_same_weights_fp16kv_prefill_stats.numeric_dispatch_rows+=
+        after.rows-before.rows;
+
+    const int final_position=base_position+final_offset;
+    cuda_check(cudaMemcpyAsync(impl_->position_device,&final_position,
+                               sizeof(final_position),cudaMemcpyHostToDevice,stream),
+               "publish final layer-major head position");
+    // The even layer count leaves the completed residual in hidden_a. The
+    // existing final norm/head and tap-generation code publishes the same
+    // final chunk that sequential append_prefill_wide would expose.
+    impl_->process_rows(nullptr,final_rows,final_position,stream,
+        nullptr,false,final_rows>1,true,true,false,nullptr,
+        kLayers,kLayers,
+        impl_->hidden_a+static_cast<std::size_t>(final_offset)*kHidden,
+        nullptr,false);
+    const int last_position=base_position+total-1;
+    cuda_check(cudaMemcpyAsync(impl_->position_device,&last_position,
+                               sizeof(last_position),cudaMemcpyHostToDevice,stream),
+               "publish completed layer-major position");
+    cuda_check(cudaStreamSynchronize(stream),
+               "complete layer-major layers before public position commit");
+    if (!layer_profile.events.empty()) {
+        double gdn_gpu_ms=0.0,attention_gpu_ms=0.0;
+        for (int layer=0;layer<kLayers;++layer) {
+            float elapsed_ms=0.0f;
+            cuda_check(cudaEventElapsedTime(&elapsed_ms,
+                layer_profile.events[layer],layer_profile.events[layer+1]),
+                "resolve layer-major GPU owner timing");
+            if (impl_->model->layers[layer].full_attention)
+                attention_gpu_ms+=elapsed_ms;
+            else gdn_gpu_ms+=elapsed_ms;
+        }
+        std::fprintf(stderr,
+            "LAYER_MAJOR_PROFILE gdn_gpu_ms=%.3f full_attention_gpu_ms=%.3f "
+            "gpu_stack_ms=%.3f rows=%d\n",
+            gdn_gpu_ms,attention_gpu_ms,gdn_gpu_ms+attention_gpu_ms,total);
+    }
+    position_+=total;
+    last_decode_h2d_+=chunks;
+    } catch (...) {
+        workspace.end_layer_reuse();
+        impl_->fast_prefill_failed=true;
+        impl_->last_rows=0;
+        impl_->tap_rows=0;
+        impl_->embedding_rows=0;
+        impl_->qkv_trace_valid=false;
+        impl_->last_hidden_source=nullptr;
+        impl_->graph_active=false;
+        throw;
+    }
 }
 
 void Exl3TextContext::append_media_embeddings_numeric(std::span<const float> embeddings,
@@ -8318,8 +8879,10 @@ void Exl3TextContext::retain_transaction_prefix_impl(
             "P2 retained prefix source rows are inconsistent");
     const bool host_kv = transaction.host_kv && impl_->host_kv.enabled &&
         impl_->oscar == nullptr;
+    const bool device_kv=transaction.device_kv && !impl_->host_kv.enabled &&
+        impl_->oscar == nullptr;
     require(impl_->capture_taps &&
-                (host_kv || (impl_->oscar != nullptr &&
+                (host_kv || device_kv || (impl_->oscar != nullptr &&
                     impl_->oscar->graph_class() == 0)) &&
                 !impl_->graph_active && !impl_->graph_capture_active,
             "P2 retained prefix requires its eager OSCAR or exact HostKV mode");
@@ -8362,7 +8925,7 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     impl_->last_rows = 0;
     impl_->qkv_trace_valid = false;
 
-    if (!host_kv)
+    if (!host_kv && !device_kv)
         impl_->oscar->restore_checkpoint(transaction.oscar_checkpoint, stream);
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl_->full_layers[layer]) {
@@ -8540,8 +9103,9 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
     result.serial=++impl_->greedy_serial;
     auto* output=static_cast<Exl3GreedyRow*>(impl_->greedy_rows->ptr);
     try {
-        exl3_greedy_packet_kernel<<<rows,256,0,stream>>>(source,kVocab,kVocab,result.serial,output);
+        exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,result.serial,output);
         cuda_check(cudaGetLastError(),"greedy packet reduction");
+        if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         // Context-owned destination survives exceptions/partial transfers. No
         // stack packet escapes or is reused after a failed completion fence.
         cuda_check(cudaMemcpyAsync(impl_->greedy_host_rows.data(),output,rows*sizeof(Exl3GreedyRow),
@@ -8597,9 +9161,10 @@ Exl3PendingGreedyPacket Exl3TextContext::submit_greedy_packet(
         acquisition,execution,reinterpret_cast<std::uintptr_t>(
             defer_host_readback?transfer->consumer_event:transfer->event));
     try {
-        exl3_greedy_packet_kernel<<<rows,256,0,stream>>>(source,kVocab,kVocab,
+        exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,
             pending.serial_,static_cast<Exl3GreedyRow*>(transfer->device->ptr));
         cuda_check(cudaGetLastError(),"pending greedy packet reduction");
+        if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         cuda_check(cudaEventRecord(transfer->device_event,stream),
             "pending greedy packet device readiness event");
         if(!defer_host_readback) {
@@ -8796,10 +9361,11 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet_from_scores_for_test(
     result.serial=++impl_->greedy_serial;
     auto* output=static_cast<Exl3GreedyRow*>(impl_->greedy_rows->ptr);
     try {
-        exl3_greedy_packet_kernel<<<rows,256,0,stream>>>(
+        exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,
             static_cast<const std::uint16_t*>(represented.ptr),vocabulary,stride,
             result.serial,output);
         cuda_check(cudaGetLastError(),"greedy packet fixture reduction");
+        if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         cuda_check(cudaMemcpyAsync(impl_->greedy_host_rows.data(),output,
             rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost,stream),
             "greedy packet fixture download");
@@ -9567,6 +10133,7 @@ bool Exl3TextContext::capture_decode_graph(cudaStream_t stream) {
 }
 
 void Exl3TextContext::decode_graph(std::int64_t token_id, cudaStream_t stream) {
+    require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     Impl::require_host_kv_retirement_admission();
     require(!impl_->transaction || !impl_->transaction->rollback_required,
             "P2 target transaction requires rollback after failed prefix retention");
@@ -9771,6 +10338,55 @@ bool Exl3ExactHostState::same_represented_payload_for_test(const Exl3ExactHostSt
             std::memcmp(recurrent_plane(i).data(), x.recurrent_plane(i).data(), recurrent_plane(i).size_bytes()) != 0)
             return false;
     return true;
+}
+std::string Exl3ExactHostState::represented_first_difference_for_test(
+    const Exl3ExactHostState& x) const {
+    const auto scalar=[&](const char* name,auto a,auto b)->std::string {
+        if(a==b)return {};
+        return std::string(name)+" expected="+std::to_string(a)+
+            " actual="+std::to_string(b);
+    };
+    if(auto d=scalar("position",position_,x.position_);!d.empty())return d;
+    if(auto d=scalar("device_position",device_position_,x.device_position_);!d.empty())return d;
+    if(auto d=scalar("rope_offset",rope_offset_,x.rope_offset_);!d.empty())return d;
+    if(auto d=scalar("tap_rows",tap_rows_,x.tap_rows_);!d.empty())return d;
+    if(auto d=scalar("embedding_rows",embedding_rows_,x.embedding_rows_);!d.empty())return d;
+    if(auto d=scalar("last_rows",last_rows_,x.last_rows_);!d.empty())return d;
+    const auto vector_difference=[&](const std::string& name,const auto& a,
+                                     const auto& b)->std::string {
+        if(a.size()!=b.size())return name+" size expected="+
+            std::to_string(a.size())+" actual="+std::to_string(b.size());
+        for(std::size_t i=0;i<a.size();++i)
+            if(std::memcmp(&a[i],&b[i],sizeof(a[i]))!=0)
+                return name+" index="+std::to_string(i)+" expected="+
+                    std::to_string(a[i])+" actual="+std::to_string(b[i]);
+        return {};
+    };
+    if(auto d=scalar("kv_page_count",kv_pages_.size(),x.kv_pages_.size());!d.empty())return d;
+    for(std::size_t i=0;i<kv_pages_.size();++i) {
+        const auto& a=*kv_pages_[i];const auto& b=*x.kv_pages_[i];
+        const auto name="kv_page="+std::to_string(i);
+        if(auto d=scalar((name+" first").c_str(),a.first,b.first);!d.empty())return d;
+        if(auto d=scalar((name+" rows").c_str(),a.rows,b.rows);!d.empty())return d;
+        for(std::size_t bank=0;bank<a.k.size();++bank) {
+            if(auto d=vector_difference(name+" bank="+std::to_string(bank)+" k",
+                    a.k[bank],b.k[bank]);!d.empty())return d;
+            if(auto d=vector_difference(name+" bank="+std::to_string(bank)+" v",
+                    a.v[bank],b.v[bank]);!d.empty())return d;
+        }
+    }
+    for(std::size_t i=0;i<convolution_.size();++i)
+        if(auto d=vector_difference("convolution layer="+std::to_string(i),
+                convolution_[i],x.convolution_[i]);!d.empty())return d;
+    if(auto d=vector_difference("logits",logits_,x.logits_);!d.empty())return d;
+    if(auto d=vector_difference("embedding",embedding_,x.embedding_);!d.empty())return d;
+    for(std::size_t i=0;i<taps_.size();++i)
+        if(auto d=vector_difference("tap="+std::to_string(i),taps_[i],x.taps_[i]);!d.empty())return d;
+    for(std::size_t i=0;i<recurrent_.size();++i) {
+        const auto a=recurrent_plane(i),b=x.recurrent_plane(i);
+        if(auto d=vector_difference("recurrent layer="+std::to_string(i),a,b);!d.empty())return d;
+    }
+    return "equal";
 }
 std::uint64_t Exl3ExactHostState::represented_payload_hash_for_test() const noexcept {
     std::uint64_t hash=1469598103934665603ull;
@@ -10057,7 +10673,8 @@ void Exl3TextContext::fail_export_copy_for_test(unsigned submission) {
 std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_state(cudaStream_t stream,bool share_prefix,
     bool fail_after_recurrent_plan_for_test) const {
     const bool transaction_ready = !impl_->transaction ||
-        (impl_->transaction->host_kv && !impl_->transaction->active &&
+        ((impl_->transaction->host_kv || impl_->transaction->device_kv) &&
+         !impl_->transaction->active &&
          !impl_->transaction->rollback_required);
     require(!impl_->oscar_only && !impl_->oscar && !impl_->graph_active && !impl_->graph_capture_active &&
             transaction_ready && impl_->capture_taps && position_ > 0 &&
@@ -10482,7 +11099,10 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
             (!impl_->oscar_only || oscar) &&
             (!impl_->transaction ||
                 (!impl_->transaction->active && !impl_->transaction->rollback_required &&
-                 (oscar ? !impl_->transaction->host_kv : impl_->transaction->host_kv))) &&
+                 (oscar ? (!impl_->transaction->host_kv &&
+                           !impl_->transaction->device_kv) :
+                          (impl_->transaction->host_kv ||
+                           impl_->transaction->device_kv)))) &&
             (!warm || (oscar && warm->source_.get()==&state)) &&
             impl_->capture_taps && state.model_identity_ == impl_->model->host_state_identity &&
             state.position_ > 0 && state.position_ <= impl_->max_context &&

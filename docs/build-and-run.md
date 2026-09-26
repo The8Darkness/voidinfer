@@ -56,3 +56,32 @@ see [exl3-serving.md](exl3-serving.md). The publication procedure did not redist
 
 Optional Nsight Systems/Compute tools are for profiling and are not runtime dependencies. Profiling
 changes timing; keep attribution captures separate from production-style measurements.
+
+## Bounded host-only configuration checks
+
+During a no-GPU maintenance phase, the ordinary configure/build/CTest commands
+above are not the host-only entry point. On Windows, use:
+
+```powershell
+pwsh -NoProfile -File tools/maintenance/Test-CleanupJob.ps1
+pwsh -NoProfile -File tools/maintenance/Run-Exl3HostContracts.ps1
+```
+
+The first command checks Job Object membership, effective affinity `0xFF` and
+BelowNormal priority in a parent, child and grandchild, including an attempted
+affinity widening. The second directly compiles and runs only the environment
+option/restoration and existing candidate-contract tests. It uses the same job
+limits, one compiler at a time, `/MP1`, `/cgthreads1` and single-threaded library
+settings. The Job Object has no breakaway permission and terminates remaining
+children when its owning shell exits. Run these scripts in a disposable shell;
+their environment and containment apply to that shell's lifetime.
+
+The runner accepts explicit MSVC/Windows SDK roots and versions; its defaults
+match the local MSVC 14.44 / Windows SDK 10.0.26100.0 installation. It has no
+CUDA includes/linkage, project configure, device probe, dependency installation
+or test discovery. Outputs stay in `build-host-contracts/`. To extend the closed
+allowlist, audit the added test's complete include/link/launch path first.
+
+These checks do not build or qualify the engine, CUDA translation units or the
+full DFlash2 harness. Separate authorization and matched runtime validation are
+required before attributing performance or promoting the cleaned source.

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -116,6 +117,21 @@ public:
         // Acquisition identity is separate from the publication generation:
         // yielding does not invalidate a client's cancellation ticket.
         std::uint64_t acquisition = 0;
+    };
+    // Logical authority while a caller-owned physical lane keeps the exact
+    // target/draft state. The initial host root stays resident until one
+    // terminal child is supplied. This handle never owns numerical state.
+    struct DeviceLogicalLease {
+        Ticket ticket;
+        std::shared_ptr<const Exl3VeriCacheRequest> initial_root;
+        std::shared_ptr<const void> physical_owner;
+        std::uint64_t acquisition = 0;
+        int frontier = 0;
+    };
+    struct DeviceLogicalPublication {
+        DeviceLogicalLease lease;
+        std::size_t committed_tokens = 0;
+        std::uint64_t sequence = 0;
     };
     // Issued only by a physical DFlash lane after its final scoped event has
     // completed and retired. Logical cancellation or lease liveness cannot
@@ -809,6 +825,122 @@ public:
         return Lease{Ticket{entry.id, entry.generation}, entry.root, entry.acquisition};
     }
 
+    // The caller must already own the physical lane. Reserve all logical
+    // suffix storage before invalidating its ordinary host Lease.
+    DeviceLogicalLease enter_device_logical(const Lease& lease,
+        std::shared_ptr<const void> physical_owner,int initial_frontier,
+        std::size_t output_token_capacity,int max_context) {
+        std::unique_lock lock(mutex_);
+        require_open(lock);
+        auto& entry=require_lease_locked(lease);
+        if(!physical_owner || max_context<=0 ||
+           !entry.root->state()->native_extent_valid(max_context) ||
+           initial_frontier!=entry.root->state()->position() ||
+           initial_frontier<0 || initial_frontier>max_context ||
+           output_token_capacity==0 ||
+           output_token_capacity>static_cast<std::size_t>(
+               max_context-initial_frontier))
+            throw std::invalid_argument("serving coordinator device logical entry extent/owner");
+        if(entry.generation==UINT64_MAX)
+            throw std::overflow_error("serving coordinator device logical generation exhausted");
+        std::vector<std::int64_t> suffix;
+        suffix.reserve(output_token_capacity);
+        DeviceLogicalLease result{
+            Ticket{entry.id,entry.generation+1},entry.root,
+            physical_owner,entry.acquisition,initial_frontier};
+        entry.device_suffix=std::move(suffix);
+        entry.device_owner=std::move(physical_owner);
+        entry.device_initial_frontier=initial_frontier;
+        entry.device_capacity=output_token_capacity;
+        entry.device_mode=true;
+        ++entry.generation;
+        return result;
+    }
+
+    // The verified numerical operation and any rollback are caller-owned.
+    // This critical section only commits its ordered token result. No host
+    // child or resident-set update is made for an intermediate window.
+    DeviceLogicalPublication publish_device_logical_window(
+        const DeviceLogicalLease& lease,std::span<const std::int64_t> tokens) {
+        std::unique_lock lock(mutex_);
+        require_open(lock);
+        auto& entry=require_device_logical_lease_locked(lease);
+        if(tokens.empty() || tokens.size()>128 ||
+           tokens.size()>entry.device_capacity-entry.device_suffix.size() ||
+           std::any_of(tokens.begin(),tokens.end(),
+               [](std::int64_t token){return token<0;}))
+            throw std::invalid_argument("serving coordinator device logical window tokens/extent");
+        if(entry.generation==UINT64_MAX || entry.publications==UINT64_MAX ||
+           publications_==UINT64_MAX || next_publication_sequence_==UINT64_MAX)
+            throw std::overflow_error("serving coordinator device logical publication exhausted");
+        DeviceLogicalPublication result{
+            DeviceLogicalLease{Ticket{entry.id,entry.generation+1},
+                entry.root,entry.device_owner,entry.acquisition,
+                lease.frontier+static_cast<int>(tokens.size())},
+            entry.device_suffix.size()+tokens.size(),next_publication_sequence_};
+        // Capacity was reserved on entry. Inserting trivial token values does
+        // not allocate; all validation and result construction precedes it.
+        entry.device_suffix.insert(entry.device_suffix.end(),tokens.begin(),tokens.end());
+        ++entry.generation;
+        ++entry.publications;
+        ++publications_;
+        ++next_publication_sequence_;
+        return result;
+    }
+
+    // The caller supplies a fully prepared immutable exact host child. Only
+    // after its lineage and entire accumulated suffix match do we replace the
+    // initial resident root once and restore an ordinary host Lease.
+    Lease materialize_device_logical(const DeviceLogicalLease& lease,
+        std::shared_ptr<const Exl3VeriCacheRequest> child) {
+        validate_root(child);
+        std::unique_lock lock(mutex_);
+        require_open(lock);
+        auto& entry=require_device_logical_lease_locked(lease);
+        if(entry.generation==UINT64_MAX || entry.publications==UINT64_MAX ||
+           publications_==UINT64_MAX || next_publication_sequence_==UINT64_MAX)
+            throw std::overflow_error("serving coordinator device logical materialization exhausted");
+        if(entry.device_suffix.empty() || !child->is_child_of(*entry.root) ||
+           child->state()->model_identity()!=entry.root->state()->model_identity() ||
+           child->state()->position()!=lease.frontier ||
+           child->token_suffix(entry.device_initial_frontier)!=entry.device_suffix)
+            throw std::invalid_argument("serving coordinator device logical child lineage/tokens");
+        const std::array<std::pair<std::uint64_t,
+            std::shared_ptr<const Exl3VeriCacheRequest>>,1> replacement{{{entry.id,child}}};
+        (void)replace_resident_locked(replacement,0);
+        entry.root=std::move(child);
+        entry.device_owner.reset();
+        std::vector<std::int64_t>{}.swap(entry.device_suffix);
+        entry.device_initial_frontier=0;
+        entry.device_capacity=0;
+        entry.device_mode=false;
+        ++entry.generation;
+        ++entry.publications;
+        ++publications_;
+        ++next_publication_sequence_;
+        return Lease{Ticket{entry.id,entry.generation},entry.root,entry.acquisition};
+    }
+
+    // Active logical cancellation is allowed only after the physical worker
+    // has finished or rolled back its operation. The initial root is removed
+    // from residency by the same one-shot cancellation path as host leases.
+    void cancel_device_logical(const DeviceLogicalLease& lease,
+        bool worker_complete) {
+        std::unique_lock lock(mutex_);
+        require_open(lock);
+        auto& entry=require_device_logical_lease_locked(lease);
+        if(!worker_complete)
+            throw std::logic_error("serving coordinator device logical cancellation needs worker boundary");
+        const auto id=entry.id;
+        (void)replace_resident_locked(std::span<const std::pair<std::uint64_t,
+            std::shared_ptr<const Exl3VeriCacheRequest>>>{},id);
+        --active_;
+        entries().erase(std::find_if(entries().begin(),entries().end(),
+            [&](const Entry& candidate){return candidate.id==id;}));
+        ++cancellations_;
+        if(entries().empty())model_identity_.reset();
+    }
+
     void yield(const Lease& lease) {
         std::unique_lock lock(mutex_);
         require_open(lock);
@@ -905,7 +1037,7 @@ public:
             const auto& lease=leases[i];
             for(std::size_t j=0;j<i;++j) if(leases[j].ticket.request_id==lease.ticket.request_id) return false;
             const auto found=std::find_if(entries().begin(),entries().end(),[&](const Entry& e){return e.id==lease.ticket.request_id;});
-            if(found==entries().end() || !found->active || found->generation!=lease.ticket.generation ||
+            if(found==entries().end() || found->device_mode || !found->active || found->generation!=lease.ticket.generation ||
                found->acquisition!=lease.acquisition || found->root!=lease.root) return false;
         }
         return true;
@@ -1137,6 +1269,11 @@ private:
         std::uint64_t publications = 0;
         std::shared_ptr<const Exl3VeriCacheRequest> root;
         std::uint64_t acquisition = 0;
+        bool device_mode = false;
+        std::shared_ptr<const void> device_owner;
+        int device_initial_frontier = 0;
+        std::size_t device_capacity = 0;
+        std::vector<std::int64_t> device_suffix;
     };
 
     static void validate_root(
@@ -1182,9 +1319,24 @@ private:
     }
     Entry& require_lease_locked(const Lease& lease) {
         auto& entry = find_locked(lease.ticket.request_id);
-        if (!entry.active || entry.generation != lease.ticket.generation ||
+        if (entry.device_mode || !entry.active || entry.generation != lease.ticket.generation ||
             entry.root != lease.root || entry.acquisition != lease.acquisition)
             throw std::invalid_argument("serving coordinator stale lease");
+        return entry;
+    }
+    Entry& require_device_logical_lease_locked(const DeviceLogicalLease& lease) {
+        auto& entry=find_locked(lease.ticket.request_id);
+        const auto& owner=lease.physical_owner;
+        const auto& held=entry.device_owner;
+        if(!entry.device_mode || !entry.active ||
+           entry.generation!=lease.ticket.generation ||
+           entry.acquisition!=lease.acquisition ||
+           entry.root!=lease.initial_root || !owner || !held ||
+           owner.get()!=held.get() || owner.owner_before(held) ||
+           held.owner_before(owner) ||
+           lease.frontier!=entry.device_initial_frontier+
+               static_cast<int>(entry.device_suffix.size()))
+            throw std::invalid_argument("serving coordinator stale device logical lease");
         return entry;
     }
     static void require_retirement(const Lease& lease,

@@ -104,8 +104,10 @@ std::string serve_usage_text(const char* argv0) {
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--no-dual-load]\n"
            "       EXL3 selection: --exl3-target DIR --exl3-draft DIR [--exl3-dual-manifest FILE]\n"
-           "       explicit EXL3: C1 or --max-concurrency 2/eager/FP16 HostKV/DFlash2 K7; --temperature 0 required,\n"
-           "       greedy text and exact prefix reuse; positive sampling and media are rejected\n"
+           "       [--exl3-round established|coherent-device]; established is the default\n"
+           "       explicit EXL3: established C1/C2 eager FP16 HostKV DFlash2 K7; coherent-device\n"
+           "       requires C1, ordinary FP16 Device KV, 2048..32768 context, host-root cache,\n"
+           "       and --greedy or --temperature 0; positive sampling and media are rejected\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -191,6 +193,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if(arg=="--exl3-dual-manifest") {
             if(!options.exl3_package)throw std::invalid_argument("EXL3 manifest requires package selection");
             options.exl3_package->verified_dual_manifest=require_value("--exl3-dual-manifest");
+        } else if (arg == "--exl3-round") {
+            if (!options.exl3_package) {
+                throw std::invalid_argument("--exl3-round requires --exl3-target selection");
+            }
+            const std::string_view implementation = require_value("--exl3-round");
+            if (implementation == "established") {
+                options.exl3_package->round_implementation = Exl3RoundImplementation::Established;
+            } else if (implementation == "coherent-device") {
+                options.exl3_package->round_implementation = Exl3RoundImplementation::CoherentDevice;
+            } else {
+                throw std::invalid_argument("--exl3-round must be established or coherent-device");
+            }
         } else if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -428,8 +442,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if(options.exl3_package) {
         if(options.exl3_package->draft_directory.empty())throw std::invalid_argument("EXL3 selection needs --exl3-draft");
-        if(kv_dtype_explicit)throw std::invalid_argument("EXL3 package fixes ordinary FP16 Host KV");
-        options.kv_cache=KvCacheStorage::Float16Host;
+        if(kv_dtype_explicit)throw std::invalid_argument("EXL3 package fixes its ordinary FP16 KV storage");
+        options.kv_cache=options.exl3_package->round_implementation==
+            Exl3RoundImplementation::CoherentDevice?
+            KvCacheStorage::Float16Device:KvCacheStorage::Float16Host;
         if(!speculative_explicit)options.speculative={SpeculativeBackend::DFlash2,7,ProposalHead::Full};
         if(options.hierarchical_vericache.enabled || options.hierarchical_vericache.enable_host_tier_snapshots)
             throw std::invalid_argument("EXL3 text milestone does not enable optional hierarchy/snapshot serving");
@@ -489,6 +505,37 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if(options.exl3_package && options.exl3_package->round_implementation==
+            Exl3RoundImplementation::CoherentDevice) {
+        const auto& sampling=options.sampling_overrides;
+        if((!options.greedy && (!sampling.temperature || *sampling.temperature!=0.0f)) ||
+           (sampling.temperature && *sampling.temperature!=0.0f) ||
+           (sampling.presence_penalty && *sampling.presence_penalty!=0.0f) ||
+           (sampling.frequency_penalty && *sampling.frequency_penalty!=0.0f) ||
+           (sampling.top_p && *sampling.top_p!=1.0f) ||
+           (sampling.top_k && *sampling.top_k!=0) ||
+           (sampling.min_p && *sampling.min_p!=0.0f))
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires explicit greedy sampling without distribution overrides");
+        if(options.max_concurrency!=1 || options.enable_vision || options.use_cuda_graph ||
+           options.hierarchical_vericache.enabled ||
+           options.speculative.backend!=SpeculativeBackend::DFlash2 ||
+           options.speculative.draft_tokens!=7 ||
+           options.speculative.proposal_head!=ProposalHead::Full)
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires C1 text/eager/DFlash2-K7 full proposals");
+        if(options.max_context<2048 || options.max_context>32768 ||
+           options.kv_capacity.mode!=KvCapacityMode::Explicit ||
+           options.kv_capacity.explicit_tokens<options.max_context)
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires ordinary 2048..32768 context and explicit full KV capacity");
+        if(!options.context_cache.enabled || options.context_cache.host_state_slots==0 ||
+           options.context_cache.max_shared_prefixes==0 ||
+           options.context_cache.host_kv_capacity_bytes<
+               static_cast<std::uint64_t>(options.max_context)*65536)
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires a host-root cache and one terminal exact KV snapshot");
+    }
     if (options.kv_cache == KvCacheStorage::VeriCacheNvfp4 &&
         options.speculative.backend != SpeculativeBackend::Mtp &&
         options.speculative.backend != SpeculativeBackend::DFlash) {
