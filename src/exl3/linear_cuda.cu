@@ -60,36 +60,8 @@ bool exl3_pdl_enabled() {
     return enabled;
 }
 
-// NINFER_EXL3_COHERENT_TAIL_REDUCE (default 1): the coherent producer's last
-// split CTA per Hadamard group runs the exact warp reduction/output transform.
-bool coherent_tail_reduce_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_TAIL_REDUCE");
-        if (!value || std::strcmp(value, "1") == 0) return true;
-        if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_COHERENT_TAIL_REDUCE must be 0 or 1");
-    }();
-    return enabled;
-}
-
-// Zeroed arrival counters, one pool per accumulation plane. Producers sharing
-// a plane are already serialized by that shared scratch, so they may share
-// counters. Allocated outside capture (workspace construction) and retained
-// for the process lifetime.
-unsigned* exl3_tail_counters_for(const float* accum) {
-    static std::mutex mutex;
-    static std::unordered_map<const float*, unsigned*> pools;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto& pool = pools[accum];
-    if (!pool) {
-        constexpr std::size_t kGroups = 1024;
-        if (cudaMalloc(reinterpret_cast<void**>(&pool), kGroups * sizeof(unsigned)) != cudaSuccess ||
-            cudaMemset(pool, 0, kGroups * sizeof(unsigned)) != cudaSuccess)
-            throw std::runtime_error("allocate coherent tail counters");
-    }
-    return pool;
-}
-
+bool coherent_tail_reduce_enabled();
+unsigned* exl3_tail_counters_for(const float* accum);
 template<class... KernelArgs,class... CallArgs>
 void exl3_launch_pdl(void (*kernel)(KernelArgs...),dim3 grid,dim3 block,
                      std::size_t shared,cudaStream_t stream,CallArgs&&... args) {
@@ -10150,6 +10122,37 @@ bool generic_narrow_enabled() {
         throw std::invalid_argument("NINFER_EXL3_GENERIC_NARROW must be 0 or 1");
     }();
     return enabled;
+}
+
+// NINFER_EXL3_COHERENT_TAIL_REDUCE (default 1): the coherent producer's last
+// split CTA per Hadamard group runs the exact warp reduction/output transform.
+bool coherent_tail_reduce_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_TAIL_REDUCE");
+        if (!value || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        throw std::invalid_argument("NINFER_EXL3_COHERENT_TAIL_REDUCE must be 0 or 1");
+    }();
+    return enabled;
+}
+
+// Zeroed arrival counters, one pool per accumulation plane. Producers sharing
+// a plane are already serialized by that shared scratch, so they may share
+// counters. Allocated outside capture (workspace construction) and retained
+// for the process lifetime.
+unsigned* exl3_tail_counters_for(const float* accum) {
+    static std::mutex mutex;
+    static std::unordered_map<const float*, unsigned*> pools;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& pool = pools[accum];
+    if (!pool) {
+        constexpr std::size_t kGroups = 1024;
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&pool), kGroups * sizeof(unsigned)),
+                   "cudaMalloc coherent tail counters");
+        cuda_check(cudaMemset(pool, 0, kGroups * sizeof(unsigned)),
+                   "zero coherent tail counters");
+    }
+    return pool;
 }
 
 template <int Bits>
