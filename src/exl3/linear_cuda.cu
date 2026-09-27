@@ -1482,11 +1482,46 @@ __device__ __forceinline__ void decode4_three_word_k7(
     w3 = decode_state_from_three_words_k7(a, b, c, relative_bit + 21);
 }
 
+// Branch-free K7 four-state window for any t_offset in [0,256). States 0..2
+// always lie inside the first two represented words; only state 3 can reach
+// the third word (relative bit > 27), and it is selected rather than taken
+// through a divergent per-lane path. Extracted states, and hence decoded
+// halves, are bitwise identical to decode4_generic/decode4_three_word_k7.
+__device__ __forceinline__ void exl3_dq4_k7_window(
+    const std::uint32_t* packed, int t_offset, Exl3FragB& fragment,
+    std::uint32_t mul1_multiplier) {
+    const int b0 = t_offset * 7 + 1783;
+    int i0 = b0 >> 5;
+    if (i0 >= 56) i0 -= 56;
+    const int i1 = i0 == 55 ? 0 : i0 + 1;
+    const int i2 = i1 == 55 ? 0 : i1 + 1;
+    const int rel = b0 & 31;
+    const std::uint32_t a = packed[i0], b = packed[i1], c = packed[i2];
+    const std::uint64_t ab = (static_cast<std::uint64_t>(a) << 32) | b;
+    const std::uint64_t bc = (static_cast<std::uint64_t>(b) << 32) | c;
+    const std::uint32_t w0 = static_cast<std::uint32_t>(ab >> (48 - rel)) & 0xffffu;
+    const std::uint32_t w1 = static_cast<std::uint32_t>(ab >> (41 - rel)) & 0xffffu;
+    const std::uint32_t w2 = static_cast<std::uint32_t>(ab >> (34 - rel)) & 0xffffu;
+    const std::uint32_t w3 = (rel <= 27
+        ? static_cast<std::uint32_t>(ab >> (27 - rel))
+        : static_cast<std::uint32_t>(bc >> (59 - rel))) & 0xffffu;
+    fragment.values[0] = decode_mul1_product_2_k7(w0 * mul1_multiplier,
+                                                   w1 * mul1_multiplier);
+    fragment.values[1] = decode_mul1_product_2_k7(w2 * mul1_multiplier,
+                                                   w3 * mul1_multiplier);
+}
+
 template <int Bits, bool K7ThreeWord = false>
 __device__ __forceinline__ void exl3_dq4_generic(const std::uint32_t* packed,
                                                   int t_offset,
                                                   Exl3FragB& fragment,
                                                   std::uint32_t mul1_multiplier) {
+#ifndef NINFER_EXL3_K7_DIVERGENT_DECODE
+    if constexpr (Bits == 7 && K7ThreeWord) {
+        exl3_dq4_k7_window(packed, t_offset, fragment, mul1_multiplier);
+        return;
+    }
+#endif
     const int b0 = (t_offset + 257) * Bits - 16;
     if ((b0 & 31) + 3 * Bits + 16 > 64) {
         // A four-state window can cross three 32-bit words for some K7/K8
