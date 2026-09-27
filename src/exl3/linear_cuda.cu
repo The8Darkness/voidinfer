@@ -9612,6 +9612,24 @@ static void launch_coherent_packed_variant(
         static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t) +
         16u * tiles * 16u * sizeof(float);
     const int grid = output_features / (16 * tiles) * split_count;
+    // The exact K6 lane-window and K7 three-word decoders (identical state
+    // words and MUL1 arithmetic) are the measured default;
+    // NINFER_EXL3_COHERENT_FAST_DECODE=0 restores the generic decoder.
+    static const bool fast_decode = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_FAST_DECODE");
+        if (!value) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        throw std::invalid_argument("NINFER_EXL3_COHERENT_FAST_DECODE must be 0 or 1");
+    }();
+    if (fast_decode) {
+        exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
+            false, Bits == 6, false, false, false, Stages, Warps, Per><<<
+            dim3(grid), dim3(Warps * 32), shared, stream>>>(
+                transformed, trellis, mul1, accum, rows, input_features,
+                output_features, split_count);
+        return;
+    }
     exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
         false, false, false, false, false, Stages, Warps, Per><<<
         dim3(grid), dim3(Warps * 32), shared, stream>>>(
