@@ -432,6 +432,12 @@ __global__ void gdn_recurrence_sm120_kernel(const std::uint16_t* q, const std::u
     float* s = state + head * kHeadDim * kHeadDim;
     constexpr unsigned mask = 0xffffffffu;
     constexpr float output_scale = 0.08838834764831843f; // 1 / sqrt(128)
+    // The warp's state column stays in registers across rows: loaded once,
+    // stored once. Per-row arithmetic is unchanged.
+    float column[4];
+    #pragma unroll
+    for (int part = 0; part < 4; ++part)
+        column[part] = s[(lane + part * 32) * kHeadDim + value_dim];
     for (int row = 0; row < rows; ++row) {
         const int qk_base = row * (kKeyHeads * kHeadDim) + qk_head * kHeadDim;
         float q_norm[4], k_norm[4];
@@ -466,8 +472,7 @@ __global__ void gdn_recurrence_sm120_kernel(const std::uint16_t* q, const std::u
         float kv_mem = 0.0f;
         #pragma unroll
         for (int part = 0; part < 4; ++part) {
-            const int kd = lane + part * 32;
-            updated[part] = s[kd * kHeadDim + value_dim] * alpha;
+            updated[part] = column[part] * alpha;
             kv_mem += updated[part] * k_norm[part];
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -478,9 +483,8 @@ __global__ void gdn_recurrence_sm120_kernel(const std::uint16_t* q, const std::u
         const float delta = beta_value * (value - kv_mem);
         #pragma unroll
         for (int part = 0; part < 4; ++part) {
-            const int kd = lane + part * 32;
             updated[part] += k_norm[part] * delta;
-            s[kd * kHeadDim + value_dim] = updated[part];
+            column[part] = updated[part];
         }
 
         float result = 0.0f;
@@ -493,6 +497,9 @@ __global__ void gdn_recurrence_sm120_kernel(const std::uint16_t* q, const std::u
             out[row * (kHeads * kHeadDim) + head * kHeadDim + value_dim] = __float2bfloat16_rn(result * output_scale);
         }
     }
+    #pragma unroll
+    for (int part = 0; part < 4; ++part)
+        s[(lane + part * 32) * kHeadDim + value_dim] = column[part];
 }
 
 __global__ void gdn_prefill_normalize_kernel(const std::uint16_t* q,
