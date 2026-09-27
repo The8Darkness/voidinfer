@@ -1247,6 +1247,91 @@ __global__ void control_fused_kernel(const std::uint16_t* input,
     }
 }
 
+// Staged twin of control_fused_kernel: the CTA copies the activation row and
+// both weight rows to shared memory with 16-byte loads in one pass, then each
+// thread runs the identical fmaf chain over d = t, t+128, ... and the same
+// shuffle / four-warp reduction, so every output is bitwise unchanged.
+__global__ void __launch_bounds__(128) control_fused_staged_kernel(
+    const std::uint16_t* input, const std::uint16_t* a_weight,
+    const std::uint16_t* b_weight, const float* a_log, const float* dt_bias,
+    float* a_output, float* b_output, float* beta_trace, float* g_trace, int rows) {
+    EXL3_PDL_SMALL_PROLOGUE();
+    constexpr int kThreads = 128;
+    constexpr int kWarps = kThreads / 32;
+    constexpr int kVectors = kHidden / 8;
+    __shared__ uint4 staged_x[kVectors], staged_a[kVectors], staged_b[kVectors];
+    __shared__ float partial_a[kWarps];
+    __shared__ float partial_b[kWarps];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int index = static_cast<int>(blockIdx.x);
+    const int row = index / kHeads;
+    const int head = index % kHeads;
+    if (row >= rows) return;
+    const auto* x_source = reinterpret_cast<const uint4*>(input + row * kHidden);
+    const auto* a_source = reinterpret_cast<const uint4*>(a_weight + head * kHidden);
+    const auto* b_source = reinterpret_cast<const uint4*>(b_weight + head * kHidden);
+    #pragma unroll
+    for (int i = tid; i < kVectors; i += kThreads) {
+        staged_x[i] = x_source[i];
+        staged_a[i] = a_source[i];
+        staged_b[i] = b_source[i];
+    }
+    __syncthreads();
+    const auto* xs = reinterpret_cast<const std::uint16_t*>(staged_x);
+    const auto* as = reinterpret_cast<const std::uint16_t*>(staged_a);
+    const auto* bs = reinterpret_cast<const std::uint16_t*>(staged_b);
+    float asum = 0.0f, bsum = 0.0f;
+    #pragma unroll 8
+    for (int step = 0; step < kHidden / kThreads; ++step) {
+        const int d = tid + step * kThreads;
+        const float x = half_value(xs[d]);
+        asum = fmaf(x, half_value(as[d]), asum);
+        bsum = fmaf(x, half_value(bs[d]), bsum);
+    }
+    constexpr unsigned mask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        asum += __shfl_down_sync(mask, asum, offset);
+        bsum += __shfl_down_sync(mask, bsum, offset);
+    }
+    if (lane == 0) {
+        partial_a[warp] = asum;
+        partial_b[warp] = bsum;
+    }
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        asum = 0.0f;
+        bsum = 0.0f;
+        for (int w = 0; w < kWarps; ++w) {
+            asum += partial_a[w];
+            bsum += partial_b[w];
+        }
+        a_output[index] = asum;
+        b_output[index] = bsum;
+        const float beta_f = 1.0f / (1.0f + expf(-bsum));
+        const float av = asum + dt_bias[head];
+        const float softplus = av > 20.0f ? av : log1pf(expf(av));
+        beta_trace[index] = __bfloat162float(__float2bfloat16_rn(beta_f));
+        g_trace[index] = -expf(a_log[head]) * softplus;
+    }
+}
+
+bool control_aligned(const void* a,const void* b,const void* c) {
+    return ((reinterpret_cast<std::uintptr_t>(a)|reinterpret_cast<std::uintptr_t>(b)|
+             reinterpret_cast<std::uintptr_t>(c))&15u)==0;
+}
+
+bool gdn_control_staged_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_CONTROL_STAGED");
+        if(!value||std::strcmp(value,"1")==0) return true;
+        if(std::strcmp(value,"0")==0) return false;
+        throw std::invalid_argument("NINFER_EXL3_GDN_CONTROL_STAGED must be 0 or 1");
+    }();
+    return enabled;
+}
+
 // Tiled twin of control_fused_kernel for prefill: one CTA owns R rows x H
 // heads. Thread t keeps, for every (row, head) pair, the same ascending fmaf
 // chain over d = t, t+128, ... and the same shuffle and four-warp reductions,
@@ -2431,7 +2516,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
                 a,b,beta_trace,g_trace,rows);
         } else {
-            exl3_launch_small(control_fused_kernel,dim3(rows*kHeads),dim3(128),0,stream,
+            exl3_launch_small(gdn_control_staged_enabled()&&control_aligned(h,weights_.a_weight,weights_.b_weight)?control_fused_staged_kernel:control_fused_kernel,
+                dim3(rows*kHeads),dim3(128),0,stream,
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
                 a,b,beta_trace,g_trace,rows);
         }
@@ -3329,7 +3415,8 @@ void Exl3GdnLayer::forward_pair_staged_serial_for_test(
         telemetry->serial_b8_projection_calls += 2;
     }
     for (auto& lane : lanes) {
-        exl3_launch_small(control_fused_kernel,dim3(rows * kHeads),dim3(128),0,stream,
+        exl3_launch_small(gdn_control_staged_enabled()&&control_aligned(lane.h,lane.layer->weights_.a_weight,lane.layer->weights_.b_weight)?control_fused_staged_kernel:control_fused_kernel,
+            dim3(rows * kHeads),dim3(128),0,stream,
             lane.h, lane.layer->weights_.a_weight, lane.layer->weights_.b_weight,
             lane.layer->weights_.a_log, lane.layer->weights_.dt_bias,
             lane.a, lane.b, lane.beta_trace, lane.g_trace, rows);
