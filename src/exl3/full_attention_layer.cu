@@ -5974,10 +5974,67 @@ void fast_wmma64_attention_fixture(const std::uint16_t* q,
 // softmax (natural-exponent domain, P rounded to FP16 for P x V). Results are
 // written into the fused-flash scratch slot layout (unnormalized values plus
 // segment max and denominator), so the existing segment merge is reused.
-constexpr int kVerifyMmaKeys=256;
 constexpr int kVerifyMmaChunk=32;
 constexpr int kVerifyMmaStride=kHeadDim+8;
 
+// Per-head twin of attention_cached_gqa_six_fused_flash_merge_kernel: one CTA
+// per (row, KV head, query head) instead of one per (row, KV head). Every
+// output performs the identical ordered max, scale, denominator and numerator
+// chain, so the result is bitwise equal; only the parallel extent changes.
+__global__ void attention_fused_flash_merge_heads_kernel(
+    const float* workspace,std::uint16_t* output,int rows,int segments,
+    int position,int capacity,int keys,const int* position_device,
+    int query_offset) {
+    constexpr int H=kFastFusedFlashHeads;
+    const int block=static_cast<int>(blockIdx.x);
+    const int head=block%H;
+    const int query=block/(H*kKVHeads);
+    const int kv_head=(block/H)%kKVHeads;
+    const int tid=threadIdx.x;
+    if(query>=rows || tid>=kHeadDim) return;
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int count=base+query+1;
+    std::uint16_t* out=output+(query*kQHeads+kv_head*H+head)*kHeadDim+tid;
+    if(count<1 || count>capacity) { *out=0; return; }
+    const int live_segments=min(segments,(count+keys-1)/keys);
+    const float* slots=workspace+
+        (static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments*kFastFusedFlashStride;
+    float global_max=-3.402823466e+38F;
+    for(int segment=0;segment<live_segments;++segment)
+        global_max=fmaxf(global_max,
+            slots[segment*kFastFusedFlashStride+kFastFusedFlashValues+head]);
+    float denominator=0.0f,numerator=0.0f;
+    for(int segment=0;segment<live_segments;++segment) {
+        const float* slot=slots+segment*kFastFusedFlashStride;
+        const float scale=expf(slot[kFastFusedFlashValues+head]-global_max);
+        denominator+=slot[kFastFusedFlashValues+H+head]*scale;
+        numerator+=slot[head*kHeadDim+tid]*scale;
+    }
+    *out=__half_as_ushort(__float2half_rn(numerator/denominator));
+}
+
+bool fused_flash_merge_heads_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_FLASH_MERGE_HEADS");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+void launch_fused_flash_merge(const float* workspace,std::uint16_t* output,int rows,
+    int segments,int position,int capacity,int keys,const int* position_device,
+    cudaStream_t stream) {
+    if(fused_flash_merge_heads_enabled())
+        attention_fused_flash_merge_heads_kernel<<<
+            rows*kKVHeads*kFastFusedFlashHeads,256,0,stream>>>(workspace,output,rows,
+                segments,position,capacity,keys,position_device,0);
+    else
+        attention_cached_gqa_six_fused_flash_merge_kernel<<<
+            rows*kKVHeads,256,0,stream>>>(workspace,output,rows,segments,position,
+                capacity,keys,position_device,0);
+}
+
+template<int kVerifyMmaKeys>
 __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,float* workspace,int rows,int position,
@@ -6141,23 +6198,64 @@ bool verify_flash_mma_enabled() {
     return enabled;
 }
 
-void launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
-    const std::uint16_t* v,float* workspace,int rows,int position,int capacity,
-    int segments,const int* position_device,cudaStream_t stream) {
-    attention_verify_flash_mma_kernel<<<dim3(segments,kKVHeads),96,0,stream>>>(
-        q,k,v,workspace,rows,position,capacity,segments,position_device,0);
+// Key-segment length of the tensor-core flash path (64, 128 or 256). Shorter
+// segments raise the CTA count for decode-sized row counts; a length whose
+// scratch would exceed the owned plane falls back to the next longer one.
+int verify_flash_mma_keys() {
+    static const int keys=[] {
+        const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS");
+        if(!value) return 256;
+        const int parsed=std::atoi(value);
+        if(parsed!=64 && parsed!=128 && parsed!=256)
+            throw std::invalid_argument("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS must be 64, 128 or 256");
+        return parsed;
+    }();
+    return keys;
+}
+
+// Tensor-core flash attention plus segment merge. Returns the key-segment
+// length used.
+int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,float* workspace,std::size_t workspace_bytes,
+    std::uint16_t* output,int rows,int position,int capacity,
+    const int* position_device,cudaStream_t stream,int requested_keys=0) {
+    const int count=position+rows;
+    int keys=requested_keys?requested_keys:verify_flash_mma_keys();
+    const auto required=[&](int length) {
+        return static_cast<std::size_t>(rows)*kKVHeads*((count+length-1)/length)*
+            kFastFusedFlashStride*sizeof(float);
+    };
+    while(keys<256 && required(keys)>workspace_bytes) keys*=2;
+    if(required(keys)>workspace_bytes)
+        throw std::invalid_argument("verify flash MMA scratch extent");
+    const int segments=(count+keys-1)/keys;
+    const dim3 grid(segments,kKVHeads);
+    if(keys==64)
+        attention_verify_flash_mma_kernel<64><<<grid,96,0,stream>>>(
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0);
+    else if(keys==128)
+        attention_verify_flash_mma_kernel<128><<<grid,96,0,stream>>>(
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0);
+    else
+        attention_verify_flash_mma_kernel<256><<<grid,96,0,stream>>>(
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0);
+    launch_fused_flash_merge(workspace,output,rows,segments,position,capacity,keys,
+        position_device,stream);
+    return keys;
 }
 
 void fast_verify_flash_mma_fixture(const std::uint16_t* q,
     const std::uint16_t* k,const std::uint16_t* v,float* workspace,
     std::uint16_t* output,int position,int capacity,int segments,int rows,
-    cudaStream_t stream) {
+    cudaStream_t stream,int keys) {
     if(rows<1 || rows>8 || position<0 || position+rows>capacity)
         throw std::invalid_argument("verify flash MMA fixture rows/frontier");
-    launch_verify_flash_mma(q,k,v,workspace,rows,position,capacity,segments,nullptr,stream);
-    attention_cached_gqa_six_fused_flash_merge_kernel<<<
-        rows*kKVHeads,256,0,stream>>>(workspace,output,rows,segments,position,
-            capacity,kFastFusedFlashKeys256,nullptr,0);
+    const std::size_t bytes=static_cast<std::size_t>(rows)*kKVHeads*
+        ((position+rows+keys-1)/keys)*kFastFusedFlashStride*sizeof(float);
+    (void)segments;
+    if(launch_verify_flash_mma(q,k,v,workspace,bytes,output,rows,position,capacity,
+           nullptr,stream,keys)!=keys)
+        throw std::invalid_argument("verify flash MMA fixture segment length");
     cuda_check(cudaGetLastError(),"verify flash MMA fixture launch");
 }
 
@@ -8002,9 +8100,11 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                                                          cache_capacity_))
                 throw std::invalid_argument(
                     "FAST fused flash attention scratch extent");
-            if(fast_fused_flash_attention_keys256_&&verify_flash_mma_enabled())
-                launch_verify_flash_mma(qr,attention_k,attention_v,exact_scores_,rows,
-                    position,cache_capacity_,segments,position_device_,stream);
+            const bool mma=fast_fused_flash_attention_keys256_&&verify_flash_mma_enabled();
+            if(mma)
+                launch_verify_flash_mma(qr,attention_k,attention_v,exact_scores_,
+                    exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
+                    attn,rows,position,cache_capacity_,position_device_,stream);
             else if(fast_fused_flash_attention_keys256_&&fused_flash_staged_k_enabled())
                 attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256,true><<<
                     rows*kKVHeads*segments,256,0,stream>>>(
@@ -8020,10 +8120,9 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     rows*kKVHeads*segments,256,0,stream>>>(
                         qr,attention_k,attention_v,exact_scores_,attn,rows,position,
                         cache_capacity_,segments,position_device_,0);
-            attention_cached_gqa_six_fused_flash_merge_kernel<<<
-                rows*kKVHeads,256,0,stream>>>(
-                    exact_scores_,attn,rows,segments,position,cache_capacity_,
-                    fused_keys,position_device_,0);
+            if(!mma)
+                launch_fused_flash_merge(exact_scores_,attn,rows,segments,position,
+                    cache_capacity_,fused_keys,position_device_,stream);
             launch(cudaGetLastError(),
                    "launch FAST same-weight FP16-KV fused flash attention");
             fast_fused_flash_attention_counter.fetch_add(

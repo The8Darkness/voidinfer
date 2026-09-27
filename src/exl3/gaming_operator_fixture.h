@@ -52,7 +52,7 @@ void fast_wmma64_attention_fixture(const std::uint16_t* q,
 void fast_verify_flash_mma_fixture(const std::uint16_t* q,
     const std::uint16_t* k,const std::uint16_t* v,float* workspace,
     std::uint16_t* output,int position,int capacity,int segments,int rows,
-    cudaStream_t stream=nullptr);
+    cudaStream_t stream=nullptr,int keys=256);
 void fast_fused_attention_fixture(const std::uint16_t* q,
     const std::uint16_t* k,const std::uint16_t* v,float* workspace,
     std::uint16_t* output,int position,int capacity,int segments,

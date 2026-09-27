@@ -384,15 +384,20 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         quality<<"index,target,nll,argmax\n";
         constexpr int kVocabRows=248320;
         double total_nll=0.0;std::size_t scored=0,agree=0;
-        for(std::size_t first=0;first+8<tokens.size();first+=8) {
-            const std::span<const std::int64_t> block(tokens.data()+first,8);
+        // Block length (1..8; default 8) selects the verifier row count, so
+        // decode-sized attention/GEMM routes can be gated by the same metric.
+        const int block_rows=env("NINFER_EXL3_TEST_VERIFY_QUALITY_ROWS").empty()?8:
+            std::stoi(env("NINFER_EXL3_TEST_VERIFY_QUALITY_ROWS"));
+        require(block_rows>=1&&block_rows<=8,"verify quality rows");
+        for(std::size_t first=0;first+block_rows<tokens.size();first+=block_rows) {
+            const std::span<const std::int64_t> block(tokens.data()+first,block_rows);
             live->begin_transaction(diagnostic_stream.value);
             live->continue_rows(block,diagnostic_stream.value);
             const auto logits=live->continuation_logits_host(diagnostic_stream.value);
-            require(logits.size()>=static_cast<std::size_t>(8)*kVocabRows,
+            require(logits.size()>=static_cast<std::size_t>(block_rows)*kVocabRows,
                 "verify quality logits extent");
             live->commit_transaction();
-            for(int row=0;row<8;++row) {
+            for(int row=0;row<block_rows;++row) {
                 const float* values=logits.data()+static_cast<std::size_t>(row)*kVocabRows;
                 const auto target=tokens[first+row+1];
                 float maximum=-INFINITY;int arg=0;

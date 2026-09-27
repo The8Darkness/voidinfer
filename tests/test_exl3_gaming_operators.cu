@@ -375,7 +375,7 @@ static void wmma32_register_bitwise(int rows,int position,int split,int heads,bo
 // tensor-core candidate against one independent FP64 oracle (causal GQA-6,
 // head dim 256, 1/16 score scale) over realistic activation magnitudes.
 static void verify_flash_mma_oracle(int rows,int position,double* worst_candidate,
-                                    double* worst_reference){
+                                    double* worst_reference,int keys=256){
     constexpr int qheads=24,kvheads=4,dim=256;
     const int capacity=position+rows+64;
     const int segments=(position+rows+255)/256;
@@ -388,13 +388,13 @@ static void verify_flash_mma_oracle(int rows,int position,double* worst_candidat
     for(auto& x:kh)x=__half_as_ushort(__float2half_rn(uniform()*3.0f));
     for(auto& x:vh)x=__half_as_ushort(__float2half_rn(uniform()*2.0f));
     H q(qh.size()),k(kh.size()),v(vh.size()),reference(qh.size()),candidate(qh.size());
-    Buffer<float> workspace(static_cast<std::size_t>(rows)*kvheads*segments*
-        (6*dim+12));
+    Buffer<float> workspace(static_cast<std::size_t>(rows)*kvheads*
+        ((position+rows+63)/64)*(6*dim+12));
     q.set(qh);k.set(kh);v.set(vh);
     fast_fused_attention_fixture(q.p,k.p,v.p,workspace.p,reference.p,position,capacity,
         segments,nullptr,nullptr,rows);
     fast_verify_flash_mma_fixture(q.p,k.p,v.p,workspace.p,candidate.p,position,capacity,
-        segments,rows,nullptr);
+        segments,rows,nullptr,keys);
     ck(cudaDeviceSynchronize());
     const auto ref_out=reference.get(),cand_out=candidate.get();
     double max_ref=0,max_cand=0;
@@ -418,7 +418,7 @@ static void verify_flash_mma_oracle(int rows,int position,double* worst_candidat
     }
     *worst_candidate=std::max(*worst_candidate,max_cand);
     *worst_reference=std::max(*worst_reference,max_ref);
-    std::cout<<"VERIFY_FLASH_MMA rows="<<rows<<" position="<<position<<
+    std::cout<<"VERIFY_FLASH_MMA keys="<<keys<<" rows="<<rows<<" position="<<position<<
         " max_abs_error_candidate="<<max_cand<<" max_abs_error_scalar="<<max_ref<<'\n';
 }
 static void fused_graph_coverage(){
@@ -652,7 +652,9 @@ int main(int argc,char** argv){try{
         double worst_candidate=0,worst_reference=0;
         for(auto shape:std::vector<std::pair<int,int>>{{1,0},{8,0},{8,31},{3,255},{8,256},
                 {8,1000},{5,2047},{8,4095},{8,8190}})
-            verify_flash_mma_oracle(shape.first,shape.second,&worst_candidate,&worst_reference);
+            for(int keys:{256,128,64})
+                verify_flash_mma_oracle(shape.first,shape.second,&worst_candidate,
+                    &worst_reference,keys);
         std::cout<<"VERIFY_FLASH_MMA worst candidate="<<worst_candidate<<
             " scalar="<<worst_reference<<'\n';
         require(worst_candidate<=2.0*worst_reference+2e-3,
