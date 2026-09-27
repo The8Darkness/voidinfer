@@ -41,6 +41,46 @@ constexpr int kTilesN = 1088;
 constexpr int kHadamard = 128;
 constexpr int kThreads = 256;
 constexpr float kHadamardScale = 0.088388347648f;
+
+// Programmatic dependent launch. Kernels carrying this prologue wait for full
+// completion (and memory visibility) of their stream predecessor before any
+// global access, so the attribute only overlaps launch/scheduling latency.
+// Without the attribute both instructions are no-ops.
+#define EXL3_PDL_PROLOGUE()                                              \
+    do {                                                                 \
+        asm volatile("griddepcontrol.wait;" ::: "memory");               \
+        asm volatile("griddepcontrol.launch_dependents;");               \
+    } while (0)
+
+bool exl3_pdl_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_PDL");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+template<class... KernelArgs,class... CallArgs>
+void exl3_launch_pdl(void (*kernel)(KernelArgs...),dim3 grid,dim3 block,
+                     std::size_t shared,cudaStream_t stream,CallArgs&&... args) {
+    if(!exl3_pdl_enabled()) {
+        kernel<<<grid,block,shared,stream>>>(std::forward<CallArgs>(args)...);
+        return;
+    }
+    cudaLaunchAttribute attribute{};
+    attribute.id=cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute.val.programmaticStreamSerializationAllowed=1;
+    cudaLaunchConfig_t config{};
+    config.gridDim=grid;
+    config.blockDim=block;
+    config.dynamicSmemBytes=shared;
+    config.stream=stream;
+    config.attrs=&attribute;
+    config.numAttrs=1;
+    const cudaError_t error=cudaLaunchKernelEx(&config,kernel,std::forward<CallArgs>(args)...);
+    if(error!=cudaSuccess)
+        throw std::runtime_error(std::string("PDL launch: ")+cudaGetErrorString(error));
+}
 constexpr std::uint16_t kMul1AccumulatorHalf = 0x6400u;
 constexpr std::uint16_t kMul1InverseHalf = 0x1eeeu;
 constexpr std::uint16_t kMul1BiasHalf = 0xc931u;
@@ -985,6 +1025,7 @@ template<bool RoundProductToHalf,bool GateUp>
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) input_hadamard_warp_kernel(
     const std::uint16_t* input,const std::uint16_t* suh,std::uint16_t* transformed,
     int rows,int input_features,const std::uint16_t* up,std::uint16_t* activation) {
+    EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
     const int blocks=input_features/kHadamard;
     const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
@@ -1025,6 +1066,7 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) input_hadamard_warp
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_warp_kernel(
     const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
     int output_features) {
+    EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
     const int blocks=output_features/kHadamard;
     const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
@@ -1050,6 +1092,7 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_war
 
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_fp16_inplace_warp_kernel(
     std::uint16_t* output,const std::uint16_t* svh,int rows,int output_features) {
+    EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
     const int blocks=output_features/kHadamard;
     const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
@@ -1095,9 +1138,9 @@ void launch_input_hadamard(cudaStream_t stream,const std::uint16_t* input,
     static_assert(Block==kHadamard);
     if(rows>0 && exl3_hadamard_warp_enabled() && input_features%kHadamard==0 &&
        exl3_hadamard_warp_aligned(input,suh,transformed,up,activation))
-        input_hadamard_warp_kernel<RoundProductToHalf,GateUp><<<
-            exl3_hadamard_warp_grid(rows,input_features),kHadamardWarpsPerBlock*32,0,stream>>>(
-                input,suh,transformed,rows,input_features,up,activation);
+        exl3_launch_pdl(input_hadamard_warp_kernel<RoundProductToHalf,GateUp>,
+            dim3(exl3_hadamard_warp_grid(rows,input_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,input,suh,transformed,rows,input_features,up,activation);
     else
         input_hadamard_kernel<Block,RoundProductToHalf,GateUp><<<
             dim3(rows,input_features/kHadamard),dim3(kHadamard),0,stream>>>(
@@ -1108,8 +1151,9 @@ inline void launch_output_hadamard(cudaStream_t stream,const float* accum,
     const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features) {
     if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
        exl3_hadamard_warp_aligned(accum,svh,output))
-        output_hadamard_warp_kernel<<<exl3_hadamard_warp_grid(rows,output_features),
-            kHadamardWarpsPerBlock*32,0,stream>>>(accum,svh,output,rows,output_features);
+        exl3_launch_pdl(output_hadamard_warp_kernel,
+            dim3(exl3_hadamard_warp_grid(rows,output_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,accum,svh,output,rows,output_features);
     else
         output_hadamard_kernel<<<dim3(rows,output_features/kHadamard),dim3(kHadamard),0,
             stream>>>(accum,svh,output,rows,output_features);
@@ -1119,8 +1163,9 @@ inline void launch_output_hadamard_fp16_inplace(cudaStream_t stream,std::uint16_
     const std::uint16_t* svh,int rows,int output_features) {
     if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
        exl3_hadamard_warp_aligned(output,svh))
-        output_hadamard_fp16_inplace_warp_kernel<<<exl3_hadamard_warp_grid(rows,output_features),
-            kHadamardWarpsPerBlock*32,0,stream>>>(output,svh,rows,output_features);
+        exl3_launch_pdl(output_hadamard_fp16_inplace_warp_kernel,
+            dim3(exl3_hadamard_warp_grid(rows,output_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,output,svh,rows,output_features);
     else
         output_hadamard_fp16_inplace_kernel<<<dim3(rows,output_features/kHadamard),
             dim3(kHadamard),0,stream>>>(output,svh,rows,output_features);
@@ -1276,6 +1321,7 @@ template<bool Fp16GemmDestination>
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) prefill_reduce_output_warp_kernel(
     const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
     int output_features,int split_count) {
+    EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
     const int blocks=output_features/kHadamard;
     const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
@@ -1315,9 +1361,9 @@ void launch_prefill_reduce_output(cudaStream_t stream,const float* accum,
     int split_count) {
     if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
        exl3_hadamard_warp_aligned(accum,svh,output))
-        prefill_reduce_output_warp_kernel<Fp16GemmDestination><<<
-            exl3_hadamard_warp_grid(rows,output_features),kHadamardWarpsPerBlock*32,0,stream>>>(
-                accum,svh,output,rows,output_features,split_count);
+        exl3_launch_pdl(prefill_reduce_output_warp_kernel<Fp16GemmDestination>,
+            dim3(exl3_hadamard_warp_grid(rows,output_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,accum,svh,output,rows,output_features,split_count);
     else
         prefill_reduce_output_kernel<ShuffleLocal,MinimalBarriers,PrefetchSplitPlanes,
             Fp16GemmDestination><<<dim3(rows,output_features/kHadamard),kHadamard,0,stream>>>(
@@ -2134,6 +2180,13 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
                                                  int input_features,
                                                  int output_features,
                                                  int split_count) {
+    // Deep async-A stages may stream the constant packed weights of their
+    // preload groups before the dependency wait; everything else waits first.
+    constexpr bool kEarlyWeights = DeepStages > 0 && AsyncA && !RegisterPipeline;
+    if constexpr (!kEarlyWeights) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    asm volatile("griddepcontrol.launch_dependents;");
     constexpr int output_tiles_per_block = OutputTilesPerBlock;
     // Each warp owns fragments_per_warp N8 fragments over the CTA's complete
     // K range. Narrower CTAs (fewer warps, fewer tiles) keep that per-warp
@@ -2191,18 +2244,20 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     const int tile_k_end = min(tile_k_begin + tiles_per_split, tiles_k);
     const std::uint32_t mul1_multiplier = static_cast<std::uint32_t>(*mul1);
 
-    auto prefetch = [&](int tile_k, int stage, bool commit = true) {
+    // part: 0 = packed weights and A, 1 = packed weights only, 2 = A only.
+    auto prefetch = [&](int tile_k, int stage, bool commit = true, int part = 0) {
         if (tile_k >= tile_k_end) return;
         const std::size_t offset =
             (static_cast<std::size_t>(tile_k) * tiles_n + tile_base) *
             static_cast<std::size_t>(tile_half);
         auto* destination = sh_raw + stage * raw_stage_half;
         const auto* source = trellis + offset;
+        if (part != 2)
         for (int chunk = thread; chunk < raw_stage_half / 8; chunk += threads) {
             exl3_cp_async_16(destination + chunk * 8, source + chunk * 8);
         }
         if constexpr (AsyncA) {
-            if (thread < 32) {
+            if (part != 1 && thread < 32) {
                 const int row = thread / 2;
                 const int column = (thread % 2) * 8;
                 const int source_column =
@@ -2346,15 +2401,29 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
         // One committed group per stage of `per` consecutive k-tiles,
         // including empty tail groups, so wait_pending<stages-2> always
         // completes the current stage. Tiles are consumed in ascending k.
-        auto issue = [&](int group, int stage) {
+        auto issue = [&](int group, int stage, int part = 0) {
             #pragma unroll
             for (int t = 0; t < per; ++t)
-                prefetch(tile_k_begin + group * per + t, stage * per + t, false);
+                prefetch(tile_k_begin + group * per + t, stage * per + t, false, part);
             exl3_cp_async_commit();
         };
+        if constexpr (kEarlyWeights) {
+            // Weights for every preload stage, then (after the dependency
+            // wait) the producer-written A slices. Commit order B0..B(s-2),
+            // A0..A(s-2), then combined groups: each wait_pending<stages-2>
+            // below still covers the stage it consumes.
+            #pragma unroll
+            for (int preload = 0; preload < stages - 1; ++preload)
+                issue(preload, preload, 1);
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            #pragma unroll
+            for (int preload = 0; preload < stages - 1; ++preload)
+                issue(preload, preload, 2);
+        } else {
         #pragma unroll
         for (int preload = 0; preload < stages - 1; ++preload)
             issue(preload, preload);
+        }
         const int groups = (tile_k_end - tile_k_begin + per - 1) / per;
         for (int group = 0; group < groups; ++group) {
             exl3_cp_async_wait_pending<stages - 2>();
@@ -9843,16 +9912,16 @@ static void launch_coherent_packed_variant(
         throw std::invalid_argument("NINFER_EXL3_COHERENT_FAST_DECODE must be 0 or 1");
     }();
     if (fast_decode) {
-        exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
-            false, Bits == 6, false, false, false, Stages, Warps, Per><<<
-            dim3(grid), dim3(Warps * 32), shared, stream>>>(
+        exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
+            false, Bits == 6, false, false, false, Stages, Warps, Per>,
+            dim3(grid), dim3(Warps * 32), shared, stream,
                 transformed, trellis, mul1, accum, rows, input_features,
                 output_features, split_count);
         return;
     }
-    exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
-        false, false, false, false, false, Stages, Warps, Per><<<
-        dim3(grid), dim3(Warps * 32), shared, stream>>>(
+    exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
+        false, false, false, false, false, Stages, Warps, Per>,
+        dim3(grid), dim3(Warps * 32), shared, stream,
             transformed, trellis, mul1, accum, rows, input_features,
             output_features, split_count);
 }
