@@ -9063,17 +9063,6 @@ int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows)
 }
 
 int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexcept {
-    // NINFER_EXL3_TARGET_COHERENT_WIDE_SPLIT (16 or 20, when the planes fit)
-    // overrides split10; a numerics-policy candidate.
-    static const int wide_split = [] {
-        const char* value = std::getenv("NINFER_EXL3_TARGET_COHERENT_WIDE_SPLIT");
-        const int parsed = value ? std::atoi(value) : 0;
-        return parsed == 16 || parsed == 20 ? parsed : 0;
-    }();
-    if (wide_split && coherent_wide_k6_split10_enabled_ &&
-        accumulation_capacity_bytes_ >= static_cast<std::size_t>(rows) *
-            static_cast<std::size_t>(out_features_) * wide_split * sizeof(float))
-        return wide_split;
     constexpr int split10 = 10;
     const auto required = static_cast<std::size_t>(rows) *
         static_cast<std::size_t>(out_features_) * split10 * sizeof(float);
