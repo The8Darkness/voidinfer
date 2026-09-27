@@ -1268,6 +1268,62 @@ __global__ void prefill_reduce_output_kernel(const float* accum,
     output[row * output_features + offset] = __half_as_ushort(__hmul(normalized, scale));
 }
 
+// Warp-per-block twin of prefill_reduce_output_kernel: the split planes are
+// summed in the same chronological order, the optional FP16 destination
+// boundary is kept, and the transform is the exact butterfly network of the
+// shared-memory kernel (see exl3_warp_butterflies).
+template<bool Fp16GemmDestination>
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) prefill_reduce_output_warp_kernel(
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
+    int output_features,int split_count) {
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=output_features/kHadamard;
+    const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=static_cast<long long>(rows)*blocks) return;
+    const int row=static_cast<int>(task/blocks);
+    const int block=static_cast<int>(task%blocks);
+    const int offset=block*kHadamard+lane*4;
+    const std::size_t index=static_cast<std::size_t>(row)*output_features+offset;
+    const std::size_t stride=static_cast<std::size_t>(rows)*output_features;
+    const float4 first=*reinterpret_cast<const float4*>(accum+index);
+    float v[4]={first.x,first.y,first.z,first.w};
+    for(int split=1;split<split_count;++split) {
+        const float4 plane=*reinterpret_cast<const float4*>(accum+split*stride+index);
+        v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
+    }
+    if constexpr(Fp16GemmDestination) {
+        #pragma unroll
+        for(int j=0;j<4;++j) v[j]=__half2float(__float2half_rn(v[j]));
+    }
+    std::uint16_t scale[4];
+    exl3_load_half4(svh+offset,scale);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+    }
+    exl3_store_half4(output+row*output_features+offset,result);
+}
+
+template<bool ShuffleLocal=false,bool MinimalBarriers=false,
+         bool PrefetchSplitPlanes=false,bool Fp16GemmDestination=false>
+void launch_prefill_reduce_output(cudaStream_t stream,const float* accum,
+    const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features,
+    int split_count) {
+    if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
+       exl3_hadamard_warp_aligned(accum,svh,output))
+        prefill_reduce_output_warp_kernel<Fp16GemmDestination><<<
+            exl3_hadamard_warp_grid(rows,output_features),kHadamardWarpsPerBlock*32,0,stream>>>(
+                accum,svh,output,rows,output_features,split_count);
+    else
+        prefill_reduce_output_kernel<ShuffleLocal,MinimalBarriers,PrefetchSplitPlanes,
+            Fp16GemmDestination><<<dim3(rows,output_features/kHadamard),kHadamard,0,stream>>>(
+                accum,svh,output,rows,output_features,split_count);
+}
+
 // Generic native EXL3 path used by E3A's K=6 and K=8 projection families.
 // It deliberately keeps the packed trellis as the source of truth and decodes
 // one 16x16 tile in shared memory at a time. This is a correctness-first CUDA
@@ -3704,10 +3760,10 @@ exl3_split_plane_prefetch_discriminator_for_test() {
         const dim3 grid(rows,output_features/kHadamard);
         const auto launch=[&](bool candidate) {
             if(candidate)
-                prefill_reduce_output_kernel<true,false,true><<<grid,kHadamard>>>(
+                launch_prefill_reduce_output<true,false,true>(0,
                     accum,scale,prefetched,rows,output_features,split_count);
             else
-                prefill_reduce_output_kernel<true,false,false><<<grid,kHadamard>>>(
+                launch_prefill_reduce_output<true,false,false>(0,
                     accum,scale,selected,rows,output_features,split_count);
         };
         for(int warmup=0;warmup<4;++warmup){launch(false);launch(true);}
@@ -6436,9 +6492,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         if (timing)
             cuda_check(cudaEventRecord(events[3], stream),
                        "K5 packed direct GEMM event");
-        prefill_reduce_output_kernel<false, false, false, true><<<
-            dim3(rows, metadata.out_features / kHadamard), kHadamard,
-            0, stream>>>(impl_->accum, weights.svh, output, rows,
+        launch_prefill_reduce_output<false, false, false, true>(stream,impl_->accum, weights.svh, output, rows,
                          metadata.out_features, split_count);
         cuda_check(cudaGetLastError(), "launch GDN bulk packed K5 output");
         ++impl_->stats.calls;
@@ -6511,9 +6565,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         }
         cuda_check(cudaGetLastError(),
                    "launch FAST packed direct K6 projection");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, metadata.out_features / kHadamard), kHadamard, 0,
-            stream>>>(impl_->accum, weights.svh, output, rows,
+        launch_prefill_reduce_output<false>(stream,impl_->accum, weights.svh, output, rows,
                       metadata.out_features, split_count);
         cuda_check(cudaGetLastError(),
                    "launch FAST packed direct K6 reduction/output");
@@ -7467,8 +7519,7 @@ void Exl3CudaLinearWorkspace::forward_predecoded_m1_k6_for_test(
             transformed_,decoded,weights.mul1,accum_,rows,in_features_,
             out_features_,split_count);
     cuda_check(cudaGetLastError(),"launch predecoded M1 K6 discriminator partials");
-    prefill_reduce_output_kernel<false><<<
-        dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+    launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,rows,out_features_,split_count);
     cuda_check(cudaGetLastError(),"launch predecoded M1 K6 discriminator output");
 }
@@ -7500,8 +7551,7 @@ void Exl3CudaLinearWorkspace::forward_fast_decode_m1_k6_for_test(
                 in_features_,out_features_,split_count);
     cuda_check(cudaGetLastError(),
         "launch fast-decode M1 K6 discriminator partials");
-    prefill_reduce_output_kernel<false><<<
-        dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+    launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,rows,out_features_,split_count);
     cuda_check(cudaGetLastError(),
         "launch fast-decode M1 K6 discriminator output");
@@ -7546,11 +7596,9 @@ void Exl3CudaLinearWorkspace::forward_k6_rowpair_shared_decode_for_test(
     cuda_check(cudaGetLastError(),
         "launch K6 rowpair shared-decode discriminator partials");
     if(target_reduce_shfl_)
-        prefill_reduce_output_kernel<true><<<
-            dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+        launch_prefill_reduce_output<true>(stream,
                 accum_,weights.svh,output,rows,out_features_,splits);
-    else prefill_reduce_output_kernel<false><<<
-        dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+    else launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,rows,out_features_,splits);
     cuda_check(cudaGetLastError(),
         "launch K6 rowpair shared-decode discriminator output");
@@ -7663,14 +7711,14 @@ void Exl3CudaLinearWorkspace::forward_reconstructed_exact_from_transformed(
     } // Next slice may overwrite decoded only after this slice's consumers.
     if(target_reduce_shfl_) {
         if(target_reduce_shfl_min_barriers_) {
-            prefill_reduce_output_kernel<true,true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+            launch_prefill_reduce_output<true,true>(stream,
                 accum_,weights.svh,output,rows,out_features_,splits);
             ++reduce_shfl_min_barrier_calls_;reduce_shfl_min_barrier_rows_+=rows;
-        } else prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+        } else launch_prefill_reduce_output<true>(stream,
             accum_,weights.svh,output,rows,out_features_,splits);
     }
     else
-        prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,rows,out_features_,splits);
     cuda_check(cudaGetLastError(), "exact reconstructed K7 reduction and output");
 }
@@ -8061,8 +8109,7 @@ void Exl3CudaLinearWorkspace::forward_k4_prefill_mma_for_test(
             transformed_,weights.trellis,weights.mul1,accum_,rows,
             in_features_,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch K4 MMA prefill discriminator projection");
-    prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),
-        kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,splits);
+    launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch K4 MMA prefill discriminator output");
 }
 
@@ -8125,18 +8172,14 @@ bool Exl3CudaLinearWorkspace::forward_target_prefill_gate_up_pair(
             rows,in_features_,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch paired target K6 gate/up partials");
     if(target_reduce_shfl_)
-        prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),
-            kHadamard,0,stream>>>(accum_,gate_weights.svh,gate_output,rows,
+        launch_prefill_reduce_output<true>(stream,accum_,gate_weights.svh,gate_output,rows,
                 out_features_,splits);
-    else prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),
-            kHadamard,0,stream>>>(accum_,gate_weights.svh,gate_output,rows,
+    else launch_prefill_reduce_output<false>(stream,accum_,gate_weights.svh,gate_output,rows,
                 out_features_,splits);
     if(up_workspace.target_reduce_shfl_)
-        prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),
-            kHadamard,0,stream>>>(up_workspace.accum_,up_weights.svh,up_output,
+        launch_prefill_reduce_output<true>(stream,up_workspace.accum_,up_weights.svh,up_output,
                 rows,out_features_,splits);
-    else prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),
-            kHadamard,0,stream>>>(up_workspace.accum_,up_weights.svh,up_output,
+    else launch_prefill_reduce_output<false>(stream,up_workspace.accum_,up_weights.svh,up_output,
                 rows,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch paired target K6 gate/up reductions");
     ++target_prefill_gate_up_pair_calls_;
@@ -8283,11 +8326,9 @@ void Exl3CudaLinearWorkspace::forward_target_m1_gate_up_pair(
         }
         cuda_check(cudaGetLastError(),"launch target M1 packed gate/up pair discriminator");
     }
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(accum_,gate_weights.svh,gate_output,1,
+    launch_prefill_reduce_output<false>(stream,accum_,gate_weights.svh,gate_output,1,
             out_features_,splits);
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(up_workspace.accum_,up_weights.svh,up_output,1,
+    launch_prefill_reduce_output<false>(stream,up_workspace.accum_,up_weights.svh,up_output,1,
             out_features_,splits);
     cuda_check(cudaGetLastError(),"reduce target M1 K6 gate/up pair discriminator");
     process_fast_same_weights_fp16kv_m1_gate_up_pair_calls_.fetch_add(
@@ -8351,11 +8392,9 @@ void Exl3CudaLinearWorkspace::forward_target_m1_kv_pair_for_test(
                 second_weights.trellis,second_weights.mul1,accum_,
                 second_workspace.accum_,in_features_,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch target M1 K6 K/V pair discriminator");
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(accum_,first_weights.svh,first_output,1,
+    launch_prefill_reduce_output<false>(stream,accum_,first_weights.svh,first_output,1,
             out_features_,splits);
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(second_workspace.accum_,second_weights.svh,
+    launch_prefill_reduce_output<false>(stream,second_workspace.accum_,second_weights.svh,
             second_output,1,out_features_,splits);
     cuda_check(cudaGetLastError(),"reduce target M1 K6 K/V pair discriminator");
     process_fast_same_weights_fp16kv_m1_kv_pair_calls_.fetch_add(
@@ -8409,11 +8448,9 @@ void Exl3CudaLinearWorkspace::forward_target_m1_kv_wide_pair_for_test(
                 second_weights.trellis,second_weights.mul1,accum_,
                 second_workspace.accum_,in_features_,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch target M1 wide K6/K7 K/V pair");
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(accum_,first_weights.svh,first_output,1,
+    launch_prefill_reduce_output<false>(stream,accum_,first_weights.svh,first_output,1,
             out_features_,splits);
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(second_workspace.accum_,second_weights.svh,
+    launch_prefill_reduce_output<false>(stream,second_workspace.accum_,second_weights.svh,
             second_output,1,out_features_,splits);
     cuda_check(cudaGetLastError(),"reduce target M1 wide K6/K7 K/V pair");
     process_fast_same_weights_fp16kv_m1_kv_pair_calls_.fetch_add(
@@ -10087,8 +10124,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             kernel,
             dim3(output_blocks*split_count),dim3(kThreads),args,shared_bytes,
             stream),"launch packed FP16 M2-8 target projection");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+        launch_prefill_reduce_output<false>(stream,
                 accum_,weights.svh,output,rows,out_features_,split_count);
         cuda_check(cudaGetLastError(),"reduce packed FP16 M2-8 target projection");
         process_fast_fp16_m2_8_down_calls_.fetch_add(1,std::memory_order_relaxed);
@@ -10279,8 +10315,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(grid_x, chunks), dim3(block_threads),
                        kernel_args, shared_bytes, stream),
                    "launch native persistent prefill GEMM");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, rows, out_features_, 1);
         cuda_check(cudaGetLastError(),
                    "launch native persistent prefill output transform");
@@ -10346,8 +10381,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch native MTP one-step K4 N64 async-A");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch native MTP one-step K4 reduction/output");
@@ -10373,8 +10407,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                    "launch native MTP K4 N64 async-A prefill");
         // prefill_reduce_output_kernel's non-shuffle path visits split planes
         // 0,1,...,4, preserving the qualified ascending reduction order.
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
                 accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch native MTP K4 N64 reduction/output");
@@ -10470,8 +10503,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(grid), dim3(block_threads), kernel_args,
                        shared_bytes, stream),
                    "launch native persistent M1 GEMM");
-        prefill_reduce_output_kernel<false><<<
-            dim3(1, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
                 accum_, weights.svh, output, 1, out_features_, 1);
         cuda_check(cudaGetLastError(),
                    "launch native persistent M1 FP32 output transform");
@@ -10530,8 +10562,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                            kernel, dim3(output_blocks * global_split_count),
                            dim3(kThreads), kernel_args, shared_bytes, stream),
                        "launch native K6 global-slice cooperative GEMM");
-            prefill_reduce_output_kernel<false><<<
-                dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+            launch_prefill_reduce_output<false>(stream,
                 accum_, weights.svh, output, rows, out_features_, 1);
             cuda_check(cudaGetLastError(),
                        "launch native K6 global-slice reduction/output");
@@ -10612,8 +10643,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        dim3(output_blocks * split_count), dim3(kThreads),
                        kernel_args, shared_bytes, stream),
                    "launch native K6 critical-path partials");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch native K6 critical-path reduction/output");
@@ -10660,14 +10690,14 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             cuda_check(cudaGetLastError(),"launch staged shape4 partials");
             if(target_reduce_shfl_) {
                 if(target_reduce_shfl_min_barriers_) {
-                    prefill_reduce_output_kernel<true,true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+                    launch_prefill_reduce_output<true,true>(stream,
                         accum_,weights.svh,output,rows,out_features_,kShape4Splits);
                     ++reduce_shfl_min_barrier_calls_;reduce_shfl_min_barrier_rows_+=rows;
-                } else prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+                } else launch_prefill_reduce_output<true>(stream,
                     accum_,weights.svh,output,rows,out_features_,kShape4Splits);
             }
             else
-                prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+                launch_prefill_reduce_output<false>(stream,
                     accum_,weights.svh,output,rows,out_features_,kShape4Splits);
             cuda_check(cudaGetLastError(),"launch staged shape4 reduction");
             return;
@@ -10807,12 +10837,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         }
         if(target_reduce_shfl_) {
             if(target_reduce_shfl_min_barriers_) {
-                prefill_reduce_output_kernel<true,true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,splits);
+                launch_prefill_reduce_output<true,true>(stream,accum_,weights.svh,output,rows,out_features_,splits);
                 ++reduce_shfl_min_barrier_calls_;reduce_shfl_min_barrier_rows_+=rows;
-            } else prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,splits);
+            } else launch_prefill_reduce_output<true>(stream,accum_,weights.svh,output,rows,out_features_,splits);
         }
         else
-            prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,splits);
+            launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,splits);
         cuda_check(cudaGetLastError(), "launch staged prefill reduction/output");
         return;
     }
@@ -10859,8 +10889,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(output_blocks * split_count),
                        dim3(kThreads), kernel_args, shared_bytes, stream),
                    "launch FAST_SAME_WEIGHTS FP16 M1 N16");
-        prefill_reduce_output_kernel<false><<<
-            dim3(1, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, 1, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch FAST_SAME_WEIGHTS FP16 M1 N16 reduction/output");
@@ -10914,8 +10943,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(output_blocks * split_count),
                        dim3(kThreads), kernel_args, shared_bytes, stream),
                    "launch FAST_SAME_WEIGHTS FP16 M1 N64 cooperative GEMV");
-        prefill_reduce_output_kernel<false><<<
-            dim3(1, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, 1, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch FAST_SAME_WEIGHTS FP16 M1 N64 reduction/output");
@@ -10999,8 +11027,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                     dim3(output_blocks*split_count,1,1),dim3(512),kernel_args,
                     shared_bytes,stream),"launch FAST wide native M1 K7");
         }
-        prefill_reduce_output_kernel<false><<<
-            dim3(1,out_features_/kHadamard),kHadamard,0,stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,1,out_features_,split_count);
         cuda_check(cudaGetLastError(),"reduce FAST wide native M1");
         process_fast_same_weights_fp16_m1_calls_.fetch_add(
@@ -11068,8 +11095,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(output_blocks * split_count),
                        dim3(kThreads), kernel_args, shared_bytes, stream),
                    "launch FAST_SAME_WEIGHTS FP16 M1 cooperative GEMV");
-        prefill_reduce_output_kernel<false><<<
-            dim3(1, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, 1, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch FAST_SAME_WEIGHTS FP16 M1 reduction/output");
@@ -11089,8 +11115,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                 weights.trellis,weights.mul1,accum_,in_features_,out_features_,
                 split_count);
         cuda_check(cudaGetLastError(),"launch target K6 M1 SIMT partials");
-        prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-            kHadamard,0,stream>>>(accum_,weights.svh,output,1,out_features_,
+        launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,1,out_features_,
                 split_count);
         cuda_check(cudaGetLastError(),"launch target K6 M1 SIMT reduction/output");
         ++target_k6_m1_simt_calls_;
@@ -11253,7 +11278,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                         ? reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<7,false,16,false,true,true>)
                         : reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<7,false,16,false,true>));
             cuda_check(cudaLaunchKernel(kernel,dim3(grid_blocks),dim3(kThreads),kernel_args,shared_bytes,stream),"launch exact N16 stream partials");
-            prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,split_count);
+            launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,split_count);
             cuda_check(cudaGetLastError(),"launch exact N16 stream reduction/output");
             ++extended_stream_reduction_calls_;
             if(target_down_k6_async_a)++target_down_k6_async_a_calls_;
@@ -11456,7 +11481,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                     ? reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<7,false,32,false,true,true>)
                     : reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<7,false,32,false,true>));
             cuda_check(cudaLaunchKernel(kernel,dim3(grid_blocks),dim3(kThreads),kernel_args,shared_bytes,stream),"launch exact K7 N32 stream partials");
-            prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,split_count);
+            launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,split_count);
             cuda_check(cudaGetLastError(),"launch exact K7 N32 stream reduction/output");
             ++extended_stream_reduction_calls_;
             if(target_k7_small_m_async_a)++target_k7_small_m_async_a_calls_;
@@ -11480,7 +11505,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                 : reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<6,false,32,false,true>);
             cuda_check(cudaLaunchKernel(kernel,dim3(grid_blocks),dim3(kThreads),kernel_args,shared_bytes,stream),
                 "launch exact K6 normal split partials");
-            prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+            launch_prefill_reduce_output<false>(stream,
                 accum_,weights.svh,output,rows,out_features_,split_count);
             cuda_check(cudaGetLastError(),"launch exact K6 stream reduction/output");
             ++stream_reduction_calls_;
