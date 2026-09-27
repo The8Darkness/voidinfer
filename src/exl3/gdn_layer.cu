@@ -2779,7 +2779,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         graph_qkvz_concurrency_.complete();
     const bool dual_transform = exl3_paired_transform_admission(
         dual_input_transform_,bool(projection_timing_),bool(projection_observer_),
-        preserve_m1_topology,rows,wide_prefill)==Exl3PairedTransformAdmission::admitted;
+        preserve_m1_topology,rows,wide_prefill)==Exl3PairedTransformAdmission::admitted &&
+        !wide_prefill && rows<=8;
     const auto* projection_chain_value=
         std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
     const auto* projection_chain_gdn_value=
