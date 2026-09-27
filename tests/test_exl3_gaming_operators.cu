@@ -371,6 +371,56 @@ static void wmma32_register_bitwise(int rows,int position,int split,int heads,bo
     std::cout<<"WMMA32_REGISTER_BITWISE rows="<<rows<<" position="<<position<<
         " split="<<split<<" heads="<<heads<<" m64="<<m64<<" equal=1\n";
 }
+// Verify-path attention numerics: the scalar fused flash kernel and the
+// tensor-core candidate against one independent FP64 oracle (causal GQA-6,
+// head dim 256, 1/16 score scale) over realistic activation magnitudes.
+static void verify_flash_mma_oracle(int rows,int position,double* worst_candidate,
+                                    double* worst_reference){
+    constexpr int qheads=24,kvheads=4,dim=256;
+    const int capacity=position+rows+64;
+    const int segments=(position+rows+255)/256;
+    std::vector<std::uint16_t> qh(static_cast<std::size_t>(rows)*qheads*dim),
+        kh(static_cast<std::size_t>(capacity)*kvheads*dim),vh(kh.size());
+    std::uint32_t state=0x2545f491U^static_cast<std::uint32_t>(rows*977+position);
+    auto uniform=[&](){state^=state<<13;state^=state>>17;state^=state<<5;
+        return float(state>>8)/float(1u<<24)*2.0f-1.0f;};
+    for(auto& x:qh)x=__half_as_ushort(__float2half_rn(uniform()*3.0f));
+    for(auto& x:kh)x=__half_as_ushort(__float2half_rn(uniform()*3.0f));
+    for(auto& x:vh)x=__half_as_ushort(__float2half_rn(uniform()*2.0f));
+    H q(qh.size()),k(kh.size()),v(vh.size()),reference(qh.size()),candidate(qh.size());
+    Buffer<float> workspace(static_cast<std::size_t>(rows)*kvheads*segments*
+        (6*dim+12));
+    q.set(qh);k.set(kh);v.set(vh);
+    fast_fused_attention_fixture(q.p,k.p,v.p,workspace.p,reference.p,position,capacity,
+        segments,nullptr,nullptr,rows);
+    fast_verify_flash_mma_fixture(q.p,k.p,v.p,workspace.p,candidate.p,position,capacity,
+        segments,rows,nullptr);
+    ck(cudaDeviceSynchronize());
+    const auto ref_out=reference.get(),cand_out=candidate.get();
+    double max_ref=0,max_cand=0;
+    for(int r=0;r<rows;++r)for(int h=0;h<qheads;++h){
+        const int kv=h/6,count=position+r+1;
+        std::vector<double> scores(count);double maximum=-1e300;
+        for(int key=0;key<count;++key){double dot=0;
+            for(int d=0;d<dim;++d)dot+=half_value(qh[(r*qheads+h)*dim+d])*
+                half_value(kh[(key*kvheads+kv)*dim+d]);
+            scores[key]=dot/16.0;maximum=std::max(maximum,scores[key]);}
+        double denominator=0;for(double& x:scores){x=std::exp(x-maximum);denominator+=x;}
+        for(int d=0;d<dim;++d){double numerator=0;
+            for(int key=0;key<count;++key)numerator+=scores[key]*
+                half_value(vh[(key*kvheads+kv)*dim+d]);
+            const double expected=numerator/denominator;
+            const std::size_t index=(static_cast<std::size_t>(r)*qheads+h)*dim+d;
+            max_ref=std::max(max_ref,std::abs(half_value(ref_out[index])-expected));
+            max_cand=std::max(max_cand,std::abs(half_value(cand_out[index])-expected));
+            require(std::isfinite(half_value(cand_out[index])),"verify MMA non-finite output");
+        }
+    }
+    *worst_candidate=std::max(*worst_candidate,max_cand);
+    *worst_reference=std::max(*worst_reference,max_ref);
+    std::cout<<"VERIFY_FLASH_MMA rows="<<rows<<" position="<<position<<
+        " max_abs_error_candidate="<<max_cand<<" max_abs_error_scalar="<<max_ref<<'\n';
+}
 static void fused_graph_coverage(){
     constexpr int capacity=16640,heads=24,kvheads=4,dim=256;
     constexpr int captured_segments=(capacity+255)/256;
@@ -540,8 +590,8 @@ static void control_pair(int rows){
 int main(int argc,char** argv){try{
     require(argc<=2,"pass optional candidate number 1..14 (9 uses greedy-device executable)");
     const int requested=argc==2?std::atoi(argv[1]):0;
-    require(argc==1 || (requested>=1&&requested<=15&&requested!=9),"operator candidate id");
-    for(int which=1;which<=15;++which) {
+    require(argc==1 || (requested>=1&&requested<=16&&requested!=9),"operator candidate id");
+    for(int which=1;which<=16;++which) {
     if(which==9 || (requested && which!=requested))continue;
     if(which==1)for(int rows:{2,3,7,8})recurrence(rows);
     for(int rows:{1,2,3,7,8,9,16}){
@@ -598,6 +648,16 @@ int main(int argc,char** argv){try{
             false,true,true,false,true);
     }
     if(which==14){fused_graph_coverage();fused_multirow_coverage();}
+    if(which==16){
+        double worst_candidate=0,worst_reference=0;
+        for(auto shape:std::vector<std::pair<int,int>>{{1,0},{8,0},{8,31},{3,255},{8,256},
+                {8,1000},{5,2047},{8,4095},{8,8190}})
+            verify_flash_mma_oracle(shape.first,shape.second,&worst_candidate,&worst_reference);
+        std::cout<<"VERIFY_FLASH_MMA worst candidate="<<worst_candidate<<
+            " scalar="<<worst_reference<<'\n';
+        require(worst_candidate<=2.0*worst_reference+2e-3,
+            "verify MMA attention error exceeds the scalar route envelope");
+    }
     if(which==15){
         for(int heads:{1,2,3})for(int split:{1,2,4})
             for(auto shape:std::vector<std::pair<int,int>>{{1,0},{17,5},{32,0},{33,30},

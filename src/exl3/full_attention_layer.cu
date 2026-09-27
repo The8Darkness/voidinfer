@@ -5966,6 +5966,201 @@ void fast_wmma64_attention_fixture(const std::uint16_t* q,
     cuda_check(cudaGetLastError(),"WMMA64 attention fixture launch");
 }
 
+// Tensor-core flash-decode for FP16-KV verifier/decode rows (numerics policy
+// candidate; quality-gated). One CTA owns one KV head and one 256-key segment
+// for up to eight query rows; the 6 sibling query heads of each row form 48
+// query vectors, handled as three m16 tiles by three warps. QK^T and P x V use
+// m16n8k16 HMMA with FP32 accumulation over 32-key chunks with an FP32 online
+// softmax (natural-exponent domain, P rounded to FP16 for P x V). Results are
+// written into the fused-flash scratch slot layout (unnormalized values plus
+// segment max and denominator), so the existing segment merge is reused.
+constexpr int kVerifyMmaKeys=256;
+constexpr int kVerifyMmaChunk=32;
+constexpr int kVerifyMmaStride=kHeadDim+8;
+
+__global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
+    const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,float* workspace,int rows,int position,
+    int capacity,int segments,const int* position_device,int query_offset) {
+    constexpr int H=kFastFusedFlashHeads;
+    constexpr int kVectors=kHeadDim/8;
+    __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
+    __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
+    const int segment=static_cast<int>(blockIdx.x);
+    const int kv_head=static_cast<int>(blockIdx.y);
+    const int tid=static_cast<int>(threadIdx.x);
+    const int warp=tid>>5;
+    const int lane=tid&31;
+    const int g=lane>>2;
+    const int t=lane&3;
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int first=segment*kVerifyMmaKeys;
+    const int last_count=base+rows;  // largest live key count of the block
+    if(first>=last_count || base+1<1 || last_count>capacity) return;
+    const int segment_end=min(first+kVerifyMmaKeys,last_count);
+
+    // Fragment rows: pair = row*6 + head for this warp's m16 tile.
+    const int pair0=warp*16+g;
+    const int pair1=pair0+8;
+    const int row0=pair0/H,head0=pair0%H;
+    const int row1=pair1/H,head1=pair1%H;
+    const bool live0=row0<rows,live1=row1<rows;
+    const int count0=base+row0+1,count1=base+row1+1;
+    const auto* q0=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(live0?row0:0)*kQHeads+kv_head*H+head0)*kHeadDim+2*t);
+    const auto* q1=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(live1?row1:0)*kQHeads+kv_head*H+head1)*kHeadDim+2*t);
+
+    float acc[kHeadDim/8][4];
+    #pragma unroll
+    for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+    float running_max[2]={-INFINITY,-INFINITY};
+    float denominator[2]={0.0f,0.0f};
+
+    for(int chunk_first=first;chunk_first<segment_end;chunk_first+=kVerifyMmaChunk) {
+        __syncthreads();
+        for(int index=tid;index<kVerifyMmaChunk*kVectors;index+=blockDim.x) {
+            const int key_offset=index/kVectors;
+            const int dim=(index%kVectors)*8;
+            const int key=chunk_first+key_offset;
+            uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
+            if(key<segment_end) {
+                const std::size_t offset=(static_cast<std::size_t>(key)*kKVHeads+kv_head)*
+                    kHeadDim+dim;
+                key_bits=*reinterpret_cast<const uint4*>(k_cache+offset);
+                value_bits=*reinterpret_cast<const uint4*>(v_cache+offset);
+            }
+            *reinterpret_cast<uint4*>(k_s+key_offset*kVerifyMmaStride+dim)=key_bits;
+            *reinterpret_cast<uint4*>(v_s+key_offset*kVerifyMmaStride+dim)=value_bits;
+        }
+        __syncthreads();
+
+        float s[4][4];
+        #pragma unroll
+        for(int j=0;j<4;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.0f;
+        #pragma unroll
+        for(int kk=0;kk<kHeadDim;kk+=16) {
+            const unsigned a[4]={live0?q0[kk/2]:0u,live1?q1[kk/2]:0u,
+                                 live0?q0[kk/2+4]:0u,live1?q1[kk/2+4]:0u};
+            #pragma unroll
+            for(int pair=0;pair<2;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4(b,k_s+(pair*16+(lane&7)+((lane>>4)<<3))*
+                    kVerifyMmaStride+kk+((lane>>3)&1)*8);
+                reg_attn_mma(s[2*pair],a,b[0],b[1]);
+                reg_attn_mma(s[2*pair+1],a,b[2],b[3]);
+            }
+        }
+        float tile_max[2]={-INFINITY,-INFINITY};
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const int key=chunk_first+8*j+2*t+(e&1);
+                const bool valid=e<2?(live0&&key<count0):(live1&&key<count1);
+                s[j][e]=valid?s[j][e]*0.0625f:-INFINITY;
+                tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]);
+            }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],1));
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],2));
+        }
+        float scale[2];
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            const float next=fmaxf(running_max[i],tile_max[i]);
+            scale[i]=next==-INFINITY?1.0f:expf(running_max[i]-next);
+            running_max[i]=next;
+        }
+        half p[4][4];
+        float sums[2]={0.0f,0.0f};
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const float m=running_max[e>>1];
+                p[j][e]=__float2half_rn(s[j][e]==-INFINITY?0.0f:expf(s[j][e]-m));
+                sums[e>>1]+=__half2float(p[j][e]);
+            }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],1);
+            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],2);
+            denominator[i]=denominator[i]*scale[i]+sums[i];
+        }
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n) {
+            acc[n][0]*=scale[0];acc[n][1]*=scale[0];
+            acc[n][2]*=scale[1];acc[n][3]*=scale[1];
+        }
+        #pragma unroll
+        for(int kk=0;kk<2;++kk) {
+            const unsigned a[4]={reg_attn_pack(p[2*kk][0],p[2*kk][1]),
+                                 reg_attn_pack(p[2*kk][2],p[2*kk][3]),
+                                 reg_attn_pack(p[2*kk+1][0],p[2*kk+1][1]),
+                                 reg_attn_pack(p[2*kk+1][2],p[2*kk+1][3])};
+            #pragma unroll
+            for(int pair=0;pair<kHeadDim/16;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4_trans(b,v_s+(16*kk+(lane&7)+((lane>>3)&1)*8)*
+                    kVerifyMmaStride+pair*16+(lane>>4)*8);
+                reg_attn_mma(acc[2*pair],a,b[0],b[1]);
+                reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+        const int row=i==0?row0:row1;
+        const int head=i==0?head0:head1;
+        const int count=i==0?count0:count1;
+        if(!(i==0?live0:live1) || first>=count) continue;
+        float* slot=workspace+
+            ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*
+                kFastFusedFlashStride;
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n) {
+            const int dim=8*n+2*t;
+            slot[head*kHeadDim+dim]=acc[n][2*i];
+            slot[head*kHeadDim+dim+1]=acc[n][2*i+1];
+        }
+        if(t==0) {
+            slot[kFastFusedFlashValues+head]=running_max[i];
+            slot[kFastFusedFlashValues+H+head]=denominator[i];
+        }
+    }
+}
+
+bool verify_flash_mma_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+void launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,float* workspace,int rows,int position,int capacity,
+    int segments,const int* position_device,cudaStream_t stream) {
+    attention_verify_flash_mma_kernel<<<dim3(segments,kKVHeads),96,0,stream>>>(
+        q,k,v,workspace,rows,position,capacity,segments,position_device,0);
+}
+
+void fast_verify_flash_mma_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,float* workspace,
+    std::uint16_t* output,int position,int capacity,int segments,int rows,
+    cudaStream_t stream) {
+    if(rows<1 || rows>8 || position<0 || position+rows>capacity)
+        throw std::invalid_argument("verify flash MMA fixture rows/frontier");
+    launch_verify_flash_mma(q,k,v,workspace,rows,position,capacity,segments,nullptr,stream);
+    attention_cached_gqa_six_fused_flash_merge_kernel<<<
+        rows*kKVHeads,256,0,stream>>>(workspace,output,rows,segments,position,
+            capacity,kFastFusedFlashKeys256,nullptr,0);
+    cuda_check(cudaGetLastError(),"verify flash MMA fixture launch");
+}
+
 void fast_fused_attention_fixture(const std::uint16_t* q,
     const std::uint16_t* k,const std::uint16_t* v,float* workspace,
     std::uint16_t* output,int position,int capacity,int segments,
@@ -7807,7 +8002,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                                                          cache_capacity_))
                 throw std::invalid_argument(
                     "FAST fused flash attention scratch extent");
-            if(fast_fused_flash_attention_keys256_&&fused_flash_staged_k_enabled())
+            if(fast_fused_flash_attention_keys256_&&verify_flash_mma_enabled())
+                launch_verify_flash_mma(qr,attention_k,attention_v,exact_scores_,rows,
+                    position,cache_capacity_,segments,position_device_,stream);
+            else if(fast_fused_flash_attention_keys256_&&fused_flash_staged_k_enabled())
                 attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256,true><<<
                     rows*kKVHeads*segments,256,0,stream>>>(
                         qr,attention_k,attention_v,exact_scores_,attn,rows,position,

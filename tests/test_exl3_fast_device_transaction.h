@@ -371,6 +371,43 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         live->prepare_continuation(8);
         live->prepare_transaction();
     }
+    if(!env("NINFER_EXL3_TEST_VERIFY_QUALITY_OUT").empty()) {
+        // Verify-path quality diagnostic: teacher-force a canonical
+        // continuation through committed 8-row verifier transactions and
+        // record, per row, the NLL of the next canonical token and whether the
+        // row argmax equals it. The DFlash round is not run in this mode.
+        std::ifstream token_file(env("NINFER_EXL3_TEST_VERIFY_QUALITY_TOKENS"));
+        std::vector<std::int64_t> tokens;
+        for(std::int64_t token=0;token_file>>token;)tokens.push_back(token);
+        require(tokens.size()>=9,"verify quality continuation too short");
+        std::ofstream quality(env("NINFER_EXL3_TEST_VERIFY_QUALITY_OUT"));
+        quality<<"index,target,nll,argmax\n";
+        constexpr int kVocabRows=248320;
+        double total_nll=0.0;std::size_t scored=0,agree=0;
+        for(std::size_t first=0;first+8<tokens.size();first+=8) {
+            const std::span<const std::int64_t> block(tokens.data()+first,8);
+            live->begin_transaction(diagnostic_stream.value);
+            live->continue_rows(block,diagnostic_stream.value);
+            const auto logits=live->continuation_logits_host(diagnostic_stream.value);
+            require(logits.size()>=static_cast<std::size_t>(8)*kVocabRows,
+                "verify quality logits extent");
+            live->commit_transaction();
+            for(int row=0;row<8;++row) {
+                const float* values=logits.data()+static_cast<std::size_t>(row)*kVocabRows;
+                const auto target=tokens[first+row+1];
+                float maximum=-INFINITY;int arg=0;
+                for(int i=0;i<kVocabRows;++i)if(values[i]>maximum){maximum=values[i];arg=i;}
+                double sum=0.0;
+                for(int i=0;i<kVocabRows;++i)sum+=std::exp(static_cast<double>(values[i])-maximum);
+                const double nll=std::log(sum)+maximum-values[target];
+                total_nll+=nll;++scored;agree+=arg==target;
+                quality<<first+row+1<<','<<target<<','<<nll<<','<<arg<<'\n';
+            }
+        }
+        std::cout<<"VERIFY_QUALITY PASS rows="<<scored<<" mean_nll="<<total_nll/scored
+                 <<" argmax_agree="<<agree<<'\n';
+        return;
+    }
     if(pending_round || device_pending_round) {
         const std::array<std::int64_t,2> model_stops{248046,248044};
         const std::span<const std::int64_t> pending_terminal=
