@@ -11235,7 +11235,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         // Narrow M1 CTAs for small grids: each warp keeps 16 output columns
         // and the same split partition/in-kernel reduction, so results are
         // unchanged while the grid covers the SMs.
-        const int narrow_warps = rows == 1 && generic_narrow_enabled() &&
+        const int narrow_warps = rows <= 16 && generic_narrow_enabled() &&
             output_blocks * split_count < 340
             ? (out_features_ <= 2048 ? 2 : 4) : 0;
         void* narrow_kernel = nullptr;
