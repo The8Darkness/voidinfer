@@ -10023,6 +10023,20 @@ bool generic_narrow_enabled() {
     return enabled;
 }
 
+// NINFER_EXL3_COHERENT_SMALL_GRID_WARPS=2 narrows 4-warp coherent launches
+// whose grid would stay below 512 CTAs (K6/K7 down, K7 O: 400 CTAs on 170
+// SMs) to 2-warp CTAs. Per-warp columns, K range and MMA order are unchanged,
+// so outputs stay bitwise identical; only the wave shape changes.
+int coherent_small_grid_warps() {
+    static const int warps = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_SMALL_GRID_WARPS");
+        if (!value || std::strcmp(value, "0") == 0) return 0;
+        if (std::strcmp(value, "2") == 0) return 2;
+        throw std::invalid_argument("NINFER_EXL3_COHERENT_SMALL_GRID_WARPS must be 0 or 2");
+    }();
+    return warps;
+}
+
 template <int Bits>
 static void launch_coherent_packed_partials(
     int grid, std::size_t two_stage_bytes, cudaStream_t stream,
@@ -10030,7 +10044,10 @@ static void launch_coherent_packed_partials(
     const std::int32_t* mul1, float* accum, int rows, int input_features,
     int output_features, int split_count) {
     const int stages = coherent_deep_pipeline_stages();
-    const int warps = coherent_packed_warps();
+    int warps = coherent_packed_warps();
+    if (warps == 4 && coherent_small_grid_warps() == 2 &&
+        output_features / (16 * 4) * split_count < 512)
+        warps = 2;
     const int per_setting = coherent_tiles_per_stage_setting();
     if (const int per = per_setting ? per_setting : (rows == 1 ? 2 : 4); per != 1) {
 #define NINFER_COHERENT_MULTI(S, W, P)                                                 if (stages == S && warps == W && per == P) {                                       launch_coherent_packed_variant<Bits, S, W, P>(stream, transformed,                 trellis, mul1, accum, rows, input_features, output_features,                   split_count);                                                              return;                                                                    }
