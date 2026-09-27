@@ -199,7 +199,14 @@ void require_coherent_device_profile(const EngineOptions& options) {
     equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED","1");
     equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32","1");
     equals("NINFER_EXL3_FAST_LAYER_MAJOR_PREFILL","1");
-    equals("NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT","0");
+    // K5 layer reconstruction (FP32-accumulated cuBLAS at live context >= 8192)
+    // is a quality-gated numerics policy; both settings are admitted.
+    {
+        const auto* k5=std::getenv("NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
+        if(!k5 || (std::string_view(k5)!="0" && std::string_view(k5)!="1"))
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT=0|1");
+    }
     equals("NINFER_DFLASH2_PREFILL_WINDOW","1");
     equals("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
     equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW","1");
