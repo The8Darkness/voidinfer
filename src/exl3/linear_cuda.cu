@@ -9901,6 +9901,22 @@ static void launch_coherent_packed_variant(
         static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t) +
         16u * tiles * 16u * sizeof(float);
     const int grid = output_features / (16 * tiles) * split_count;
+    if (shared > 48u * 1024u) {
+        static const bool configured = [shared] {
+            cuda_check(cudaFuncSetAttribute(
+                exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
+                    false, Bits == 6, false, false, false, Stages, Warps, Per>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)),
+                "set deep coherent shared memory");
+            cuda_check(cudaFuncSetAttribute(
+                exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
+                    false, false, false, false, false, Stages, Warps, Per>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)),
+                "set deep coherent shared memory");
+            return true;
+        }();
+        (void)configured;
+    }
     // The exact K6 lane-window and K7 three-word decoders (identical state
     // words and MUL1 arithmetic) are the measured default;
     // NINFER_EXL3_COHERENT_FAST_DECODE=0 restores the generic decoder.
@@ -9941,10 +9957,13 @@ int coherent_packed_warps() {
 }
 
 // NINFER_EXL3_COHERENT_TILES_PER_STAGE: k-tiles per coherent cp.async stage.
-int coherent_tiles_per_stage() {
+// Returns 0 when unset: single-row decode then takes two tiles per stage and
+// wider verifier rows four (both measured); the choice never changes numerics.
+int coherent_tiles_per_stage_setting() {
     static const int per = [] {
         const char* value = std::getenv("NINFER_EXL3_COHERENT_TILES_PER_STAGE");
-        if (!value || std::strcmp(value, "4") == 0) return 4;  // measured default
+        if (!value) return 0;
+        if (std::strcmp(value, "4") == 0) return 4;
         if (std::strcmp(value, "1") == 0) return 1;
         if (std::strcmp(value, "2") == 0) return 2;
         throw std::invalid_argument(
@@ -9974,19 +9993,14 @@ static void launch_coherent_packed_partials(
     int output_features, int split_count) {
     const int stages = coherent_deep_pipeline_stages();
     const int warps = coherent_packed_warps();
-    if (const int per = coherent_tiles_per_stage(); per != 1) {
-        if (stages != 4)
-            throw std::invalid_argument("multi-tile coherent stages require 4 pipeline stages");
-        if (warps == 4 && per == 2) {
-            launch_coherent_packed_variant<Bits, 4, 4, 2>(stream, transformed, trellis,
-                mul1, accum, rows, input_features, output_features, split_count);
-            return;
-        }
-        if (warps == 4 && per == 4) {
-            launch_coherent_packed_variant<Bits, 4, 4, 4>(stream, transformed, trellis,
-                mul1, accum, rows, input_features, output_features, split_count);
-            return;
-        }
+    const int per_setting = coherent_tiles_per_stage_setting();
+    if (const int per = per_setting ? per_setting : (rows == 1 ? 2 : 4); per != 1) {
+#define NINFER_COHERENT_MULTI(S, W, P)                                                 if (stages == S && warps == W && per == P) {                                       launch_coherent_packed_variant<Bits, S, W, P>(stream, transformed,                 trellis, mul1, accum, rows, input_features, output_features,                   split_count);                                                              return;                                                                    }
+        NINFER_COHERENT_MULTI(4, 4, 2) NINFER_COHERENT_MULTI(4, 4, 4)
+        NINFER_COHERENT_MULTI(8, 4, 2) NINFER_COHERENT_MULTI(8, 4, 4)
+        NINFER_COHERENT_MULTI(4, 2, 2) NINFER_COHERENT_MULTI(4, 2, 4)
+        NINFER_COHERENT_MULTI(8, 2, 2) NINFER_COHERENT_MULTI(8, 2, 4)
+#undef NINFER_COHERENT_MULTI
         throw std::invalid_argument("unsupported coherent multi-tile variant");
     }
     if (warps == 8 && stages == 0) {
