@@ -1648,6 +1648,13 @@ void Exl3GdnLayer::restore_host_state(std::span<const float> recurrent,
 void Exl3GdnLayer::reconstruct_retained_prefix(
     const Exl3GdnLayerCheckpoint& checkpoint, int retained_rows,
     cudaStream_t stream) {
+    const int attempted_rows=reconstruct_retained_prefix_host(checkpoint,retained_rows,stream);
+    enqueue_retained_prefix_reconstruct(checkpoint,retained_rows,attempted_rows,stream);
+}
+
+int Exl3GdnLayer::reconstruct_retained_prefix_host(
+    const Exl3GdnLayerCheckpoint& checkpoint, int retained_rows,
+    cudaStream_t stream) {
     if (!retained_prefix_available_ || retained_rows <= 0 ||
         retained_rows > retained_prefix_rows_) {
         throw std::invalid_argument("EXL3 GDN retained prefix is absent or row count is invalid");
@@ -1678,7 +1685,8 @@ void Exl3GdnLayer::reconstruct_retained_prefix(
     if (capture_status != cudaStreamCaptureStatusNone) {
         throw std::invalid_argument("EXL3 GDN retained prefix requires an eager stream");
     }
-    const auto history=continuation_history_view(
+    // Validates that the continuation history still belongs to this attempt.
+    (void)continuation_history_view(
         std::shared_ptr<const void>(recurrent_model_owner_,this),
         checkpoint.position,0,retained_prefix_rows_);
 
@@ -1686,6 +1694,18 @@ void Exl3GdnLayer::reconstruct_retained_prefix(
     // reusable if the caller later needs a full rollback.
     invalidate_continuation_history();
     retained_prefix_available_ = false;
+    current_checkpoint_generation_ = 0;
+    current_checkpoint_stream_ = nullptr;
+    current_checkpoint_recurrent_ = nullptr;
+    current_checkpoint_conv_ = nullptr;
+    trace_.state_before = recurrent_state_before_;
+    trace_.state_after = recurrent_state_;
+    return retained_prefix_rows_;
+}
+
+void Exl3GdnLayer::enqueue_retained_prefix_reconstruct(
+    const Exl3GdnLayerCheckpoint& checkpoint, int retained_rows, int attempted_rows,
+    cudaStream_t stream) const {
     check(cudaMemcpyAsync(recurrent_state_, checkpoint.recurrent_state_device,
                           kStateBytes, cudaMemcpyDeviceToDevice, stream),
           "restore EXL3 GDN retained prefix recurrent base");
@@ -1702,21 +1722,16 @@ void Exl3GdnLayer::reconstruct_retained_prefix(
         check(cudaMemcpyAsync(recurrent_state_before_,checkpoint.recurrent_state_device,
                               kStateBytes,cudaMemcpyDeviceToDevice,stream),
               "restore EXL3 GDN retained prefix recurrent trace");
+    // Continuation history rows start at row 0 of the fixed attempt buffers.
     reconstruct_conv_prefix_kernel<<<(kQkv + 255) / 256, 256, 0, stream>>>(
         static_cast<const std::uint16_t*>(checkpoint.conv_state_device),
-        history.conv_input, conv_state_, conv_state_trace_, retained_rows,
-        retained_prefix_rows_);
+        half_buffers_[3], conv_state_, conv_state_trace_, retained_rows,
+        attempted_rows);
     check(cudaGetLastError(), "reconstruct EXL3 GDN retained convolution prefix");
     gdn_recurrence_sm120_kernel<<<kHeads * (kHeadDim / 4), 4 * 32, 0, stream>>>(
-        history.q, history.k, history.v, history.g, history.beta,
-        recurrent_state_, half_buffers_[9], retained_rows);
+        half_buffers_[4], half_buffers_[5], half_buffers_[6], float_buffers_[5],
+        float_buffers_[4], recurrent_state_, half_buffers_[9], retained_rows);
     check(cudaGetLastError(), "reconstruct EXL3 GDN retained recurrent prefix");
-    current_checkpoint_generation_ = 0;
-    current_checkpoint_stream_ = nullptr;
-    current_checkpoint_recurrent_ = nullptr;
-    current_checkpoint_conv_ = nullptr;
-    trace_.state_before = recurrent_state_before_;
-    trace_.state_after = recurrent_state_;
 }
 
 void Exl3GdnLayer::arm_captured_retained_prefix(

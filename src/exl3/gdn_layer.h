@@ -612,6 +612,16 @@ public:
     void reconstruct_retained_prefix(const Exl3GdnLayerCheckpoint& checkpoint,
                                      int retained_rows,
                                      cudaStream_t stream = nullptr);
+    // Split form for a captured multi-layer repair graph: the host part runs
+    // every provenance check and state transition of reconstruct_retained_prefix
+    // without GPU work; the enqueue part submits exactly its device work and
+    // may be recorded into a graph (fixed buffers, no host state access).
+    // Returns the attempted row count the enqueue must use.
+    int reconstruct_retained_prefix_host(const Exl3GdnLayerCheckpoint& checkpoint,
+                                         int retained_rows, cudaStream_t stream);
+    void enqueue_retained_prefix_reconstruct(const Exl3GdnLayerCheckpoint& checkpoint,
+                                             int retained_rows, int attempted_rows,
+                                             cudaStream_t stream) const;
     // Host-side completion for a successfully replayed fixed-width graph.
     // Binds stable forward scratch to the eager checkpoint taken immediately
     // before replay; it performs no device work or state publication.

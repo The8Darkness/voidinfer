@@ -1143,6 +1143,16 @@ struct Exl3TextContext::Impl {
     // Continuation (verifier) rows 2..8 replay captured full-layer graphs too;
     // the retained-prefix capability is re-armed on the host after replay.
     bool ordinary_full_layer_multirow_graphs_enabled=false;
+    // Device-KV retained-prefix GDN repair: one captured graph per
+    // (retained, attempted) row pair records every layer's device work.
+    struct GdnRepairGraph {
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable executable;
+        bool ready=false;
+        // Checkpoint buffers the graph recorded; a mismatch forces recapture.
+        std::array<const void*,kLayers> recorded_checkpoints{};
+    };
+    std::array<GdnRepairGraph,64> gdn_repair_graphs{};
     int ordinary_full_layer_graph_capture_position=0;
     std::uint64_t ordinary_full_layer_graph_captures=0;
     std::uint64_t ordinary_full_layer_graph_replays=0;
@@ -8992,6 +9002,69 @@ void Exl3TextContext::retain_transaction_prefix_impl(
 
     if (!host_kv && !device_kv)
         impl_->oscar->restore_checkpoint(transaction.oscar_checkpoint, stream);
+    static const bool repair_graph=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_REPAIR_GRAPH");
+        if(!value)return true;  // measured default; "0" keeps eager per-layer repair
+        if(std::strcmp(value,"0")==0)return false;
+        if(std::strcmp(value,"1")==0)return true;
+        throw std::invalid_argument("NINFER_EXL3_GDN_REPAIR_GRAPH must be 0 or 1");
+    }();
+    if (repair_graph && device_kv && fail_after_model_layer < 0 &&
+        attempted_rows >= 2 && attempted_rows <= 8) {
+        // Every per-layer host check and state transition runs first; the
+        // device work of all GDN layers then replays as one captured graph.
+        for (int layer = 0; layer < kLayers; ++layer) {
+            if (impl_->full_layers[layer]) {
+                impl_->full_layers[layer]->reappend_retained_prefix(
+                    retained_rows, attempted_rows, base_position, stream);
+            } else if (impl_->gdn_layers[layer]) {
+                const int layer_attempted=impl_->gdn_layers[layer]->
+                    reconstruct_retained_prefix_host(
+                        transaction.gdn_checkpoints[layer], retained_rows, stream);
+                require(layer_attempted==attempted_rows,
+                    "P2 GDN repair graph attempted-row mismatch");
+            }
+        }
+        auto& graph=impl_->gdn_repair_graphs[
+            static_cast<std::size_t>(retained_rows-1)*8+(attempted_rows-1)];
+        std::array<const void*,kLayers> checkpoints{};
+        for (int layer = 0; layer < kLayers; ++layer)
+            if (impl_->gdn_layers[layer])
+                checkpoints[layer]=transaction.gdn_checkpoints[layer].recurrent_state_device;
+        if (graph.ready && graph.recorded_checkpoints!=checkpoints) {
+            // Waits for any in-flight replay before the executable is replaced.
+            cuda_check(cudaStreamSynchronize(stream),"drain stale GDN repair graph");
+            graph.ready=false;
+        }
+        if (!graph.ready) {
+            graph.recorded_checkpoints=checkpoints;
+            impl_->bind_graph_device();
+            cudaStream_t capture_stream=nullptr;
+            cuda_check(cudaStreamCreateWithFlags(&capture_stream,cudaStreamNonBlocking),
+                "create GDN repair graph capture stream");
+            try {
+                graph.definition.capture(capture_stream,[&] {
+                    for (int layer = 0; layer < kLayers; ++layer)
+                        if (impl_->gdn_layers[layer])
+                            impl_->gdn_layers[layer]->enqueue_retained_prefix_reconstruct(
+                                transaction.gdn_checkpoints[layer], retained_rows,
+                                attempted_rows, capture_stream);
+                });
+                graph.executable.instantiate(graph.definition);
+                graph.executable.upload(capture_stream);
+                cuda_check(cudaStreamSynchronize(capture_stream),
+                    "complete GDN repair graph preparation");
+            } catch(...) {
+                (void)cudaStreamSynchronize(capture_stream);
+                (void)cudaStreamDestroy(capture_stream);
+                throw;
+            }
+            cuda_check(cudaStreamDestroy(capture_stream),
+                "destroy GDN repair graph capture stream");
+            graph.ready=true;
+        }
+        graph.executable.launch(stream);
+    } else
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl_->full_layers[layer]) {
             impl_->full_layers[layer]->reappend_retained_prefix(
