@@ -81,7 +81,36 @@ __global__ void rms_norm_f16_kernel(const std::uint16_t* input, const std::uint1
     const int lane = static_cast<int>(threadIdx.x);
     if (row >= rows || lane >= features) return;
     extern __shared__ float shared[];
+    constexpr int kCached = 10;
+    const bool cached = features == kCached * static_cast<int>(blockDim.x);
+    float values[kCached];
     float sum = 0.0f;
+    if (cached) {
+        // Same elements, same x*x accumulation order; loads issued together and
+        // the represented inputs kept in registers for the output pass.
+        std::uint16_t represented[kCached];
+        #pragma unroll
+        for (int j = 0; j < kCached; ++j)
+            represented[j] = input[row * features + lane + j * static_cast<int>(blockDim.x)];
+        if constexpr(Residual) {
+            std::uint16_t right_bits[kCached];
+            #pragma unroll
+            for (int j = 0; j < kCached; ++j)
+                right_bits[j] = right[row * features + lane + j * static_cast<int>(blockDim.x)];
+            #pragma unroll
+            for (int j = 0; j < kCached; ++j) {
+                represented[j] = __half_as_ushort(__float2half_rn(
+                    half_value(represented[j]) + half_value(right_bits[j])));
+                materialized[row * features + lane + j * static_cast<int>(blockDim.x)] =
+                    represented[j];
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < kCached; ++j) {
+            values[j] = half_value(represented[j]);
+            sum += values[j] * values[j];
+        }
+    } else
     for (int i = lane; i < features; i += blockDim.x) {
         const int index=row * features + i;
         std::uint16_t represented=input[index];
@@ -94,11 +123,30 @@ __global__ void rms_norm_f16_kernel(const std::uint16_t* input, const std::uint1
     }
     shared[lane] = sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    // Cross-warp strides in shared memory; strides 16..1 are the same pairwise
+    // adds done with shfl_down in warp 0.
+    for (int stride = blockDim.x / 2; stride >= 32; stride >>= 1) {
         if (lane < stride) shared[lane] += shared[lane + stride];
         __syncthreads();
     }
+    if (lane < 32) {
+        float value = shared[lane];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        if (lane == 0) shared[0] = value;
+    }
+    __syncthreads();
     const float inv = rsqrtf(shared[0] / static_cast<float>(features) + kRmsEps);
+    if (cached) {
+        #pragma unroll
+        for (int j = 0; j < kCached; ++j) {
+            const int i = lane + j * static_cast<int>(blockDim.x);
+            const float x = values[j] * inv;
+            const float w = half_value(weight[i]);
+            output[row * features + i] = __half_as_ushort(__float2half_rn(x * (w + 1.0f)));
+        }
+        return;
+    }
     for (int i = lane; i < features; i += blockDim.x) {
         const float x = half_value((Residual?materialized:input)[row * features + i]) * inv;
         const float w = half_value(weight[i]);
@@ -1117,10 +1165,24 @@ __global__ void control_fused_kernel(const std::uint16_t* input,
     const int input_base = row * kHidden;
     const int weight_base = head * kHidden;
     float asum = 0.0f, bsum = 0.0f;
-    for (int d = static_cast<int>(threadIdx.x); d < kHidden; d += kThreads) {
-        const float x = half_value(input[input_base + d]);
-        asum = fmaf(x, half_value(a_weight[weight_base + d]), asum);
-        bsum = fmaf(x, half_value(b_weight[weight_base + d]), bsum);
+    // Loads for eight consecutive strided elements are issued together; the
+    // fmaf chain still visits d = t, t+128, ... in the same order.
+    constexpr int kBatch = 8;
+    static_assert(kHidden % (kThreads * kBatch) == 0);
+    for (int step = 0; step < kHidden / kThreads; step += kBatch) {
+        float x[kBatch], wa[kBatch], wb[kBatch];
+        #pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            const int d = static_cast<int>(threadIdx.x) + (step + j) * kThreads;
+            x[j] = half_value(input[input_base + d]);
+            wa[j] = half_value(a_weight[weight_base + d]);
+            wb[j] = half_value(b_weight[weight_base + d]);
+        }
+        #pragma unroll
+        for (int j = 0; j < kBatch; ++j) {
+            asum = fmaf(x[j], wa[j], asum);
+            bsum = fmaf(x[j], wb[j], bsum);
+        }
     }
     constexpr unsigned mask = 0xffffffffu;
     for (int offset = 16; offset > 0; offset >>= 1) {
