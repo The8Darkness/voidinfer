@@ -1677,6 +1677,161 @@ __global__ void dflash_topk16_local_merge_kernel(const std::uint16_t* logits, in
     }
 }
 
+// Segmented top-16: the (value desc, id asc) order is strict, so the top-16
+// of the union of per-segment top-16 lists is exactly the row's top-16. Any
+// NaN in a row routes the whole row to the serial kernel, as before.
+constexpr int kTopKSegments = 32;
+constexpr int kTopKSegmentThreads = 128;
+
+__device__ __forceinline__ void dflash_topk16_insert(float* values, int* ids,
+                                                     float value, int id) {
+    constexpr int kInvalid = 0x7fffffff;
+    if (id == kInvalid || value < values[kTopK - 1] ||
+        (value == values[kTopK - 1] && id >= ids[kTopK - 1]))
+        return;
+    int slot = kTopK - 1;
+    while (slot > 0 &&
+           (value > values[slot - 1] || (value == values[slot - 1] && id < ids[slot - 1]))) {
+        values[slot] = values[slot - 1];
+        ids[slot] = ids[slot - 1];
+        --slot;
+    }
+    values[slot] = value;
+    ids[slot] = id;
+}
+
+// Lane zero merges the 32 register lists of its warp into shared[base..+16).
+__device__ __forceinline__ void dflash_topk16_warp_merge(const float* local_values,
+    const int* local_ids, float* shared_values, int* shared_ids) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    #pragma unroll
+    for (int rank = 0; rank < kTopK; ++rank) {
+        for (int source = 0; source < 32; ++source) {
+            const float value = __shfl_sync(0xffffffffU, local_values[rank], source);
+            const int id = __shfl_sync(0xffffffffU, local_ids[rank], source);
+            if (lane == 0) dflash_topk16_insert(shared_values, shared_ids, value, id);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(kTopKSegmentThreads) dflash_topk16_segment_kernel(
+    const std::uint16_t* logits, int vocab, float* segment_values, int* segment_ids,
+    int* segment_nan) {
+    constexpr int kInvalid = 0x7fffffff;
+    constexpr int kWarps = kTopKSegmentThreads / 32;
+    const int segment = static_cast<int>(blockIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    const int t = static_cast<int>(threadIdx.x);
+    const int span = (vocab + kTopKSegments - 1) / kTopKSegments;
+    const int begin = segment * span;
+    const int end = min(vocab, begin + span);
+    const auto* input = logits + static_cast<std::size_t>(row) * vocab;
+    float local_values[kTopK];
+    int local_ids[kTopK];
+    #pragma unroll
+    for (int i = 0; i < kTopK; ++i) {
+        local_values[i] = -CUDART_INF_F;
+        local_ids[i] = kInvalid;
+    }
+    bool nan = false;
+    for (int column = begin + t; column < end; column += kTopKSegmentThreads) {
+        const float value = half_to_float(input[column]);
+        nan = nan || isnan(value);
+        dflash_topk16_insert(local_values, local_ids, value, column);
+    }
+    __shared__ float warp_values[kWarps * kTopK];
+    __shared__ int warp_ids[kWarps * kTopK];
+    for (int i = t; i < kWarps * kTopK; i += kTopKSegmentThreads) {
+        warp_values[i] = -CUDART_INF_F;
+        warp_ids[i] = kInvalid;
+    }
+    const bool any_nan = __syncthreads_or(nan);
+    const int out = (row * kTopKSegments + segment) * kTopK;
+    if (any_nan) {
+        if (t == 0) segment_nan[row * kTopKSegments + segment] = 1;
+        return;
+    }
+    const int base = (t >> 5) * kTopK;
+    dflash_topk16_warp_merge(local_values, local_ids, warp_values + base, warp_ids + base);
+    __syncthreads();
+    if (t == 0) {
+        float values[kTopK];
+        int ids[kTopK];
+        #pragma unroll
+        for (int rank = 0; rank < kTopK; ++rank) {
+            values[rank] = -CUDART_INF_F;
+            ids[rank] = kInvalid;
+        }
+        for (int candidate = 0; candidate < kWarps * kTopK; ++candidate)
+            dflash_topk16_insert(values, ids, warp_values[candidate], warp_ids[candidate]);
+        #pragma unroll
+        for (int rank = 0; rank < kTopK; ++rank) {
+            segment_values[out + rank] = values[rank];
+            segment_ids[out + rank] = ids[rank];
+        }
+        segment_nan[row * kTopKSegments + segment] = 0;
+    }
+}
+
+__global__ void __launch_bounds__(32) dflash_topk16_segment_merge_kernel(
+    const std::uint16_t* logits, int vocab, const float* segment_values,
+    const int* segment_ids, const int* segment_nan, std::int64_t* cand_ids,
+    float* cand_unary) {
+    static_assert(kTopKSegments == 32, "one lane per segment");
+    constexpr int kInvalid = 0x7fffffff;
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (__any_sync(0xffffffffU, segment_nan[row * kTopKSegments + lane] != 0)) {
+        if (lane == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary);
+        return;
+    }
+    float local_values[kTopK];
+    int local_ids[kTopK];
+    const int in = (row * kTopKSegments + lane) * kTopK;
+    #pragma unroll
+    for (int rank = 0; rank < kTopK; ++rank) {
+        local_values[rank] = segment_values[in + rank];
+        local_ids[rank] = segment_ids[in + rank];
+    }
+    __shared__ float values[kTopK];
+    __shared__ int ids[kTopK];
+    if (lane < kTopK) {
+        values[lane] = -CUDART_INF_F;
+        ids[lane] = kInvalid;
+    }
+    __syncwarp();
+    dflash_topk16_warp_merge(local_values, local_ids, values, ids);
+    __syncwarp();
+    if (lane < kTopK) {
+        cand_ids[static_cast<std::size_t>(row) * kTopK + lane] = ids[lane];
+        cand_unary[static_cast<std::size_t>(row) * kTopK + lane] = values[lane];
+    }
+}
+
+bool dflash_topk_segmented_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_TOPK_SEGMENTED");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+std::size_t dflash_topk_segment_bytes() {
+    return static_cast<std::size_t>(kBlockCap) * kTopKSegments *
+        (kTopK * (sizeof(float) + sizeof(int)) + sizeof(int));
+}
+
+void launch_dflash_topk16_segmented(const std::uint16_t* logits, int rows, int vocab,
+    std::int64_t* cand_ids, float* cand_unary, void* scratch, cudaStream_t stream) {
+    auto* values = static_cast<float*>(scratch);
+    auto* ids = reinterpret_cast<int*>(values + kBlockCap * kTopKSegments * kTopK);
+    auto* nan = ids + kBlockCap * kTopKSegments * kTopK;
+    dflash_topk16_segment_kernel<<<dim3(kTopKSegments, rows), kTopKSegmentThreads, 0, stream>>>(
+        logits, vocab, values, ids, nan);
+    dflash_topk16_segment_merge_kernel<<<rows, 32, 0, stream>>>(
+        logits, vocab, values, ids, nan, cand_ids, cand_unary);
+}
+
 void dflash2_topk16_for_test(const std::uint16_t* logits, int rows, int vocab,
                            std::int64_t* ids, float* values, bool parallel,
                            bool local_merge,
@@ -1688,7 +1843,13 @@ void dflash2_topk16_for_test(const std::uint16_t* logits, int rows, int vocab,
     require(logits && ids && values, "top-K test entry received null buffers");
     require(!nonfinite_flag || local_merge,
             "fused top-K liveness test requires local merge");
-    if (local_merge) {
+    if (local_merge && !nonfinite_flag && dflash_topk_segmented_enabled()) {
+        static void* scratch = nullptr;
+        if (!scratch)
+            cuda_check(cudaMalloc(&scratch, dflash_topk_segment_bytes()),
+                       "top-K segmented test scratch");
+        launch_dflash_topk16_segmented(logits, rows, vocab, ids, values, scratch, stream);
+    } else if (local_merge) {
         if (nonfinite_flag)
             dflash_topk16_local_merge_kernel<true><<<rows, 256, 0, stream>>>(
                 logits, rows, vocab, ids, values, nonfinite_flag);
@@ -2312,6 +2473,7 @@ struct Exl3Dflash2DraftModel::Impl {
         std::int64_t* ids = nullptr;        // [L]
         std::int64_t* cand_ids = nullptr;   // [P][16]
         float* cand_unary = nullptr;        // [P][16]
+        void* topk_segments = nullptr;      // segmented top-K scratch
         float* edge_scores = nullptr;       // [16]
         std::int64_t* proposal_out = nullptr; // [P]
         DraftPositionConfidence* confidence_out = nullptr; // [P], T73A only
@@ -2501,6 +2663,7 @@ struct Exl3Dflash2DraftModel::Impl {
         alloc(rowsB(kBlockCap) * sizeof(std::int64_t), reinterpret_cast<void**>(&s.ids), "dflash token ids");
         alloc(rowsB(kBlockCap) * kTopK * sizeof(std::int64_t), reinterpret_cast<void**>(&s.cand_ids), "dflash cand ids");
         alloc(rowsB(kBlockCap) * kTopK * sizeof(float), reinterpret_cast<void**>(&s.cand_unary), "dflash cand unary");
+        alloc(dflash_topk_segment_bytes(), &s.topk_segments, "dflash segmented top-K scratch");
         alloc(kTopK * sizeof(float), reinterpret_cast<void**>(&s.edge_scores), "dflash edge scores");
         alloc(rowsB(kBlockCap) * sizeof(std::int64_t), reinterpret_cast<void**>(&s.proposal_out), "dflash proposal out");
         if (position_confidence)
@@ -4792,6 +4955,9 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
                 m.s.head_out, proposal_rows, kVocab, m.s.cand_ids,
                 m.s.cand_unary, m.s.liveness_flag);
             ++m.fused_topk_liveness_calls;
+        } else if (dflash_topk_segmented_enabled()) {
+            launch_dflash_topk16_segmented(m.s.head_out, proposal_rows, kVocab,
+                m.s.cand_ids, m.s.cand_unary, m.s.topk_segments, stream);
         } else {
             dflash_topk16_local_merge_kernel<false><<<proposal_rows, 256, 0, stream>>>(
                 m.s.head_out, proposal_rows, kVocab, m.s.cand_ids,
