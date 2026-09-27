@@ -10935,6 +10935,35 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         float* accum = accum_;
         int row_count = rows;
         void* kernel_args[] = {&transformed, &trellis, &mul1, &accum, &row_count};
+        // Default: the same K5 five-split partition and fixed-order in-kernel
+        // reduction through the narrow async-deep generic producer (64-column
+        // CTAs; measured). NINFER_EXL3_SHAPE4_NARROW=0 keeps the shape-4 leaf.
+        static const bool shape4_narrow = [] {
+            const char* value = std::getenv("NINFER_EXL3_SHAPE4_NARROW");
+            if (!value) return true;
+            if (std::strcmp(value, "0") == 0) return false;
+            if (std::strcmp(value, "1") == 0) return true;
+            throw std::invalid_argument("NINFER_EXL3_SHAPE4_NARROW must be 0 or 1");
+        }();
+        if (shape4_narrow) {
+            constexpr int warps = 4, stages = 4;
+            int input_features = in_features_;
+            int output_features = out_features_;
+            int split_count = kShape4Splits;
+            void* narrow_args[] = {&transformed, &trellis, &mul1, &accum, &row_count,
+                                   &input_features, &output_features, &split_count};
+            const std::size_t narrow_shared =
+                static_cast<std::size_t>(stages) *
+                    (256u * sizeof(half) + warps * 16u * 5u * sizeof(std::uint16_t)) +
+                16u * warps * 16u * sizeof(float);
+            cuda_check(cudaLaunchCooperativeKernel(
+                           reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<
+                               5, false, warps, true, false, false, false, false, false,
+                               false, false, stages, warps>),
+                           dim3(out_features_ / (16 * warps) * split_count), dim3(warps * 32),
+                           narrow_args, narrow_shared, stream),
+                       "launch EXL3 narrow shape-4 split GEMV");
+        } else
         cuda_check(cudaLaunchCooperativeKernel(
                        reinterpret_cast<void*>(exl3_gemm_m1_shape4_kernel),
                        dim3(cooperative_grid_), dim3(kThreads), kernel_args,
