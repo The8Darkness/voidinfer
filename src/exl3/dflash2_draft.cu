@@ -803,6 +803,90 @@ __global__ void dflash_dense_gemm_t_kernel(const std::uint16_t* a,
     }
 }
 
+// K-major dense rows kernel: 16 output columns x up to 8 rows per 128-thread
+// CTA, with K tiles of both operands streamed through a cp.async ring. Every
+// output keeps the single ascending FP32 chain of dflash_dense_gemm_t_kernel,
+// so the stored F16 bits are identical; only operand delivery changes.
+constexpr int kDenseRowsCols=16;
+constexpr int kDenseRowsTileK=128;
+constexpr int kDenseRowsStages=4;
+constexpr int kDenseRowsMax=8;
+
+__device__ __forceinline__ void dflash_cp_async_16(void* shared_ptr,const void* global_ptr) {
+    const auto shared_address=
+        static_cast<std::uint32_t>(__cvta_generic_to_shared(shared_ptr));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(shared_address), "l"(global_ptr));
+}
+
+__global__ void __launch_bounds__(128) dflash_dense_rows_kmajor_kernel(
+    const std::uint16_t* a,const std::uint16_t* b,std::uint16_t* c,int m,int k,int n) {
+    __shared__ __align__(16) std::uint16_t weights[kDenseRowsStages][kDenseRowsTileK][kDenseRowsCols];
+    __shared__ __align__(16) std::uint16_t inputs[kDenseRowsStages][kDenseRowsMax][kDenseRowsTileK];
+    const int tid=static_cast<int>(threadIdx.x);
+    const int col0=static_cast<int>(blockIdx.x)*kDenseRowsCols;
+    const int col=tid%kDenseRowsCols;
+    const int row=tid/kDenseRowsCols;
+    const int tiles=k/kDenseRowsTileK;
+    auto load=[&](int tile,int stage) {
+        const int k0=tile*kDenseRowsTileK;
+        for(int chunk=tid;chunk<kDenseRowsTileK*2;chunk+=128) {
+            const int r=chunk>>1,part=chunk&1;
+            dflash_cp_async_16(&weights[stage][r][part*8],
+                b+static_cast<std::size_t>(k0+r)*n+col0+part*8);
+        }
+        for(int chunk=tid;chunk<m*(kDenseRowsTileK/8);chunk+=128) {
+            const int r=chunk/(kDenseRowsTileK/8),part=chunk%(kDenseRowsTileK/8);
+            dflash_cp_async_16(&inputs[stage][r][part*8],
+                a+static_cast<std::size_t>(r)*k+k0+part*8);
+        }
+    };
+    #pragma unroll
+    for(int stage=0;stage<kDenseRowsStages-1;++stage) {
+        if(stage<tiles) load(stage,stage);
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+    float acc=0.0f;
+    for(int tile=0;tile<tiles;++tile) {
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(kDenseRowsStages-2));
+        __syncthreads();
+        const int next=tile+kDenseRowsStages-1;
+        if(next<tiles) load(next,next%kDenseRowsStages);
+        asm volatile("cp.async.commit_group;\n" ::);
+        const int stage=tile%kDenseRowsStages;
+        if(row<m) {
+            #pragma unroll 4
+            for(int i=0;i<kDenseRowsTileK;i+=8) {
+                const uint4 packed=*reinterpret_cast<const uint4*>(&inputs[stage][row][i]);
+                const auto* input_bits=reinterpret_cast<const std::uint16_t*>(&packed);
+                #pragma unroll
+                for(int j=0;j<8;++j)
+                    acc+=half_to_float(input_bits[j])*half_to_float(weights[stage][i+j][col]);
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    if(row<m) c[static_cast<std::size_t>(row)*n+col0+col]=float_to_half(acc);
+}
+
+bool dflash_dense_rows_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_DFLASH2_DENSE_ROWS_PIPELINE");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+bool launch_dflash_dense_rows_kmajor(const std::uint16_t* in,const std::uint16_t* weights,
+    std::uint16_t* out,int rows,int k,int n,cudaStream_t stream) {
+    if(!dflash_dense_rows_enabled() || rows<1 || rows>kDenseRowsMax ||
+       k%kDenseRowsTileK!=0 || n%kDenseRowsCols!=0 ||
+       (reinterpret_cast<std::uintptr_t>(in)|reinterpret_cast<std::uintptr_t>(weights))%16!=0)
+        return false;
+    dflash_dense_rows_kmajor_kernel<<<n/kDenseRowsCols,128,0,stream>>>(in,weights,out,rows,k,n);
+    return true;
+}
+
 template<bool WeightsKMajor>
 __global__ void gopt_draft_dense_rowpair_kernel(const std::uint16_t* a,
     const std::uint16_t* b,std::uint16_t* c,int m,int k,int n) {
@@ -1546,7 +1630,8 @@ void dflash2_dense_t_for_test(const std::uint16_t* input,
         "draft dense qualification geometry");
     require(input && weights && output,"draft dense qualification pointers");
     const dim3 grid((n+255)/256,rows);
-    if(weights_kmajor)
+    if(weights_kmajor && launch_dflash_dense_rows_kmajor(input,weights,output,rows,k,n,stream)) {
+    } else if(weights_kmajor)
         dflash_dense_gemm_t_kernel<true><<<grid,256,
             static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(
             input,weights,output,rows,k,n);
@@ -3968,6 +4053,9 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
                     static_cast<std::size_t>(2*k)*sizeof(std::uint16_t),stream>>>(in,weight_outmajor,out,rows,k,n);
             cuda_check(cudaGetLastError(),"launch GOPT draft dense row pair");
             gopt_record(m.gaming_submissions,Gopt::DraftDenseRowPair);
+        } else if(m.dense_kmajor &&
+                  launch_dflash_dense_rows_kmajor(in,weight_outmajor,out,rows,k,n,stream)) {
+            ++m.dense_kmajor_launches;
         } else if(m.dense_kmajor) {
             dflash_dense_gemm_t_kernel<true><<<dim3((n+255)/256,rows),256,
                 static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(
