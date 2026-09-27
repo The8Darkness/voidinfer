@@ -8997,6 +8997,18 @@ std::size_t Exl3CudaLinearWorkspace::coherent_wide_k6_shared_bytes_for_test() no
     return kCoherentWideK6SharedBytes;
 }
 
+// NINFER_EXL3_COHERENT_ANY_K=1 also admits K5 and K7 weights to the coherent
+// wide and down producers (numerics policy: split-plane FP32 accumulation).
+static bool coherent_any_k_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_ANY_K");
+        if (!value || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        throw std::invalid_argument("NINFER_EXL3_COHERENT_ANY_K must be 0 or 1");
+    }();
+    return enabled;
+}
+
 bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
@@ -9004,7 +9016,9 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
         coherent_wide_k6_resident_capacity_ <= 0 ||
         rows < 1 || rows > 8 || rows > max_rows_ ||
         metadata.in_features != in_features_ ||
-        metadata.out_features != out_features_ || metadata.K != 6 ||
+        metadata.out_features != out_features_ ||
+        !(metadata.K == 6 ||
+          (coherent_any_k_enabled() && (metadata.K == 5 || metadata.K == 7))) ||
         metadata.mcg || !metadata.mul1 || metadata.has_bias)
         return false;
     constexpr Exl3CudaLinearAdmission continuation[5] = {
@@ -9056,7 +9070,8 @@ bool Exl3CudaLinearWorkspace::coherent_down_k6_candidate(
          admission == Exl3CudaLinearAdmission::target_continuation_down) &&
         in_features_ == 17408 && out_features_ == 5120 &&
         metadata.in_features == in_features_ &&
-        metadata.out_features == out_features_ && metadata.K == 6 &&
+        metadata.out_features == out_features_ &&
+        (metadata.K == 6 || (coherent_any_k_enabled() && metadata.K == 5)) &&
         !metadata.mcg && metadata.mul1 && !metadata.has_bias;
 }
 
@@ -10122,7 +10137,11 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         // One packed-MMA producer instantiation serves M1 and M2..8. Each
         // K/N tile's B decode is reused across active independent row C
         // fragments; inactive physical M16 rows are zero and never stored.
-        launch_coherent_packed_partials<6>(
+        if (metadata.K == 5) launch_coherent_packed_partials<5>(
+            output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count);
+        else launch_coherent_packed_partials<6>(
             output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
             rows, in_features_, out_features_, split_count);
@@ -10176,7 +10195,15 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (coherent_wide_k6_candidate(metadata, rows, admission)) {
         const int output_blocks = out_features_ / kHadamard;
         const int split_count = coherent_wide_k6_split_count(rows);
-        launch_coherent_packed_partials<6>(
+        if (metadata.K == 5) launch_coherent_packed_partials<5>(
+            output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count);
+        else if (metadata.K == 7) launch_coherent_packed_partials<7>(
+            output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count);
+        else launch_coherent_packed_partials<6>(
             output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
             rows, in_features_, out_features_, split_count);
