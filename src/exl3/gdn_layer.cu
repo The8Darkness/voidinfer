@@ -995,6 +995,97 @@ __global__ void control_fused_kernel(const std::uint16_t* input,
     }
 }
 
+// Tiled twin of control_fused_kernel for prefill: one CTA owns R rows x H
+// heads. Thread t keeps, for every (row, head) pair, the same ascending fmaf
+// chain over d = t, t+128, ... and the same shuffle and four-warp reductions,
+// while each loaded activation and weight element now feeds R*H chains
+// instead of one, removing the repeated L2 traversal of rows and weights.
+bool gdn_control_tiled_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_CONTROL_TILED");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+template<int R,int H>
+__global__ void __launch_bounds__(128) control_fused_tiled_kernel(
+    const std::uint16_t* input,const std::uint16_t* a_weight,const std::uint16_t* b_weight,
+    const float* a_log,const float* dt_bias,float* a_output,float* b_output,
+    float* beta_trace,float* g_trace,int rows) {
+    constexpr int kThreads=128;
+    constexpr int kWarps=kThreads/32;
+    static_assert(kHeads%H==0);
+    __shared__ float partial_a[R*H][kWarps];
+    __shared__ float partial_b[R*H][kWarps];
+    const int tid=static_cast<int>(threadIdx.x);
+    const int lane=tid&31;
+    const int warp=tid>>5;
+    constexpr int kHeadGroups=kHeads/H;
+    const int row0=(static_cast<int>(blockIdx.x)/kHeadGroups)*R;
+    const int head0=(static_cast<int>(blockIdx.x)%kHeadGroups)*H;
+    if(row0>=rows) return;
+    float asum[R][H],bsum[R][H];
+    #pragma unroll
+    for(int r=0;r<R;++r)
+        #pragma unroll
+        for(int h=0;h<H;++h) asum[r][h]=bsum[r][h]=0.0f;
+    for(int d=tid;d<kHidden;d+=kThreads) {
+        float x[R];
+        #pragma unroll
+        for(int r=0;r<R;++r)
+            x[r]=row0+r<rows?half_value(input[(row0+r)*kHidden+d]):0.0f;
+        #pragma unroll
+        for(int h=0;h<H;++h) {
+            const float a=half_value(a_weight[(head0+h)*kHidden+d]);
+            const float b=half_value(b_weight[(head0+h)*kHidden+d]);
+            #pragma unroll
+            for(int r=0;r<R;++r) {
+                asum[r][h]=fmaf(x[r],a,asum[r][h]);
+                bsum[r][h]=fmaf(x[r],b,bsum[r][h]);
+            }
+        }
+    }
+    constexpr unsigned mask=0xffffffffu;
+    #pragma unroll
+    for(int r=0;r<R;++r) {
+        #pragma unroll
+        for(int h=0;h<H;++h) {
+            float a=asum[r][h],b=bsum[r][h];
+            for(int offset=16;offset>0;offset>>=1) {
+                a+=__shfl_down_sync(mask,a,offset);
+                b+=__shfl_down_sync(mask,b,offset);
+            }
+            if(lane==0) {
+                partial_a[r*H+h][warp]=a;
+                partial_b[r*H+h][warp]=b;
+            }
+        }
+    }
+    __syncthreads();
+    if(tid<R*H) {
+        const int r=tid/H;
+        const int h=tid%H;
+        const int row=row0+r;
+        if(row<rows) {
+            const int head=head0+h;
+            const int index=row*kHeads+head;
+            float a=0.0f,b=0.0f;
+            for(int w=0;w<kWarps;++w) {
+                a+=partial_a[tid][w];
+                b+=partial_b[tid][w];
+            }
+            a_output[index]=a;
+            b_output[index]=b;
+            const float beta_f=1.0f/(1.0f+expf(-b));
+            const float av=a+dt_bias[head];
+            const float softplus=av>20.0f?av:log1pf(expf(av));
+            beta_trace[index]=__bfloat162float(__float2bfloat16_rn(beta_f));
+            g_trace[index]=-expf(a_log[head])*softplus;
+        }
+    }
+}
+
 // Two verifier rows share each represented coefficient load. Each row keeps
 // the canonical per-thread FMA and warp/CTA reduction order.
 __global__ void control_fused_row_pair_kernel(const std::uint16_t* input,
@@ -2071,6 +2162,10 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
                 a,b,beta_trace,g_trace,rows);
             gopt_record(gaming_submissions_,Gopt::GdnControlRowPair);
+        } else if(rows>=16 && gdn_control_tiled_enabled()) {
+            control_fused_tiled_kernel<4,4><<<((rows+3)/4)*(kHeads/4),128,0,stream>>>(
+                h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
+                a,b,beta_trace,g_trace,rows);
         } else {
             control_fused_kernel<<<rows*kHeads,128,0,stream>>>(
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
