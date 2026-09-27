@@ -325,6 +325,52 @@ static void wmma_attention_reference(bool rows32,int rows,int position,
         " max_error="<<max_error<<" failures="<<failures<<'\n';
     require(failures==0,"repaired WMMA QK/causal softmax/PV differs from independent FP32 reference");
 }
+// Bitwise differential: the register-resident WMMA32 twin against the shared
+// WMMA32 reference for split 1/2/4, every CTA head grouping, ragged row blocks,
+// unaligned frontiers and multi-tile causal scans.
+static void wmma32_register_bitwise(int rows,int position,int split,int heads,bool m64=false){
+    constexpr int qheads=24,kvheads=4,dim=256;
+    const int capacity=position+rows+7;
+    std::vector<std::uint16_t> qh(static_cast<std::size_t>(rows)*qheads*dim),
+        kh(static_cast<std::size_t>(capacity)*kvheads*dim),vh(kh.size());
+    std::uint32_t state=0x9e3779b9U^static_cast<std::uint32_t>(rows*131+position*7+split);
+    auto next=[&](float scale){
+        state^=state<<13;state^=state>>17;state^=state<<5;
+        const float u=float(state>>8)/float(1u<<24)*2.0f-1.0f;
+        return __half_as_ushort(__float2half_rn(u*scale));
+    };
+    for(auto& x:qh)x=next(2.0f);
+    for(auto& x:kh)x=next(2.0f);
+    for(auto& x:vh)x=next(1.0f);
+    H q(qh.size()),k(kh.size()),v(vh.size()),reference(qh.size()),candidate(qh.size());
+    Buffer<float> reference_partial(static_cast<std::size_t>(4)*qh.size()),
+        candidate_partial(static_cast<std::size_t>(4)*qh.size());
+    Buffer<float> reference_stats(static_cast<std::size_t>(4)*rows*qheads*2),
+        candidate_stats(static_cast<std::size_t>(4)*rows*qheads*2);
+    q.set(qh);k.set(kh);v.set(vh);
+    if(m64)
+        fast_wmma64_attention_fixture(q.p,k.p,v.p,reference.p,reference_partial.p,
+            reference_stats.p,rows,position,capacity,nullptr,0,nullptr,false,split==2);
+    else if(split==1)
+        fast_wmma_attention_fixture(true,q.p,k.p,v.p,reference.p,rows,position,
+            capacity,nullptr,0,nullptr,false);
+    else if(split==2)
+        fast_wmma_split2_attention_fixture(q.p,k.p,v.p,reference.p,reference_partial.p,
+            reference_stats.p,rows,position,capacity,nullptr,0,nullptr,false);
+    else
+        fast_wmma_split4_attention_fixture(q.p,k.p,v.p,reference.p,reference_partial.p,
+            reference_stats.p,rows,position,capacity,nullptr,0,nullptr,false);
+    fast_wmma32_register_attention_fixture(q.p,k.p,v.p,candidate.p,candidate_partial.p,
+        candidate_stats.p,rows,position,capacity,nullptr,0,split,heads,nullptr,m64?64:32);
+    ck(cudaDeviceSynchronize());
+    equal(reference,candidate,"register WMMA32 output differs from reference");
+    if(split>1){
+        equal(reference_partial,candidate_partial,"register WMMA32 split partials differ");
+        equal(reference_stats,candidate_stats,"register WMMA32 split stats differ");
+    }
+    std::cout<<"WMMA32_REGISTER_BITWISE rows="<<rows<<" position="<<position<<
+        " split="<<split<<" heads="<<heads<<" m64="<<m64<<" equal=1\n";
+}
 static void fused_graph_coverage(){
     constexpr int capacity=16640,heads=24,kvheads=4,dim=256;
     constexpr int captured_segments=(capacity+255)/256;
@@ -494,8 +540,8 @@ static void control_pair(int rows){
 int main(int argc,char** argv){try{
     require(argc<=2,"pass optional candidate number 1..14 (9 uses greedy-device executable)");
     const int requested=argc==2?std::atoi(argv[1]):0;
-    require(argc==1 || (requested>=1&&requested<=14&&requested!=9),"operator candidate id");
-    for(int which=1;which<=14;++which) {
+    require(argc==1 || (requested>=1&&requested<=15&&requested!=9),"operator candidate id");
+    for(int which=1;which<=15;++which) {
     if(which==9 || (requested && which!=requested))continue;
     if(which==1)for(int rows:{2,3,7,8})recurrence(rows);
     for(int rows:{1,2,3,7,8,9,16}){
@@ -552,6 +598,16 @@ int main(int argc,char** argv){try{
             false,true,true,false,true);
     }
     if(which==14){fused_graph_coverage();fused_multirow_coverage();}
+    if(which==15){
+        for(int heads:{1,2,3})for(int split:{1,2,4})
+            for(auto shape:std::vector<std::pair<int,int>>{{1,0},{17,5},{32,0},{33,30},
+                    {64,1000},{100,2047},{1024,0},{1024,3072},{256,4001}})
+                wmma32_register_bitwise(shape.first,shape.second,split,heads);
+        for(int heads:{2,3})for(int split:{1,2})
+            for(auto shape:std::vector<std::pair<int,int>>{{64,0},{128,33},{1024,0},
+                    {1024,3072},{512,8000}})
+                wmma32_register_bitwise(shape.first,shape.second,split,heads,true);
+    }
     }
     std::cout<<"PASS GOPT operator differentials, bounded oracles, tails and graph replay\n";
     return 0;

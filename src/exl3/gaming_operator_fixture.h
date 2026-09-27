@@ -38,6 +38,11 @@ void fast_wmma_split4_attention_fixture(const std::uint16_t* q,
     float* split_output,float* split_stats,int rows,int position,int capacity,
     const int* position_device,int query_offset,cudaStream_t stream=nullptr,
     bool padded=false);
+void fast_wmma32_register_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,int split_count,int heads,
+    cudaStream_t stream=nullptr,int split_block_m=32);
 void fast_wmma64_attention_fixture(const std::uint16_t* q,
     const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
     float* split_output,float* split_stats,int rows,int position,int capacity,

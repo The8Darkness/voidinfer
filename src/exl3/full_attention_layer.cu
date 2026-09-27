@@ -5412,6 +5412,355 @@ void fast_wmma_attention_fixture(bool rows32,const std::uint16_t* q,
     cuda_check(cudaGetLastError(),"WMMA attention fixture launch");
 }
 
+// Register-resident twin of attention_cached_gqa_six_wmma32_prefill_kernel
+// <*,SplitCount,32>. Each warp owns 16 query rows of one query head across the
+// whole key scan; Heads query heads of one KV head share every K/V tile. The
+// arithmetic is the reference's: 32-key tiles in the same order, the same
+// m16n8k16 HMMA k-sequence for S and for P x V, exact quad max, the same
+// exp2f/half rounding of P, an in-order FP32 tile sum and the same running
+// max/denominator/rescale updates. Only operand residency changes: the FP32
+// output accumulators stay in registers instead of shared memory round trips.
+constexpr int kRegAttnStride=kHeadDim+8;
+constexpr int kRegAttnPStride=32+8;
+
+template<int Heads>
+constexpr std::size_t reg_attn_shared_bytes() {
+    return (static_cast<std::size_t>(Heads)*32*kRegAttnStride+
+            2*32*kRegAttnStride+2*Heads*16*kRegAttnPStride)*sizeof(half);
+}
+
+__device__ __forceinline__ void reg_attn_ldmatrix_x4(unsigned (&r)[4],const half* p) {
+    const unsigned address=static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 :"=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]):"r"(address));
+}
+
+__device__ __forceinline__ void reg_attn_ldmatrix_x4_trans(unsigned (&r)[4],const half* p) {
+    const unsigned address=static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 :"=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]):"r"(address));
+}
+
+__device__ __forceinline__ void reg_attn_mma(float (&c)[4],const unsigned (&a)[4],
+                                             unsigned b0,unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3])
+                 :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
+}
+
+__device__ __forceinline__ unsigned reg_attn_pack(half low,half high) {
+    return static_cast<unsigned>(__half_as_ushort(low))|
+        (static_cast<unsigned>(__half_as_ushort(high))<<16);
+}
+
+// SplitBlockM names the reference row block whose frontier defines the split
+// boundaries and capacity check (32 for WMMA32, 64 for the M64 twin). Extra
+// fully masked tiles are exact no-ops for rows of the smaller block.
+template<int SplitCount,int Heads,int SplitBlockM=32>
+__global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_prefill_kernel(
+    const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,std::uint16_t* output,int rows,
+    int position,int capacity,const int* position_device,int query_offset,
+    float* split_output,float* split_stats) {
+    constexpr int BlockM=32;
+    constexpr int BlockN=32;
+    constexpr int kHeadsPerKV=kQHeads/kKVHeads;
+    constexpr int kVectors=kHeadDim/8;
+    static_assert(kHeadsPerKV%Heads==0);
+    static_assert(SplitCount==1 || SplitCount==2 || SplitCount==4);
+    extern __shared__ __align__(16) unsigned char reg_attn_shared[];
+    half* q_s=reinterpret_cast<half*>(reg_attn_shared);
+    half* k_s=q_s+Heads*BlockM*kRegAttnStride;
+    half* v_s=k_s+BlockN*kRegAttnStride;
+    half* p_s=v_s+BlockN*kRegAttnStride;
+
+    const int query_base=static_cast<int>(blockIdx.x)*BlockM;
+    const int kv_head=static_cast<int>(blockIdx.y);
+    const int head_group=static_cast<int>(blockIdx.z)/SplitCount;
+    const int split=static_cast<int>(blockIdx.z)%SplitCount;
+    const int tid=static_cast<int>(threadIdx.x);
+    const int warp=tid>>5;
+    const int lane=tid&31;
+    const int q_head_base=kv_head*kHeadsPerKV+head_group*Heads;
+    if(query_base>=rows || kv_head>=kKVHeads) return;
+    static_assert(SplitBlockM==32 || SplitBlockM==64);
+    const int active_rows=min(BlockM,rows-query_base);
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int maximum_count=base+query_base+active_rows;
+    const int split_base=(query_base/SplitBlockM)*SplitBlockM;
+    const int split_count=base+split_base+min(SplitBlockM,rows-split_base);
+    if(base+split_base+1<1 || split_count>capacity) return;
+    const int segment_tiles=(split_count+SplitCount*BlockN-1)/(SplitCount*BlockN);
+    const int first_begin=SplitCount==1?0:
+        min(split*segment_tiles*BlockN,split_count);
+    const int first_end=SplitCount==1?maximum_count:
+        min((split+1)*segment_tiles*BlockN,split_count);
+
+    for(int index=tid;index<Heads*BlockM*kVectors;index+=blockDim.x) {
+        const int head=index/(BlockM*kVectors);
+        const int rem=index%(BlockM*kVectors);
+        const int row=rem/kVectors;
+        const int dim=(rem%kVectors)*8;
+        uint4 bits=make_uint4(0,0,0,0);
+        if(row<active_rows)
+            bits=*reinterpret_cast<const uint4*>(q+
+                (static_cast<std::size_t>(query_base+row)*kQHeads+q_head_base+head)*
+                    kHeadDim+dim);
+        *reinterpret_cast<uint4*>(q_s+(head*BlockM+row)*kRegAttnStride+dim)=bits;
+    }
+
+    const int head_local=warp>>1;
+    const int m_base=(warp&1)*16;
+    const int g=lane>>2;
+    const int t=lane&3;
+    const int row0=m_base+g;
+    const int row1=row0+8;
+    const half* q_warp=q_s+(head_local*BlockM+m_base)*kRegAttnStride;
+    half* p_warp=p_s+warp*16*kRegAttnPStride;
+    float acc[kHeadDim/8][4];
+    #pragma unroll
+    for(int n=0;n<kHeadDim/8;++n)
+        acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+    float running_max[2]={-3.402823466e+38F,-3.402823466e+38F};
+    float denominator[2]={0.0f,0.0f};
+
+    for(int first=first_begin;first<first_end;first+=BlockN) {
+        __syncthreads();
+        for(int index=tid;index<BlockN*kVectors;index+=blockDim.x) {
+            const int key_offset=index/kVectors;
+            const int dim=(index%kVectors)*8;
+            const int key=first+key_offset;
+            uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
+            if(key<first_end && key<capacity) {
+                const std::size_t offset=(static_cast<std::size_t>(key)*kKVHeads+
+                    kv_head)*kHeadDim+dim;
+                key_bits=*reinterpret_cast<const uint4*>(k_cache+offset);
+                value_bits=*reinterpret_cast<const uint4*>(v_cache+offset);
+            }
+            *reinterpret_cast<uint4*>(k_s+key_offset*kRegAttnStride+dim)=key_bits;
+            *reinterpret_cast<uint4*>(v_s+key_offset*kRegAttnStride+dim)=value_bits;
+        }
+        __syncthreads();
+
+        float s[4][4];
+        #pragma unroll
+        for(int j=0;j<4;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.0f;
+        #pragma unroll
+        for(int kk=0;kk<kHeadDim;kk+=16) {
+            unsigned a[4];
+            reg_attn_ldmatrix_x4(a,q_warp+(lane&15)*kRegAttnStride+kk+(lane>>4)*8);
+            #pragma unroll
+            for(int pair=0;pair<2;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4(b,k_s+(pair*16+(lane&7)+((lane>>4)<<3))*
+                    kRegAttnStride+kk+((lane>>3)&1)*8);
+                reg_attn_mma(s[2*pair],a,b[0],b[1]);
+                reg_attn_mma(s[2*pair+1],a,b[2],b[3]);
+            }
+        }
+
+        const int in_range=first_end-first;
+        const int causal=base+query_base-first;
+        float tile_max[2]={-3.402823466e+38F,-3.402823466e+38F};
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const int row=e<2?row0:row1;
+                const int offset=8*j+2*t+(e&1);
+                if(row<active_rows && offset<in_range && offset<=causal+row)
+                    tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]*0.0625f);
+            }
+        }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],1));
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],2));
+        }
+        float old_scale[2];
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            const float next_max=fmaxf(running_max[i],tile_max[i]);
+            old_scale[i]=denominator[i]==0.0f?0.0f:
+                exp2f((running_max[i]-next_max)*1.4426950408889634f);
+            running_max[i]=next_max;
+        }
+        half p[4][4];
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const int row=e<2?row0:row1;
+                const int offset=8*j+2*t+(e&1);
+                const bool valid=row<active_rows && offset<in_range &&
+                    offset<=causal+row;
+                const float score=s[j][e]*0.0625f;
+                p[j][e]=__float2half(valid?exp2f((score-running_max[e>>1])*
+                    1.4426950408889634f):0.0f);
+            }
+            *reinterpret_cast<unsigned*>(p_warp+g*kRegAttnPStride+8*j+2*t)=
+                reg_attn_pack(p[j][0],p[j][1]);
+            *reinterpret_cast<unsigned*>(p_warp+(g+8)*kRegAttnPStride+8*j+2*t)=
+                reg_attn_pack(p[j][2],p[j][3]);
+        }
+        __syncwarp();
+        float tile_sum=0.0f;
+        if(lane<16) {
+            const int extent=min(BlockN,in_range);
+            for(int offset=0;offset<extent;++offset)
+                tile_sum+=__half2float(p_warp[lane*kRegAttnPStride+offset]);
+        }
+        const float sums[2]={__shfl_sync(0xffffffffU,tile_sum,g),
+                             __shfl_sync(0xffffffffU,tile_sum,g+8)};
+        #pragma unroll
+        for(int i=0;i<2;++i)
+            denominator[i]=denominator[i]*old_scale[i]+sums[i];
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n) {
+            acc[n][0]*=old_scale[0];
+            acc[n][1]*=old_scale[0];
+            acc[n][2]*=old_scale[1];
+            acc[n][3]*=old_scale[1];
+        }
+        #pragma unroll
+        for(int kk=0;kk<2;++kk) {
+            const unsigned a[4]={reg_attn_pack(p[2*kk][0],p[2*kk][1]),
+                                 reg_attn_pack(p[2*kk][2],p[2*kk][3]),
+                                 reg_attn_pack(p[2*kk+1][0],p[2*kk+1][1]),
+                                 reg_attn_pack(p[2*kk+1][2],p[2*kk+1][3])};
+            #pragma unroll
+            for(int pair=0;pair<kHeadDim/16;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4_trans(b,v_s+(16*kk+(lane&7)+((lane>>3)&1)*8)*
+                    kRegAttnStride+pair*16+(lane>>4)*8);
+                reg_attn_mma(acc[2*pair],a,b[0],b[1]);
+                reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+            }
+        }
+        __syncwarp();
+    }
+
+    const int q_head=q_head_base+head_local;
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+        const int row=i==0?row0:row1;
+        if(row>=active_rows) continue;
+        const std::size_t row_base=(static_cast<std::size_t>(query_base+row)*kQHeads+
+            q_head)*kHeadDim;
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n) {
+            const int dim=8*n+2*t;
+            const float first_value=denominator[i]>0.0f?
+                acc[n][2*i]/denominator[i]:0.0f;
+            const float second_value=denominator[i]>0.0f?
+                acc[n][2*i+1]/denominator[i]:0.0f;
+            if constexpr(SplitCount>1) {
+                float* destination=split_output+static_cast<std::size_t>(split)*rows*
+                    kQHeads*kHeadDim+row_base+dim;
+                destination[0]=first_value;
+                destination[1]=second_value;
+            } else {
+                output[row_base+dim]=__half_as_ushort(__float2half_rn(first_value));
+                output[row_base+dim+1]=__half_as_ushort(__float2half_rn(second_value));
+            }
+        }
+        if constexpr(SplitCount>1) {
+            if(t==0) {
+                const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+
+                    (query_base+row)*kQHeads+q_head)*2;
+                split_stats[stat]=running_max[i];
+                split_stats[stat+1]=denominator[i];
+            }
+        }
+    }
+}
+
+template<int SplitCount,int Heads,int SplitBlockM=32>
+void launch_wmma32_register_prefill(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    const int* position_device,int query_offset,float* split_output,float* split_stats,
+    cudaStream_t stream) {
+    constexpr std::size_t bytes=reg_attn_shared_bytes<Heads>();
+    static const bool configured=[] {
+        cuda_check(cudaFuncSetAttribute(
+            attention_gqa_six_wmma32_register_prefill_kernel<SplitCount,Heads,SplitBlockM>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
+            "configure register WMMA32 prefill shared memory");
+        return true;
+    }();
+    (void)configured;
+    attention_gqa_six_wmma32_register_prefill_kernel<SplitCount,Heads,SplitBlockM><<<
+        dim3((rows+31)/32,kKVHeads,(kQHeads/kKVHeads/Heads)*SplitCount),64*Heads,
+        bytes,stream>>>(q,k,v,output,rows,position,capacity,position_device,
+            query_offset,split_output,split_stats);
+}
+
+int wmma32_register_heads() {
+    static const int heads=[] {
+        const char* value=std::getenv("NINFER_EXL3_WMMA32_REGISTER");
+        if(!value) return 2;
+        const int parsed=std::atoi(value);
+        if(parsed!=0 && parsed!=1 && parsed!=2 && parsed!=3)
+            throw std::invalid_argument("NINFER_EXL3_WMMA32_REGISTER must be 0, 1, 2 or 3");
+        return parsed;
+    }();
+    return heads;
+}
+
+// Returns false when disabled; otherwise launches the split partials (or the
+// final output for SplitCount 1).
+template<int SplitCount,int SplitBlockM=32>
+bool launch_wmma32_register_selected(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    const int* position_device,int query_offset,float* split_output,float* split_stats,
+    cudaStream_t stream) {
+    switch(wmma32_register_heads()) {
+    case 1: launch_wmma32_register_prefill<SplitCount,1,SplitBlockM>(q,k,v,output,rows,position,capacity,
+        position_device,query_offset,split_output,split_stats,stream); return true;
+    case 2: launch_wmma32_register_prefill<SplitCount,2,SplitBlockM>(q,k,v,output,rows,position,capacity,
+        position_device,query_offset,split_output,split_stats,stream); return true;
+    case 3: launch_wmma32_register_prefill<SplitCount,3,SplitBlockM>(q,k,v,output,rows,position,capacity,
+        position_device,query_offset,split_output,split_stats,stream); return true;
+    default: return false;
+    }
+}
+
+void fast_wmma32_register_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,int split_count,int heads,
+    cudaStream_t stream,int split_block_m) {
+    if(heads<1 || heads>3 || (split_count!=1 && split_count!=2 && split_count!=4) ||
+       (split_block_m!=32 && split_block_m!=64))
+        throw std::invalid_argument("register WMMA32 fixture geometry");
+    auto run=[&](auto split_tag) {
+        constexpr int S=decltype(split_tag)::value;
+        auto launch=[&](auto heads_tag,auto block_tag) {
+            launch_wmma32_register_prefill<S,decltype(heads_tag)::value,
+                decltype(block_tag)::value>(q,k,v,output,rows,position,capacity,
+                position_device,query_offset,split_output,split_stats,stream);
+        };
+        auto by_block=[&](auto heads_tag) {
+            if(split_block_m==64) launch(heads_tag,std::integral_constant<int,64>{});
+            else launch(heads_tag,std::integral_constant<int,32>{});
+        };
+        if(heads==1) by_block(std::integral_constant<int,1>{});
+        else if(heads==2) by_block(std::integral_constant<int,2>{});
+        else by_block(std::integral_constant<int,3>{});
+        cuda_check(cudaGetLastError(),"register WMMA32 fixture launch");
+        if constexpr(S>1) {
+            attention_wmma32_split_merge_kernel<S><<<
+                (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                    split_output,split_stats,output,rows);
+            cuda_check(cudaGetLastError(),"register WMMA32 fixture merge");
+        }
+    };
+    if(split_count==1) run(std::integral_constant<int,1>{});
+    else if(split_count==2) run(std::integral_constant<int,2>{});
+    else run(std::integral_constant<int,4>{});
+}
+
 void fast_wmma_split2_attention_fixture(const std::uint16_t* q,
     const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
     float* split_output,float* split_stats,int rows,int position,int capacity,
@@ -6975,7 +7324,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                             256,0,stream>>>(qr,attention_k,attention_v,attn,
                             rows,position,cache_capacity_,nullptr,0,
                             fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
-                    else if(fast_prefill_wmma32_padded_attention_)
+                    else if(launch_wmma32_register_selected<2,64>(qr,attention_k,
+                                attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                                fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(fast_prefill_wmma32_padded_attention_)
                         attention_cached_gqa_six_wmma32_prefill_kernel<
                             kHeadDim+16,2,64><<<
                             dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
@@ -6999,7 +7351,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 } else if(fast_wmma32_split_count_==4) {
                     if(fast_prefill_wmma32_padded_attention_)
                     {
-                    if(wmma32_vector_loads_enabled())
+                    if(launch_wmma32_register_selected<4>(qr,attention_k,
+                           attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                           fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(wmma32_vector_loads_enabled())
                         attention_cached_gqa_six_wmma32_prefill_kernel<
                             kHeadDim+16,4,32,true><<<
                             dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
@@ -7016,7 +7371,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     }
                     else
                     {
-                    if(wmma32_vector_loads_enabled())
+                    if(launch_wmma32_register_selected<4>(qr,attention_k,
+                           attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                           fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(wmma32_vector_loads_enabled())
                         attention_cached_gqa_six_wmma32_prefill_kernel<
                             kHeadDim,4,32,true><<<
                             dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
@@ -7036,7 +7394,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                         throw std::logic_error("WMMA32 split count");
                     if(fast_prefill_wmma32_padded_attention_)
                     {
-                    if(wmma32_vector_loads_enabled())
+                    if(launch_wmma32_register_selected<2>(qr,attention_k,
+                           attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                           fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(wmma32_vector_loads_enabled())
                         attention_cached_gqa_six_wmma32_prefill_kernel<
                             kHeadDim+16,2,32,true><<<
                             dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
@@ -7053,7 +7414,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     }
                     else
                     {
-                    if(wmma32_vector_loads_enabled())
+                    if(launch_wmma32_register_selected<2>(qr,attention_k,
+                           attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                           fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(wmma32_vector_loads_enabled())
                         attention_cached_gqa_six_wmma32_prefill_kernel<
                             kHeadDim,2,32,true><<<
                             dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
@@ -7125,7 +7489,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                         dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
                         qr,attention_k,attention_v,attn,rows,position,
                         cache_capacity_,nullptr,0,nullptr,nullptr);
-                else if(fast_prefill_wmma32_padded_attention_ && position+rows>=8192)
+                else if(launch_wmma32_register_selected<1,64>(qr,attention_k,
+                            attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                            nullptr,nullptr,stream)) {
+                } else if(fast_prefill_wmma32_padded_attention_ && position+rows>=8192)
                     attention_cached_gqa_six_wmma32_prefill_kernel<
                         kHeadDim+16,1,64><<<
                         dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
@@ -7146,6 +7513,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                         fast_prefill_wmma64_register_keys64_attention_?64:32);
             } else if (fast_prefill_wmma32_padded_attention_ &&
                 position+rows>=8192 && wmma32_vector_loads_enabled()) {
+                if(!launch_wmma32_register_selected<1>(qr,attention_k,attention_v,
+                       attn,rows,position,cache_capacity_,nullptr,0,nullptr,nullptr,stream))
                 attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,1,32,true><<<
                     dim3((rows + 31) / 32, kKVHeads,
                          kQHeads / kKVHeads), 256, 0, stream>>>(
@@ -7159,6 +7528,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     qr, attention_k, attention_v, attn, rows, position,
                     cache_capacity_, nullptr, 0,nullptr,nullptr);
             } else if (fast_prefill_wmma32_attention_ && wmma32_vector_loads_enabled()) {
+                if(!launch_wmma32_register_selected<1>(qr,attention_k,attention_v,
+                       attn,rows,position,cache_capacity_,nullptr,0,nullptr,nullptr,stream))
                 attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,1,32,true><<<
                     dim3((rows + 31) / 32, kKVHeads,
                          kQHeads / kKVHeads), 256, 0, stream>>>(
