@@ -10076,9 +10076,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down shared-row partials");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, output_blocks), dim3(kHadamard), 0, stream>>>(
-                accum_, weights.svh, output, rows, out_features_, split_count);
+        launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down row reduction/output");
         process_coherent_down_k6_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -10097,9 +10095,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down shared-row partials");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, output_blocks), dim3(kHadamard), 0, stream>>>(
-                accum_, weights.svh, output, rows, out_features_, split_count);
+        launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down row reduction/output");
         process_coherent_down_k7_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -10118,9 +10114,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O shared-row partials");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, output_blocks), dim3(kHadamard), 0, stream>>>(
-                accum_, weights.svh, output, rows, out_features_, split_count);
+        launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O row reduction/output");
         process_coherent_o_k7_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -10138,9 +10132,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 shared-row partials");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, output_blocks), dim3(kHadamard), 0, stream>>>(
-                accum_, weights.svh, output, rows, out_features_, split_count);
+        launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 row reduction/output");
         coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(
