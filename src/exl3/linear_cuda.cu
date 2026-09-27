@@ -9019,15 +9019,14 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
          admission == continuation[coherent_wide_k6_operation_]);
 }
 
-// NINFER_EXL3_COHERENT_DOWN_SPLIT / NINFER_EXL3_COHERENT_O_SPLIT (5 default,
-// 8 or 10): K partitions of the coherent down / O producers. A numerics-policy
+// NINFER_EXL3_COHERENT_DOWN_SPLIT / NINFER_EXL3_COHERENT_O_SPLIT (10 default,
+// quality-gated within +/-0.00022 nats/token; 5 or 8): K partitions of the coherent down / O producers. A numerics-policy
 // choice (FP32 partial boundaries move); falls back to 5 when the owned
 // accumulation planes are too small.
 int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows) const {
     const char* value = std::getenv(name);
     const int base = static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
-    if (!value) return base;
-    const int split = std::atoi(value);
+    const int split = value ? std::atoi(value) : 10;
     if (split != 5 && split != 8 && split != 10)
         throw std::invalid_argument("coherent split override must be 5, 8 or 10");
     const auto required = static_cast<std::size_t>(rows) *
