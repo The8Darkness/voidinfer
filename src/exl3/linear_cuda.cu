@@ -929,6 +929,203 @@ __global__ void output_hadamard_fp16_inplace_kernel(
         __half_as_ushort(__hmul(normalized, scale));
 }
 
+
+// Warp-per-block twins of the 128-point transforms: each warp owns one
+// (row, 128-column) block with four elements per lane. Widths 1 and 2 pair
+// elements inside a lane, wider widths pair lanes through shfl_xor. Every
+// butterfly output is the same single FP32 add (lower+upper) or subtract
+// (lower-upper) of the same operands as the shared-memory kernels, so the
+// transformed bits are identical; only the CTA/barrier structure changes.
+bool exl3_hadamard_warp_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_HADAMARD_WARP");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+__device__ __forceinline__ void exl3_warp_butterflies(float (&v)[4],int lane) {
+    {
+        const float a=v[0],b=v[1],c=v[2],d=v[3];
+        v[0]=a+b; v[1]=a-b; v[2]=c+d; v[3]=c-d;
+    }
+    {
+        const float a=v[0],b=v[1],c=v[2],d=v[3];
+        v[0]=a+c; v[2]=a-c; v[1]=b+d; v[3]=b-d;
+    }
+    #pragma unroll
+    for(int mask=1;mask<32;mask<<=1) {
+        const bool lower=(lane&mask)==0;
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const float partner=__shfl_xor_sync(0xffffffffU,v[j],mask);
+            v[j]=lower?v[j]+partner:partner-v[j];
+        }
+    }
+}
+
+__device__ __forceinline__ void exl3_load_half4(const std::uint16_t* p,std::uint16_t (&h)[4]) {
+    const uint2 bits=*reinterpret_cast<const uint2*>(p);
+    h[0]=static_cast<std::uint16_t>(bits.x&0xffffu);
+    h[1]=static_cast<std::uint16_t>(bits.x>>16);
+    h[2]=static_cast<std::uint16_t>(bits.y&0xffffu);
+    h[3]=static_cast<std::uint16_t>(bits.y>>16);
+}
+
+__device__ __forceinline__ void exl3_store_half4(std::uint16_t* p,const std::uint16_t (&h)[4]) {
+    uint2 bits;
+    bits.x=static_cast<unsigned>(h[0])|(static_cast<unsigned>(h[1])<<16);
+    bits.y=static_cast<unsigned>(h[2])|(static_cast<unsigned>(h[3])<<16);
+    *reinterpret_cast<uint2*>(p)=bits;
+}
+
+constexpr int kHadamardWarpsPerBlock=8;
+
+template<bool RoundProductToHalf,bool GateUp>
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) input_hadamard_warp_kernel(
+    const std::uint16_t* input,const std::uint16_t* suh,std::uint16_t* transformed,
+    int rows,int input_features,const std::uint16_t* up,std::uint16_t* activation) {
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=input_features/kHadamard;
+    const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=static_cast<long long>(rows)*blocks) return;
+    const int row=static_cast<int>(task/blocks);
+    const int block=static_cast<int>(task%blocks);
+    const int offset=block*kHadamard+lane*4;
+    const std::size_t element=static_cast<std::size_t>(row)*input_features+offset;
+    std::uint16_t represented[4],scale[4];
+    exl3_load_half4(input+element,represented);
+    exl3_load_half4(suh+offset,scale);
+    if constexpr(GateUp) {
+        std::uint16_t up_bits[4];
+        exl3_load_half4(up+element,up_bits);
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const float g=__half2float(__ushort_as_half(represented[j]));
+            const float u=__half2float(__ushort_as_half(up_bits[j]));
+            represented[j]=__half_as_ushort(__float2half_rn((g/(1.0f+expf(-g)))*u));
+        }
+        exl3_store_half4(activation+element,represented);
+    }
+    float v[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        float product=half_product(represented[j],scale[j]);
+        if constexpr(RoundProductToHalf) product=__half2float(__float2half_rn(product));
+        v[j]=product;
+    }
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) result[j]=__half_as_ushort(__float2half_rn(v[j]*kHadamardScale));
+    exl3_store_half4(transformed+element,result);
+}
+
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_warp_kernel(
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
+    int output_features) {
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=output_features/kHadamard;
+    const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=static_cast<long long>(rows)*blocks) return;
+    const int row=static_cast<int>(task/blocks);
+    const int block=static_cast<int>(task%blocks);
+    const int offset=block*kHadamard+lane*4;
+    const std::size_t element=static_cast<std::size_t>(row)*output_features+offset;
+    const float4 loaded=*reinterpret_cast<const float4*>(accum+element);
+    float v[4]={loaded.x,loaded.y,loaded.z,loaded.w};
+    std::uint16_t scale[4];
+    exl3_load_half4(svh+offset,scale);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+    }
+    exl3_store_half4(output+element,result);
+}
+
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_fp16_inplace_warp_kernel(
+    std::uint16_t* output,const std::uint16_t* svh,int rows,int output_features) {
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=output_features/kHadamard;
+    const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=static_cast<long long>(rows)*blocks) return;
+    const int row=static_cast<int>(task/blocks);
+    const int block=static_cast<int>(task%blocks);
+    const int offset=block*kHadamard+lane*4;
+    const std::size_t element=static_cast<std::size_t>(row)*output_features+offset;
+    std::uint16_t loaded[4],scale[4];
+    exl3_load_half4(output+element,loaded);
+    exl3_load_half4(svh+offset,scale);
+    float v[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) v[j]=__half2float(__ushort_as_half(loaded[j]));
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+    }
+    exl3_store_half4(output+element,result);
+}
+
+inline unsigned exl3_hadamard_warp_grid(int rows,int features) {
+    const long long tasks=static_cast<long long>(rows)*(features/kHadamard);
+    return static_cast<unsigned>((tasks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock);
+}
+
+inline bool exl3_hadamard_warp_aligned(const void* a,const void* b,const void* c=nullptr,
+                                       const void* d=nullptr,const void* e=nullptr) {
+    const auto bits=reinterpret_cast<std::uintptr_t>(a)|reinterpret_cast<std::uintptr_t>(b)|
+        reinterpret_cast<std::uintptr_t>(c)|reinterpret_cast<std::uintptr_t>(d)|
+        reinterpret_cast<std::uintptr_t>(e);
+    return (bits&15u)==0;
+}
+
+template<int Block,bool RoundProductToHalf=false,bool GateUp=false>
+void launch_input_hadamard(cudaStream_t stream,const std::uint16_t* input,
+    const std::uint16_t* suh,std::uint16_t* transformed,int rows,int input_features,
+    const std::uint16_t* up=nullptr,std::uint16_t* activation=nullptr) {
+    static_assert(Block==kHadamard);
+    if(rows>0 && exl3_hadamard_warp_enabled() && input_features%kHadamard==0 &&
+       exl3_hadamard_warp_aligned(input,suh,transformed,up,activation))
+        input_hadamard_warp_kernel<RoundProductToHalf,GateUp><<<
+            exl3_hadamard_warp_grid(rows,input_features),kHadamardWarpsPerBlock*32,0,stream>>>(
+                input,suh,transformed,rows,input_features,up,activation);
+    else
+        input_hadamard_kernel<Block,RoundProductToHalf,GateUp><<<
+            dim3(rows,input_features/kHadamard),dim3(kHadamard),0,stream>>>(
+                input,suh,transformed,rows,input_features,up,activation);
+}
+
+inline void launch_output_hadamard(cudaStream_t stream,const float* accum,
+    const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features) {
+    if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
+       exl3_hadamard_warp_aligned(accum,svh,output))
+        output_hadamard_warp_kernel<<<exl3_hadamard_warp_grid(rows,output_features),
+            kHadamardWarpsPerBlock*32,0,stream>>>(accum,svh,output,rows,output_features);
+    else
+        output_hadamard_kernel<<<dim3(rows,output_features/kHadamard),dim3(kHadamard),0,
+            stream>>>(accum,svh,output,rows,output_features);
+}
+
+inline void launch_output_hadamard_fp16_inplace(cudaStream_t stream,std::uint16_t* output,
+    const std::uint16_t* svh,int rows,int output_features) {
+    if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
+       exl3_hadamard_warp_aligned(output,svh))
+        output_hadamard_fp16_inplace_warp_kernel<<<exl3_hadamard_warp_grid(rows,output_features),
+            kHadamardWarpsPerBlock*32,0,stream>>>(output,svh,rows,output_features);
+    else
+        output_hadamard_fp16_inplace_kernel<<<dim3(rows,output_features/kHadamard),
+            dim3(kHadamard),0,stream>>>(output,svh,rows,output_features);
+}
+
 // Bulk down projections already write the GEMM destination as FP16.
 // Preserve its represented down value before performing the same FP32-add,
 // FP16-store boundary as GDN's separate residual kernel. The final diagnostic
@@ -5981,16 +6178,13 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         fast_fp16_destination && !fused_original && metadata.K!=5;
     if (!fused_original) {
         if (up) {
-            input_hadamard_kernel<kHadamard,false,true><<<
-                dim3(rows, metadata.in_features / kHadamard),
-                dim3(kHadamard), 0, stream>>>(
+            launch_input_hadamard<kHadamard,false,true>(stream,
                     input,weights.suh,impl_->transformed,rows,
                     metadata.in_features,up,activation);
             ++impl_->stats.fused_gate_up_down_calls;
             impl_->stats.fused_gate_up_down_rows += static_cast<std::uint64_t>(rows);
         } else {
-            input_hadamard_kernel<kHadamard><<<
-                dim3(rows, metadata.in_features / kHadamard), dim3(kHadamard), 0, stream>>>(
+            launch_input_hadamard<kHadamard>(stream,
                     input, weights.suh, impl_->transformed, rows, metadata.in_features);
         }
         cuda_check(cudaGetLastError(), "T69 input Hadamard");
@@ -6083,9 +6277,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         if (timing)
             cuda_check(cudaEventRecord(events[3], stream),
                        "T69 persistent prefill GEMM event");
-        output_hadamard_kernel<<<
-            dim3(rows, metadata.out_features / kHadamard), dim3(kHadamard), 0,
-            stream>>>(impl_->accum, weights.svh, output, rows,
+        launch_output_hadamard(stream,impl_->accum, weights.svh, output, rows,
                       metadata.out_features);
         cuda_check(cudaGetLastError(), "T69 persistent prefill output Hadamard");
         if (timing) {
@@ -6585,14 +6777,11 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                 impl_->stats.fused_down_residual_rows +=
                     static_cast<std::uint64_t>(rows);
             } else {
-                output_hadamard_fp16_inplace_kernel<<<
-                    dim3(rows, metadata.out_features / kHadamard),
-                    dim3(kHadamard), 0, stream>>>(
+                launch_output_hadamard_fp16_inplace(stream,
                         output, weights.svh, rows, metadata.out_features);
             }
         } else {
-            output_hadamard_kernel<<<
-                dim3(rows, metadata.out_features / kHadamard), dim3(kHadamard), 0, stream>>>(
+            launch_output_hadamard(stream,
                     impl_->accum, weights.svh, output, rows, metadata.out_features);
         }
         cuda_check(cudaGetLastError(), "T69 output Hadamard");
@@ -7217,8 +7406,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_v6_numeric(
     // V6's donor multiplies the FP16 activation and SUH in FP16 before
     // the FP32 butterfly. The established text route deliberately keeps its
     // original full product; this specialization is admitted only here.
-    input_hadamard_kernel<kHadamard,true><<<dim3(rows,metadata.in_features/kHadamard),
-        kHadamard,0,stream>>>(input,weights.suh,impl_->transformed,rows,metadata.in_features);
+    launch_input_hadamard<kHadamard,true>(stream,input,weights.suh,impl_->transformed,rows,metadata.in_features);
     exl3_reconstruct_transformed_weight_kernel<6><<<
         dim3(metadata.out_features/16,metadata.in_features/16),256,0,stream>>>(
         weights.trellis,weights.mul1,impl_->reconstructed,metadata.in_features,metadata.out_features);
@@ -7541,9 +7729,7 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
                          metadata.out_features, CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                      "fast Mia-parity wide-prefill FP32-compute GEMM");
-        output_hadamard_kernel<<<
-            dim3(rows, metadata.out_features / kHadamard), kHadamard, 0,
-            stream>>>(accum_, weights.svh, output, rows, metadata.out_features);
+        launch_output_hadamard(stream,accum_, weights.svh, output, rows, metadata.out_features);
         cuda_check(cudaGetLastError(),
                    "fast Mia-parity wide-prefill output Hadamard");
     } catch (...) {
@@ -7818,8 +8004,7 @@ void Exl3CudaLinearWorkspace::transform_input(const Exl3CudaLinearWeights& weigh
         throw std::invalid_argument("EXL3 CUDA received a null device buffer");
     }
 
-    input_hadamard_kernel<kHadamard><<<dim3(rows, in_features_ / kHadamard),
-                                       dim3(kHadamard), 0, stream>>>(
+    launch_input_hadamard<kHadamard>(stream,
         input, weights.suh, transformed_, rows, in_features_);
     cuda_check(cudaGetLastError(), "launch EXL3 input Hadamard");
 }
@@ -7852,8 +8037,7 @@ void Exl3CudaLinearWorkspace::forward_k4_prefill_for_test(
             accum_+output_offset,tail,in_features_,out_features_,4);
     }
     cuda_check(cudaGetLastError(),"launch K4 prefill discriminator projection");
-    output_hadamard_kernel<<<dim3(rows,out_features_/kHadamard),
-        dim3(kHadamard),0,stream>>>(accum_,weights.svh,output,rows,out_features_);
+    launch_output_hadamard(stream,accum_,weights.svh,output,rows,out_features_);
     cuda_check(cudaGetLastError(),"launch K4 prefill discriminator output");
 }
 
@@ -8256,8 +8440,7 @@ void Exl3CudaLinearWorkspace::transform_gate_up(const Exl3CudaLinearWeights& wei
             {reinterpret_cast<std::uintptr_t>(input),reinterpret_cast<std::uintptr_t>(weights.suh),
              reinterpret_cast<std::uintptr_t>(weights.suh),reinterpret_cast<std::uintptr_t>(activation),
              reinterpret_cast<std::uintptr_t>(transformed_)});
-    input_hadamard_kernel<kHadamard,false,true><<<dim3(rows,in_features_/kHadamard),
-        dim3(kHadamard),0,stream>>>(gate,weights.suh,transformed_,rows,in_features_,up,activation);
+    launch_input_hadamard<kHadamard,false,true>(stream,gate,weights.suh,transformed_,rows,in_features_,up,activation);
     cuda_check(cudaGetLastError(),"launch EXL3 gate/up activation input Hadamard");
 }
 
@@ -11422,7 +11605,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     cuda_check(cudaGetLastError(), "launch EXL3 packed GEMV");
     if (target_k5_small_m_batch_candidate(metadata, rows, admission))
         ++target_k5_small_m_batch_calls_;
-    output_hadamard_kernel<<<dim3(rows, out_features_ / kHadamard), dim3(kHadamard), 0, stream>>>(
+    launch_output_hadamard(stream,
         accum_, weights.svh, output, rows, out_features_);
     cuda_check(cudaGetLastError(), "launch EXL3 output Hadamard");
 }
