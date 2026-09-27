@@ -1334,6 +1334,20 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) prefill_reduce_outp
     const std::size_t stride=static_cast<std::size_t>(rows)*output_features;
     const float4 first=*reinterpret_cast<const float4*>(accum+index);
     float v[4]={first.x,first.y,first.z,first.w};
+    if(split_count<=10) {
+        // All planes are loaded before the (unchanged, ascending) adds.
+        float4 planes[9];
+        #pragma unroll
+        for(int split=1;split<10;++split)
+            if(split<split_count)
+                planes[split-1]=*reinterpret_cast<const float4*>(accum+split*stride+index);
+        #pragma unroll
+        for(int split=1;split<10;++split)
+            if(split<split_count) {
+                v[0]+=planes[split-1].x; v[1]+=planes[split-1].y;
+                v[2]+=planes[split-1].z; v[3]+=planes[split-1].w;
+            }
+    } else
     for(int split=1;split<split_count;++split) {
         const float4 plane=*reinterpret_cast<const float4*>(accum+split*stride+index);
         v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
