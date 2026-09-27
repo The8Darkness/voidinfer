@@ -1689,7 +1689,16 @@ void Exl3GdnLayer::reconstruct_retained_prefix(
     check(cudaMemcpyAsync(recurrent_state_, checkpoint.recurrent_state_device,
                           kStateBytes, cudaMemcpyDeviceToDevice, stream),
           "restore EXL3 GDN retained prefix recurrent base");
-    if (checkpoint.recurrent_state_device != recurrent_state_before_)
+    // The state-before buffer is a trace: the next forward rewrites it before
+    // any consumer reads it, so the repair may skip restoring it.
+    static const bool skip_trace_restore=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_SKIP_TRACE_RESTORE");
+        if(!value)return true;  // measured default; "0" restores the trace copy
+        if(std::strcmp(value,"0")==0)return false;
+        if(std::strcmp(value,"1")==0)return true;
+        throw std::invalid_argument("NINFER_EXL3_GDN_SKIP_TRACE_RESTORE must be 0 or 1");
+    }();
+    if (checkpoint.recurrent_state_device != recurrent_state_before_ && !skip_trace_restore)
         check(cudaMemcpyAsync(recurrent_state_before_,checkpoint.recurrent_state_device,
                               kStateBytes,cudaMemcpyDeviceToDevice,stream),
               "restore EXL3 GDN retained prefix recurrent trace");
