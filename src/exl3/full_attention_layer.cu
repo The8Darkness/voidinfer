@@ -6198,13 +6198,14 @@ bool verify_flash_mma_enabled() {
     return enabled;
 }
 
-// Key-segment length of the tensor-core flash path (64, 128 or 256). Shorter
+// Key-segment length of the tensor-core flash path (64 default, 128 or 256;
+// quality-gated: 2-row verify NLL within +0.0003 nats/token). Shorter
 // segments raise the CTA count for decode-sized row counts; a length whose
 // scratch would exceed the owned plane falls back to the next longer one.
 int verify_flash_mma_keys() {
     static const int keys=[] {
         const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS");
-        if(!value) return 256;
+        if(!value) return 64;
         const int parsed=std::atoi(value);
         if(parsed!=64 && parsed!=128 && parsed!=256)
             throw std::invalid_argument("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS must be 64, 128 or 256");
