@@ -167,6 +167,19 @@ __global__ void rms_norm_f16_kernel(const std::uint16_t* input, const std::uint1
     }
 }
 
+// NINFER_EXL3_RESIDUAL_NORM_FUSED (default 1): the post-attention residual
+// add and RMS norm run as rms_norm_f16_kernel<true> (identical half(a+b)
+// residual, materialized, then the same norm); 0 restores two launches.
+bool residual_norm_fused_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_RESIDUAL_NORM_FUSED");
+        if(!value||std::strcmp(value,"1")==0) return true;
+        if(std::strcmp(value,"0")==0) return false;
+        throw std::invalid_argument("NINFER_EXL3_RESIDUAL_NORM_FUSED must be 0 or 1");
+    }();
+    return enabled;
+}
+
 __global__ void transpose_f16_to_bf16_kernel(const std::uint16_t* input, std::uint16_t* output,
                                              int rows, int features) {
     EXL3_PDL_SMALL_PROLOGUE();
@@ -2969,8 +2982,13 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         exl3_gdn_residual_norm(input,o,weights_.post_attention_norm,post,mlp_input,rows,true,stream);
         ++fused_residual_norm_submissions_;
     } else {
+        if(residual_norm_fused_enabled())
+            exl3_launch_small(rms_norm_f16_kernel<true>,dim3(rows),dim3(512),512*sizeof(float),stream,
+                input,weights_.post_attention_norm,mlp_input,rows,kHidden,o,post);
+        else {
         exl3_launch_small(residual_kernel,dim3((rows*kHidden+255)/256),dim3(256),0,stream,input,o,post,rows*kHidden);
         exl3_launch_small(rms_norm_f16_kernel<>,dim3(rows),dim3(512),512*sizeof(float),stream,post,weights_.post_attention_norm,mlp_input,rows,kHidden);
+        }
     }
     check(cudaGetLastError(), "launch GDN residual/norm"); end(8);
     if (deferred_mlp) {
@@ -3363,11 +3381,17 @@ void Exl3GdnLayer::forward_pair_staged_serial_for_test(
         telemetry->serial_b8_projection_calls += 2;
     }
     for (auto& lane : lanes) {
+        if(residual_norm_fused_enabled())
+            exl3_launch_small(rms_norm_f16_kernel<true>,dim3(rows),dim3(512),512 * sizeof(float),stream,
+                lane.input, lane.layer->weights_.post_attention_norm,
+                lane.mlp_input, rows, kHidden, lane.o, lane.post);
+        else {
         exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,
             lane.input, lane.o, lane.post, rows * kHidden);
         exl3_launch_small(rms_norm_f16_kernel<>,dim3(rows),dim3(512),512 * sizeof(float),stream,
             lane.post, lane.layer->weights_.post_attention_norm,
             lane.mlp_input, rows, kHidden);
+        }
         check(cudaGetLastError(), "launch staged GDN residual/norm");
     }
     for (auto& lane : lanes)
