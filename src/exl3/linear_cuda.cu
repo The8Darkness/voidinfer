@@ -11122,6 +11122,31 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         int split_count = 1;
         void* kernel_args[] = {&transformed_input, &trellis, &mul1, &accum,
                                &rows, &input_features, &output_features, &split_count};
+        // Default: 64-column 4-warp CTAs with async-A, the 4x4 cp.async ring
+        // and the exact K6 lane-window decoder (measured). Each warp still
+        // accumulates its 16 columns over the whole K in order.
+        // NINFER_EXL3_H6_NARROW=0 restores the 512-column launch.
+        static const bool h6_narrow = [] {
+            const char* value = std::getenv("NINFER_EXL3_H6_NARROW");
+            if (!value) return true;
+            if (std::strcmp(value, "0") == 0) return false;
+            if (std::strcmp(value, "1") == 0) return true;
+            throw std::invalid_argument("NINFER_EXL3_H6_NARROW must be 0 or 1");
+        }();
+        if (h6_narrow) {
+            constexpr int warps = 4, stages = 4, per = 4;
+            const std::size_t narrow_shared =
+                static_cast<std::size_t>(stages * per) *
+                    (256u * sizeof(half) + warps * 16u * 6u * sizeof(std::uint16_t)) +
+                16u * warps * 16u * sizeof(float);
+            cuda_check(cudaLaunchKernel(
+                           reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<
+                               6, true, warps, true, false, false, false, true, false,
+                               false, false, stages, warps, per>),
+                           dim3(out_features_ / (16 * warps)), dim3(warps * 32), kernel_args,
+                           narrow_shared, stream),
+                       "launch EXL3 H6 narrow single-split GEMV");
+        } else
         cuda_check(cudaLaunchKernel(
                        reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<6, true>),
                        dim3(output_blocks), dim3(kThreads), kernel_args,
