@@ -1,3 +1,4 @@
+#include "exl3/pdl_small.cuh"
 #include "exl3/full_attention_layer.h"
 #include "exl3/environment_options.h"
 #include "exl3/vericache_serving_coordinator.h"
@@ -69,6 +70,7 @@ __global__ void split_qg_kernel(const std::uint16_t* qg,
                                 std::uint16_t* q,
                                 std::uint16_t* gate,
                                 int rows) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kQHeads * kHeadDim;
     if (index >= total) return;
@@ -85,6 +87,7 @@ __global__ void rms_norm_kernel(const std::uint16_t* input,
                                 std::uint16_t* output,
                                 int rows,
                                 int features) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int row = static_cast<int>(blockIdx.x);
     const int lane = static_cast<int>(threadIdx.x);
     if (row >= rows || lane >= features) return;
@@ -151,6 +154,7 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
                             int rows,
                             int position,
                             const int* position_device,const int* positions_xyz,int offset) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kQHeads * kHeadDim;
     if (index >= total) return;
@@ -192,6 +196,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
                               int rows,
                               int position,
                               const int* position_device,const int* positions_xyz,int offset) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kKVHeads * kHeadDim;
     if (index >= total) return;
@@ -262,6 +267,7 @@ __global__ void append_kv_cache_kernel(const std::uint16_t* k,
                                        int position,
                                        int capacity,
                                        const int* position_device) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kKVHeads * kHeadDim;
     if (index >= total) return;
@@ -4476,6 +4482,7 @@ __global__ void attention_cached_gqa_six_splitk_merge_kernel(
 __global__ void sigmoid_mul_kernel(const std::uint16_t* gate,
                                    std::uint16_t* values,
                                    int count) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float g = __half2float(__ushort_as_half(gate[i]));
@@ -4487,6 +4494,7 @@ __global__ void silu_mul_kernel(const std::uint16_t* gate,
                                 const std::uint16_t* up,
                                 std::uint16_t* output,
                                 int count) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float g = __half2float(__ushort_as_half(gate[i]));
@@ -4498,6 +4506,7 @@ __global__ void residual_kernel(const std::uint16_t* left,
                                 const std::uint16_t* right,
                                 std::uint16_t* output,
                                 int count) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float a = __half2float(__ushort_as_half(left[i]));
@@ -4981,7 +4990,7 @@ exl3_attention_gate_fusion_discriminator_for_test() {
                 attention_cached_gqa_triple_normalized_values_kernel<false><<<
                     value_blocks,value_threads>>>(values,selected_output,scores,1,
                         capacity-1,capacity,nullptr,0);
-                sigmoid_mul_kernel<<<static_cast<int>((output_count+255)/256),256>>>(
+                exl3_launch_small(sigmoid_mul_kernel,dim3(static_cast<int>((output_count+255)/256)),dim3(256),0,nullptr,
                     gate,selected_output,static_cast<int>(output_count));
             }
         };
@@ -6022,6 +6031,7 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     const float* workspace,std::uint16_t* output,int rows,int segments,
     int position,int capacity,int keys,const int* position_device,
     int query_offset) {
+    EXL3_PDL_SMALL_PROLOGUE();
     constexpr int H=kFastFusedFlashHeads;
     const int block=static_cast<int>(blockIdx.x);
     const int head=block%H;
@@ -6062,8 +6072,7 @@ void launch_fused_flash_merge(const float* workspace,std::uint16_t* output,int r
     int segments,int position,int capacity,int keys,const int* position_device,
     cudaStream_t stream) {
     if(fused_flash_merge_heads_enabled())
-        attention_fused_flash_merge_heads_kernel<<<
-            rows*kKVHeads*kFastFusedFlashHeads,256,0,stream>>>(workspace,output,rows,
+        exl3_launch_small(attention_fused_flash_merge_heads_kernel,dim3(rows*kKVHeads*kFastFusedFlashHeads),dim3(256),0,stream,workspace,output,rows,
                 segments,position,capacity,keys,position_device,0);
     else
         attention_cached_gqa_six_fused_flash_merge_kernel<<<
@@ -6076,6 +6085,7 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,float* workspace,int rows,int position,
     int capacity,int segments,const int* position_device,int query_offset) {
+    EXL3_PDL_SMALL_PROLOGUE();
     constexpr int H=kFastFusedFlashHeads;
     constexpr int kVectors=kHeadDim/8;
     __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
@@ -6269,13 +6279,13 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
     const int segments=(count+keys-1)/keys;
     const dim3 grid(segments,kKVHeads);
     if(keys==64)
-        attention_verify_flash_mma_kernel<64><<<grid,96,0,stream>>>(
+        exl3_launch_small(attention_verify_flash_mma_kernel<64>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0);
     else if(keys==128)
-        attention_verify_flash_mma_kernel<128><<<grid,96,0,stream>>>(
+        exl3_launch_small(attention_verify_flash_mma_kernel<128>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0);
     else
-        attention_verify_flash_mma_kernel<256><<<grid,96,0,stream>>>(
+        exl3_launch_small(attention_verify_flash_mma_kernel<256>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0);
     launch_fused_flash_merge(workspace,output,rows,segments,position,capacity,keys,
         position_device,stream);
@@ -6888,7 +6898,7 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
     auto* up=buffers_[13];
     auto* act=buffers_[14];
     auto* down=buffers_[15];
-    rms_norm_kernel<<<rows,512,512*sizeof(float),stream>>>(post_resid,
+    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512*sizeof(float),stream,post_resid,
         weights_.post_attention_norm,mlp_in,rows,kHidden);
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail norm");
     const auto project=[&](Exl3CudaLinearWorkspace* workspace,
@@ -6961,7 +6971,7 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
             Exl3CudaLinearAdmission::target_continuation_gate_up);
         cuda_check(cudaGetLastError(),"capture HostKV MLP-tail up");
     }
-    silu_mul_kernel<<<(rows*kIntermediate+255)/256,256,0,stream>>>(
+    exl3_launch_small(silu_mul_kernel,dim3((rows*kIntermediate+255)/256),dim3(256),0,stream,
         gp,up,act,rows*kIntermediate);
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail SiLU");
     const bool down_small_m=rows>1 &&
@@ -6972,7 +6982,7 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
         act,down,down_small_m,
         Exl3CudaLinearAdmission::target_continuation_down);
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail down");
-    residual_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(
+    exl3_launch_small(residual_kernel,dim3((rows*kHidden+255)/256),dim3(256),0,stream,
         post_resid,down,output,rows*kHidden);
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail residual");
 }
@@ -7276,7 +7286,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     };
 
     begin(0);
-    rms_norm_kernel<<<rows, 512, 512 * sizeof(float), stream>>>(input, weights_.input_norm,
+    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,input, weights_.input_norm,
         input_norm, rows, kHidden);
     launch(cudaGetLastError(), "launch EXL3 input RMSNorm"); end(0);
 
@@ -7462,22 +7472,22 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         end(3);
     }
 
-    split_qg_kernel<<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(qg, qn, gp, rows);
+    exl3_launch_small(split_qg_kernel,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qg, qn, gp, rows);
     launch(cudaGetLastError(), "launch EXL3 Q/gate split");
     begin(4);
-    rms_norm_kernel<<<rows * kQHeads, 256, 256 * sizeof(float), stream>>>(qn, weights_.q_norm,
+    exl3_launch_small(rms_norm_kernel,dim3(rows * kQHeads),dim3(256),256 * sizeof(float),stream,qn, weights_.q_norm,
         qn, rows * kQHeads, kHeadDim);
-    rms_norm_kernel<<<rows * kKVHeads, 256, 256 * sizeof(float), stream>>>(kp, weights_.k_norm,
+    exl3_launch_small(rms_norm_kernel,dim3(rows * kKVHeads),dim3(256),256 * sizeof(float),stream,kp, weights_.k_norm,
         kn, rows * kKVHeads, kHeadDim);
     launch(cudaGetLastError(), "launch EXL3 Q/K RMSNorm"); end(4);
 
     begin(5);
     if(mrope_positions_||rope_offset_){
-        rope_kernel<true><<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(qn,kn,qr,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
-        rope_k_kernel<true><<<(rows * kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(kn,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
+        exl3_launch_small(rope_kernel<true>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
+        exl3_launch_small(rope_k_kernel<true>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
     }else{
-        rope_kernel<false><<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(qn,kn,qr,kr,rows,position,position_device_,nullptr,0);
-        rope_k_kernel<false><<<(rows * kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(kn,kr,rows,position,position_device_,nullptr,0);
+        exl3_launch_small(rope_kernel<false>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,nullptr,0);
+        exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0);
     }
     launch(cudaGetLastError(), "launch EXL3 RoPE"); end(5);
 
@@ -7587,11 +7597,11 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             position < 0 || position + rows > cache_capacity_) {
             throw std::invalid_argument("invalid EXL3 attention cache configuration");
         }
-        append_kv_cache_kernel<<<(rows * kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(
+        exl3_launch_small(append_kv_cache_kernel,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,
             kr, vp, k_cache_, v_cache_, rows, position, cache_capacity_, position_device_);
         launch(cudaGetLastError(), "append EXL3 attention KV cache");
         if(direct_staged_rows_) {
-            append_kv_cache_kernel<<<(rows * kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(
+            exl3_launch_small(append_kv_cache_kernel,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,
                 kr, vp, direct_staged_k_, direct_staged_v_, rows, position,
                 cache_capacity_, position_device_);
             launch(cudaGetLastError(), "append direct staged EXL3 attention KV");
@@ -8757,7 +8767,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         attention_kernel<<<rows * kQHeads, 256, 0, stream>>>(qr, kr, vp, attn, rows);
     }
     launch(cudaGetLastError(), "launch EXL3 causal GQA");
-    sigmoid_mul_kernel<<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(gp, attn,
+    exl3_launch_small(sigmoid_mul_kernel,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,gp, attn,
         rows * kQHeads * kHeadDim);
     launch(cudaGetLastError(), "launch EXL3 attention output gate"); end(6);
     if(attention_core_sample) {
@@ -8786,7 +8796,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     launch(cudaGetLastError(), "launch EXL3 output projection"); end(7);
 
     begin(8);
-    residual_kernel<<<(rows * kHidden + 255) / 256, 256, 0, stream>>>(input, op, post_resid,
+    exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,input, op, post_resid,
         rows * kHidden);
     launch(cudaGetLastError(), "launch EXL3 attention residual");
     if(mlp_tail_graph) {
@@ -8800,7 +8810,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         end(8);
         mlp_tail_graph->launch(stream);
     } else {
-    rms_norm_kernel<<<rows, 512, 512 * sizeof(float), stream>>>(post_resid, weights_.post_attention_norm,
+    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,post_resid, weights_.post_attention_norm,
         mlp_in, rows, kHidden);
     launch(cudaGetLastError(), "launch EXL3 attention residual and norm"); end(8);
 
@@ -8900,7 +8910,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 Exl3CudaLinearAdmission::target_continuation_down);
         ++fused_gate_up_submissions_;
     } else {
-        silu_mul_kernel<<<(rows * kIntermediate + 255) / 256, 256, 0, stream>>>(
+        exl3_launch_small(silu_mul_kernel,dim3((rows * kIntermediate + 255) / 256),dim3(256),0,stream,
             gp,up,act,rows*kIntermediate);
         launch(cudaGetLastError(), "launch EXL3 SiLU gate");
     }
@@ -8914,7 +8924,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             Exl3TargetProjectionOperator::down,
             fused_gate_up?linear_workspaces_[6]->transformed_device():nullptr);
     launch(cudaGetLastError(), "launch EXL3 down projection");
-    residual_kernel<<<(rows * kHidden + 255) / 256, 256, 0, stream>>>(post_resid, down, output,
+    exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post_resid, down, output,
         rows * kHidden);
     launch(cudaGetLastError(), "launch EXL3 final residual"); end(12);
     }
