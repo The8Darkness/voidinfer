@@ -2007,7 +2007,22 @@ struct Exl3EngineCore::Impl {
             const auto decode=Clock::now();
             std::uint32_t remaining=allowance;
             Exl3CompleteRouteCounters route;
+            // Test-only host phase attribution (prepare / decide / settle /
+            // publish), accumulated per request and printed after it.
+            const bool round_phases=[] {
+                const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROUND_PHASES");
+                return value && std::string_view(value)=="1";
+            }();
+            std::array<double,4> phase_ms{};
+            auto phase_mark=Clock::now();
+            const auto phase=[&](std::size_t index) {
+                if(!round_phases)return;
+                const auto now=Clock::now();
+                phase_ms[index]+=std::chrono::duration<double,std::milli>(now-phase_mark).count();
+                phase_mark=now;
+            };
             while(remaining && !request.cancelled) {
+                if(round_phases)phase_mark=Clock::now();
                 if(!output.pending_control_tokens().empty())
                     throw std::invalid_argument(
                         "coherent-device EXL3 does not admit injected control tokens");
@@ -2020,6 +2035,7 @@ struct Exl3EngineCore::Impl {
                     Exl3ControlPublicationBoundary::Kind::model);
                 const auto prepared_round=round->prepare_device_pending(width,
                     terminal_tokens);
+                phase(0);
                 pending_ticket=prepared_round.ticket;
                 const auto& candidate=prepared_round.candidate;
                 if(root_diagnostic && result.speculative.rounds==0) {
@@ -2076,6 +2092,7 @@ struct Exl3EngineCore::Impl {
                 request.require_result_slots(selected.size());
                 if(!request.publication_boundary.resume_numerical(boundary))
                     throw std::logic_error("coherent-device settlement ordering");
+                phase(1);
                 Exl3FastDeviceRound::Step settled;
                 try {
                     settled=round->settle_device_pending(*pending_ticket,
@@ -2089,6 +2106,7 @@ struct Exl3EngineCore::Impl {
                     throw;
                 }
                 pending_ticket.reset();
+                phase(2);
                 if(!request.publication_boundary.numerical_ready(boundary) ||
                    !request.publication_boundary.prepare_output(boundary) ||
                    !request.publication_boundary.begin_publication(boundary))
@@ -2117,6 +2135,7 @@ struct Exl3EngineCore::Impl {
                 result.speculative.accepted_tokens+=settled.verification.accepted;
                 result.speculative.accepted_prefix_per_round.push_back(
                     static_cast<std::uint8_t>(settled.verification.accepted));
+                phase(3);
                 if(decision.finished()) {
                     result.finish_reason=decision.finish_reason;
                     break;
@@ -2132,6 +2151,11 @@ struct Exl3EngineCore::Impl {
                 publish_preview(request);
             }
             round->finish();
+            if(round_phases)
+                std::fprintf(stderr,
+                    "COHERENT_DEVICE_ENGINE_ROUND_PHASES rounds=%zu prepare_ms=%.3f decide_ms=%.3f settle_ms=%.3f publish_ms=%.3f\n",
+                    static_cast<std::size_t>(result.speculative.rounds),
+                    phase_ms[0],phase_ms[1],phase_ms[2],phase_ms[3]);
             if(!result.token_accounting.conserves_result_tokens(
                 result.generated_token_ids.size()))
                 throw std::logic_error("coherent-device result token accounting");
