@@ -4284,9 +4284,12 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         target_gateup_owner && in_features_ == 5120 && out_features_ == 17408 ? 4 : -1;
     coherent_wide_k6_enabled_ = coherent_wide_k6_requested &&
         coherent_wide_k6_operation_ >= 0;
+    // Split10 is the quality-gated default (teacher-forced verify NLL within
+    // +/-0.00012 nats/token); 0 restores the 5-split reduction order.
     coherent_wide_k6_split10_enabled_ = coherent_wide_k6_enabled_ &&
-        read_binary_option("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",
-            "coherent wide K6 split10 must be 0 or 1");
+        (!std::getenv("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10") ||
+         read_binary_option("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",
+            "coherent wide K6 split10 must be 0 or 1"));
     coherent_down_k6_enabled_ = target_down_owner &&
         read_binary_option("NINFER_EXL3_COHERENT_DOWN_K6",
             "coherent K6 down must be 0 or 1");
