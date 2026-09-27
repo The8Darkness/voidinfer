@@ -3996,9 +3996,13 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(device_transaction_checkpoint_graph,"0")==0 ||
             std::strcmp(device_transaction_checkpoint_graph,"1")==0,
         "device-KV transaction checkpoint graph must be 0 or 1");
+    // Default on for the guarded device-KV transaction (measured); "0" keeps
+    // the eager per-layer checkpoint copies.
     impl->device_transaction_checkpoint_graph_enabled=
-        device_transaction_checkpoint_graph &&
-        std::strcmp(device_transaction_checkpoint_graph,"1")==0;
+        device_transaction_checkpoint_graph ?
+            std::strcmp(device_transaction_checkpoint_graph,"1")==0 :
+            (!impl->host_kv.enabled && !impl->oscar &&
+             fast_device_kv_transaction_enabled());
     require(!impl->device_transaction_checkpoint_graph_enabled ||
             (!impl->host_kv.enabled && !impl->oscar &&
              fast_device_kv_transaction_enabled()),
