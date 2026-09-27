@@ -1,5 +1,6 @@
 #pragma once
 
+#include <fstream>
 #include "exl3/dflash2_draft.h"
 #include "exl3/exact_outer_reference.h"
 #include <algorithm>
@@ -701,6 +702,24 @@ private:
         value.verifier_ms=elapsed(verifier_start);
         if(after_verify)after_verify(*context_);
         value.committed_tokens=value.verification.committed_tokens;
+        if(const char* log_path=std::getenv("NINFER_DFLASH2_ROUND_LOG")) {
+            // Diagnostic-only round record: root position, proposal chain,
+            // committed tokens and the draft's per-position top-16 candidates.
+            const int rows=value.width-1;
+            std::vector<std::int64_t> candidates(static_cast<std::size_t>(rows)*16);
+            if(rows>0 && draft_.last_topk_ids_device_for_test())
+                check(cudaMemcpy(candidates.data(),draft_.last_topk_ids_device_for_test(),
+                        candidates.size()*sizeof(std::int64_t),cudaMemcpyDeviceToHost),
+                    "round log top-16 candidates");
+            std::ofstream log(log_path,std::ios::app);
+            log<<value.root_position<<';';
+            for(int i=0;i<value.width;++i)log<<value.proposal[static_cast<std::size_t>(i)]<<(i+1<value.width?' ':';');
+            for(std::size_t i=0;i<value.committed_tokens.size();++i)
+                log<<value.committed_tokens[i]<<(i+1<value.committed_tokens.size()?' ':';');
+            for(std::size_t i=0;i<candidates.size();++i)
+                log<<candidates[i]<<(i+1<candidates.size()?' ':'\n');
+            if(candidates.empty())log<<'\n';
+        }
         const auto useful=value.committed_tokens.size();
         if(!useful || useful>static_cast<std::size_t>(value.width) ||
            staged!=useful*5*tap_hidden*sizeof(std::uint16_t) ||

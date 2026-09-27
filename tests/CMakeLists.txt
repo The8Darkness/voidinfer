@@ -139,6 +139,10 @@ ninfer_add_test(ninfer_exl3_mtp_hidden_handoff_test
   SOURCES test_exl3_mtp_hidden_handoff.cpp
   LIBRARIES ninfer_exl3_text_model)
 set_tests_properties(ninfer_exl3_mtp_hidden_handoff_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_exl3_mtp_accuracy_probe_test
+  SOURCES test_exl3_mtp_accuracy_probe.cpp
+  LIBRARIES ninfer_exl3_text_model)
+set_tests_properties(ninfer_exl3_mtp_accuracy_probe_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_exl3_dflash2_minimal_test
   SOURCES test_exl3_dflash2_minimal.cpp
   LIBRARIES ninfer_exl3_dflash2)
