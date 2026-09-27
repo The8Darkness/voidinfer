@@ -2758,7 +2758,12 @@ constexpr int kFastFusedFlashHeads=kQHeads/kKVHeads;
 constexpr int kFastFusedFlashValues=kFastFusedFlashHeads*kHeadDim;
 constexpr int kFastFusedFlashStride=kFastFusedFlashValues+2*kFastFusedFlashHeads;
 
-template<int kKeys>
+// Staged-K dimension chunk. Each key lane keeps its sequential FMA chain over
+// d; only the K source moves from strided global loads to a coalesced shared
+// tile, so the scores are bitwise identical to the unstaged kernel.
+constexpr int kFastFusedFlashStageDims=16;
+
+template<int kKeys,bool kStagedK=false>
 __global__ void attention_cached_gqa_six_fused_flash_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,float* workspace,std::uint16_t* output,
@@ -2778,8 +2783,8 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
     const int extent=min(kKeys,count-first);
     if(extent<=0 || count<1 || count>capacity) return;
 
-    __shared__ float query_values[kFastFusedFlashHeads][kHeadDim];
-    __shared__ float score_tile[kFastFusedFlashHeads][kKeys];
+    __shared__ __align__(16) float query_values[kFastFusedFlashHeads][kHeadDim];
+    __shared__ __align__(16) float score_tile[kFastFusedFlashHeads][kKeys];
     __shared__ float maximum[kFastFusedFlashHeads];
     __shared__ float denominator[kFastFusedFlashHeads];
     if(tid<kHeadDim) {
@@ -2792,7 +2797,49 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
 
     // The first 128 lanes own K rows. All six score chains use the same
     // represented FP16 K load, while the d lanes below own the V output.
-    if(tid<extent) {
+    if constexpr(kStagedK) {
+        constexpr int kWords=kFastFusedFlashStageDims/2;
+        constexpr int kParts=kFastFusedFlashStageDims/8;
+        __shared__ __half2 key_tile[kKeys][kWords+1];
+        float dot[kFastFusedFlashHeads]={};
+        for(int c=0;c<kHeadDim;c+=kFastFusedFlashStageDims) {
+            for(int w=tid;w<extent*kParts;w+=static_cast<int>(blockDim.x)) {
+                const int key=w/kParts;
+                const int part=w%kParts;
+                const uint4 packed=*reinterpret_cast<const uint4*>(k_cache+
+                    (static_cast<std::size_t>(first+key)*kKVHeads+kv_head)*kHeadDim+
+                        c+part*8);
+                key_tile[key][part*4+0]=*reinterpret_cast<const __half2*>(&packed.x);
+                key_tile[key][part*4+1]=*reinterpret_cast<const __half2*>(&packed.y);
+                key_tile[key][part*4+2]=*reinterpret_cast<const __half2*>(&packed.z);
+                key_tile[key][part*4+3]=*reinterpret_cast<const __half2*>(&packed.w);
+            }
+            __syncthreads();
+            if(tid<extent) {
+                #pragma unroll
+                for(int word=0;word<kWords;word+=2) {
+                    const int d=c+2*word;
+                    const float2 low=__half22float2(key_tile[tid][word]);
+                    const float2 high=__half22float2(key_tile[tid][word+1]);
+                    #pragma unroll
+                    for(int head=0;head<kFastFusedFlashHeads;++head) {
+                        const float4 query4=
+                            *reinterpret_cast<const float4*>(&query_values[head][d]);
+                        dot[head]+=query4.x*low.x;
+                        dot[head]+=query4.y*low.y;
+                        dot[head]+=query4.z*high.x;
+                        dot[head]+=query4.w*high.y;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if(tid<extent) {
+            #pragma unroll
+            for(int head=0;head<kFastFusedFlashHeads;++head)
+                score_tile[head][tid]=dot[head]*0.0625f;
+        }
+    } else if(tid<extent) {
         const int key=first+tid;
         const auto* key_values=k_cache+
             (static_cast<std::size_t>(key)*kKVHeads+kv_head)*kHeadDim;
@@ -2833,7 +2880,40 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
     __syncthreads();
 
     float accumulated[kFastFusedFlashHeads]={};
-    if(tid<kHeadDim) {
+    if(kStagedK && tid<kHeadDim) {
+        // Batch eight independent V loads, then apply them in chronological
+        // order: each head keeps the same FP32 chain as the scalar loop.
+        int offset=0;
+        for(;offset+8<=extent;offset+=8) {
+            float values[8];
+            #pragma unroll
+            for(int j=0;j<8;++j)
+                values[j]=__half2float(__ushort_as_half(
+                    v_cache[(static_cast<std::size_t>(first+offset+j)*kKVHeads+kv_head)*
+                        kHeadDim+tid]));
+            #pragma unroll
+            for(int head=0;head<kFastFusedFlashHeads;++head) {
+                const float4 a=*reinterpret_cast<const float4*>(&score_tile[head][offset]);
+                const float4 b=*reinterpret_cast<const float4*>(&score_tile[head][offset+4]);
+                accumulated[head]+=a.x*values[0];
+                accumulated[head]+=a.y*values[1];
+                accumulated[head]+=a.z*values[2];
+                accumulated[head]+=a.w*values[3];
+                accumulated[head]+=b.x*values[4];
+                accumulated[head]+=b.y*values[5];
+                accumulated[head]+=b.z*values[6];
+                accumulated[head]+=b.w*values[7];
+            }
+        }
+        for(;offset<extent;++offset) {
+            const auto represented=__half2float(__ushort_as_half(
+                v_cache[(static_cast<std::size_t>(first+offset)*kKVHeads+kv_head)*
+                    kHeadDim+tid]));
+            #pragma unroll
+            for(int head=0;head<kFastFusedFlashHeads;++head)
+                accumulated[head]+=score_tile[head][offset]*represented;
+        }
+    } else if(tid<kHeadDim) {
         for(int offset=0;offset<extent;++offset) {
             const auto represented=__half2float(__ushort_as_half(
                 v_cache[(static_cast<std::size_t>(first+offset)*kKVHeads+kv_head)*
@@ -2855,6 +2935,14 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
         slot[kFastFusedFlashValues+tid]=maximum[tid];
         slot[kFastFusedFlashValues+kFastFusedFlashHeads+tid]=denominator[tid];
     }
+}
+
+bool fused_flash_staged_k_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_FLASH_STAGED_K");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
 }
 
 __global__ void attention_cached_gqa_six_fused_flash_merge_kernel(
@@ -7226,7 +7314,12 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                                                          cache_capacity_))
                 throw std::invalid_argument(
                     "FAST fused flash attention scratch extent");
-            if(fast_fused_flash_attention_keys256_)
+            if(fast_fused_flash_attention_keys256_&&fused_flash_staged_k_enabled())
+                attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256,true><<<
+                    rows*kKVHeads*segments,256,0,stream>>>(
+                        qr,attention_k,attention_v,exact_scores_,attn,rows,position,
+                        cache_capacity_,segments,position_device_,0);
+            else if(fast_fused_flash_attention_keys256_)
                 attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256><<<
                     rows*kKVHeads*segments,256,0,stream>>>(
                         qr,attention_k,attention_v,exact_scores_,attn,rows,position,
