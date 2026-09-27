@@ -65,9 +65,11 @@ static void direct_target_only_probe(const char* path,const char* target,
         throw std::runtime_error("direct target-only probe prompt extent");
     auto model=ninfer::exl3::Exl3TextModel::load(target,max_context);
     auto context=model->create_context(true);
-    context->prefill(std::span<const std::int64_t>(ids).first(16));
+    const auto initial=static_cast<std::size_t>(
+        ninfer::exl3::Exl3TextContext::layer_major_initial_rows());
+    if(initial)context->prefill(std::span<const std::int64_t>(ids).first(initial));
     context->append_prefill_layer_major(
-        std::span<const std::int64_t>(ids).subspan(16));
+        std::span<const std::int64_t>(ids).subspan(initial));
     if(cudaStreamSynchronize(nullptr)!=cudaSuccess)
         throw std::runtime_error("direct target-only prefill completion");
     const auto root=context->export_exact_host_state();

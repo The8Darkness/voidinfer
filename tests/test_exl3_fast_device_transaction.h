@@ -166,9 +166,11 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     if(custom_prompt &&
        env("NINFER_EXL3_TEST_FAST_DEVICE_RESERVED_CONTEXT")=="1") {
         auto cold=target.create_context(true);
-        cold->prefill(std::span<const std::int64_t>(prefix).first(16));
+        const auto initial=static_cast<std::size_t>(
+            ninfer::exl3::Exl3TextContext::layer_major_initial_rows());
+        if(initial)cold->prefill(std::span<const std::int64_t>(prefix).first(initial));
         cold->append_prefill_layer_major(
-            std::span<const std::int64_t>(prefix).subspan(16));
+            std::span<const std::int64_t>(prefix).subspan(initial));
         cuda_check(cudaStreamSynchronize(nullptr),
             "matched cold target-only prefill completion");
         const auto cold_root=cold->export_exact_host_state();

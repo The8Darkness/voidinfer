@@ -179,6 +179,8 @@ struct Exl3ReconstructGemmStats {
     std::uint64_t k5_calls = 0;
     std::uint64_t k5_lt_calls = 0;
     std::uint64_t large_lt_calls = 0;
+    std::uint64_t mxfp8_calls = 0;
+    std::uint64_t mxfp8_rows = 0;
     std::uint64_t k6_calls = 0;
     std::uint64_t k7_calls = 0;
     std::uint64_t rows = 0;

@@ -8,6 +8,7 @@
 #include "core/nvtx_range.h"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -1619,6 +1620,97 @@ __device__ __forceinline__ int inverse_tensor_core_index(int row, int column) {
     const int c_group = column >= 8 ? column - 8 : column;
     const int slot = variant + (column >= 8 ? 4 : 0);
     return (c_group * 4 + t_mod) * 8 + slot;
+}
+
+// MXFP8 (OCP MX: E4M3 elements, one E8M0 power-of-two scale per 32 elements
+// along K) operands for the cuBLASLt VEC32_UE8M0 prefill route. Scale factors
+// use the cuBLASLt 128x4 tile layout; `inner_blocks` is K/32 rounded up to 4.
+__device__ __forceinline__ std::size_t mxfp8_scale_offset(int outer,int inner,
+                                                          int inner_blocks) {
+    return (static_cast<std::size_t>(outer/128)*inner_blocks+(inner/4)*4)*128+
+        (outer%32)*16+((outer%128)/32)*4+(inner%4);
+}
+
+// Power-of-two scale so the block maximum maps at or below the E4M3 finite
+// maximum (448); a zero block keeps the minimum scale and encodes zeros.
+__device__ __forceinline__ int mxfp8_block_exponent(float amax) {
+    if (!(amax>0.0f)) return -127;
+    int power=0;
+    const float mantissa=frexpf(amax*(1.0f/448.0f),&power);
+    const int exponent=mantissa==0.5f?power-1:power;
+    return exponent<-127?-127:(exponent>127?127:exponent);
+}
+
+__device__ __forceinline__ void mxfp8_encode32(const float (&values)[32],float scale,
+                                               std::uint8_t* destination) {
+    alignas(16) std::uint8_t bytes[32];
+#pragma unroll
+    for (int i=0;i<32;i+=2) {
+        const __nv_fp8x2_storage_t pair=__nv_cvt_float2_to_fp8x2(
+            make_float2(values[i]*scale,values[i+1]*scale),__NV_SATFINITE,__NV_E4M3);
+        bytes[i]=static_cast<std::uint8_t>(pair&0xff);
+        bytes[i+1]=static_cast<std::uint8_t>(pair>>8);
+    }
+    reinterpret_cast<uint4*>(destination)[0]=reinterpret_cast<const uint4*>(bytes)[0];
+    reinterpret_cast<uint4*>(destination)[1]=reinterpret_cast<const uint4*>(bytes)[1];
+}
+
+// K-contiguous FP16 activations [rows][k] -> E4M3 [rows][k] plus scales for
+// rows padded to 128 (padding scales are zero-filled as cuBLASLt requires).
+__global__ void mxfp8_quantize_rows_kernel(const half* __restrict__ source,
+    std::uint8_t* __restrict__ values,std::uint8_t* __restrict__ scales,
+    int rows,int k,int padded_rows) {
+    const int blocks=k/32;
+    const int inner_blocks=(blocks+3)/4*4;
+    const int index=blockIdx.x*blockDim.x+threadIdx.x;
+    if (index>=padded_rows*blocks) return;
+    const int row=index/blocks,block=index%blocks;
+    if (row>=rows) {
+        scales[mxfp8_scale_offset(row,block,inner_blocks)]=0;
+        return;
+    }
+    const auto* input=reinterpret_cast<const uint4*>(
+        source+static_cast<std::size_t>(row)*k+block*32);
+    float x[32];
+    float amax=0.0f;
+#pragma unroll
+    for (int part=0;part<4;++part) {
+        const uint4 packed=input[part];
+        const half2* pairs=reinterpret_cast<const half2*>(&packed);
+#pragma unroll
+        for (int i=0;i<4;++i) {
+            const float2 value=__half22float2(pairs[i]);
+            x[part*8+i*2]=value.x;x[part*8+i*2+1]=value.y;
+            amax=fmaxf(amax,fmaxf(fabsf(value.x),fabsf(value.y)));
+        }
+    }
+    const int exponent=mxfp8_block_exponent(amax);
+    mxfp8_encode32(x,exp2f(static_cast<float>(-exponent)),
+        values+static_cast<std::size_t>(row)*k+block*32);
+    scales[mxfp8_scale_offset(row,block,inner_blocks)]=
+        static_cast<std::uint8_t>(exponent+127);
+}
+
+// Reconstructed FP16 weight [k][n] (N contiguous) -> K-major E4M3 [n][k] plus
+// scales (outer n, inner k/32). One thread owns one output column's 32-row
+// K block; grid (ceil(n/256), k/32). n and k are multiples of 128.
+__global__ void mxfp8_quantize_weight_transposed_kernel(const half* __restrict__ source,
+    std::uint8_t* __restrict__ values,std::uint8_t* __restrict__ scales,int k,int n) {
+    const int column=blockIdx.x*blockDim.x+threadIdx.x;
+    const int block=blockIdx.y;
+    if (column>=n) return;
+    float x[32];
+    float amax=0.0f;
+#pragma unroll
+    for (int i=0;i<32;++i) {
+        x[i]=__half2float(source[static_cast<std::size_t>(block*32+i)*n+column]);
+        amax=fmaxf(amax,fabsf(x[i]));
+    }
+    const int exponent=mxfp8_block_exponent(amax);
+    mxfp8_encode32(x,exp2f(static_cast<float>(-exponent)),
+        values+static_cast<std::size_t>(column)*k+block*32);
+    scales[mxfp8_scale_offset(column,block,(k/32+3)/4*4)]=
+        static_cast<std::uint8_t>(exponent+127);
 }
 
 template <int Bits, bool FragmentOrder = false>
@@ -5827,6 +5919,7 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     std::unordered_map<std::uint64_t,LtPlan> lt_plans;
     bool k5_lt_enabled = false;
     bool large_lt_enabled = false;
+    bool mxfp8_enabled = false;
     bool fused_original_enabled = false;
     bool original_gdn_mlp_cache_enabled = false;
     bool fp16_compute_enabled = false;
@@ -5937,6 +6030,16 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->large_lt_enabled=accept_all_model_shapes && large_lt &&
         std::strcmp(large_lt,"1")==0;
+    // Prefill numerical policy (default 1, quality-gated; 0 = FP16 control):
+    // large-M projections run as MXFP8 (E4M3 with block-32 E8M0 scales on
+    // weights and activations, FP32 accumulation).
+    const char* mxfp8=std::getenv("NINFER_EXL3_PREFILL_MXFP8");
+    if(mxfp8 && std::strcmp(mxfp8,"0")!=0 && std::strcmp(mxfp8,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_MXFP8 must be 0 or 1");
+    }
+    impl_->mxfp8_enabled=accept_all_model_shapes &&
+        (!mxfp8 || std::strcmp(mxfp8,"1")==0);
     const char* packed_direct_k6 = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_PACKED_DIRECT_K6");
     if (packed_direct_k6 && std::strcmp(packed_direct_k6, "0") != 0 &&
@@ -6053,7 +6156,7 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
         cuda_check(cudaMalloc(&impl_->cublas_workspace, cublas_bytes),
                    "T69 allocate cuBLAS workspace");
         cublas_check(cublasCreate(&impl_->handle), "T69 create cuBLAS handle");
-        if (impl_->k5_lt_enabled || impl_->large_lt_enabled)
+        if (impl_->k5_lt_enabled || impl_->large_lt_enabled || impl_->mxfp8_enabled)
             cublas_check(cublasLtCreate(&impl_->lt_handle),
                          "create K5 prefill cuBLASLt handle");
         cublas_check(cublasSetPointerMode(impl_->handle, CUBLAS_POINTER_MODE_HOST),
@@ -6788,6 +6891,16 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
             } else slot->valid = true;
         }
     }
+    // MXFP8 policy: the layer-reuse slot holds the K-major E4M3 weight and its
+    // block scales; FP16 reconstruction goes through the scratch plane first.
+    // Without a resident slot the call keeps the FP16 route.
+    const bool mxfp8 = impl_->mxfp8_enabled && fast_fp16_destination &&
+        !fused_original && metadata.K != 5 && rows >= 16 &&
+        metadata.in_features % 128 == 0 && metadata.out_features % 128 == 0 &&
+        reconstructed != impl_->reconstructed;
+    std::uint8_t* const mx_weight =
+        mxfp8 ? reinterpret_cast<std::uint8_t*>(reconstructed) : nullptr;
+    if (mxfp8) reconstructed = impl_->reconstructed;
     if (reconstruct_needed && fused_original) {
         const dim3 fused_grid(metadata.out_features / kHadamard,
                               metadata.in_features / kHadamard);
@@ -6824,6 +6937,16 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
         impl_->stats.reconstructed_weight_bytes += weight_bytes;
         ++impl_->stats.reconstructed_weight_calls;
+        if (mxfp8) {
+            mxfp8_quantize_weight_transposed_kernel<<<
+                dim3((metadata.out_features + 255) / 256, metadata.in_features / 32),
+                256, 0, stream>>>(
+                    reinterpret_cast<const half*>(reconstructed), mx_weight,
+                    mx_weight + static_cast<std::size_t>(metadata.in_features) *
+                        metadata.out_features,
+                    metadata.in_features, metadata.out_features);
+            cuda_check(cudaGetLastError(), "MXFP8 weight quantization");
+        }
     }
     if (timing) cuda_check(cudaEventRecord(events[2], stream), "T69 reconstruct event");
 
@@ -6844,9 +6967,116 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const cudaDataType output_type =
         (fused_original || fast_fp16_destination) ? CUDA_R_16F : CUDA_R_32F;
     bool used_lt=false;
-    const bool large_lt_candidate=impl_->large_lt_enabled &&
+    if (mxfp8) {
+        const int in_blocks = metadata.in_features / 32;
+        const int padded_rows = (rows + 127) / 128 * 128;
+        auto* act_values = reinterpret_cast<std::uint8_t*>(impl_->accum);
+        auto* act_scales = act_values +
+            static_cast<std::size_t>(rows) * metadata.in_features;
+        act_scales += (16 - reinterpret_cast<std::uintptr_t>(act_scales) % 16) % 16;
+        const int act_threads = padded_rows * in_blocks;
+        mxfp8_quantize_rows_kernel<<<(act_threads + 255) / 256, 256, 0, stream>>>(
+            reinterpret_cast<const half*>(impl_->transformed), act_values, act_scales,
+            rows, metadata.in_features, padded_rows);
+        cuda_check(cudaGetLastError(), "MXFP8 activation quantization");
+        const std::uint64_t key = (1ull << 62) |
+            (static_cast<std::uint64_t>(metadata.in_features) << 32) |
+            (static_cast<std::uint64_t>(metadata.out_features) << 16) |
+            static_cast<std::uint64_t>(rows);
+        auto found = impl_->lt_plans.find(key);
+        if (found == impl_->lt_plans.end()) {
+            Impl::LtPlan plan{};
+            cublasLtMatmulPreference_t preference = nullptr;
+            try {
+                cublas_check(cublasLtMatmulDescCreate(&plan.operation,
+                    CUBLAS_COMPUTE_32F, CUDA_R_32F), "create MXFP8 Lt operation");
+                const cublasOperation_t transpose = CUBLAS_OP_T, plain = CUBLAS_OP_N;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_TRANSA, &transpose, sizeof(transpose)),
+                    "MXFP8 transa");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_TRANSB, &plain, sizeof(plain)), "MXFP8 transb");
+                const cublasLtMatmulMatrixScale_t mode =
+                    CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)),
+                    "MXFP8 A scale mode");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode)),
+                    "MXFP8 B scale mode");
+                // Block-scaled heuristics require bound scale pointers; each
+                // call rebinds its own weight and activation scales.
+                const void* placeholder = impl_->cublas_workspace;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &placeholder, sizeof(placeholder)),
+                    "MXFP8 placeholder A scales");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &placeholder, sizeof(placeholder)),
+                    "MXFP8 placeholder B scales");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_8F_E4M3,
+                    metadata.in_features, metadata.out_features, metadata.in_features),
+                    "create MXFP8 weight layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_8F_E4M3,
+                    metadata.in_features, rows, metadata.in_features),
+                    "create MXFP8 activation layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16F,
+                    metadata.out_features, rows, metadata.out_features),
+                    "create MXFP8 output layout");
+                cublas_check(cublasLtMatmulPreferenceCreate(&preference),
+                    "create MXFP8 Lt preference");
+                constexpr std::size_t limit = 16u * 1024u * 1024u;
+                cublas_check(cublasLtMatmulPreferenceSetAttribute(preference,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &limit, sizeof(limit)),
+                    "bound MXFP8 Lt workspace");
+                cublasLtMatmulHeuristicResult_t candidates[4]{};
+                int count = 0;
+                cublas_check(cublasLtMatmulAlgoGetHeuristic(impl_->lt_handle,
+                    plan.operation, plan.a, plan.b, plan.c, plan.c, preference,
+                    4, candidates, &count), "query MXFP8 Lt algorithms");
+                bool selected = false;
+                for (int i = 0; i < count && !selected; ++i) {
+                    if (candidates[i].state == CUBLAS_STATUS_SUCCESS &&
+                        candidates[i].workspaceSize <= limit) {
+                        plan.algorithm = candidates[i].algo;
+                        plan.workspace_bytes = candidates[i].workspaceSize;
+                        selected = true;
+                    }
+                }
+                if (!selected) throw std::runtime_error("no supported MXFP8 Lt plan");
+                cublasLtMatmulPreferenceDestroy(preference);
+                preference = nullptr;
+                found = impl_->lt_plans.emplace(key, plan).first;
+            } catch (...) {
+                if (preference) cublasLtMatmulPreferenceDestroy(preference);
+                if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+                if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+                if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+                if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+                throw;
+            }
+        }
+        const auto& plan = found->second;
+        const void* weight_scales = mx_weight +
+            static_cast<std::size_t>(metadata.in_features) * metadata.out_features;
+        const void* input_scales = act_scales;
+        cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+            CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &weight_scales, sizeof(weight_scales)),
+            "bind MXFP8 weight scales");
+        cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+            CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &input_scales, sizeof(input_scales)),
+            "bind MXFP8 activation scales");
+        cublas_check(cublasLtMatmul(impl_->lt_handle, plan.operation, &alpha,
+            mx_weight, plan.a, act_values, plan.b, &beta,
+            output, plan.c, output, plan.c, &plan.algorithm,
+            impl_->cublas_workspace, plan.workspace_bytes, stream),
+            "MXFP8 prefill cuBLASLt GEMM");
+        ++impl_->stats.mxfp8_calls;
+        impl_->stats.mxfp8_rows += static_cast<std::uint64_t>(rows);
+        used_lt = true;
+    }
+    const bool large_lt_candidate=!mxfp8 && impl_->large_lt_enabled &&
         (metadata.K==6 || metadata.K==7) && rows>=4096;
-    if (((impl_->k5_lt_enabled && metadata.K==5 && !fp16_compute) ||
+    if (!mxfp8 && ((impl_->k5_lt_enabled && metadata.K==5 && !fp16_compute) ||
          (large_lt_candidate && fp16_compute)) &&
         fast_fp16_destination && !fused_original) {
         const std::uint64_t key=(fp16_compute?1ull<<63:0ull) |

@@ -7934,6 +7934,16 @@ Exl3TextContext::device_transaction_checkpoint_graph_stats() const noexcept {
         impl_->device_transaction_checkpoint_graph_capture_ms};
 }
 
+bool Exl3TextContext::layer_major_from_zero() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_LAYER_MAJOR_FROM_ZERO");
+        if (!value || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        throw std::invalid_argument("NINFER_EXL3_LAYER_MAJOR_FROM_ZERO must be 0 or 1");
+    }();
+    return enabled;
+}
+
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
@@ -7951,7 +7961,9 @@ void Exl3TextContext::append_prefill_layer_major(
             (!impl_->transaction ||
              (!impl_->transaction->active && !impl_->transaction->rollback_required)),
             "layer-major prefill requires an idle Fast90 ordinary device-KV context");
-    require(position_ > 0 && impl_->last_rows > 0 &&
+    const bool fresh_prompt = position_ == 0 && layer_major_from_zero() &&
+        !impl_->host_kv_failed && !impl_->deferred_reconstruction_bytes;
+    require((fresh_prompt || (position_ > 0 && impl_->last_rows > 0)) &&
             token_ids.size() > 1024 &&
             token_ids.size() <= static_cast<std::size_t>(impl_->max_context-position_) &&
             std::all_of(token_ids.begin(),token_ids.end(),[](std::int64_t token) {
@@ -8033,9 +8045,28 @@ void Exl3TextContext::append_prefill_layer_major(
 
     const int base_position = position_;
     const int total = static_cast<int>(token_ids.size());
-    const int chunks = (total+1023)/1024;
-    const int final_offset = (chunks-1)*1024;
-    const int final_rows = total-final_offset;
+    // Causal chunk partition: 1024-row chunks with the remainder last. A
+    // remainder below 256 rows is merged with the preceding chunk and split
+    // evenly, so no chunk falls to the small-M decode route or below the bulk
+    // admission width (a fresh prompt at 1024k+r would otherwise end in r rows).
+    std::vector<int> chunk_offsets;
+    std::vector<int> chunk_sizes;
+    {
+        const int full = (total+1023)/1024;
+        for (int chunk=0;chunk<full;++chunk) {
+            chunk_offsets.push_back(chunk*1024);
+            chunk_sizes.push_back(std::min(1024,total-chunk*1024));
+        }
+        if (full>1 && chunk_sizes.back()<256) {
+            const int merged=1024+chunk_sizes.back();
+            chunk_sizes[full-2]=merged/2;
+            chunk_sizes[full-1]=merged-merged/2;
+            chunk_offsets[full-1]=chunk_offsets[full-2]+chunk_sizes[full-2];
+        }
+    }
+    const int chunks = static_cast<int>(chunk_offsets.size());
+    const int final_offset = chunk_offsets.back();
+    const int final_rows = chunk_sizes.back();
     cuda_check(cudaMemcpyAsync(impl_->token_ids,token_ids.data(),
                                token_ids.size_bytes(),cudaMemcpyHostToDevice,stream),
                "upload layer-major prefill IDs");
@@ -8066,9 +8097,8 @@ void Exl3TextContext::append_prefill_layer_major(
         workspace.begin_layer_reuse(cache_budget,
             base_position+total>=8192 ||
             impl_->gdn_bulk_mlp_short_k5_enabled);
-        const auto execute_chunk=[&](int offset,
+        const auto execute_chunk=[&](int offset,int rows,
                 const Exl3GdnLayer::BulkPrefillBuffers* prepared) {
-                const int rows=std::min(1024,total-offset);
                 const int logical_position=base_position+offset;
                 cuda_check(cudaMemcpyAsync(impl_->position_device,&logical_position,
                     sizeof(logical_position),cudaMemcpyHostToDevice,stream),
@@ -8086,15 +8116,25 @@ void Exl3TextContext::append_prefill_layer_major(
         const bool bulk=impl_->gdn_bulk_prefill_enabled &&
             impl_->gdn_layers[layer] &&
             impl_->gdn_layers[layer]->supports_bulk_prefill();
+        // Bulk blocks group whole consecutive chunks up to the arena capacity.
+        const auto for_each_block=[&](int capacity,const auto& body) {
+            for (int first=0;first<chunks;) {
+                int last=first,count=0;
+                while (last<chunks && count+chunk_sizes[last]<=capacity)
+                    count+=chunk_sizes[last++];
+                require(last>first,"layer-major chunk exceeds bulk capacity");
+                body(first,last,chunk_offsets[first],count);
+                first=last;
+            }
+        };
         if (bulk_mlp) {
             const int batch_rows=impl_->gdn_bulk_capacity;
-            for(int block=0;block<total;block+=batch_rows) {
-                const int count=std::min(batch_rows,total-block);
+            for_each_block(batch_rows,[&](int first_chunk,int end_chunk,int block,int count) {
                 if(count<256 ||
                    !impl_->gdn_layers[layer]->supports_bulk_mlp(count)) {
-                    for(int offset=block;offset<block+count;offset+=1024)
-                        execute_chunk(offset,nullptr);
-                    continue;
+                    for(int chunk=first_chunk;chunk<end_chunk;++chunk)
+                        execute_chunk(chunk_offsets[chunk],chunk_sizes[chunk],nullptr);
+                    return;
                 }
                 require(count<=impl_->gdn_bulk_capacity,
                         "GDN bulk MLP arena capacity");
@@ -8102,8 +8142,9 @@ void Exl3TextContext::append_prefill_layer_major(
                     static_cast<std::size_t>(block)*kHidden;
                 auto* output_base=(layer%2==0?impl_->hidden_b:impl_->hidden_a)+
                     static_cast<std::size_t>(block)*kHidden;
-                for(int relative=0;relative<count;relative+=1024) {
-                    const int rows=std::min(1024,count-relative);
+                for(int chunk=first_chunk;chunk<end_chunk;++chunk) {
+                    const int relative=chunk_offsets[chunk]-block;
+                    const int rows=chunk_sizes[chunk];
                     const int logical_position=base_position+block+relative;
                     cuda_check(cudaMemcpyAsync(impl_->position_device,
                         &logical_position,sizeof(logical_position),
@@ -8133,16 +8174,16 @@ void Exl3TextContext::append_prefill_layer_major(
                         static_cast<std::size_t>(final_rows)*kHidden*
                             sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
                         "capture final GDN bulk MLP hidden tap");
-            }
+            });
         } else if (bulk) {
             constexpr int bulk_rows=4096;
-            for (int block=0;block<total;block+=bulk_rows) {
-                const int count=std::min(bulk_rows,total-block);
+            for_each_block(bulk_rows,[&](int first_chunk,int end_chunk,int block,int count) {
                 require(count<=impl_->gdn_bulk_capacity,
                         "GDN bulk arena capacity");
                 if (count<256) {
-                    execute_chunk(block,nullptr);
-                    continue;
+                    for(int chunk=first_chunk;chunk<end_chunk;++chunk)
+                        execute_chunk(chunk_offsets[chunk],chunk_sizes[chunk],nullptr);
+                    return;
                 }
                 auto* input=(layer%2==0?impl_->hidden_a:impl_->hidden_b)+
                     static_cast<std::size_t>(block)*kHidden;
@@ -8151,19 +8192,20 @@ void Exl3TextContext::append_prefill_layer_major(
                 impl_->gdn_layers[layer]->prepare_bulk_prefill(input,buffers,stream);
                 ++gdn_bulk_calls;
                 gdn_bulk_rows+=static_cast<std::uint64_t>(count);
-                for(int offset=block;offset<block+count;offset+=1024) {
+                for(int chunk=first_chunk;chunk<end_chunk;++chunk) {
+                    const int offset=chunk_offsets[chunk];
                     const int relative=offset-block;
                     Exl3GdnLayer::BulkPrefillBuffers slice{
                         buffers.h+static_cast<std::size_t>(relative)*kHidden,
                         buffers.qkv+static_cast<std::size_t>(relative)*10240,
                         buffers.z+static_cast<std::size_t>(relative)*6144,
-                        std::min(1024,total-offset)};
-                    execute_chunk(offset,&slice);
+                        chunk_sizes[chunk]};
+                    execute_chunk(offset,chunk_sizes[chunk],&slice);
                 }
-            }
+            });
         } else {
-            for(int offset=0;offset<total;offset+=1024)
-                execute_chunk(offset,nullptr);
+            for(int chunk=0;chunk<chunks;++chunk)
+                execute_chunk(chunk_offsets[chunk],chunk_sizes[chunk],nullptr);
         }
         const int tap=impl_->tap_index(layer);
         if (retained_taps && tap>=0) {

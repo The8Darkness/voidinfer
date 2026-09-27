@@ -826,6 +826,15 @@ public:
     void append_prefill_layer_major(std::span<const std::int64_t> token_ids,
                                     cudaStream_t stream = nullptr,
                                     const RetainedTapTail* retained_taps = nullptr);
+    // Fresh-prompt layer-major policy (NINFER_EXL3_LAYER_MAJOR_FROM_ZERO, default
+    // 1, process latched; 0 = initial16 control): a reset context admits
+    // layer-major prefill at position 0, so the
+    // whole prompt runs as 1024-row layer-major chunks instead of an ordered
+    // initial16 forward followed by the layer-major suffix. Numerical policy:
+    // the first 16 rows use the chunk projection route.
+    static bool layer_major_from_zero();
+    // Rows a fresh layer-major prompt executes before the layer-major suffix.
+    static int layer_major_initial_rows() { return layer_major_from_zero() ? 0 : 16; }
 
     // Qualification/reference path for a bounded eager target continuation.
     // Setup allocates fixed scratch once. Execution and host getters are ordered

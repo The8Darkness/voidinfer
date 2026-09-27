@@ -109,10 +109,13 @@ public:
         try {
             draft_.reset(stream_);
             draft_.begin_fresh_prefill(0,static_cast<long long>(input.size()),stream_);
-            context_->prefill(input.first(16),stream_);
-            if(layer_major && input.size()>=2064)
-                draft_.skip_fresh_prefill_block(16,0,stream_);
-            else commit_captured(16,0);
+            const int initial=layer_major?Exl3TextContext::layer_major_initial_rows():16;
+            if(initial) {
+                context_->prefill(input.first(initial),stream_);
+                if(layer_major && input.size()>=2064)
+                    draft_.skip_fresh_prefill_block(initial,0,stream_);
+                else commit_captured(initial,0);
+            }
             if(layer_major)prefill_layer_major(input);
             else {
                 for(std::size_t first=16;first<input.size();) {
@@ -573,7 +576,10 @@ private:
         const int total=static_cast<int>(input.size());
         // Near the minimum admitted context the initial 16 rows still belong
         // to the draft ring. They were committed from the ordinary tap capture.
-        const int first=std::max(16,retained_start_for(total));
+        // Both schedules place draft blocks on the same 16-aligned absolute
+        // partition; only the target's initial forward differs.
+        const int initial=Exl3TextContext::layer_major_initial_rows();
+        const int first=std::max(initial,retained_start_for(total));
         const int rows=total-first;
         if(rows<2032 || rows>2063)
             throw std::logic_error("fast device retained tap partition halo");
@@ -588,9 +594,9 @@ private:
         const Exl3TextContext::RetainedTapTail retained{
             arena.ptr,bytes,first,rows};
         try {
-            context_->append_prefill_layer_major(input.subspan(16),stream_,
+            context_->append_prefill_layer_major(input.subspan(initial),stream_,
                 &retained);
-            for(int forward=16;forward<total;) {
+            for(int forward=initial;forward<total;) {
                 const int forward_rows=std::min(1024,total-forward);
                 for(int row=0;row<forward_rows;row+=16) {
                     const int count=std::min(16,forward_rows-row);

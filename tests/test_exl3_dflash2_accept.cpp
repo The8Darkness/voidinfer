@@ -487,13 +487,16 @@ double ingest_prefix(Exl3TextContext& ctx, const std::vector<std::int64_t>& pref
         }
     }
     if (fresh_window) sink.draft->begin_fresh_prefill(0, total, nullptr);
-    const int c0 = std::min(total, 16);
+    const int c0 = layer_major ? Exl3TextContext::layer_major_initial_rows() :
+        std::min(total, 16);
     TtftTrace::mark("initial16_begin", ctx.position());
-    ctx.prefill(std::span<const std::int64_t>(prefix.data(), static_cast<std::size_t>(c0)));
-    require(ctx.position() == c0, "E5A4 position after first prefill chunk");
-    if (sink.draft != nullptr) {
-        if (layer_major) sink.draft->skip_fresh_prefill_block(c0, 0);
-        else commit_current_rows(ctx, *sink.draft, *sink.stage, c0, 0);
+    if (c0) {
+        ctx.prefill(std::span<const std::int64_t>(prefix.data(), static_cast<std::size_t>(c0)));
+        require(ctx.position() == c0, "E5A4 position after first prefill chunk");
+        if (sink.draft != nullptr) {
+            if (layer_major) sink.draft->skip_fresh_prefill_block(c0, 0);
+            else commit_current_rows(ctx, *sink.draft, *sink.stage, c0, 0);
+        }
     }
     TtftTrace::mark("initial16_complete", ctx.position(), -1, true);
     TtftTrace::mark(wide_rows==1024 ? "chunk1024_suffix_begin" : wide_rows==512 ? "chunk512_suffix_begin" : wide_rows==256 ? "chunk256_suffix_begin" : wide_rows==128 ? "chunk128_suffix_begin" : wide_rows==64 ? "chunk64_suffix_begin" : wide_rows==32 ? "chunk32_suffix_begin" : wide ? "chunk16_suffix_begin" : chunked ? "chunk8_suffix_begin" : "m1_suffix_begin", ctx.position());
@@ -3391,6 +3394,8 @@ int main() {
                       << numeric_prefill_stats.reused_weight_calls
                       << " reused_weight_bytes="
                       << numeric_prefill_stats.reused_weight_bytes
+                      << " mxfp8_calls=" << numeric_prefill_stats.mxfp8_calls
+                      << " mxfp8_rows=" << numeric_prefill_stats.mxfp8_rows
                       << " large_lt_calls="
                       << numeric_prefill_stats.large_lt_calls
                       << " cached_weight_capacity_bytes="
