@@ -1153,6 +1153,23 @@ struct Exl3TextContext::Impl {
         std::array<const void*,kLayers> recorded_checkpoints{};
     };
     std::array<GdnRepairGraph,64> gdn_repair_graphs{};
+    // Overlapped retained-prefix GDN repair: the repair graph runs on a side
+    // stream forked from the target stream; every later operation on target
+    // state joins it first (join_repair / drain_repair).
+    cudaStream_t repair_stream=nullptr;
+    cudaEvent_t repair_fork=nullptr;
+    cudaEvent_t repair_join=nullptr;
+    bool repair_pending=false;
+    void join_repair(cudaStream_t stream) {
+        if(!repair_pending) return;
+        cuda_check(cudaStreamWaitEvent(stream,repair_join,0),"join overlapped GDN repair");
+        repair_pending=false;
+    }
+    void drain_repair() {
+        if(!repair_pending) return;
+        cuda_check(cudaEventSynchronize(repair_join),"drain overlapped GDN repair");
+        repair_pending=false;
+    }
     int ordinary_full_layer_graph_capture_position=0;
     std::uint64_t ordinary_full_layer_graph_captures=0;
     std::uint64_t ordinary_full_layer_graph_replays=0;
@@ -1976,6 +1993,13 @@ struct Exl3TextContext::Impl {
         return true;
     }
     ~Impl() {
+        if(repair_stream) {
+            (void)cudaStreamSynchronize(repair_stream);
+            (void)cudaEventDestroy(repair_fork);
+            (void)cudaEventDestroy(repair_join);
+            (void)cudaStreamDestroy(repair_stream);
+            repair_stream=nullptr;
+        }
         // Captured nodes retain the auxiliary stream/events/workspace. Destroy
         // the executable and definition before releasing any such resource.
         if(transaction) {
@@ -6816,6 +6840,7 @@ void Exl3TextContext::reset(cudaStream_t stream) {
 }
 
 void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->host_kv_failed,"context reset cannot reuse failed HostKV lineage");
     require(!impl_->reconstruction_backing || !impl_->reconstruction_backing->stream.failed(),
@@ -6979,6 +7004,7 @@ void Exl3TextContext::prepare_transaction_reserved(
 
 void Exl3TextContext::prepare_transaction_impl(
     Exl3VeriCacheServingCoordinator* authority, unsigned startup_fault) {
+    impl_->drain_repair();
     require(startup_fault <= 5 && (!startup_fault || authority),
             "P2 target transaction startup fault requires reserved stage1..5");
     if (impl_->transaction) return;
@@ -7146,6 +7172,7 @@ void Exl3TextContext::prepare_transaction_impl(
 }
 
 void Exl3TextContext::begin_transaction(cudaStream_t stream) {
+    impl_->join_repair(stream);
     require(impl_->transaction != nullptr, "P2 target transaction was not prepared");
     auto& transaction = *impl_->transaction;
     require(!transaction.rollback_required,
@@ -7342,6 +7369,7 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
 }
 
 void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
+    impl_->join_repair(stream);
     require(impl_->transaction != nullptr && impl_->transaction->active,
             "P2 target transaction rollback has no active snapshot");
     auto& transaction = *impl_->transaction;
@@ -7778,6 +7806,7 @@ void Exl3TextContext::set_layer_observer_for_test(
 }
 
 void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStream_t stream) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     require(!impl_->host_kv_failed,"HostKV prefill requires intact transfer lineage");
@@ -7810,6 +7839,7 @@ void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStrea
 }
 
 void Exl3TextContext::decode(std::int64_t token_id, cudaStream_t stream) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     require(!impl_->host_kv_failed,"HostKV decode requires intact transfer lineage");
@@ -7844,6 +7874,7 @@ void Exl3TextContext::append_prefill_wide(std::span<const std::int64_t> token_id
 
 void Exl3TextContext::append_prefill_impl(std::span<const std::int64_t> token_ids,
                                         cudaStream_t stream, bool wide, bool exact) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     require(!impl_->host_kv_failed,"HostKV append requires intact transfer lineage");
@@ -7906,6 +7937,7 @@ Exl3TextContext::device_transaction_checkpoint_graph_stats() const noexcept {
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     require(impl_->fast_same_weights_fp16kv_prefill_enabled &&
@@ -8676,6 +8708,7 @@ void Exl3TextContext::prepare_continuation_impl(int capacity,Exl3VeriCacheServin
 
 void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
                                     cudaStream_t stream) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->host_kv_failed,"HostKV continuation requires intact transfer lineage");
     require(!impl_->transaction || !impl_->transaction->rollback_required,
@@ -8763,6 +8796,7 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_preserving(std::string_
 }
 Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view contract,
     const Exl3ExactHostState* root,std::uint64_t expected_generation) {
+    impl_->drain_repair();
     Impl::require_host_kv_retirement_admission();
     require(!impl_->host_kv_failed,"request reset cannot reuse failed HostKV lineage");
     require(!impl_->reconstruction_backing || !impl_->reconstruction_backing->stream.failed(),
@@ -8872,6 +8906,7 @@ void Exl3TextContext::append_exact_prefill_tail(std::span<const std::int64_t> to
 }
 
 void Exl3TextContext::finish_exact_continuation(cudaStream_t stream) {
+    impl_->join_repair(stream);
     const bool transaction_ready=!impl_->transaction ||
         (!impl_->transaction->active && !impl_->transaction->rollback_required);
     require(transaction_ready && !impl_->graph_active && !impl_->graph_capture_active &&
@@ -8928,6 +8963,7 @@ void Exl3TextContext::retain_transaction_prefix_for_test(
 
 void Exl3TextContext::retain_transaction_prefix_impl(
     int retained_rows, int fail_after_model_layer, cudaStream_t stream) {
+    impl_->join_repair(stream);
     require(impl_->transaction != nullptr && impl_->transaction->active,
             "P2 retained prefix requires an active target transaction");
     auto& transaction = *impl_->transaction;
@@ -9034,6 +9070,9 @@ void Exl3TextContext::retain_transaction_prefix_impl(
         if (graph.ready && graph.recorded_checkpoints!=checkpoints) {
             // Waits for any in-flight replay before the executable is replaced.
             cuda_check(cudaStreamSynchronize(stream),"drain stale GDN repair graph");
+            if(impl_->repair_stream)
+                cuda_check(cudaStreamSynchronize(impl_->repair_stream),
+                    "drain stale overlapped GDN repair graph");
             graph.ready=false;
         }
         if (!graph.ready) {
@@ -9063,6 +9102,27 @@ void Exl3TextContext::retain_transaction_prefix_impl(
                 "destroy GDN repair graph capture stream");
             graph.ready=true;
         }
+        static const bool overlap=[] {
+            const char* value=std::getenv("NINFER_EXL3_GDN_REPAIR_OVERLAP");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        if(overlap) {
+            if(!impl_->repair_stream) {
+                cuda_check(cudaStreamCreateWithFlags(&impl_->repair_stream,
+                    cudaStreamNonBlocking),"create overlapped GDN repair stream");
+                cuda_check(cudaEventCreateWithFlags(&impl_->repair_fork,
+                    cudaEventDisableTiming),"create GDN repair fork event");
+                cuda_check(cudaEventCreateWithFlags(&impl_->repair_join,
+                    cudaEventDisableTiming),"create GDN repair join event");
+            }
+            cuda_check(cudaEventRecord(impl_->repair_fork,stream),"fork GDN repair");
+            cuda_check(cudaStreamWaitEvent(impl_->repair_stream,impl_->repair_fork,0),
+                "order GDN repair after verification");
+            graph.executable.launch(impl_->repair_stream);
+            cuda_check(cudaEventRecord(impl_->repair_join,impl_->repair_stream),
+                "record GDN repair completion");
+            impl_->repair_pending=true;
+        } else
         graph.executable.launch(stream);
     } else
     for (int layer = 0; layer < kLayers; ++layer) {
@@ -9521,6 +9581,7 @@ Exl3TextContext::GreedyReadbackStats Exl3TextContext::greedy_readback_stats() co
 }
 
 bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     if(impl_->continuation)
         ++impl_->continuation->graph_stats.preparation_attempts;
@@ -9958,6 +10019,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
 
 void Exl3TextContext::continue_rows_graph(
     std::span<const std::int64_t> token_ids,cudaStream_t stream) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     const int rows = static_cast<int>(token_ids.size());
     require(impl_->continuation && impl_->continuation->graph_active &&
@@ -10271,6 +10333,7 @@ bool Exl3TextContext::capture_decode_graph(cudaStream_t stream) {
 }
 
 void Exl3TextContext::decode_graph(std::int64_t token_id, cudaStream_t stream) {
+    impl_->join_repair(stream);
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
     Impl::require_host_kv_retirement_admission();
     require(!impl_->transaction || !impl_->transaction->rollback_required,
@@ -10810,6 +10873,7 @@ void Exl3TextContext::fail_export_copy_for_test(unsigned submission) {
 
 std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_state(cudaStream_t stream,bool share_prefix,
     bool fail_after_recurrent_plan_for_test) const {
+    impl_->join_repair(stream);
     const bool transaction_ready = !impl_->transaction ||
         ((impl_->transaction->host_kv || impl_->transaction->device_kv) &&
          !impl_->transaction->active &&
@@ -11229,6 +11293,7 @@ void Exl3TextContext::rebase_oscar_host_state_delta(const Exl3ExactHostState& ol
 
 void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     const Exl3TurboAngleWarmPages* warm, bool oscar, cudaStream_t stream) {
+    impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->host_kv_failed,"host restore cannot reuse failed HostKV lineage");
     require(!impl_->graph_active && !impl_->graph_capture_active &&
@@ -11363,6 +11428,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
 }
 
 std::vector<float> Exl3TextContext::gdn_state_host(int layer, cudaStream_t stream) const {
+    impl_->join_repair(stream);
     require(layer >= 0 && layer < kLayers && impl_->gdn_layers[layer] != nullptr,
             "E4B2 requested state from a non-GDN layer");
     const auto* gdn = impl_->gdn_layers[layer].get();
