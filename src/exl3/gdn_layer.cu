@@ -606,6 +606,160 @@ __global__ void gdn_recurrence_sm120_kernel(const std::uint16_t* q, const std::u
         s[(lane + part * 32) * kHeadDim + value_dim] = column[part];
 }
 
+// Coalesced-state twin of gdn_recurrence_sm120_kernel for verifier-sized
+// batches. A CTA stages a [128 key][32 value] block of the recurrent state
+// with 16-byte loads, each warp carries four value columns as independent
+// chains (lane == key dimension, exactly as the sm120 leaf), and the block is
+// written back with 16-byte stores. Per-column arithmetic, reduction trees and
+// row order are those of gdn_recurrence_sm120_kernel.
+constexpr int kGdnTiledColumns=32;
+constexpr int kGdnTiledWarps=8;
+
+bool gdn_decode_tiled_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_DECODE_TILED");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+__global__ void __launch_bounds__(kGdnTiledWarps*32) gdn_recurrence_sm120_tiled_kernel(
+    const std::uint16_t* q,const std::uint16_t* k,const std::uint16_t* v,const float* g,
+    const float* beta,float* state,std::uint16_t* output,int rows) {
+    constexpr int kColumnsPerWarp=kGdnTiledColumns/kGdnTiledWarps;
+    __shared__ float tile[kHeadDim][kGdnTiledColumns+1];
+    const int tid=static_cast<int>(threadIdx.x);
+    const int lane=tid&31;
+    const int warp=tid>>5;
+    constexpr int kTilesPerHead=kHeadDim/kGdnTiledColumns;
+    const int head=static_cast<int>(blockIdx.x)/kTilesPerHead;
+    const int column_base=(static_cast<int>(blockIdx.x)%kTilesPerHead)*kGdnTiledColumns;
+    if(head>=kHeads) return;
+    float* s=state+head*kHeadDim*kHeadDim;
+    constexpr int kVectorsPerRow=kGdnTiledColumns/4;
+    for(int index=tid;index<kHeadDim*kVectorsPerRow;index+=blockDim.x) {
+        const int key=index/kVectorsPerRow;
+        const int part=(index%kVectorsPerRow)*4;
+        const float4 values=*reinterpret_cast<const float4*>(s+key*kHeadDim+column_base+part);
+        tile[key][part+0]=values.x;
+        tile[key][part+1]=values.y;
+        tile[key][part+2]=values.z;
+        tile[key][part+3]=values.w;
+    }
+    __syncthreads();
+    const int qk_head=head/3;
+    const auto* qv=reinterpret_cast<const __nv_bfloat16*>(q);
+    const auto* kv=reinterpret_cast<const __nv_bfloat16*>(k);
+    const auto* vv=reinterpret_cast<const __nv_bfloat16*>(v);
+    auto* out=reinterpret_cast<__nv_bfloat16*>(output);
+    constexpr unsigned mask=0xffffffffu;
+    constexpr float output_scale=0.08838834764831843f;
+    float column[kColumnsPerWarp][4];
+    #pragma unroll
+    for(int c=0;c<kColumnsPerWarp;++c)
+        #pragma unroll
+        for(int part=0;part<4;++part)
+            column[c][part]=tile[lane+part*32][warp*kColumnsPerWarp+c];
+    for(int row=0;row<rows;++row) {
+        const int qk_base=row*(kKeyHeads*kHeadDim)+qk_head*kHeadDim;
+        float q_norm[4],k_norm[4];
+        float q_sum=0.0f,k_sum=0.0f;
+        #pragma unroll
+        for(int part=0;part<4;++part) {
+            const int kd=lane+part*32;
+            const float qd=__bfloat162float(qv[qk_base+kd]);
+            const float kval=__bfloat162float(kv[qk_base+kd]);
+            q_norm[part]=qd;
+            k_norm[part]=kval;
+            q_sum+=qd*qd;
+            k_sum+=kval*kval;
+        }
+        for(int offset=16;offset>0;offset>>=1) {
+            q_sum+=__shfl_down_sync(mask,q_sum,offset);
+            k_sum+=__shfl_down_sync(mask,k_sum,offset);
+        }
+        q_sum=__shfl_sync(mask,q_sum,0);
+        k_sum=__shfl_sync(mask,k_sum,0);
+        const float q_inv=rsqrtf(q_sum+kRmsEps);
+        const float k_inv=rsqrtf(k_sum+kRmsEps);
+        #pragma unroll
+        for(int part=0;part<4;++part) {
+            q_norm[part]*=q_inv;
+            k_norm[part]*=k_inv;
+        }
+        const float alpha=expf(g[row*kHeads+head]);
+        const float beta_value=beta[row*kHeads+head];
+        float updated[kColumnsPerWarp][4];
+        float kv_mem[kColumnsPerWarp];
+        #pragma unroll
+        for(int c=0;c<kColumnsPerWarp;++c) {
+            kv_mem[c]=0.0f;
+            #pragma unroll
+            for(int part=0;part<4;++part) {
+                updated[c][part]=column[c][part]*alpha;
+                kv_mem[c]+=updated[c][part]*k_norm[part];
+            }
+        }
+        for(int offset=16;offset>0;offset>>=1) {
+            #pragma unroll
+            for(int c=0;c<kColumnsPerWarp;++c)
+                kv_mem[c]+=__shfl_down_sync(mask,kv_mem[c],offset);
+        }
+        float result[kColumnsPerWarp];
+        #pragma unroll
+        for(int c=0;c<kColumnsPerWarp;++c) {
+            kv_mem[c]=__shfl_sync(mask,kv_mem[c],0);
+            const int value_dim=column_base+warp*kColumnsPerWarp+c;
+            const float value=__bfloat162float(vv[row*(kHeads*kHeadDim)+head*kHeadDim+value_dim]);
+            const float delta=beta_value*(value-kv_mem[c]);
+            #pragma unroll
+            for(int part=0;part<4;++part) {
+                updated[c][part]+=k_norm[part]*delta;
+                column[c][part]=updated[c][part];
+            }
+            result[c]=0.0f;
+            #pragma unroll
+            for(int part=0;part<4;++part) result[c]+=updated[c][part]*q_norm[part];
+        }
+        for(int offset=16;offset>0;offset>>=1) {
+            #pragma unroll
+            for(int c=0;c<kColumnsPerWarp;++c)
+                result[c]+=__shfl_down_sync(mask,result[c],offset);
+        }
+        if(lane==0) {
+            #pragma unroll
+            for(int c=0;c<kColumnsPerWarp;++c) {
+                const int value_dim=column_base+warp*kColumnsPerWarp+c;
+                out[row*(kHeads*kHeadDim)+head*kHeadDim+value_dim]=
+                    __float2bfloat16_rn(result[c]*output_scale);
+            }
+        }
+    }
+    #pragma unroll
+    for(int c=0;c<kColumnsPerWarp;++c)
+        #pragma unroll
+        for(int part=0;part<4;++part)
+            tile[lane+part*32][warp*kColumnsPerWarp+c]=column[c][part];
+    __syncthreads();
+    for(int index=tid;index<kHeadDim*kVectorsPerRow;index+=blockDim.x) {
+        const int key=index/kVectorsPerRow;
+        const int part=(index%kVectorsPerRow)*4;
+        *reinterpret_cast<float4*>(s+key*kHeadDim+column_base+part)=make_float4(
+            tile[key][part+0],tile[key][part+1],tile[key][part+2],tile[key][part+3]);
+    }
+}
+
+void launch_gdn_recurrence_sm120(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,const float* g,const float* beta,float* state,
+    std::uint16_t* output,int rows,cudaStream_t stream) {
+    if(rows>=1 && rows<=8 && gdn_decode_tiled_enabled())
+        gdn_recurrence_sm120_tiled_kernel<<<kHeads*(kHeadDim/kGdnTiledColumns),
+            kGdnTiledWarps*32,0,stream>>>(q,k,v,g,beta,state,output,rows);
+    else
+        gdn_recurrence_sm120_kernel<<<kHeads*(kHeadDim/4),4*32,0,stream>>>(
+            q,k,v,g,beta,state,output,rows);
+}
+
 __global__ void gdn_prefill_normalize_kernel(const std::uint16_t* q,
     const std::uint16_t* k, const float* g, float* qout, float* kout, float* alpha) {
     const int lane = static_cast<int>(threadIdx.x);
@@ -1923,9 +2077,9 @@ void Exl3GdnLayer::enqueue_retained_prefix_reconstruct(
         half_buffers_[3], conv_state_, conv_state_trace_, retained_rows,
         attempted_rows);
     check(cudaGetLastError(), "reconstruct EXL3 GDN retained convolution prefix");
-    gdn_recurrence_sm120_kernel<<<kHeads * (kHeadDim / 4), 4 * 32, 0, stream>>>(
+    launch_gdn_recurrence_sm120(
         half_buffers_[4], half_buffers_[5], half_buffers_[6], float_buffers_[5],
-        float_buffers_[4], recurrent_state_, half_buffers_[9], retained_rows);
+        float_buffers_[4], recurrent_state_, half_buffers_[9], retained_rows, stream);
     check(cudaGetLastError(), "reconstruct EXL3 GDN retained recurrent prefix");
 }
 
@@ -2673,8 +2827,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         if(recurrence_sample)
             check(cudaEventRecord(recurrence_start,stream),
                   "record GDN recurrence sample start");
-        gdn_recurrence_sm120_kernel<<<kHeads * (kHeadDim / 4), 4 * 32, 0, stream>>>(
-            q, k, v, g_trace, beta_trace, recurrent_state_, core, rows);
+        launch_gdn_recurrence_sm120(
+            q, k, v, g_trace, beta_trace, recurrent_state_, core, rows, stream);
     }
     check(cudaGetLastError(), "launch GDN recurrence"); end(5);
     if(recurrence_sample) {
@@ -3083,9 +3237,9 @@ void Exl3GdnLayer::forward_pair_staged_serial_for_test(
         check(cudaMemcpyAsync(lane.layer->recurrent_state_before_, lane.layer->recurrent_state_,
                               kStateBytes, cudaMemcpyDeviceToDevice, stream),
               "save staged GDN state trace");
-        gdn_recurrence_sm120_kernel<<<kHeads * (kHeadDim / 4), 4 * 32, 0, stream>>>(
+        launch_gdn_recurrence_sm120(
             lane.q, lane.k, lane.v, lane.g_trace, lane.beta_trace,
-            lane.layer->recurrent_state_, lane.core, rows);
+            lane.layer->recurrent_state_, lane.core, rows, stream);
         check(cudaGetLastError(), "launch staged GDN recurrence");
         if (telemetry) ++telemetry->published_lanes;
         if (fail_after_published_lane == lane_index)
