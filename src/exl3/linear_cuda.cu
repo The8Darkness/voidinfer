@@ -7910,6 +7910,10 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
     return true;
 }
 
+static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission, int in_features, int out_features,
+    std::size_t capacity);
+
 void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
                                       const Exl3CudaLinearMetadata& metadata,
                                       const std::uint16_t* input,
@@ -7926,6 +7930,13 @@ void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
     if(admission==Exl3CudaLinearAdmission::target_continuation_head &&
        !target_head_small_m_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared head requires admitted H6 small-M workspace");
+    if (coherent_kv_split_for(metadata, rows, admission, in_features_, out_features_,
+            accumulation_capacity_bytes_)) {
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
     if (coherent_down_k6_candidate(metadata, rows, admission)) {
         // This explicit policy wins over older M1-only INT8/fused-input probes.
         // Scalar and verifier must not silently select different down math.
@@ -10107,6 +10118,35 @@ static void launch_coherent_packed_partials(
     throw std::logic_error("unsupported coherent packed producer variant");
 }
 
+// NINFER_EXL3_COHERENT_KV_SPLIT=S (unset/0 = off): the narrow 5120->1024
+// K/V projections (K6..K8) run as the coherent split-plane producer with S
+// K partitions instead of the 160-CTA generic GEMV. Numerics-policy candidate.
+static int coherent_kv_split_setting() {
+    static const int split = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_KV_SPLIT");
+        const int parsed = value ? std::atoi(value) : 0;
+        if (parsed < 0 || parsed > 80)
+            throw std::invalid_argument("NINFER_EXL3_COHERENT_KV_SPLIT must be 0..80");
+        return parsed;
+    }();
+    return split;
+}
+
+static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission, int in_features, int out_features,
+    std::size_t capacity) {
+    const int split = coherent_kv_split_setting();
+    if (!split || rows < 1 || rows > 8 || in_features != 5120 || out_features != 1024 ||
+        metadata.in_features != in_features || metadata.out_features != out_features ||
+        metadata.K < 6 || metadata.K > 8 || metadata.mcg || !metadata.mul1 ||
+        metadata.has_bias ||
+        (admission != Exl3CudaLinearAdmission::ordinary &&
+         admission != Exl3CudaLinearAdmission::target_continuation_kv))
+        return 0;
+    const auto required = static_cast<std::size_t>(rows) * out_features * split * sizeof(float);
+    return capacity >= required ? split : 0;
+}
+
 void Exl3CudaLinearWorkspace::forward_from_transformed(
     const Exl3CudaLinearWeights& weights,
     const Exl3CudaLinearMetadata& metadata,
@@ -10144,6 +10184,24 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     // contract before any reconstructed or ordinary dispatch can run.
     Exl3LinearWorkspaceRequirements::derive(in_features_,out_features_,rows,true,true)
         .require_disjoint_borrowed_views(transformed_input,accum_);
+
+    if (const int kv_split = coherent_kv_split_for(metadata, rows, admission,
+            in_features_, out_features_, accumulation_capacity_bytes_)) {
+        if (metadata.K == 6)
+            launch_coherent_packed_partials<6>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split);
+        else if (metadata.K == 7)
+            launch_coherent_packed_partials<7>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split);
+        else
+            launch_coherent_packed_partials<8>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split);
+        cuda_check(cudaGetLastError(), "launch coherent K/V partials");
+        launch_prefill_reduce_output<false>(stream, accum_, weights.svh, output, rows,
+            out_features_, kv_split);
+        cuda_check(cudaGetLastError(), "launch coherent K/V reduction/output");
+        return;
+    }
 
     if (coherent_down_k6_candidate(metadata, rows, admission)) {
         constexpr int output_blocks = 5120 / 128;
