@@ -5423,10 +5423,18 @@ void fast_wmma_attention_fixture(bool rows32,const std::uint16_t* q,
 constexpr int kRegAttnStride=kHeadDim+8;
 constexpr int kRegAttnPStride=32+8;
 
-template<int Heads>
+template<int Heads,bool QGlobal=false>
 constexpr std::size_t reg_attn_shared_bytes() {
-    return (static_cast<std::size_t>(Heads)*32*kRegAttnStride+
+    return ((QGlobal?0:static_cast<std::size_t>(Heads)*32*kRegAttnStride)+
             2*32*kRegAttnStride+2*Heads*16*kRegAttnPStride)*sizeof(half);
+}
+
+bool wmma32_register_q_global() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_WMMA32_REGISTER_Q_GLOBAL");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
 }
 
 __device__ __forceinline__ void reg_attn_ldmatrix_x4(unsigned (&r)[4],const half* p) {
@@ -5457,7 +5465,10 @@ __device__ __forceinline__ unsigned reg_attn_pack(half low,half high) {
 // SplitBlockM names the reference row block whose frontier defines the split
 // boundaries and capacity check (32 for WMMA32, 64 for the M64 twin). Extra
 // fully masked tiles are exact no-ops for rows of the smaller block.
-template<int SplitCount,int Heads,int SplitBlockM=32>
+// QGlobal reads the identical m16n8k16 A fragments of Q straight from global
+// memory (zero for rows beyond the live block) instead of staging Q in shared
+// memory, halving the CTA footprint so two CTAs fit per SM.
+template<int SplitCount,int Heads,int SplitBlockM=32,bool QGlobal=false>
 __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_prefill_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,std::uint16_t* output,int rows,
@@ -5471,7 +5482,7 @@ __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_pr
     static_assert(SplitCount==1 || SplitCount==2 || SplitCount==4);
     extern __shared__ __align__(16) unsigned char reg_attn_shared[];
     half* q_s=reinterpret_cast<half*>(reg_attn_shared);
-    half* k_s=q_s+Heads*BlockM*kRegAttnStride;
+    half* k_s=q_s+(QGlobal?0:Heads*BlockM*kRegAttnStride);
     half* v_s=k_s+BlockN*kRegAttnStride;
     half* p_s=v_s+BlockN*kRegAttnStride;
 
@@ -5497,6 +5508,7 @@ __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_pr
     const int first_end=SplitCount==1?maximum_count:
         min((split+1)*segment_tiles*BlockN,split_count);
 
+    if constexpr(!QGlobal)
     for(int index=tid;index<Heads*BlockM*kVectors;index+=blockDim.x) {
         const int head=index/(BlockM*kVectors);
         const int rem=index%(BlockM*kVectors);
@@ -5516,7 +5528,15 @@ __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_pr
     const int t=lane&3;
     const int row0=m_base+g;
     const int row1=row0+8;
-    const half* q_warp=q_s+(head_local*BlockM+m_base)*kRegAttnStride;
+    const half* q_warp=q_s+(QGlobal?0:(head_local*BlockM+m_base)*kRegAttnStride);
+    const bool q_row0_live=row0<active_rows;
+    const bool q_row1_live=row1<active_rows;
+    const auto* q_global0=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(query_base+(q_row0_live?row0:0))*kQHeads+
+            q_head_base+head_local)*kHeadDim+2*t);
+    const auto* q_global1=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(query_base+(q_row1_live?row1:0))*kQHeads+
+            q_head_base+head_local)*kHeadDim+2*t);
     half* p_warp=p_s+warp*16*kRegAttnPStride;
     float acc[kHeadDim/8][4];
     #pragma unroll
@@ -5549,6 +5569,12 @@ __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_pr
         #pragma unroll
         for(int kk=0;kk<kHeadDim;kk+=16) {
             unsigned a[4];
+            if constexpr(QGlobal) {
+                a[0]=q_row0_live?q_global0[kk/2]:0u;
+                a[1]=q_row1_live?q_global1[kk/2]:0u;
+                a[2]=q_row0_live?q_global0[kk/2+4]:0u;
+                a[3]=q_row1_live?q_global1[kk/2+4]:0u;
+            } else
             reg_attn_ldmatrix_x4(a,q_warp+(lane&15)*kRegAttnStride+kk+(lane>>4)*8);
             #pragma unroll
             for(int pair=0;pair<2;++pair) {
@@ -5676,24 +5702,39 @@ __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_pr
     }
 }
 
-template<int SplitCount,int Heads,int SplitBlockM=32>
-void launch_wmma32_register_prefill(const std::uint16_t* q,const std::uint16_t* k,
+template<int SplitCount,int Heads,int SplitBlockM=32,bool QGlobal=false>
+void launch_wmma32_register_prefill_variant(const std::uint16_t* q,const std::uint16_t* k,
     const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
     const int* position_device,int query_offset,float* split_output,float* split_stats,
     cudaStream_t stream) {
-    constexpr std::size_t bytes=reg_attn_shared_bytes<Heads>();
+    constexpr std::size_t bytes=reg_attn_shared_bytes<Heads,QGlobal>();
     static const bool configured=[] {
         cuda_check(cudaFuncSetAttribute(
-            attention_gqa_six_wmma32_register_prefill_kernel<SplitCount,Heads,SplitBlockM>,
+            attention_gqa_six_wmma32_register_prefill_kernel<SplitCount,Heads,SplitBlockM,QGlobal>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
             "configure register WMMA32 prefill shared memory");
         return true;
     }();
     (void)configured;
-    attention_gqa_six_wmma32_register_prefill_kernel<SplitCount,Heads,SplitBlockM><<<
+    attention_gqa_six_wmma32_register_prefill_kernel<SplitCount,Heads,SplitBlockM,QGlobal><<<
         dim3((rows+31)/32,kKVHeads,(kQHeads/kKVHeads/Heads)*SplitCount),64*Heads,
         bytes,stream>>>(q,k,v,output,rows,position,capacity,position_device,
             query_offset,split_output,split_stats);
+}
+
+template<int SplitCount,int Heads,int SplitBlockM=32>
+void launch_wmma32_register_prefill(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    const int* position_device,int query_offset,float* split_output,float* split_stats,
+    cudaStream_t stream) {
+    if(wmma32_register_q_global())
+        launch_wmma32_register_prefill_variant<SplitCount,Heads,SplitBlockM,true>(q,k,v,
+            output,rows,position,capacity,position_device,query_offset,split_output,
+            split_stats,stream);
+    else
+        launch_wmma32_register_prefill_variant<SplitCount,Heads,SplitBlockM,false>(q,k,v,
+            output,rows,position,capacity,position_device,query_offset,split_output,
+            split_stats,stream);
 }
 
 int wmma32_register_heads() {
