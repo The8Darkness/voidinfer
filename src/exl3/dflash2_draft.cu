@@ -1181,6 +1181,132 @@ __global__ void dflash_attention_ring_parallel_kernel(const std::uint16_t* q,
     out[q_idx * kHeadDim + t] = float_to_half(acc / denominator);
 }
 
+// Staged ring attention: identical per-key dot, max, exp, denominator and
+// chronological V accumulation as dflash_attention_ring_parallel_kernel, but K
+// rows arrive through a coalesced shared tile, the max uses an exact
+// order-free reduction, and V loads are issued eight keys ahead.
+constexpr int kRingStageKeys=128;
+constexpr int kRingStageDims=32;
+
+__device__ __forceinline__ const std::uint16_t* dflash_ring_key_row(
+    const std::uint16_t* ring, const std::uint16_t* blk, int ring_start_slot,
+    int ctx_start, int context, int key, int kv_head) {
+    constexpr int kv_row = kKVHeads * kHeadDim;
+    return key < context ?
+        ring + static_cast<std::size_t>((ring_start_slot + ctx_start + key) & kRingMask) *
+            kv_row + kv_head * kHeadDim :
+        blk + (key - context) * kv_row + kv_head * kHeadDim;
+}
+
+__global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
+    const std::uint16_t* q, const std::uint16_t* ring_k, const std::uint16_t* ring_v,
+    int ring_start_slot, int ctx_keys, const std::uint16_t* k_blk,
+    const std::uint16_t* v_blk, std::uint16_t* out, int queries, int block_keys,
+    float scale) {
+    const int q_idx = static_cast<int>(blockIdx.x);
+    const int query = q_idx / kQHeads;
+    const int head = q_idx % kQHeads;
+    if (query >= queries) return;
+    const int t = static_cast<int>(threadIdx.x);
+    const int kv_head = head / (kQHeads / kKVHeads);
+    const auto* q_row = q + q_idx * kHeadDim;
+    __shared__ __align__(16) float query_values[kHeadDim];
+    __shared__ __align__(16) float scores[kRingKeep + kBlockCap + 8];
+    __shared__ __half2 key_tile[kRingStageKeys][kRingStageDims / 2 + 1];
+    __shared__ float warp_max[kHeadDim / 32];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    query_values[t] = half_to_float(q_row[t]);
+    int ctx_start = ctx_keys + query - (kRingCap - 1);
+    if (ctx_start < 0) ctx_start = 0;
+    const int context = ctx_keys - ctx_start;
+    const int keys = context + block_keys;
+    __syncthreads();
+    constexpr int kParts = kRingStageDims / 8;
+    for (int first = 0; first < keys; first += kRingStageKeys) {
+        const int extent = min(kRingStageKeys, keys - first);
+        float dot = 0.0f;
+        for (int c = 0; c < kHeadDim; c += kRingStageDims) {
+            for (int w = t; w < extent * kParts; w += kHeadDim) {
+                const int local = w / kParts, part = w % kParts;
+                const uint4 packed = *reinterpret_cast<const uint4*>(dflash_ring_key_row(
+                    ring_k, k_blk, ring_start_slot, ctx_start, context, first + local,
+                    kv_head) + c + part * 8);
+                key_tile[local][part * 4 + 0] = *reinterpret_cast<const __half2*>(&packed.x);
+                key_tile[local][part * 4 + 1] = *reinterpret_cast<const __half2*>(&packed.y);
+                key_tile[local][part * 4 + 2] = *reinterpret_cast<const __half2*>(&packed.z);
+                key_tile[local][part * 4 + 3] = *reinterpret_cast<const __half2*>(&packed.w);
+            }
+            __syncthreads();
+            if (t < extent) {
+                #pragma unroll
+                for (int word = 0; word < kRingStageDims / 2; word += 2) {
+                    const int d = c + 2 * word;
+                    const float2 low = __half22float2(key_tile[t][word]);
+                    const float2 high = __half22float2(key_tile[t][word + 1]);
+                    const float4 q4 = *reinterpret_cast<const float4*>(&query_values[d]);
+                    dot += q4.x * low.x;
+                    dot += q4.y * low.y;
+                    dot += q4.z * high.x;
+                    dot += q4.w * high.y;
+                }
+            }
+            __syncthreads();
+        }
+        if (t < extent) scores[first + t] = dot;
+    }
+    __syncthreads();
+    // fmaxf is exact and order-free for non-NaN values, and any mix of signed
+    // zeros yields identical exp(score*scale - max) values below.
+    float local_max = -3.402823466e+38F;
+    for (int key = t; key < keys; key += kHeadDim)
+        local_max = fmaxf(local_max, scores[key] * scale);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
+    if ((t & 31) == 0) warp_max[t >> 5] = local_max;
+    __syncthreads();
+    if (t == 0) {
+        float m = warp_max[0];
+        #pragma unroll
+        for (int w = 1; w < kHeadDim / 32; ++w) m = fmaxf(m, warp_max[w]);
+        maximum = m;
+    }
+    __syncthreads();
+    for (int key = t; key < keys; key += kHeadDim)
+        scores[key] = expf(scores[key] * scale - maximum);
+    __syncthreads();
+    if (t == 0) {
+        float sum = 0.0f;
+        for (int key = 0; key < keys; ++key) sum += scores[key];
+        denominator = sum;
+    }
+    float acc = 0.0f;
+    int key = 0;
+    for (; key + 8 <= keys; key += 8) {
+        float values[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            values[j] = half_to_float(dflash_ring_key_row(ring_v, v_blk, ring_start_slot,
+                ctx_start, context, key + j, kv_head)[t]);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) acc += scores[key + j] * values[j];
+    }
+    for (; key < keys; ++key)
+        acc += scores[key] * half_to_float(dflash_ring_key_row(ring_v, v_blk,
+            ring_start_slot, ctx_start, context, key, kv_head)[t]);
+    __syncthreads();
+    out[q_idx * kHeadDim + t] = float_to_half(acc / denominator);
+}
+
+bool dflash_ring_staged_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_RING_STAGED");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 // E5A3: per-slot FNV-1a digest of ring K/V bytes, XOR-folded on host by ring_digest().
 // One thread per slot; slot order is preserved by the host fold via slot labels.
 __global__ void dflash_ring_digest_kernel(const std::uint16_t* ring_k,
@@ -1587,7 +1713,10 @@ void dflash2_ring_attention_for_test(const std::uint16_t* q,
     if (queries == 0) return;
     require(q && k && v && out && (count == 0 || (ring_k && ring_v)),
             "ring attention test null buffers");
-    if (parallel)
+    if (parallel && dflash_ring_staged_enabled())
+        dflash_attention_ring_staged_kernel<<<queries * kQHeads, kHeadDim, 0, stream>>>(
+            q, ring_k, ring_v, start, count, k, v, out, queries, block, scale);
+    else if (parallel)
         dflash_attention_ring_parallel_kernel<<<queries * kQHeads, kHeadDim, 0, stream>>>(
             q, ring_k, ring_v, start, count, k, v, out, queries, block, scale);
     else
@@ -4513,7 +4642,11 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             const int ring_start = shared_segment_enabled?shared_segment.ring_start_slot():
                 static_cast<int>(m.ring_base_abs & kRingMask);
             const int private_ring_count=shared_segment_enabled?shared_segment.ring_count:m.ring_count;
-            if (m.parallel_ring_attention)
+            if (m.parallel_ring_attention && dflash_ring_staged_enabled())
+                dflash_attention_ring_staged_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
+                    m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
+                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
+            else if (m.parallel_ring_attention)
                 dflash_attention_ring_parallel_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
                     private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
