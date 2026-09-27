@@ -1511,6 +1511,29 @@ __device__ __forceinline__ void exl3_dq4_k7_window(
                                                    w3 * mul1_multiplier);
 }
 
+// K5 four-state window for any t_offset in [0,256): 31 bits always fit the
+// two represented words i0, i0+1 (mod 40), so the modulo-40 indexing of
+// decode4_generic reduces to one conditional subtraction. Same states and
+// MUL1 arithmetic, bitwise identical.
+__device__ __forceinline__ void exl3_dq4_k5_window(
+    const std::uint32_t* packed, int t_offset, Exl3FragB& fragment,
+    std::uint32_t mul1_multiplier) {
+    const int b0 = t_offset * 5 + 1269;
+    int i0 = b0 >> 5;
+    if (i0 >= 40) i0 -= 40;
+    const int i1 = i0 == 39 ? 0 : i0 + 1;
+    const int rel = b0 & 31;
+    const std::uint64_t ab = (static_cast<std::uint64_t>(packed[i0]) << 32) | packed[i1];
+    const std::uint32_t w0 = static_cast<std::uint32_t>(ab >> (48 - rel)) & 0xffffu;
+    const std::uint32_t w1 = static_cast<std::uint32_t>(ab >> (43 - rel)) & 0xffffu;
+    const std::uint32_t w2 = static_cast<std::uint32_t>(ab >> (38 - rel)) & 0xffffu;
+    const std::uint32_t w3 = static_cast<std::uint32_t>(ab >> (33 - rel)) & 0xffffu;
+    fragment.values[0] = decode_mul1_product_2(w0 * mul1_multiplier,
+                                                w1 * mul1_multiplier);
+    fragment.values[1] = decode_mul1_product_2(w2 * mul1_multiplier,
+                                                w3 * mul1_multiplier);
+}
+
 template <int Bits, bool K7ThreeWord = false>
 __device__ __forceinline__ void exl3_dq4_generic(const std::uint32_t* packed,
                                                   int t_offset,
@@ -1519,6 +1542,10 @@ __device__ __forceinline__ void exl3_dq4_generic(const std::uint32_t* packed,
 #ifndef NINFER_EXL3_K7_DIVERGENT_DECODE
     if constexpr (Bits == 7 && K7ThreeWord) {
         exl3_dq4_k7_window(packed, t_offset, fragment, mul1_multiplier);
+        return;
+    }
+    if constexpr (Bits == 5) {
+        exl3_dq4_k5_window(packed, t_offset, fragment, mul1_multiplier);
         return;
     }
 #endif
