@@ -312,6 +312,110 @@ __global__ void gdn_conv_f16_decode_fused_kernel(
     }
 }
 
+// Tiled prefill twin of transpose_f16_to_bf16 + gdn_conv_kernel + pack_qkv.
+// The depthwise convolution has no recurrence beyond its three-row window, so
+// each (row, channel) output reads its represented BF16 window directly: the
+// saved state for rows before zero, otherwise the F16->BF16 input. The
+// accumulation expression, SiLU and BF16 rounding are those of gdn_conv_kernel;
+// conv_input keeps its channel-major BF16 contents for retained-prefix repair.
+// The four-slot state (and optional trace) is written by a second kernel after
+// every tile has read the old state.
+constexpr int kConvTileRows=64;
+constexpr int kConvTileChannels=64;
+
+bool gdn_conv_prefill_tiled_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_CONV_TILED");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+__global__ void __launch_bounds__(256) gdn_conv_prefill_tiled_kernel(
+    const std::uint16_t* input_f16,const std::uint16_t* weight,const std::uint16_t* state,
+    std::uint16_t* conv_input_bf16,std::uint16_t* q,std::uint16_t* k,std::uint16_t* v,
+    std::uint16_t* packed_bf16,int rows) {
+    __shared__ float window[kConvTileRows+3][kConvTileChannels+1];
+    const int c0=static_cast<int>(blockIdx.x)*kConvTileChannels;
+    const int r0=static_cast<int>(blockIdx.y)*kConvTileRows;
+    const int tid=static_cast<int>(threadIdx.x);
+    const int lane_channel=tid%kConvTileChannels;
+    const int group=tid/kConvTileChannels;
+    constexpr int kGroups=256/kConvTileChannels;
+    const int channel=c0+lane_channel;
+    for(int local=group;local<kConvTileRows+3;local+=kGroups) {
+        const int row=r0-3+local;
+        float value=0.0f;
+        if(row>=0) {
+            if(row<rows)
+                value=__bfloat162float(__float2bfloat16_rn(
+                    half_value(input_f16[row*kQkv+channel])));
+        } else {
+            value=bf16_value(state[channel*kConvStorage+4+row]);
+        }
+        window[local][lane_channel]=value;
+    }
+    __syncthreads();
+    const auto* w=reinterpret_cast<const __nv_bfloat16*>(weight);
+    const float w0=__bfloat162float(w[channel*4+0]);
+    const float w1=__bfloat162float(w[channel*4+1]);
+    const float w2=__bfloat162float(w[channel*4+2]);
+    const float w3=__bfloat162float(w[channel*4+3]);
+    auto* q_out=reinterpret_cast<__nv_bfloat16*>(q);
+    auto* k_out=reinterpret_cast<__nv_bfloat16*>(k);
+    auto* v_out=reinterpret_cast<__nv_bfloat16*>(v);
+    auto* packed=reinterpret_cast<__nv_bfloat16*>(packed_bf16);
+    for(int local=group;local<kConvTileRows;local+=kGroups) {
+        const int row=r0+local;
+        if(row>=rows) break;
+        const float s1=window[local][lane_channel];
+        const float s2=window[local+1][lane_channel];
+        const float s3=window[local+2][lane_channel];
+        const float x0=window[local+3][lane_channel];
+        const float acc = w0 * s1 +
+                          w1 * s2 +
+                          w2 * s3 +
+                          w3 * x0;
+        const __nv_bfloat16 y=__float2bfloat16_rn(silu_f32(acc));
+        if(channel<2048) q_out[row*2048+channel]=y;
+        else if(channel<4096) k_out[row*2048+(channel-2048)]=y;
+        else v_out[row*6144+(channel-4096)]=y;
+        packed[row*kQkv+channel]=y;
+    }
+    auto* conv_input=reinterpret_cast<__nv_bfloat16*>(conv_input_bf16);
+    const int row=r0+lane_channel;
+    if(row<rows) {
+        for(int local_channel=group;local_channel<kConvTileChannels;local_channel+=kGroups)
+            conv_input[static_cast<std::size_t>(c0+local_channel)*rows+row]=
+                __float2bfloat16_rn(window[lane_channel+3][local_channel]);
+    }
+}
+
+template<bool Trace>
+__global__ void gdn_conv_prefill_state_kernel(const std::uint16_t* input_f16,
+    std::uint16_t* state,int rows,std::uint16_t* state_trace) {
+    const int channel=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(channel>=kQkv) return;
+    float history[4];
+    #pragma unroll
+    for(int slot=0;slot<4;++slot) {
+        const int row=rows-4+slot;
+        history[slot]=row>=0?
+            __bfloat162float(__float2bfloat16_rn(half_value(input_f16[row*kQkv+channel]))):
+            bf16_value(state[channel*kConvStorage+4+row]);
+    }
+    auto* state_out=reinterpret_cast<__nv_bfloat16*>(state);
+    #pragma unroll
+    for(int slot=0;slot<4;++slot)
+        state_out[channel*kConvStorage+slot]=__float2bfloat16_rn(history[slot]);
+    if constexpr(Trace) {
+        auto* trace=reinterpret_cast<__nv_bfloat16*>(state_trace);
+        #pragma unroll
+        for(int slot=0;slot<3;++slot)
+            trace[channel*3+slot]=__float2bfloat16_rn(history[slot]);
+    }
+}
+
 // Select specialized leaves on the host: all-off convolution has no trace
 // branch or candidate stores, matching the inherited operation sequence.
 void launch_gopt_conv(bool trace,bool decode,const std::uint16_t* input,
@@ -2357,6 +2461,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     const bool fast_same_weights_fp16kv_gdn_decode_conv =
         fast_same_weights_fp16kv_gdn_decode_conv_ && rows >= 1 && rows <= 8 &&
         !wide_prefill;
+    bool conv_tiled_packed=false;
     if (fast_same_weights_fp16kv_gdn_decode_conv) {
         launch_gopt_conv(gaming_[Gopt::GdnConvTrace],true,qkv,weights_.conv_weight,
             conv_state_,conv_input,q,k,v,conv_output,conv_state_trace_,rows,stream);
@@ -2365,6 +2470,20 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
         }
         ++fast_same_weights_fp16kv_gdn_decode_conv_calls_;
+    } else if (rows>=kConvTileRows && gdn_conv_prefill_tiled_enabled()) {
+        gdn_conv_prefill_tiled_kernel<<<dim3(kQkv/kConvTileChannels,
+            (rows+kConvTileRows-1)/kConvTileRows),256,0,stream>>>(
+            qkv,weights_.conv_weight,conv_state_,conv_input,q,k,v,conv_output,rows);
+        if(gaming_[Gopt::GdnConvTrace]) {
+            gdn_conv_prefill_state_kernel<true><<<(kQkv+255)/256,256,0,stream>>>(
+                qkv,conv_state_,rows,conv_state_trace_);
+            check(cudaGetLastError(),"launch GOPT tiled conv trace");
+            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
+        } else {
+            gdn_conv_prefill_state_kernel<false><<<(kQkv+255)/256,256,0,stream>>>(
+                qkv,conv_state_,rows,nullptr);
+        }
+        conv_tiled_packed=true;
     } else {
         transpose_f16_to_bf16_kernel<<<(rows * kQkv + 255) / 256, 256, 0, stream>>>(qkv, conv_input, rows, kQkv);
         launch_gopt_conv(gaming_[Gopt::GdnConvTrace],false,qkv,weights_.conv_weight,
@@ -2376,7 +2495,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     }
     if(!gaming_[Gopt::GdnConvTrace])
         copy_conv_state_trace_kernel<<<(kConvStateElements + 255) / 256, 256, 0, stream>>>(conv_state_, conv_state_trace_);
-    if (!fast_same_weights_fp16kv_gdn_decode_conv)
+    if (!fast_same_weights_fp16kv_gdn_decode_conv && !conv_tiled_packed)
         pack_qkv_bf16_kernel<<<(rows * kQkv + 255) / 256, 256, 0, stream>>>(q, k, v, conv_output, rows);
     convert_f16_to_bf16_kernel<<<(rows * kZ + 255) / 256, 256, 0, stream>>>(z, z_bf16, rows * kZ);
     check(cudaGetLastError(), "launch GDN convolution staging"); end(4);
