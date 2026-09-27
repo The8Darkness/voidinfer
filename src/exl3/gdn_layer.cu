@@ -1162,6 +1162,14 @@ bool gdn_control_tiled_enabled() {
     return enabled;
 }
 
+bool gdn_control_decode_tiled_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_CONTROL_DECODE_TILED");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
 template<int R,int H>
 __global__ void __launch_bounds__(128) control_fused_tiled_kernel(
     const std::uint16_t* input,const std::uint16_t* a_weight,const std::uint16_t* b_weight,
@@ -2316,6 +2324,10 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
                 a,b,beta_trace,g_trace,rows);
             gopt_record(gaming_submissions_,Gopt::GdnControlRowPair);
+        } else if(rows>=2 && rows<16 && gdn_control_decode_tiled_enabled()) {
+            control_fused_tiled_kernel<2,2><<<((rows+1)/2)*(kHeads/2),128,0,stream>>>(
+                h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
+                a,b,beta_trace,g_trace,rows);
         } else if(rows>=16 && gdn_control_tiled_enabled()) {
             control_fused_tiled_kernel<4,4><<<((rows+3)/4)*(kHeads/4),128,0,stream>>>(
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
