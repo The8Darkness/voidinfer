@@ -2937,6 +2937,14 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
     }
 }
 
+bool wmma32_vector_loads_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_WMMA32_VECTOR_LOADS");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
 bool fused_flash_staged_k_enabled() {
     static const bool enabled=[] {
         const char* value=std::getenv("NINFER_EXL3_FLASH_STAGED_K");
@@ -3618,7 +3626,9 @@ __global__ void attention_cached_gqa_six_wmma_prefill_kernel(
 // within the physical-C1 limit while reusing each K/V tile across 32 rows. It is
 // construction-latched and default-off: the exact score/value path remains
 // the fallback for every unsupported or disabled configuration.
-template<int TileStride,int SplitCount=1,int BlockM=32>
+// VectorLoads moves the same represented Q/K/V halves into the same shared
+// tiles with independent 16-byte loads instead of a dependent 2-byte loop.
+template<int TileStride,int SplitCount=1,int BlockM=32,bool VectorLoads=false>
 __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,std::uint16_t* output,int rows,
@@ -3653,9 +3663,10 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
 
     // M64 streams Q from its original row-major positions and overlays K/V.
     // That keeps the FP32 online output accumulator within SM120 shared memory.
-    __shared__ half q_tile[HeadsPerBlock][BlockM==64?1:BlockM][TileStride];
-    __shared__ half k_tile[BlockN][TileStride];
-    __shared__ half v_tile[BlockM==64?1:BlockN][TileStride];
+    __shared__ __align__(16) half q_tile[HeadsPerBlock][BlockM==64?1:BlockM][TileStride];
+    __shared__ __align__(16) half k_tile[BlockN][TileStride];
+    __shared__ __align__(16) half v_tile[BlockM==64?1:BlockN][TileStride];
+    static_assert(!VectorLoads || (BlockM==32 && HeadsPerBlock==1 && TileStride%8==0));
     __shared__ float score_tile[HeadsPerBlock][BlockM][BlockN];
     __shared__ half probability_tile[HeadsPerBlock][BlockM][BlockN];
     __shared__ float accumulated[HeadsPerBlock][BlockM][kHeadDim];
@@ -3684,6 +3695,23 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
     __syncthreads();
 
     for(int first=first_begin;first<first_end;first+=BlockN) {
+        if constexpr(VectorLoads) {
+            constexpr int kVectors=kHeadDim/8;
+            for(int index=tid;index<BlockN*kVectors;index+=blockDim.x) {
+                const int key_offset=index/kVectors;
+                const int dim=(index%kVectors)*8;
+                const int key=first+key_offset;
+                uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
+                if(key<first_end && key<capacity) {
+                    const std::size_t offset=(static_cast<std::size_t>(key)*kKVHeads+
+                        kv_head)*kHeadDim+dim;
+                    key_bits=*reinterpret_cast<const uint4*>(k_cache+offset);
+                    value_bits=*reinterpret_cast<const uint4*>(v_cache+offset);
+                }
+                *reinterpret_cast<uint4*>(&k_tile[key_offset][dim])=key_bits;
+                *reinterpret_cast<uint4*>(&v_tile[key_offset][dim])=value_bits;
+            }
+        } else
         for(int index=tid;index<BlockN*kHeadDim;index+=blockDim.x) {
             const int key_offset=index/kHeadDim;
             const int dim=index%kHeadDim;
@@ -6970,8 +6998,27 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                             fast_prefill_wmma64_register_keys64_attention_?64:32);
                 } else if(fast_wmma32_split_count_==4) {
                     if(fast_prefill_wmma32_padded_attention_)
+                    {
+                    if(wmma32_vector_loads_enabled())
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,4,32,true><<<
+                            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
                         attention_cached_gqa_six_wmma32_prefill_kernel<
                             kHeadDim+16,4><<<
+                            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    }
+                    else
+                    {
+                    if(wmma32_vector_loads_enabled())
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,4,32,true><<<
                             dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
                             256,0,stream>>>(qr,attention_k,attention_v,attn,
                             rows,position,cache_capacity_,nullptr,0,
@@ -6983,12 +7030,32 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                             256,0,stream>>>(qr,attention_k,attention_v,attn,
                             rows,position,cache_capacity_,nullptr,0,
                             fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    }
                 } else {
                     if(fast_wmma32_split_count_!=2)
                         throw std::logic_error("WMMA32 split count");
                     if(fast_prefill_wmma32_padded_attention_)
+                    {
+                    if(wmma32_vector_loads_enabled())
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,2,32,true><<<
+                            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
                         attention_cached_gqa_six_wmma32_prefill_kernel<
                             kHeadDim+16,2><<<
+                            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    }
+                    else
+                    {
+                    if(wmma32_vector_loads_enabled())
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,2,32,true><<<
                             dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
                             256,0,stream>>>(qr,attention_k,attention_v,attn,
                             rows,position,cache_capacity_,nullptr,0,
@@ -7000,6 +7067,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                             256,0,stream>>>(qr,attention_k,attention_v,attn,
                             rows,position,cache_capacity_,nullptr,0,
                             fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    }
                 }
                 launch(cudaGetLastError(),"launch WMMA32 split2 partials");
                 if(fast_wmma32_split_count_==4)
@@ -7077,8 +7145,21 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                         fast_prefill_wmma64_shared_heads_attention_?2:1,
                         fast_prefill_wmma64_register_keys64_attention_?64:32);
             } else if (fast_prefill_wmma32_padded_attention_ &&
+                position+rows>=8192 && wmma32_vector_loads_enabled()) {
+                attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,1,32,true><<<
+                    dim3((rows + 31) / 32, kKVHeads,
+                         kQHeads / kKVHeads), 256, 0, stream>>>(
+                    qr, attention_k, attention_v, attn, rows, position,
+                    cache_capacity_, nullptr, 0,nullptr,nullptr);
+            } else if (fast_prefill_wmma32_padded_attention_ &&
                 position+rows>=8192) {
                 attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16><<<
+                    dim3((rows + 31) / 32, kKVHeads,
+                         kQHeads / kKVHeads), 256, 0, stream>>>(
+                    qr, attention_k, attention_v, attn, rows, position,
+                    cache_capacity_, nullptr, 0,nullptr,nullptr);
+            } else if (fast_prefill_wmma32_attention_ && wmma32_vector_loads_enabled()) {
+                attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,1,32,true><<<
                     dim3((rows + 31) / 32, kKVHeads,
                          kQHeads / kKVHeads), 256, 0, stream>>>(
                     qr, attention_k, attention_v, attn, rows, position,
