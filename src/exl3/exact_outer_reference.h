@@ -313,6 +313,20 @@ inline bool exl3_outer_device_seed_matches(
         ready_seed->token==proposed_root &&
         ready_seed->token>=0 && ready_seed->token<248320;
 }
+// A rejected round's correction row is deferred to the next round's verifier
+// (row 0) instead of being decoded by a separate M1 pass. Measured default;
+// NINFER_EXL3_FOLD_CORRECTION=0 restores the separate correction pass.
+inline bool exl3_fold_correction_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_FOLD_CORRECTION");
+        if(!value)return true;
+        if(std::string_view(value)=="0")return false;
+        if(std::string_view(value)=="1")return true;
+        throw std::invalid_argument("NINFER_EXL3_FOLD_CORRECTION must be 0 or 1");
+    }();
+    return enabled;
+}
+
 enum class Exl3OuterDeviceSettlement : std::uint8_t {
     Eager,
     DeferTargetCommit,
@@ -400,7 +414,21 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
                 exact.position()-exact.captured_tap_rows(),
                 exact.captured_tap_rows(),repair,correction,stream);
         };
-        if(result.rejected) {
+        if(result.rejected && result.accepted>0 && exl3_fold_correction_enabled()) {
+            // Folded correction: keep only the verified prefix. Retention
+            // restores the last retained row's logits, so the next round's
+            // seed is exactly this correction and its verifier consumes it as
+            // row 0. The correction is published only when consumed.
+            const int accepted=static_cast<int>(result.accepted);
+            exact.retain_transaction_prefix(accepted,stream);
+            ++result.checkpoint_restores;
+            result.checkpoint_reconstructed_rows=accepted;
+            stage_taps(0,accepted,0,true);
+            result.committed_tokens.pop_back();
+            result.stopped=exl3_terminal_token(result.committed_tokens.back(),terminal);
+            if(settlement==Exl3OuterDeviceSettlement::Eager)
+                exact.commit_transaction();
+        } else if(result.rejected) {
             const int accepted=static_cast<int>(result.accepted);
             const auto correction=result.committed_tokens.back();
             if(accepted>0) {
