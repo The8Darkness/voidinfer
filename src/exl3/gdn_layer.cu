@@ -4,6 +4,7 @@
 #include "exl3/linear_workspace_requirements.h"
 #include "exl3/paired_transform_extent.h"
 #include "exl3/residual_norm_extent.h"
+#include "exl3/block_tree_sum.cuh"
 
 #include "core/arena.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -84,8 +85,12 @@ __global__ void rms_norm_f16_kernel(const std::uint16_t* input, const std::uint1
     constexpr int kCached = 10;
     const bool cached = features == kCached * static_cast<int>(blockDim.x);
     float values[kCached];
+    std::uint16_t weight_bits[kCached];
     float sum = 0.0f;
     if (cached) {
+        #pragma unroll
+        for (int j = 0; j < kCached; ++j)
+            weight_bits[j] = weight[lane + j * static_cast<int>(blockDim.x)];
         // Same elements, same x*x accumulation order; loads issued together and
         // the represented inputs kept in registers for the output pass.
         std::uint16_t represented[kCached];
@@ -121,6 +126,10 @@ __global__ void rms_norm_f16_kernel(const std::uint16_t* input, const std::uint1
         const float x = half_value(represented);
         sum += x * x;
     }
+    float total;
+    if (blockDim.x == 512) {
+        total = block_tree_sum_exact<512>(sum, shared, lane);
+    } else {
     shared[lane] = sum;
     __syncthreads();
     // Cross-warp strides in shared memory; strides 16..1 are the same pairwise
@@ -136,13 +145,15 @@ __global__ void rms_norm_f16_kernel(const std::uint16_t* input, const std::uint1
         if (lane == 0) shared[0] = value;
     }
     __syncthreads();
-    const float inv = rsqrtf(shared[0] / static_cast<float>(features) + kRmsEps);
+    total = shared[0];
+    }
+    const float inv = rsqrtf(total / static_cast<float>(features) + kRmsEps);
     if (cached) {
         #pragma unroll
         for (int j = 0; j < kCached; ++j) {
             const int i = lane + j * static_cast<int>(blockDim.x);
             const float x = values[j] * inv;
-            const float w = half_value(weight[i]);
+            const float w = half_value(weight_bits[j]);
             output[row * features + i] = __half_as_ushort(__float2half_rn(x * (w + 1.0f)));
         }
         return;

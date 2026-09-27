@@ -2,6 +2,7 @@
 #include "exl3/environment_options.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/linear_workspace_requirements.h"
+#include "exl3/block_tree_sum.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -9,6 +10,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <type_traits>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -87,6 +89,41 @@ __global__ void rms_norm_kernel(const std::uint16_t* input,
     const int lane = static_cast<int>(threadIdx.x);
     if (row >= rows || lane >= features) return;
     extern __shared__ float shared[];
+    // Decode-shaped rows (5120 over 512 threads, 256-wide heads over 256):
+    // loads issued together and kept in registers; the per-thread x*x order
+    // and the pairwise tree are unchanged (block_tree_sum_exact).
+    const auto cached = [&](auto width, auto count) {
+        constexpr int B = decltype(width)::value, C = decltype(count)::value;
+        std::uint16_t x_bits[C], w_bits[C];
+        #pragma unroll
+        for (int j = 0; j < C; ++j) {
+            x_bits[j] = input[row * features + lane + j * B];
+            w_bits[j] = weight[lane + j * B];
+        }
+        float partial = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < C; ++j) {
+            const float value = __half2float(__ushort_as_half(x_bits[j]));
+            partial += value * value;
+        }
+        const float inv = rsqrtf(block_tree_sum_exact<B>(partial, shared, lane) /
+                                 static_cast<float>(features) + kRmsEps);
+        #pragma unroll
+        for (int j = 0; j < C; ++j) {
+            const float x = __half2float(__ushort_as_half(x_bits[j])) * inv;
+            const float w = __half2float(__ushort_as_half(w_bits[j]));
+            output[row * features + lane + j * B] =
+                __half_as_ushort(__float2half_rn(x * (w + 1.0f)));
+        }
+    };
+    if (blockDim.x == 512 && features == 5120) {
+        cached(std::integral_constant<int, 512>{}, std::integral_constant<int, 10>{});
+        return;
+    }
+    if (blockDim.x == 256 && features == 256) {
+        cached(std::integral_constant<int, 256>{}, std::integral_constant<int, 1>{});
+        return;
+    }
     float sum = 0.0f;
     for (int i = lane; i < features; i += blockDim.x) {
         const float value = __half2float(__ushort_as_half(input[row * features + i]));
