@@ -9022,13 +9022,13 @@ std::size_t Exl3CudaLinearWorkspace::coherent_wide_k6_shared_bytes_for_test() no
     return kCoherentWideK6SharedBytes;
 }
 
-// NINFER_EXL3_COHERENT_ANY_K=1 also admits K5 and K7 weights to the coherent
+// NINFER_EXL3_COHERENT_ANY_K (default 1; quality-gated) also admits K5 and K7 weights to the coherent
 // wide and down producers (numerics policy: split-plane FP32 accumulation).
 static bool coherent_any_k_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_EXL3_COHERENT_ANY_K");
-        if (!value || std::strcmp(value, "0") == 0) return false;
-        if (std::strcmp(value, "1") == 0) return true;
+        if (!value || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
         throw std::invalid_argument("NINFER_EXL3_COHERENT_ANY_K must be 0 or 1");
     }();
     return enabled;
@@ -10118,13 +10118,13 @@ static void launch_coherent_packed_partials(
     throw std::logic_error("unsupported coherent packed producer variant");
 }
 
-// NINFER_EXL3_COHERENT_KV_SPLIT=S (unset/0 = off): the narrow 5120->1024
+// NINFER_EXL3_COHERENT_KV_SPLIT=S (default 20, quality-gated; 0 = generic GEMV): the narrow 5120->1024
 // K/V projections (K6..K8) run as the coherent split-plane producer with S
 // K partitions instead of the 160-CTA generic GEMV. Numerics-policy candidate.
 static int coherent_kv_split_setting() {
     static const int split = [] {
         const char* value = std::getenv("NINFER_EXL3_COHERENT_KV_SPLIT");
-        const int parsed = value ? std::atoi(value) : 0;
+        const int parsed = value ? std::atoi(value) : 20;
         if (parsed < 0 || parsed > 80)
             throw std::invalid_argument("NINFER_EXL3_COHERENT_KV_SPLIT must be 0..80");
         return parsed;
