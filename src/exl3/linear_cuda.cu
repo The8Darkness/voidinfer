@@ -6255,7 +6255,9 @@ void Exl3CudaReconstructGemmWorkspace::end_layer_reuse() noexcept {
 bool Exl3CudaReconstructGemmWorkspace::prefetch_numeric_weight(
     const Exl3CudaLinearWeights& weights,
     const Exl3CudaLinearMetadata& metadata,int rows,cudaStream_t stream) {
+    // The FP16 prefetch slot format is not the MXFP8 slot format.
     if (!impl_ || !impl_->reuse_active || !impl_->k5_scope_enabled ||
+        impl_->mxfp8_enabled ||
         metadata.K!=5 || rows<1024 || !supports(metadata,rows) ||
         !weights.trellis || !weights.mul1 || !weights.suh || !weights.svh)
         return false;
@@ -6344,7 +6346,8 @@ bool Exl3CudaReconstructGemmWorkspace::supports(
             metadata.in_features % kHadamard == 0 &&
             metadata.out_features % kHadamard == 0;
         const bool k5_layer=metadata.K==5 &&
-            impl_->k5_scope_enabled && impl_->reuse_active && rows>=256;
+            (impl_->k5_scope_enabled || impl_->mxfp8_enabled) &&
+            impl_->reuse_active && rows>=256;
         return bounded_shape && (metadata.K == 6 || metadata.K == 7 || k5_layer) &&
             metadata.mul1 && !metadata.mcg && !metadata.has_bias;
     }
@@ -6895,7 +6898,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     // block scales; FP16 reconstruction goes through the scratch plane first.
     // Without a resident slot the call keeps the FP16 route.
     const bool mxfp8 = impl_->mxfp8_enabled && fast_fp16_destination &&
-        !fused_original && metadata.K != 5 && rows >= 16 &&
+        !fused_original && rows >= 16 &&
         metadata.in_features % 128 == 0 && metadata.out_features % 128 == 0 &&
         reconstructed != impl_->reconstructed;
     std::uint8_t* const mx_weight =
