@@ -1283,14 +1283,15 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
     }
     float acc = 0.0f;
     int key = 0;
-    for (; key + 8 <= keys; key += 8) {
-        float values[8];
+    constexpr int kRingVBatch = 32;
+    for (; key + kRingVBatch <= keys; key += kRingVBatch) {
+        float values[kRingVBatch];
         #pragma unroll
-        for (int j = 0; j < 8; ++j)
+        for (int j = 0; j < kRingVBatch; ++j)
             values[j] = half_to_float(dflash_ring_key_row(ring_v, v_blk, ring_start_slot,
                 ctx_start, context, key + j, kv_head)[t]);
         #pragma unroll
-        for (int j = 0; j < 8; ++j) acc += scores[key + j] * values[j];
+        for (int j = 0; j < kRingVBatch; ++j) acc += scores[key + j] * values[j];
     }
     for (; key < keys; ++key)
         acc += scores[key] * half_to_float(dflash_ring_key_row(ring_v, v_blk,
