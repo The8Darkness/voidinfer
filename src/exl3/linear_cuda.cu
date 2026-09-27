@@ -2238,7 +2238,7 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool RegisterPipeline = false, bool GlobalSlices = false,
            int DeepStages = 0, int Warps = 8, int TilesPerStage = 1,
            bool TailReduce = false>
-__device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(const std::uint16_t* transformed,
+__global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
                                                  float* accum,
@@ -2246,9 +2246,9 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(const std::uint16_
                                                  int input_features,
                                                  int output_features,
                                                  int split_count,
-                                                 const std::uint16_t* tail_svh,
-                                                 std::uint16_t* tail_output,
-                                                 unsigned* tail_counters) {
+                                                 const std::uint16_t* tail_svh = nullptr,
+                                                 std::uint16_t* tail_output = nullptr,
+                                                 unsigned* tail_counters = nullptr) {
     // Deep async-A stages may stream the constant packed weights of their
     // preload groups before the dependency wait; everything else waits first.
     constexpr bool kEarlyWeights = DeepStages > 0 && AsyncA && !RegisterPipeline;
@@ -2730,49 +2730,6 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(const std::uint16_
         }
       }
     }
-}
-
-template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
-           bool AsyncA = false, bool PartialOnly = false,
-           bool K7ThreeWord = false, bool PredecodedB = false,
-           bool FastK6Decode = false, bool Fp16Accumulate = false,
-           bool RegisterPipeline = false, bool GlobalSlices = false,
-           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1>
-__global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
-                                                 const std::uint16_t* trellis,
-                                                 const std::int32_t* mul1,
-                                                 float* accum,
-                                                 int rows,
-                                                 int input_features,
-                                                 int output_features,
-                                                 int split_count) {
-    exl3_gemm_m1_generic_mma_body<Bits, SingleSplit, OutputTilesPerBlock, AsyncA, PartialOnly, K7ThreeWord, PredecodedB, FastK6Decode, Fp16Accumulate, RegisterPipeline, GlobalSlices, DeepStages, Warps, TilesPerStage, false>(
-        transformed, trellis, mul1, accum, rows, input_features, output_features,
-        split_count, nullptr, nullptr, nullptr);
-}
-
-// Coherent split producer whose last CTA per Hadamard group also performs the
-// exact reduction/output transform (see TailReduce in the body).
-template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
-           bool AsyncA = false, bool PartialOnly = false,
-           bool K7ThreeWord = false, bool PredecodedB = false,
-           bool FastK6Decode = false, bool Fp16Accumulate = false,
-           bool RegisterPipeline = false, bool GlobalSlices = false,
-           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1>
-__global__ void exl3_gemm_m1_generic_mma_tail_kernel(const std::uint16_t* transformed,
-                                                      const std::uint16_t* trellis,
-                                                      const std::int32_t* mul1,
-                                                      float* accum,
-                                                      int rows,
-                                                      int input_features,
-                                                      int output_features,
-                                                      int split_count,
-                                                      const std::uint16_t* tail_svh,
-                                                      std::uint16_t* tail_output,
-                                                      unsigned* tail_counters) {
-    exl3_gemm_m1_generic_mma_body<Bits, SingleSplit, OutputTilesPerBlock, AsyncA, PartialOnly, K7ThreeWord, PredecodedB, FastK6Decode, Fp16Accumulate, RegisterPipeline, GlobalSlices, DeepStages, Warps, TilesPerStage, true>(
-        transformed, trellis, mul1, accum, rows, input_features, output_features,
-        split_count, tail_svh, tail_output, tail_counters);
 }
 
 // One CTA owns a complete 128-column Hadamard group for up to eight rows.
@@ -10117,16 +10074,16 @@ static void launch_coherent_packed_variant(
             if (shared > 48u * 1024u) {
                 static const bool configured = [shared] {
                     cuda_check(cudaFuncSetAttribute(
-                        exl3_gemm_m1_generic_mma_tail_kernel<Bits, false, tiles, true, true, Bits == 7,
-                            false, Bits == 6, false, false, false, Stages, Warps, Per>,
+                        exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
+                            false, Bits == 6, false, false, false, Stages, Warps, Per, true>,
                         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)),
                         "set deep coherent tail shared memory");
                     return true;
                 }();
                 (void)configured;
             }
-            exl3_launch_pdl(exl3_gemm_m1_generic_mma_tail_kernel<Bits, false, tiles, true, true, Bits == 7,
-                false, Bits == 6, false, false, false, Stages, Warps, Per>,
+            exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
+                false, Bits == 6, false, false, false, Stages, Warps, Per, true>,
                 dim3(grid), dim3(Warps * 32), shared, stream,
                     transformed, trellis, mul1, accum, rows, input_features,
                     output_features, split_count, tail_svh, tail_output, tail_counters);
@@ -10138,14 +10095,18 @@ static void launch_coherent_packed_variant(
             false, Bits == 6, false, false, false, Stages, Warps, Per>,
             dim3(grid), dim3(Warps * 32), shared, stream,
                 transformed, trellis, mul1, accum, rows, input_features,
-                output_features, split_count);
+                output_features, split_count,
+                static_cast<const std::uint16_t*>(nullptr),
+                static_cast<std::uint16_t*>(nullptr), static_cast<unsigned*>(nullptr));
         return;
     }
     exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
         false, false, false, false, false, Stages, Warps, Per>,
         dim3(grid), dim3(Warps * 32), shared, stream,
             transformed, trellis, mul1, accum, rows, input_features,
-            output_features, split_count);
+            output_features, split_count,
+            static_cast<const std::uint16_t*>(nullptr),
+            static_cast<std::uint16_t*>(nullptr), static_cast<unsigned*>(nullptr));
 }
 
 // NINFER_EXL3_COHERENT_WARPS selects the CTA width: 4 warps (64 columns,
