@@ -60,8 +60,6 @@ bool exl3_pdl_enabled() {
     return enabled;
 }
 
-bool coherent_tail_reduce_enabled();
-unsigned* exl3_tail_counters_for(const float* accum);
 template<class... KernelArgs,class... CallArgs>
 void exl3_launch_pdl(void (*kernel)(KernelArgs...),dim3 grid,dim3 block,
                      std::size_t shared,cudaStream_t stream,CallArgs&&... args) {
@@ -2208,8 +2206,7 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool K7ThreeWord = false, bool PredecodedB = false,
            bool FastK6Decode = false, bool Fp16Accumulate = false,
            bool RegisterPipeline = false, bool GlobalSlices = false,
-           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1,
-           bool TailReduce = false>
+           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1>
 __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
@@ -2217,10 +2214,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
                                                  int rows,
                                                  int input_features,
                                                  int output_features,
-                                                 int split_count,
-                                                 const std::uint16_t* tail_svh = nullptr,
-                                                 std::uint16_t* tail_output = nullptr,
-                                                 unsigned* tail_counters = nullptr) {
+                                                 int split_count) {
     // Deep async-A stages may stream the constant packed weights of their
     // preload groups before the dependency wait; everything else waits first.
     constexpr bool kEarlyWeights = DeepStages > 0 && AsyncA && !RegisterPipeline;
@@ -2630,57 +2624,6 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
             } else {
                 accum[static_cast<std::size_t>(split) * partial_stride +
                       row * output_features + tile_base * 16 + column] = sh_c[i];
-            }
-        }
-    }
-    if constexpr (TailReduce) {
-        // The last CTA to publish partials for a 128-column Hadamard group
-        // performs prefill_reduce_output_warp_kernel's work for that group:
-        // the same chronological split sum, butterfly network, scale and SVH
-        // product, so the output is bitwise identical and the reduction
-        // launch disappears. The counter returns to zero for the next launch.
-        static_assert(PartialOnly && !SingleSplit && !GlobalSlices,
-                      "tail reduction consumes split partial planes");
-        constexpr int columns = output_tiles_per_block * 16;
-        static_assert(kHadamard % columns == 0,
-                      "tail reduction needs whole Hadamard groups per CTA set");
-        __shared__ unsigned tail_last;
-        __threadfence();
-        __syncthreads();
-        const int group = tile_base * 16 / kHadamard;
-        if (thread == 0) {
-            const unsigned arrivals =
-                static_cast<unsigned>(split_count) * (kHadamard / columns);
-            const unsigned previous = atomicAdd(tail_counters + group, 1u);
-            tail_last = previous + 1u == arrivals ? 1u : 0u;
-            if (tail_last) tail_counters[group] = 0u;
-        }
-        __syncthreads();
-        if (tail_last) {
-            __threadfence();
-            const int offset = group * kHadamard + lane * 4;
-            for (int row = warp; row < rows; row += Warps) {
-                const std::size_t index =
-                    static_cast<std::size_t>(row) * output_features + offset;
-                const float4 first =
-                    __ldcg(reinterpret_cast<const float4*>(accum + index));
-                float v[4] = {first.x, first.y, first.z, first.w};
-                for (int other = 1; other < split_count; ++other) {
-                    const float4 plane = __ldcg(reinterpret_cast<const float4*>(
-                        accum + static_cast<std::size_t>(other) * partial_stride + index));
-                    v[0] += plane.x; v[1] += plane.y; v[2] += plane.z; v[3] += plane.w;
-                }
-                std::uint16_t scale[4];
-                exl3_load_half4(tail_svh + offset, scale);
-                exl3_warp_butterflies(v, lane);
-                std::uint16_t result[4];
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const auto normalized = __float2half_rn(v[j] * kHadamardScale);
-                    result[j] = __half_as_ushort(
-                        __hmul(normalized, __ushort_as_half(scale[j])));
-                }
-                exl3_store_half4(tail_output + row * output_features + offset, result);
             }
         }
     }
@@ -5731,8 +5674,6 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     workspace_bytes_ = requirement.owned_bytes;
     accumulation_capacity_bytes_ = accum_bytes;
     transformed_capacity_bytes_ = transformed_bytes;
-    // Coherent tail-reduction counters are created before any capture.
-    if (accum_ && coherent_tail_reduce_enabled()) (void)exl3_tail_counters_for(accum_);
     if (fast_wide_prefill_gemm_enabled_) {
         try {
             auto state = std::make_unique<FastWideGemmState>();
@@ -10005,9 +9946,7 @@ template <int Bits, int Stages, int Warps, int Per = 1>
 static void launch_coherent_packed_variant(
     cudaStream_t stream, const std::uint16_t* transformed,
     const std::uint16_t* trellis, const std::int32_t* mul1, float* accum,
-    int rows, int input_features, int output_features, int split_count,
-    const std::uint16_t* tail_svh = nullptr, std::uint16_t* tail_output = nullptr,
-    unsigned* tail_counters = nullptr) {
+    int rows, int input_features, int output_features, int split_count) {
     constexpr int tiles = Warps;
     constexpr int stage_count = (Stages ? Stages : 2) * Per;
     const std::size_t shared =
@@ -10041,44 +9980,19 @@ static void launch_coherent_packed_variant(
         if (std::strcmp(value, "1") == 0) return true;
         throw std::invalid_argument("NINFER_EXL3_COHERENT_FAST_DECODE must be 0 or 1");
     }();
-    if (fast_decode && tail_counters) {
-        if constexpr (16 * tiles <= kHadamard) {
-            if (shared > 48u * 1024u) {
-                static const bool configured = [shared] {
-                    cuda_check(cudaFuncSetAttribute(
-                        exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
-                            false, Bits == 6, false, false, false, Stages, Warps, Per, true>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)),
-                        "set deep coherent tail shared memory");
-                    return true;
-                }();
-                (void)configured;
-            }
-            exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
-                false, Bits == 6, false, false, false, Stages, Warps, Per, true>,
-                dim3(grid), dim3(Warps * 32), shared, stream,
-                    transformed, trellis, mul1, accum, rows, input_features,
-                    output_features, split_count, tail_svh, tail_output, tail_counters);
-            return;
-        }
-    }
     if (fast_decode) {
         exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
             false, Bits == 6, false, false, false, Stages, Warps, Per>,
             dim3(grid), dim3(Warps * 32), shared, stream,
                 transformed, trellis, mul1, accum, rows, input_features,
-                output_features, split_count,
-                static_cast<const std::uint16_t*>(nullptr),
-                static_cast<std::uint16_t*>(nullptr), static_cast<unsigned*>(nullptr));
+                output_features, split_count);
         return;
     }
     exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
         false, false, false, false, false, Stages, Warps, Per>,
         dim3(grid), dim3(Warps * 32), shared, stream,
             transformed, trellis, mul1, accum, rows, input_features,
-            output_features, split_count,
-            static_cast<const std::uint16_t*>(nullptr),
-            static_cast<std::uint16_t*>(nullptr), static_cast<unsigned*>(nullptr));
+            output_features, split_count);
 }
 
 // NINFER_EXL3_COHERENT_WARPS selects the CTA width: 4 warps (64 columns,
@@ -10124,55 +10038,17 @@ bool generic_narrow_enabled() {
     return enabled;
 }
 
-// NINFER_EXL3_COHERENT_TAIL_REDUCE (default 1): the coherent producer's last
-// split CTA per Hadamard group runs the exact warp reduction/output transform.
-bool coherent_tail_reduce_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_TAIL_REDUCE");
-        if (!value || std::strcmp(value, "1") == 0) return true;
-        if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_COHERENT_TAIL_REDUCE must be 0 or 1");
-    }();
-    return enabled;
-}
-
-// Zeroed arrival counters, one pool per accumulation plane. Producers sharing
-// a plane are already serialized by that shared scratch, so they may share
-// counters. Allocated outside capture (workspace construction) and retained
-// for the process lifetime.
-unsigned* exl3_tail_counters_for(const float* accum) {
-    static std::mutex mutex;
-    static std::unordered_map<const float*, unsigned*> pools;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto& pool = pools[accum];
-    if (!pool) {
-        constexpr std::size_t kGroups = 1024;
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&pool), kGroups * sizeof(unsigned)),
-                   "cudaMalloc coherent tail counters");
-        cuda_check(cudaMemset(pool, 0, kGroups * sizeof(unsigned)),
-                   "zero coherent tail counters");
-    }
-    return pool;
-}
-
 template <int Bits>
-static bool launch_coherent_packed_partials(
+static void launch_coherent_packed_partials(
     int grid, std::size_t two_stage_bytes, cudaStream_t stream,
     const std::uint16_t* transformed, const std::uint16_t* trellis,
     const std::int32_t* mul1, float* accum, int rows, int input_features,
-    int output_features, int split_count,
-    const std::uint16_t* tail_svh = nullptr, std::uint16_t* tail_output = nullptr,
-    unsigned* tail_counters = nullptr) {
+    int output_features, int split_count) {
     const int stages = coherent_deep_pipeline_stages();
     const int warps = coherent_packed_warps();
     const int per_setting = coherent_tiles_per_stage_setting();
-    const bool tail = tail_counters && exl3_hadamard_warp_enabled() &&
-        output_features % kHadamard == 0 &&
-        exl3_hadamard_warp_aligned(accum, tail_svh, tail_output) &&
-        output_features / kHadamard <= 1024;
-    if (!tail) tail_counters = nullptr;
     if (const int per = per_setting ? per_setting : (rows == 1 ? 2 : 4); per != 1) {
-#define NINFER_COHERENT_MULTI(S, W, P)                                                 if (stages == S && warps == W && per == P) {                                       launch_coherent_packed_variant<Bits, S, W, P>(stream, transformed,                 trellis, mul1, accum, rows, input_features, output_features,                   split_count, tail_svh, tail_output, tail_counters); return tail; }
+#define NINFER_COHERENT_MULTI(S, W, P)                                                 if (stages == S && warps == W && per == P) {                                       launch_coherent_packed_variant<Bits, S, W, P>(stream, transformed,                 trellis, mul1, accum, rows, input_features, output_features,                   split_count);                                                              return;                                                                    }
         NINFER_COHERENT_MULTI(4, 4, 2) NINFER_COHERENT_MULTI(4, 4, 4)
         NINFER_COHERENT_MULTI(8, 4, 2) NINFER_COHERENT_MULTI(8, 4, 4)
         NINFER_COHERENT_MULTI(4, 2, 2) NINFER_COHERENT_MULTI(4, 2, 4)
@@ -10185,14 +10061,14 @@ static bool launch_coherent_packed_partials(
             dim3(grid), dim3(kThreads), two_stage_bytes, stream>>>(
                 transformed, trellis, mul1, accum, rows, input_features,
                 output_features, split_count);
-        return false;
+        return;
     }
 #define NINFER_COHERENT_VARIANT(S, W)                                          \
     if (stages == S && warps == W) {                                           \
         launch_coherent_packed_variant<Bits, S, W>(stream, transformed,        \
             trellis, mul1, accum, rows, input_features, output_features,       \
-            split_count, tail_svh, tail_output, tail_counters);                \
-        return tail;                                                           \
+            split_count);                                                      \
+        return;                                                                \
     }
     NINFER_COHERENT_VARIANT(4, 8) NINFER_COHERENT_VARIANT(8, 8)
     NINFER_COHERENT_VARIANT(0, 4) NINFER_COHERENT_VARIANT(4, 4)
@@ -10246,14 +10122,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         // One packed-MMA producer instantiation serves M1 and M2..8. Each
         // K/N tile's B decode is reused across active independent row C
         // fragments; inactive physical M16 rows are zero and never stored.
-        const bool fused = launch_coherent_packed_partials<6>(
+        launch_coherent_packed_partials<6>(
             output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
-            rows, in_features_, out_features_, split_count, weights.svh, output,
-            coherent_tail_reduce_enabled() ? exl3_tail_counters_for(accum_) : nullptr);
+            rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down shared-row partials");
-        if (!fused)
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down row reduction/output");
@@ -10266,14 +10140,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (coherent_down_k7_candidate(metadata, rows, admission)) {
         constexpr int output_blocks = 5120 / 128;
         const int split_count = coherent_split_override("NINFER_EXL3_COHERENT_DOWN_SPLIT", rows);
-        const bool fused = launch_coherent_packed_partials<7>(
+        launch_coherent_packed_partials<7>(
             output_blocks * split_count, kCoherentDownK7SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
-            rows, in_features_, out_features_, split_count, weights.svh, output,
-            coherent_tail_reduce_enabled() ? exl3_tail_counters_for(accum_) : nullptr);
+            rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down shared-row partials");
-        if (!fused)
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down row reduction/output");
@@ -10286,14 +10158,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (coherent_o_k7_candidate(metadata, rows, admission)) {
         constexpr int output_blocks = 5120 / 128;
         const int split_count = coherent_split_override("NINFER_EXL3_COHERENT_O_SPLIT", rows);
-        const bool fused = launch_coherent_packed_partials<7>(
+        launch_coherent_packed_partials<7>(
             output_blocks * split_count, kCoherentOK7SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
-            rows, in_features_, out_features_, split_count, weights.svh, output,
-            coherent_tail_reduce_enabled() ? exl3_tail_counters_for(accum_) : nullptr);
+            rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O shared-row partials");
-        if (!fused)
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O row reduction/output");
@@ -10306,14 +10176,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (coherent_wide_k6_candidate(metadata, rows, admission)) {
         const int output_blocks = out_features_ / kHadamard;
         const int split_count = coherent_wide_k6_split_count(rows);
-        const bool fused = launch_coherent_packed_partials<6>(
+        launch_coherent_packed_partials<6>(
             output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
-            rows, in_features_, out_features_, split_count, weights.svh, output,
-            coherent_tail_reduce_enabled() ? exl3_tail_counters_for(accum_) : nullptr);
+            rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 shared-row partials");
-        if (!fused)
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 row reduction/output");
