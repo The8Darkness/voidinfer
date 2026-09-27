@@ -405,10 +405,14 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
                 double sum=0.0;
                 for(int i=0;i<kVocabRows;++i)sum+=std::exp(static_cast<double>(values[i])-maximum);
                 const double nll=std::log(sum)+maximum-values[target];
+                require(std::isfinite(maximum)&&std::isfinite(nll)&&nll>=-1e-6,
+                    "verify quality row is not finite");
                 total_nll+=nll;++scored;agree+=arg==target;
                 quality<<first+row+1<<','<<target<<','<<nll<<','<<arg<<'\n';
             }
         }
+        quality.flush();
+        require(quality.good()&&scored>0,"verify quality output write");
         std::cout<<"VERIFY_QUALITY PASS rows="<<scored<<" mean_nll="<<total_nll/scored
                  <<" argmax_agree="<<agree<<'\n';
         return;
