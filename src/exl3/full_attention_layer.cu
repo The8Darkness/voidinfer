@@ -6047,12 +6047,10 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     const float* slots=workspace+
         (static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments*kFastFusedFlashStride;
     float global_max=-3.402823466e+38F;
-    #pragma unroll 8
     for(int segment=0;segment<live_segments;++segment)
         global_max=fmaxf(global_max,
             slots[segment*kFastFusedFlashStride+kFastFusedFlashValues+head]);
     float denominator=0.0f,numerator=0.0f;
-    #pragma unroll 8
     for(int segment=0;segment<live_segments;++segment) {
         const float* slot=slots+segment*kFastFusedFlashStride;
         const float scale=expf(slot[kFastFusedFlashValues+head]-global_max);
@@ -6090,12 +6088,8 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     EXL3_PDL_SMALL_PROLOGUE();
     constexpr int H=kFastFusedFlashHeads;
     constexpr int kVectors=kHeadDim/8;
-    // 64-key segments stage the whole segment in one load pass; the MMA and
-    // softmax still consume it as the same ascending 32-key chunks.
-    constexpr int kStageKeys=kVerifyMmaKeys==64?64:kVerifyMmaChunk;
-    extern __shared__ __align__(16) half verify_mma_shared[];
-    half* const k_all=verify_mma_shared;
-    half* const v_all=verify_mma_shared+kStageKeys*kVerifyMmaStride;
+    __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
+    __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
     const int segment=static_cast<int>(blockIdx.x);
     const int kv_head=static_cast<int>(blockIdx.y);
     const int tid=static_cast<int>(threadIdx.x);
@@ -6127,13 +6121,12 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     float running_max[2]={-INFINITY,-INFINITY};
     float denominator[2]={0.0f,0.0f};
 
-    for(int stage_first=first;stage_first<segment_end;stage_first+=kStageKeys) {
+    for(int chunk_first=first;chunk_first<segment_end;chunk_first+=kVerifyMmaChunk) {
         __syncthreads();
-        #pragma unroll 4
-        for(int index=tid;index<kStageKeys*kVectors;index+=blockDim.x) {
+        for(int index=tid;index<kVerifyMmaChunk*kVectors;index+=blockDim.x) {
             const int key_offset=index/kVectors;
             const int dim=(index%kVectors)*8;
-            const int key=stage_first+key_offset;
+            const int key=chunk_first+key_offset;
             uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
             if(key<segment_end) {
                 const std::size_t offset=(static_cast<std::size_t>(key)*kKVHeads+kv_head)*
@@ -6141,14 +6134,10 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
                 key_bits=*reinterpret_cast<const uint4*>(k_cache+offset);
                 value_bits=*reinterpret_cast<const uint4*>(v_cache+offset);
             }
-            *reinterpret_cast<uint4*>(k_all+key_offset*kVerifyMmaStride+dim)=key_bits;
-            *reinterpret_cast<uint4*>(v_all+key_offset*kVerifyMmaStride+dim)=value_bits;
+            *reinterpret_cast<uint4*>(k_s+key_offset*kVerifyMmaStride+dim)=key_bits;
+            *reinterpret_cast<uint4*>(v_s+key_offset*kVerifyMmaStride+dim)=value_bits;
         }
         __syncthreads();
-    for(int sub=0;sub<kStageKeys&&stage_first+sub<segment_end;sub+=kVerifyMmaChunk) {
-        const int chunk_first=stage_first+sub;
-        const half* const k_s=k_all+sub*kVerifyMmaStride;
-        const half* const v_s=v_all+sub*kVerifyMmaStride;
 
         float s[4][4];
         #pragma unroll
@@ -6225,7 +6214,6 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
             }
         }
     }
-    }
 
     #pragma unroll
     for(int i=0;i<2;++i) {
@@ -6290,22 +6278,14 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
         throw std::invalid_argument("verify flash MMA scratch extent");
     const int segments=(count+keys-1)/keys;
     const dim3 grid(segments,kKVHeads);
-    static const bool configured=[] {
-        cuda_check(cudaFuncSetAttribute(attention_verify_flash_mma_kernel<64>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(2*64*kVerifyMmaStride*sizeof(half))),
-            "configure verify flash MMA 64-key shared memory");
-        return true;
-    }();
-    (void)configured;
     if(keys==64)
-        exl3_launch_small(attention_verify_flash_mma_kernel<64>,dim3(grid),dim3(96),2*64*kVerifyMmaStride*sizeof(half),stream,
+        exl3_launch_small(attention_verify_flash_mma_kernel<64>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0);
     else if(keys==128)
-        exl3_launch_small(attention_verify_flash_mma_kernel<128>,dim3(grid),dim3(96),2*kVerifyMmaChunk*kVerifyMmaStride*sizeof(half),stream,
+        exl3_launch_small(attention_verify_flash_mma_kernel<128>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0);
     else
-        exl3_launch_small(attention_verify_flash_mma_kernel<256>,dim3(grid),dim3(96),2*kVerifyMmaChunk*kVerifyMmaStride*sizeof(half),stream,
+        exl3_launch_small(attention_verify_flash_mma_kernel<256>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0);
     launch_fused_flash_merge(workspace,output,rows,segments,position,capacity,keys,
         position_device,stream);
