@@ -1140,6 +1140,9 @@ struct Exl3TextContext::Impl {
         ordinary_full_layer_graphs{};
     bool ordinary_full_layer_graphs_enabled=false;
     bool ordinary_full_layer_graph_extended_replay=false;
+    // Continuation (verifier) rows 2..8 replay captured full-layer graphs too;
+    // the retained-prefix capability is re-armed on the host after replay.
+    bool ordinary_full_layer_multirow_graphs_enabled=false;
     int ordinary_full_layer_graph_capture_position=0;
     std::uint64_t ordinary_full_layer_graph_captures=0;
     std::uint64_t ordinary_full_layer_graph_replays=0;
@@ -2784,20 +2787,23 @@ struct Exl3TextContext::Impl {
             "create ordinary full-layer graph capture stream");
         const auto started=std::chrono::steady_clock::now();
         try {
-            // This lane is intentionally limited to the physical C1 shape.  A
-            // single graph per full-attention layer removes the complete
+            // One graph per full-attention layer removes the complete
             // attention-layer launch chain while position_device_ keeps the
-            // live cache frontier dynamic at replay.
-            constexpr int rows=1;
+            // live cache frontier dynamic at replay. The C1 shape is always
+            // captured; verifier continuation rows 2..8 are captured when the
+            // multirow family is admitted.
             // The segmented fused attention grid is frozen during capture.
             // Size it for this context's full capacity; the merge reads only
             // live segments from position_device_ during replay.
             ordinary_full_layer_graph_capture_position=max_context-1;
-            require(ordinary_full_layer_graph_capture_position>0 &&
-                    ordinary_full_layer_graph_capture_position+rows<=max_context,
+            require(ordinary_full_layer_graph_capture_position>0,
                 "ordinary full-layer graph capture frontier");
+            const int max_rows=ordinary_full_layer_multirow_graphs_enabled?
+                host_kv_full_graph_row_shapes:1;
+            for(int rows=1;rows<=max_rows;++rows)
             for(int segment=0;segment<host_kv_full_layer_count;++segment) {
                 const int layer=segment*4+3;
+                const int capture_position=max_context-rows;
                 auto& entry=ordinary_full_layer_graph(rows,segment);
                 require(static_cast<bool>(full_layers[layer]),
                     "ordinary full-layer graph topology");
@@ -2809,8 +2815,7 @@ struct Exl3TextContext::Impl {
                 try {
                     entry.definition.capture(capture_stream,[&] {
                         full_layers[layer]->forward(hidden_b,hidden_a,rows,
-                            ordinary_full_layer_graph_capture_position,
-                            capture_stream,false,false,false,nullptr);
+                            capture_position,capture_stream,false,rows>1,false,nullptr);
                     });
                 } catch(...) {
                     full_layers[layer]->set_capture_active(false);
@@ -3083,9 +3088,13 @@ struct Exl3TextContext::Impl {
             !layer_observer && !target_projection_timing &&
             !target_projection_observer && !wide_prefill && !positions_xyz &&
             !eager_mlp_gateup_concurrent && !native_mtp_hidden_capture_active() &&
-            !continuation_reference && rows==1 &&
-            (position<=ordinary_full_layer_graph_capture_position ||
-             (ordinary_full_layer_graph_extended_replay &&
+            ((!continuation_reference && rows==1 &&
+              (position<=ordinary_full_layer_graph_capture_position ||
+               (ordinary_full_layer_graph_extended_replay &&
+                position+rows<=max_context))) ||
+             (ordinary_full_layer_multirow_graphs_enabled &&
+              continuation_reference && rows>=2 &&
+              rows<=host_kv_full_graph_row_shapes &&
               position+rows<=max_context));
         if (rows==1 && std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
             std::fprintf(stderr,
@@ -3365,6 +3374,13 @@ struct Exl3TextContext::Impl {
                     graph.executable.launch(stream);
                     ++ordinary_full_layer_graph_replays;
                     count_ordinary_graph(ordinary_graph_process_counters.full_layer_replays);
+                    // Replay bypasses the eager host-side arming of the
+                    // retained-prefix capability; reproduce it exactly as the
+                    // HostKV continuation graphs do.
+                    if(rows>1 && continuation_reference &&
+                       arm_captured_transaction_prefix)
+                        full_layers[layer]->arm_captured_retained_prefix(
+                            rows,position,stream);
                     if (rows==1 &&
                         std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                         std::fprintf(stderr,
@@ -3978,6 +3994,18 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->ordinary_full_layer_graph_extended_replay ||
             impl->ordinary_full_layer_graphs_enabled,
         "ordinary full-layer graph extended replay requires ordinary full-layer graphs");
+    const char* ordinary_full_layer_multirow=std::getenv(
+        "NINFER_EXL3_ORDINARY_FULL_LAYER_MULTIROW_GRAPHS");
+    require(!ordinary_full_layer_multirow ||
+            std::strcmp(ordinary_full_layer_multirow,"0")==0 ||
+            std::strcmp(ordinary_full_layer_multirow,"1")==0,
+        "ordinary full-layer multirow graphs must be 0 or 1");
+    // Default on with extended full-layer replay (measured); "0" keeps the
+    // verifier's multi-row full-attention layers eager.
+    impl->ordinary_full_layer_multirow_graphs_enabled=
+        impl->ordinary_full_layer_graph_extended_replay &&
+        (!ordinary_full_layer_multirow ||
+         std::strcmp(ordinary_full_layer_multirow,"1")==0);
     const char* host_kv_transaction_checkpoint_graph=std::getenv(
         "NINFER_EXL3_HOST_KV_TRANSACTION_CHECKPOINT_GRAPH");
     require(!host_kv_transaction_checkpoint_graph ||

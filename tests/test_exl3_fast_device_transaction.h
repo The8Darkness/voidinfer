@@ -1054,8 +1054,13 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         "real device DFlash differs from target-only stream/state or ring frontier");
     if(seed_reuse)require(reused_seeds==rounds && seed_fallbacks==0,
         "real device DFlash seed packet did not reach every verifier round");
+    // Captured multirow full-layer graphs replay the fused multirow attention
+    // without host-side dispatch counts; accept their replay as evidence.
     if(env("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW")=="1")
-        require(fused_flash_multirow_calls>0,
+        require(fused_flash_multirow_calls>0 ||
+                (env("NINFER_EXL3_ORDINARY_FULL_LAYER_MULTIROW_GRAPHS")=="1" &&
+                 ninfer::exl3::Exl3TextContext::ordinary_graph_process_stats_for_test()
+                     .full_layer_replays>0),
             "real device DFlash multirow fused attention did not dispatch");
     if(adaptive_width) {
         const auto b4=horizon_policy.snapshot(4);
