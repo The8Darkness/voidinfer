@@ -1956,7 +1956,9 @@ void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
         trellis, mul1, values, scales, weight_global, k, n); break;
     case 7: exl3_decode_quantize_weight_kernel<7, Quant><<<grid, 256, 0, stream>>>(
         trellis, mul1, values, scales, weight_global, k, n); break;
-    default: throw std::invalid_argument("fused EXL3 decode/quantize supports K5..K7");
+    case 8: exl3_decode_quantize_weight_kernel<8, Quant><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
+    default: throw std::invalid_argument("fused EXL3 decode/quantize supports K5..K8");
     }
 }
 
@@ -6770,7 +6772,10 @@ bool Exl3CudaReconstructGemmWorkspace::supports(
         const bool k5_layer=metadata.K==5 &&
             (impl_->k5_scope_enabled || impl_->mxfp8_enabled) &&
             impl_->reuse_active && rows>=256;
-        return bounded_shape && (metadata.K == 6 || metadata.K == 7 || k5_layer) &&
+        // K8 (attention K/V) is admitted only to the fused decode route.
+        const bool k8_layer=metadata.K==8 && impl_->mxfp8_enabled &&
+            impl_->fused_decode_enabled && impl_->reuse_active && rows>=256;
+        return bounded_shape && (metadata.K == 6 || metadata.K == 7 || k5_layer || k8_layer) &&
             metadata.mul1 && !metadata.mcg && !metadata.has_bias;
     }
     const bool primary_shape =
@@ -7414,7 +7419,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     // Default 1: decode EXL3 trellis tiles straight into the quantized operand
     // (NINFER_EXL3_PREFILL_FUSED_DECODE=0 keeps the FP16 reconstruct + quantize control).
     const bool fused_decode = mxfp8 && impl_->fused_decode_enabled &&
-        metadata.K >= 5 && metadata.K <= 7;
+        metadata.K >= 5 && metadata.K <= 8;
     float* const nv_weight_global = nvfp4 ? reinterpret_cast<float*>(
         mx_weight + nv_value_bytes + nv_scale_bytes) : nullptr;
     if (mxfp8) reconstructed = impl_->reconstructed;
@@ -7450,6 +7455,11 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                     metadata.in_features, metadata.out_features);
         } else if (metadata.K == 6) {
             exl3_reconstruct_transformed_weight_kernel<6><<<
+                reconstruct_grid, 256, 0, stream>>>(
+                    weights.trellis, weights.mul1, reconstructed,
+                    metadata.in_features, metadata.out_features);
+        } else if (metadata.K == 8) {
+            exl3_reconstruct_transformed_weight_kernel<8><<<
                 reconstruct_grid, 256, 0, stream>>>(
                     weights.trellis, weights.mul1, reconstructed,
                     metadata.in_features, metadata.out_features);

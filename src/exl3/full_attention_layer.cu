@@ -7132,7 +7132,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
              target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
              metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
              ((reconstruct_gemm_->accepts_all_model_shapes() &&
-               (metadata.K == 5 || metadata.K == 6 || metadata.K == 7) && rows >= 256) ||
+               metadata.K >= 5 && metadata.K <= 8 && rows >= 256) ||
               ((operation == Exl3TargetProjectionOperator::gate ||
                 operation == Exl3TargetProjectionOperator::up) &&
                metadata.K == 6 && metadata.in_features == kHidden &&
