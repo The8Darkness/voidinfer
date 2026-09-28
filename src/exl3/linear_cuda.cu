@@ -1881,6 +1881,85 @@ __global__ void exl3_reconstruct_transformed_weight_kernel(
                           output_features + tile_n * 16 + column] = value;
 }
 
+// EXL3 MUL1 codebook values lie in [-3.454, 3.447] for every state, so the
+// NVFP4 weight global scale is a constant bound instead of a measured amax.
+constexpr float kNvfp4WeightGlobal = 3.5f / (6.0f * 448.0f);
+
+// Fused EXL3 decode + block quantization of one transformed weight into the
+// K-major MXFP8 (Quant=32) or NVFP4 (Quant=16) prefill operand, bypassing the
+// FP16 reconstruction plane. Each thread decodes the Quant consecutive K
+// values of one output column (one quantization block) from the packed
+// trellis tiles staged in shared memory. Grid (ceil(n/256), k/Quant).
+template <int Bits, int Quant>
+__global__ void __launch_bounds__(256) exl3_decode_quantize_weight_kernel(
+    const std::uint16_t* __restrict__ trellis, const std::int32_t* __restrict__ mul1,
+    std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
+    float* __restrict__ weight_global, int k, int n) {
+    constexpr int kTilesK = Quant / 16;
+    constexpr int kWords = 16 * Bits;          // packed u16 words per 16x16 tile
+    __shared__ std::uint16_t packed[kTilesK][16][kWords];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tiles_n = n / 16;
+    const int tile_n0 = static_cast<int>(blockIdx.x) * 16;
+    const int live_tiles = min(16, tiles_n - tile_n0);
+    const int k_tile0 = static_cast<int>(blockIdx.y) * kTilesK;
+    for (int kt = 0; kt < kTilesK; ++kt) {
+        const std::uint16_t* source = trellis +
+            (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords;
+        for (int i = tid; i < live_tiles * kWords; i += 256)
+            packed[kt][i / kWords][i % kWords] = source[i];
+    }
+    if (Quant == 16 && tid == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+        *weight_global = kNvfp4WeightGlobal;
+    __syncthreads();
+    const int local_tile = tid / 16, column_in_tile = tid % 16;
+    if (local_tile >= live_tiles) return;
+    const int column = (tile_n0 + local_tile) * 16 + column_in_tile;
+    const std::uint32_t multiplier = static_cast<std::uint32_t>(*mul1);
+    float x[Quant];
+    float amax = 0.0f;
+#pragma unroll
+    for (int kt = 0; kt < kTilesK; ++kt) {
+#pragma unroll
+        for (int row = 0; row < 16; ++row) {
+            const int encoded = inverse_tensor_core_index(row, column_in_tile);
+            const float value = __half2float(__ushort_as_half(decode_mul1_generic(
+                decode_state_generic(packed[kt][local_tile], Bits, encoded), multiplier)));
+            x[kt * 16 + row] = value;
+            amax = fmaxf(amax, fabsf(value));
+        }
+    }
+    const int k0 = static_cast<int>(blockIdx.y) * Quant;
+    if constexpr (Quant == 32) {
+        const int exponent = mxfp8_block_exponent(amax);
+        mxfp8_encode32(x, exp2f(static_cast<float>(-exponent)),
+            values + static_cast<std::size_t>(column) * k + k0);
+        scales[mxfp8_scale_offset(column, blockIdx.y, (k / 32 + 3) / 4 * 4)] =
+            static_cast<std::uint8_t>(exponent + 127);
+    } else {
+        std::uint8_t code = 0;
+        nvfp4_encode16(x, amax, kNvfp4WeightGlobal,
+            values + (static_cast<std::size_t>(column) * k + k0) / 2, code);
+        scales[mxfp8_scale_offset(column, blockIdx.y, (k / 16 + 3) / 4 * 4)] = code;
+    }
+}
+
+template <int Quant>
+void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
+    const std::int32_t* mul1, std::uint8_t* values, std::uint8_t* scales,
+    float* weight_global, int k, int n, cudaStream_t stream) {
+    const dim3 grid((n / 16 + 15) / 16, k / Quant);
+    switch (bits) {
+    case 5: exl3_decode_quantize_weight_kernel<5, Quant><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
+    case 6: exl3_decode_quantize_weight_kernel<6, Quant><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
+    case 7: exl3_decode_quantize_weight_kernel<7, Quant><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
+    default: throw std::invalid_argument("fused EXL3 decode/quantize supports K5..K7");
+    }
+}
+
 // Fold both EXL3 128-point transforms into a row-major reconstructed weight.
 // The input/output Hadamard launches are intentionally absent from the caller
 // when this candidate is enabled: the resulting matrix is consumed directly
@@ -6040,6 +6119,7 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     bool large_lt_enabled = false;
     bool mxfp8_enabled = false;
     int nvfp4_mode = 0;
+    bool fused_decode_enabled = true;
     int prefill_layer = -1;
     float* nvfp4_scalars = nullptr;
     bool fused_original_enabled = false;
@@ -6173,6 +6253,12 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
         throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0, 1, 2 or 3");
     }
     impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 2) : 0;
+    const char* fused_decode=std::getenv("NINFER_EXL3_PREFILL_FUSED_DECODE");
+    if(fused_decode && std::strcmp(fused_decode,"0")!=0 && std::strcmp(fused_decode,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_DECODE must be 0 or 1");
+    }
+    impl_->fused_decode_enabled=!fused_decode || std::strcmp(fused_decode,"1")==0;
     const char* packed_direct_k6 = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_PACKED_DIRECT_K6");
     if (packed_direct_k6 && std::strcmp(packed_direct_k6, "0") != 0 &&
@@ -7062,6 +7148,10 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         static_cast<std::size_t>(metadata.in_features) * metadata.out_features / 2;
     const std::size_t nv_scale_bytes =
         static_cast<std::size_t>(metadata.in_features) * metadata.out_features / 16;
+    // Default 1: decode EXL3 trellis tiles straight into the quantized operand
+    // (NINFER_EXL3_PREFILL_FUSED_DECODE=0 keeps the FP16 reconstruct + quantize control).
+    const bool fused_decode = mxfp8 && impl_->fused_decode_enabled &&
+        metadata.K >= 5 && metadata.K <= 7;
     float* const nv_weight_global = nvfp4 ? reinterpret_cast<float*>(
         mx_weight + nv_value_bytes + nv_scale_bytes) : nullptr;
     if (mxfp8) reconstructed = impl_->reconstructed;
@@ -7079,6 +7169,16 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                 reconstructed, weights.trellis, weights.suh,
                 weights.svh, metadata.out_features / 16);
         }
+    } else if (reconstruct_needed && fused_decode) {
+        if (nvfp4)
+            launch_decode_quantize_weight<16>(metadata.K, weights.trellis, weights.mul1,
+                mx_weight, mx_weight + nv_value_bytes, nv_weight_global,
+                metadata.in_features, metadata.out_features, stream);
+        else
+            launch_decode_quantize_weight<32>(metadata.K, weights.trellis, weights.mul1,
+                mx_weight, mx_weight + static_cast<std::size_t>(metadata.in_features) *
+                    metadata.out_features, nullptr,
+                metadata.in_features, metadata.out_features, stream);
     } else if (reconstruct_needed) {
         if (metadata.K == 5) {
             exl3_reconstruct_transformed_weight_kernel<5><<<
@@ -7101,7 +7201,9 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
         impl_->stats.reconstructed_weight_bytes += weight_bytes;
         ++impl_->stats.reconstructed_weight_calls;
-        if (nvfp4) {
+        if (fused_decode) {
+            cuda_check(cudaGetLastError(), "fused EXL3 decode/quantize");
+        } else if (nvfp4) {
             auto* amax_bits = reinterpret_cast<unsigned*>(impl_->nvfp4_scalars + 3);
             cuda_check(cudaMemsetAsync(amax_bits, 0, sizeof(unsigned), stream),
                        "clear NVFP4 weight amax");
