@@ -183,6 +183,7 @@ struct Exl3ReconstructGemmStats {
     std::uint64_t mxfp8_rows = 0;
     std::uint64_t nvfp4_calls = 0;
     std::uint64_t nvfp4_rows = 0;
+    std::uint64_t fused_mlp_calls = 0;
     std::uint64_t k6_calls = 0;
     std::uint64_t k7_calls = 0;
     std::uint64_t rows = 0;
@@ -265,6 +266,18 @@ public:
         int rows,
         cudaStream_t stream = nullptr);
     bool supports_fused_gate_up_down() const noexcept;
+    // Prefill MLP on the block-quantized route: gate/up keep their raw GEMM
+    // outputs and the down projection's quantized input is produced in one
+    // pass (gate/up output transforms, SiLU*up, down input transform and
+    // block quantization). Returns false without work when not admitted.
+    // Gate/up buffers then hold untransformed values; activation is unused.
+    bool forward_numeric_mlp(
+        const Exl3CudaLinearWeights& gate, const Exl3CudaLinearMetadata& gate_metadata,
+        const Exl3CudaLinearWeights& up, const Exl3CudaLinearMetadata& up_metadata,
+        const Exl3CudaLinearWeights& down, const Exl3CudaLinearMetadata& down_metadata,
+        const std::uint16_t* input, std::uint16_t* gate_output, std::uint16_t* up_output,
+        std::uint16_t* activation, std::uint16_t* output, int rows,
+        cudaStream_t stream = nullptr);
 
     // Reuse only the current layer's reconstructed projections while a
     // layer-major prompt suffix is processed in causal row chunks. The caller

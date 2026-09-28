@@ -2396,20 +2396,29 @@ void Exl3GdnLayer::finish_bulk_mlp(DeferredMlpBuffers buffers,
     if (bulk_mlp_weight_prefetch_)
         (void)reconstruct_gemm_->prefetch_numeric_weight(weights_.up,
             weights_.up_metadata,buffers.rows,stream);
+    const int final_offset=((buffers.rows-1)/1024)*1024;
+    const int final_rows=buffers.rows-final_offset;
+    // Fused prefill MLP: gate/up stay untransformed and the quantized down
+    // input is produced in one pass; gate/up/activation traces are unset.
+    const bool fused_mlp=!bulk_mlp_fused_down_ &&
+        reconstruct_gemm_->forward_numeric_mlp(weights_.gate,weights_.gate_metadata,
+            weights_.up,weights_.up_metadata,weights_.down,weights_.down_metadata,
+            buffers.mlp_input,gate,up,act,down,buffers.rows,stream);
+    if(!fused_mlp) {
     reconstruct_gemm_->forward_numeric_candidate(weights_.gate,
         weights_.gate_metadata,buffers.mlp_input,gate,buffers.rows,stream);
     reconstruct_gemm_->forward_numeric_candidate(weights_.up,
         weights_.up_metadata,buffers.mlp_input,up,buffers.rows,stream);
-    const int final_offset=((buffers.rows-1)/1024)*1024;
-    const int final_rows=buffers.rows-final_offset;
     if(preserve_trace && act==gate)
         check(cudaMemcpyAsync(half_buffers_[16],
             gate+static_cast<std::size_t>(final_offset)*kIntermediate,
             static_cast<std::size_t>(final_rows)*kIntermediate*sizeof(std::uint16_t),
             cudaMemcpyDeviceToDevice,stream),
             "preserve final GDN bulk gate trace");
+    }
     bool fused_down_residual=false;
-    if(bulk_mlp_fused_down_ && reconstruct_gemm_->supports_fused_gate_up_down()) {
+    if(fused_mlp) {
+    } else if(bulk_mlp_fused_down_ && reconstruct_gemm_->supports_fused_gate_up_down()) {
         reconstruct_gemm_->forward_numeric_gate_up_down(weights_.down,
             weights_.down_metadata,gate,up,act,down,buffers.rows,stream);
     } else {
@@ -2439,11 +2448,12 @@ void Exl3GdnLayer::finish_bulk_mlp(DeferredMlpBuffers buffers,
         static_cast<std::size_t>(final_offset)*kHidden;
     trace_.mlp_input=buffers.mlp_input+
         static_cast<std::size_t>(final_offset)*kHidden;
-    trace_.gate_projection=preserve_trace && act==gate?half_buffers_[16]:
+    trace_.gate_projection=fused_mlp?nullptr:
+        preserve_trace && act==gate?half_buffers_[16]:
         gate+static_cast<std::size_t>(final_offset)*kIntermediate;
-    trace_.up_projection=up+
+    trace_.up_projection=fused_mlp?nullptr:up+
         static_cast<std::size_t>(final_offset)*kIntermediate;
-    trace_.activated_mlp=act+
+    trace_.activated_mlp=fused_mlp?nullptr:act+
         static_cast<std::size_t>(final_offset)*kIntermediate;
     trace_.down_projection=preserve_trace && down==output?half_buffers_[19]:
         down+static_cast<std::size_t>(final_offset)*kHidden;

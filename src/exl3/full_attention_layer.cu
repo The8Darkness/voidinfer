@@ -8814,6 +8814,20 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         mlp_in, rows, kHidden);
     launch(cudaGetLastError(), "launch EXL3 attention residual and norm"); end(8);
 
+    // Fused prefill MLP (quantized route): gate/up stay untransformed and the
+    // quantized down input is produced in one pass.
+    const bool fused_prefill_mlp = wide_prefill && reconstruct_gemm_ &&
+        !capture_active_ && !oscar_ && !profile && !projection_timing_ &&
+        !projection_observer_ && !can_share_target && rows >= 256 &&
+        reconstruct_gemm_->forward_numeric_mlp(weights_.gate, weights_.gate_metadata,
+            weights_.up, weights_.up_metadata, weights_.down, weights_.down_metadata,
+            mlp_in, gp, up, act, down, rows, stream);
+    if (fused_prefill_mlp) {
+        launch(cudaGetLastError(), "launch fused EXL3 prefill MLP");
+        exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,
+            post_resid, down, output, rows * kHidden);
+        launch(cudaGetLastError(), "launch EXL3 final residual");
+    } else {
     const bool concurrent_mlp_gateup =
         eager_mlp_gateup_concurrency_.complete() && !capture_active_ && !oscar_ &&
         !profile && !projection_timing_ && !projection_observer_ &&
@@ -8927,6 +8941,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post_resid, down, output,
         rows * kHidden);
     launch(cudaGetLastError(), "launch EXL3 final residual"); end(12);
+    }
     }
 
     if (profile) {
