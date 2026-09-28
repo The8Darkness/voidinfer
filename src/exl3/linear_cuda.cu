@@ -1960,6 +1960,82 @@ void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
     }
 }
 
+// Transformed activations are bounded well below 4 on this model (observed
+// per-site maxima <= 0.49 over 4K/16K code and prose prefills), so the NVFP4
+// activation global scale is a static bound, as with calibrated input scales.
+constexpr float kNvfp4ActivationGlobal = 4.0f / (6.0f * 448.0f);
+
+// Input Hadamard fused with block quantization of its FP16-rounded result
+// (identical values to transform-then-quantize). One warp owns a 128-element
+// Hadamard block; Quant=16 (NVFP4, constant activation global) spans 4 lanes,
+// Quant=32 (MXFP8) spans 8. Tasks cover rows padded to 128 so padding scales
+// are zero. Thread 0 publishes the NVFP4 GEMM alpha.
+template <int Quant>
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock * 32) input_hadamard_quantize_warp_kernel(
+    const std::uint16_t* __restrict__ input, const std::uint16_t* __restrict__ suh,
+    std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
+    int rows, int padded_rows, int input_features,
+    const float* __restrict__ weight_global, float* __restrict__ alpha) {
+    constexpr int kGroup = Quant / 4;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int blocks = input_features / kHadamard;
+    const long long task = static_cast<long long>(blockIdx.x) * kHadamardWarpsPerBlock +
+        (static_cast<int>(threadIdx.x) >> 5);
+    if (Quant == 16 && task == 0 && lane == 0) *alpha = kNvfp4ActivationGlobal * *weight_global;
+    if (task >= static_cast<long long>(padded_rows) * blocks) return;
+    const int row = static_cast<int>(task / blocks);
+    const int block = static_cast<int>(task % blocks);
+    const int offset = block * kHadamard + lane * 4;
+    const int inner_blocks = (input_features / Quant + 3) / 4 * 4;
+    if (row >= rows) {
+        if (lane % kGroup == 0) scales[mxfp8_scale_offset(row, offset / Quant, inner_blocks)] = 0;
+        return;
+    }
+    const std::size_t element = static_cast<std::size_t>(row) * input_features + offset;
+    std::uint16_t represented[4], scale[4];
+    exl3_load_half4(input + element, represented);
+    exl3_load_half4(suh + offset, scale);
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = half_product(represented[j], scale[j]);
+    exl3_warp_butterflies(v, lane);
+    float x[4];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        x[j] = __half2float(__float2half_rn(v[j] * kHadamardScale));
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+#pragma unroll
+    for (int o = 1; o < kGroup; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if constexpr (Quant == 32) {
+        const int exponent = mxfp8_block_exponent(amax);
+        const float s = exp2f(static_cast<float>(-exponent));
+        const __nv_fp8x2_storage_t low = __nv_cvt_float2_to_fp8x2(
+            make_float2(x[0] * s, x[1] * s), __NV_SATFINITE, __NV_E4M3);
+        const __nv_fp8x2_storage_t high = __nv_cvt_float2_to_fp8x2(
+            make_float2(x[2] * s, x[3] * s), __NV_SATFINITE, __NV_E4M3);
+        *reinterpret_cast<std::uint32_t*>(values + element) =
+            static_cast<std::uint32_t>(low) | (static_cast<std::uint32_t>(high) << 16);
+        if (lane % kGroup == 0)
+            scales[mxfp8_scale_offset(row, offset / 32, inner_blocks)] =
+                static_cast<std::uint8_t>(exponent + 127);
+    } else {
+        float block_scale = 1.0f;
+        const std::uint8_t code = nvfp4_scale_code(
+            fmaxf(amax / (6.0f * kNvfp4ActivationGlobal), 1e-30f), block_scale);
+        const float inverse = 1.0f / (block_scale * kNvfp4ActivationGlobal);
+        const auto low = static_cast<std::uint16_t>(__nv_cvt_float2_to_fp4x2(
+            make_float2(x[0] * inverse, x[1] * inverse), __NV_E2M1, cudaRoundNearest));
+        const auto high = static_cast<std::uint16_t>(__nv_cvt_float2_to_fp4x2(
+            make_float2(x[2] * inverse, x[3] * inverse), __NV_E2M1, cudaRoundNearest));
+        *reinterpret_cast<std::uint16_t*>(values + element / 2) =
+            static_cast<std::uint16_t>((low & 0xffu) | ((high & 0xffu) << 8));
+        if (lane % kGroup == 0)
+            scales[mxfp8_scale_offset(row, offset / 16, inner_blocks)] = code;
+    }
+}
+
 // Fold both EXL3 128-point transforms into a row-major reconstructed weight.
 // The input/output Hadamard launches are intentionally absent from the caller
 // when this candidate is enabled: the resulting matrix is consumed directly
@@ -6120,6 +6196,7 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     bool mxfp8_enabled = false;
     int nvfp4_mode = 0;
     bool fused_decode_enabled = true;
+    bool fused_act_enabled = true;
     int prefill_layer = -1;
     float* nvfp4_scalars = nullptr;
     bool fused_original_enabled = false;
@@ -6259,6 +6336,12 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
         throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_DECODE must be 0 or 1");
     }
     impl_->fused_decode_enabled=!fused_decode || std::strcmp(fused_decode,"1")==0;
+    const char* fused_act=std::getenv("NINFER_EXL3_PREFILL_FUSED_ACT");
+    if(fused_act && std::strcmp(fused_act,"0")!=0 && std::strcmp(fused_act,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_ACT must be 0 or 1");
+    }
+    impl_->fused_act_enabled=!fused_act || std::strcmp(fused_act,"1")==0;
     const char* packed_direct_k6 = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_PACKED_DIRECT_K6");
     if (packed_direct_k6 && std::strcmp(packed_direct_k6, "0") != 0 &&
@@ -6690,6 +6773,20 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         throw std::invalid_argument("bulk down residual epilogue admission");
     const bool fp16_compute = impl_->fp16_compute_enabled &&
         fast_fp16_destination && !fused_original && metadata.K!=5;
+    // Under the block-quantized route the FP16 transformed input is only
+    // materialized if a non-quantized branch consumes it; otherwise the
+    // transform is fused into activation quantization.
+    bool transformed_ready = false;
+    const bool defer_input = impl_->mxfp8_enabled && impl_->fused_act_enabled &&
+        fast_fp16_destination && !fused_original && !up &&
+        metadata.in_features % kHadamard == 0;
+    const auto ensure_transformed = [&]() {
+        if (transformed_ready || fused_original) return;
+        launch_input_hadamard<kHadamard>(stream,
+                input, weights.suh, impl_->transformed, rows, metadata.in_features);
+        cuda_check(cudaGetLastError(), "T69 input Hadamard");
+        transformed_ready = true;
+    };
     if (!fused_original) {
         if (up) {
             launch_input_hadamard<kHadamard,false,true>(stream,
@@ -6697,11 +6794,11 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                     metadata.in_features,up,activation);
             ++impl_->stats.fused_gate_up_down_calls;
             impl_->stats.fused_gate_up_down_rows += static_cast<std::uint64_t>(rows);
-        } else {
-            launch_input_hadamard<kHadamard>(stream,
-                    input, weights.suh, impl_->transformed, rows, metadata.in_features);
+            cuda_check(cudaGetLastError(), "T69 input Hadamard");
+            transformed_ready = true;
+        } else if (!defer_input) {
+            ensure_transformed();
         }
-        cuda_check(cudaGetLastError(), "T69 input Hadamard");
     }
     if (timing) cuda_check(cudaEventRecord(events[1], stream), "T69 input event");
 
@@ -6731,6 +6828,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         impl_->persistent_prefill_capacity[persistent_prefill_capacity_index] >=
             persistent_prefill_chunks;
     if (persistent_prefill_candidate) {
+        ensure_transformed();
         const bool k7 = metadata.K == 7;
         const int tile_k = persistent_prefill_down ? 32 : 16;
         const int tile_n = persistent_prefill_down ? (k7 ? 128 : 256) : 512;
@@ -6831,6 +6929,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         impl_->persistent_prefill_capacity[persistent_prefill_capacity_index] >=
             persistent_prefill_chunks;
     if (mia_prefill_candidate) {
+        ensure_transformed();
         const bool k7 = metadata.K == 7;
         const int tile_k = persistent_prefill_down ? 32 : 16;
         const int tile_n = persistent_prefill_down ? (k7 ? 128 : 256) : 512;
@@ -6931,6 +7030,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         weights.mul1 && weights.suh && weights.svh &&
         (packed_direct_k5_gate_up || packed_direct_k5_down);
     if (packed_direct_k5_candidate) {
+        ensure_transformed();
         constexpr int output_tiles_per_block = 64;
         constexpr int split_count = 1;
         const int output_blocks = metadata.out_features /
@@ -6993,6 +7093,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         metadata.K == 6 && metadata.in_features % 16 == 0 &&
         metadata.out_features % 16 == 0 && weights.trellis && weights.mul1;
     if (packed_direct_k6_candidate) {
+        ensure_transformed();
         const int output_tiles_per_block =
             metadata.out_features % (16 * 64) == 0 ? 64 :
             metadata.out_features % (16 * 32) == 0 ? 32 : 16;
@@ -7238,6 +7339,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const float alpha = 1.0f, beta = 0.0f;
     const half alpha_half = __float2half(1.0f);
     const half beta_half = __float2half(0.0f);
+    if (!mxfp8) ensure_transformed();
     const void* gemm_input = fused_original
         ? static_cast<const void*>(input)
         : static_cast<const void*>(impl_->transformed);
@@ -7258,16 +7360,24 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         auto* amax_bits = reinterpret_cast<unsigned*>(impl_->nvfp4_scalars);
         float* alpha_device = impl_->nvfp4_scalars + 1;
         float* beta_device = impl_->nvfp4_scalars + 2;
-        cuda_check(cudaMemsetAsync(amax_bits, 0, sizeof(unsigned), stream),
-                   "clear NVFP4 activation amax");
-        nvfp4_amax_kernel<<<512, 256, 0, stream>>>(
-            reinterpret_cast<const half*>(impl_->transformed),
-            static_cast<std::size_t>(rows) * metadata.in_features, amax_bits);
-        const int act_threads = padded_rows * in_blocks;
-        nvfp4_quantize_rows_kernel<<<(act_threads + 255) / 256, 256, 0, stream>>>(
-            reinterpret_cast<const half*>(impl_->transformed), act_values, act_scales,
-            rows, metadata.in_features, padded_rows, amax_bits, nv_weight_global,
-            alpha_device);
+        if (!transformed_ready) {
+            input_hadamard_quantize_warp_kernel<16><<<
+                exl3_hadamard_warp_grid(padded_rows, metadata.in_features),
+                kHadamardWarpsPerBlock * 32, 0, stream>>>(
+                    input, weights.suh, act_values, act_scales, rows, padded_rows,
+                    metadata.in_features, nv_weight_global, alpha_device);
+        } else {
+            cuda_check(cudaMemsetAsync(amax_bits, 0, sizeof(unsigned), stream),
+                       "clear NVFP4 activation amax");
+            nvfp4_amax_kernel<<<512, 256, 0, stream>>>(
+                reinterpret_cast<const half*>(impl_->transformed),
+                static_cast<std::size_t>(rows) * metadata.in_features, amax_bits);
+            const int act_threads = padded_rows * in_blocks;
+            nvfp4_quantize_rows_kernel<<<(act_threads + 255) / 256, 256, 0, stream>>>(
+                reinterpret_cast<const half*>(impl_->transformed), act_values, act_scales,
+                rows, metadata.in_features, padded_rows, amax_bits, nv_weight_global,
+                alpha_device);
+        }
         cuda_check(cudaGetLastError(), "NVFP4 activation quantization");
         const std::uint64_t key = (1ull << 61) |
             (static_cast<std::uint64_t>(metadata.in_features) << 32) |
@@ -7371,10 +7481,18 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         auto* act_scales = act_values +
             static_cast<std::size_t>(rows) * metadata.in_features;
         act_scales += (16 - reinterpret_cast<std::uintptr_t>(act_scales) % 16) % 16;
-        const int act_threads = padded_rows * in_blocks;
-        mxfp8_quantize_rows_kernel<<<(act_threads + 255) / 256, 256, 0, stream>>>(
-            reinterpret_cast<const half*>(impl_->transformed), act_values, act_scales,
-            rows, metadata.in_features, padded_rows);
+        if (!transformed_ready) {
+            input_hadamard_quantize_warp_kernel<32><<<
+                exl3_hadamard_warp_grid(padded_rows, metadata.in_features),
+                kHadamardWarpsPerBlock * 32, 0, stream>>>(
+                    input, weights.suh, act_values, act_scales, rows, padded_rows,
+                    metadata.in_features, nullptr, nullptr);
+        } else {
+            const int act_threads = padded_rows * in_blocks;
+            mxfp8_quantize_rows_kernel<<<(act_threads + 255) / 256, 256, 0, stream>>>(
+                reinterpret_cast<const half*>(impl_->transformed), act_values, act_scales,
+                rows, metadata.in_features, padded_rows);
+        }
         cuda_check(cudaGetLastError(), "MXFP8 activation quantization");
         const std::uint64_t key = (1ull << 62) |
             (static_cast<std::uint64_t>(metadata.in_features) << 32) |
