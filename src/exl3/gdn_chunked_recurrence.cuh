@@ -76,20 +76,27 @@ __host__ __device__ inline std::size_t tile_index(int chunk, int head) {
 }
 
 // ---- Kernel 1: per (chunk, head): decays, Gram, blocked (I+A)^-1, w, u, Kt, P, Qg ----
+// Shared layout (~48 KB, two blocks per SM): AT holds A in its strict lower
+// triangle and T^T in its upper triangle plus diagonal, so the blocked inverse
+// runs in place; it later stages per-warp tiles and P. Gram and Q K^T read
+// TF32 fragments straight from global q/k; T X runs on FP16 tensor cores
+// (the operands carry the 10-bit mantissa TF32 would keep).
+constexpr int kLdH128 = kD + 8;       // halves, 128-wide
+constexpr int kLdH64 = kC + 8;        // halves, 64-wide
 constexpr std::size_t kPrepSmem =
-    sizeof(float) * (kC * kLd + 2 * kC * kLd64 + 3 * 16 * 17 + 2 * kC);
+    sizeof(float) * kC * kLd64 + sizeof(half) * (kC * kLdH128 + kC * kLdH64) +
+    sizeof(float) * (3 * 16 * 17 + 2 * kC);
 
-// out (64 x 128 half, ld 128) = T (64x64 smem, lower) * X (64x128 smem). 8 warps.
-__device__ __forceinline__ void t_times(const float* Ts, const float* Xs, float* stage,
-                                        half* out, int warp, int lane) {
+// out (64 x 128 half, ld 128) = T (64x64 half smem, lower) * X (64x128 half smem).
+__device__ __forceinline__ void t_times_half(const half* Th, const half* Xh, float* stage,
+                                             half* out, int warp, int lane) {
     for (int t = warp; t < 32; t += 8) {
         const int ti = t / 8, tj = t % 8;
-        FragC acc; wmma::fill_fragment(acc, 0.0f);
-        for (int kk = 0; kk <= ti * 16 + 8; kk += 8) {
-            FragA a; FragB b;
-            wmma::load_matrix_sync(a, Ts + ti * 16 * kLd64 + kk, kLd64);
-            wmma::load_matrix_sync(b, Xs + kk * kLd + tj * 16, kLd);
-            to_tf32(a); to_tf32(b);
+        HC acc; wmma::fill_fragment(acc, 0.0f);
+        for (int kk = 0; kk <= ti * 16; kk += 16) {
+            HA a; HB b;
+            wmma::load_matrix_sync(a, Th + ti * 16 * kLdH64 + kk, kLdH64);
+            wmma::load_matrix_sync(b, Xh + kk * kLdH128 + tj * 16, kLdH128);
             wmma::mma_sync(acc, a, b, acc);
         }
         wmma::store_matrix_sync(stage, acc, 16, wmma::mem_row_major);
@@ -100,28 +107,22 @@ __device__ __forceinline__ void t_times(const float* Ts, const float* Xs, float*
     }
 }
 
-__global__ void __launch_bounds__(256) prep_kernel(const float* __restrict__ q,
+__global__ void __launch_bounds__(256, 2) prep_kernel(const float* __restrict__ q,
     const float* __restrict__ k, const std::uint16_t* __restrict__ v,
     const float* __restrict__ alpha, const float* __restrict__ beta, int rows, Workspace ws) {
     extern __shared__ float smem[];
-    float* Xs = smem;                 // [64][kLd]  K, scaled K, scaled V
-    float* As = Xs + kC * kLd;        // [64][kLd64] A, later P
-    float* Ts = As + kC * kLd64;      // [64][kLd64]
-    float* Ms = Ts + kC * kLd64;      // [3][16][17] off-diagonal products / warp stages
-    float* Ls = Ms + 3 * 16 * 17;     // [64]
-    float* Bs = Ls + kC;              // [64]
+    float* AT = smem;                                          // [64][kLd64]
+    half* Xh = reinterpret_cast<half*>(AT + kC * kLd64);       // [64][kLdH128]
+    half* Th = Xh + kC * kLdH128;                              // [64][kLdH64]
+    float* Ms = reinterpret_cast<float*>(Th + kC * kLdH64);    // [3][16][17]
+    float* Ls = Ms + 3 * 16 * 17;                              // [64]
+    float* Bs = Ls + kC;                                       // [64]
     const int chunk = blockIdx.x, head = blockIdx.y, kh = head / 3;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int row0 = chunk * kC;
     const std::size_t index = tile_index(chunk, head);
     const float* kc = k + static_cast<std::size_t>(row0) * kQkStride + kh * kD;
     const float* qc = q + static_cast<std::size_t>(row0) * kQkStride + kh * kD;
-    for (int i = tid; i < kC * kD / 4; i += 256) {
-        const int r = i / (kD / 4), d = (i % (kD / 4)) * 4;
-        *reinterpret_cast<float4*>(Xs + r * kLd + d) =
-            *reinterpret_cast<const float4*>(kc + static_cast<std::size_t>(r) * kQkStride + d);
-    }
-    for (int i = tid; i < kC * kC; i += 256) Ts[(i / kC) * kLd64 + i % kC] = 0.0f;
     if (tid < 32) {
         float l0 = 0.0f, l1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
         const int r0 = row0 + 2 * tid, r1 = r0 + 1;
@@ -141,25 +142,27 @@ __global__ void __launch_bounds__(256) prep_kernel(const float* __restrict__ q,
         Bs[2 * tid + 1] = b1;
         if (tid == 31) ws.decay[index] = __expf(before + pair);
     }
-    __syncthreads();
+    // Gram of the lower tiles from global K (TF32).
     for (int t = warp; t < 16; t += 8) {
         const int ti = t / 4, tj = t % 4;
-        if (tj > ti) continue;
         FragC acc; wmma::fill_fragment(acc, 0.0f);
+        if (tj <= ti) {
 #pragma unroll 4
-        for (int kk = 0; kk < kD; kk += 8) {
-            FragA a; FragBc b;
-            wmma::load_matrix_sync(a, Xs + ti * 16 * kLd + kk, kLd);
-            wmma::load_matrix_sync(b, Xs + tj * 16 * kLd + kk, kLd);
-            to_tf32(a); to_tf32(b);
-            wmma::mma_sync(acc, a, b, acc);
+            for (int kk = 0; kk < kD; kk += 8) {
+                FragA a; FragBc b;
+                wmma::load_matrix_sync(a, kc + static_cast<std::size_t>(ti * 16) * kQkStride + kk, kQkStride);
+                wmma::load_matrix_sync(b, kc + static_cast<std::size_t>(tj * 16) * kQkStride + kk, kQkStride);
+                to_tf32(a); to_tf32(b);
+                wmma::mma_sync(acc, a, b, acc);
+            }
         }
-        wmma::store_matrix_sync(As + ti * 16 * kLd64 + tj * 16, acc, kLd64, wmma::mem_row_major);
+        wmma::store_matrix_sync(AT + ti * 16 * kLd64 + tj * 16, acc, kLd64, wmma::mem_row_major);
     }
     __syncthreads();
+    // A in the strict lower triangle; upper triangle and diagonal cleared for T^T.
     for (int i = tid; i < kC * kC; i += 256) {
         const int r = i / kC, c = i % kC;
-        As[r * kLd64 + c] = c < r ? Bs[r] * __expf(Ls[r] - Ls[c]) * As[r * kLd64 + c] : 0.0f;
+        AT[r * kLd64 + c] = c < r ? Bs[r] * __expf(Ls[r] - Ls[c]) * AT[r * kLd64 + c] : 0.0f;
     }
     {
         // Kt_j = exp(L_last - L_j) k_j and Qg_i = gamma_i q_i (pad rows are zero).
@@ -168,31 +171,33 @@ __global__ void __launch_bounds__(256) prep_kernel(const float* __restrict__ q,
         half* qg = ws.qg + index * kC * kD;
         for (int i = tid; i < kC * kD; i += 256) {
             const int r = i / kD, d = i % kD;
-            kt[r * kD + d] = __float2half_rn(Xs[r * kLd + d] * __expf(last - Ls[r]));
-            qg[r * kD + d] = __float2half_rn(qc[static_cast<std::size_t>(r) * kQkStride + d] *
-                                             __expf(Ls[r]));
+            const std::size_t at = static_cast<std::size_t>(r) * kQkStride + d;
+            kt[r * kD + d] = __float2half_rn(kc[at] * __expf(last - Ls[r]));
+            qg[r * kD + d] = __float2half_rn(qc[at] * __expf(Ls[r]));
         }
     }
     __syncthreads();
+    // Diagonal 16x16 inverses; T[i][j] is stored at AT[j][i] (upper + diagonal).
     if (tid < kC) {
         const int b = tid / 16, c = tid % 16, base = b * 16;
         for (int i = 0; i < 16; ++i) {
-            float value = 0.0f;
-            if (i == c) value = 1.0f;
-            else if (i > c)
-                for (int j = c; j < i; ++j)
-                    value -= As[(base + i) * kLd64 + base + j] * Ts[(base + j) * kLd64 + base + c];
-            Ts[(base + i) * kLd64 + base + c] = value;
+            if (i < c) continue;
+            float value = i == c ? 1.0f : 0.0f;
+            for (int j = c; j < i; ++j)
+                value -= AT[(base + i) * kLd64 + base + j] * AT[(base + c) * kLd64 + base + j];
+            AT[(base + c) * kLd64 + base + i] = value;
         }
     }
     __syncthreads();
+    // Off-diagonal blocks by distance d: T_ij = -T_ii * sum_{m} A_im T_mj.
     for (int d = 1; d < 4; ++d) {
         const int blocks = 4 - d;
         for (int e = tid; e < blocks * 256; e += 256) {
             const int bj = e / 256, bi = bj + d, r = (e % 256) / 16, c = e % 16;
+            const int col = bj * 16 + c;
             float sum = 0.0f;
-            for (int m = bj * 16; m < bi * 16; ++m)
-                sum += As[(bi * 16 + r) * kLd64 + m] * Ts[m * kLd64 + bj * 16 + c];
+            for (int m = col; m < bi * 16; ++m)   // T[m][col] = 0 for m < col
+                sum += AT[(bi * 16 + r) * kLd64 + m] * AT[col * kLd64 + m];
             Ms[(bj * 16 + r) * 17 + c] = sum;
         }
         __syncthreads();
@@ -200,43 +205,24 @@ __global__ void __launch_bounds__(256) prep_kernel(const float* __restrict__ q,
             const int bj = e / 256, bi = bj + d, r = (e % 256) / 16, c = e % 16;
             float sum = 0.0f;
             for (int t = 0; t <= r; ++t)
-                sum += Ts[(bi * 16 + r) * kLd64 + bi * 16 + t] * Ms[(bj * 16 + t) * 17 + c];
-            Ts[(bi * 16 + r) * kLd64 + bj * 16 + c] = -sum;
+                sum += AT[(bi * 16 + t) * kLd64 + bi * 16 + r] * Ms[(bj * 16 + t) * 17 + c];
+            AT[(bj * 16 + c) * kLd64 + bi * 16 + r] = -sum;
         }
         __syncthreads();
     }
-    // P = Q K^T masked and decay-scaled (A is no longer needed): lower 10 tiles.
-    for (int t = warp; t < 16; t += 8) {
-        const int ti = t / 4, tj = t % 4;
-        FragC acc; wmma::fill_fragment(acc, 0.0f);
-        if (tj <= ti) {
-#pragma unroll 4
-            for (int kk = 0; kk < kD; kk += 8) {
-                FragA a; FragBc b;
-                wmma::load_matrix_sync(a, qc + static_cast<std::size_t>(ti * 16) * kQkStride + kk, kQkStride);
-                wmma::load_matrix_sync(b, Xs + tj * 16 * kLd + kk, kLd);
-                to_tf32(a); to_tf32(b);
-                wmma::mma_sync(acc, a, b, acc);
-            }
-        }
-        wmma::store_matrix_sync(As + ti * 16 * kLd64 + tj * 16, acc, kLd64, wmma::mem_row_major);
-    }
-    __syncthreads();
-    {
-        half* p = ws.p + index * kC * kC;
-        for (int i = tid; i < kC * kC; i += 256) {
-            const int r = i / kC, c = i % kC;
-            p[i] = __float2half_rn(c <= r ? As[r * kLd64 + c] * __expf(Ls[r] - Ls[c]) : 0.0f);
-        }
+    // FP16 row-major T and beta*gamma-scaled K.
+    for (int i = tid; i < kC * kC; i += 256) {
+        const int r = i / kC, c = i % kC;
+        Th[r * kLdH64 + c] = __float2half_rn(c <= r ? AT[c * kLd64 + r] : 0.0f);
     }
     for (int i = tid; i < kC * kD; i += 256) {
         const int r = i / kD, d = i % kD;
-        Xs[r * kLd + d] *= Bs[r] * __expf(Ls[r]);
+        Xh[r * kLdH128 + d] = __float2half_rn(
+            kc[static_cast<std::size_t>(r) * kQkStride + d] * Bs[r] * __expf(Ls[r]));
     }
     __syncthreads();
-    float* stage = Ms;   // 8 warps x 256 floats would overflow Ms; use As (free now)
-    stage = As + warp * 256;
-    t_times(Ts, Xs, stage, ws.w + index * kC * kD, warp, lane);
+    float* stage = AT + warp * 256;   // AT is free once Th is built
+    t_times_half(Th, Xh, stage, ws.w + index * kC * kD, warp, lane);
     __syncthreads();
     const auto* vv = reinterpret_cast<const __nv_bfloat16*>(v);
     for (int i = tid; i < kC * kD / 2; i += 256) {
@@ -245,11 +231,34 @@ __global__ void __launch_bounds__(256) prep_kernel(const float* __restrict__ q,
         if (row < rows)
             value = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
                 vv + (static_cast<std::size_t>(row) * kH + head) * kD + d));
-        Xs[r * kLd + d] = value.x * Bs[r];
-        Xs[r * kLd + d + 1] = value.y * Bs[r];
+        Xh[r * kLdH128 + d] = __float2half_rn(value.x * Bs[r]);
+        Xh[r * kLdH128 + d + 1] = __float2half_rn(value.y * Bs[r]);
     }
     __syncthreads();
-    t_times(Ts, Xs, stage, ws.u + index * kC * kD, warp, lane);
+    t_times_half(Th, Xh, stage, ws.u + index * kC * kD, warp, lane);
+    __syncthreads();
+    // P = Q K^T masked and decay-scaled (TF32 from global), staged in AT.
+    for (int t = warp; t < 16; t += 8) {
+        const int ti = t / 4, tj = t % 4;
+        FragC acc; wmma::fill_fragment(acc, 0.0f);
+        if (tj <= ti) {
+#pragma unroll 4
+            for (int kk = 0; kk < kD; kk += 8) {
+                FragA a; FragBc b;
+                wmma::load_matrix_sync(a, qc + static_cast<std::size_t>(ti * 16) * kQkStride + kk, kQkStride);
+                wmma::load_matrix_sync(b, kc + static_cast<std::size_t>(tj * 16) * kQkStride + kk, kQkStride);
+                to_tf32(a); to_tf32(b);
+                wmma::mma_sync(acc, a, b, acc);
+            }
+        }
+        wmma::store_matrix_sync(AT + ti * 16 * kLd64 + tj * 16, acc, kLd64, wmma::mem_row_major);
+    }
+    __syncthreads();
+    half* p = ws.p + index * kC * kC;
+    for (int i = tid; i < kC * kC; i += 256) {
+        const int r = i / kC, c = i % kC;
+        p[i] = __float2half_rn(c <= r ? AT[r * kLd64 + c] * __expf(Ls[r] - Ls[c]) : 0.0f);
+    }
 }
 
 // ---- Kernel 2: sequential chunk scan with fused outputs, per (head, 32-wide value tile) ----
