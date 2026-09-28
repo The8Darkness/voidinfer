@@ -2893,6 +2893,15 @@ int main() {
                 cuda_check(cudaDeviceSynchronize(),
                            "targetrequest exact HostKV prefix completion");
             };
+            // Warm process: one untimed prefill of the same prompt and a context
+            // reset, so the timed prefill excludes first-use module loading and
+            // allocation growth (as in a running server). Fresh state is timed.
+            if (env("NINFER_E5A4_TARGETREQUEST_WARM") == "1") {
+                ingest_targetrequest_prefix(*ctx);
+                cuda_check(cudaDeviceSynchronize(), "targetrequest warm-up prefill");
+                ctx->reset();
+                cuda_check(cudaDeviceSynchronize(), "targetrequest warm-up reset");
+            }
             const auto ingest_begin = std::chrono::steady_clock::now();
             ingest_targetrequest_prefix(*ctx);
             const auto ingest_end = std::chrono::steady_clock::now();

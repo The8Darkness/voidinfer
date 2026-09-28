@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <atomic>
@@ -218,6 +219,46 @@ __global__ void transpose_f16_to_bf16_kernel(const std::uint16_t* input, std::ui
     const int feature = index % features;
     reinterpret_cast<__nv_bfloat16*>(output)[feature * rows + row] =
         __float2bfloat16_rn(half_value(input[index]));
+}
+
+// Prefill GDN control projections (rows >= 16): the 5120 -> 48 a/b
+// projections run as FP16 tensor-core GEMMs with FP32 accumulation and output
+// instead of the CTA-reduced FMA kernel, which re-reads the input per head
+// group and the weights per row group. NINFER_EXL3_GDN_CONTROL_GEMM=0 keeps
+// the tiled kernel.
+bool gdn_control_gemm_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_GDN_CONTROL_GEMM");
+        if (!value || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        throw std::invalid_argument("NINFER_EXL3_GDN_CONTROL_GEMM must be 0 or 1");
+    }();
+    return enabled;
+}
+
+// Process-wide handle: GDN layers submit their prefill work sequentially on the
+// owning stream, which is bound before every call.
+cublasHandle_t gdn_control_cublas() {
+    static cublasHandle_t handle = [] {
+        cublasHandle_t created = nullptr;
+        if (cublasCreate(&created) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("create GDN control cuBLAS handle");
+        return created;
+    }();
+    return handle;
+}
+
+__global__ void control_epilogue_kernel(const float* a, const float* b,
+    const float* a_log, const float* dt_bias, float* beta_trace, float* g_trace,
+    int count) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const int head = index % kHeads;
+    const float beta_f = 1.0f / (1.0f + expf(-b[index]));
+    const float av = a[index] + dt_bias[head];
+    const float softplus = av > 20.0f ? av : log1pf(expf(av));
+    beta_trace[index] = __bfloat162float(__float2bfloat16_rn(beta_f));
+    g_trace[index] = -expf(a_log[head]) * softplus;
 }
 
 __global__ void convert_f16_to_bf16_kernel(const std::uint16_t* input, std::uint16_t* output, int count) {
@@ -2549,6 +2590,22 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             control_fused_tiled_kernel<2,2><<<((rows+1)/2)*(kHeads/2),128,0,stream>>>(
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
                 a,b,beta_trace,g_trace,rows);
+        } else if(rows>=16 && wide_prefill && gdn_control_gemm_enabled()) {
+            // a/b[row*kHeads+head] = h[row] . weight[head]: column-major
+            // C(48 x rows) = W^T(48 x 5120) * H(5120 x rows).
+            const auto handle = gdn_control_cublas();
+            if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS)
+                throw std::runtime_error("bind GDN control cuBLAS stream");
+            const float one = 1.0f, zero = 0.0f;
+            for (int which = 0; which < 2; ++which) {
+                if (cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, kHeads, rows, kHidden,
+                        &one, which ? weights_.b_weight : weights_.a_weight, CUDA_R_16F, kHidden,
+                        h, CUDA_R_16F, kHidden, &zero, which ? b : a, CUDA_R_32F, kHeads,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS)
+                    throw std::runtime_error("GDN control projection GEMM");
+            }
+            control_epilogue_kernel<<<(rows*kHeads+255)/256,256,0,stream>>>(
+                a,b,weights_.a_log,weights_.dt_bias,beta_trace,g_trace,rows*kHeads);
         } else if(rows>=16 && gdn_control_tiled_enabled()) {
             control_fused_tiled_kernel<4,4><<<((rows+3)/4)*(kHeads/4),128,0,stream>>>(
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
@@ -3094,7 +3151,9 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         check(cudaGetLastError(),"launch GOPT GDN output packing");
         gopt_record(gaming_submissions_,Gopt::GdnOutputPack);
     } else {
-        exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
+        // head_trace is not part of the published trace; wide prefill skips the copy.
+        if (!wide_prefill)
+            exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
         exl3_launch_small(transpose_bf16_to_f16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,gdn_norm, o_input, rows, kZ);
     }
     check(cudaGetLastError(), "launch GDN gated norm staging"); end(6);
