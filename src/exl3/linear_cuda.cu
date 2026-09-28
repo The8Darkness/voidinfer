@@ -9,6 +9,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_fp4.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -1711,6 +1712,124 @@ __global__ void mxfp8_quantize_weight_transposed_kernel(const half* __restrict__
         values+static_cast<std::size_t>(column)*k+block*32);
     scales[mxfp8_scale_offset(column,block,(k/32+3)/4*4)]=
         static_cast<std::uint8_t>(exponent+127);
+}
+
+// NVFP4 operands for the cuBLASLt VEC16_UE4M3 prefill route: E2M1 elements
+// (two per byte, lower K index in the low nibble), one unsigned E4M3 scale per
+// 16 elements along K in the 128x4 tile layout (inner = K/16 rounded up to 4),
+// and one FP32 global scale per tensor so block scales stay in E4M3 range.
+// Dequantized value = e2m1 * e4m3_scale * global.
+__device__ __forceinline__ float nvfp4_global_from_amax(float amax) {
+    return amax > 0.0f ? amax / (6.0f * 448.0f) : 1.0f;
+}
+
+__device__ __forceinline__ float nvfp4_decode_e4m3(__nv_fp8_storage_t code) {
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw(code, __NV_E4M3)));
+}
+
+// Smallest positive E4M3 code whose value is >= target, saturating at 448.
+__device__ __forceinline__ std::uint8_t nvfp4_scale_code(float target, float& value) {
+    __nv_fp8_storage_t code = __nv_cvt_float_to_fp8(target, __NV_SATFINITE, __NV_E4M3);
+    float decoded = nvfp4_decode_e4m3(code);
+    if (decoded < target && code < 0x7e) decoded = nvfp4_decode_e4m3(++code);
+    if (!(decoded > 0.0f)) decoded = nvfp4_decode_e4m3(code = 0x01);
+    value = decoded;
+    return static_cast<std::uint8_t>(code);
+}
+
+__device__ __forceinline__ void nvfp4_encode16(const float (&x)[16], float amax,
+    float global, std::uint8_t* destination, std::uint8_t& scale_code) {
+    float scale = 1.0f;
+    scale_code = nvfp4_scale_code(fmaxf(amax / (6.0f * global), 1e-30f), scale);
+    const float inverse = 1.0f / (scale * global);
+    alignas(8) std::uint8_t bytes[8];
+#pragma unroll
+    for (int i = 0; i < 16; i += 2)
+        bytes[i / 2] = static_cast<std::uint8_t>(__nv_cvt_float2_to_fp4x2(
+            make_float2(x[i] * inverse, x[i + 1] * inverse), __NV_E2M1, cudaRoundNearest));
+    *reinterpret_cast<uint2*>(destination) = *reinterpret_cast<const uint2*>(bytes);
+}
+
+// Tensor absolute maximum; non-negative floats order as unsigned bit patterns.
+__global__ void nvfp4_amax_kernel(const half* __restrict__ source, std::size_t count,
+                                  unsigned* __restrict__ amax_bits) {
+    float local = 0.0f;
+    for (std::size_t i = (blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x) * 8;
+         i < count; i += static_cast<std::size_t>(gridDim.x) * blockDim.x * 8) {
+        const uint4 packed = *reinterpret_cast<const uint4*>(source + i);
+        const half2* pairs = reinterpret_cast<const half2*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 value = __half22float2(pairs[j]);
+            local = fmaxf(local, fmaxf(fabsf(value.x), fabsf(value.y)));
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local = fmaxf(local, __shfl_xor_sync(0xffffffffu, local, offset));
+    if ((threadIdx.x & 31) == 0) atomicMax(amax_bits, __float_as_uint(local));
+}
+
+// K-contiguous FP16 activations [rows][k] -> packed E2M1 [rows][k/2] plus block
+// scales (rows padded to 128, padding zero-filled). Publishes the GEMM
+// alpha = activation global * weight global.
+__global__ void nvfp4_quantize_rows_kernel(const half* __restrict__ source,
+    std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
+    int rows, int k, int padded_rows, const unsigned* __restrict__ amax_bits,
+    const float* __restrict__ weight_global, float* __restrict__ alpha) {
+    const float global = nvfp4_global_from_amax(__uint_as_float(*amax_bits));
+    const int blocks = k / 16;
+    const int inner_blocks = (blocks + 3) / 4 * 4;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index == 0) *alpha = global * *weight_global;
+    if (index >= padded_rows * blocks) return;
+    const int row = index / blocks, block = index % blocks;
+    if (row >= rows) {
+        scales[mxfp8_scale_offset(row, block, inner_blocks)] = 0;
+        return;
+    }
+    const auto* input = reinterpret_cast<const uint4*>(
+        source + static_cast<std::size_t>(row) * k + block * 16);
+    float x[16];
+    float amax = 0.0f;
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+        const uint4 packed = input[part];
+        const half2* pairs = reinterpret_cast<const half2*>(&packed);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 value = __half22float2(pairs[i]);
+            x[part * 8 + i * 2] = value.x;
+            x[part * 8 + i * 2 + 1] = value.y;
+            amax = fmaxf(amax, fmaxf(fabsf(value.x), fabsf(value.y)));
+        }
+    }
+    std::uint8_t code = 0;
+    nvfp4_encode16(x, amax, global,
+        values + (static_cast<std::size_t>(row) * k + block * 16) / 2, code);
+    scales[mxfp8_scale_offset(row, block, inner_blocks)] = code;
+}
+
+// Reconstructed FP16 weight [k][n] -> K-major packed E2M1 [n][k/2] plus block
+// scales (outer n, inner k/16) and the weight global scale. Grid (ceil(n/256), k/16).
+__global__ void nvfp4_quantize_weight_transposed_kernel(const half* __restrict__ source,
+    std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
+    int k, int n, const unsigned* __restrict__ amax_bits, float* __restrict__ weight_global) {
+    const float global = nvfp4_global_from_amax(__uint_as_float(*amax_bits));
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int block = blockIdx.y;
+    if (column == 0 && block == 0) *weight_global = global;
+    if (column >= n) return;
+    float x[16];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        x[i] = __half2float(source[static_cast<std::size_t>(block * 16 + i) * n + column]);
+        amax = fmaxf(amax, fabsf(x[i]));
+    }
+    std::uint8_t code = 0;
+    nvfp4_encode16(x, amax, global,
+        values + (static_cast<std::size_t>(column) * k + block * 16) / 2, code);
+    scales[mxfp8_scale_offset(column, block, (k / 16 + 3) / 4 * 4)] = code;
 }
 
 template <int Bits, bool FragmentOrder = false>
@@ -5920,6 +6039,8 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     bool k5_lt_enabled = false;
     bool large_lt_enabled = false;
     bool mxfp8_enabled = false;
+    int nvfp4_mode = 0;
+    float* nvfp4_scalars = nullptr;
     bool fused_original_enabled = false;
     bool original_gdn_mlp_cache_enabled = false;
     bool fp16_compute_enabled = false;
@@ -6040,6 +6161,16 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->mxfp8_enabled=accept_all_model_shapes &&
         (!mxfp8 || std::strcmp(mxfp8,"1")==0);
+    // NVFP4 prefill numerical policy (default 2 = MLP gate/up/down only,
+    // quality-gated; 0 = MXFP8 control; 1 = all admitted prefill projections,
+    // rejected on held-out quality). Requires the MXFP8 route.
+    const char* nvfp4=std::getenv("NINFER_EXL3_PREFILL_NVFP4");
+    if(nvfp4 && std::strcmp(nvfp4,"0")!=0 && std::strcmp(nvfp4,"1")!=0 &&
+       std::strcmp(nvfp4,"2")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0, 1 or 2");
+    }
+    impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 2) : 0;
     const char* packed_direct_k6 = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_PACKED_DIRECT_K6");
     if (packed_direct_k6 && std::strcmp(packed_direct_k6, "0") != 0 &&
@@ -6155,6 +6286,12 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
                    "T69 allocate GEMM output");
         cuda_check(cudaMalloc(&impl_->cublas_workspace, cublas_bytes),
                    "T69 allocate cuBLAS workspace");
+        if (impl_->nvfp4_mode) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&impl_->nvfp4_scalars),
+                                  4 * sizeof(float)), "allocate NVFP4 scalars");
+            cuda_check(cudaMemset(impl_->nvfp4_scalars, 0, 4 * sizeof(float)),
+                       "clear NVFP4 scalars");
+        }
         cublas_check(cublasCreate(&impl_->handle), "T69 create cuBLAS handle");
         if (impl_->k5_lt_enabled || impl_->large_lt_enabled || impl_->mxfp8_enabled)
             cublas_check(cublasLtCreate(&impl_->lt_handle),
@@ -6198,6 +6335,7 @@ Exl3CudaReconstructGemmWorkspace::~Exl3CudaReconstructGemmWorkspace() {
         (void)cudaStreamDestroy(impl_->weight_prefetch_stream);
     if (impl_->handle) cublasDestroy(impl_->handle);
     if (impl_->cublas_workspace) cudaFree(impl_->cublas_workspace);
+    if (impl_->nvfp4_scalars) cudaFree(impl_->nvfp4_scalars);
     if (impl_->accum) cudaFree(impl_->accum);
     if (impl_->reconstructed) cudaFree(impl_->reconstructed);
     if (impl_->transformed) cudaFree(impl_->transformed);
@@ -6903,6 +7041,19 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         reconstructed != impl_->reconstructed;
     std::uint8_t* const mx_weight =
         mxfp8 ? reinterpret_cast<std::uint8_t*>(reconstructed) : nullptr;
+    const bool mlp_shape =
+        (metadata.in_features == 5120 && metadata.out_features == 17408) ||
+        (metadata.in_features == 17408 && metadata.out_features == 5120);
+    const bool nvfp4 = mxfp8 && (impl_->nvfp4_mode == 1 ||
+        (impl_->nvfp4_mode == 2 && mlp_shape));
+    // NVFP4 slot: packed values (k*n/2), block scales (n x k/16), then the
+    // FP32 weight global scale, all inside the FP16-sized reuse slot.
+    const std::size_t nv_value_bytes =
+        static_cast<std::size_t>(metadata.in_features) * metadata.out_features / 2;
+    const std::size_t nv_scale_bytes =
+        static_cast<std::size_t>(metadata.in_features) * metadata.out_features / 16;
+    float* const nv_weight_global = nvfp4 ? reinterpret_cast<float*>(
+        mx_weight + nv_value_bytes + nv_scale_bytes) : nullptr;
     if (mxfp8) reconstructed = impl_->reconstructed;
     if (reconstruct_needed && fused_original) {
         const dim3 fused_grid(metadata.out_features / kHadamard,
@@ -6940,7 +7091,22 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
         impl_->stats.reconstructed_weight_bytes += weight_bytes;
         ++impl_->stats.reconstructed_weight_calls;
-        if (mxfp8) {
+        if (nvfp4) {
+            auto* amax_bits = reinterpret_cast<unsigned*>(impl_->nvfp4_scalars + 3);
+            cuda_check(cudaMemsetAsync(amax_bits, 0, sizeof(unsigned), stream),
+                       "clear NVFP4 weight amax");
+            nvfp4_amax_kernel<<<1024, 256, 0, stream>>>(
+                reinterpret_cast<const half*>(reconstructed),
+                static_cast<std::size_t>(metadata.in_features) * metadata.out_features,
+                amax_bits);
+            nvfp4_quantize_weight_transposed_kernel<<<
+                dim3((metadata.out_features + 255) / 256, metadata.in_features / 16),
+                256, 0, stream>>>(
+                    reinterpret_cast<const half*>(reconstructed), mx_weight,
+                    mx_weight + nv_value_bytes, metadata.in_features,
+                    metadata.out_features, amax_bits, nv_weight_global);
+            cuda_check(cudaGetLastError(), "NVFP4 weight quantization");
+        } else if (mxfp8) {
             mxfp8_quantize_weight_transposed_kernel<<<
                 dim3((metadata.out_features + 255) / 256, metadata.in_features / 32),
                 256, 0, stream>>>(
@@ -6970,7 +7136,123 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const cudaDataType output_type =
         (fused_original || fast_fp16_destination) ? CUDA_R_16F : CUDA_R_32F;
     bool used_lt=false;
-    if (mxfp8) {
+    if (nvfp4) {
+        const int in_blocks = metadata.in_features / 16;
+        const int padded_rows = (rows + 127) / 128 * 128;
+        auto* act_values = reinterpret_cast<std::uint8_t*>(impl_->accum);
+        auto* act_scales = act_values +
+            static_cast<std::size_t>(rows) * metadata.in_features / 2;
+        act_scales += (16 - reinterpret_cast<std::uintptr_t>(act_scales) % 16) % 16;
+        auto* amax_bits = reinterpret_cast<unsigned*>(impl_->nvfp4_scalars);
+        float* alpha_device = impl_->nvfp4_scalars + 1;
+        float* beta_device = impl_->nvfp4_scalars + 2;
+        cuda_check(cudaMemsetAsync(amax_bits, 0, sizeof(unsigned), stream),
+                   "clear NVFP4 activation amax");
+        nvfp4_amax_kernel<<<512, 256, 0, stream>>>(
+            reinterpret_cast<const half*>(impl_->transformed),
+            static_cast<std::size_t>(rows) * metadata.in_features, amax_bits);
+        const int act_threads = padded_rows * in_blocks;
+        nvfp4_quantize_rows_kernel<<<(act_threads + 255) / 256, 256, 0, stream>>>(
+            reinterpret_cast<const half*>(impl_->transformed), act_values, act_scales,
+            rows, metadata.in_features, padded_rows, amax_bits, nv_weight_global,
+            alpha_device);
+        cuda_check(cudaGetLastError(), "NVFP4 activation quantization");
+        const std::uint64_t key = (1ull << 61) |
+            (static_cast<std::uint64_t>(metadata.in_features) << 32) |
+            (static_cast<std::uint64_t>(metadata.out_features) << 16) |
+            static_cast<std::uint64_t>(rows);
+        auto found = impl_->lt_plans.find(key);
+        if (found == impl_->lt_plans.end()) {
+            Impl::LtPlan plan{};
+            cublasLtMatmulPreference_t preference = nullptr;
+            try {
+                cublas_check(cublasLtMatmulDescCreate(&plan.operation,
+                    CUBLAS_COMPUTE_32F, CUDA_R_32F), "create NVFP4 Lt operation");
+                const cublasOperation_t transpose = CUBLAS_OP_T, plain = CUBLAS_OP_N;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_TRANSA, &transpose, sizeof(transpose)),
+                    "NVFP4 transa");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_TRANSB, &plain, sizeof(plain)), "NVFP4 transb");
+                const cublasLtPointerMode_t device_mode = CUBLASLT_POINTER_MODE_DEVICE;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_POINTER_MODE, &device_mode, sizeof(device_mode)),
+                    "NVFP4 device alpha");
+                const cublasLtMatmulMatrixScale_t mode =
+                    CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)),
+                    "NVFP4 A scale mode");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode)),
+                    "NVFP4 B scale mode");
+                const void* placeholder = impl_->cublas_workspace;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &placeholder, sizeof(placeholder)),
+                    "NVFP4 placeholder A scales");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &placeholder, sizeof(placeholder)),
+                    "NVFP4 placeholder B scales");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_4F_E2M1,
+                    metadata.in_features, metadata.out_features, metadata.in_features),
+                    "create NVFP4 weight layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_4F_E2M1,
+                    metadata.in_features, rows, metadata.in_features),
+                    "create NVFP4 activation layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16F,
+                    metadata.out_features, rows, metadata.out_features),
+                    "create NVFP4 output layout");
+                cublas_check(cublasLtMatmulPreferenceCreate(&preference),
+                    "create NVFP4 Lt preference");
+                constexpr std::size_t limit = 16u * 1024u * 1024u;
+                cublas_check(cublasLtMatmulPreferenceSetAttribute(preference,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &limit, sizeof(limit)),
+                    "bound NVFP4 Lt workspace");
+                cublasLtMatmulHeuristicResult_t candidates[4]{};
+                int count = 0;
+                cublas_check(cublasLtMatmulAlgoGetHeuristic(impl_->lt_handle,
+                    plan.operation, plan.a, plan.b, plan.c, plan.c, preference,
+                    4, candidates, &count), "query NVFP4 Lt algorithms");
+                bool selected = false;
+                for (int i = 0; i < count && !selected; ++i) {
+                    if (candidates[i].state == CUBLAS_STATUS_SUCCESS &&
+                        candidates[i].workspaceSize <= limit) {
+                        plan.algorithm = candidates[i].algo;
+                        plan.workspace_bytes = candidates[i].workspaceSize;
+                        selected = true;
+                    }
+                }
+                if (!selected) throw std::runtime_error("no supported NVFP4 Lt plan");
+                cublasLtMatmulPreferenceDestroy(preference);
+                preference = nullptr;
+                found = impl_->lt_plans.emplace(key, plan).first;
+            } catch (...) {
+                if (preference) cublasLtMatmulPreferenceDestroy(preference);
+                if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+                if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+                if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+                if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+                throw;
+            }
+        }
+        const auto& plan = found->second;
+        const void* weight_scales = mx_weight + nv_value_bytes;
+        const void* input_scales = act_scales;
+        cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+            CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &weight_scales, sizeof(weight_scales)),
+            "bind NVFP4 weight scales");
+        cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+            CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &input_scales, sizeof(input_scales)),
+            "bind NVFP4 activation scales");
+        cublas_check(cublasLtMatmul(impl_->lt_handle, plan.operation, alpha_device,
+            mx_weight, plan.a, act_values, plan.b, beta_device,
+            output, plan.c, output, plan.c, &plan.algorithm,
+            impl_->cublas_workspace, plan.workspace_bytes, stream),
+            "NVFP4 prefill cuBLASLt GEMM");
+        ++impl_->stats.nvfp4_calls;
+        impl_->stats.nvfp4_rows += static_cast<std::uint64_t>(rows);
+        used_lt = true;
+    } else if (mxfp8) {
         const int in_blocks = metadata.in_features / 32;
         const int padded_rows = (rows + 127) / 128 * 128;
         auto* act_values = reinterpret_cast<std::uint8_t*>(impl_->accum);

@@ -6,6 +6,7 @@
 #include "exl3/paired_transform_extent.h"
 #include "exl3/residual_norm_extent.h"
 #include "exl3/block_tree_sum.cuh"
+#include "exl3/gdn_chunked_recurrence.cuh"
 
 #include "core/arena.h"
 #include "ninfer/ops/gated_delta_net.h"
@@ -27,6 +28,33 @@
 
 namespace ninfer::exl3 {
 namespace {
+
+// Prefill numerical policy (default 1, quality-gated): wide-prefill GDN
+// recurrences of >= 64 rows use the chunk-parallel WY form (FP32 state,
+// TF32/FP16 tensor-core products) instead of the sequential resident
+// recurrence. 0 = sequential control.
+bool gdn_chunked_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_GDN_CHUNKED_PREFILL");
+        if (!value || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        throw std::invalid_argument("NINFER_EXL3_GDN_CHUNKED_PREFILL must be 0 or 1");
+    }();
+    return enabled;
+}
+
+// One process-wide chunk workspace: GDN layers execute their prefill
+// recurrences sequentially on the owning stream, at most 1024 rows per call.
+gdn_chunked::Workspace gdn_chunked_workspace() {
+    static void* base = [] {
+        void* pointer = nullptr;
+        if (cudaMalloc(&pointer, gdn_chunked::workspace_bytes(1024)) != cudaSuccess)
+            throw std::runtime_error("allocate chunked GDN prefill workspace");
+        gdn_chunked::configure();
+        return pointer;
+    }();
+    return gdn_chunked::carve(base, 1024);
+}
 
 constexpr int kHidden = 5120;
 constexpr int kQkv = 10240;
@@ -3002,6 +3030,10 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             gdn_recurrence_prefill_resident_quad_columns_kernel<<<
                 kHeads*(kHeadDim/(4*4)),4*32,0,stream>>>(
                 normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
+        else if(gdn_chunked_prefill_enabled() && wide_prefill && rows>=64 &&
+                rows<=max_rows_ && max_rows_<=1024 && max_rows_%gdn_chunked::kC==0)
+            gdn_chunked::launch(normalized_q,normalized_k,v,alpha,beta_trace,
+                recurrent_state_,core,rows,gdn_chunked_workspace(),stream);
         else if(prefill_resident_pair_columns_) {
             if(vector_pair_supported)
                 gdn_recurrence_prefill_resident_pair_columns_kernel<true><<<

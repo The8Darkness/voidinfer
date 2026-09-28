@@ -3396,6 +3396,8 @@ int main() {
                       << numeric_prefill_stats.reused_weight_bytes
                       << " mxfp8_calls=" << numeric_prefill_stats.mxfp8_calls
                       << " mxfp8_rows=" << numeric_prefill_stats.mxfp8_rows
+                      << " nvfp4_calls=" << numeric_prefill_stats.nvfp4_calls
+                      << " nvfp4_rows=" << numeric_prefill_stats.nvfp4_rows
                       << " large_lt_calls="
                       << numeric_prefill_stats.large_lt_calls
                       << " cached_weight_capacity_bytes="
