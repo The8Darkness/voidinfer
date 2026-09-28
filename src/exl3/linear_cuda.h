@@ -271,6 +271,9 @@ public:
     // owns the stream ordering and closes the scope before the next layer.
     void begin_layer_reuse(std::size_t max_cached_bytes, bool allow_k5 = false);
     void end_layer_reuse() noexcept;
+    // Model layer of the active layer-major reuse scope (-1 outside one); the
+    // NVFP4 mode 3 policy keeps layers >= 56 on MXFP8.
+    void set_prefill_layer(int layer) noexcept;
     // Schedule one immutable K5 slab in the current layer's bounded reuse
     // slot. The next numeric forward joins the preparation before GEMM.
     bool prefetch_numeric_weight(const Exl3CudaLinearWeights& weights,

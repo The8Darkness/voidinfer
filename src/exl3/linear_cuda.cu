@@ -6040,6 +6040,7 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     bool large_lt_enabled = false;
     bool mxfp8_enabled = false;
     int nvfp4_mode = 0;
+    int prefill_layer = -1;
     float* nvfp4_scalars = nullptr;
     bool fused_original_enabled = false;
     bool original_gdn_mlp_cache_enabled = false;
@@ -6163,12 +6164,13 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
         (!mxfp8 || std::strcmp(mxfp8,"1")==0);
     // NVFP4 prefill numerical policy (default 2 = MLP gate/up/down only,
     // quality-gated; 0 = MXFP8 control; 1 = all admitted prefill projections,
-    // rejected on held-out quality). Requires the MXFP8 route.
+    // rejected on held-out quality: +0.039 overall, prose +0.068).
+    // Requires the MXFP8 route.
     const char* nvfp4=std::getenv("NINFER_EXL3_PREFILL_NVFP4");
     if(nvfp4 && std::strcmp(nvfp4,"0")!=0 && std::strcmp(nvfp4,"1")!=0 &&
-       std::strcmp(nvfp4,"2")!=0) {
+       std::strcmp(nvfp4,"2")!=0 && std::strcmp(nvfp4,"3")!=0) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0, 1 or 2");
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0, 1, 2 or 3");
     }
     impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 2) : 0;
     const char* packed_direct_k6 = std::getenv(
@@ -6369,8 +6371,13 @@ void Exl3CudaReconstructGemmWorkspace::begin_layer_reuse(
     }
 }
 
+void Exl3CudaReconstructGemmWorkspace::set_prefill_layer(int layer) noexcept {
+    if (impl_) impl_->prefill_layer = layer;
+}
+
 void Exl3CudaReconstructGemmWorkspace::end_layer_reuse() noexcept {
     if (!impl_) return;
+    impl_->prefill_layer = -1;
     if (impl_->weight_prefetch_stream) {
         for (const auto& slot : impl_->reuse_slots) {
             if (slot.prefetch_pending) {
@@ -7044,8 +7051,11 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const bool mlp_shape =
         (metadata.in_features == 5120 && metadata.out_features == 17408) ||
         (metadata.in_features == 17408 && metadata.out_features == 5120);
+    // Mode 3 mirrors the NInfer Qwen3.8 NVFP4 artifact: MLP layers 0..55.
     const bool nvfp4 = mxfp8 && (impl_->nvfp4_mode == 1 ||
-        (impl_->nvfp4_mode == 2 && mlp_shape));
+        (impl_->nvfp4_mode == 2 && mlp_shape) ||
+        (impl_->nvfp4_mode == 3 && mlp_shape && impl_->prefill_layer >= 0 &&
+         impl_->prefill_layer < 56));
     // NVFP4 slot: packed values (k*n/2), block scales (n x k/16), then the
     // FP32 weight global scale, all inside the FP16-sized reuse slot.
     const std::size_t nv_value_bytes =

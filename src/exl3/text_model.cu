@@ -8097,6 +8097,7 @@ void Exl3TextContext::append_prefill_layer_major(
         workspace.begin_layer_reuse(cache_budget,
             base_position+total>=8192 ||
             impl_->gdn_bulk_mlp_short_k5_enabled);
+        workspace.set_prefill_layer(layer);
         const auto execute_chunk=[&](int offset,int rows,
                 const Exl3GdnLayer::BulkPrefillBuffers* prepared) {
                 const int logical_position=base_position+offset;
