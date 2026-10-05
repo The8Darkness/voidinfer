@@ -3278,7 +3278,9 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         !shared_gateup_enabled_ && !small_m_fused_gate_up_transform_ &&
         linear_workspaces_[3]->forward_m1_gate_up_silu(*linear_workspaces_[4],
             weights_.gate,weights_.gate_metadata,weights_.up,weights_.up_metadata,
-            mlp_input,gate,up,act,stream);
+            mlp_input,gate,up,act,stream,
+            shared_down_enabled_?nullptr:&weights_.down,
+            shared_down_enabled_?nullptr:linear_workspaces_[5]);
     if (gdn_m1_gate_up_pair) {
         // This production-labeled route remains default-off and graph-safe:
         // all policy, geometry and storage were fixed during construction.
@@ -3385,7 +3387,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             act,down,rows,0,model_layer_,stream,Exl3TargetSharedFamily::down});
     if(!shared_down)project(linear_workspaces_[5], weights_.down, weights_.down_metadata, act, down,
                        Exl3TargetProjectionOperator::down,
-                       fused_gate_up?linear_workspaces_[5]->transformed_device():nullptr); exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post, down, final_output, rows * kHidden); check(cudaGetLastError(), "launch GDN final residual"); end(11);
+                       (fused_gate_up||merged_gate_up)?linear_workspaces_[5]->transformed_device():nullptr); exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post, down, final_output, rows * kHidden); check(cudaGetLastError(), "launch GDN final residual"); end(11);
     if (output != final_output) check(cudaMemcpyAsync(output, final_output, static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream), "copy GDN output");
     if (collect_stage_events) {
         record(total_end, stream); check(cudaEventSynchronize(total_end), "synchronize GDN timing");

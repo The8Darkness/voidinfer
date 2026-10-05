@@ -9131,7 +9131,9 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             !wide_prefill && !small_m_fused_gate_up_transform_ &&
             linear_workspaces_[4]->forward_m1_gate_up_silu(*linear_workspaces_[5],
                 weights_.gate,weights_.gate_metadata,weights_.up,weights_.up_metadata,
-                mlp_in,gp,up,act,stream);
+                mlp_in,gp,up,act,stream,
+                target_down_executor_enabled_?nullptr:&weights_.down,
+                target_down_executor_enabled_?nullptr:linear_workspaces_[6]);
         const bool paired_gate_up=!paired_m1_gate_up && !merged_gate_up && !can_share_target &&
             !profile && !projection_timing_ &&
             !projection_observer_ && linear_workspaces_[4]->forward_target_prefill_gate_up_pair(
@@ -9183,7 +9185,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             act,down,rows,position,model_layer_,stream,Exl3TargetSharedFamily::down});
     if(!shared_down)project(linear_workspaces_[6], weights_.down, weights_.down_metadata, act, down,
             Exl3TargetProjectionOperator::down,
-            fused_gate_up?linear_workspaces_[6]->transformed_device():nullptr);
+            (fused_gate_up||merged_gate_up)?linear_workspaces_[6]->transformed_device():nullptr);
     launch(cudaGetLastError(), "launch EXL3 down projection");
     exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post_resid, down, output,
         rows * kHidden);

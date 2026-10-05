@@ -719,7 +719,9 @@ public:
                                  const Exl3CudaLinearMetadata& up_metadata,
                                  const std::uint16_t* input,std::uint16_t* gate_output,
                                  std::uint16_t* up_output,std::uint16_t* activation,
-                                 cudaStream_t stream);
+                                 cudaStream_t stream,
+                                 const Exl3CudaLinearWeights* down_weights = nullptr,
+                                 Exl3CudaLinearWorkspace* down_workspace = nullptr);
 
     // Exact target-prefill fast path for a gate/up pair. Matrix-specific SUH
     // transforms share one launch and remain separate through the paired MMA.

@@ -3286,7 +3286,8 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_ou
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_gate_up_reduce_silu_kernel(
     const float* accum_gate,const float* accum_up,const std::uint16_t* svh_gate,
     const std::uint16_t* svh_up,std::uint16_t* gate,std::uint16_t* up,
-    std::uint16_t* activation,int output_features,int split_count) {
+    std::uint16_t* activation,int output_features,int split_count,
+    const std::uint16_t* down_suh,std::uint16_t* down_transformed) {
     EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
     const int block=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
@@ -3322,6 +3323,20 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_gate_up_reduce
     for(int j=0;j<4;++j)
         act[j]=__half_as_ushort(__float2half_rn((g[j]/(1.0f+expf(-g[j])))*u[j]));
     exl3_store_half4(activation+offset,act);
+    if(down_transformed) {
+        // The down projection's input Hadamard (input_hadamard_warp_kernel
+        // arithmetic) on the block this warp already holds.
+        std::uint16_t scale[4];
+        exl3_load_half4(down_suh+offset,scale);
+        float v[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) v[j]=half_product(act[j],scale[j]);
+        exl3_warp_butterflies(v,lane);
+        std::uint16_t result[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) result[j]=__half_as_ushort(__float2half_rn(v[j]*kHadamardScale));
+        exl3_store_half4(down_transformed+offset,result);
+    }
 }
 
 // One CTA owns a complete 128-column Hadamard group for up to eight rows.
@@ -9057,7 +9072,8 @@ bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
     const Exl3CudaLinearWeights& gate_weights,const Exl3CudaLinearMetadata& gate_metadata,
     const Exl3CudaLinearWeights& up_weights,const Exl3CudaLinearMetadata& up_metadata,
     const std::uint16_t* input,std::uint16_t* gate_output,std::uint16_t* up_output,
-    std::uint16_t* activation,cudaStream_t stream) {
+    std::uint16_t* activation,cudaStream_t stream,
+    const Exl3CudaLinearWeights* down_weights,Exl3CudaLinearWorkspace* down_workspace) {
     if(!coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
@@ -9071,6 +9087,9 @@ bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
         return false;
     const int split_count=coherent_wide_k6_split_count(1);
     if(split_count!=up_workspace.coherent_wide_k6_split_count(1))return false;
+    if(down_workspace && (!down_weights || !down_weights->suh ||
+        down_workspace->in_features_!=out_features_ || !down_workspace->transformed_))
+        return false;
     // Ordered layer projections may share one accumulation buffer; the up
     // partials then follow the gate planes.
     const std::size_t planes=static_cast<std::size_t>(split_count)*out_features_;
@@ -9103,7 +9122,9 @@ bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
     exl3_launch_pdl(exl3_gate_up_reduce_silu_kernel,
         dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
         dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,up_accum,
-        gate_weights.svh,up_weights.svh,gate_output,up_output,activation,out_features_,split_count);
+        gate_weights.svh,up_weights.svh,gate_output,up_output,activation,out_features_,split_count,
+        down_workspace?down_weights->suh:nullptr,
+        down_workspace?down_workspace->transformed_:nullptr);
     cuda_check(cudaGetLastError(),"launch merged M1 gate/up reduction and activation");
     coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
     coherent_wide_k6_rows_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
