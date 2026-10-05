@@ -2011,7 +2011,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                 }
                 for(int rows:{1,8,16})
                     require(ninfer::exl3::exl3_exact_attention_score_bytes(rows,65536)==
-                        static_cast<std::size_t>(rows)*24*65536*4,"exact attention scratch extent");
+                        static_cast<std::size_t>(rows)*100*65536*4,"exact attention scratch extent");
                 for(int rows:{-1,0,17}) {
                     bool refused=false;
                     try{ninfer::exl3::exl3_exact_attention_score_bytes(rows,64);}catch(const std::invalid_argument&){refused=true;}

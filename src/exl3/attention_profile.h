@@ -21,7 +21,10 @@ inline constexpr Exl3SegmentedAttentionRoute exl3_segmented_attention_route(
 inline std::size_t exl3_exact_attention_score_bytes(int rows,int capacity) {
     if(rows<1 || rows>16 || capacity<rows)
         throw std::invalid_argument("exact attention scratch row/capacity geometry");
-    const auto row_bytes=static_cast<std::size_t>(rows)*24*sizeof(float);
+    // 100 floats per row and key: the 24 query-head score plane, or the
+    // 64-key flash-segment slots (6 heads x (256 values + 2 stats) x 4 KV
+    // heads / 64 keys = 96.75) so verifier rows keep 64-key segments.
+    const auto row_bytes=static_cast<std::size_t>(rows)*100*sizeof(float);
     if(static_cast<std::size_t>(capacity)>std::numeric_limits<std::size_t>::max()/row_bytes)
         throw std::overflow_error("exact attention scratch byte extent");
     return row_bytes*static_cast<std::size_t>(capacity);
