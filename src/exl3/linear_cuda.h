@@ -696,7 +696,8 @@ public:
                                   int rows,
                                   cudaStream_t stream = nullptr,
                                   Exl3CudaLinearAdmission admission =
-                                      Exl3CudaLinearAdmission::ordinary);
+                                      Exl3CudaLinearAdmission::ordinary,
+                                  const std::uint16_t* raw_input = nullptr);
 
     // Exact target-prefill fast path for a gate/up pair. Matrix-specific SUH
     // transforms share one launch and remain separate through the paired MMA.
