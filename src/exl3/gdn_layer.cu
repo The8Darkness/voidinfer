@@ -3398,9 +3398,14 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         preserve_m1_topology && !wide_prefill && rows>=1 && rows<=8 &&
         shared_gateup_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
             act,down,rows,0,model_layer_,stream,Exl3TargetSharedFamily::down});
+    if(!shared_down && rows==1 && !profile && !projection_timing_ && !projection_observer_)
+        linear_workspaces_[5]->arm_residual(post,final_output);
     if(!shared_down)project(linear_workspaces_[5], weights_.down, weights_.down_metadata, act, down,
                        Exl3TargetProjectionOperator::down,
-                       (fused_gate_up||merged_gate_up)?linear_workspaces_[5]->transformed_device():nullptr); exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post, down, final_output, rows * kHidden); check(cudaGetLastError(), "launch GDN final residual"); end(11);
+                       (fused_gate_up||merged_gate_up)?linear_workspaces_[5]->transformed_device():nullptr);
+    if(!linear_workspaces_[5]->take_residual_applied())
+        exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post, down, final_output, rows * kHidden);
+    check(cudaGetLastError(), "launch GDN final residual"); end(11);
     if (output != final_output) check(cudaMemcpyAsync(output, final_output, static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream), "copy GDN output");
     if (collect_stage_events) {
         record(total_end, stream); check(cudaEventSynchronize(total_end), "synchronize GDN timing");

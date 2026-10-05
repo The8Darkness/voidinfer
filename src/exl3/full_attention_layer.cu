@@ -9183,10 +9183,13 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         target_shared_admission(Exl3TargetSharedFamily::down,weights_.down_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
             act,down,rows,position,model_layer_,stream,Exl3TargetSharedFamily::down});
+    if(!shared_down && rows==1 && !profile && !projection_timing_ && !projection_observer_)
+        linear_workspaces_[6]->arm_residual(post_resid,output);
     if(!shared_down)project(linear_workspaces_[6], weights_.down, weights_.down_metadata, act, down,
             Exl3TargetProjectionOperator::down,
             (fused_gate_up||merged_gate_up)?linear_workspaces_[6]->transformed_device():nullptr);
     launch(cudaGetLastError(), "launch EXL3 down projection");
+    if(!linear_workspaces_[6]->take_residual_applied())
     exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post_resid, down, output,
         rows * kHidden);
     launch(cudaGetLastError(), "launch EXL3 final residual"); end(12);

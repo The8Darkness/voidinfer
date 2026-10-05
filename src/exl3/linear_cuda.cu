@@ -1371,6 +1371,40 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) prefill_reduce_outp
     exl3_store_half4(output+row*output_features+offset,result);
 }
 
+// prefill_reduce_output_warp_kernel<false> followed by residual_kernel:
+// output = reduced projection, residual_out = half(left + output).
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) reduce_output_residual_warp_kernel(
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int output_features,
+    int split_count,const std::uint16_t* left,std::uint16_t* residual_out) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int block=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(block>=output_features/kHadamard) return;
+    const int offset=block*kHadamard+lane*4;
+    const float4 first=*reinterpret_cast<const float4*>(accum+offset);
+    float v[4]={first.x,first.y,first.z,first.w};
+    for(int split=1;split<split_count;++split) {
+        const float4 plane=*reinterpret_cast<const float4*>(
+            accum+static_cast<std::size_t>(split)*output_features+offset);
+        v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
+    }
+    std::uint16_t scale[4],base[4];
+    exl3_load_half4(svh+offset,scale);
+    exl3_load_half4(left+offset,base);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4],sum[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+        sum[j]=__half_as_ushort(__float2half_rn(__half2float(__ushort_as_half(base[j]))+
+                                                __half2float(__ushort_as_half(result[j]))));
+    }
+    exl3_store_half4(output+offset,result);
+    exl3_store_half4(residual_out+offset,sum);
+}
+
 template<bool ShuffleLocal=false,bool MinimalBarriers=false,
          bool PrefetchSplitPlanes=false,bool Fp16GemmDestination=false>
 void launch_prefill_reduce_output(cudaStream_t stream,const float* accum,
@@ -11652,7 +11686,15 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down shared-row partials");
+        if (rows == 1 && pending_residual_left_ && out_features_ % kHadamard == 0) {
+            exl3_launch_pdl(reduce_output_residual_warp_kernel,
+                dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,out_features_,
+                split_count,pending_residual_left_,pending_residual_out_);
+            residual_applied_=true;
+        } else
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
+        pending_residual_left_=nullptr; pending_residual_out_=nullptr;
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down row reduction/output");
         process_coherent_down_k6_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -11670,7 +11712,15 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down shared-row partials");
+        if (rows == 1 && pending_residual_left_ && out_features_ % kHadamard == 0) {
+            exl3_launch_pdl(reduce_output_residual_warp_kernel,
+                dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,out_features_,
+                split_count,pending_residual_left_,pending_residual_out_);
+            residual_applied_=true;
+        } else
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
+        pending_residual_left_=nullptr; pending_residual_out_=nullptr;
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down row reduction/output");
         process_coherent_down_k7_calls_.fetch_add(1, std::memory_order_relaxed);

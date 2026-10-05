@@ -715,6 +715,18 @@ public:
     // Single-row MLP gate/up/SiLU in one coherent producer launch plus one
     // reduction/activation launch. Returns false (nothing submitted) when the
     // pair is not on the fused-input coherent wide route.
+    // Single-row MLP down only: the next coherent down projection also writes
+    // residual_out = half(left + projection) in its reduction kernel. The
+    // caller checks take_residual_applied() and skips its residual launch.
+    void arm_residual(const std::uint16_t* left,std::uint16_t* residual_out) noexcept {
+        pending_residual_left_=left; pending_residual_out_=residual_out; residual_applied_=false;
+    }
+    bool take_residual_applied() noexcept {
+        const bool applied=residual_applied_;
+        residual_applied_=false; pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        return applied;
+    }
+
     // Two same-input single-row projections (e.g. GDN qkv and z) in one
     // coherent producer launch and one reduction launch; false when ineligible.
     // Optional GDN control projections (one extra CTA per head, the
@@ -1421,6 +1433,9 @@ private:
     bool draft_prefill_fc_enabled_ = false;
     std::uint16_t* transformed_ = nullptr;
     float* accum_ = nullptr;
+    const std::uint16_t* pending_residual_left_ = nullptr;
+    std::uint16_t* pending_residual_out_ = nullptr;
+    bool residual_applied_ = false;
     bool accum_owned_ = true;
     bool transformed_owned_ = true;
     std::size_t workspace_bytes_ = 0;
