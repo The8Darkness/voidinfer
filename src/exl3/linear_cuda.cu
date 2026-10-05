@@ -9125,16 +9125,29 @@ bool Exl3CudaLinearWorkspace::forward_m1_pair(
     if(!coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
-       first_metadata.K!=second_metadata.K || first_metadata.K<5 || first_metadata.K>7 ||
+       first_metadata.K!=second_metadata.K || first_metadata.K<5 || first_metadata.K>8 ||
        in_features_!=second_workspace.in_features_ ||
        out_features_%kHadamard!=0 || second_workspace.out_features_%kHadamard!=0 ||
-       !coherent_wide_k6_candidate(first_metadata,1,Exl3CudaLinearAdmission::ordinary) ||
-       !second_workspace.coherent_wide_k6_candidate(second_metadata,1,Exl3CudaLinearAdmission::ordinary) ||
        !first_weights.suh || !first_weights.svh || !second_weights.suh || !second_weights.svh ||
        !input || !first_output || !second_output)
         return false;
-    const int split_count=coherent_wide_k6_split_count(1);
-    if(split_count!=second_workspace.coherent_wide_k6_split_count(1))return false;
+    // Both projections must take the same coherent route and split: the wide
+    // producer (split 10) or the narrow K/V split-plane producer.
+    const auto route_split=[](Exl3CudaLinearWorkspace& workspace,
+                              const Exl3CudaLinearMetadata& metadata) {
+        if(const int kv=coherent_kv_split_for(metadata,1,Exl3CudaLinearAdmission::ordinary,
+               workspace.in_features_,workspace.out_features_,
+               workspace.accumulation_capacity_bytes_))
+            return -kv;
+        if(metadata.K<=7 &&
+           workspace.coherent_wide_k6_candidate(metadata,1,Exl3CudaLinearAdmission::ordinary))
+            return workspace.coherent_wide_k6_split_count(1);
+        return 0;
+    };
+    const int first_route=route_split(*this,first_metadata);
+    if(!first_route || first_route!=route_split(second_workspace,second_metadata))return false;
+    const bool kv_route=first_route<0;
+    const int split_count=kv_route?-first_route:first_route;
     const int out_a=out_features_, out_b=second_workspace.out_features_;
     float* second_accum=second_workspace.accum_;
     if(second_accum==accum_) {
@@ -9161,7 +9174,8 @@ bool Exl3CudaLinearWorkspace::forward_m1_pair(
     };
     if(first_metadata.K==5) launch(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>);
     else if(first_metadata.K==6) launch(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>);
-    else launch(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>);
+    else if(first_metadata.K==7) launch(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>);
+    else launch(exl3_gemm_m1_fused_input_dual_kernel<8,false,false,stages,warps,per>);
     cuda_check(cudaGetLastError(),"launch merged M1 pair producers");
     const int blocks=(out_a+out_b)/kHadamard;
     exl3_launch_pdl(exl3_pair_reduce_output_kernel,
@@ -9169,7 +9183,7 @@ bool Exl3CudaLinearWorkspace::forward_m1_pair(
         dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,first_weights.svh,first_output,out_a,
         second_accum,second_weights.svh,second_output,out_b,split_count);
     cuda_check(cudaGetLastError(),"launch merged M1 pair reduction");
-    for(auto* workspace:{this,&second_workspace}) {
+    if(!kv_route) for(auto* workspace:{this,&second_workspace}) {
         workspace->coherent_wide_k6_calls_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
         workspace->coherent_wide_k6_rows_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
         if(split_count==10)

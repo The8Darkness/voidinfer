@@ -7663,7 +7663,15 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             weights_.k_metadata.out_features==kKVProjection &&
             weights_.v_metadata.out_features==kKVProjection;
         begin(2);
-        if(m1_kv_pair) {
+        const bool merged_kv=!m1_kv_pair && rows==1 && !can_share_target && !oscar_ &&
+            !profile && !projection_timing_ && !projection_observer_ && !wide_prefill &&
+            linear_workspaces_[1] && linear_workspaces_[2] &&
+            linear_workspaces_[1]->forward_m1_pair(*linear_workspaces_[2],
+                weights_.k,weights_.k_metadata,kp,weights_.v,weights_.v_metadata,vp,
+                input_norm,stream);
+        if(merged_kv) {
+            launch(cudaGetLastError(),"launch merged EXL3 K/V projection");
+        } else if(m1_kv_pair) {
             if(fast_same_weights_fp16kv_m1_kv_wide_pair_)
                 linear_workspaces_[1]->forward_target_m1_kv_wide_pair_for_test(
                     *linear_workspaces_[2],weights_.k,weights_.k_metadata,
@@ -7684,7 +7692,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         }
         end(2);
         begin(3);
-        if(!m1_kv_pair) {
+        if(!m1_kv_pair && !merged_kv) {
             const bool shared_v=can_share_target && target_kv_executor_enabled_ &&
                 target_shared_admission(Exl3TargetSharedFamily::v,weights_.v_metadata).has_value() &&
                 target_q_executor_(Exl3TargetQContinuation{weights_.v,weights_.v_metadata,
