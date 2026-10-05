@@ -702,6 +702,16 @@ public:
     // Single-row MLP gate/up/SiLU in one coherent producer launch plus one
     // reduction/activation launch. Returns false (nothing submitted) when the
     // pair is not on the fused-input coherent wide route.
+    // Two same-input single-row projections (e.g. GDN qkv and z) in one
+    // coherent producer launch and one reduction launch; false when ineligible.
+    bool forward_m1_pair(Exl3CudaLinearWorkspace& second_workspace,
+                         const Exl3CudaLinearWeights& first_weights,
+                         const Exl3CudaLinearMetadata& first_metadata,
+                         std::uint16_t* first_output,
+                         const Exl3CudaLinearWeights& second_weights,
+                         const Exl3CudaLinearMetadata& second_metadata,
+                         std::uint16_t* second_output,const std::uint16_t* input,
+                         cudaStream_t stream);
     bool forward_m1_gate_up_silu(Exl3CudaLinearWorkspace& up_workspace,
                                  const Exl3CudaLinearWeights& gate_weights,
                                  const Exl3CudaLinearMetadata& gate_metadata,

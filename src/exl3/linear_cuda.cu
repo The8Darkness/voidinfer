@@ -3227,19 +3227,57 @@ template <int Bits, bool K7ThreeWord, bool FastK6Decode, int DeepStages, int War
 __global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_input,
     const std::uint16_t* suh_a, const std::uint16_t* trellis_a, const std::int32_t* mul1_a,
     float* accum_a, const std::uint16_t* suh_b, const std::uint16_t* trellis_b,
-    const std::int32_t* mul1_b, float* accum_b, int input_features, int output_features,
-    int split_count, int grid_a) {
+    const std::int32_t* mul1_b, float* accum_b, int input_features, int output_features_a,
+    int output_features_b, int split_count, int grid_a) {
     const int block = static_cast<int>(blockIdx.x);
     if (block < grid_a)
         exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
             FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
                 block, raw_input, trellis_a, mul1_a, accum_a, 1, input_features,
-                output_features, split_count, raw_input, suh_a);
+                output_features_a, split_count, raw_input, suh_a);
     else
         exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
             FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
                 block - grid_a, raw_input, trellis_b, mul1_b, accum_b, 1, input_features,
-                output_features, split_count, raw_input, suh_b);
+                output_features_b, split_count, raw_input, suh_b);
+}
+
+// Reduction of two independent single-row split-plane sets (blocks of the
+// first matrix, then of the second); per block exactly
+// prefill_reduce_output_warp_kernel<false>.
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_output_kernel(
+    const float* accum_a,const std::uint16_t* svh_a,std::uint16_t* output_a,int features_a,
+    const float* accum_b,const std::uint16_t* svh_b,std::uint16_t* output_b,int features_b,
+    int split_count) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    int block=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    const int blocks_a=features_a/kHadamard;
+    const float* accum=accum_a; const std::uint16_t* svh=svh_a; std::uint16_t* output=output_a;
+    int features=features_a;
+    if(block>=blocks_a) {
+        block-=blocks_a; accum=accum_b; svh=svh_b; output=output_b; features=features_b;
+        if(block>=features_b/kHadamard) return;
+    }
+    const int offset=block*kHadamard+lane*4;
+    const float4 first=*reinterpret_cast<const float4*>(accum+offset);
+    float v[4]={first.x,first.y,first.z,first.w};
+    for(int split=1;split<split_count;++split) {
+        const float4 plane=*reinterpret_cast<const float4*>(
+            accum+static_cast<std::size_t>(split)*features+offset);
+        v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
+    }
+    std::uint16_t scale[4];
+    exl3_load_half4(svh+offset,scale);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+    }
+    exl3_store_half4(output+offset,result);
 }
 
 // Reduces both split-plane sets exactly as prefill_reduce_output_warp_kernel
@@ -9056,7 +9094,7 @@ bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
         exl3_launch_pdl(kernel,dim3(2*grid),dim3(warps*32),shared,stream,input,
             gate_weights.suh,gate_weights.trellis,gate_weights.mul1,accum_,
             up_weights.suh,up_weights.trellis,up_weights.mul1,up_accum,
-            in_features_,out_features_,split_count,grid);
+            in_features_,out_features_,out_features_,split_count,grid);
     };
     if(gate_metadata.K==5) launch(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>);
     else if(gate_metadata.K==6) launch(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>);
@@ -9074,6 +9112,68 @@ bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
     if(split_count==10) {
         coherent_wide_k6_split10_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
         up_workspace.coherent_wide_k6_split10_calls_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool Exl3CudaLinearWorkspace::forward_m1_pair(
+    Exl3CudaLinearWorkspace& second_workspace,
+    const Exl3CudaLinearWeights& first_weights,const Exl3CudaLinearMetadata& first_metadata,
+    std::uint16_t* first_output,
+    const Exl3CudaLinearWeights& second_weights,const Exl3CudaLinearMetadata& second_metadata,
+    std::uint16_t* second_output,const std::uint16_t* input,cudaStream_t stream) {
+    if(!coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
+       coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
+       (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
+       first_metadata.K!=second_metadata.K || first_metadata.K<5 || first_metadata.K>7 ||
+       in_features_!=second_workspace.in_features_ ||
+       out_features_%kHadamard!=0 || second_workspace.out_features_%kHadamard!=0 ||
+       !coherent_wide_k6_candidate(first_metadata,1,Exl3CudaLinearAdmission::ordinary) ||
+       !second_workspace.coherent_wide_k6_candidate(second_metadata,1,Exl3CudaLinearAdmission::ordinary) ||
+       !first_weights.suh || !first_weights.svh || !second_weights.suh || !second_weights.svh ||
+       !input || !first_output || !second_output)
+        return false;
+    const int split_count=coherent_wide_k6_split_count(1);
+    if(split_count!=second_workspace.coherent_wide_k6_split_count(1))return false;
+    const int out_a=out_features_, out_b=second_workspace.out_features_;
+    float* second_accum=second_workspace.accum_;
+    if(second_accum==accum_) {
+        const std::size_t total=static_cast<std::size_t>(split_count)*(out_a+out_b)*sizeof(float);
+        if(accumulation_capacity_bytes_<total)return false;
+        second_accum=accum_+static_cast<std::size_t>(split_count)*out_a;
+    }
+    constexpr int stages=4,warps=4,per=2;
+    const int grid_a=out_a/(16*warps)*split_count, grid_b=out_b/(16*warps)*split_count;
+    const int tiles_per_split=(in_features_/16+split_count-1)/split_count;
+    const std::size_t shared=
+        static_cast<std::size_t>(stages*per)*256u*sizeof(half)+
+        static_cast<std::size_t>(stages*per)*warps*16u*first_metadata.K*sizeof(std::uint16_t)+
+        16u*warps*16u*sizeof(float)+
+        static_cast<std::size_t>((tiles_per_split*16+kHadamard-1)/kHadamard+1)*kHadamard*sizeof(half);
+    const auto launch=[&](auto kernel) {
+        if(shared>48u*1024u)
+            cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shared)),"set merged pair shared memory");
+        exl3_launch_pdl(kernel,dim3(grid_a+grid_b),dim3(warps*32),shared,stream,input,
+            first_weights.suh,first_weights.trellis,first_weights.mul1,accum_,
+            second_weights.suh,second_weights.trellis,second_weights.mul1,second_accum,
+            in_features_,out_a,out_b,split_count,grid_a);
+    };
+    if(first_metadata.K==5) launch(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>);
+    else if(first_metadata.K==6) launch(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>);
+    else launch(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>);
+    cuda_check(cudaGetLastError(),"launch merged M1 pair producers");
+    const int blocks=(out_a+out_b)/kHadamard;
+    exl3_launch_pdl(exl3_pair_reduce_output_kernel,
+        dim3((blocks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+        dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,first_weights.svh,first_output,out_a,
+        second_accum,second_weights.svh,second_output,out_b,split_count);
+    cuda_check(cudaGetLastError(),"launch merged M1 pair reduction");
+    for(auto* workspace:{this,&second_workspace}) {
+        workspace->coherent_wide_k6_calls_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+        workspace->coherent_wide_k6_rows_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+        if(split_count==10)
+            workspace->coherent_wide_k6_split10_calls_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
     }
     return true;
 }

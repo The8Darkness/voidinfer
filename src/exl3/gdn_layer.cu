@@ -3042,6 +3042,13 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             (void)cudaStreamWaitEvent(stream, graph_qkvz_concurrency_.z_done, 0);
             throw;
         }
+    } else if (rows == 1 && !profile && !projection_timing_ && !projection_observer_ &&
+               !wide_prefill &&
+               linear_workspaces_[0]->forward_m1_pair(*linear_workspaces_[1],
+                   weights_.qkv,weights_.qkv_metadata,qkv,weights_.z,weights_.z_metadata,z,
+                   h,stream)) {
+        begin(1); end(1); begin(2); end(2);
+        begin(3); launch_control(); end(3);
     } else {
         begin(1); project(linear_workspaces_[0], weights_.qkv, weights_.qkv_metadata, h, qkv,
                           Exl3TargetProjectionOperator::qkv); end(1);
