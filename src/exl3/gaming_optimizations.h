@@ -30,8 +30,13 @@ struct Exl3GamingOptions {
     }
     static Exl3GamingOptions from_environment() {
         Exl3GamingOptions result;
-        for(unsigned i=0;i<gopt_flags.size();++i)
-            result.enabled[i]=parse(std::getenv(gopt_flags[i]));
+        for(unsigned i=0;i<gopt_flags.size();++i) {
+            const char* value=std::getenv(gopt_flags[i]);
+            // GOPT-002 (convolution trace published from the convolution
+            // kernel, bit-identical) is the measured default.
+            result.enabled[i]=!value && i==static_cast<unsigned>(Gopt::GdnConvTrace)
+                ? true : parse(value);
+        }
         // Both consume the same attn-finish residual. Test them separately.
         if(result[Gopt::DraftConvResidual] && result[Gopt::DraftResidualNorm])
             throw std::invalid_argument("GOPT-007 and GOPT-008 are exclusive");
