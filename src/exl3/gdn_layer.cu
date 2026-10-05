@@ -278,6 +278,58 @@ __global__ void transpose_bf16_to_f16_kernel(const std::uint16_t* input, std::ui
         __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(input)[index])));
 }
 
+
+// Fused GDN output stage (NINFER_EXL3_GDN_FUSED_GATED_NORM, default 1; 0 = the
+// three-kernel control): FP16 z is rounded to BF16, the per-head gated RMSNorm
+// is the ops::rmsnorm_warp_bf16x2_kernel<Gated> arithmetic (same reduction
+// order, rsqrtf, x*inv*w*silu(z), BF16 rounding), and the BF16 result is
+// written as the FP16 O-projection input. Bit-identical to the control.
+__global__ void __launch_bounds__(512) gdn_gated_norm_f16io_kernel(
+    const __nv_bfloat162* core,const half2* z,const __nv_bfloat162* weight,
+    half2* output,int head_rows,float eps) {
+    EXL3_PDL_SMALL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int row=static_cast<int>(blockIdx.x)*16+(static_cast<int>(threadIdx.x)>>5);
+    if(row>=head_rows) return;
+    const std::size_t base=static_cast<std::size_t>(row)*64;
+    __nv_bfloat162 values[2];
+    float sum=0.0f;
+    #pragma unroll
+    for(int k=0;k<2;++k) {
+        values[k]=core[base+lane+32*k];
+        const float2 xf=__bfloat1622float2(values[k]);
+        sum+=xf.x*xf.x+xf.y*xf.y;
+    }
+    #pragma unroll
+    for(int offset=16;offset>0;offset>>=1) sum+=__shfl_down_sync(0xffffffffu,sum,offset);
+    float inv=lane==0?rsqrtf(sum/128.0f+eps):0.0f;
+    inv=__shfl_sync(0xffffffffu,inv,0);
+    #pragma unroll
+    for(int k=0;k<2;++k) {
+        const int pair=lane+32*k;
+        const float2 xf=__bfloat1622float2(values[k]);
+        const float2 wf=__bfloat1622float2(weight[pair]);
+        const float2 zh=__half22float2(z[base+pair]);
+        const float zx=__bfloat162float(__float2bfloat16_rn(zh.x));
+        const float zy=__bfloat162float(__float2bfloat16_rn(zh.y));
+        float vx=xf.x*inv*wf.x; vx*=zx/(1.0f+expf(-zx));
+        float vy=xf.y*inv*wf.y; vy*=zy/(1.0f+expf(-zy));
+        const __nv_bfloat162 rounded=__floats2bfloat162_rn(vx,vy);
+        output[base+pair]=__floats2half2_rn(__bfloat162float(rounded.x),
+                                            __bfloat162float(rounded.y));
+    }
+}
+
+static bool gdn_fused_gated_norm_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_FUSED_GATED_NORM");
+        if(!value || std::strcmp(value,"1")==0) return true;
+        if(std::strcmp(value,"0")==0) return false;
+        throw std::invalid_argument("NINFER_EXL3_GDN_FUSED_GATED_NORM must be 0 or 1");
+    }();
+    return enabled;
+}
+
 __global__ void gopt_gdn_output_pack_kernel(const std::uint16_t* core,
     const std::uint16_t* norm,std::uint16_t* trace,std::uint16_t* projection,int count) {
     const int i=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;
@@ -3038,7 +3090,9 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         exl3_launch_small(copy_conv_state_trace_kernel,dim3((kConvStateElements + 255) / 256),dim3(256),0,stream,conv_state_, conv_state_trace_);
     if (!fast_same_weights_fp16kv_gdn_decode_conv && !conv_tiled_packed)
         exl3_launch_small(pack_qkv_bf16_kernel,dim3((rows * kQkv + 255) / 256),dim3(256),0,stream,q, k, v, conv_output, rows);
-    exl3_launch_small(convert_f16_to_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,z, z_bf16, rows * kZ);
+    const bool fused_gated_norm=gdn_fused_gated_norm_enabled() && !gaming_[Gopt::GdnOutputPack];
+    if(!fused_gated_norm)
+        exl3_launch_small(convert_f16_to_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,z, z_bf16, rows * kZ);
     check(cudaGetLastError(), "launch GDN convolution staging"); end(4);
     begin(5);
     // Diagnostic only: sample the reached recurrence on the unchanged Fast90
@@ -3142,6 +3196,14 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         cudaEventDestroy(recurrence_end);
     }
     begin(6);
+    if(fused_gated_norm) {
+        if (!wide_prefill)
+            exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
+        exl3_launch_small(gdn_gated_norm_f16io_kernel,dim3((rows*kHeads+15)/16),dim3(512),0,stream,
+            reinterpret_cast<const __nv_bfloat162*>(core),reinterpret_cast<const half2*>(z),
+            reinterpret_cast<const __nv_bfloat162*>(weights_.gdn_norm),
+            reinterpret_cast<half2*>(o_input),rows*kHeads,kRmsEps);
+    } else {
     Tensor tz(z_bf16, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tcore(core, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tnorm(gdn_norm, DType::BF16, {kHeadDim, kHeads, rows});
     Tensor nw(const_cast<std::uint16_t*>(weights_.gdn_norm), DType::BF16, {kHeadDim});
     ninfer::ops::gated_rmsnorm(tcore, nw, tz, kRmsEps, tnorm, stream);
@@ -3155,6 +3217,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         if (!wide_prefill)
             exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
         exl3_launch_small(transpose_bf16_to_f16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,gdn_norm, o_input, rows, kZ);
+    }
     }
     check(cudaGetLastError(), "launch GDN gated norm staging"); end(6);
     begin(7); project(linear_workspaces_[2], weights_.o, weights_.o_metadata, o_input, o,
