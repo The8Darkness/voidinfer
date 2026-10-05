@@ -1237,6 +1237,7 @@ struct Exl3TextContext::Impl {
     bool gdn_bulk_mlp_short_k5_enabled = false;
     bool fast_wmma32_split2_enabled = false;
     int fast_wmma32_split_count = 0;
+    int fast_wmma32_split_capacity = 0;
     int gdn_bulk_capacity = 0;
     std::shared_ptr<DeviceAllocation> host_layer_k, host_layer_v;
     std::shared_ptr<Exl3AttentionStageStorage> attention_stage_storage;
@@ -4466,6 +4467,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             "WMMA32 split2 and split4 are exclusive");
     impl->fast_wmma32_split_count=split4_enabled?4:
         (impl->fast_wmma32_split2_enabled?2:0);
+    // The FA2 prefill route (same fast scope) uses four FP32 partial planes.
+    impl->fast_wmma32_split_capacity=
+        fast_same_weights_fp16kv_scope && exl3_fa2_prefill_enabled() ? 4 :
+        impl->fast_wmma32_split_count;
     require(!impl->gdn_bulk_prefill_enabled || !impl->gdn_bulk_mlp_enabled,
             "GDN bulk prefix and MLP are isolated candidates");
     impl->gdn_bulk_capacity=impl->gdn_bulk_mlp_enabled
@@ -4555,13 +4560,13 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             allocate(bulk_rows*17408*sizeof(std::uint16_t),
                 reinterpret_cast<void**>(&impl->gdn_mlp_up),"allocate GDN bulk up");
         }
-        if (impl->fast_wmma32_split_count) {
+        if (impl->fast_wmma32_split_capacity) {
             constexpr std::size_t rows=1024;
-            allocate(static_cast<std::size_t>(impl->fast_wmma32_split_count)*
+            allocate(static_cast<std::size_t>(impl->fast_wmma32_split_capacity)*
                 rows*kQHeads*kHeadDim*sizeof(float),
                 reinterpret_cast<void**>(&impl->fast_wmma32_split2_output),
                 "allocate WMMA32 split FP32 partial output");
-            allocate(static_cast<std::size_t>(impl->fast_wmma32_split_count)*
+            allocate(static_cast<std::size_t>(impl->fast_wmma32_split_capacity)*
                 rows*kQHeads*2*sizeof(float),
                 reinterpret_cast<void**>(&impl->fast_wmma32_split2_stats),
                 "allocate WMMA32 split FP32 max and sum");
@@ -5278,11 +5283,11 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 numeric_attention_splitk_workspace,
                 numeric_attention_splitk_workspace_bytes,
                 numeric_attention_splitk_enabled);
-            if(impl->fast_wmma32_split_count)
+            if(impl->fast_wmma32_split_capacity)
                 impl->full_layers[layer]->set_fast_wmma32_split2_workspace(
                     impl->fast_wmma32_split2_output,
                     impl->fast_wmma32_split2_stats,1024,
-                    impl->fast_wmma32_split_count);
+                    impl->fast_wmma32_split_count,impl->fast_wmma32_split_capacity);
         } else {
             const auto layer_requirement=layer_requirements[layer];
             const auto expected_layer_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(

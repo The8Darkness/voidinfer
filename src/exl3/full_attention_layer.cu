@@ -5748,6 +5748,230 @@ __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_pr
     }
 }
 
+
+// FA2-style GQA-6 prefill attention (NINFER_EXL3_FA2_PREFILL, default 1; 0 =
+// the register WMMA32 route). Eight warps cover two query heads x 64 rows and
+// share every 32-key K/V tile; Q A-fragments stay in registers; K/V tiles are
+// double buffered with cp.async; causal masking only on diagonal tiles; row
+// sums come from the register P values. Chunks whose causal extent reaches
+// 2048 keys split the key range four ways (longest row blocks first) and merge
+// through attention_wmma32_split_merge_kernel. Numerical profile: FP16 Q/K/V
+// and P, FP32 scores/accumulators; differs from the WMMA32 route only in FP32
+// summation order.
+namespace fa2_prefill {
+constexpr int kStride=kHeadDim+8;
+constexpr int BM=64, BN=32;
+constexpr int kStage=2*BN*kStride; // halfs (K then V)
+constexpr std::size_t smem_bytes(){ return 2u*kStage*sizeof(half); }
+__device__ __forceinline__ void cp16(void* dst,const void* src,bool valid){
+  const unsigned d=static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"::"r"(d),"l"(src),"r"(valid?16:0));
+}
+__device__ __forceinline__ void commit(){ asm volatile("cp.async.commit_group;\n"); }
+template<int N> __device__ __forceinline__ void wait(){ asm volatile("cp.async.wait_group %0;\n"::"n"(N)); }
+template<int S>
+__global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,std::uint16_t* output,int rows,int base,int capacity,
+    float* split_output,float* split_stats){
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  half* sm=reinterpret_cast<half*>(smem_raw);
+  const int query_base=(static_cast<int>(gridDim.x)-1-static_cast<int>(blockIdx.x))*BM;
+  const int kv_head=blockIdx.y;
+  const int head_group=blockIdx.z/S, split=blockIdx.z%S;
+  const int tid=threadIdx.x, warp=tid>>5, lane=tid&31;
+  const int head_local=warp>>2, m_base=(warp&3)*16;
+  const int g=lane>>2, t=lane&3;
+  const int row0=m_base+g, row1=row0+8;
+  const int q_head=kv_head*(kQHeads/kKVHeads)+head_group*2+head_local;
+  const int active_rows=min(BM,rows-query_base);
+  if(active_rows<=0) return;
+  const int maximum_count=min(base+query_base+active_rows,capacity);
+  const int tiles=(maximum_count+BN-1)/BN;
+  const int per=(tiles+S-1)/S;
+  const int t_begin=split*per, t_end=min(tiles,t_begin+per);
+  unsigned qa[kHeadDim/16][4];
+  {
+    const bool l0=row0<active_rows, l1=row1<active_rows;
+    const unsigned* q0=reinterpret_cast<const unsigned*>(q+(static_cast<std::size_t>(query_base+(l0?row0:0))*kQHeads+q_head)*kHeadDim+2*t);
+    const unsigned* q1=reinterpret_cast<const unsigned*>(q+(static_cast<std::size_t>(query_base+(l1?row1:0))*kQHeads+q_head)*kHeadDim+2*t);
+    #pragma unroll
+    for(int kk=0;kk<kHeadDim/16;++kk){
+      qa[kk][0]=l0?q0[kk*8]:0u; qa[kk][1]=l1?q1[kk*8]:0u;
+      qa[kk][2]=l0?q0[kk*8+4]:0u; qa[kk][3]=l1?q1[kk*8+4]:0u;
+    }
+  }
+  float acc[kHeadDim/8][4];
+  #pragma unroll
+  for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
+  float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
+  auto load=[&](int tile,int stage){
+    half* ks=sm+stage*kStage; half* vs=ks+BN*kStride;
+    const int first=tile*BN;
+    #pragma unroll
+    for(int i=0;i<(BN*kHeadDim/8)/256;++i){
+      const int idx=tid+i*256; const int key_off=idx/(kHeadDim/8); const int dim=(idx%(kHeadDim/8))*8;
+      const int key=first+key_off; const bool valid=key<maximum_count;
+      const std::size_t off=(static_cast<std::size_t>(valid?key:0)*kKVHeads+kv_head)*kHeadDim+dim;
+      cp16(ks+key_off*kStride+dim,k_cache+off,valid);
+      cp16(vs+key_off*kStride+dim,v_cache+off,valid);
+    }
+    commit();
+  };
+  if(t_begin<t_end) load(t_begin,0);
+  const int warp_min_limit=base+query_base+m_base;
+  const int warp_max_limit=base+query_base+m_base+15;
+  for(int tile=t_begin;tile<t_end;++tile){
+    const int stage=(tile-t_begin)&1;
+    if(tile+1<t_end){ load(tile+1,stage^1); wait<1>(); } else wait<0>();
+    __syncthreads();
+    const int first=tile*BN;
+    const half* ks=sm+stage*kStage; const half* vs=ks+BN*kStride;
+    const bool warp_live=(m_base<active_rows) && first<=warp_max_limit;
+    if(warp_live){
+      float s[BN/8][4];
+      #pragma unroll
+      for(int j=0;j<BN/8;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.f;
+      #pragma unroll
+      for(int kk=0;kk<kHeadDim/16;++kk){
+        #pragma unroll
+        for(int pair=0;pair<BN/16;++pair){
+          unsigned b[4];
+          reg_attn_ldmatrix_x4(b,ks+(pair*16+(lane&7)+((lane>>4)<<3))*kStride+kk*16+((lane>>3)&1)*8);
+          reg_attn_mma(s[2*pair],qa[kk],b[0],b[1]);
+          reg_attn_mma(s[2*pair+1],qa[kk],b[2],b[3]);
+        }
+      }
+      const bool need_mask=first+BN-1>warp_min_limit;
+      float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
+      #pragma unroll
+      for(int j=0;j<BN/8;++j)
+        #pragma unroll
+        for(int e=0;e<4;++e){
+          const int row=e<2?row0:row1; const int key=first+8*j+2*t+(e&1);
+          float sc=s[j][e]*0.0625f;
+          if(need_mask && (key>base+query_base+row || row>=active_rows)) sc=-3.402823466e+38F;
+          s[j][e]=sc; tmax[e>>1]=fmaxf(tmax[e>>1],sc);
+        }
+      #pragma unroll
+      for(int i=0;i<2;++i){ tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],1)); tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],2)); }
+      float scale[2];
+      #pragma unroll
+      for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:exp2f((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+      unsigned pp[BN/8][2]; float rs[2]={0.f,0.f};
+      #pragma unroll
+      for(int j=0;j<BN/8;++j){
+        half p[4];
+        #pragma unroll
+        for(int e=0;e<4;++e){
+          const float x=s[j][e];
+          p[e]=__float2half(x==-3.402823466e+38F?0.f:exp2f((x-run_max[e>>1])*1.4426950408889634f));
+          rs[e>>1]+=__half2float(p[e]);
+        }
+        pp[j][0]=reg_attn_pack(p[0],p[1]); pp[j][1]=reg_attn_pack(p[2],p[3]);
+      }
+      #pragma unroll
+      for(int i=0;i<2;++i){ rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],1); rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],2); den[i]=den[i]*scale[i]+rs[i]; }
+      if(!__all_sync(0xffffffffu,scale[0]==1.f && scale[1]==1.f)){
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n){ acc[n][0]*=scale[0]; acc[n][1]*=scale[0]; acc[n][2]*=scale[1]; acc[n][3]*=scale[1]; }
+      }
+#if 0
+      unsigned hacc[kHeadDim/8][2];
+      #pragma unroll
+      for(int n=0;n<kHeadDim/8;++n) hacc[n][0]=hacc[n][1]=0u;
+#endif
+      #pragma unroll
+      for(int kk=0;kk<BN/16;++kk){
+        const unsigned a[4]={pp[2*kk][0],pp[2*kk][1],pp[2*kk+1][0],pp[2*kk+1][1]};
+        #pragma unroll
+        for(int pair=0;pair<kHeadDim/16;++pair){
+          unsigned b[4];
+          reg_attn_ldmatrix_x4_trans(b,vs+(16*kk+(lane&7)+((lane>>3)&1)*8)*kStride+pair*16+(lane>>4)*8);
+#if 0
+          mma_h(hacc[2*pair],a,b[0],b[1]); mma_h(hacc[2*pair+1],a,b[2],b[3]);
+#else
+          reg_attn_mma(acc[2*pair],a,b[0],b[1]); reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+#endif
+        }
+      }
+#if 0
+      #pragma unroll
+      for(int n=0;n<kHeadDim/8;++n){
+        const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hacc[n][0]));
+        const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hacc[n][1]));
+        acc[n][0]+=lo.x; acc[n][1]+=lo.y; acc[n][2]+=hi.x; acc[n][3]+=hi.y;
+      }
+#endif
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for(int i=0;i<2;++i){
+    const int row=i==0?row0:row1;
+    if(row>=active_rows) continue;
+    const std::size_t row_base=(static_cast<std::size_t>(query_base+row)*kQHeads+q_head)*kHeadDim;
+    const float inv=den[i]>0.f?1.f/den[i]:0.f;
+    #pragma unroll
+    for(int n=0;n<kHeadDim/8;++n){
+      const int dim=8*n+2*t;
+      const float a0=acc[n][2*i]*inv, a1=acc[n][2*i+1]*inv;
+      if constexpr(S>1){
+        float2* d=reinterpret_cast<float2*>(split_output+static_cast<std::size_t>(split)*rows*kQHeads*kHeadDim+row_base+dim);
+        *d=make_float2(a0,a1);
+      } else {
+        *reinterpret_cast<unsigned*>(output+row_base+dim)=reg_attn_pack(__float2half_rn(a0),__float2half_rn(a1));
+      }
+    }
+    if constexpr(S>1) if(t==0){
+      const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+(query_base+row)*kQHeads+q_head)*2;
+      split_stats[stat]=run_max[i]; split_stats[stat+1]=den[i];
+    }
+  }
+}
+} // namespace fa2_prefill
+
+bool exl3_fa2_prefill_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_FA2_PREFILL");
+        if(!value || std::strcmp(value,"1")==0) return true;
+        if(std::strcmp(value,"0")==0) return false;
+        throw std::invalid_argument("NINFER_EXL3_FA2_PREFILL must be 0 or 1");
+    }();
+    return enabled;
+}
+
+template<int S>
+static void launch_fa2_prefill_variant(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    float* split_output,float* split_stats,cudaStream_t stream) {
+    constexpr std::size_t bytes=fa2_prefill::smem_bytes();
+    static const bool configured=[] {
+        cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
+            "configure FA2 prefill shared memory");
+        return true;
+    }();
+    (void)configured;
+    fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S><<<
+        dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,kKVHeads,(kQHeads/kKVHeads/2)*S),256,
+        bytes,stream>>>(q,k,v,output,rows,position,capacity,split_output,split_stats);
+    cuda_check(cudaGetLastError(),"launch FA2 prefill attention");
+    if constexpr(S>1) {
+        attention_wmma32_split_merge_kernel<S><<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            split_output,split_stats,output,rows);
+        cuda_check(cudaGetLastError(),"launch FA2 prefill split merge");
+    }
+}
+
+static void launch_fa2_prefill(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    float* split_output,float* split_stats,cudaStream_t stream) {
+    if(position+rows>=2048)
+        launch_fa2_prefill_variant<4>(q,k,v,output,rows,position,capacity,split_output,split_stats,stream);
+    else
+        launch_fa2_prefill_variant<1>(q,k,v,output,rows,position,capacity,split_output,split_stats,stream);
+}
+
 template<int SplitCount,int Heads,int SplitBlockM=32,bool QGlobal=false>
 void launch_wmma32_register_prefill_variant(const std::uint16_t* q,const std::uint16_t* k,
     const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
@@ -7654,7 +7878,14 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             !fused_flash_eligible) {
             // T77 is selected explicitly when requested; T75 remains the
             // fallback WMMA candidate under its original gate.
-            if (fast_wmma32_split2_output_ && fast_prefill_wmma32_attention_ &&
+            if (fast_wmma32_split2_output_ && fast_wmma32_split2_capacity_splits_>=4 &&
+                fast_wmma32_split2_capacity_rows_>=rows && exl3_fa2_prefill_enabled()) {
+                launch_fa2_prefill(qr,attention_k,attention_v,attn,rows,position,
+                    cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream);
+                static std::atomic<int> fa2_prefill_dispatches{0};
+                if(fa2_prefill_dispatches.fetch_add(1,std::memory_order_relaxed)==0)
+                    std::fprintf(stderr,"FA2_PREFILL_DISPATCH rows=%d position=%d\n",rows,position);
+            } else if (fast_wmma32_split2_output_ && fast_prefill_wmma32_attention_ &&
                 position+rows>=8192) {
                 if(!fast_wmma32_split2_stats_ ||
                    fast_wmma32_split2_capacity_rows_<rows)

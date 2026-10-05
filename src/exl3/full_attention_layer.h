@@ -21,6 +21,9 @@
 #include <stdexcept>
 
 namespace ninfer::exl3 {
+// NINFER_EXL3_FA2_PREFILL (default 1): FA2-style prefill attention route.
+bool exl3_fa2_prefill_enabled();
+
 struct Exl3PrefillQkvConcurrencyView {
     cudaStream_t k_stream = nullptr;
     cudaStream_t v_stream = nullptr;
@@ -634,12 +637,16 @@ public:
         numeric_attention_splitk_workspace_bytes_=workspace_bytes;
         numeric_attention_splitk_=enabled;
     }
+    // capacity_splits: FP32 partial planes allocated (the FA2 prefill route
+    // needs four); split_count: the WMMA32 route's split (0 when unselected).
     void set_fast_wmma32_split2_workspace(float* output,float* stats,
-                                           int capacity_rows,int split_count=2) noexcept {
+                                           int capacity_rows,int split_count,
+                                           int capacity_splits) noexcept {
         fast_wmma32_split2_output_=output;
         fast_wmma32_split2_stats_=stats;
         fast_wmma32_split2_capacity_rows_=capacity_rows;
         fast_wmma32_split_count_=split_count;
+        fast_wmma32_split2_capacity_splits_=capacity_splits;
     }
 
     // Decode-only graph path: kernels read the current position through this
@@ -982,6 +989,7 @@ private:
     float* fast_wmma32_split2_stats_ = nullptr;
     int fast_wmma32_split2_capacity_rows_ = 0;
     int fast_wmma32_split_count_ = 0;
+    int fast_wmma32_split2_capacity_splits_ = 0;
     const int* position_device_ = nullptr;
     const int* mrope_positions_ = nullptr;
     int rope_offset_ = 0;
