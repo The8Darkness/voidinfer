@@ -342,6 +342,19 @@ void exl3_transform_input_pair(
 
 // Persistent temporary storage for the isolated EXL3 leaf. It is allocated once and
 // reused across calls; no CUDA allocation occurs in forward().
+// GDN control projection operands for a merged single-row qkv/z launch.
+struct Exl3GdnControlSide {
+    const std::uint16_t* a_weight = nullptr;
+    const std::uint16_t* b_weight = nullptr;
+    const float* a_log = nullptr;
+    const float* dt_bias = nullptr;
+    float* a_output = nullptr;
+    float* b_output = nullptr;
+    float* beta_trace = nullptr;
+    float* g_trace = nullptr;
+    int heads = 0;
+};
+
 class Exl3CudaLinearWorkspace {
 public:
     explicit Exl3CudaLinearWorkspace(int max_rows = 16);
@@ -704,6 +717,9 @@ public:
     // pair is not on the fused-input coherent wide route.
     // Two same-input single-row projections (e.g. GDN qkv and z) in one
     // coherent producer launch and one reduction launch; false when ineligible.
+    // Optional GDN control projections (one extra CTA per head, the
+    // control_fused_staged_kernel arithmetic) and a BF16 copy of the first
+    // output (the GDN convolution input) ride on the same launches.
     bool forward_m1_pair(Exl3CudaLinearWorkspace& second_workspace,
                          const Exl3CudaLinearWeights& first_weights,
                          const Exl3CudaLinearMetadata& first_metadata,
@@ -711,7 +727,9 @@ public:
                          const Exl3CudaLinearWeights& second_weights,
                          const Exl3CudaLinearMetadata& second_metadata,
                          std::uint16_t* second_output,const std::uint16_t* input,
-                         cudaStream_t stream);
+                         cudaStream_t stream,
+                         const Exl3GdnControlSide* control = nullptr,
+                         std::uint16_t* first_bf16 = nullptr);
     bool forward_m1_gate_up_silu(Exl3CudaLinearWorkspace& up_workspace,
                                  const Exl3CudaLinearWeights& gate_weights,
                                  const Exl3CudaLinearMetadata& gate_metadata,

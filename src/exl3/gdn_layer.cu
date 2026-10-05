@@ -2632,6 +2632,16 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     float* beta_trace = float_buffers_[4]; float* g_trace = float_buffers_[5];
     const bool control_pair = gaming_[Gopt::GdnControlRowPair] &&
         rows >= 2 && rows <= 8 && !wide_prefill;
+    Exl3GdnControlSide merged_control;
+    merged_control.a_weight=weights_.a_weight; merged_control.b_weight=weights_.b_weight;
+    merged_control.a_log=weights_.a_log; merged_control.dt_bias=weights_.dt_bias;
+    merged_control.a_output=a; merged_control.b_output=b;
+    merged_control.beta_trace=beta_trace; merged_control.g_trace=g_trace;
+    merged_control.heads=kHeads;
+    // Only the ordinary single-row convolution path consumes conv_input as
+    // the plain BF16 copy of qkv.
+    std::uint16_t* merged_conv_input=conv_input;
+    bool merged_qkvz_side=false;
     const auto launch_control = [&] {
         if (control_pair) {
             control_fused_row_pair_kernel<<<((rows+1)/2)*kHeads,128,0,stream>>>(
@@ -3043,12 +3053,14 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             throw;
         }
     } else if (rows == 1 && !profile && !projection_timing_ && !projection_observer_ &&
-               !wide_prefill &&
+               !wide_prefill && !control_pair &&
                linear_workspaces_[0]->forward_m1_pair(*linear_workspaces_[1],
                    weights_.qkv,weights_.qkv_metadata,qkv,weights_.z,weights_.z_metadata,z,
-                   h,stream)) {
-        begin(1); end(1); begin(2); end(2);
-        begin(3); launch_control(); end(3);
+                   h,stream,&merged_control,merged_conv_input)) {
+        // Control projections and the BF16 convolution input were produced
+        // by the merged launches.
+        merged_qkvz_side=true;
+        begin(1); end(1); begin(2); end(2); begin(3); end(3);
     } else {
         begin(1); project(linear_workspaces_[0], weights_.qkv, weights_.qkv_metadata, h, qkv,
                           Exl3TargetProjectionOperator::qkv); end(1);
@@ -3085,7 +3097,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         }
         conv_tiled_packed=true;
     } else {
-        exl3_launch_small(transpose_f16_to_bf16_kernel,dim3((rows * kQkv + 255) / 256),dim3(256),0,stream,qkv, conv_input, rows, kQkv);
+        if (!merged_qkvz_side)
+            exl3_launch_small(transpose_f16_to_bf16_kernel,dim3((rows * kQkv + 255) / 256),dim3(256),0,stream,qkv, conv_input, rows, kQkv);
         launch_gopt_conv(gaming_[Gopt::GdnConvTrace],false,qkv,weights_.conv_weight,
             conv_state_,conv_input,q,k,v,conv_output,conv_state_trace_,rows,stream);
         if(gaming_[Gopt::GdnConvTrace]) {

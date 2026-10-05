@@ -8,6 +8,7 @@
 #include "core/nvtx_range.h"
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 #include <cuda_runtime.h>
@@ -3228,8 +3229,46 @@ __global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_in
     const std::uint16_t* suh_a, const std::uint16_t* trellis_a, const std::int32_t* mul1_a,
     float* accum_a, const std::uint16_t* suh_b, const std::uint16_t* trellis_b,
     const std::int32_t* mul1_b, float* accum_b, int input_features, int output_features_a,
-    int output_features_b, int split_count, int grid_a) {
+    int output_features_b, int split_count, int grid_a, int grid_b,
+    Exl3GdnControlSide control) {
     const int block = static_cast<int>(blockIdx.x);
+    if (block >= grid_a + grid_b) {
+        // GDN a/b control projections (control_fused_staged_kernel arithmetic:
+        // same fmaf order over d = t + 128 s, shuffle and four-warp sums).
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        asm volatile("griddepcontrol.launch_dependents;");
+        __shared__ float partial_a[4], partial_b[4];
+        const int head = block - grid_a - grid_b;
+        const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+        const std::uint16_t* a_row = control.a_weight + static_cast<std::size_t>(head) * input_features;
+        const std::uint16_t* b_row = control.b_weight + static_cast<std::size_t>(head) * input_features;
+        float asum = 0.0f, bsum = 0.0f;
+        #pragma unroll 8
+        for (int step = 0; step < input_features / 128; ++step) {
+            const int d = tid + step * 128;
+            const float x = __half2float(__ushort_as_half(raw_input[d]));
+            asum = fmaf(x, __half2float(__ushort_as_half(a_row[d])), asum);
+            bsum = fmaf(x, __half2float(__ushort_as_half(b_row[d])), bsum);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            asum += __shfl_down_sync(0xffffffffu, asum, offset);
+            bsum += __shfl_down_sync(0xffffffffu, bsum, offset);
+        }
+        if (lane == 0) { partial_a[warp] = asum; partial_b[warp] = bsum; }
+        __syncthreads();
+        if (tid == 0) {
+            asum = 0.0f; bsum = 0.0f;
+            for (int w = 0; w < 4; ++w) { asum += partial_a[w]; bsum += partial_b[w]; }
+            control.a_output[head] = asum;
+            control.b_output[head] = bsum;
+            const float beta_f = 1.0f / (1.0f + expf(-bsum));
+            const float av = asum + control.dt_bias[head];
+            const float softplus = av > 20.0f ? av : log1pf(expf(av));
+            control.beta_trace[head] = __bfloat162float(__float2bfloat16_rn(beta_f));
+            control.g_trace[head] = -expf(control.a_log[head]) * softplus;
+        }
+        return;
+    }
     if (block < grid_a)
         exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
             FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
@@ -3248,7 +3287,7 @@ __global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_in
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_output_kernel(
     const float* accum_a,const std::uint16_t* svh_a,std::uint16_t* output_a,int features_a,
     const float* accum_b,const std::uint16_t* svh_b,std::uint16_t* output_b,int features_b,
-    int split_count) {
+    int split_count,std::uint16_t* first_bf16) {
     EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
     int block=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
@@ -3256,8 +3295,10 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_ou
     const int blocks_a=features_a/kHadamard;
     const float* accum=accum_a; const std::uint16_t* svh=svh_a; std::uint16_t* output=output_a;
     int features=features_a;
+    std::uint16_t* bf16_copy=first_bf16;
     if(block>=blocks_a) {
         block-=blocks_a; accum=accum_b; svh=svh_b; output=output_b; features=features_b;
+        bf16_copy=nullptr;
         if(block>=features_b/kHadamard) return;
     }
     const int offset=block*kHadamard+lane*4;
@@ -3278,6 +3319,16 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_ou
         result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
     }
     exl3_store_half4(output+offset,result);
+    if(bf16_copy) {
+        // transpose_f16_to_bf16_kernel at one row: bf16_rn(float(fp16)).
+        std::uint16_t converted[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const __nv_bfloat16 value=__float2bfloat16_rn(__half2float(__ushort_as_half(result[j])));
+            converted[j]=*reinterpret_cast<const std::uint16_t*>(&value);
+        }
+        exl3_store_half4(bf16_copy+offset,converted);
+    }
 }
 
 // Reduces both split-plane sets exactly as prefill_reduce_output_warp_kernel
@@ -9113,7 +9164,7 @@ bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
         exl3_launch_pdl(kernel,dim3(2*grid),dim3(warps*32),shared,stream,input,
             gate_weights.suh,gate_weights.trellis,gate_weights.mul1,accum_,
             up_weights.suh,up_weights.trellis,up_weights.mul1,up_accum,
-            in_features_,out_features_,out_features_,split_count,grid);
+            in_features_,out_features_,out_features_,split_count,grid,grid,Exl3GdnControlSide{});
     };
     if(gate_metadata.K==5) launch(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>);
     else if(gate_metadata.K==6) launch(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>);
@@ -9142,7 +9193,9 @@ bool Exl3CudaLinearWorkspace::forward_m1_pair(
     const Exl3CudaLinearWeights& first_weights,const Exl3CudaLinearMetadata& first_metadata,
     std::uint16_t* first_output,
     const Exl3CudaLinearWeights& second_weights,const Exl3CudaLinearMetadata& second_metadata,
-    std::uint16_t* second_output,const std::uint16_t* input,cudaStream_t stream) {
+    std::uint16_t* second_output,const std::uint16_t* input,cudaStream_t stream,
+    const Exl3GdnControlSide* control,std::uint16_t* first_bf16) {
+    if(control && (in_features_%128!=0 || control->heads<=0))return false;
     if(!coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
@@ -9188,10 +9241,12 @@ bool Exl3CudaLinearWorkspace::forward_m1_pair(
         if(shared>48u*1024u)
             cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(shared)),"set merged pair shared memory");
-        exl3_launch_pdl(kernel,dim3(grid_a+grid_b),dim3(warps*32),shared,stream,input,
+        exl3_launch_pdl(kernel,dim3(grid_a+grid_b+(control?control->heads:0)),dim3(warps*32),
+            shared,stream,input,
             first_weights.suh,first_weights.trellis,first_weights.mul1,accum_,
             second_weights.suh,second_weights.trellis,second_weights.mul1,second_accum,
-            in_features_,out_a,out_b,split_count,grid_a);
+            in_features_,out_a,out_b,split_count,grid_a,grid_b,
+            control?*control:Exl3GdnControlSide{});
     };
     if(first_metadata.K==5) launch(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>);
     else if(first_metadata.K==6) launch(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>);
@@ -9202,7 +9257,7 @@ bool Exl3CudaLinearWorkspace::forward_m1_pair(
     exl3_launch_pdl(exl3_pair_reduce_output_kernel,
         dim3((blocks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
         dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,first_weights.svh,first_output,out_a,
-        second_accum,second_weights.svh,second_output,out_b,split_count);
+        second_accum,second_weights.svh,second_output,out_b,split_count,first_bf16);
     cuda_check(cudaGetLastError(),"launch merged M1 pair reduction");
     if(!kv_route) for(auto* workspace:{this,&second_workspace}) {
         workspace->coherent_wide_k6_calls_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
