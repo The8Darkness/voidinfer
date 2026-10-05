@@ -1371,6 +1371,32 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) prefill_reduce_outp
     exl3_store_half4(output+row*output_features+offset,result);
 }
 
+// Ascending split-plane sum (prefill_reduce_output_warp_kernel order): up to
+// ten planes are loaded before the adds so their latencies overlap.
+__device__ __forceinline__ void exl3_sum_split_planes(const float* accum,std::size_t stride,
+    int offset,int split_count,float (&v)[4]) {
+    const float4 first=*reinterpret_cast<const float4*>(accum+offset);
+    v[0]=first.x; v[1]=first.y; v[2]=first.z; v[3]=first.w;
+    if(split_count<=10) {
+        float4 planes[9];
+        #pragma unroll
+        for(int split=1;split<10;++split)
+            if(split<split_count)
+                planes[split-1]=*reinterpret_cast<const float4*>(accum+split*stride+offset);
+        #pragma unroll
+        for(int split=1;split<10;++split)
+            if(split<split_count) {
+                v[0]+=planes[split-1].x; v[1]+=planes[split-1].y;
+                v[2]+=planes[split-1].z; v[3]+=planes[split-1].w;
+            }
+        return;
+    }
+    for(int split=1;split<split_count;++split) {
+        const float4 plane=*reinterpret_cast<const float4*>(accum+split*stride+offset);
+        v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
+    }
+}
+
 // prefill_reduce_output_warp_kernel<false> followed by residual_kernel:
 // output = reduced projection, residual_out = half(left + output).
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) reduce_output_residual_warp_kernel(
@@ -1382,13 +1408,8 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) reduce_output_resid
         (static_cast<int>(threadIdx.x)>>5);
     if(block>=output_features/kHadamard) return;
     const int offset=block*kHadamard+lane*4;
-    const float4 first=*reinterpret_cast<const float4*>(accum+offset);
-    float v[4]={first.x,first.y,first.z,first.w};
-    for(int split=1;split<split_count;++split) {
-        const float4 plane=*reinterpret_cast<const float4*>(
-            accum+static_cast<std::size_t>(split)*output_features+offset);
-        v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
-    }
+    float v[4];
+    exl3_sum_split_planes(accum,static_cast<std::size_t>(output_features),offset,split_count,v);
     std::uint16_t scale[4],base[4];
     exl3_load_half4(svh+offset,scale);
     exl3_load_half4(left+offset,base);
@@ -3336,13 +3357,8 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_ou
         if(block>=features_b/kHadamard) return;
     }
     const int offset=block*kHadamard+lane*4;
-    const float4 first=*reinterpret_cast<const float4*>(accum+offset);
-    float v[4]={first.x,first.y,first.z,first.w};
-    for(int split=1;split<split_count;++split) {
-        const float4 plane=*reinterpret_cast<const float4*>(
-            accum+static_cast<std::size_t>(split)*features+offset);
-        v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
-    }
+    float v[4];
+    exl3_sum_split_planes(accum,static_cast<std::size_t>(features),offset,split_count,v);
     std::uint16_t scale[4];
     exl3_load_half4(svh+offset,scale);
     exl3_warp_butterflies(v,lane);
@@ -3382,13 +3398,8 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_gate_up_reduce
     float g[4],u[4];
     const auto reduce=[&](const float* accum,const std::uint16_t* svh,std::uint16_t* out,
                           float (&value)[4]) {
-        const float4 first=*reinterpret_cast<const float4*>(accum+offset);
-        float v[4]={first.x,first.y,first.z,first.w};
-        for(int split=1;split<split_count;++split) {
-            const float4 plane=*reinterpret_cast<const float4*>(
-                accum+static_cast<std::size_t>(split)*output_features+offset);
-            v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
-        }
+        float v[4];
+        exl3_sum_split_planes(accum,static_cast<std::size_t>(output_features),offset,split_count,v);
         std::uint16_t scale[4];
         exl3_load_half4(svh+offset,scale);
         exl3_warp_butterflies(v,lane);
