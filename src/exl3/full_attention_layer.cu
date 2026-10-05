@@ -9030,11 +9030,14 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         target_shared_admission(Exl3TargetSharedFamily::o,weights_.o_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.o,weights_.o_metadata,
             attn,op,rows,position,model_layer_,stream,Exl3TargetSharedFamily::o});
+    if(!shared_o && rows==1 && !profile && !projection_timing_ && !projection_observer_)
+        linear_workspaces_[3]->arm_residual(input,post_resid);
     if(!shared_o)project(linear_workspaces_[3], weights_.o, weights_.o_metadata, attn, op,
             Exl3TargetProjectionOperator::o);
     launch(cudaGetLastError(), "launch EXL3 output projection"); end(7);
 
     begin(8);
+    if(!linear_workspaces_[3]->take_residual_applied())
     exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,input, op, post_resid,
         rows * kHidden);
     launch(cudaGetLastError(), "launch EXL3 attention residual");

@@ -11738,7 +11738,15 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O shared-row partials");
+        if (rows == 1 && pending_residual_left_ && out_features_ % kHadamard == 0) {
+            exl3_launch_pdl(reduce_output_residual_warp_kernel,
+                dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,out_features_,
+                split_count,pending_residual_left_,pending_residual_out_);
+            residual_applied_=true;
+        } else
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
+        pending_residual_left_=nullptr; pending_residual_out_=nullptr;
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O row reduction/output");
         process_coherent_o_k7_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -11764,7 +11772,15 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 shared-row partials");
+        if (rows == 1 && pending_residual_left_ && out_features_ % kHadamard == 0) {
+            exl3_launch_pdl(reduce_output_residual_warp_kernel,
+                dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,out_features_,
+                split_count,pending_residual_left_,pending_residual_out_);
+            residual_applied_=true;
+        } else
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
+        pending_residual_left_=nullptr; pending_residual_out_=nullptr;
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 row reduction/output");
         coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(
