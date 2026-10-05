@@ -3266,6 +3266,12 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         weights_.up_metadata.in_features == kHidden &&
         weights_.gate_metadata.out_features == kIntermediate &&
         weights_.up_metadata.out_features == kIntermediate;
+    const bool merged_gate_up = !gdn_m1_gate_up_pair && rows == 1 && !profile &&
+        !projection_timing_ && !projection_observer_ && !wide_prefill &&
+        !shared_gateup_enabled_ && !small_m_fused_gate_up_transform_ &&
+        linear_workspaces_[3]->forward_m1_gate_up_silu(*linear_workspaces_[4],
+            weights_.gate,weights_.gate_metadata,weights_.up,weights_.up_metadata,
+            mlp_input,gate,up,act,stream);
     if (gdn_m1_gate_up_pair) {
         // This production-labeled route remains default-off and graph-safe:
         // all policy, geometry and storage were fixed during construction.
@@ -3273,6 +3279,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             *linear_workspaces_[4],weights_.gate,weights_.gate_metadata,
             weights_.up,weights_.up_metadata,mlp_input,gate,up,stream);
         ++fast_same_weights_fp16kv_gdn_m1_gate_up_pair_submissions_;
+    } else if (merged_gate_up) {
+        // Gate, up and the SiLU activation were produced by the merged route.
     } else if (dual_transform) {
         exl3_transform_input_pair(
             weights_.gate, weights_.gate_metadata, weights_.up, weights_.up_metadata,
@@ -3349,7 +3357,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         !reconstruct_gemm_ && !shared_down_enabled_ &&
         !weights_.down_metadata.mcg && weights_.down_metadata.mul1 && !weights_.down_metadata.has_bias;
     begin(10);
-    if(fused_gate_up) {
+    if(merged_gate_up) {
+    } else if(fused_gate_up) {
         linear_workspaces_[5]->transform_gate_up(weights_.down,weights_.down_metadata,
             gate,up,act,rows,stream,wide_prefill ?
                 Exl3CudaLinearAdmission::target_wide_prefill :

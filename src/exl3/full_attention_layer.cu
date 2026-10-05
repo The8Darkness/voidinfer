@@ -9065,6 +9065,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         (preserve_m1_topology || rows == 1) && !wide_prefill &&
         rows >= 1 && rows <= 8 &&
         !(can_share_target && target_gateup_executor_enabled_);
+    bool merged_gate_up = false;
     if (concurrent_mlp_gateup) {
         launch(cudaEventRecord(eager_mlp_gateup_concurrency_.fork, stream),
                "record eager full-attention MLP gate/up fork");
@@ -9117,12 +9118,18 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,stream);
             ++fast_same_weights_fp16kv_m1_gate_up_pair_submissions_;
         }
-        const bool paired_gate_up=!paired_m1_gate_up && !can_share_target &&
+        merged_gate_up=!paired_m1_gate_up && rows==1 && !can_share_target &&
+            !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
+            !wide_prefill && !small_m_fused_gate_up_transform_ &&
+            linear_workspaces_[4]->forward_m1_gate_up_silu(*linear_workspaces_[5],
+                weights_.gate,weights_.gate_metadata,weights_.up,weights_.up_metadata,
+                mlp_in,gp,up,act,stream);
+        const bool paired_gate_up=!paired_m1_gate_up && !merged_gate_up && !can_share_target &&
             !profile && !projection_timing_ &&
             !projection_observer_ && linear_workspaces_[4]->forward_target_prefill_gate_up_pair(
                 *linear_workspaces_[5],weights_.gate,weights_.gate_metadata,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,rows,stream);
-        const bool shared_gate=paired_m1_gate_up || paired_gate_up ||
+        const bool shared_gate=paired_m1_gate_up || merged_gate_up || paired_gate_up ||
             (can_share_target && target_gateup_executor_enabled_ &&
             target_shared_admission(Exl3TargetSharedFamily::gate,weights_.gate_metadata).has_value() &&
             target_q_executor_(Exl3TargetQContinuation{weights_.gate,weights_.gate_metadata,
@@ -9131,7 +9138,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 Exl3TargetProjectionOperator::gate);
         launch(cudaGetLastError(), "launch EXL3 gate projection"); end(9);
         begin(10);
-        const bool shared_up=paired_m1_gate_up || paired_gate_up ||
+        const bool shared_up=paired_m1_gate_up || merged_gate_up || paired_gate_up ||
             (can_share_target && target_gateup_executor_enabled_ &&
             target_shared_admission(Exl3TargetSharedFamily::up,weights_.up_metadata).has_value() &&
             target_q_executor_(Exl3TargetQContinuation{weights_.up,weights_.up_metadata,
@@ -9148,7 +9155,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         !weights_.down_metadata.mcg && weights_.down_metadata.mul1 &&
         !weights_.down_metadata.has_bias;
     begin(11);
-    if(fused_gate_up) {
+    if(merged_gate_up) {
+    } else if(fused_gate_up) {
         linear_workspaces_[6]->transform_gate_up(
             weights_.down,weights_.down_metadata,gp,up,act,rows,stream,
             rows==1 ? Exl3CudaLinearAdmission::ordinary :

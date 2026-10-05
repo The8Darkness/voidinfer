@@ -2699,7 +2699,8 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool RegisterPipeline = false, bool GlobalSlices = false,
            int DeepStages = 0, int Warps = 8, int TilesPerStage = 1,
            bool FusedInput = false>
-__device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(const std::uint16_t* transformed,
+__device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
+                                                 const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
                                                  float* accum,
@@ -2773,7 +2774,7 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(const std::uint16_
     const int tiles_k = input_features / 16;
     const int tiles_n = output_features / 16;
     const int output_blocks = (tiles_n + output_tiles_per_block - 1) / output_tiles_per_block;
-    const int block = static_cast<int>(blockIdx.x);
+    const int block = block_index;
     const int tile_base = (SingleSplit ? block : block % output_blocks) * output_tiles_per_block;
     const int split = SingleSplit ? 0 : block / output_blocks;
     const int tiles_per_split = (tiles_k + split_count - 1) / split_count;
@@ -3198,7 +3199,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     exl3_gemm_m1_generic_mma_body<Bits, SingleSplit, OutputTilesPerBlock, AsyncA,
         PartialOnly, K7ThreeWord, PredecodedB, FastK6Decode, Fp16Accumulate,
         RegisterPipeline, GlobalSlices, DeepStages, Warps, TilesPerStage, false>(
-            transformed, trellis, mul1, accum, rows, input_features, output_features,
+            static_cast<int>(blockIdx.x), transformed, trellis, mul1, accum, rows, input_features, output_features,
             split_count, nullptr, nullptr);
 }
 
@@ -3214,8 +3215,75 @@ __global__ void exl3_gemm_m1_fused_input_kernel(const std::uint16_t* raw_input,
                                                  int split_count) {
     exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
         FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
-            raw_input, trellis, mul1, accum, 1, input_features, output_features,
-            split_count, raw_input, suh);
+            static_cast<int>(blockIdx.x), raw_input, trellis, mul1, accum, 1,
+            input_features, output_features, split_count, raw_input, suh);
+}
+
+// Two same-input M1 projections (MLP gate and up) in one launch: blocks
+// [0, grid_a) run the first producer, the rest the second. Each block's
+// arithmetic is exl3_gemm_m1_fused_input_kernel's.
+template <int Bits, bool K7ThreeWord, bool FastK6Decode, int DeepStages, int Warps,
+          int TilesPerStage>
+__global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_input,
+    const std::uint16_t* suh_a, const std::uint16_t* trellis_a, const std::int32_t* mul1_a,
+    float* accum_a, const std::uint16_t* suh_b, const std::uint16_t* trellis_b,
+    const std::int32_t* mul1_b, float* accum_b, int input_features, int output_features,
+    int split_count, int grid_a) {
+    const int block = static_cast<int>(blockIdx.x);
+    if (block < grid_a)
+        exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+            FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
+                block, raw_input, trellis_a, mul1_a, accum_a, 1, input_features,
+                output_features, split_count, raw_input, suh_a);
+    else
+        exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+            FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
+                block - grid_a, raw_input, trellis_b, mul1_b, accum_b, 1, input_features,
+                output_features, split_count, raw_input, suh_b);
+}
+
+// Reduces both split-plane sets exactly as prefill_reduce_output_warp_kernel
+// (ascending planes, output Hadamard, SVH) and applies the silu_mul_kernel
+// activation; one warp per 128-column block.
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_gate_up_reduce_silu_kernel(
+    const float* accum_gate,const float* accum_up,const std::uint16_t* svh_gate,
+    const std::uint16_t* svh_up,std::uint16_t* gate,std::uint16_t* up,
+    std::uint16_t* activation,int output_features,int split_count) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int block=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(block>=output_features/kHadamard) return;
+    const int offset=block*kHadamard+lane*4;
+    float g[4],u[4];
+    const auto reduce=[&](const float* accum,const std::uint16_t* svh,std::uint16_t* out,
+                          float (&value)[4]) {
+        const float4 first=*reinterpret_cast<const float4*>(accum+offset);
+        float v[4]={first.x,first.y,first.z,first.w};
+        for(int split=1;split<split_count;++split) {
+            const float4 plane=*reinterpret_cast<const float4*>(
+                accum+static_cast<std::size_t>(split)*output_features+offset);
+            v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
+        }
+        std::uint16_t scale[4];
+        exl3_load_half4(svh+offset,scale);
+        exl3_warp_butterflies(v,lane);
+        std::uint16_t result[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+            result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+            value[j]=__half2float(__ushort_as_half(result[j]));
+        }
+        exl3_store_half4(out+offset,result);
+    };
+    reduce(accum_gate,svh_gate,gate,g);
+    reduce(accum_up,svh_up,up,u);
+    std::uint16_t act[4];
+    #pragma unroll
+    for(int j=0;j<4;++j)
+        act[j]=__half_as_ushort(__float2half_rn((g[j]/(1.0f+expf(-g[j])))*u[j]));
+    exl3_store_half4(activation+offset,act);
 }
 
 // One CTA owns a complete 128-column Hadamard group for up to eight rows.
@@ -8942,6 +9010,73 @@ static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int row
     std::size_t capacity);
 
 static bool coherent_fused_input_for(int rows);
+static bool merged_gate_up_enabled();
+int coherent_packed_warps();
+int coherent_tiles_per_stage_setting();
+
+bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
+    Exl3CudaLinearWorkspace& up_workspace,
+    const Exl3CudaLinearWeights& gate_weights,const Exl3CudaLinearMetadata& gate_metadata,
+    const Exl3CudaLinearWeights& up_weights,const Exl3CudaLinearMetadata& up_metadata,
+    const std::uint16_t* input,std::uint16_t* gate_output,std::uint16_t* up_output,
+    std::uint16_t* activation,cudaStream_t stream) {
+    if(!coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
+       coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
+       (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
+       gate_metadata.K!=up_metadata.K || gate_metadata.K<5 || gate_metadata.K>7 ||
+       in_features_!=up_workspace.in_features_ || out_features_!=up_workspace.out_features_ ||
+       out_features_%kHadamard!=0 ||
+       !coherent_wide_k6_candidate(gate_metadata,1,Exl3CudaLinearAdmission::ordinary) ||
+       !up_workspace.coherent_wide_k6_candidate(up_metadata,1,Exl3CudaLinearAdmission::ordinary) ||
+       !gate_weights.suh || !gate_weights.svh || !up_weights.suh || !up_weights.svh ||
+       !input || !gate_output || !up_output || !activation)
+        return false;
+    const int split_count=coherent_wide_k6_split_count(1);
+    if(split_count!=up_workspace.coherent_wide_k6_split_count(1))return false;
+    // Ordered layer projections may share one accumulation buffer; the up
+    // partials then follow the gate planes.
+    const std::size_t planes=static_cast<std::size_t>(split_count)*out_features_;
+    float* up_accum=up_workspace.accum_;
+    if(up_accum==accum_) {
+        if(accumulation_capacity_bytes_<2*planes*sizeof(float))return false;
+        up_accum=accum_+planes;
+    }
+    constexpr int stages=4,warps=4,per=2;
+    const int grid=out_features_/(16*warps)*split_count;
+    const int tiles_per_split=(in_features_/16+split_count-1)/split_count;
+    const std::size_t shared=
+        static_cast<std::size_t>(stages*per)*256u*sizeof(half)+
+        static_cast<std::size_t>(stages*per)*warps*16u*gate_metadata.K*sizeof(std::uint16_t)+
+        16u*warps*16u*sizeof(float)+
+        static_cast<std::size_t>((tiles_per_split*16+kHadamard-1)/kHadamard+1)*kHadamard*sizeof(half);
+    const auto launch=[&](auto kernel) {
+        if(shared>48u*1024u)
+            cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shared)),"set merged gate/up shared memory");
+        exl3_launch_pdl(kernel,dim3(2*grid),dim3(warps*32),shared,stream,input,
+            gate_weights.suh,gate_weights.trellis,gate_weights.mul1,accum_,
+            up_weights.suh,up_weights.trellis,up_weights.mul1,up_accum,
+            in_features_,out_features_,split_count,grid);
+    };
+    if(gate_metadata.K==5) launch(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>);
+    else if(gate_metadata.K==6) launch(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>);
+    else launch(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>);
+    cuda_check(cudaGetLastError(),"launch merged M1 gate/up producers");
+    exl3_launch_pdl(exl3_gate_up_reduce_silu_kernel,
+        dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+        dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,up_accum,
+        gate_weights.svh,up_weights.svh,gate_output,up_output,activation,out_features_,split_count);
+    cuda_check(cudaGetLastError(),"launch merged M1 gate/up reduction and activation");
+    coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    coherent_wide_k6_rows_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    up_workspace.coherent_wide_k6_calls_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    up_workspace.coherent_wide_k6_rows_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    if(split_count==10) {
+        coherent_wide_k6_split10_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+        up_workspace.coherent_wide_k6_split10_calls_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    }
+    return true;
+}
 
 void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
                                       const Exl3CudaLinearMetadata& metadata,
@@ -11121,6 +11256,19 @@ int coherent_packed_warps() {
         throw std::invalid_argument("NINFER_EXL3_COHERENT_WARPS must be 8, 4 or 2");
     }();
     return warps;
+}
+
+// NINFER_EXL3_MERGED_GATE_UP (default 1; 0 = separate gate, up and SiLU
+// launches): single-row MLP gate/up share one producer launch and one
+// reduction/activation kernel. Bit-identical outputs.
+static bool merged_gate_up_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_MERGED_GATE_UP");
+        if (!value || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        throw std::invalid_argument("NINFER_EXL3_MERGED_GATE_UP must be 0 or 1");
+    }();
+    return enabled;
 }
 
 // NINFER_EXL3_COHERENT_FUSED_INPUT (default 1; 0 = separate input-Hadamard

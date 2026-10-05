@@ -699,6 +699,18 @@ public:
                                       Exl3CudaLinearAdmission::ordinary,
                                   const std::uint16_t* raw_input = nullptr);
 
+    // Single-row MLP gate/up/SiLU in one coherent producer launch plus one
+    // reduction/activation launch. Returns false (nothing submitted) when the
+    // pair is not on the fused-input coherent wide route.
+    bool forward_m1_gate_up_silu(Exl3CudaLinearWorkspace& up_workspace,
+                                 const Exl3CudaLinearWeights& gate_weights,
+                                 const Exl3CudaLinearMetadata& gate_metadata,
+                                 const Exl3CudaLinearWeights& up_weights,
+                                 const Exl3CudaLinearMetadata& up_metadata,
+                                 const std::uint16_t* input,std::uint16_t* gate_output,
+                                 std::uint16_t* up_output,std::uint16_t* activation,
+                                 cudaStream_t stream);
+
     // Exact target-prefill fast path for a gate/up pair. Matrix-specific SUH
     // transforms share one launch and remain separate through the paired MMA.
     // Returns false without mutation when the candidate is disabled or either
