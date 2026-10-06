@@ -811,13 +811,17 @@ __global__ void gdn_recurrence_sm120_kernel(const std::uint16_t* q, const std::u
 }
 
 // Coalesced-state twin of gdn_recurrence_sm120_kernel for verifier-sized
-// batches. A CTA stages a [128 key][32 value] block of the recurrent state
-// with 16-byte loads, each warp carries four value columns as independent
-// chains (lane == key dimension, exactly as the sm120 leaf), and the block is
-// written back with 16-byte stores. Per-column arithmetic, reduction trees and
-// row order are those of gdn_recurrence_sm120_kernel.
+// batches (1..8 rows). A CTA stages a [128 key][32 value] block of the
+// recurrent state with 16-byte loads, each warp carries four value columns as
+// independent chains (lane == key dimension, exactly as the sm120 leaf), and
+// the block is written back with 16-byte stores. The row-independent work
+// (q/k L2 normalization, gates, values) runs for all rows up front, one warp
+// per row, and the output reductions run after the state chain; only the
+// S^T k reduction stays on the per-row critical path. Per-column arithmetic,
+// reduction trees and row order are those of gdn_recurrence_sm120_kernel.
 constexpr int kGdnTiledColumns=32;
 constexpr int kGdnTiledWarps=8;
+constexpr int kGdnTiledMaxRows=8;
 
 bool gdn_decode_tiled_enabled() {
     static const bool enabled=[] {
@@ -831,8 +835,13 @@ __global__ void __launch_bounds__(kGdnTiledWarps*32) gdn_recurrence_sm120_tiled_
     const std::uint16_t* q,const std::uint16_t* k,const std::uint16_t* v,const float* g,
     const float* beta,float* state,std::uint16_t* output,int rows) {
     EXL3_PDL_SMALL_PROLOGUE();
+    static_assert(kGdnTiledWarps>=kGdnTiledMaxRows,"one prologue warp per row");
     constexpr int kColumnsPerWarp=kGdnTiledColumns/kGdnTiledWarps;
     __shared__ float tile[kHeadDim][kGdnTiledColumns+1];
+    __shared__ float q_rows[kGdnTiledMaxRows][kHeadDim];
+    __shared__ float k_rows[kGdnTiledMaxRows][kHeadDim];
+    __shared__ float v_rows[kGdnTiledMaxRows][kGdnTiledColumns];
+    __shared__ float alpha_rows[kGdnTiledMaxRows],beta_rows[kGdnTiledMaxRows];
     const int tid=static_cast<int>(threadIdx.x);
     const int lane=tid&31;
     const int warp=tid>>5;
@@ -851,7 +860,6 @@ __global__ void __launch_bounds__(kGdnTiledWarps*32) gdn_recurrence_sm120_tiled_
         tile[key][part+2]=values.z;
         tile[key][part+3]=values.w;
     }
-    __syncthreads();
     const int qk_head=head/3;
     const auto* qv=reinterpret_cast<const __nv_bfloat16*>(q);
     const auto* kv=reinterpret_cast<const __nv_bfloat16*>(k);
@@ -859,13 +867,8 @@ __global__ void __launch_bounds__(kGdnTiledWarps*32) gdn_recurrence_sm120_tiled_
     auto* out=reinterpret_cast<__nv_bfloat16*>(output);
     constexpr unsigned mask=0xffffffffu;
     constexpr float output_scale=0.08838834764831843f;
-    float column[kColumnsPerWarp][4];
-    #pragma unroll
-    for(int c=0;c<kColumnsPerWarp;++c)
-        #pragma unroll
-        for(int part=0;part<4;++part)
-            column[c][part]=tile[lane+part*32][warp*kColumnsPerWarp+c];
-    for(int row=0;row<rows;++row) {
+    if(warp<rows) {
+        const int row=warp;
         const int qk_base=row*(kKeyHeads*kHeadDim)+qk_head*kHeadDim;
         float q_norm[4],k_norm[4];
         float q_sum=0.0f,k_sum=0.0f;
@@ -889,11 +892,35 @@ __global__ void __launch_bounds__(kGdnTiledWarps*32) gdn_recurrence_sm120_tiled_
         const float k_inv=rsqrtf(k_sum+kRmsEps);
         #pragma unroll
         for(int part=0;part<4;++part) {
-            q_norm[part]*=q_inv;
-            k_norm[part]*=k_inv;
+            q_rows[row][lane+part*32]=q_norm[part]*q_inv;
+            k_rows[row][lane+part*32]=k_norm[part]*k_inv;
         }
-        const float alpha=expf(g[row*kHeads+head]);
-        const float beta_value=beta[row*kHeads+head];
+        v_rows[row][lane]=__bfloat162float(
+            vv[row*(kHeads*kHeadDim)+head*kHeadDim+column_base+lane]);
+        if(lane==0) {
+            alpha_rows[row]=expf(g[row*kHeads+head]);
+            beta_rows[row]=beta[row*kHeads+head];
+        }
+    }
+    __syncthreads();
+    float column[kColumnsPerWarp][4];
+    #pragma unroll
+    for(int c=0;c<kColumnsPerWarp;++c)
+        #pragma unroll
+        for(int part=0;part<4;++part)
+            column[c][part]=tile[lane+part*32][warp*kColumnsPerWarp+c];
+    float result[kGdnTiledMaxRows][kColumnsPerWarp];
+    #pragma unroll
+    for(int row=0;row<kGdnTiledMaxRows;++row) {
+        if(row>=rows) break;
+        float q_norm[4],k_norm[4];
+        #pragma unroll
+        for(int part=0;part<4;++part) {
+            q_norm[part]=q_rows[row][lane+part*32];
+            k_norm[part]=k_rows[row][lane+part*32];
+        }
+        const float alpha=alpha_rows[row];
+        const float beta_value=beta_rows[row];
         float updated[kColumnsPerWarp][4];
         float kv_mem[kColumnsPerWarp];
         #pragma unroll
@@ -910,33 +937,35 @@ __global__ void __launch_bounds__(kGdnTiledWarps*32) gdn_recurrence_sm120_tiled_
             for(int c=0;c<kColumnsPerWarp;++c)
                 kv_mem[c]+=__shfl_down_sync(mask,kv_mem[c],offset);
         }
-        float result[kColumnsPerWarp];
         #pragma unroll
         for(int c=0;c<kColumnsPerWarp;++c) {
             kv_mem[c]=__shfl_sync(mask,kv_mem[c],0);
-            const int value_dim=column_base+warp*kColumnsPerWarp+c;
-            const float value=__bfloat162float(vv[row*(kHeads*kHeadDim)+head*kHeadDim+value_dim]);
+            const float value=v_rows[row][warp*kColumnsPerWarp+c];
             const float delta=beta_value*(value-kv_mem[c]);
             #pragma unroll
             for(int part=0;part<4;++part) {
                 updated[c][part]+=k_norm[part]*delta;
                 column[c][part]=updated[c][part];
             }
-            result[c]=0.0f;
+            result[row][c]=0.0f;
             #pragma unroll
-            for(int part=0;part<4;++part) result[c]+=updated[c][part]*q_norm[part];
+            for(int part=0;part<4;++part) result[row][c]+=updated[c][part]*q_norm[part];
         }
+    }
+    #pragma unroll
+    for(int row=0;row<kGdnTiledMaxRows;++row) {
+        if(row>=rows) break;
         for(int offset=16;offset>0;offset>>=1) {
             #pragma unroll
             for(int c=0;c<kColumnsPerWarp;++c)
-                result[c]+=__shfl_down_sync(mask,result[c],offset);
+                result[row][c]+=__shfl_down_sync(mask,result[row][c],offset);
         }
         if(lane==0) {
             #pragma unroll
             for(int c=0;c<kColumnsPerWarp;++c) {
                 const int value_dim=column_base+warp*kColumnsPerWarp+c;
                 out[row*(kHeads*kHeadDim)+head*kHeadDim+value_dim]=
-                    __float2bfloat16_rn(result[c]*output_scale);
+                    __float2bfloat16_rn(result[row][c]*output_scale);
             }
         }
     }
