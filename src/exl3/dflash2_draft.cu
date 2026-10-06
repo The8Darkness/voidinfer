@@ -2395,52 +2395,58 @@ __global__ void dflash_selector_edges_kernel(int position, std::int64_t anchor,
 // candidate order, FP32 reduction order, and strict-greater tie rule while
 // keeping the bounded autoregressive chain on one block. The proposal output
 // slot used by device-seed validity is intentionally untouched.
-__global__ void dflash_selector_fused_chain_kernel(
+// One warp per candidate. Lane L holds the products of ranks L + 32 k and
+// reproduces the 256-wide shared-memory tree (strides 128, 64, 32 in registers,
+// then 16..1 by shuffles), so every score and the selected chain are those of
+// the former one-product-per-thread reduction.
+constexpr int kSelectorFusedThreads = kTopK * 32;
+static_assert(kRank == 256, "selector tree is laid out for rank 256");
+
+__global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_chain_kernel(
     int proposal_rows, std::int64_t initial_anchor,
     const std::int64_t* device_anchor, const std::int64_t* cand_ids,
     const std::uint16_t* hidden, const std::uint16_t* pred_cb,
     const std::uint16_t* succ_cb, const float* cand_unary,
     std::int64_t* proposal_out) {
-    const int lane = static_cast<int>(threadIdx.x);
-    if (blockIdx.x != 0 || lane >= 256) return;
-    __shared__ float reduced[256];
+    const int t = static_cast<int>(threadIdx.x);
+    const int lane = t & 31;
+    const int candidate_index = t >> 5;
+    if (blockIdx.x != 0 || t >= kSelectorFusedThreads) return;
+    __shared__ float scores[kTopK];
     __shared__ std::int64_t anchor;
-    if (lane == 0)
+    if (t == 0)
         anchor = device_anchor != nullptr ? device_anchor[0] : initial_anchor;
     __syncthreads();
 
     for (int position = 0; position < proposal_rows; ++position) {
         const auto* pred_row = pred_cb + static_cast<std::size_t>(anchor) * kRank;
         const auto* hid_row = hidden + static_cast<std::size_t>(position) * kRank;
-        float best_score = -CUDART_INF_F;
-        int best = 0;
-        for (int candidate_index = 0; candidate_index < kTopK; ++candidate_index) {
-            const auto candidate = cand_ids[
-                static_cast<std::size_t>(position) * kTopK + candidate_index];
-            const auto* succ_row = succ_cb + static_cast<std::size_t>(candidate) * kRank;
-            float acc = 0.0f;
-            for (int r = lane; r < kRank; r += blockDim.x) {
-                acc += half_to_float(pred_row[r]) * half_to_float(hid_row[r]) *
-                       half_to_float(succ_row[r]);
-            }
-            reduced[lane] = acc;
-            __syncthreads();
-            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-                if (lane < stride) reduced[lane] += reduced[lane + stride];
-                __syncthreads();
-            }
-            if (lane == 0) {
-                const float score = cand_unary[
-                    static_cast<std::size_t>(position) * kTopK + candidate_index] +
-                    reduced[0];
-                if (candidate_index == 0 || score > best_score) {
-                    best_score = score;
-                    best = candidate_index;
-                }
-            }
-            __syncthreads();
+        const auto candidate = cand_ids[
+            static_cast<std::size_t>(position) * kTopK + candidate_index];
+        const auto* succ_row = succ_cb + static_cast<std::size_t>(candidate) * kRank;
+        float r[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int rank = lane + 32 * k;
+            r[k] = half_to_float(pred_row[rank]) * half_to_float(hid_row[rank]) *
+                   half_to_float(succ_row[rank]);
         }
-        if (lane == 0) {
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) r[k] += r[k + 4];
+        #pragma unroll
+        for (int k = 0; k < 2; ++k) r[k] += r[k + 2];
+        float value = r[0] + r[1];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        if (lane == 0)
+            scores[candidate_index] = cand_unary[
+                static_cast<std::size_t>(position) * kTopK + candidate_index] + value;
+        __syncthreads();
+        if (t == 0) {
+            float best_score = scores[0];
+            int best = 0;
+            for (int c = 1; c < kTopK; ++c)
+                if (scores[c] > best_score) { best_score = scores[c]; best = c; }
             const auto selected = cand_ids[
                 static_cast<std::size_t>(position) * kTopK + best];
             proposal_out[position] = selected;
@@ -5489,7 +5495,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     std::int64_t anchor = block_ids[0];
     require(anchor >= 0 && anchor < kVocab, "E5A2 draft anchor outside vocabulary");
     if (fused_selector) {
-        dflash_selector_fused_chain_kernel<<<1, 256, 0, stream>>>(
+        dflash_selector_fused_chain_kernel<<<1, kSelectorFusedThreads, 0, stream>>>(
             proposal_rows, anchor, device_seed ? m.s.ids : nullptr,
             m.s.cand_ids, m.s.hidden_proj_out, m.pred_cb, m.succ_cb,
             m.s.cand_unary, m.s.proposal_out);
