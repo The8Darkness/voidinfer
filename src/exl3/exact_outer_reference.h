@@ -95,6 +95,7 @@ struct Exl3OuterReferenceResult {
     std::size_t checkpoint_restores = 0;
     std::size_t checkpoint_reconstructed_rows = 0;
     std::size_t checkpoint_fallback_rows = 0;
+    std::size_t sibling_promotions = 0;
     bool device_seed_reused = false;
     bool device_seed_fallback = false;
     std::size_t committed_tap_d2d_bytes = 0;
@@ -340,12 +341,19 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
     Exl3OuterDeviceStageTimeline* timeline=nullptr,
     const Exl3OuterDeviceSeedPacket* ready_seed=nullptr,
     std::uint64_t numerical_policy=0,
-    Exl3OuterDeviceSettlement settlement=Exl3OuterDeviceSettlement::Eager) {
+    Exl3OuterDeviceSettlement settlement=Exl3OuterDeviceSettlement::Eager,
+    int siblings=0) {
     if(tentative.size()<2 || tentative.size()>8 ||
        exact.continuation_capacity()<tentative.size() ||
        !exact.transaction_prepared())
         throw std::invalid_argument(
             "device-resident verifier requires prepared B2..B8 transaction");
+    // tentative = [seed, chain drafts, sibling leaves]: sibling j replaces
+    // chain row j + 1 (sibling_rows.cuh).
+    const int chain_rows=static_cast<int>(tentative.size())-siblings;
+    if(siblings<0 || chain_rows<2 ||
+       (siblings && (!exl3_device_greedy_enabled() || !exl3_fold_correction_enabled())))
+        throw std::invalid_argument("device-resident verifier sibling layout");
     for(auto token:tentative) if(token<0 || token>=248320)
         throw std::invalid_argument("device-resident tentative token extent");
     for(auto token:terminal) if(token<0 || token>=248320)
@@ -382,6 +390,7 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
         // The valid host token was already synchronized before draft proposal.
         const auto seed=reuse_seed?ready_seed->token:exl3_branch_greedy(exact,stream);
         if(timeline)stage_end(timeline->seed_ms);
+        if(siblings)exact.set_verifier_siblings(siblings);
         exact.continue_rows(tentative,stream);
         if(timeline)stage_end(timeline->submit_ms);
         result.verification_rows=tentative.size();
@@ -390,9 +399,34 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
         std::array<std::int64_t,8> path_storage{};
         auto path=std::span<std::int64_t>(path_storage).first(tentative.size());
         std::int64_t deferred_bonus=-1;
+        int promoted_sibling=-1;
+        Exl3OuterDecision decision;
+        if(siblings) {
+            const auto packet=exact.greedy_packet(true,stream);
+            auto chain_path=path.first(static_cast<std::size_t>(chain_rows));
+            chain_path[0]=seed;
+            for(int row=1;row<chain_rows;++row)
+                chain_path[static_cast<std::size_t>(row)]=packet.decisions[row-1].token;
+            decision=decide_exl3_outer_prefix(chain_path,
+                tentative.first(static_cast<std::size_t>(chain_rows)),terminal);
+            // A rejected chain row d (1 <= d <= siblings) whose target token
+            // equals sibling d - 1 continues through that sibling's row.
+            const int depth=static_cast<int>(decision.accepted);
+            if(decision.rejected && !decision.stopped && depth>=1 && depth<=siblings &&
+               tentative[static_cast<std::size_t>(chain_rows+depth-1)]==
+                   decision.committed_tokens.back()) {
+                promoted_sibling=chain_rows+depth-1;
+                const auto next=packet.decisions[promoted_sibling].token;
+                decision.committed_tokens.push_back(next);
+                decision.accepted=static_cast<std::size_t>(depth)+1;
+                decision.stopped=exl3_terminal_token(next,terminal);
+                ++result.sibling_promotions;
+            }
+        } else {
         exl3_outer_greedy_path(exact,seed,path,stream,
             fast_w1?&deferred_bonus:nullptr);
-        auto decision=decide_exl3_outer_prefix(path,tentative,terminal);
+        decision=decide_exl3_outer_prefix(path,tentative,terminal);
+        }
         result.committed_tokens=std::move(decision.committed_tokens);
         result.accepted=decision.accepted;
         result.rejected=decision.rejected;
@@ -422,6 +456,8 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
             // seed is exactly this correction and its verifier consumes it as
             // row 0. The correction is published only when consumed.
             const int accepted=static_cast<int>(result.accepted);
+            if(promoted_sibling>=0)
+                exact.promote_sibling_row(promoted_sibling,accepted-1,stream);
             exact.retain_transaction_prefix(accepted,stream);
             ++result.checkpoint_restores;
             result.checkpoint_reconstructed_rows=accepted;

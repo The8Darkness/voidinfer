@@ -1014,6 +1014,13 @@ public:
     // or rollback if that later publication fails.
     void retain_transaction_prefix(int retained_rows,
                                    cudaStream_t stream = nullptr);
+    // The next continue_rows() treats its last `siblings` rows as sibling
+    // leaves (sibling_rows.cuh); one-shot.
+    void set_verifier_siblings(int siblings);
+    // Copies an accepted sibling leaf row of the last continuation into its
+    // chain slot (all per-row traces, K/V rows, taps, embedding and logits)
+    // before retain_transaction_prefix(destination + 1).
+    void promote_sibling_row(int source_row,int destination_row,cudaStream_t stream);
     // Qualification-only deterministic failure injection. Uses the identical
     // retention implementation and throws after repairing fail_after_model_layer
     // (0..63), before logits, position, or row metadata publication.

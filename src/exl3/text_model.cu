@@ -1160,6 +1160,13 @@ struct Exl3TextContext::Impl {
     cudaEvent_t repair_fork=nullptr;
     cudaEvent_t repair_join=nullptr;
     bool repair_pending=false;
+    int verifier_siblings=0;
+    // Sibling promotion descriptor tables, one per (source, destination, rows).
+    struct SiblingCopyTable {
+        int source=-1,destination=-1,rows=0,count=0;
+        std::unique_ptr<DeviceAllocation> device;
+    };
+    std::array<SiblingCopyTable,8> sibling_copy_tables{};
     // Overlapped device-transaction checkpoint: the checkpoint graph runs on
     // its own stream (after the transaction stream's prior work and any
     // pending repair) while the caller drafts; the same joins order every
@@ -1625,7 +1632,7 @@ struct Exl3TextContext::Impl {
         const auto add=[&](const void* address,std::size_t bytes) noexcept {
             result.buffers[result.count++]={address,bytes};
         };
-        add(position_device,sizeof(int));
+        add(position_device,2*sizeof(int));
         add(hidden_a,hidden_bytes);
         add(hidden_b,hidden_bytes);
         add(embedding_trace?embedding_trace->ptr:nullptr,hidden_bytes);
@@ -4599,7 +4606,9 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         allocate(kHidden*sizeof(std::uint16_t),reinterpret_cast<void**>(&impl->final_norm),"allocate E4A final norm");
         allocate(kVocab*sizeof(std::uint16_t),reinterpret_cast<void**>(&impl->logits),"allocate E4A logits");
         allocate(token_bytes,reinterpret_cast<void**>(&impl->token_ids),"allocate E4A token ids");
-        allocate(sizeof(int),reinterpret_cast<void**>(&impl->position_device),"allocate E4B2 position parameter");
+        // [0] device position, [1] verifier chain rows (0: every row is a
+        // chain row; c > 0: rows >= c are sibling leaves, see sibling_row_offset).
+        allocate(2*sizeof(int),reinterpret_cast<void**>(&impl->position_device),"allocate E4B2 position parameter");
         allocate(sizeof(std::int64_t),reinterpret_cast<void**>(&impl->draft_token_id),"allocate E5A2 draft token id");
     };
     std::size_t base_bytes=0,base_owners=0;
@@ -5342,6 +5351,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 "target GDN owner metadata requirement mismatch");
             impl->persistent_bytes=expected_layer_persistent;
             impl->gdn_layers[layer]->set_reconstructed_exact(reconstructed_exact_view);
+            impl->gdn_layers[layer]->set_chain_rows_device(impl->position_device+1);
         }
     }
     require(impl->persistent_bytes==expected_layer_group,"target complete layer group requirement mismatch");
@@ -6962,7 +6972,7 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
             cuda_check(cudaMemsetAsync(impl_->cache_v[layer]->ptr, 0, impl_->cache_v[layer]->bytes, stream), "reset E4A V cache");
         }
     }
-    cuda_check(cudaMemsetAsync(impl_->position_device, 0, sizeof(int), stream),
+    cuda_check(cudaMemsetAsync(impl_->position_device, 0, 2*sizeof(int), stream),
                "reset E4B2 position parameter");
     if (impl_->oscar) impl_->oscar->reset();
     position_ = 0;
@@ -7895,7 +7905,7 @@ void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStrea
     if (impl_->continuation) impl_->continuation->rows = 0;
     cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
                                cudaMemcpyHostToDevice, stream), "upload E4A prefill token IDs");
-    cuda_check(cudaMemsetAsync(impl_->position_device, 0, sizeof(int), stream),
+    cuda_check(cudaMemsetAsync(impl_->position_device, 0, 2*sizeof(int), stream),
                "set E4B2 prefill position parameter");
     if(impl_->host_kv_prefill_fault_for_test==1) {
         impl_->host_kv_prefill_fault_for_test=0;
@@ -8821,6 +8831,70 @@ void Exl3TextContext::prepare_continuation_impl(int capacity,Exl3VeriCacheServin
     }
 }
 
+__global__ void sibling_row_copy_kernel(const Exl3SiblingRowCopy* entries,
+    const int* position_device,int attempted_rows) {
+    const auto entry=entries[blockIdx.x];
+    const std::ptrdiff_t shift=entry.slot_elements?
+        static_cast<std::ptrdiff_t>(*position_device-attempted_rows+1)*entry.slot_elements:0;
+    for(int i=static_cast<int>(blockIdx.y*blockDim.x+threadIdx.x);i<entry.count;
+        i+=static_cast<int>(gridDim.y*blockDim.x)) {
+        const std::ptrdiff_t offset=shift+static_cast<std::ptrdiff_t>(i)*entry.stride;
+        entry.dst[offset]=entry.src[offset];
+    }
+}
+
+void Exl3TextContext::set_verifier_siblings(int siblings) {
+    require(siblings>=0 && siblings<8,"verifier sibling count");
+    impl_->verifier_siblings=siblings;
+}
+
+void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
+                                          cudaStream_t stream) {
+    require(impl_->continuation && impl_->transaction && impl_->transaction->active &&
+            impl_->transaction->prefix_available,
+            "sibling promotion requires the immediate continuation of an active transaction");
+    const int rows=impl_->continuation->rows;
+    require(destination_row>=1 && destination_row<source_row && source_row<rows,
+            "sibling promotion rows");
+    auto* table=&impl_->sibling_copy_tables[0];
+    for(auto& entry:impl_->sibling_copy_tables) {
+        if(entry.source==source_row && entry.destination==destination_row && entry.rows==rows) {
+            table=&entry;break;
+        }
+        if(entry.source<0) {table=&entry;break;}
+    }
+    if(table->source!=source_row || table->destination!=destination_row || table->rows!=rows) {
+        Exl3SiblingRowCopies copies;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(impl_->gdn_layers[layer])
+                impl_->gdn_layers[layer]->append_sibling_row_copies(copies,source_row,
+                    destination_row,rows);
+            else if(impl_->full_layers[layer])
+                impl_->full_layers[layer]->append_sibling_row_copies(copies,source_row,
+                    destination_row);
+        }
+        const auto hidden_row=[&](void* base) {
+            auto* p=static_cast<std::uint16_t*>(base);
+            copies.push_back({p+static_cast<std::size_t>(source_row)*kHidden,
+                p+static_cast<std::size_t>(destination_row)*kHidden,kHidden,1,0});
+        };
+        for(const auto& tap:impl_->taps)hidden_row(tap->ptr);
+        hidden_row(impl_->embedding_trace->ptr);
+        auto* logits=static_cast<std::uint16_t*>(impl_->continuation->logits->ptr);
+        copies.push_back({logits+static_cast<std::size_t>(source_row)*kVocab,
+            logits+static_cast<std::size_t>(destination_row)*kVocab,kVocab,1,0});
+        const auto bytes=copies.size()*sizeof(Exl3SiblingRowCopy);
+        table->device=std::make_unique<DeviceAllocation>(bytes,"sibling promotion table");
+        cuda_check(cudaMemcpy(table->device->ptr,copies.data(),bytes,cudaMemcpyHostToDevice),
+                   "upload sibling promotion table");
+        table->source=source_row;table->destination=destination_row;table->rows=rows;
+        table->count=static_cast<int>(copies.size());
+    }
+    sibling_row_copy_kernel<<<dim3(table->count,8),256,0,stream>>>(
+        static_cast<const Exl3SiblingRowCopy*>(table->device->ptr),impl_->position_device,rows);
+    cuda_check(cudaGetLastError(),"launch sibling row promotion");
+}
+
 void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
                                     cudaStream_t stream) {
     impl_->join_repair(stream);
@@ -8868,15 +8942,20 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
                                cudaMemcpyHostToDevice, stream),
                "upload P2 target continuation token IDs");
+    const int siblings=impl_->verifier_siblings;
+    impl_->verifier_siblings=0;
+    require(siblings==0 || rows-siblings>=2,"verifier sibling layout needs two chain rows");
+    // [0] base position, [1] chain rows (0 when every row is a chain row).
+    const std::array<int,2> layout{position_,siblings?rows-siblings:0};
     const int base_position = position_;
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &base_position, sizeof(base_position),
+    cuda_check(cudaMemcpyAsync(impl_->position_device, layout.data(), sizeof(layout),
                                cudaMemcpyHostToDevice, stream),
                "set P2 target continuation base position");
     impl_->process_rows(impl_->token_ids, rows, base_position, stream,
                         nullptr, true, true, true);
-    const int final_device_position = base_position + rows - 1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &final_device_position,
-                               sizeof(final_device_position), cudaMemcpyHostToDevice, stream),
+    const std::array<int,2> final_layout{base_position + rows - 1,0};
+    cuda_check(cudaMemcpyAsync(impl_->position_device, final_layout.data(),
+                               sizeof(final_layout), cudaMemcpyHostToDevice, stream),
                "set P2 target continuation final device position");
     position_ += rows;
     impl_->continuation->rows = rows;

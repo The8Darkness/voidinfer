@@ -1,4 +1,5 @@
 #include "exl3/pdl_small.cuh"
+#include "exl3/sibling_rows.cuh"
 #include "exl3/full_attention_layer.h"
 #include "exl3/environment_options.h"
 #include "exl3/vericache_serving_coordinator.h"
@@ -153,7 +154,8 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
                             std::uint16_t* k_out,
                             int rows,
                             int position,
-                            const int* position_device,const int* positions_xyz,int offset) {
+                            const int* position_device,const int* positions_xyz,int offset,
+                            const int* chain_rows=nullptr) {
     EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kQHeads * kHeadDim;
@@ -163,7 +165,7 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
     const int kv_index = row * kKVHeads * kHeadDim +
                          ((index / kHeadDim) % kKVHeads) * kHeadDim + channel;
     const int base_position = position_device ? *position_device : position;
-    int pos = base_position + row;
+    int pos = base_position + sibling_row_offset(row, sibling_chain_rows(chain_rows));
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
     float q = __half2float(__ushort_as_half(q_in[index]));
     float k = __half2float(__ushort_as_half(k_in[kv_index]));
@@ -195,7 +197,8 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
                               std::uint16_t* k_out,
                               int rows,
                               int position,
-                              const int* position_device,const int* positions_xyz,int offset) {
+                              const int* position_device,const int* positions_xyz,int offset,
+                              const int* chain_rows=nullptr) {
     EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kKVHeads * kHeadDim;
@@ -203,7 +206,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
     const int channel = index % kHeadDim;
     const int row = index / (kKVHeads * kHeadDim);
     const int base_position = position_device ? *position_device : position;
-    int pos = base_position + row;
+    int pos = base_position + sibling_row_offset(row, sibling_chain_rows(chain_rows));
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
     float value = __half2float(__ushort_as_half(k_in[index]));
     if (channel < kRopeDim) {
@@ -6254,7 +6257,8 @@ constexpr int kVerifyMmaStride=kHeadDim+8;
 __global__ void attention_fused_flash_merge_heads_kernel(
     const float* workspace,std::uint16_t* output,int rows,int segments,
     int position,int capacity,int keys,const int* position_device,
-    int query_offset) {
+    int query_offset,const std::uint16_t* self_q=nullptr,
+    const std::uint16_t* self_k=nullptr,const std::uint16_t* self_v=nullptr) {
     EXL3_PDL_SMALL_PROLOGUE();
     constexpr int H=kFastFusedFlashHeads;
     const int block=static_cast<int>(blockIdx.x);
@@ -6274,12 +6278,39 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     for(int segment=0;segment<live_segments;++segment)
         global_max=fmaxf(global_max,
             slots[segment*kFastFusedFlashStride+kFastFusedFlashValues+head]);
+    // Self term (verifier MMA route): the segments hold only the keys before
+    // the row's logical position; its own key, at physical slot count - 1, is
+    // the final term, so chain and sibling rows share one arithmetic.
+    float self_score=-INFINITY,self_value=0.0f;
+    if(self_q) {
+        __shared__ float partial[kHeadDim/32];
+        const std::size_t kv=static_cast<std::size_t>(count-1)*kKVHeads*kHeadDim+
+            kv_head*kHeadDim+tid;
+        float dot=__half2float(__ushort_as_half(
+            self_q[(query*kQHeads+kv_head*H+head)*kHeadDim+tid]))*
+            __half2float(__ushort_as_half(self_k[kv]));
+        for(int offset=16;offset>0;offset>>=1)
+            dot+=__shfl_xor_sync(0xffffffffu,dot,offset);
+        if((tid&31)==0)partial[tid>>5]=dot;
+        __syncthreads();
+        dot=0.0f;
+        #pragma unroll
+        for(int w=0;w<kHeadDim/32;++w)dot+=partial[w];
+        self_score=dot*0.0625f;
+        self_value=__half2float(__ushort_as_half(self_v[kv]));
+        global_max=fmaxf(global_max,self_score);
+    }
     float denominator=0.0f,numerator=0.0f;
     for(int segment=0;segment<live_segments;++segment) {
         const float* slot=slots+segment*kFastFusedFlashStride;
         const float scale=expf(slot[kFastFusedFlashValues+head]-global_max);
         denominator+=slot[kFastFusedFlashValues+H+head]*scale;
         numerator+=slot[head*kHeadDim+tid]*scale;
+    }
+    if(self_q) {
+        const float weight=expf(self_score-global_max);
+        denominator+=weight;
+        numerator+=weight*self_value;
     }
     *out=__half_as_ushort(__float2half_rn(numerator/denominator));
 }
@@ -6294,10 +6325,13 @@ bool fused_flash_merge_heads_enabled() {
 
 void launch_fused_flash_merge(const float* workspace,std::uint16_t* output,int rows,
     int segments,int position,int capacity,int keys,const int* position_device,
-    cudaStream_t stream) {
+    cudaStream_t stream,const std::uint16_t* self_q=nullptr,
+    const std::uint16_t* self_k=nullptr,const std::uint16_t* self_v=nullptr) {
+    if(self_q && !fused_flash_merge_heads_enabled())
+        throw std::invalid_argument("verifier self-term merge requires the per-head merge");
     if(fused_flash_merge_heads_enabled())
         exl3_launch_small(attention_fused_flash_merge_heads_kernel,dim3(rows*kKVHeads*kFastFusedFlashHeads),dim3(256),0,stream,workspace,output,rows,
-                segments,position,capacity,keys,position_device,0);
+                segments,position,capacity,keys,position_device,0,self_q,self_k,self_v);
     else
         attention_cached_gqa_six_fused_flash_merge_kernel<<<
             rows*kKVHeads,256,0,stream>>>(workspace,output,rows,segments,position,
@@ -6312,6 +6346,9 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     EXL3_PDL_SMALL_PROLOGUE();
     constexpr int H=kFastFusedFlashHeads;
     constexpr int kVectors=kHeadDim/8;
+    // A sibling row (sibling_row_offset) sees the prefix before its logical
+    // position plus its own key at its physical slot.
+    const int chain=sibling_chain_rows(position_device?position_device+1:nullptr);
     __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
     __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
     const int segment=static_cast<int>(blockIdx.x);
@@ -6334,6 +6371,9 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const int row1=pair1/H,head1=pair1%H;
     const bool live0=row0<rows,live1=row1<rows;
     const int count0=base+row0+1,count1=base+row1+1;
+    // Keys before the logical position; the own key is the merge's self term.
+    const int prefix0=base+sibling_row_offset(row0,chain);
+    const int prefix1=base+sibling_row_offset(row1,chain);
     const auto* q0=reinterpret_cast<const unsigned*>(q+
         (static_cast<std::size_t>(live0?row0:0)*kQHeads+kv_head*H+head0)*kHeadDim+2*t);
     const auto* q1=reinterpret_cast<const unsigned*>(q+
@@ -6385,7 +6425,7 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
             #pragma unroll
             for(int e=0;e<4;++e) {
                 const int key=chunk_first+8*j+2*t+(e&1);
-                const bool valid=e<2?(live0&&key<count0):(live1&&key<count1);
+                const bool valid=e<2?(live0&&key<prefix0):(live1&&key<prefix1);
                 s[j][e]=valid?s[j][e]*0.0625f:-INFINITY;
                 tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]);
             }
@@ -6512,7 +6552,7 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
         exl3_launch_small(attention_verify_flash_mma_kernel<256>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0);
     launch_fused_flash_merge(workspace,output,rows,segments,position,capacity,keys,
-        position_device,stream);
+        position_device,stream,q,k,v);
     return keys;
 }
 
@@ -7023,6 +7063,16 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
 void Exl3FullAttentionLayer::set_oscar(Exl3OscarContext* oscar, int model_layer) noexcept {
     oscar_ = oscar;
     oscar_layer_ = model_layer;
+}
+
+void Exl3FullAttentionLayer::append_sibling_row_copies(Exl3SiblingRowCopies& out,
+    int source,int destination) const {
+    if(!k_cache_ || !v_cache_)
+        throw std::invalid_argument("sibling promotion requires the ordinary K/V cache");
+    constexpr int row=kKVHeads*kHeadDim;
+    for(auto* cache:{k_cache_,v_cache_})
+        out.push_back({cache+static_cast<std::size_t>(source)*row,
+            cache+static_cast<std::size_t>(destination)*row,row,1,row});
 }
 
 void Exl3FullAttentionLayer::set_position_device(const int* position_device) noexcept {
@@ -7718,8 +7768,9 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         exl3_launch_small(rope_kernel<true>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
         exl3_launch_small(rope_k_kernel<true>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
     }else{
-        exl3_launch_small(rope_kernel<false>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,nullptr,0);
-        exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0);
+        const int* chain_rows=position_device_?position_device_+1:nullptr;
+        exl3_launch_small(rope_kernel<false>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,nullptr,0,chain_rows);
+        exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0,chain_rows);
     }
     launch(cudaGetLastError(), "launch EXL3 RoPE"); end(5);
 

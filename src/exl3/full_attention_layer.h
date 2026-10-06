@@ -1,6 +1,7 @@
 #pragma once
 
 #include "exl3/linear_cuda.h"
+#include "exl3/sibling_rows.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/attention_page_ranges.h"
 #include "exl3/attention_position_contract.h"
@@ -652,6 +653,9 @@ public:
     // Decode-only graph path: kernels read the current position through this
     // stable device pointer instead of a captured host scalar.
     void set_position_device(const int* position_device) noexcept;
+    // K/V cache rows an accepted sibling carries into its chain slot.
+    void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,
+                                   int destination) const;
     // Research media phases only. Causal/cache positions keep their original
     // logical cursor; these coordinates affect the rotary phase exclusively.
     void set_mrope_positions(const int* rows_xyz,int offset) noexcept {

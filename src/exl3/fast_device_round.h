@@ -672,18 +672,27 @@ private:
         // overlap the draft (the verifier then reuses it).
         if(deferred && !context_->transaction_active())
             context_->begin_transaction(stream_);
+        // Sibling leaves (NINFER_DFLASH2_SIBLINGS, default 2): the last `siblings` verifier
+        // rows replace chain rows 1..siblings with the draft's runner-up.
+        // Each sibling replaces a drafted chain row: siblings <= chain drafts.
+        const int siblings=deferred?std::min(sibling_count(),(value.width-1)/2):0;
+        const int chain_width=value.width-siblings;
+        draft_.set_proposal_siblings(siblings);
         const auto draft_start=Clock::now();
         value.target_seed_ms=std::chrono::duration<double,std::milli>(
             draft_start-proposal_start).count();
         auto proposed=draft_.propose_cached_view(
-            std::span<const std::int64_t>(value.proposal).first(value.width),
+            std::span<const std::int64_t>(value.proposal).first(chain_width),
             value.root_position,context_->target_embedding(),
             context_->target_lm_head_weights(),
             context_->target_lm_head_metadata(),248070,stream_);
-        if(proposed.size()!=static_cast<std::size_t>(value.width-1))
+        if(proposed.size()!=static_cast<std::size_t>(chain_width-1) ||
+           draft_.last_proposal_siblings().size()!=static_cast<std::size_t>(siblings))
             throw std::runtime_error("fast device round draft proposal extent");
         value.draft_api_ms=elapsed(draft_start);
         std::copy(proposed.begin(),proposed.end(),value.proposal.begin()+1);
+        std::copy(draft_.last_proposal_siblings().begin(),draft_.last_proposal_siblings().end(),
+                  value.proposal.begin()+chain_width);
         value.proposal_ms=elapsed(proposal_start);
         std::size_t staged=0;
         const Exl3CommittedTapConsumer consumer=[&](
@@ -709,7 +718,7 @@ private:
         value.verification=verify_exl3_outer_device_resident_reference(
             *context_,std::span<const std::int64_t>(value.proposal).first(value.width),
             terminal,stream_,&binding,&consumer,timeline,
-            seed?&*seed:nullptr,reuse_seed_?coherent_policy:0,settlement);
+            seed?&*seed:nullptr,reuse_seed_?coherent_policy:0,settlement,siblings);
         value.verifier_ms=elapsed(verifier_start);
         if(after_verify)after_verify(*context_);
         value.committed_tokens=value.verification.committed_tokens;
@@ -746,6 +755,17 @@ private:
         }
         value.staged_bytes=staged;
         value.terminal=value.verification.stopped;
+    }
+
+    static int sibling_count() {
+        static const int count=[] {
+            const char* value=std::getenv("NINFER_DFLASH2_SIBLINGS");
+            const int parsed=value?std::atoi(value):2;
+            if(parsed<0 || parsed>4)
+                throw std::invalid_argument("NINFER_DFLASH2_SIBLINGS must be 0..4");
+            return parsed;
+        }();
+        return count;
     }
 
     std::shared_ptr<Exl3TextContext> context_;

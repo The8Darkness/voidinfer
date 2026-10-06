@@ -1,5 +1,6 @@
 #pragma once
 #include "exl3/gaming_optimizations.h"
+#include "exl3/sibling_rows.h"
 
 #include "exl3/linear_cuda.h"
 #include "exl3/layer_buffer_retirement.h"
@@ -572,6 +573,13 @@ public:
     void prepare_eager_mlp_gateup_concurrency(
         Exl3MlpGateUpConcurrencyView view);
     void set_capture_active(bool active) noexcept { capture_active_ = active; }
+    // Verifier row layout (sibling_rows.cuh); nullptr keeps every row a chain row.
+    void set_chain_rows_device(const int* chain_rows) noexcept { chain_rows_device_ = chain_rows; }
+    // Per-row continuation traces (convolution input, q/k/v, gates) of the
+    // last `rows`-row forward that an accepted sibling must carry into
+    // `destination` before retained-prefix repair.
+    void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,int destination,
+                                   int rows) const;
     void set_shared_gateup_executor(Exl3TargetQExecutor executor,int layer,bool gateup=true,bool down=false) {
         shared_gateup_executor_=std::move(executor);model_layer_=layer;
         shared_gateup_enabled_=gateup;shared_down_enabled_=down;
@@ -828,6 +836,7 @@ private:
     Exl3TargetQExecutor shared_gateup_executor_;
     Exl3ActivationLifetime mlp_activation_lifetime_;
     bool shared_gateup_enabled_=false,shared_down_enabled_=false;
+    const int* chain_rows_device_ = nullptr;
     bool capture_active_ = false;
     Exl3GdnGraphQkvzConcurrencyView graph_qkvz_concurrency_{};
     std::shared_ptr<const void> prefill_projection_chain_context_owner_ =
