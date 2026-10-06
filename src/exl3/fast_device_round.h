@@ -667,6 +667,11 @@ private:
                 throw std::invalid_argument("fast device selected horizon");
             value.width=selected;
         }
+        // The target checkpoint only reads settled target state, which the
+        // draft never touches: begin the transaction first so its copies
+        // overlap the draft (the verifier then reuses it).
+        if(deferred && !context_->transaction_active())
+            context_->begin_transaction(stream_);
         const auto draft_start=Clock::now();
         value.target_seed_ms=std::chrono::duration<double,std::milli>(
             draft_start-proposal_start).count();

@@ -1160,12 +1160,30 @@ struct Exl3TextContext::Impl {
     cudaEvent_t repair_fork=nullptr;
     cudaEvent_t repair_join=nullptr;
     bool repair_pending=false;
+    // Overlapped device-transaction checkpoint: the checkpoint graph runs on
+    // its own stream (after the transaction stream's prior work and any
+    // pending repair) while the caller drafts; the same joins order every
+    // later target-state operation after it.
+    cudaStream_t checkpoint_stream=nullptr;
+    cudaEvent_t checkpoint_fork=nullptr;
+    cudaEvent_t checkpoint_join=nullptr;
+    bool checkpoint_pending=false;
     void join_repair(cudaStream_t stream) {
+        if(checkpoint_pending) {
+            cuda_check(cudaStreamWaitEvent(stream,checkpoint_join,0),
+                "join overlapped transaction checkpoint");
+            checkpoint_pending=false;
+        }
         if(!repair_pending) return;
         cuda_check(cudaStreamWaitEvent(stream,repair_join,0),"join overlapped GDN repair");
         repair_pending=false;
     }
     void drain_repair() {
+        if(checkpoint_pending) {
+            cuda_check(cudaEventSynchronize(checkpoint_join),
+                "drain overlapped transaction checkpoint");
+            checkpoint_pending=false;
+        }
         if(!repair_pending) return;
         cuda_check(cudaEventSynchronize(repair_join),"drain overlapped GDN repair");
         repair_pending=false;
@@ -2000,6 +2018,13 @@ struct Exl3TextContext::Impl {
             (void)cudaEventDestroy(repair_join);
             (void)cudaStreamDestroy(repair_stream);
             repair_stream=nullptr;
+        }
+        if(checkpoint_stream) {
+            (void)cudaStreamSynchronize(checkpoint_stream);
+            (void)cudaEventDestroy(checkpoint_fork);
+            (void)cudaEventDestroy(checkpoint_join);
+            (void)cudaStreamDestroy(checkpoint_stream);
+            checkpoint_stream=nullptr;
         }
         // Captured nodes retain the auxiliary stream/events/workspace. Destroy
         // the executable and definition before releasing any such resource.
@@ -7176,8 +7201,24 @@ void Exl3TextContext::prepare_transaction_impl(
     impl_->transaction = std::move(prepared);
 }
 
+// NINFER_EXL3_CHECKPOINT_OVERLAP (default 1): the device-KV checkpoint graph
+// runs on a side stream; target-state consumers join it (join_repair).
+static bool checkpoint_overlap_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_CHECKPOINT_OVERLAP");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
 void Exl3TextContext::begin_transaction(cudaStream_t stream) {
-    impl_->join_repair(stream);
+    const bool overlap_checkpoint=checkpoint_overlap_enabled() && impl_->transaction &&
+        impl_->transaction->device_kv && !impl_->host_kv.enabled && impl_->oscar==nullptr &&
+        impl_->device_transaction_checkpoint_graph_enabled && impl_->tap_rows<=8 &&
+        impl_->prefill_capacity>=8;
+    // An overlapped checkpoint orders itself after a pending repair on its
+    // own stream; the transaction stream keeps running until a later join.
+    if(!overlap_checkpoint)impl_->join_repair(stream);
     require(impl_->transaction != nullptr, "P2 target transaction was not prepared");
     auto& transaction = *impl_->transaction;
     require(!transaction.rollback_required,
@@ -7256,6 +7297,18 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
             8:static_cast<std::size_t>(impl_->tap_rows);
         const std::size_t graph_copy_bytes=
             graph_copy_rows*kHidden*sizeof(std::uint16_t);
+        cudaStream_t graph_stream=stream;
+        if(overlap_checkpoint) {
+            if(!impl_->checkpoint_stream) {
+                cuda_check(cudaStreamCreateWithFlags(&impl_->checkpoint_stream,
+                    cudaStreamNonBlocking),"create overlapped checkpoint stream");
+                cuda_check(cudaEventCreateWithFlags(&impl_->checkpoint_fork,
+                    cudaEventDisableTiming),"create checkpoint fork event");
+                cuda_check(cudaEventCreateWithFlags(&impl_->checkpoint_join,
+                    cudaEventDisableTiming),"create checkpoint join event");
+            }
+            graph_stream=impl_->checkpoint_stream;
+        }
         if(!transaction.checkpoint_graph_active) {
             impl_->bind_graph_device();
             const auto started=std::chrono::steady_clock::now();
@@ -7302,7 +7355,7 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
             }
             cuda_check(cudaStreamDestroy(capture_stream),
                 "destroy transaction checkpoint graph capture stream");
-            transaction.checkpoint_graph_stream=stream;
+            transaction.checkpoint_graph_stream=graph_stream;
             transaction.checkpoint_graph_active=true;
             const double capture_ms=std::chrono::duration<double,std::milli>(
                 std::chrono::steady_clock::now()-started).count();
@@ -7314,7 +7367,7 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                 impl_->host_kv.transaction_checkpoint_graph_capture_ms+=capture_ms;
             }
         }
-        require(transaction.checkpoint_graph_stream==stream &&
+        require(transaction.checkpoint_graph_stream==graph_stream &&
                     transaction.checkpoint_graph_definition.ready() &&
                     transaction.checkpoint_graph_executable.ready(),
                 "transaction checkpoint graph stream/handle mismatch");
@@ -7324,7 +7377,21 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                 generations[layer]=impl_->gdn_layers[layer]->
                     begin_checkpoint_graph_replay(
                         transaction.gdn_checkpoints[layer]);
-        transaction.checkpoint_graph_executable.launch(stream);
+        if(overlap_checkpoint) {
+            cuda_check(cudaEventRecord(impl_->checkpoint_fork,stream),
+                "fork overlapped transaction checkpoint");
+            cuda_check(cudaStreamWaitEvent(graph_stream,impl_->checkpoint_fork,0),
+                "order checkpoint after transaction stream");
+            if(impl_->repair_pending)
+                cuda_check(cudaStreamWaitEvent(graph_stream,impl_->repair_join,0),
+                    "order checkpoint after overlapped GDN repair");
+        }
+        transaction.checkpoint_graph_executable.launch(graph_stream);
+        if(overlap_checkpoint) {
+            cuda_check(cudaEventRecord(impl_->checkpoint_join,graph_stream),
+                "record overlapped transaction checkpoint completion");
+            impl_->checkpoint_pending=true;
+        }
         for(int layer=0;layer<kLayers;++layer)
             if(impl_->gdn_layers[layer])
                 impl_->gdn_layers[layer]->publish_checkpoint_graph_replay(

@@ -373,7 +373,9 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
         stage_start=now;
     };
     try {
-        exact.begin_transaction(stream);
+        // A caller may begin the transaction before drafting so its
+        // checkpoint overlaps the draft.
+        if(!exact.transaction_active())exact.begin_transaction(stream);
         result.checkpoint_captured_bytes=exact.transaction_bytes();
         if(timeline)stage_end(timeline->begin_ms);
         // An invalid or stale packet takes the ordinary checked reduction.
