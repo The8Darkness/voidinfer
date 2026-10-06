@@ -679,38 +679,57 @@ __global__ void dflash_embed_kernel(const std::int64_t* ids,
 // on the residual path (x_a/x_b use BF16); output is always F16 because every
 // RMSNorm output is renormalized to O(1) scale. Accumulation stays FP32.
 template <DFlashFmt kInFmt,bool Residual=false>
-__global__ void dflash_rms_norm_kernel(const std::uint16_t* input,
+__global__ void __launch_bounds__(256) dflash_rms_norm_kernel(const std::uint16_t* input,
                                        const std::uint16_t* weight,
                                        std::uint16_t* output,
                                        int rows,
                                        int features,
                                        const std::uint16_t* right=nullptr,
                                        std::uint16_t* materialized=nullptr) {
+    // 256 threads; each keeps its strided values in registers, and the sum
+    // reproduces the 256-wide shared-memory tree (strides 128, 64, 32 through
+    // shared memory, 16..1 by shuffles).
+    constexpr int kThreads = 256;
+    constexpr int kPerThread = 32;
     const int row = static_cast<int>(blockIdx.x);
     if (row >= rows) return;
     extern __shared__ float shared[];
     const int lane = static_cast<int>(threadIdx.x);
+    float values[kPerThread];
     float sum = 0.0f;
-    for (int i = lane; i < features; i += blockDim.x) {
-        const int index=row*features+i;
-        auto bits=input[index];
-        if constexpr(Residual) {
-            bits=float_to_bf16(bf16_to_float(bits)+bf16_to_float(right[index]));
-            materialized[index]=bits;
+    #pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+        const int i = lane + j * kThreads;
+        if (i < features) {
+            const int index=row*features+i;
+            auto bits=input[index];
+            if constexpr(Residual) {
+                bits=float_to_bf16(bf16_to_float(bits)+bf16_to_float(right[index]));
+                materialized[index]=bits;
+            }
+            values[j] = dflash_load(bits, kInFmt);
+            sum += values[j] * values[j];
         }
-        const float value = dflash_load(bits, kInFmt);
-        sum += value * value;
     }
     shared[lane] = sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) shared[lane] += shared[lane + stride];
-        __syncthreads();
+    if (lane < 128) shared[lane] += shared[lane + 128];
+    __syncthreads();
+    if (lane < 64) shared[lane] += shared[lane + 64];
+    __syncthreads();
+    if (lane < 32) {
+        float total = shared[lane] + shared[lane + 32];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        if (lane == 0) shared[0] = total;
     }
+    __syncthreads();
     const float inv = rsqrtf(shared[0] / static_cast<float>(features) + kRmsEps);
-    for (int i = lane; i < features; i += blockDim.x) {
-        const float value = dflash_load((Residual?materialized:input)[row * features + i], kInFmt) * inv;
-        output[row * features + i] = float_to_half(value * half_to_float(weight[i]));
+    #pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+        const int i = lane + j * kThreads;
+        if (i < features)
+            output[row * features + i] = float_to_half(values[j] * inv * half_to_float(weight[i]));
     }
 }
 
@@ -732,9 +751,11 @@ __global__ void dflash_dyn_conv_kernel(const std::uint16_t* x,
                                        std::uint16_t* residual_out=nullptr) {
     const int row = static_cast<int>(blockIdx.x);
     if (row >= rows) return;
-    const int lane = static_cast<int>(threadIdx.x);
     const std::uint16_t* base_row = base + stream * (kConvKernel * kHidden);
-    for (int i = lane; i < kHidden; i += blockDim.x) {
+    // Grid (rows, kHidden / blockDim): one channel per thread.
+    {
+        const int i = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
+        if (i >= kHidden) return;
         const int g = i / kConvGroup;
         const float x0 = half_to_float(x[row * kHidden + i]);
         const float x1 = row > 0 ? half_to_float(x[(row - 1) * kHidden + i]) : 0.0f;
@@ -807,10 +828,12 @@ __global__ void dflash_dense_gemm_t_kernel(const std::uint16_t* a,
 // CTA, with K tiles of both operands streamed through a cp.async ring. Every
 // output keeps the single ascending FP32 chain of dflash_dense_gemm_t_kernel,
 // so the stored F16 bits are identical; only operand delivery changes.
-constexpr int kDenseRowsCols=16;
+constexpr int kDenseRowsCols=8;
 constexpr int kDenseRowsTileK=128;
 constexpr int kDenseRowsStages=4;
 constexpr int kDenseRowsMax=8;
+constexpr int kDenseRowsThreads=kDenseRowsCols*kDenseRowsMax;
+constexpr int kDenseRowsParts=kDenseRowsCols/8;
 
 __device__ __forceinline__ void dflash_cp_async_16(void* shared_ptr,const void* global_ptr) {
     const auto shared_address=
@@ -819,7 +842,7 @@ __device__ __forceinline__ void dflash_cp_async_16(void* shared_ptr,const void* 
                  :: "r"(shared_address), "l"(global_ptr));
 }
 
-__global__ void __launch_bounds__(128) dflash_dense_rows_kmajor_kernel(
+__global__ void __launch_bounds__(kDenseRowsThreads) dflash_dense_rows_kmajor_kernel(
     const std::uint16_t* a,const std::uint16_t* b,std::uint16_t* c,int m,int k,int n) {
     __shared__ __align__(16) std::uint16_t weights[kDenseRowsStages][kDenseRowsTileK][kDenseRowsCols];
     __shared__ __align__(16) std::uint16_t inputs[kDenseRowsStages][kDenseRowsMax][kDenseRowsTileK];
@@ -830,12 +853,12 @@ __global__ void __launch_bounds__(128) dflash_dense_rows_kmajor_kernel(
     const int tiles=k/kDenseRowsTileK;
     auto load=[&](int tile,int stage) {
         const int k0=tile*kDenseRowsTileK;
-        for(int chunk=tid;chunk<kDenseRowsTileK*2;chunk+=128) {
-            const int r=chunk>>1,part=chunk&1;
+        for(int chunk=tid;chunk<kDenseRowsTileK*kDenseRowsParts;chunk+=kDenseRowsThreads) {
+            const int r=chunk/kDenseRowsParts,part=chunk%kDenseRowsParts;
             dflash_cp_async_16(&weights[stage][r][part*8],
                 b+static_cast<std::size_t>(k0+r)*n+col0+part*8);
         }
-        for(int chunk=tid;chunk<m*(kDenseRowsTileK/8);chunk+=128) {
+        for(int chunk=tid;chunk<m*(kDenseRowsTileK/8);chunk+=kDenseRowsThreads) {
             const int r=chunk/(kDenseRowsTileK/8),part=chunk%(kDenseRowsTileK/8);
             dflash_cp_async_16(&inputs[stage][r][part*8],
                 a+static_cast<std::size_t>(r)*k+k0+part*8);
@@ -883,7 +906,7 @@ bool launch_dflash_dense_rows_kmajor(const std::uint16_t* in,const std::uint16_t
        k%kDenseRowsTileK!=0 || n%kDenseRowsCols!=0 ||
        (reinterpret_cast<std::uintptr_t>(in)|reinterpret_cast<std::uintptr_t>(weights))%16!=0)
         return false;
-    dflash_dense_rows_kmajor_kernel<<<n/kDenseRowsCols,128,0,stream>>>(in,weights,out,rows,k,n);
+    dflash_dense_rows_kmajor_kernel<<<n/kDenseRowsCols,kDenseRowsThreads,0,stream>>>(in,weights,out,rows,k,n);
     return true;
 }
 
@@ -2679,9 +2702,9 @@ void gopt_draft_ring_norm_fixture(bool fused,const std::uint16_t* k,
 void gopt_draft_conv_fixture(bool fused,const std::uint16_t* input,
     const std::uint16_t* dynamic,const std::uint16_t* base,std::uint16_t* conv,
     const std::uint16_t* residual,std::uint16_t* output,int rows,cudaStream_t stream) {
-    if(fused)dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<rows,256,0,stream>>>(
+    if(fused)dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<dim3(rows, kHidden / 256), 256,0,stream>>>(
         input,dynamic,base,conv,rows,1,residual,output);
-    else dflash_dyn_conv_kernel<DFlashFmt::BF16,false><<<rows,256,0,stream>>>(
+    else dflash_dyn_conv_kernel<DFlashFmt::BF16,false><<<dim3(rows, kHidden / 256), 256,0,stream>>>(
         input,dynamic,base,conv,rows,1);
     cuda_check(cudaGetLastError(),"GOPT draft conv fixture");
     if(!fused)dflash_residual_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(residual,conv,output,rows*kHidden);
@@ -4797,9 +4820,9 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
                                const std::uint16_t* base, std::uint16_t* y, int rows,
                                int conv_stream, bool out_bf16 = false) {
         if (out_bf16) {
-            dflash_dyn_conv_kernel<DFlashFmt::BF16><<<rows, 256, 0, stream>>>(x, dyn, base, y, rows, conv_stream);
+            dflash_dyn_conv_kernel<DFlashFmt::BF16><<<dim3(rows, kHidden / 256), 256, 0, stream>>>(x, dyn, base, y, rows, conv_stream);
         } else {
-            dflash_dyn_conv_kernel<DFlashFmt::F16><<<rows, 256, 0, stream>>>(x, dyn, base, y, rows, conv_stream);
+            dflash_dyn_conv_kernel<DFlashFmt::F16><<<dim3(rows, kHidden / 256), 256, 0, stream>>>(x, dyn, base, y, rows, conv_stream);
         }
         cuda_check(cudaGetLastError(), "E5A2 launch draft dynamic conv");
     };
@@ -5280,7 +5303,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         stage_maxabs("oproj_" + std::to_string(layer_index), m.s.oproj, block_len * kHidden);
         if (!use_ring && layer_index == 0) diff_l0_oproj(block_len);
         if(m.gaming[Gopt::DraftConvResidual]) {
-            dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<block_len,256,0,stream>>>(
+            dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<dim3(block_len, kHidden / 256), 256,0,stream>>>(
                 m.s.oproj,m.s.dyn,lay.attn_base,m.s.convf,block_len,1,current,other);
             cuda_check(cudaGetLastError(),"launch GOPT draft conv/residual");
             gopt_record(m.gaming_submissions,Gopt::DraftConvResidual);
@@ -5343,7 +5366,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         stage_nan("mlp_down_" + std::to_string(layer_index), m.s.down, block_len * kHidden);
         stage_maxabs("mlp_down_" + std::to_string(layer_index), m.s.down, block_len * kHidden);
         if(m.gaming[Gopt::DraftConvResidual]) {
-            dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<block_len,256,0,stream>>>(
+            dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<dim3(block_len, kHidden / 256), 256,0,stream>>>(
                 m.s.down,m.s.dyn2,lay.mlp_base,m.s.convf2,block_len,1,other,other);
             cuda_check(cudaGetLastError(),"launch GOPT draft conv/residual");
             gopt_record(m.gaming_submissions,Gopt::DraftConvResidual);
