@@ -2036,6 +2036,172 @@ __global__ void __launch_bounds__(32) dflash_topk16_segment_merge_kernel(
     }
 }
 
+
+// Chunked exact top-16 (default; NINFER_DFLASH2_TOPK_CHUNKED=0 keeps the
+// segmented insertion route). With T the 16th largest of the per-128-logit
+// chunk maxima, every top-16 logit lies in a chunk whose maximum is >= T, so
+// sorting the (value desc, id asc) pairs of those chunks yields exactly the
+// serial insertion order. NaN rows and rows with more than kTopKChunkCandidates
+// such chunks (ties) take dflash_topk16_serial_row.
+constexpr int kTopKChunk = 128;
+constexpr int kTopKMaxChunks = (kVocab + 256 + kTopKChunk - 1) / kTopKChunk;
+constexpr int kTopKChunkSort = 2048;  // chunk-maximum capacity per row
+constexpr int kTopKChunkCandidates = 32;
+constexpr int kTopKCandidateSort = kTopKChunkCandidates * kTopKChunk;
+constexpr int kTopKChunkThreads = 256;
+static_assert(kTopKMaxChunks <= kTopKChunkSort);
+
+__global__ void __launch_bounds__(kTopKChunkThreads) dflash_topk16_chunk_max_kernel(
+    const std::uint16_t* logits, int vocab, float* chunk_max, int* chunk_nan) {
+    constexpr int kWarps = kTopKChunkThreads / 32;
+    const int row = static_cast<int>(blockIdx.y);
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int chunk = static_cast<int>(blockIdx.x) * kWarps + (static_cast<int>(threadIdx.x) >> 5);
+    const int chunks = (vocab + kTopKChunk - 1) / kTopKChunk;
+    if (chunk >= chunks) return;
+    const auto* input = logits + static_cast<std::size_t>(row) * vocab;
+    float maximum = -CUDART_INF_F;
+    bool nan = false;
+    #pragma unroll
+    for (int i = 0; i < kTopKChunk / 32; ++i) {
+        const int column = chunk * kTopKChunk + lane + 32 * i;
+        if (column < vocab) {
+            const float value = half_to_float(input[column]);
+            nan = nan || isnan(value);
+            maximum = fmaxf(maximum, value);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+    nan = __any_sync(0xffffffffu, nan);
+    if (lane == 0) {
+        chunk_max[static_cast<std::size_t>(row) * kTopKMaxChunks + chunk] = maximum;
+        chunk_nan[static_cast<std::size_t>(row) * kTopKMaxChunks + chunk] = nan ? 1 : 0;
+    }
+}
+
+// a precedes b in (value desc, id asc) order.
+__device__ __forceinline__ bool dflash_topk_precedes(float av, int ai, float bv, int bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+// Block-wide first pair in (value desc, id asc) order; every thread gets it.
+__device__ __forceinline__ void dflash_block_first(float& value, int& id, float* warp_values,
+                                                   int* warp_ids) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float v = __shfl_xor_sync(0xffffffffu, value, offset);
+        const int i = __shfl_xor_sync(0xffffffffu, id, offset);
+        if (dflash_topk_precedes(v, i, value, id)) { value = v; id = i; }
+    }
+    if (lane == 0) { warp_values[warp] = value; warp_ids[warp] = id; }
+    __syncthreads();
+    value = warp_values[lane];
+    id = warp_ids[lane];
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float v = __shfl_xor_sync(0xffffffffu, value, offset);
+        const int i = __shfl_xor_sync(0xffffffffu, id, offset);
+        if (dflash_topk_precedes(v, i, value, id)) { value = v; id = i; }
+    }
+    __syncthreads();
+}
+
+constexpr int kTopKSelectThreads = 1024;
+constexpr int kTopKSelectPerThread = kTopKCandidateSort / kTopKSelectThreads;
+static_assert(kTopKSelectThreads == 32 * 32, "two-level warp reduction");
+static_assert(kTopKChunkSort <= kTopKSelectThreads * kTopKSelectPerThread);
+
+__global__ void __launch_bounds__(kTopKSelectThreads) dflash_topk16_chunk_select_kernel(
+    const std::uint16_t* logits, int vocab, const float* chunk_max, const int* chunk_nan,
+    std::int64_t* cand_ids, float* cand_unary) {
+    constexpr int kInvalid = 0x7fffffff;
+    __shared__ float warp_values[32];
+    __shared__ int warp_ids[32];
+    __shared__ int selected[kTopKChunkCandidates];
+    __shared__ int selected_count;
+    const int row = static_cast<int>(blockIdx.x);
+    const int t = static_cast<int>(threadIdx.x);
+    const int chunks = (vocab + kTopKChunk - 1) / kTopKChunk;
+    const float* maxima = chunk_max + static_cast<std::size_t>(row) * kTopKMaxChunks;
+    float values[kTopKSelectPerThread];
+    int ids[kTopKSelectPerThread];
+    bool nan = false;
+    #pragma unroll
+    for (int j = 0; j < kTopKSelectPerThread; ++j) {
+        const int c = t + j * kTopKSelectThreads;
+        values[j] = c < chunks ? maxima[c] : -CUDART_INF_F;
+        ids[j] = c < chunks ? c : kInvalid;
+        if (c < chunks) nan = nan || chunk_nan[static_cast<std::size_t>(row) * kTopKMaxChunks + c];
+    }
+    if (t == 0) selected_count = 0;
+    if (__syncthreads_or(nan)) {
+        if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary);
+        return;
+    }
+    // T = 16th largest chunk maximum (with multiplicity).
+    float threshold = -CUDART_INF_F;
+    for (int rank = 0; rank < kTopK; ++rank) {
+        float value = -CUDART_INF_F;
+        int id = kInvalid;
+        #pragma unroll
+        for (int j = 0; j < kTopKSelectPerThread; ++j)
+            if (dflash_topk_precedes(values[j], ids[j], value, id)) { value = values[j]; id = ids[j]; }
+        dflash_block_first(value, id, warp_values, warp_ids);
+        threshold = value;
+        #pragma unroll
+        for (int j = 0; j < kTopKSelectPerThread; ++j)
+            if (ids[j] == id) { values[j] = -CUDART_INF_F; ids[j] = kInvalid; }
+    }
+    for (int c = t; c < chunks; c += kTopKSelectThreads) {
+        if (maxima[c] >= threshold) {
+            const int slot = atomicAdd(&selected_count, 1);
+            if (slot < kTopKChunkCandidates) selected[slot] = c;
+        }
+    }
+    __syncthreads();
+    const int count = selected_count;
+    if (count > kTopKChunkCandidates) {
+        if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary);
+        return;
+    }
+    const auto* input = logits + static_cast<std::size_t>(row) * vocab;
+    #pragma unroll
+    for (int j = 0; j < kTopKSelectPerThread; ++j) {
+        const int i = t + j * kTopKSelectThreads;
+        const int slot = i / kTopKChunk;
+        const int column = slot < count ? selected[slot] * kTopKChunk + i % kTopKChunk : vocab;
+        values[j] = column < vocab ? half_to_float(input[column]) : -CUDART_INF_F;
+        ids[j] = column < vocab ? column : kInvalid;
+    }
+    for (int rank = 0; rank < kTopK; ++rank) {
+        float value = -CUDART_INF_F;
+        int id = kInvalid;
+        #pragma unroll
+        for (int j = 0; j < kTopKSelectPerThread; ++j)
+            if (dflash_topk_precedes(values[j], ids[j], value, id)) { value = values[j]; id = ids[j]; }
+        dflash_block_first(value, id, warp_values, warp_ids);
+        if (t == 0) {
+            cand_ids[static_cast<std::size_t>(row) * kTopK + rank] = id;
+            cand_unary[static_cast<std::size_t>(row) * kTopK + rank] = value;
+        }
+        #pragma unroll
+        for (int j = 0; j < kTopKSelectPerThread; ++j)
+            if (ids[j] == id) { values[j] = -CUDART_INF_F; ids[j] = kInvalid; }
+    }
+}
+
+bool dflash_topk_chunked_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_TOPK_CHUNKED");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 bool dflash_topk_segmented_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_DFLASH2_TOPK_SEGMENTED");
@@ -2045,12 +2211,24 @@ bool dflash_topk_segmented_enabled() {
 }
 
 std::size_t dflash_topk_segment_bytes() {
-    return static_cast<std::size_t>(kBlockCap) * kTopKSegments *
-        (kTopK * (sizeof(float) + sizeof(int)) + sizeof(int));
+    return std::max(static_cast<std::size_t>(kBlockCap) * kTopKSegments *
+            (kTopK * (sizeof(float) + sizeof(int)) + sizeof(int)),
+        static_cast<std::size_t>(kBlockCap) * kTopKMaxChunks * (sizeof(float) + sizeof(int)));
 }
 
 void launch_dflash_topk16_segmented(const std::uint16_t* logits, int rows, int vocab,
     std::int64_t* cand_ids, float* cand_unary, void* scratch, cudaStream_t stream) {
+    if (dflash_topk_chunked_enabled()) {
+        auto* chunk_max = static_cast<float*>(scratch);
+        auto* chunk_nan = reinterpret_cast<int*>(chunk_max + kBlockCap * kTopKMaxChunks);
+        const int chunks = (vocab + kTopKChunk - 1) / kTopKChunk;
+        constexpr int warps = kTopKChunkThreads / 32;
+        dflash_topk16_chunk_max_kernel<<<dim3((chunks + warps - 1) / warps, rows),
+            kTopKChunkThreads, 0, stream>>>(logits, vocab, chunk_max, chunk_nan);
+        dflash_topk16_chunk_select_kernel<<<rows, kTopKSelectThreads, 0, stream>>>(
+            logits, vocab, chunk_max, chunk_nan, cand_ids, cand_unary);
+        return;
+    }
     auto* values = static_cast<float*>(scratch);
     auto* ids = reinterpret_cast<int*>(values + kBlockCap * kTopKSegments * kTopK);
     auto* nan = ids + kBlockCap * kTopKSegments * kTopK;
