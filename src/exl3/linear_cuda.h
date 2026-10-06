@@ -712,10 +712,7 @@ public:
                                       Exl3CudaLinearAdmission::ordinary,
                                   const std::uint16_t* raw_input = nullptr);
 
-    // Single-row MLP gate/up/SiLU in one coherent producer launch plus one
-    // reduction/activation launch. Returns false (nothing submitted) when the
-    // pair is not on the fused-input coherent wide route.
-    // Single-row MLP down only: the next coherent down projection also writes
+    // The next coherent down/O projection (1..8 rows) also writes
     // residual_out = half(left + projection) in its reduction kernel. The
     // caller checks take_residual_applied() and skips its residual launch.
     void arm_residual(const std::uint16_t* left,std::uint16_t* residual_out) noexcept {
@@ -727,31 +724,36 @@ public:
         return applied;
     }
 
-    // Two same-input single-row projections (e.g. GDN qkv and z) in one
-    // coherent producer launch and one reduction launch; false when ineligible.
-    // Optional GDN control projections (one extra CTA per head, the
-    // control_fused_staged_kernel arithmetic) and a BF16 copy of the first
-    // output (the GDN convolution input) ride on the same launches.
-    bool forward_m1_pair(Exl3CudaLinearWorkspace& second_workspace,
-                         const Exl3CudaLinearWeights& first_weights,
-                         const Exl3CudaLinearMetadata& first_metadata,
-                         std::uint16_t* first_output,
-                         const Exl3CudaLinearWeights& second_weights,
-                         const Exl3CudaLinearMetadata& second_metadata,
-                         std::uint16_t* second_output,const std::uint16_t* input,
-                         cudaStream_t stream,
-                         const Exl3GdnControlSide* control = nullptr,
-                         std::uint16_t* first_bf16 = nullptr);
-    bool forward_m1_gate_up_silu(Exl3CudaLinearWorkspace& up_workspace,
-                                 const Exl3CudaLinearWeights& gate_weights,
-                                 const Exl3CudaLinearMetadata& gate_metadata,
-                                 const Exl3CudaLinearWeights& up_weights,
-                                 const Exl3CudaLinearMetadata& up_metadata,
-                                 const std::uint16_t* input,std::uint16_t* gate_output,
-                                 std::uint16_t* up_output,std::uint16_t* activation,
-                                 cudaStream_t stream,
-                                 const Exl3CudaLinearWeights* down_weights = nullptr,
-                                 Exl3CudaLinearWorkspace* down_workspace = nullptr);
+    // Two same-input projections of 1..8 rows (e.g. GDN qkv and z) in one
+    // fused-input coherent producer launch and one reduction launch; false
+    // (nothing submitted) when ineligible. Optional GDN control projections
+    // (rows*heads extra CTAs, the control_fused_staged_kernel arithmetic) and
+    // a BF16 copy of the first output in the GDN convolution-input layout
+    // ([feature*rows+row]) ride on the same launches.
+    bool forward_merged_pair(Exl3CudaLinearWorkspace& second_workspace,
+                             const Exl3CudaLinearWeights& first_weights,
+                             const Exl3CudaLinearMetadata& first_metadata,
+                             std::uint16_t* first_output,
+                             const Exl3CudaLinearWeights& second_weights,
+                             const Exl3CudaLinearMetadata& second_metadata,
+                             std::uint16_t* second_output,const std::uint16_t* input,
+                             int rows,cudaStream_t stream,
+                             const Exl3GdnControlSide* control = nullptr,
+                             std::uint16_t* first_bf16 = nullptr);
+    // MLP gate/up/SiLU of 1..8 rows in one fused-input coherent producer
+    // launch plus one reduction/activation launch, which can also emit the
+    // down projection's transformed input. Returns false (nothing submitted)
+    // when the pair is not on the fused-input coherent wide route.
+    bool forward_merged_gate_up_silu(Exl3CudaLinearWorkspace& up_workspace,
+                                     const Exl3CudaLinearWeights& gate_weights,
+                                     const Exl3CudaLinearMetadata& gate_metadata,
+                                     const Exl3CudaLinearWeights& up_weights,
+                                     const Exl3CudaLinearMetadata& up_metadata,
+                                     const std::uint16_t* input,std::uint16_t* gate_output,
+                                     std::uint16_t* up_output,std::uint16_t* activation,
+                                     int rows,cudaStream_t stream,
+                                     const Exl3CudaLinearWeights* down_weights = nullptr,
+                                     Exl3CudaLinearWorkspace* down_workspace = nullptr);
 
     // Exact target-prefill fast path for a gate/up pair. Matrix-specific SUH
     // transforms share one launch and remain separate through the paired MMA.

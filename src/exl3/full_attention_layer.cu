@@ -7663,12 +7663,12 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             weights_.k_metadata.out_features==kKVProjection &&
             weights_.v_metadata.out_features==kKVProjection;
         begin(2);
-        const bool merged_kv=!m1_kv_pair && rows==1 && !can_share_target && !oscar_ &&
-            !profile && !projection_timing_ && !projection_observer_ && !wide_prefill &&
-            linear_workspaces_[1] && linear_workspaces_[2] &&
-            linear_workspaces_[1]->forward_m1_pair(*linear_workspaces_[2],
+        const bool merged_kv=!m1_kv_pair && rows>=1 && rows<=8 && !can_share_target &&
+            !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
+            !wide_prefill && linear_workspaces_[1] && linear_workspaces_[2] &&
+            linear_workspaces_[1]->forward_merged_pair(*linear_workspaces_[2],
                 weights_.k,weights_.k_metadata,kp,weights_.v,weights_.v_metadata,vp,
-                input_norm,stream);
+                input_norm,rows,stream);
         if(merged_kv) {
             launch(cudaGetLastError(),"launch merged EXL3 K/V projection");
         } else if(m1_kv_pair) {
@@ -9030,7 +9030,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         target_shared_admission(Exl3TargetSharedFamily::o,weights_.o_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.o,weights_.o_metadata,
             attn,op,rows,position,model_layer_,stream,Exl3TargetSharedFamily::o});
-    if(!shared_o && rows==1 && !profile && !projection_timing_ && !projection_observer_)
+    if(!shared_o && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+       !projection_observer_)
         linear_workspaces_[3]->arm_residual(input,post_resid);
     if(!shared_o)project(linear_workspaces_[3], weights_.o, weights_.o_metadata, attn, op,
             Exl3TargetProjectionOperator::o);
@@ -9129,12 +9130,12 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,stream);
             ++fast_same_weights_fp16kv_m1_gate_up_pair_submissions_;
         }
-        merged_gate_up=!paired_m1_gate_up && rows==1 && !can_share_target &&
+        merged_gate_up=!paired_m1_gate_up && rows>=1 && rows<=8 && !can_share_target &&
             !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
             !wide_prefill && !small_m_fused_gate_up_transform_ &&
-            linear_workspaces_[4]->forward_m1_gate_up_silu(*linear_workspaces_[5],
+            linear_workspaces_[4]->forward_merged_gate_up_silu(*linear_workspaces_[5],
                 weights_.gate,weights_.gate_metadata,weights_.up,weights_.up_metadata,
-                mlp_in,gp,up,act,stream,
+                mlp_in,gp,up,act,rows,stream,
                 target_down_executor_enabled_?nullptr:&weights_.down,
                 target_down_executor_enabled_?nullptr:linear_workspaces_[6]);
         const bool paired_gate_up=!paired_m1_gate_up && !merged_gate_up && !can_share_target &&
@@ -9186,7 +9187,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         target_shared_admission(Exl3TargetSharedFamily::down,weights_.down_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
             act,down,rows,position,model_layer_,stream,Exl3TargetSharedFamily::down});
-    if(!shared_down && rows==1 && !profile && !projection_timing_ && !projection_observer_)
+    if(!shared_down && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+       !projection_observer_)
         linear_workspaces_[6]->arm_residual(post_resid,output);
     if(!shared_down)project(linear_workspaces_[6], weights_.down, weights_.down_metadata, act, down,
             Exl3TargetProjectionOperator::down,

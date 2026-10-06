@@ -3052,11 +3052,11 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             (void)cudaStreamWaitEvent(stream, graph_qkvz_concurrency_.z_done, 0);
             throw;
         }
-    } else if (rows == 1 && !profile && !projection_timing_ && !projection_observer_ &&
-               !wide_prefill && !control_pair &&
-               linear_workspaces_[0]->forward_m1_pair(*linear_workspaces_[1],
+    } else if (rows >= 1 && rows <= 8 && !profile && !projection_timing_ &&
+               !projection_observer_ && !wide_prefill && !control_pair &&
+               linear_workspaces_[0]->forward_merged_pair(*linear_workspaces_[1],
                    weights_.qkv,weights_.qkv_metadata,qkv,weights_.z,weights_.z_metadata,z,
-                   h,stream,&merged_control,merged_conv_input)) {
+                   h,rows,stream,&merged_control,merged_conv_input)) {
         // Control projections and the BF16 convolution input were produced
         // by the merged launches.
         merged_qkvz_side=true;
@@ -3286,12 +3286,12 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         weights_.up_metadata.in_features == kHidden &&
         weights_.gate_metadata.out_features == kIntermediate &&
         weights_.up_metadata.out_features == kIntermediate;
-    const bool merged_gate_up = !gdn_m1_gate_up_pair && rows == 1 && !profile &&
+    const bool merged_gate_up = !gdn_m1_gate_up_pair && rows >= 1 && rows <= 8 && !profile &&
         !projection_timing_ && !projection_observer_ && !wide_prefill &&
         !shared_gateup_enabled_ && !small_m_fused_gate_up_transform_ &&
-        linear_workspaces_[3]->forward_m1_gate_up_silu(*linear_workspaces_[4],
+        linear_workspaces_[3]->forward_merged_gate_up_silu(*linear_workspaces_[4],
             weights_.gate,weights_.gate_metadata,weights_.up,weights_.up_metadata,
-            mlp_input,gate,up,act,stream,
+            mlp_input,gate,up,act,rows,stream,
             shared_down_enabled_?nullptr:&weights_.down,
             shared_down_enabled_?nullptr:linear_workspaces_[5]);
     if (gdn_m1_gate_up_pair) {
@@ -3398,7 +3398,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         preserve_m1_topology && !wide_prefill && rows>=1 && rows<=8 &&
         shared_gateup_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
             act,down,rows,0,model_layer_,stream,Exl3TargetSharedFamily::down});
-    if(!shared_down && rows==1 && !profile && !projection_timing_ && !projection_observer_)
+    if(!shared_down && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+       !projection_observer_)
         linear_workspaces_[5]->arm_residual(post,final_output);
     if(!shared_down)project(linear_workspaces_[5], weights_.down, weights_.down_metadata, act, down,
                        Exl3TargetProjectionOperator::down,

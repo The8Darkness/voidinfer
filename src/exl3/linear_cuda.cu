@@ -1066,6 +1066,41 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) input_hadamard_warp
     exl3_store_half4(transformed+element,result);
 }
 
+// Input transforms of one activation for two projections (input_hadamard_warp
+// _kernel arithmetic for each SUH); one warp per (row, 128-block).
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) input_hadamard_pair_warp_kernel(
+    const std::uint16_t* input,const std::uint16_t* suh_a,const std::uint16_t* suh_b,
+    std::uint16_t* transformed_a,std::uint16_t* transformed_b,int rows,int input_features) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=input_features/kHadamard;
+    const int task=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=rows*blocks) return;
+    const int offset=(task%blocks)*kHadamard+lane*4;
+    const std::size_t element=static_cast<std::size_t>(task/blocks)*input_features+offset;
+    std::uint16_t represented[4],scale_a[4],scale_b[4];
+    exl3_load_half4(input+element,represented);
+    exl3_load_half4(suh_a+offset,scale_a);
+    exl3_load_half4(suh_b+offset,scale_b);
+    float a[4],b[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        a[j]=half_product(represented[j],scale_a[j]);
+        b[j]=half_product(represented[j],scale_b[j]);
+    }
+    exl3_warp_butterflies(a,lane);
+    exl3_warp_butterflies(b,lane);
+    std::uint16_t result_a[4],result_b[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        result_a[j]=__half_as_ushort(__float2half_rn(a[j]*kHadamardScale));
+        result_b[j]=__half_as_ushort(__float2half_rn(b[j]*kHadamardScale));
+    }
+    exl3_store_half4(transformed_a+element,result_a);
+    exl3_store_half4(transformed_b+element,result_b);
+}
+
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_warp_kernel(
     const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
     int output_features) {
@@ -1400,18 +1435,22 @@ __device__ __forceinline__ void exl3_sum_split_planes(const float* accum,std::si
 // prefill_reduce_output_warp_kernel<false> followed by residual_kernel:
 // output = reduced projection, residual_out = half(left + output).
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) reduce_output_residual_warp_kernel(
-    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int output_features,
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features,
     int split_count,const std::uint16_t* left,std::uint16_t* residual_out) {
     EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
-    const int block=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+    const int task=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
         (static_cast<int>(threadIdx.x)>>5);
-    if(block>=output_features/kHadamard) return;
-    const int offset=block*kHadamard+lane*4;
+    const int blocks=output_features/kHadamard;
+    if(task>=rows*blocks) return;
+    const std::size_t row_base=static_cast<std::size_t>(task/blocks)*output_features;
+    const int column=(task%blocks)*kHadamard+lane*4;
+    const std::size_t offset=row_base+column;
     float v[4];
-    exl3_sum_split_planes(accum,static_cast<std::size_t>(output_features),offset,split_count,v);
+    exl3_sum_split_planes(accum+row_base,static_cast<std::size_t>(rows)*output_features,
+                          column,split_count,v);
     std::uint16_t scale[4],base[4];
-    exl3_load_half4(svh+offset,scale);
+    exl3_load_half4(svh+column,scale);
     exl3_load_half4(left+offset,base);
     exl3_warp_butterflies(v,lane);
     std::uint16_t result[4],sum[4];
@@ -2743,6 +2782,44 @@ constexpr std::size_t exl3_native_persistent_smem_bytes() {
            static_cast<std::size_t>(sh_c_elements) * sizeof(float);
 }
 
+// Per-row shared stride (halves) of the fused-input Hadamard staging: the
+// split's 128-blocks plus one block covering an unaligned split start, padded
+// by 8 halves so the eight A-fragment rows (lane / 4) read distinct banks.
+__host__ __device__ __forceinline__ int exl3_fused_input_span(int input_features,
+                                                              int split_count) {
+    const int tiles_per_split = (input_features / 16 + split_count - 1) / split_count;
+    return ((tiles_per_split * 16 + kHadamard - 1) / kHadamard + 1) * kHadamard + 8;
+}
+
+// True when a drained deep cp.async ring (ring_halves packed halves) can hold
+// the CTA's 16-row FP32 output tile.
+__host__ __device__ constexpr bool exl3_deep_ring_holds_output(int ring_halves,
+                                                               int output_tiles) {
+    return ring_halves * 2 >= 16 * output_tiles * 16 * 4;
+}
+
+// Dynamic shared bytes of a deep async-A producer that stages A tiles. The
+// output-tile bytes stay allocated even when sh_c reuses the ring: the
+// tighter footprint admits more CTAs per SM and measured slower.
+inline std::size_t exl3_deep_shared_bytes(int bits, int stages, int warps, int per) {
+    return static_cast<std::size_t>(stages * per) * 256u * sizeof(half) +
+        static_cast<std::size_t>(stages * per * warps * 16 * bits) * sizeof(std::uint16_t) +
+        16u * warps * 16u * sizeof(float);
+}
+
+// Dynamic shared bytes of a fused-input deep producer (no A staging, sh_c in
+// the drained ring when it fits, rows * span halves of transformed input).
+inline std::size_t exl3_fused_input_shared_bytes(int bits, int stages, int warps, int per,
+                                                 int rows, int input_features,
+                                                 int split_count) {
+    const int ring_halves = stages * per * warps * 16 * bits;
+    const std::size_t output_bytes = 16u * warps * 16u * sizeof(float);
+    return static_cast<std::size_t>(ring_halves) * sizeof(std::uint16_t) +
+        (exl3_deep_ring_holds_output(ring_halves, warps) ? 0u : output_bytes) +
+        static_cast<std::size_t>(rows) * exl3_fused_input_span(input_features, split_count) *
+            sizeof(half);
+}
+
 // Generalized version of the E2B cooperative leaf.  The model's real EXL3
 // projection dimensions are all multiples of a 512-column output block, so a
 // block owns 32 packed 16-column tiles and a split owns a contiguous range of
@@ -2766,10 +2843,11 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                                                  int split_count,
                                                  const std::uint16_t* raw_input,
                                                  const std::uint16_t* suh) {
-    // FusedInput (M1, deep async-A FP32 path only): the CTA computes the input
-    // Hadamard of its split's 128-blocks from the raw row and SUH (the
-    // input_hadamard_warp_kernel arithmetic) into shared memory and builds the
-    // row-0 A fragments from it; rows 1..15 stay zero as in the staged tile.
+    // FusedInput (rows 1..8, deep async-A FP32 path only): the CTA computes
+    // the input Hadamard of its split's 128-blocks from the raw rows and SUH
+    // (the input_hadamard_warp_kernel arithmetic) into shared memory, one
+    // exl3_fused_input_span row stride per row, and builds the A fragments
+    // from it; rows >= `rows` (and 8..15) stay zero as in the staged tile.
     static_assert(!FusedInput || (DeepStages > 0 && AsyncA && !RegisterPipeline &&
                                   !Fp16Accumulate && !PredecodedB),
                   "fused input requires the deep async-A FP32 producer");
@@ -2817,13 +2895,20 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                   "multi-tile stages require the deep cp.async ring");
     constexpr int raw_stage_count =
         RegisterPipeline ? 4 : (DeepStages ? DeepStages * TilesPerStage : 2);
+    // The deep ring is drained before the output tile is written, so sh_c
+    // reuses it whenever it fits (exl3_deep_ring_holds_output); fused input
+    // builds A fragments from sh_in and stages no A tiles. Launchers size
+    // fused-input shared memory with exl3_fused_input_shared_bytes.
+    constexpr bool alias_c = DeepStages > 0 &&
+        exl3_deep_ring_holds_output(raw_stage_count * raw_stage_half, output_tiles_per_block);
     extern __shared__ half shared[];
     half* sh_a = shared;
     auto* sh_raw = reinterpret_cast<std::uint16_t*>(
-        sh_a + (AsyncA ? raw_stage_count * 256 : 256));
-    float* sh_c = reinterpret_cast<float*>(
+        sh_a + (FusedInput ? 0 : (AsyncA ? raw_stage_count * 256 : 256)));
+    float* sh_c = alias_c ? reinterpret_cast<float*>(sh_raw) : reinterpret_cast<float*>(
         sh_raw + raw_stage_count * raw_stage_half);
-    half* sh_in = reinterpret_cast<half*>(sh_c + 16 * output_tiles_per_block * 16);
+    half* sh_in = alias_c ? reinterpret_cast<half*>(sh_raw + raw_stage_count * raw_stage_half)
+                          : reinterpret_cast<half*>(sh_c + 16 * output_tiles_per_block * 16);
     const int thread = static_cast<int>(threadIdx.x);
     const int warp = thread / 32;
     const int lane = thread & 31;
@@ -3019,12 +3104,17 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             issue(preload, preload);
         }
         const int fused_block0 = tile_k_begin * 16 / kHadamard;
+        const int fused_span = exl3_fused_input_span(input_features, split_count);
         if constexpr (FusedInput) {
             const int fused_block1 = (tile_k_end * 16 + kHadamard - 1) / kHadamard;
-            for (int b = fused_block0 + warp; b < fused_block1; b += Warps) {
+            const int fused_blocks = fused_block1 - fused_block0;
+            for (int task = warp; task < rows * fused_blocks; task += Warps) {
+                const int row = task / fused_blocks;
+                const int b = fused_block0 + task % fused_blocks;
                 const int offset = b * kHadamard + lane * 4;
                 std::uint16_t represented[4], scale[4];
-                exl3_load_half4(raw_input + offset, represented);
+                exl3_load_half4(raw_input + static_cast<std::size_t>(row) * input_features +
+                                offset, represented);
                 exl3_load_half4(suh + offset, scale);
                 float v[4];
                 #pragma unroll
@@ -3034,7 +3124,7 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                 #pragma unroll
                 for (int j = 0; j < 4; ++j)
                     result[j] = __half_as_ushort(__float2half_rn(v[j] * kHadamardScale));
-                exl3_store_half4(reinterpret_cast<std::uint16_t*>(sh_in) +
+                exl3_store_half4(reinterpret_cast<std::uint16_t*>(sh_in) + row * fused_span +
                                  (b - fused_block0) * kHadamard + lane * 4, result);
             }
             __syncthreads();
@@ -3052,13 +3142,17 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             const int stage = (group % stages) * per + t;
             Exl3FragA a;
             if constexpr (FusedInput) {
+                // m16n8k16 A: words 0/2 hold row lane/4 at columns
+                // 2*(lane%4) and 8+2*(lane%4); words 1/3 (rows 8..15) are zero.
                 const int tile_k = tile_k_begin + group * per + t;
-                const auto* row0 = reinterpret_cast<const std::uint32_t*>(
-                    sh_in + (tile_k * 16 - fused_block0 * kHadamard));
+                const int a_row = lane >> 2;
+                const auto* row_words = reinterpret_cast<const std::uint32_t*>(
+                    sh_in + a_row * fused_span + (tile_k * 16 - fused_block0 * kHadamard));
                 auto* words = reinterpret_cast<std::uint32_t*>(&a);
-                words[0] = lane < 4 ? row0[lane] : 0u;
+                const bool live = a_row < rows;
+                words[0] = live ? row_words[lane & 3] : 0u;
                 words[1] = 0u;
-                words[2] = lane < 4 ? row0[4 + lane] : 0u;
+                words[2] = live ? row_words[4 + (lane & 3)] : 0u;
                 words[3] = 0u;
             } else {
             const int r = (lane % 8) + 8 * ((lane / 8) % 2);
@@ -3266,25 +3360,30 @@ __global__ void exl3_gemm_m1_fused_input_kernel(const std::uint16_t* raw_input,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
                                                  float* accum,
+                                                 int rows,
                                                  int input_features,
                                                  int output_features,
                                                  int split_count) {
     exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
         FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
-            static_cast<int>(blockIdx.x), raw_input, trellis, mul1, accum, 1,
+            static_cast<int>(blockIdx.x), raw_input, trellis, mul1, accum, rows,
             input_features, output_features, split_count, raw_input, suh);
 }
 
-// Two same-input M1 projections (MLP gate and up) in one launch: blocks
-// [0, grid_a) run the first producer, the rest the second. Each block's
-// arithmetic is exl3_gemm_m1_fused_input_kernel's.
+// Two same-input projections (MLP gate and up, GDN qkv and z, K and V) of
+// 1..8 rows in one launch: blocks [0, grid_a) run the first producer, the next
+// grid_b the second, and any further rows*heads blocks the GDN control
+// projections. Fused producers transform the raw rows in their prologue
+// (exl3_gemm_m1_fused_input_kernel arithmetic); otherwise they read the two
+// pre-transformed inputs (launch_coherent_packed_partials arithmetic).
 template <int Bits, bool K7ThreeWord, bool FastK6Decode, int DeepStages, int Warps,
-          int TilesPerStage>
+          int TilesPerStage, bool Fused = true>
 __global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_input,
+    const std::uint16_t* transformed_a, const std::uint16_t* transformed_b,
     const std::uint16_t* suh_a, const std::uint16_t* trellis_a, const std::int32_t* mul1_a,
     float* accum_a, const std::uint16_t* suh_b, const std::uint16_t* trellis_b,
-    const std::int32_t* mul1_b, float* accum_b, int input_features, int output_features_a,
-    int output_features_b, int split_count, int grid_a, int grid_b,
+    const std::int32_t* mul1_b, float* accum_b, int rows, int input_features,
+    int output_features_a, int output_features_b, int split_count, int grid_a, int grid_b,
     Exl3GdnControlSide control) {
     const int block = static_cast<int>(blockIdx.x);
     if (block >= grid_a + grid_b) {
@@ -3293,7 +3392,10 @@ __global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_in
         asm volatile("griddepcontrol.wait;" ::: "memory");
         asm volatile("griddepcontrol.launch_dependents;");
         __shared__ float partial_a[4], partial_b[4];
-        const int head = block - grid_a - grid_b;
+        const int index = block - grid_a - grid_b;
+        const int head = index % control.heads;
+        const std::uint16_t* x_row = raw_input +
+            static_cast<std::size_t>(index / control.heads) * input_features;
         const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
         const std::uint16_t* a_row = control.a_weight + static_cast<std::size_t>(head) * input_features;
         const std::uint16_t* b_row = control.b_weight + static_cast<std::size_t>(head) * input_features;
@@ -3301,7 +3403,7 @@ __global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_in
         #pragma unroll 8
         for (int step = 0; step < input_features / 128; ++step) {
             const int d = tid + step * 128;
-            const float x = __half2float(__ushort_as_half(raw_input[d]));
+            const float x = __half2float(__ushort_as_half(x_row[d]));
             asum = fmaf(x, __half2float(__ushort_as_half(a_row[d])), asum);
             bsum = fmaf(x, __half2float(__ushort_as_half(b_row[d])), bsum);
         }
@@ -3314,51 +3416,69 @@ __global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_in
         if (tid == 0) {
             asum = 0.0f; bsum = 0.0f;
             for (int w = 0; w < 4; ++w) { asum += partial_a[w]; bsum += partial_b[w]; }
-            control.a_output[head] = asum;
-            control.b_output[head] = bsum;
+            control.a_output[index] = asum;
+            control.b_output[index] = bsum;
             const float beta_f = 1.0f / (1.0f + expf(-bsum));
             const float av = asum + control.dt_bias[head];
             const float softplus = av > 20.0f ? av : log1pf(expf(av));
-            control.beta_trace[head] = __bfloat162float(__float2bfloat16_rn(beta_f));
-            control.g_trace[head] = -expf(control.a_log[head]) * softplus;
+            control.beta_trace[index] = __bfloat162float(__float2bfloat16_rn(beta_f));
+            control.g_trace[index] = -expf(control.a_log[head]) * softplus;
         }
         return;
     }
-    if (block < grid_a)
-        exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
-            FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
-                block, raw_input, trellis_a, mul1_a, accum_a, 1, input_features,
-                output_features_a, split_count, raw_input, suh_a);
-    else
-        exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
-            FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
-                block - grid_a, raw_input, trellis_b, mul1_b, accum_b, 1, input_features,
-                output_features_b, split_count, raw_input, suh_b);
+    if constexpr (Fused) {
+        if (block < grid_a)
+            exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+                FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
+                    block, raw_input, trellis_a, mul1_a, accum_a, rows, input_features,
+                    output_features_a, split_count, raw_input, suh_a);
+        else
+            exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+                FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
+                    block - grid_a, raw_input, trellis_b, mul1_b, accum_b, rows, input_features,
+                    output_features_b, split_count, raw_input, suh_b);
+    } else {
+        if (block < grid_a)
+            exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+                FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, false>(
+                    block, transformed_a, trellis_a, mul1_a, accum_a, rows, input_features,
+                    output_features_a, split_count, nullptr, nullptr);
+        else
+            exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+                FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, false>(
+                    block - grid_a, transformed_b, trellis_b, mul1_b, accum_b, rows,
+                    input_features, output_features_b, split_count, nullptr, nullptr);
+    }
 }
 
-// Reduction of two independent single-row split-plane sets (blocks of the
-// first matrix, then of the second); per block exactly
+// Reduction of two independent split-plane sets of 1..8 rows (per row the
+// blocks of the first matrix, then of the second); per block exactly
 // prefill_reduce_output_warp_kernel<false>.
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_output_kernel(
     const float* accum_a,const std::uint16_t* svh_a,std::uint16_t* output_a,int features_a,
     const float* accum_b,const std::uint16_t* svh_b,std::uint16_t* output_b,int features_b,
-    int split_count,std::uint16_t* first_bf16) {
+    int rows,int split_count,std::uint16_t* first_bf16) {
     EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
-    int block=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+    const int task=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
         (static_cast<int>(threadIdx.x)>>5);
     const int blocks_a=features_a/kHadamard;
+    const int row_blocks=blocks_a+features_b/kHadamard;
+    if(task>=rows*row_blocks) return;
+    const int row=task/row_blocks;
+    int block=task%row_blocks;
     const float* accum=accum_a; const std::uint16_t* svh=svh_a; std::uint16_t* output=output_a;
     int features=features_a;
     std::uint16_t* bf16_copy=first_bf16;
     if(block>=blocks_a) {
         block-=blocks_a; accum=accum_b; svh=svh_b; output=output_b; features=features_b;
         bf16_copy=nullptr;
-        if(block>=features_b/kHadamard) return;
     }
     const int offset=block*kHadamard+lane*4;
+    accum+=static_cast<std::size_t>(row)*features;
+    output+=static_cast<std::size_t>(row)*features;
     float v[4];
-    exl3_sum_split_planes(accum,static_cast<std::size_t>(features),offset,split_count,v);
+    exl3_sum_split_planes(accum,static_cast<std::size_t>(rows)*features,offset,split_count,v);
     std::uint16_t scale[4];
     exl3_load_half4(svh+offset,scale);
     exl3_warp_butterflies(v,lane);
@@ -3370,14 +3490,19 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_ou
     }
     exl3_store_half4(output+offset,result);
     if(bf16_copy) {
-        // transpose_f16_to_bf16_kernel at one row: bf16_rn(float(fp16)).
+        // transpose_f16_to_bf16_kernel: bf16_rn(float(fp16)) at [feature*rows+row].
         std::uint16_t converted[4];
         #pragma unroll
         for(int j=0;j<4;++j) {
             const __nv_bfloat16 value=__float2bfloat16_rn(__half2float(__ushort_as_half(result[j])));
             converted[j]=*reinterpret_cast<const std::uint16_t*>(&value);
         }
-        exl3_store_half4(bf16_copy+offset,converted);
+        if(rows==1) exl3_store_half4(bf16_copy+offset,converted);
+        else {
+            #pragma unroll
+            for(int j=0;j<4;++j)
+                bf16_copy[static_cast<std::size_t>(offset+j)*rows+row]=converted[j];
+        }
     }
 }
 
@@ -3387,21 +3512,25 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_ou
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_gate_up_reduce_silu_kernel(
     const float* accum_gate,const float* accum_up,const std::uint16_t* svh_gate,
     const std::uint16_t* svh_up,std::uint16_t* gate,std::uint16_t* up,
-    std::uint16_t* activation,int output_features,int split_count,
+    std::uint16_t* activation,int rows,int output_features,int split_count,
     const std::uint16_t* down_suh,std::uint16_t* down_transformed) {
     EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
-    const int block=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+    const int task=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
         (static_cast<int>(threadIdx.x)>>5);
-    if(block>=output_features/kHadamard) return;
-    const int offset=block*kHadamard+lane*4;
+    const int blocks=output_features/kHadamard;
+    if(task>=rows*blocks) return;
+    const std::size_t row_base=static_cast<std::size_t>(task/blocks)*output_features;
+    const int column=(task%blocks)*kHadamard+lane*4;
+    const std::size_t offset=row_base+column;
     float g[4],u[4];
     const auto reduce=[&](const float* accum,const std::uint16_t* svh,std::uint16_t* out,
                           float (&value)[4]) {
         float v[4];
-        exl3_sum_split_planes(accum,static_cast<std::size_t>(output_features),offset,split_count,v);
+        exl3_sum_split_planes(accum+row_base,static_cast<std::size_t>(rows)*output_features,
+                              column,split_count,v);
         std::uint16_t scale[4];
-        exl3_load_half4(svh+offset,scale);
+        exl3_load_half4(svh+column,scale);
         exl3_warp_butterflies(v,lane);
         std::uint16_t result[4];
         #pragma unroll
@@ -3423,7 +3552,7 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_gate_up_reduce
         // The down projection's input Hadamard (input_hadamard_warp_kernel
         // arithmetic) on the block this warp already holds.
         std::uint16_t scale[4];
-        exl3_load_half4(down_suh+offset,scale);
+        exl3_load_half4(down_suh+column,scale);
         float v[4];
         #pragma unroll
         for(int j=0;j<4;++j) v[j]=half_product(act[j],scale[j]);
@@ -9163,32 +9292,45 @@ static bool merged_gate_up_enabled();
 int coherent_packed_warps();
 int coherent_tiles_per_stage_setting();
 
-bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
+static void launch_input_transform_pair(cudaStream_t stream,const std::uint16_t* input,
+    const std::uint16_t* suh_a,const std::uint16_t* suh_b,std::uint16_t* transformed_a,
+    std::uint16_t* transformed_b,int rows,int input_features) {
+    const int tasks=rows*(input_features/kHadamard);
+    exl3_launch_pdl(input_hadamard_pair_warp_kernel,
+        dim3((tasks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+        dim3(kHadamardWarpsPerBlock*32),0,stream,input,suh_a,suh_b,transformed_a,
+        transformed_b,rows,input_features);
+    cuda_check(cudaGetLastError(),"launch merged-route input transform pair");
+}
+
+bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
     Exl3CudaLinearWorkspace& up_workspace,
     const Exl3CudaLinearWeights& gate_weights,const Exl3CudaLinearMetadata& gate_metadata,
     const Exl3CudaLinearWeights& up_weights,const Exl3CudaLinearMetadata& up_metadata,
     const std::uint16_t* input,std::uint16_t* gate_output,std::uint16_t* up_output,
-    std::uint16_t* activation,cudaStream_t stream,
+    std::uint16_t* activation,int rows,cudaStream_t stream,
     const Exl3CudaLinearWeights* down_weights,Exl3CudaLinearWorkspace* down_workspace) {
-    if(!coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
+    if(rows<1 || rows>8 || rows>max_rows_ || rows>up_workspace.max_rows_ ||
+       !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
        gate_metadata.K!=up_metadata.K || gate_metadata.K<5 || gate_metadata.K>7 ||
+       (!coherent_fused_input_for(rows) && out_features_<in_features_) ||
        in_features_!=up_workspace.in_features_ || out_features_!=up_workspace.out_features_ ||
        out_features_%kHadamard!=0 ||
-       !coherent_wide_k6_candidate(gate_metadata,1,Exl3CudaLinearAdmission::ordinary) ||
-       !up_workspace.coherent_wide_k6_candidate(up_metadata,1,Exl3CudaLinearAdmission::ordinary) ||
+       !coherent_wide_k6_candidate(gate_metadata,rows,Exl3CudaLinearAdmission::ordinary) ||
+       !up_workspace.coherent_wide_k6_candidate(up_metadata,rows,Exl3CudaLinearAdmission::ordinary) ||
        !gate_weights.suh || !gate_weights.svh || !up_weights.suh || !up_weights.svh ||
        !input || !gate_output || !up_output || !activation)
         return false;
-    const int split_count=coherent_wide_k6_split_count(1);
-    if(split_count!=up_workspace.coherent_wide_k6_split_count(1))return false;
+    const int split_count=coherent_wide_k6_split_count(rows);
+    if(split_count!=up_workspace.coherent_wide_k6_split_count(rows))return false;
     if(down_workspace && (!down_weights || !down_weights->suh ||
         down_workspace->in_features_!=out_features_ || !down_workspace->transformed_))
         return false;
     // Ordered layer projections may share one accumulation buffer; the up
     // partials then follow the gate planes.
-    const std::size_t planes=static_cast<std::size_t>(split_count)*out_features_;
+    const std::size_t planes=static_cast<std::size_t>(split_count)*rows*out_features_;
     float* up_accum=up_workspace.accum_;
     if(up_accum==accum_) {
         if(accumulation_capacity_bytes_<2*planes*sizeof(float))return false;
@@ -9196,36 +9338,48 @@ bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
     }
     constexpr int stages=4,warps=4,per=2;
     const int grid=out_features_/(16*warps)*split_count;
-    const int tiles_per_split=(in_features_/16+split_count-1)/split_count;
-    const std::size_t shared=
-        static_cast<std::size_t>(stages*per)*256u*sizeof(half)+
-        static_cast<std::size_t>(stages*per)*warps*16u*gate_metadata.K*sizeof(std::uint16_t)+
-        16u*warps*16u*sizeof(float)+
-        static_cast<std::size_t>((tiles_per_split*16+kHadamard-1)/kHadamard+1)*kHadamard*sizeof(half);
+    // Wider rows stage both input transforms in the projection outputs: each
+    // producer finishes reading them before the reduction overwrites them.
+    const bool fused=coherent_fused_input_for(rows);
+    if(!fused) launch_input_transform_pair(stream,input,gate_weights.suh,up_weights.suh,
+        gate_output,up_output,rows,in_features_);
+    const std::size_t shared=fused ?
+        exl3_fused_input_shared_bytes(gate_metadata.K,stages,warps,per,rows,in_features_,split_count) :
+        exl3_deep_shared_bytes(gate_metadata.K,stages,warps,per);
     const auto launch=[&](auto kernel) {
         if(shared>48u*1024u)
             cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(shared)),"set merged gate/up shared memory");
         exl3_launch_pdl(kernel,dim3(2*grid),dim3(warps*32),shared,stream,input,
+            static_cast<const std::uint16_t*>(gate_output),
+            static_cast<const std::uint16_t*>(up_output),
             gate_weights.suh,gate_weights.trellis,gate_weights.mul1,accum_,
             up_weights.suh,up_weights.trellis,up_weights.mul1,up_accum,
-            in_features_,out_features_,out_features_,split_count,grid,grid,Exl3GdnControlSide{});
+            rows,in_features_,out_features_,out_features_,split_count,grid,grid,
+            Exl3GdnControlSide{});
     };
-    if(gate_metadata.K==5) launch(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>);
-    else if(gate_metadata.K==6) launch(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>);
-    else launch(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>);
+    const auto launch_k=[&](auto fused_kernel,auto staged_kernel) {
+        if(fused) launch(fused_kernel); else launch(staged_kernel);
+    };
+    if(gate_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per,false>);
+    else if(gate_metadata.K==6) launch_k(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per,false>);
+    else launch_k(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per,false>);
     cuda_check(cudaGetLastError(),"launch merged M1 gate/up producers");
     exl3_launch_pdl(exl3_gate_up_reduce_silu_kernel,
-        dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+        dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
         dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,up_accum,
-        gate_weights.svh,up_weights.svh,gate_output,up_output,activation,out_features_,split_count,
+        gate_weights.svh,up_weights.svh,gate_output,up_output,activation,rows,out_features_,
+        split_count,
         down_workspace?down_weights->suh:nullptr,
         down_workspace?down_workspace->transformed_:nullptr);
     cuda_check(cudaGetLastError(),"launch merged M1 gate/up reduction and activation");
     coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
-    coherent_wide_k6_rows_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    coherent_wide_k6_rows_[coherent_wide_k6_operation_].fetch_add(rows,std::memory_order_relaxed);
     up_workspace.coherent_wide_k6_calls_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
-    up_workspace.coherent_wide_k6_rows_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    up_workspace.coherent_wide_k6_rows_[up_workspace.coherent_wide_k6_operation_].fetch_add(rows,std::memory_order_relaxed);
     if(split_count==10) {
         coherent_wide_k6_split10_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
         up_workspace.coherent_wide_k6_split10_calls_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
@@ -9233,18 +9387,21 @@ bool Exl3CudaLinearWorkspace::forward_m1_gate_up_silu(
     return true;
 }
 
-bool Exl3CudaLinearWorkspace::forward_m1_pair(
+bool Exl3CudaLinearWorkspace::forward_merged_pair(
     Exl3CudaLinearWorkspace& second_workspace,
     const Exl3CudaLinearWeights& first_weights,const Exl3CudaLinearMetadata& first_metadata,
     std::uint16_t* first_output,
     const Exl3CudaLinearWeights& second_weights,const Exl3CudaLinearMetadata& second_metadata,
-    std::uint16_t* second_output,const std::uint16_t* input,cudaStream_t stream,
+    std::uint16_t* second_output,const std::uint16_t* input,int rows,cudaStream_t stream,
     const Exl3GdnControlSide* control,std::uint16_t* first_bf16) {
     if(control && (in_features_%128!=0 || control->heads<=0))return false;
-    if(!coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
+    if(rows<1 || rows>8 || rows>max_rows_ || rows>second_workspace.max_rows_ ||
+       !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
        first_metadata.K!=second_metadata.K || first_metadata.K<5 || first_metadata.K>8 ||
+       (!coherent_fused_input_for(rows) &&
+        (out_features_<in_features_ || second_workspace.out_features_<in_features_)) ||
        in_features_!=second_workspace.in_features_ ||
        out_features_%kHadamard!=0 || second_workspace.out_features_%kHadamard!=0 ||
        !first_weights.suh || !first_weights.svh || !second_weights.suh || !second_weights.svh ||
@@ -9252,15 +9409,15 @@ bool Exl3CudaLinearWorkspace::forward_m1_pair(
         return false;
     // Both projections must take the same coherent route and split: the wide
     // producer (split 10) or the narrow K/V split-plane producer.
-    const auto route_split=[](Exl3CudaLinearWorkspace& workspace,
-                              const Exl3CudaLinearMetadata& metadata) {
-        if(const int kv=coherent_kv_split_for(metadata,1,Exl3CudaLinearAdmission::ordinary,
+    const auto route_split=[rows](Exl3CudaLinearWorkspace& workspace,
+                                  const Exl3CudaLinearMetadata& metadata) {
+        if(const int kv=coherent_kv_split_for(metadata,rows,Exl3CudaLinearAdmission::ordinary,
                workspace.in_features_,workspace.out_features_,
                workspace.accumulation_capacity_bytes_))
             return -kv;
         if(metadata.K<=7 &&
-           workspace.coherent_wide_k6_candidate(metadata,1,Exl3CudaLinearAdmission::ordinary))
-            return workspace.coherent_wide_k6_split_count(1);
+           workspace.coherent_wide_k6_candidate(metadata,rows,Exl3CudaLinearAdmission::ordinary))
+            return workspace.coherent_wide_k6_split_count(rows);
         return 0;
     };
     const int first_route=route_split(*this,first_metadata);
@@ -9270,43 +9427,54 @@ bool Exl3CudaLinearWorkspace::forward_m1_pair(
     const int out_a=out_features_, out_b=second_workspace.out_features_;
     float* second_accum=second_workspace.accum_;
     if(second_accum==accum_) {
-        const std::size_t total=static_cast<std::size_t>(split_count)*(out_a+out_b)*sizeof(float);
+        const std::size_t total=static_cast<std::size_t>(split_count)*rows*(out_a+out_b)*sizeof(float);
         if(accumulation_capacity_bytes_<total)return false;
-        second_accum=accum_+static_cast<std::size_t>(split_count)*out_a;
+        second_accum=accum_+static_cast<std::size_t>(split_count)*rows*out_a;
     }
     constexpr int stages=4,warps=4,per=2;
     const int grid_a=out_a/(16*warps)*split_count, grid_b=out_b/(16*warps)*split_count;
-    const int tiles_per_split=(in_features_/16+split_count-1)/split_count;
-    const std::size_t shared=
-        static_cast<std::size_t>(stages*per)*256u*sizeof(half)+
-        static_cast<std::size_t>(stages*per)*warps*16u*first_metadata.K*sizeof(std::uint16_t)+
-        16u*warps*16u*sizeof(float)+
-        static_cast<std::size_t>((tiles_per_split*16+kHadamard-1)/kHadamard+1)*kHadamard*sizeof(half);
+    // Wider rows stage both input transforms in the projection outputs (see
+    // forward_merged_gate_up_silu).
+    const bool fused=coherent_fused_input_for(rows);
+    if(!fused) launch_input_transform_pair(stream,input,first_weights.suh,second_weights.suh,
+        first_output,second_output,rows,in_features_);
+    const std::size_t shared=fused ?
+        exl3_fused_input_shared_bytes(first_metadata.K,stages,warps,per,rows,in_features_,split_count) :
+        exl3_deep_shared_bytes(first_metadata.K,stages,warps,per);
     const auto launch=[&](auto kernel) {
         if(shared>48u*1024u)
             cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(shared)),"set merged pair shared memory");
-        exl3_launch_pdl(kernel,dim3(grid_a+grid_b+(control?control->heads:0)),dim3(warps*32),
-            shared,stream,input,
+        exl3_launch_pdl(kernel,dim3(grid_a+grid_b+(control?rows*control->heads:0)),
+            dim3(warps*32),shared,stream,input,
+            static_cast<const std::uint16_t*>(first_output),
+            static_cast<const std::uint16_t*>(second_output),
             first_weights.suh,first_weights.trellis,first_weights.mul1,accum_,
             second_weights.suh,second_weights.trellis,second_weights.mul1,second_accum,
-            in_features_,out_a,out_b,split_count,grid_a,grid_b,
+            rows,in_features_,out_a,out_b,split_count,grid_a,grid_b,
             control?*control:Exl3GdnControlSide{});
     };
-    if(first_metadata.K==5) launch(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>);
-    else if(first_metadata.K==6) launch(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>);
-    else if(first_metadata.K==7) launch(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>);
-    else launch(exl3_gemm_m1_fused_input_dual_kernel<8,false,false,stages,warps,per>);
+    const auto launch_k=[&](auto fused_kernel,auto staged_kernel) {
+        if(fused) launch(fused_kernel); else launch(staged_kernel);
+    };
+    if(first_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per,false>);
+    else if(first_metadata.K==6) launch_k(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per,false>);
+    else if(first_metadata.K==7) launch_k(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per,false>);
+    else launch_k(exl3_gemm_m1_fused_input_dual_kernel<8,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<8,false,false,stages,warps,per,false>);
     cuda_check(cudaGetLastError(),"launch merged M1 pair producers");
-    const int blocks=(out_a+out_b)/kHadamard;
+    const int blocks=rows*((out_a+out_b)/kHadamard);
     exl3_launch_pdl(exl3_pair_reduce_output_kernel,
         dim3((blocks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
         dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,first_weights.svh,first_output,out_a,
-        second_accum,second_weights.svh,second_output,out_b,split_count,first_bf16);
+        second_accum,second_weights.svh,second_output,out_b,rows,split_count,first_bf16);
     cuda_check(cudaGetLastError(),"launch merged M1 pair reduction");
     if(!kv_route) for(auto* workspace:{this,&second_workspace}) {
         workspace->coherent_wide_k6_calls_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
-        workspace->coherent_wide_k6_rows_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+        workspace->coherent_wide_k6_rows_[workspace->coherent_wide_k6_operation_].fetch_add(rows,std::memory_order_relaxed);
         if(split_count==10)
             workspace->coherent_wide_k6_split10_calls_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
     }
@@ -11421,11 +11589,8 @@ static void launch_coherent_packed_variant(
     const int grid = output_features / (16 * tiles) * split_count;
     if constexpr (Stages > 0) {
         if (raw_input) {
-            // One 128-block beyond the split extent covers an unaligned start.
-            const int tiles_per_split = (input_features / 16 + split_count - 1) / split_count;
-            const std::size_t fused_shared = shared +
-                static_cast<std::size_t>((tiles_per_split * 16 + kHadamard - 1) / kHadamard + 1) *
-                    kHadamard * sizeof(half);
+            const std::size_t fused_shared = exl3_fused_input_shared_bytes(
+                Bits, Stages, Warps, Per, rows, input_features, split_count);
             constexpr bool fast_k6 = Bits == 6;
             auto kernel = exl3_gemm_m1_fused_input_kernel<Bits, Bits == 7, fast_k6, Stages, Warps, Per>;
             if (fused_shared > 48u * 1024u)
@@ -11433,7 +11598,7 @@ static void launch_coherent_packed_variant(
                     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(fused_shared)),
                     "set fused-input coherent shared memory");
             exl3_launch_pdl(kernel, dim3(grid), dim3(Warps * 32), fused_shared, stream,
-                raw_input, suh, trellis, mul1, accum, input_features, output_features,
+                raw_input, suh, trellis, mul1, accum, rows, input_features, output_features,
                 split_count);
             return;
         }
@@ -11506,22 +11671,26 @@ static bool merged_gate_up_enabled() {
     return enabled;
 }
 
-// NINFER_EXL3_COHERENT_FUSED_INPUT (default 1; 0 = separate input-Hadamard
-// launch): single-row coherent producers compute the input Hadamard of their
-// split range in the CTA prologue. Bit-identical partials.
+// NINFER_EXL3_COHERENT_FUSED_INPUT=R (default 1; 0 = separate input-Hadamard
+// launches): coherent producers of 1..R rows compute the input Hadamard of
+// their split range in the CTA prologue. Every CTA of a split repeats that
+// transform, so wider verifier rows (measured) take one separate transform
+// launch instead. Bit-identical partials and outputs.
 static bool coherent_fused_input_for(int rows) {
-    static const bool enabled = [] {
+    static const int max_rows = [] {
         const char* value = std::getenv("NINFER_EXL3_COHERENT_FUSED_INPUT");
-        if (!value || std::strcmp(value, "1") == 0) return true;
-        if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_COHERENT_FUSED_INPUT must be 0 or 1");
+        const int parsed = value ? std::atoi(value) : 1;
+        if (parsed < 0 || parsed > 8)
+            throw std::invalid_argument("NINFER_EXL3_COHERENT_FUSED_INPUT must be 0..8");
+        return parsed;
     }();
-    return enabled && rows == 1 && coherent_deep_pipeline_stages() > 0;
+    return rows >= 1 && rows <= max_rows && coherent_deep_pipeline_stages() > 0;
 }
 
 // NINFER_EXL3_COHERENT_TILES_PER_STAGE: k-tiles per coherent cp.async stage.
-// Returns 0 when unset: single-row decode then takes two tiles per stage and
-// wider verifier rows four (both measured); the choice never changes numerics.
+// Returns 0 when unset: two tiles per stage for every row count (eight tiles
+// in flight at four stages; measured fastest for M1 and M2..8 verifier rows
+// alike). The choice never changes numerics.
 int coherent_tiles_per_stage_setting() {
     static const int per = [] {
         const char* value = std::getenv("NINFER_EXL3_COHERENT_TILES_PER_STAGE");
@@ -11557,10 +11726,10 @@ static void launch_coherent_packed_partials(
     const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
     const int stages = coherent_deep_pipeline_stages();
     const int warps = coherent_packed_warps();
-    if (raw_input && (rows != 1 || stages == 0))
-        throw std::logic_error("fused-input coherent producer requires the M1 deep fast-decode route");
+    if (raw_input && (rows < 1 || rows > 8 || stages == 0))
+        throw std::logic_error("fused-input coherent producer requires the deep route and 1..8 rows");
     const int per_setting = coherent_tiles_per_stage_setting();
-    if (const int per = per_setting ? per_setting : (rows == 1 ? 2 : 4); per != 1) {
+    if (const int per = per_setting ? per_setting : 2; per != 1) {
 #define NINFER_COHERENT_MULTI(S, W, P)                                                 if (stages == S && warps == W && per == P) {                                       launch_coherent_packed_variant<Bits, S, W, P>(stream, transformed,                 trellis, mul1, accum, rows, input_features, output_features,                   split_count, raw_input, suh);                                              return;                                                                    }
         NINFER_COHERENT_MULTI(4, 4, 2) NINFER_COHERENT_MULTI(4, 4, 4)
         NINFER_COHERENT_MULTI(8, 4, 2) NINFER_COHERENT_MULTI(8, 4, 4)
@@ -11697,10 +11866,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down shared-row partials");
-        if (rows == 1 && pending_residual_left_ && out_features_ % kHadamard == 0) {
+        if (pending_residual_left_ && out_features_ % kHadamard == 0) {
             exl3_launch_pdl(reduce_output_residual_warp_kernel,
-                dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,out_features_,
+                dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,rows,out_features_,
                 split_count,pending_residual_left_,pending_residual_out_);
             residual_applied_=true;
         } else
@@ -11723,10 +11892,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down shared-row partials");
-        if (rows == 1 && pending_residual_left_ && out_features_ % kHadamard == 0) {
+        if (pending_residual_left_ && out_features_ % kHadamard == 0) {
             exl3_launch_pdl(reduce_output_residual_warp_kernel,
-                dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,out_features_,
+                dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,rows,out_features_,
                 split_count,pending_residual_left_,pending_residual_out_);
             residual_applied_=true;
         } else
@@ -11749,10 +11918,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O shared-row partials");
-        if (rows == 1 && pending_residual_left_ && out_features_ % kHadamard == 0) {
+        if (pending_residual_left_ && out_features_ % kHadamard == 0) {
             exl3_launch_pdl(reduce_output_residual_warp_kernel,
-                dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,out_features_,
+                dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,rows,out_features_,
                 split_count,pending_residual_left_,pending_residual_out_);
             residual_applied_=true;
         } else
@@ -11783,10 +11952,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 shared-row partials");
-        if (rows == 1 && pending_residual_left_ && out_features_ % kHadamard == 0) {
+        if (pending_residual_left_ && out_features_ % kHadamard == 0) {
             exl3_launch_pdl(reduce_output_residual_warp_kernel,
-                dim3((out_features_/kHadamard+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,out_features_,
+                dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,rows,out_features_,
                 split_count,pending_residual_left_,pending_residual_out_);
             residual_applied_=true;
         } else
