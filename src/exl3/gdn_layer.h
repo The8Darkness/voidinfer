@@ -174,6 +174,14 @@ struct Exl3GdnStageFusionFixtureView {
 void exl3_gdn_stage_fusion_fixture(
     const Exl3GdnStageFusionFixtureView& view,
     cudaStream_t stream=nullptr,bool pair_columns=false);
+// Verifier-sized (1..8 rows) recurrence route of the decode/verify forward:
+// q,k BF16 [rows][16][128] (unnormalized), v BF16 [rows][48][128], g (log
+// decay) and beta FP32 [rows][48], state FP32 [48][128][128] updated in place,
+// output BF16 [rows][48][128]. chain_rows (device int, may be null) selects
+// the sibling-leaf layout of sibling_rows.cuh.
+void exl3_gdn_verifier_recurrence_fixture(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,const float* g,const float* beta,float* state,
+    std::uint16_t* output,int rows,const int* chain_rows,cudaStream_t stream=nullptr);
 
 // Owning read-only slice of the most recent supported M1-topology recurrent
 // history. `storage_owner` must keep the context/layer allocations alive;

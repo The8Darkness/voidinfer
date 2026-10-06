@@ -555,6 +555,107 @@ void run_gdn_stage_fusion_fixtures() {
     }
 }
 
+// Verifier recurrence (decode/verify rows 1..8, chain and sibling-leaf
+// layouts) against an FP64 sequential gated delta rule over the represented
+// BF16 inputs. Gates cover growth (g = 2), near-annihilation (g = -16) and
+// ordinary decay.
+void run_gdn_verifier_recurrence_oracle() {
+    constexpr int kh=16,d=128,vh=48,max_rows=8;
+    constexpr std::size_t state_elements=static_cast<std::size_t>(vh)*d*d;
+    std::uint32_t seed=0x9e3779b9u;
+    const auto uniform=[&] { seed=seed*1664525u+1013904223u; return (seed>>8)*(1.0/16777216.0)*2.0-1.0; };
+    const auto to_bf16=[](double x) {
+        float f=static_cast<float>(x); std::uint32_t u; std::memcpy(&u,&f,4);
+        u+=0x7fffu+((u>>16)&1u); return static_cast<std::uint16_t>(u>>16);
+    };
+    const auto from_bf16=[](std::uint16_t x) {
+        std::uint32_t u=std::uint32_t(x)<<16; float f; std::memcpy(&f,&u,4); return static_cast<double>(f);
+    };
+    std::vector<std::uint16_t> q(max_rows*kh*d),k(max_rows*kh*d),v(max_rows*vh*d);
+    std::vector<float> g(max_rows*vh),beta(max_rows*vh),state(state_elements);
+    for(auto& x:q)x=to_bf16(uniform());
+    for(auto& x:k)x=to_bf16(uniform());
+    for(auto& x:v)x=to_bf16(uniform());
+    for(int row=0;row<max_rows;++row)for(int head=0;head<vh;++head) {
+        const int mode=head%4;
+        g[row*vh+head]=static_cast<float>(mode==0?2.0:(mode==1?-16.0:-0.05-2.0*std::abs(uniform())));
+        beta[row*vh+head]=static_cast<float>(mode==3?0.0:0.2+0.8*std::abs(uniform()));
+    }
+    for(auto& x:state)x=static_cast<float>(0.3*uniform());
+    auto q_device=upload({reinterpret_cast<const std::byte*>(q.data()),q.size()*2},"allocate verifier Q");
+    auto k_device=upload({reinterpret_cast<const std::byte*>(k.data()),k.size()*2},"allocate verifier K");
+    auto v_device=upload({reinterpret_cast<const std::byte*>(v.data()),v.size()*2},"allocate verifier V");
+    auto g_device=upload({reinterpret_cast<const std::byte*>(g.data()),g.size()*4},"allocate verifier g");
+    auto beta_device=upload({reinterpret_cast<const std::byte*>(beta.data()),beta.size()*4},"allocate verifier beta");
+    auto state_device=allocate_device(state_elements*4,"allocate verifier state");
+    auto output_device=allocate_device(v.size()*2,"allocate verifier output");
+    auto chain_device=allocate_device(sizeof(int),"allocate verifier chain rows");
+    const std::array<std::array<int,2>,12> layouts{{{1,0},{2,0},{3,0},{4,0},{5,0},{7,0},{8,0},
+        {8,6},{8,5},{5,3},{3,2},{4,3}}};
+    for(const auto& [rows,chain]:layouts) {
+        cuda_check(cudaMemcpy(state_device->ptr,state.data(),state_elements*4,cudaMemcpyHostToDevice),
+                   "upload verifier state");
+        cuda_check(cudaMemcpy(chain_device->ptr,&chain,sizeof(int),cudaMemcpyHostToDevice),
+                   "upload verifier chain rows");
+        exl3_gdn_verifier_recurrence_fixture(static_cast<const std::uint16_t*>(q_device->ptr),
+            static_cast<const std::uint16_t*>(k_device->ptr),static_cast<const std::uint16_t*>(v_device->ptr),
+            static_cast<const float*>(g_device->ptr),static_cast<const float*>(beta_device->ptr),
+            static_cast<float*>(state_device->ptr),static_cast<std::uint16_t*>(output_device->ptr),
+            rows,static_cast<const int*>(chain_device->ptr));
+        cuda_check(cudaDeviceSynchronize(),"synchronize verifier recurrence");
+        std::vector<float> actual_state(state_elements);
+        std::vector<std::uint16_t> actual_output(v.size());
+        cuda_check(cudaMemcpy(actual_state.data(),state_device->ptr,state_elements*4,cudaMemcpyDeviceToHost),
+                   "download verifier state");
+        cuda_check(cudaMemcpy(actual_output.data(),output_device->ptr,static_cast<std::size_t>(rows)*vh*d*2,
+                   cudaMemcpyDeviceToHost),"download verifier output");
+        const int chain_end=chain>0 && chain<rows?chain:rows;
+        double worst_output=0,worst_state=0;
+        std::vector<double> s(d*d),next(d*d);
+        for(int head=0;head<vh;++head) {
+            for(int i=0;i<d*d;++i)s[i]=state[static_cast<std::size_t>(head)*d*d+i];
+            std::vector<double> expected(static_cast<std::size_t>(rows)*d);
+            const auto step=[&](int row,bool commit) {
+                double qq[d],kk[d],qn=0,kn=0;
+                for(int i=0;i<d;++i) {
+                    qq[i]=from_bf16(q[(row*kh+head/3)*d+i]);kk[i]=from_bf16(k[(row*kh+head/3)*d+i]);
+                    qn+=qq[i]*qq[i];kn+=kk[i]*kk[i];
+                }
+                qn=1/std::sqrt(qn+1e-6);kn=1/std::sqrt(kn+1e-6);
+                const double alpha=std::exp(static_cast<double>(g[row*vh+head])),b=beta[row*vh+head];
+                for(int i=0;i<d*d;++i)next[i]=s[i]*alpha;
+                for(int c=0;c<d;++c) {
+                    double kv=0;
+                    for(int i=0;i<d;++i)kv+=next[i*d+c]*kk[i]*kn;
+                    const double delta=b*(from_bf16(v[(row*vh+head)*d+c])-kv);
+                    double o=0;
+                    for(int i=0;i<d;++i){next[i*d+c]+=kk[i]*kn*delta;o+=next[i*d+c]*qq[i]*qn;}
+                    expected[static_cast<std::size_t>(row)*d+c]=o/std::sqrt(128.0);
+                }
+                if(commit)s=next;
+            };
+            for(int t=0;t<chain_end;++t) {
+                if(t>=1 && chain_end+t-1<rows)step(chain_end+t-1,false);
+                step(t,true);
+            }
+            double head_output=0,head_state=0;
+            for(const double x:expected)head_output=std::max(head_output,std::abs(x));
+            for(const double x:s)head_state=std::max(head_state,std::abs(x));
+            for(int row=0;row<rows;++row)for(int c=0;c<d;++c) {
+                const double e=expected[static_cast<std::size_t>(row)*d+c];
+                const double a=from_bf16(actual_output[(row*vh+head)*d+c]);
+                worst_output=std::max(worst_output,std::abs(a-e)/(std::abs(e)/128+head_output*1e-4+1e-30));
+            }
+            for(int i=0;i<d*d;++i)
+                worst_state=std::max(worst_state,
+                    std::abs(actual_state[static_cast<std::size_t>(head)*d*d+i]-s[i])/(head_state*1e-5+1e-30));
+        }
+        std::cout<<"GDN_VERIFIER rows="<<rows<<" chain="<<chain<<" output_ratio="<<worst_output
+                 <<" state_ratio="<<worst_state<<'\n';
+        require(worst_output<=1.0 && worst_state<=1.0,"GDN verifier recurrence exceeds the FP64 oracle bound");
+    }
+}
+
 #include "test_exl3_gdn_retained_prefix.h"
 #include "test_exl3_gdn_future_oracle.h"
 
@@ -567,6 +668,7 @@ int main() {
         check_recurrent_scratch_reuse_contract();
         check_gdn_stage_fusion_contract();
         check_gdn_continuation_history_contract();
+        run_gdn_verifier_recurrence_oracle();
         const auto target = env("NINFER_EXL3_TARGET_PATH"), fixture_path = env("NINFER_EXL3_ORACLE_PATH");
         if (target.empty() || fixture_path.empty()) { std::cerr << "E3B skipped: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_ORACLE_PATH\n"; return 77; }
         run_gdn_stage_fusion_fixtures();
