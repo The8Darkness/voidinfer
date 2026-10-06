@@ -207,6 +207,10 @@ void dflash2_ring_attention_for_test(const std::uint16_t* q,
     const std::uint16_t* ring_k, const std::uint16_t* ring_v, int start, int count,
     const std::uint16_t* k, const std::uint16_t* v, std::uint16_t* out,
     int queries, int block, float scale, bool parallel, cudaStream_t stream = nullptr);
+// True when the parallel ring attention at this context length takes the
+// split-K tensor-core route (FP16 probabilities; not bitwise to the serial
+// kernel, checked against the independent FP64 bound only).
+bool dflash2_ring_attention_split_for_test(int count);
 
 // Qualification entry for the draft F16 output-major dense projection and its
 // exact K-major storage adapter. The two routes retain chronological FP32

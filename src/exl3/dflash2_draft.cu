@@ -1308,6 +1308,233 @@ bool dflash_ring_staged_enabled() {
     return enabled;
 }
 
+// Tensor-core split-K draft ring attention. One CTA per (64-key chunk, kv
+// head) computes S = Q K^T for the kv head's 32 query rows (8 queries x 4 q
+// heads) and the chunk's P V with m16n8k16 FP16 MMAs (FP32 accumulation),
+// writing per-row max/sum and unnormalized FP32 outputs for the combine.
+constexpr int kMmaChunk = 64;
+constexpr int kMmaRows = kBlockCap * (kQHeads / kKVHeads);  // 32
+constexpr int kMmaThreads = 256;
+constexpr int kMmaStride = kHeadDim + 8;  // halves: rows 4 banks apart
+
+__device__ __forceinline__ void dflash_mma16816(float (&c)[4], const std::uint32_t (&a)[4],
+                                                std::uint32_t b0, std::uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__global__ void __launch_bounds__(kMmaThreads) dflash_attention_ring_mma_kernel(
+    const std::uint16_t* q, const std::uint16_t* ring_k, const std::uint16_t* ring_v,
+    int ring_start_slot, int ctx_keys, const std::uint16_t* k_blk,
+    const std::uint16_t* v_blk, int queries, int block_keys, float scale,
+    float* partial_o, float* partial_ml) {
+    constexpr int group = kQHeads / kKVHeads;
+    const int chunk = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    const int chunks = static_cast<int>(gridDim.x);
+    const int t = static_cast<int>(threadIdx.x);
+    const int lane = t & 31, warp = t >> 5;
+    const int g = lane >> 2, tig = lane & 3;
+    const int rows = queries * group;
+    const int lo = max(0, ctx_keys - (kRingCap - 1));
+    const int context = ctx_keys - lo;
+    const int keys = context + block_keys;
+    const int first = chunk * kMmaChunk;
+    __shared__ __align__(16) __half qs[kMmaRows][kMmaStride];
+    __shared__ __align__(16) __half ks[kMmaChunk][kMmaStride];
+    __shared__ __align__(16) __half vs[kMmaChunk][kMmaStride];
+    // Scores reuse the K tile once every S fragment is in registers.
+    static_assert(sizeof(float) * kMmaRows * (kMmaChunk + 4) <= sizeof(ks));
+    auto ss = reinterpret_cast<float (*)[kMmaChunk + 4]>(&ks[0][0]);
+    constexpr int kv_row = kKVHeads * kHeadDim;
+    for (int i = t; i < kMmaRows * (kHeadDim / 8); i += kMmaThreads) {
+        const int r = i / (kHeadDim / 8), part = i % (kHeadDim / 8);
+        uint4 value = make_uint4(0, 0, 0, 0);
+        if (r < rows) {
+            const int q_idx = (r / group) * kQHeads + kv_head * group + r % group;
+            value = *reinterpret_cast<const uint4*>(
+                q + static_cast<std::size_t>(q_idx) * kHeadDim + part * 8);
+        }
+        *reinterpret_cast<uint4*>(&qs[r][part * 8]) = value;
+    }
+    for (int i = t; i < kMmaChunk * (kHeadDim / 8); i += kMmaThreads) {
+        const int local = i / (kHeadDim / 8), part = i % (kHeadDim / 8);
+        const int key = first + local;
+        uint4 kp = make_uint4(0, 0, 0, 0), vp = make_uint4(0, 0, 0, 0);
+        if (key < keys) {
+            const std::size_t row = key < context
+                ? static_cast<std::size_t>((ring_start_slot + lo + key) & kRingMask) * kv_row
+                : static_cast<std::size_t>(key - context) * kv_row;
+            const std::uint16_t* kb = key < context ? ring_k : k_blk;
+            const std::uint16_t* vb = key < context ? ring_v : v_blk;
+            kp = *reinterpret_cast<const uint4*>(kb + row + kv_head * kHeadDim + part * 8);
+            vp = *reinterpret_cast<const uint4*>(vb + row + kv_head * kHeadDim + part * 8);
+        }
+        *reinterpret_cast<uint4*>(&ks[local][part * 8]) = kp;
+        *reinterpret_cast<uint4*>(&vs[local][part * 8]) = vp;
+    }
+    __syncthreads();
+    // S tiles: warp owns m-tile (warp & 1) and n-tiles 2 (warp >> 1) + {0, 1}.
+    {
+        const int m0 = (warp & 1) * 16;
+        float c[2][4] = {};
+        #pragma unroll
+        for (int k0 = 0; k0 < kHeadDim; k0 += 16) {
+            std::uint32_t a[4];
+            a[0] = *reinterpret_cast<const std::uint32_t*>(&qs[m0 + g][k0 + 2 * tig]);
+            a[1] = *reinterpret_cast<const std::uint32_t*>(&qs[m0 + g + 8][k0 + 2 * tig]);
+            a[2] = *reinterpret_cast<const std::uint32_t*>(&qs[m0 + g][k0 + 8 + 2 * tig]);
+            a[3] = *reinterpret_cast<const std::uint32_t*>(&qs[m0 + g + 8][k0 + 8 + 2 * tig]);
+            #pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                const int key = ((warp >> 1) * 2 + n) * 8 + g;
+                dflash_mma16816(c[n], a,
+                    *reinterpret_cast<const std::uint32_t*>(&ks[key][k0 + 2 * tig]),
+                    *reinterpret_cast<const std::uint32_t*>(&ks[key][k0 + 8 + 2 * tig]));
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int r = m0 + g + (e >> 1) * 8;
+                const int local = ((warp >> 1) * 2 + n) * 8 + 2 * tig + (e & 1);
+                const int key = first + local;
+                // Query r / group sees context keys from ctx_keys + query - 2047 on.
+                const bool valid = r < rows && key < keys &&
+                    (key >= context || lo + key >= ctx_keys + r / group - (kRingCap - 1));
+                ss[r][local] = valid ? c[n][e] * scale : -INFINITY;
+            }
+        }
+    }
+    __syncthreads();
+    // Row max / exp / sum: warp w owns rows 4w..4w+3, two keys per lane.
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int r = warp * 4 + j;
+        const float x0 = ss[r][lane], x1 = ss[r][lane + 32];
+        float m = fmaxf(x0, x1);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const float p0 = m == -INFINITY ? 0.0f : expf(x0 - m);
+        const float p1 = m == -INFINITY ? 0.0f : expf(x1 - m);
+        ss[r][lane] = p0; ss[r][lane + 32] = p1;
+        float l = p0 + p1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+        if (lane == 0 && r < rows) {
+            float* ml = partial_ml +
+                ((static_cast<std::size_t>(kv_head) * kMmaRows + r) * chunks + chunk) * 2;
+            ml[0] = m; ml[1] = l;
+        }
+    }
+    __syncthreads();
+    // O tiles: warp owns m-tile (warp & 1) and d n-tiles 4 (warp >> 1) + {0..3}.
+    {
+        const int m0 = (warp & 1) * 16;
+        float c[4][4] = {};
+        #pragma unroll
+        for (int k0 = 0; k0 < kMmaChunk; k0 += 16) {
+            std::uint32_t a[4];
+            const auto pack = [](float x, float y) {
+                const __half2 h = __floats2half2_rn(x, y);
+                return *reinterpret_cast<const std::uint32_t*>(&h);
+            };
+            a[0] = pack(ss[m0 + g][k0 + 2 * tig], ss[m0 + g][k0 + 2 * tig + 1]);
+            a[1] = pack(ss[m0 + g + 8][k0 + 2 * tig], ss[m0 + g + 8][k0 + 2 * tig + 1]);
+            a[2] = pack(ss[m0 + g][k0 + 8 + 2 * tig], ss[m0 + g][k0 + 9 + 2 * tig]);
+            a[3] = pack(ss[m0 + g + 8][k0 + 8 + 2 * tig], ss[m0 + g + 8][k0 + 9 + 2 * tig]);
+            #pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                const int d = ((warp >> 1) * 4 + n) * 8 + g;
+                const auto pair = [&](int key) {
+                    const __half2 h = __halves2half2(vs[key][d], vs[key + 1][d]);
+                    return *reinterpret_cast<const std::uint32_t*>(&h);
+                };
+                dflash_mma16816(c[n], a, pair(k0 + 2 * tig), pair(k0 + 8 + 2 * tig));
+            }
+        }
+        #pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int r = m0 + g + (e >> 1) * 8;
+                const int d = ((warp >> 1) * 4 + n) * 8 + 2 * tig + (e & 1);
+                if (r < rows)
+                    partial_o[((static_cast<std::size_t>(kv_head) * kMmaRows + r) * chunks + chunk) *
+                              kHeadDim + d] = c[n][e];
+            }
+        }
+    }
+}
+
+// Combines the chunk partials of one (row, kv head) per CTA (FP32 rescale by
+// exp(chunk max - row max), then one division).
+__global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_combine_kernel(
+    const float* partial_o, const float* partial_ml, std::uint16_t* out, int queries,
+    int chunks) {
+    constexpr int group = kQHeads / kKVHeads;
+    const int r = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    if (r >= queries * group) return;
+    const int d = static_cast<int>(threadIdx.x);
+    const std::size_t base = static_cast<std::size_t>(kv_head) * kMmaRows + r;
+    const float* ml = partial_ml + base * chunks * 2;
+    float m = -INFINITY;
+    for (int c = 0; c < chunks; ++c) m = fmaxf(m, ml[2 * c]);
+    float l = 0.0f, acc = 0.0f;
+    const float* po = partial_o + base * chunks * kHeadDim;
+    for (int c = 0; c < chunks; ++c) {
+        const float mc = ml[2 * c];
+        if (mc == -INFINITY) continue;
+        const float w = expf(mc - m);
+        l = fmaf(ml[2 * c + 1], w, l);
+        acc = fmaf(po[static_cast<std::size_t>(c) * kHeadDim + d], w, acc);
+    }
+    const int q_idx = (r / group) * kQHeads + kv_head * group + r % group;
+    out[static_cast<std::size_t>(q_idx) * kHeadDim + d] = float_to_half(acc / l);
+}
+
+// Split-K tensor-core route for long ring contexts (default; NINFER_DFLASH2_
+// RING_SPLIT=0 keeps the per-(query, head) staged kernel). Short contexts stay
+// on the staged kernel, which wins below kRingSplitMinKeys.
+constexpr int kRingSplitMinKeys = 256;
+constexpr int kRingSplitMaxChunks = (kRingKeep + kBlockCap + kMmaChunk - 1) / kMmaChunk;
+constexpr std::size_t kRingSplitPartialFloats =
+    static_cast<std::size_t>(kKVHeads) * kMmaRows * kRingSplitMaxChunks * kHeadDim;
+constexpr std::size_t kRingSplitMlFloats =
+    static_cast<std::size_t>(kKVHeads) * kMmaRows * kRingSplitMaxChunks * 2;
+
+bool dflash_ring_split_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_RING_SPLIT");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool dflash_ring_split_selected(int ctx_keys) {
+    return dflash_ring_split_enabled() && ctx_keys >= kRingSplitMinKeys;
+}
+
+void launch_ring_attention_split(const std::uint16_t* q, const std::uint16_t* ring_k,
+    const std::uint16_t* ring_v, int ring_start_slot, int ctx_keys,
+    const std::uint16_t* k_blk, const std::uint16_t* v_blk, std::uint16_t* out,
+    int queries, int block_keys, float scale, float* partial_o, float* partial_ml,
+    cudaStream_t stream) {
+    const int context = ctx_keys - std::max(0, ctx_keys - (kRingCap - 1));
+    const int chunks = (context + block_keys + kMmaChunk - 1) / kMmaChunk;
+    dflash_attention_ring_mma_kernel<<<dim3(chunks, kKVHeads), kMmaThreads, 0, stream>>>(
+        q, ring_k, ring_v, ring_start_slot, ctx_keys, k_blk, v_blk, queries, block_keys,
+        scale, partial_o, partial_ml);
+    dflash_attention_ring_combine_kernel<<<dim3(queries * (kQHeads / kKVHeads), kKVHeads),
+        kHeadDim, 0, stream>>>(partial_o, partial_ml, out, queries, chunks);
+}
+
 // E5A3: per-slot FNV-1a digest of ring K/V bytes, XOR-folded on host by ring_digest().
 // One thread per slot; slot order is preserved by the host fold via slot labels.
 __global__ void dflash_ring_digest_kernel(const std::uint16_t* ring_k,
@@ -1875,7 +2102,18 @@ void dflash2_ring_attention_for_test(const std::uint16_t* q,
     if (queries == 0) return;
     require(q && k && v && out && (count == 0 || (ring_k && ring_v)),
             "ring attention test null buffers");
-    if (parallel && dflash_ring_staged_enabled())
+    if (parallel && dflash_ring_split_selected(count)) {
+        static float* partial_o = nullptr;
+        static float* partial_ml = nullptr;
+        if (!partial_o) {
+            cuda_check(cudaMalloc(&partial_o, kRingSplitPartialFloats * sizeof(float)),
+                       "ring split qualification partials");
+            cuda_check(cudaMalloc(&partial_ml, kRingSplitMlFloats * sizeof(float)),
+                       "ring split qualification max/sum");
+        }
+        launch_ring_attention_split(q, ring_k, ring_v, start, count, k, v, out, queries,
+                                    block, scale, partial_o, partial_ml, stream);
+    } else if (parallel && dflash_ring_staged_enabled())
         dflash_attention_ring_staged_kernel<<<queries * kQHeads, kHeadDim, 0, stream>>>(
             q, ring_k, ring_v, start, count, k, v, out, queries, block, scale);
     else if (parallel)
@@ -1912,6 +2150,10 @@ __global__ void dflash_nonfinite_flag_kernel(const std::uint16_t* buffer,
     const float value = half_to_float(buffer[index]);
     if ((value != value) || value == INFINITY || value == -INFINITY)
         atomicExch(out, 1u);
+}
+
+bool dflash2_ring_attention_split_for_test(int count) {
+    return dflash_ring_split_selected(count);
 }
 
 void dflash2_dense_t_for_test(const std::uint16_t* input,
@@ -2468,6 +2710,8 @@ struct Exl3Dflash2DraftModel::Impl {
         std::uint16_t* final_norm = nullptr;    // [P][5120]
         std::uint16_t* head_out = nullptr;      // [P][248320]
         unsigned int* liveness_flag = nullptr;  // [1], FAST_DEVICE_LIVENESS only
+        float* ring_partial_o = nullptr;        // split ring attention partials
+        float* ring_partial_ml = nullptr;       // split ring attention max/sum
         std::uint16_t* hidden_proj_out = nullptr; // [P][256]
         std::int32_t* pos_ctx = nullptr;    // [S]
         std::int32_t* pos_blk = nullptr;    // [L]
@@ -2658,6 +2902,10 @@ struct Exl3Dflash2DraftModel::Impl {
         if (fast_device_liveness)
             alloc(sizeof(unsigned int), reinterpret_cast<void**>(&s.liveness_flag),
                   "dflash fast liveness flag");
+        alloc(kRingSplitPartialFloats * sizeof(float), reinterpret_cast<void**>(&s.ring_partial_o),
+              "dflash ring split partials");
+        alloc(kRingSplitMlFloats * sizeof(float), reinterpret_cast<void**>(&s.ring_partial_ml),
+              "dflash ring split max/sum");
         alloc(rowsB(kBlockCap) * kRank * two, reinterpret_cast<void**>(&s.hidden_proj_out), "dflash hidden proj");
         alloc(rowsB(kContextCap) * sizeof(std::int32_t), reinterpret_cast<void**>(&s.pos_ctx), "dflash ctx positions");
         alloc(rowsB(kBlockCap) * sizeof(std::int32_t), reinterpret_cast<void**>(&s.pos_blk), "dflash block positions");
@@ -4806,7 +5054,11 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             const int ring_start = shared_segment_enabled?shared_segment.ring_start_slot():
                 static_cast<int>(m.ring_base_abs & kRingMask);
             const int private_ring_count=shared_segment_enabled?shared_segment.ring_count:m.ring_count;
-            if (m.parallel_ring_attention && dflash_ring_staged_enabled())
+            if (m.parallel_ring_attention && dflash_ring_split_selected(private_ring_count))
+                launch_ring_attention_split(m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index],
+                    ring_start, private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len,
+                    block_len, scale, m.s.ring_partial_o, m.s.ring_partial_ml, stream);
+            else if (m.parallel_ring_attention && dflash_ring_staged_enabled())
                 dflash_attention_ring_staged_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
                     private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
