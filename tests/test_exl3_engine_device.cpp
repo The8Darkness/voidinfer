@@ -137,9 +137,9 @@ int main() {
         if(const auto* output_option=std::getenv(
                "NINFER_TEST_ENGINE_DEVICE_OUTPUT_TOKENS")) {
             long_outputs=std::stoi(output_option);
-            if(long_outputs!=128 && long_outputs!=512)
+            if(long_outputs<128 || long_outputs>4096)
                 throw std::invalid_argument(
-                    "device Engine long output budget must be 128 or 512");
+                    "device Engine long output budget must be 128..4096");
         }
         options.max_context=prefix+long_outputs+128;
         options.kv_capacity=KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -354,7 +354,25 @@ int main() {
                     std::istreambuf_iterator<char>{});
             }
             auto long_prompt=prompt;
-            const std::string instruction=long_outputs==512?
+            // NINFER_TEST_ENGINE_DEVICE_MESSAGES: an explicit system/user chat
+            // (system text, 0x1E, user text) replaces the source-sized prompt.
+            if(const auto* messages_path=std::getenv("NINFER_TEST_ENGINE_DEVICE_MESSAGES")) {
+                std::ifstream messages_file(messages_path,std::ios::binary);
+                std::string messages(std::istreambuf_iterator<char>{messages_file},
+                    std::istreambuf_iterator<char>{});
+                const auto split=messages.find('');
+                if(!messages_file.good() && messages.empty())
+                    throw std::runtime_error("device Engine messages file unavailable");
+                if(split==std::string::npos)
+                    throw std::runtime_error("device Engine messages file lacks a separator");
+                long_prompt.messages.clear();
+                if(split>0)long_prompt.messages.push_back({ChatRole::System,
+                    {{MessagePartKind::Text,messages.substr(0,split)}}});
+                long_prompt.messages.push_back({ChatRole::User,
+                    {{MessagePartKind::Text,messages.substr(split+1)}}});
+                source.clear();
+            }
+            const std::string instruction=long_outputs>=512?
                 (prose?
                     "\n\nWrite a detailed, numbered implementation guide for the serving "
                     "design above. Cover at least forty distinct mechanisms, with a "
@@ -374,6 +392,7 @@ int main() {
                     "in twenty numbered sections. Each section should discuss a "
                     "specific function, state transition, or failure path in detail. "
                     "Begin section one now.\n");
+            const bool explicit_messages=source.empty();
             std::vector<std::size_t> line_ends;
             for(std::size_t pos=0;pos<source.size();++pos)
                 if(source[pos]=='\n')line_ends.push_back(pos+1);
@@ -385,6 +404,7 @@ int main() {
                 return engine->count_tokens(long_prompt);
             };
             std::size_t low=0,high=line_ends.size()-1;
+            if(!explicit_messages) {
             if(count_for(high)<static_cast<std::uint32_t>(prefix))
                 throw std::runtime_error("device Engine long source lacks prompt tokens");
             while(low<high) {
@@ -392,7 +412,8 @@ int main() {
                 if(count_for(middle)<static_cast<std::uint32_t>(prefix))low=middle+1;
                 else high=middle;
             }
-            const auto long_count=count_for(low);
+            }
+            const auto long_count=explicit_messages?engine->count_tokens(long_prompt):count_for(low);
             if(long_count>static_cast<std::uint32_t>(prefix+128))
                 throw std::runtime_error("device Engine long prompt exceeded headroom");
             if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_PROMPT_OUT")) {

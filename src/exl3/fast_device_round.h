@@ -675,7 +675,11 @@ private:
         // Sibling leaves (NINFER_DFLASH2_SIBLINGS, default 2): the last `siblings` verifier
         // rows replace chain rows 1..siblings with the draft's runner-up.
         // Each sibling replaces a drafted chain row: siblings <= chain drafts.
-        const int siblings=deferred?std::min(sibling_count(),(value.width-1)/2):0;
+        // Siblings pay off while few drafts are accepted; a deep-accepting
+        // stream keeps the full chain (committed tokens per round, EMA).
+        const bool sibling_regime=committed_ema_<sibling_switch();
+        const int siblings=deferred && sibling_regime?
+            std::min(sibling_count(),(value.width-1)/2):0;
         const int chain_width=value.width-siblings;
         draft_.set_proposal_siblings(siblings);
         const auto draft_start=Clock::now();
@@ -755,7 +759,19 @@ private:
         }
         value.staged_bytes=staged;
         value.terminal=value.verification.stopped;
+        committed_ema_=0.75*committed_ema_+0.25*static_cast<double>(useful);
     }
+
+    // NINFER_DFLASH2_SIBLING_SWITCH: committed tokens per round (EMA) at and
+    // above which rounds verify the full chain without siblings.
+    static double sibling_switch() {
+        static const double value=[] {
+            const char* text=std::getenv("NINFER_DFLASH2_SIBLING_SWITCH");
+            return text?std::atof(text):3.5;
+        }();
+        return value;
+    }
+    double committed_ema_=0.0;
 
     static int sibling_count() {
         static const int count=[] {
