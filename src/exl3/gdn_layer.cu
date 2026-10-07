@@ -3265,7 +3265,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     // A verifier transaction may already have saved this exact root in the
     // state-before trace. Preserve it for rollback/accepted-prefix repair and
     // avoid submitting the duplicate full recurrent-state copy.
-    if (!(eligible_retained_prefix &&
+    if (!skip_state_trace_ && !(eligible_retained_prefix &&
           base_checkpoint_recurrent == recurrent_state_before_))
         check(cudaMemcpyAsync(recurrent_state_before_, recurrent_state_, kStateBytes,
                               cudaMemcpyDeviceToDevice, stream),
@@ -3772,6 +3772,7 @@ void Exl3GdnLayer::forward_pair_staged_serial_for_test(
         exl3_launch_small(convert_f16_to_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,
             lane.z, lane.z_bf16, rows * kZ);
         check(cudaGetLastError(), "launch staged GDN convolution");
+        if (!lane.layer->skip_state_trace_)
         check(cudaMemcpyAsync(lane.layer->recurrent_state_before_, lane.layer->recurrent_state_,
                               kStateBytes, cudaMemcpyDeviceToDevice, stream),
               "save staged GDN state trace");

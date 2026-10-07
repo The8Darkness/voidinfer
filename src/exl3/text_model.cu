@@ -5396,6 +5396,14 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->persistent_bytes=expected_layer_persistent;
             impl->gdn_layers[layer]->set_reconstructed_exact(reconstructed_exact_view);
             impl->gdn_layers[layer]->set_chain_rows_device(impl->position_device+1);
+            // NINFER_EXL3_GDN_STATE_TRACE=1 restores the per-forward state-before
+            // copy; the HostKV recurrent-trace checkpoint alias always keeps it.
+            static const bool keep_state_trace=[] {
+                const char* value=std::getenv("NINFER_EXL3_GDN_STATE_TRACE");
+                return value && std::strcmp(value,"1")==0;
+            }();
+            impl->gdn_layers[layer]->set_skip_state_trace(
+                !keep_state_trace && !impl->host_kv_transaction_recurrent_trace_enabled);
         }
     }
     require(impl->persistent_bytes==expected_layer_group,"target complete layer group requirement mismatch");
