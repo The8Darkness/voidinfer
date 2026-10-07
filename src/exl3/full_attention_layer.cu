@@ -7186,10 +7186,12 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             alloc(prefill.q_mu,r*kQHeads*sizeof(float));
             alloc(prefill.prefill_hist,4*r*kQHeads*kHeadDim*sizeof(float));
             alloc(prefill.prefill_hist_stats,4*r*kQHeads*2*sizeof(float));
+            alloc(prefill.prefill_numer,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
             alloc(prefill.prefill_split,5*r*kQHeads*kHeadDim*sizeof(float));
             alloc(prefill.prefill_split_stats,5*r*kQHeads*2*sizeof(float));
         }
         l.prefill_hist=prefill.prefill_hist; l.prefill_hist_stats=prefill.prefill_hist_stats;
+        l.prefill_numer=prefill.prefill_numer;
         l.prefill_split=prefill.prefill_split; l.prefill_split_stats=prefill.prefill_split_stats;
         shared.q_rot=prefill.q_rot; shared.q_mu=prefill.q_mu;
         l.q_rot=shared.q_rot; l.q_mu=shared.q_mu; l.hist_work=shared.hist_work; l.hist_slot=shared.hist_slot; l.hist_rotated=shared.hist_rotated;
@@ -8115,15 +8117,19 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                exact_prefix_rows_ || exact_page_ranges_.count)
                 throw std::invalid_argument("L0 OSCAR prefill route preconditions");
             const auto& a=l0_oscar::assets();
-            l0_oscar::query_kernel<<<rows*32,192,0,stream>>>(qr,rows,a,l0_.bank,
-                reinterpret_cast<__half*>(l0_.q_rot),l0_.q_mu);
+            constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
+            l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
+                rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
             l0_history_prefill_kernel<<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
                 kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),256,0,stream>>>(l0_.q_rot,l0_.q_mu,
                 l0_.k_codes,l0_.v_codes,l0_.k_meta,l0_.v_meta,l0_.prefill_hist,
                 l0_.prefill_hist_stats,rows,l0_prefill_history);
-            l0_history_unrotate_rows_kernel<<<rows*32,192,0,stream>>>(l0_.prefill_hist,
-                l0_.prefill_hist_stats,l0_.prefill_split,l0_.prefill_split_stats,rows,4,
-                a.rvt+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim*kHeadDim);
+            l0_history_split_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
+                l0_.prefill_hist_stats,reinterpret_cast<__half*>(l0_.prefill_numer),
+                l0_.prefill_split_stats,rows,4);
+            l0_launch_rotate(l0_.prefill_numer,a.rvt16+l0_.bank*bank_elements,
+                l0_.prefill_split+static_cast<std::size_t>(4)*rows*kQHeads*kHeadDim,rows,
+                nullptr,nullptr,stream);
             launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
                 cache_capacity_,l0_.prefill_split,l0_.prefill_split_stats,stream,
                 l0_prefill_history,false,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
@@ -8140,8 +8146,20 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             // fallback WMMA candidate under its original gate.
             if (fast_wmma32_split2_output_ && fast_wmma32_split2_capacity_splits_>=4 &&
                 fast_wmma32_split2_capacity_rows_>=rows && exl3_fa2_prefill_enabled()) {
-                launch_fa2_prefill(qr,attention_k,attention_v,attn,rows,position,
-                    cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream);
+                // L0 OSCAR while every key still fits the device sink and window
+                // ring: read them there, not from the host-mapped cache.
+                const bool l0_window=l0_.k_ring && position+rows<=l0_oscar::kRingRows;
+                if(l0_window && position+rows>=2048)
+                    launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
+                        cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream,
+                        0,true,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                else if(l0_window)
+                    launch_fa2_prefill_variant<1>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
+                        cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream,
+                        0,true,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                else
+                    launch_fa2_prefill(qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream);
                 static std::atomic<int> fa2_prefill_dispatches{0};
                 if(fa2_prefill_dispatches.fetch_add(1,std::memory_order_relaxed)==0)
                     std::fprintf(stderr,"FA2_PREFILL_DISPATCH rows=%d position=%d\n",rows,position);
@@ -8647,8 +8665,9 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             if(l0_.k_codes) {
                 if(rows>l0_.rows) throw std::invalid_argument("L0 OSCAR history rows");
                 const auto& a=l0_oscar::assets();
-                l0_oscar::query_kernel<<<rows*32,192,0,stream>>>(qr,rows,a,l0_.bank,
-                    reinterpret_cast<__half*>(l0_.q_rot),l0_.q_mu);
+                constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
+                l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
+                    rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
                 const dim3 grid(l0_.segments,kKVHeads);
                 const auto history=[&](auto kernel) {
                     static const bool configured=[&] {

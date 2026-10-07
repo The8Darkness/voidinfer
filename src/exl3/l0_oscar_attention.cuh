@@ -428,8 +428,10 @@ __global__ void __launch_bounds__(192) l0_history_unrotate_kernel(const float* r
 
 // L0 OSCAR prefill history: FA2-shaped (64 query rows x 2 query heads per
 // CTA, 32-key tiles) over the INT2 history [kSink, history_end) of a prefill
-// chunk whose rows all follow it. Rotated queries with the q . mu constant;
-// writes the normalized rotated-basis output and (max, denominator).
+// chunk whose rows all follow it. QK is an s8 MMA of the int8-quantized
+// rotated queries (per 128-dim group, quantized in registers) against the raw
+// K codes, as in l0_history_mma_kernel; V tiles are decoded to FP16 for the
+// PV MMA. Writes the normalized rotated-basis output and (max, denominator).
 constexpr int kL0PrefillSplits=4;
 __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
@@ -437,8 +439,10 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     float* out,float* stats,int rows,int history_end){
   // blockIdx.z = head group * kL0PrefillSplits + split over the history tiles.
   using namespace fa2_prefill;
-  const auto* q=reinterpret_cast<const std::uint16_t*>(q_rot_bits);
-  __shared__ __align__(16) half ks[BN*kStride];
+  constexpr float kLog2Scale=0.0625f*1.4426950408889634f;
+  const auto* q=reinterpret_cast<const __half*>(q_rot_bits);
+  __shared__ __align__(16) unsigned kraw[BN*l0::kCodeBytes/4];
+  __shared__ __align__(16) float4 kmeta[BN];
   __shared__ __align__(16) half vs[BN*kStride];
   const int query_base=blockIdx.x*BM;
   const int kv_head=blockIdx.y;
@@ -457,31 +461,86 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
   const int active_rows=min(BM,rows-query_base);
   if(active_rows<=0) return;
   const bool l0r=row0<active_rows, l1r=row1<active_rows;
-  const float mu0=l0r?q_mu[(query_base+row0)*kQHeads+q_head]:0.f;
-  const float mu1=l1r?q_mu[(query_base+row1)*kQHeads+q_head]:0.f;
-  unsigned qa[kHeadDim/16][4];
+  // Int8 A fragments: k-step pair m reads code word W = 8 (m >> 1) + 2t + (m & 1)
+  // of each key; byte i of (w >> 2j) & 0x03030303 is dim 16 W + 4 i + j. This
+  // lane holds rows g, g + 8 at the dims of words {2t, 2t+1, 8+2t, 9+2t}.
+  unsigned qa[4][2][4];
+  float qs[2][2],qsum[2][2],qmu[2];
   {
-    const unsigned* q0=reinterpret_cast<const unsigned*>(q+(static_cast<std::size_t>(query_base+(l0r?row0:0))*kQHeads+q_head)*kHeadDim+2*t);
-    const unsigned* q1=reinterpret_cast<const unsigned*>(q+(static_cast<std::size_t>(query_base+(l1r?row1:0))*kQHeads+q_head)*kHeadDim+2*t);
+    float x[2][4][16];
     #pragma unroll
-    for(int kk=0;kk<kHeadDim/16;++kk){
-      qa[kk][0]=l0r?q0[kk*8]:0u; qa[kk][1]=l1r?q1[kk*8]:0u;
-      qa[kk][2]=l0r?q0[kk*8+4]:0u; qa[kk][3]=l1r?q1[kk*8+4]:0u;
+    for(int r=0;r<2;++r) {
+      const bool live=r?l1r:l0r;
+      const __half* src=q+(static_cast<std::size_t>(query_base+(live?(r?row1:row0):0))*kQHeads+q_head)*kHeadDim;
+      #pragma unroll
+      for(int m=0;m<4;++m) {
+        const int W=8*(m>>1)+2*t+(m&1);
+        uint4 raw[2]={make_uint4(0,0,0,0),make_uint4(0,0,0,0)};
+        if(live) { raw[0]=*reinterpret_cast<const uint4*>(src+16*W); raw[1]=*reinterpret_cast<const uint4*>(src+16*W+8); }
+        const __half* h=reinterpret_cast<const __half*>(raw);
+        #pragma unroll
+        for(int d=0;d<16;++d) x[r][m][d]=__half2float(h[d]);
+      }
+      qmu[r]=live?q_mu[(query_base+(r?row1:row0))*kQHeads+q_head]*kLog2Scale:0.f;
     }
+    #pragma unroll
+    for(int r=0;r<2;++r)
+      #pragma unroll
+      for(int grp=0;grp<2;++grp) {
+        float amax=0.f,sum=0.f;
+        #pragma unroll
+        for(int mm=0;mm<2;++mm)
+          #pragma unroll
+          for(int d=0;d<16;++d) { amax=fmaxf(amax,fabsf(x[r][2*grp+mm][d])); sum+=x[r][2*grp+mm][d]; }
+        amax=fmaxf(amax,__shfl_xor_sync(0xffffffffU,amax,1)); amax=fmaxf(amax,__shfl_xor_sync(0xffffffffU,amax,2));
+        sum+=__shfl_xor_sync(0xffffffffU,sum,1); sum+=__shfl_xor_sync(0xffffffffU,sum,2);
+        const float inv=amax>0.f?127.f/amax:0.f;
+        #pragma unroll
+        for(int mm=0;mm<2;++mm)
+          #pragma unroll
+          for(int d=0;d<16;++d) x[r][2*grp+mm][d]=static_cast<float>(__float2int_rn(x[r][2*grp+mm][d]*inv));
+        qs[r][grp]=amax/127.f*kLog2Scale; qsum[r][grp]=sum*kLog2Scale;
+      }
+    #pragma unroll
+    for(int m=0;m<4;++m)
+      #pragma unroll
+      for(int sb=0;sb<2;++sb) {
+        unsigned w[4]={0u,0u,0u,0u};
+        #pragma unroll
+        for(int i=0;i<4;++i) {
+          const int d=4*i+2*sb;
+          w[0]|=(static_cast<unsigned>(static_cast<int>(x[0][m][d]))&255u)<<(8*i);
+          w[1]|=(static_cast<unsigned>(static_cast<int>(x[1][m][d]))&255u)<<(8*i);
+          w[2]|=(static_cast<unsigned>(static_cast<int>(x[0][m][d+1]))&255u)<<(8*i);
+          w[3]|=(static_cast<unsigned>(static_cast<int>(x[1][m][d+1]))&255u)<<(8*i);
+        }
+        qa[m][sb][0]=w[0];qa[m][sb][1]=w[1];qa[m][sb][2]=w[2];qa[m][sb][3]=w[3];
+      }
   }
   float acc[kHeadDim/8][4];
   #pragma unroll
   for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
   float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
   const bool warp_live=m_base<active_rows;
+  // Per tile: V slots (8 dims of one key) decoded to FP16, K codes and K meta raw.
   constexpr int kSlots=(BN*kHeadDim/8)/256;
   L0RawSlot raw[kSlots];
+  uint4 kc_raw=make_uint4(0,0,0,0);
+  float4 km_raw=make_float4(0.f,0.f,0.f,0.f);
   const auto fetch=[&](int tile_first){
     #pragma unroll
     for(int i=0;i<kSlots;++i){
-      const int idx=tid+i*256;
-      raw[i]=l0_load_slot(k_codes,v_codes,k_meta,v_meta,tile_first+idx/(kHeadDim/8),kv_head,
-          (idx%(kHeadDim/8))*8,tile_first+idx/(kHeadDim/8)<split_end);
+      const int idx=tid+i*256,key=tile_first+idx/(kHeadDim/8);
+      raw[i]=l0_load_slot(k_codes,v_codes,k_meta,v_meta,key,kv_head,(idx%(kHeadDim/8))*8,key<split_end);
+    }
+    if(tid<BN*4) {
+      const int key=tile_first+tid/4;
+      kc_raw=key<split_end?*reinterpret_cast<const uint4*>(k_codes+
+          (static_cast<std::size_t>(key)*kKVHeads+kv_head)*l0::kCodeBytes+(tid%4)*16):make_uint4(0,0,0,0);
+    } else if(tid<BN*5) {
+      const int key=tile_first+tid-BN*4;
+      km_raw=key<split_end?*reinterpret_cast<const float4*>(k_meta+
+          (static_cast<std::size_t>(key)*kKVHeads+kv_head)*l0::kMetaFloats):make_float4(0.f,0.f,0.f,0.f);
     }
   };
   if(split_begin<split_end) fetch(split_begin);
@@ -490,38 +549,52 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     #pragma unroll
     for(int i=0;i<kSlots;++i){
       const int idx=tid+i*256; const int key_off=idx/(kHeadDim/8); const int dim=(idx%(kHeadDim/8))*8;
-      l0_store_slot(raw[i],ks+key_off*kStride+dim,vs+key_off*kStride+dim);
+      const float vb=-raw[i].v_zero*raw[i].v_scale;
+      half v8[8];
+      #pragma unroll
+      for(int e=0;e<8;++e) v8[e]=__float2half_rn(fmaf(static_cast<float>((raw[i].v_bits>>(2*e))&3u),raw[i].v_scale,vb));
+      *reinterpret_cast<uint4*>(vs+key_off*kStride+dim)=*reinterpret_cast<const uint4*>(v8);
     }
+    if(tid<BN*4) reinterpret_cast<uint4*>(kraw)[tid]=kc_raw;
+    else if(tid<BN*5) kmeta[tid-BN*4]=km_raw;
     __syncthreads();
     if(first+BN<split_end) fetch(first+BN);
     if(!warp_live) continue;
-    float s[BN/8][4];
+    int si[2][BN/8][4];
     #pragma unroll
-    for(int j=0;j<BN/8;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.f;
-    #pragma unroll
-    for(int kk=0;kk<kHeadDim/16;++kk){
+    for(int h=0;h<2;++h)
       #pragma unroll
-      for(int pair=0;pair<BN/16;++pair){
-        unsigned b[4];
-        reg_attn_ldmatrix_x4(b,ks+(pair*16+(lane&7)+((lane>>4)<<3))*kStride+kk*16+((lane>>3)&1)*8);
-        reg_attn_mma(s[2*pair],qa[kk],b[0],b[1]);
-        reg_attn_mma(s[2*pair+1],qa[kk],b[2],b[3]);
+      for(int j=0;j<BN/8;++j) si[h][j][0]=si[h][j][1]=si[h][j][2]=si[h][j][3]=0;
+    #pragma unroll
+    for(int j=0;j<BN/8;++j) {
+      const uint2* kw=reinterpret_cast<const uint2*>(kraw+(8*j+g)*(l0::kCodeBytes/4));
+      const uint2 lo=kw[t],hi=kw[4+t];
+      #pragma unroll
+      for(int m=0;m<4;++m) {
+        const unsigned w=m==0?lo.x:m==1?lo.y:m==2?hi.x:hi.y;
+        #pragma unroll
+        for(int sb=0;sb<2;++sb)
+          l0_imma(si[m>>1][j],qa[m][sb],(w>>(4*sb))&0x03030303U,(w>>(4*sb+2))&0x03030303U);
       }
     }
+    float s[BN/8][4];
     float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
     #pragma unroll
     for(int j=0;j<BN/8;++j)
       #pragma unroll
       for(int e=0;e<4;++e){
-        const bool live=e<2?l0r:l1r;
-        const float sc=live?(s[j][e]+(e<2?mu0:mu1))*0.0625f:-3.402823466e+38F;
-        s[j][e]=sc; tmax[e>>1]=fmaxf(tmax[e>>1],sc);
+        const int r=e>>1,key=8*j+2*t+(e&1);
+        const float4 k=kmeta[key];
+        const bool live=(r?l1r:l0r)&&first+key<split_end;
+        const float v=qs[r][0]*k.x*static_cast<float>(si[0][j][e])+qs[r][1]*k.z*static_cast<float>(si[1][j][e])-
+            qsum[r][0]*k.y*k.x-qsum[r][1]*k.w*k.z+qmu[r];
+        s[j][e]=live?v:-3.402823466e+38F; tmax[r]=fmaxf(tmax[r],s[j][e]);
       }
     #pragma unroll
     for(int i=0;i<2;++i){ tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],1)); tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],2)); }
     float scale[2];
     #pragma unroll
-    for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:exp2f((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+    for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:exp2f(run_max[i]-nm); run_max[i]=nm; }
     unsigned pp[BN/8][2]; float rs[2]={0.f,0.f};
     #pragma unroll
     for(int j=0;j<BN/8;++j){
@@ -529,7 +602,7 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
       #pragma unroll
       for(int e=0;e<4;++e){
         const float x=s[j][e];
-        p[e]=__float2half(x==-3.402823466e+38F?0.f:exp2f((x-run_max[e>>1])*1.4426950408889634f));
+        p[e]=__float2half(x==-3.402823466e+38F?0.f:exp2f(x-run_max[e>>1]));
         rs[e>>1]+=__half2float(p[e]);
       }
       pp[j][0]=reg_attn_pack(p[0],p[1]); pp[j][1]=reg_attn_pack(p[2],p[3]);
@@ -562,56 +635,132 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     }
     if(t==0){
       const std::size_t stat=(static_cast<std::size_t>(query_base+row)*kQHeads+q_head)*2;
-      stats[stat]=run_max[i]; stats[stat+1]=den[i];
+      stats[stat]=run_max[i]*0.6931471805599453f; stats[stat+1]=den[i];
     }
   }
 }
 
-// Un-rotates normalized prefill history outputs o = o' R_v^T into split slot
-// `slot` of the FA2 split buffers: one CTA per (row, KV head, 32-column block).
-__global__ void __launch_bounds__(192) l0_history_unrotate_rows_kernel(const float* rotated,
-    const float* rotated_stats,float* split_output,float* split_stats,int rows,int slot,
-    const float* rvt) {
+// Y[v] = X[v] M for the (row, head) vectors of one KV head, v = row * 6 + head
+// at [row][kv * 6 + head][256]: the rotations q R_k and o' R_v^T as FP16
+// tensor-core GEMMs. CTA = 64 vectors x 64 output columns (blockIdx.y = column
+// block, blockIdx.z = KV head), 4 warps of 16 vectors; `mu` (column block 0)
+// also forms q . mu.
+constexpr int kL0RotVectors=64,kL0RotCols=64,kL0RotThreads=128;
+constexpr int kL0RotAStride=kHeadDim+8,kL0RotBStride=kL0RotCols+8;
+constexpr std::size_t kL0RotSmem=
+    (static_cast<std::size_t>(kL0RotVectors)*kL0RotAStride+kHeadDim*kL0RotBStride)*sizeof(half);
+__device__ __forceinline__ void l0_rot_store(__half* y,float a,float b) {
+    *reinterpret_cast<__half2*>(y)=__floats2half2_rn(a,b);
+}
+__device__ __forceinline__ void l0_rot_store(float* y,float a,float b) {
+    *reinterpret_cast<float2*>(y)=make_float2(a,b);
+}
+template<typename Out>
+__global__ void __launch_bounds__(kL0RotThreads) l0_rotate_kernel(const __half* x,
+    const __half* m_bank,Out* y,int rows,const float* mu,float* q_mu) {
     constexpr int H=kFastFusedFlashHeads;
-    __shared__ float numer[H][kHeadDim];
-    const int row=blockIdx.x/32,kv=(blockIdx.x/8)%4,block=blockIdx.x%8;
-    const int t=threadIdx.x,head=t/32,j=block*32+t%32;
-    if(row>=rows) return;
-    const std::size_t at=(static_cast<std::size_t>(row)*kQHeads+kv*H)*kHeadDim;
+    extern __shared__ __align__(16) unsigned char l0_rot_smem[];
+    half* xs=reinterpret_cast<half*>(l0_rot_smem);
+    half* ms=xs+kL0RotVectors*kL0RotAStride;
+    const int kv=static_cast<int>(blockIdx.z),cb=static_cast<int>(blockIdx.y);
+    const int v0=static_cast<int>(blockIdx.x)*kL0RotVectors,total=rows*H;
+    const int tid=static_cast<int>(threadIdx.x),warp=tid>>5,lane=tid&31,g=lane>>2,t=lane&3;
+    const auto vector_at=[&](int v){
+        return (static_cast<std::size_t>(v/H)*kQHeads+kv*H+v%H)*kHeadDim;
+    };
+    for(int i=tid;i<kL0RotVectors*(kHeadDim/8);i+=kL0RotThreads) {
+        const int vv=i/(kHeadDim/8),c=(i%(kHeadDim/8))*8,v=v0+vv;
+        uint4 value=make_uint4(0,0,0,0);
+        if(v<total) value=*reinterpret_cast<const uint4*>(x+vector_at(v)+c);
+        *reinterpret_cast<uint4*>(xs+vv*kL0RotAStride+c)=value;
+    }
+    const __half* m=m_bank+static_cast<std::size_t>(kv)*kHeadDim*kHeadDim+cb*kL0RotCols;
+    for(int i=tid;i<kHeadDim*(kL0RotCols/8);i+=kL0RotThreads) {
+        const int r=i/(kL0RotCols/8),c=(i%(kL0RotCols/8))*8;
+        *reinterpret_cast<uint4*>(ms+r*kL0RotBStride+c)=
+            *reinterpret_cast<const uint4*>(m+static_cast<std::size_t>(r)*kHeadDim+c);
+    }
+    __syncthreads();
+    float acc[kL0RotCols/8][4];
+    #pragma unroll
+    for(int n=0;n<kL0RotCols/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+    #pragma unroll 4
+    for(int kk=0;kk<kHeadDim;kk+=16) {
+        unsigned a[4];
+        reg_attn_ldmatrix_x4(a,xs+(warp*16+(lane&15))*kL0RotAStride+kk+(lane>>4)*8);
+        #pragma unroll
+        for(int pair=0;pair<kL0RotCols/16;++pair) {
+            unsigned b[4];
+            reg_attn_ldmatrix_x4_trans(b,ms+(kk+(lane&7)+((lane>>3)&1)*8)*kL0RotBStride+
+                pair*16+(lane>>4)*8);
+            reg_attn_mma(acc[2*pair],a,b[0],b[1]);
+            reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+        }
+    }
+    #pragma unroll
+    for(int r=0;r<2;++r) {
+        const int v=v0+warp*16+g+8*r;
+        if(v>=total) continue;
+        Out* dst=y+vector_at(v)+cb*kL0RotCols+2*t;
+        #pragma unroll
+        for(int n=0;n<kL0RotCols/8;++n) l0_rot_store(dst+8*n,acc[n][2*r],acc[n][2*r+1]);
+    }
+    if(mu && cb==0) {
+        const float* mk=mu+static_cast<std::size_t>(kv)*kHeadDim;
+        for(int i=0;i<16;++i) {
+            const int v=v0+warp*16+i;
+            float s=0.0f;
+            for(int d=lane;d<kHeadDim;d+=32) s=fmaf(__half2float(xs[(warp*16+i)*kL0RotAStride+d]),mk[d],s);
+            for(int o=16;o>0;o>>=1) s+=__shfl_xor_sync(0xffffffffU,s,o);
+            if(lane==0 && v<total) q_mu[(v/H)*kQHeads+kv*H+v%H]=s;
+        }
+    }
+}
+
+template<typename Out>
+void l0_launch_rotate(const void* x,const __half* m_bank,Out* y,int rows,const float* mu,
+    float* q_mu,cudaStream_t stream) {
+    static const bool configured=[] {
+        cuda_check(cudaFuncSetAttribute(l0_rotate_kernel<Out>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(kL0RotSmem)),
+            "configure L0 rotation shared memory");
+        return true;
+    }();
+    (void)configured;
+    l0_rotate_kernel<Out><<<dim3((rows*kFastFusedFlashHeads+kL0RotVectors-1)/kL0RotVectors,
+        kHeadDim/kL0RotCols,kKVHeads),kL0RotThreads,kL0RotSmem,stream>>>(
+        reinterpret_cast<const __half*>(x),m_bank,y,rows,mu,q_mu);
+}
+
+// Merges the kL0PrefillSplits normalized history partials of one (row, query
+// head) into FP16 rotated numerators (normalized) and writes the merged
+// (max, denominator) as prefill split `slot`.
+__global__ void __launch_bounds__(256) l0_history_split_merge_kernel(const float* rotated,
+    const float* rotated_stats,__half* numer,float* split_stats,int rows,int slot) {
+    const int vector=static_cast<int>(blockIdx.x),d=static_cast<int>(threadIdx.x);
     const std::size_t split_elements=static_cast<std::size_t>(rows)*kQHeads*kHeadDim;
     const std::size_t split_stat_stride=static_cast<std::size_t>(rows)*kQHeads*2;
-    // Merge the history splits (normalized partials) of this row's six heads.
-    __shared__ float weight[kL0PrefillSplits][H];
-    __shared__ float merged_max[H],merged_den[H];
-    if(t<H) {
-        const std::size_t stat=(static_cast<std::size_t>(row)*kQHeads+kv*H+t)*2;
-        float m=-3.402823466e+38F;
-        for(int s=0;s<kL0PrefillSplits;++s)
-            if(rotated_stats[s*split_stat_stride+stat+1]>0.f) m=fmaxf(m,rotated_stats[s*split_stat_stride+stat]);
-        float den=0.f;
-        for(int s=0;s<kL0PrefillSplits;++s) {
-            const float d=rotated_stats[s*split_stat_stride+stat+1];
-            const float w=d>0.f?d*expf(rotated_stats[s*split_stat_stride+stat]-m):0.f;
-            weight[s][t]=w;den+=w;
-        }
-        for(int s=0;s<kL0PrefillSplits;++s) weight[s][t]=den>0.f?weight[s][t]/den:0.f;
-        merged_max[t]=m;merged_den[t]=den;
+    const std::size_t stat=static_cast<std::size_t>(vector)*2;
+    float m=-3.402823466e+38F;
+    #pragma unroll
+    for(int s=0;s<kL0PrefillSplits;++s)
+        if(rotated_stats[s*split_stat_stride+stat+1]>0.f) m=fmaxf(m,rotated_stats[s*split_stat_stride+stat]);
+    float w[kL0PrefillSplits],den=0.f;
+    #pragma unroll
+    for(int s=0;s<kL0PrefillSplits;++s) {
+        const float dn=rotated_stats[s*split_stat_stride+stat+1];
+        w[s]=dn>0.f?dn*expf(rotated_stats[s*split_stat_stride+stat]-m):0.f;
+        den+=w[s];
     }
-    __syncthreads();
-    for(int i=t;i<H*kHeadDim;i+=blockDim.x) {
-        float v=0.f;
-        for(int s=0;s<kL0PrefillSplits;++s) v+=weight[s][i/kHeadDim]*rotated[s*split_elements+at+i];
-        numer[i/kHeadDim][i%kHeadDim]=v;
-    }
-    __syncthreads();
-    const float* r=rvt+static_cast<std::size_t>(kv)*kHeadDim*kHeadDim;
-    float o=0.0f;
-    for(int i=0;i<kHeadDim;++i) o=fmaf(numer[head][i],r[i*kHeadDim+j],o);
-    const std::size_t elements=static_cast<std::size_t>(rows)*kQHeads*kHeadDim;
-    split_output[static_cast<std::size_t>(slot)*elements+at+head*kHeadDim+j]=o;
-    if(block==0 && t%32==0) {
-        const std::size_t dst=(static_cast<std::size_t>(slot)*rows*kQHeads+row*kQHeads+kv*H+head)*2;
-        split_stats[dst]=merged_max[head];
-        split_stats[dst+1]=merged_den[head];
+    const float inv=den>0.f?1.f/den:0.f;
+    float v=0.f;
+    #pragma unroll
+    for(int s=0;s<kL0PrefillSplits;++s)
+        v=fmaf(w[s]*inv,rotated[s*split_elements+static_cast<std::size_t>(vector)*kHeadDim+d],v);
+    numer[static_cast<std::size_t>(vector)*kHeadDim+d]=__float2half_rn(v);
+    if(d==0) {
+        const std::size_t dst=(static_cast<std::size_t>(slot)*rows*kQHeads+vector)*2;
+        split_stats[dst]=m;
+        split_stats[dst+1]=den;
     }
 }

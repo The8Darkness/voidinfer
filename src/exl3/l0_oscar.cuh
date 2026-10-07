@@ -66,6 +66,8 @@ struct Assets {
     const float* rv = nullptr;   // [16][4][256][256]
     const float* rvt = nullptr;  // [16][4][256][256]  R_v transposed (o = o' R_v^T, coalesced)
     const float* mu = nullptr;   // [16][4][256]
+    const __half* rk16 = nullptr;   // FP16 copies for the tensor-core rotations
+    const __half* rvt16 = nullptr;
 };
 
 inline bool enabled() {
@@ -104,8 +106,18 @@ inline const Assets& assets() {
         cudaMemcpy(device + bank, rv.data(), bank * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(device + 2 * bank, rvt.data(), bank * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(device + 3 * bank, mu.data(), mu.size() * 4, cudaMemcpyHostToDevice);
+        std::vector<__half> half_copy(2 * bank);
+        for (std::size_t i = 0; i < bank; ++i) {
+            half_copy[i] = __float2half_rn(rk[i]);
+            half_copy[bank + i] = __float2half_rn(rvt[i]);
+        }
+        __half* device16 = nullptr;
+        if (cudaMalloc(&device16, half_copy.size() * sizeof(__half)) != cudaSuccess)
+            throw std::runtime_error("L0 OSCAR asset allocation");
+        cudaMemcpy(device16, half_copy.data(), half_copy.size() * sizeof(__half), cudaMemcpyHostToDevice);
         Assets a;
         a.rk = device; a.rv = device + bank; a.rvt = device + 2 * bank; a.mu = device + 3 * bank;
+        a.rk16 = device16; a.rvt16 = device16 + bank;
         return a;
     }();
     return value;

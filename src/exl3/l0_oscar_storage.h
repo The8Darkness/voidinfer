@@ -31,6 +31,7 @@ struct LayerStorage {
     float* prefill_hist_stats = nullptr;  // [prefill_rows][24][2]
     float* prefill_split = nullptr;   // [5][prefill_rows][24][256]
     float* prefill_split_stats = nullptr;  // [5][prefill_rows][24][2]
+    std::uint16_t* prefill_numer = nullptr;  // FP16 [prefill_rows][24][256] merged history
     int capacity = 0, rows = 0, prefill_rows = 0, segment_keys = 0, segments = 0, bank = 0;
 };
 
