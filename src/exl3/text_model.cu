@@ -1,3 +1,4 @@
+#include "exl3/block_tree_sum.cuh"
 #include "exl3/text_model.h"
 #include "exl3/fixed_allocation_owners.h"
 #include "exl3/host_kv_transfer_requirements.h"
@@ -558,23 +559,30 @@ __global__ void media_embedding_cast_kernel(const float* input,std::uint16_t* ou
 __global__ void final_rms_norm_kernel(const std::uint16_t* input,
                                       const std::uint16_t* weight,
                                       std::uint16_t* output) {
+    // 512 threads: the same per-thread x*x order and the same pairwise tree
+    // (block_tree_sum_exact), with the ten loads per thread issued together.
     __shared__ float partial[512];
     const int lane = static_cast<int>(threadIdx.x);
+    constexpr int kPer = kHidden / 512;
+    static_assert(kHidden % 512 == 0, "final norm geometry");
+    std::uint16_t x_bits[kPer], w_bits[kPer];
+    #pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        x_bits[j] = input[lane + j * 512];
+        w_bits[j] = weight[lane + j * 512];
+    }
     float sum = 0.0f;
-    for (int i = lane; i < kHidden; i += blockDim.x) {
-        const float value = half_to_float(input[i]);
+    #pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const float value = half_to_float(x_bits[j]);
         sum += value * value;
     }
-    partial[lane] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) partial[lane] += partial[lane + stride];
-        __syncthreads();
-    }
-    const float inv = rsqrtf(partial[0] / static_cast<float>(kHidden) + 1.0e-6f);
-    for (int i = lane; i < kHidden; i += blockDim.x) {
-        const float value = half_to_float(input[i]) * inv * (half_to_float(weight[i]) + 1.0f);
-        output[i] = float_to_half(value);
+    const float inv = rsqrtf(block_tree_sum_exact<512>(sum, partial, lane) /
+                             static_cast<float>(kHidden) + 1.0e-6f);
+    #pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const float value = half_to_float(x_bits[j]) * inv * (half_to_float(w_bits[j]) + 1.0f);
+        output[lane + j * 512] = float_to_half(value);
     }
 }
 
