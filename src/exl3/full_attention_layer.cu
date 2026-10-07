@@ -6271,7 +6271,8 @@ constexpr int kVerifyMmaStride=kHeadDim+8;
 // per (row, KV head, query head) instead of one per (row, KV head). Every
 // output performs the identical ordered max, scale, denominator and numerator
 // chain, so the result is bitwise equal; only the parallel extent changes.
-__global__ void attention_fused_flash_merge_heads_kernel(
+constexpr int kMergeGroups=4;  // segment groups per (row, query head)
+__global__ void __launch_bounds__(kMergeGroups*kHeadDim) attention_fused_flash_merge_heads_kernel(
     const float* workspace,std::uint16_t* output,int rows,int segments,
     int position,int capacity,int keys,const int* position_device,
     int query_offset,const std::uint16_t* self_q=nullptr,
@@ -6280,26 +6281,31 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
     EXL3_PDL_SMALL_PROLOGUE();
     constexpr int H=kFastFusedFlashHeads;
+    __shared__ float group_max[kMergeGroups];
+    __shared__ float group_denominator[kMergeGroups];
+    __shared__ float group_numerator[kMergeGroups][kHeadDim];
+    __shared__ float self_partial[kMergeGroups][kHeadDim/32];
     const int block=static_cast<int>(blockIdx.x);
     const int head=block%H;
     const int query=block/(H*kKVHeads);
     const int kv_head=(block/H)%kKVHeads;
-    const int tid=threadIdx.x;
-    if(query>=rows || tid>=kHeadDim) return;
+    const int tid=static_cast<int>(threadIdx.x)%kHeadDim;
+    const int group=static_cast<int>(threadIdx.x)/kHeadDim;
+    if(query>=rows) return;
     const int base=(position_device?*position_device:position)+query_offset;
     const int count=base+query+1;
     std::uint16_t* out=output+(query*kQHeads+kv_head*H+head)*kHeadDim+tid;
-    if(count<1 || count>capacity) { *out=0; return; }
+    if(count<1 || count>capacity) { if(group==0) *out=0; return; }
     const int l0_end=history_slot?min(ninfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
     const int live_segments=l0_end>ninfer::exl3::l0_oscar::kSink?
         min(segments,1+(count-l0_end+keys-1)/keys):min(segments,(count+keys-1)/keys);
     const float* slots=workspace+
         (static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments*kFastFusedFlashStride;
-    float global_max=-3.402823466e+38F;
-    for(int segment=0;segment<live_segments;++segment)
-        global_max=fmaxf(global_max,
-            slots[segment*kFastFusedFlashStride+kFastFusedFlashValues+head]);
+    // Group g owns segments g, g+G, ...; the maximum is exact in any order.
+    float local_max=-3.402823466e+38F;
+    for(int segment=group;segment<live_segments;segment+=kMergeGroups)
+        local_max=fmaxf(local_max,slots[segment*kFastFusedFlashStride+kFastFusedFlashValues+head]);
     // Self term (verifier MMA route): the segments hold only the keys before
     // the row's logical position; its own key, at physical slot count - 1, is
     // the final term, so chain and sibling rows share one arithmetic.
@@ -6307,10 +6313,8 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     const float* history=history_slot?history_slot+
         (static_cast<std::size_t>(query)*kKVHeads+kv_head)*kFastFusedFlashStride:nullptr;
     const bool history_live=history && history[kFastFusedFlashValues+H+head]>0.0f;
-    if(history_live) global_max=fmaxf(global_max,history[kFastFusedFlashValues+head]);
     float self_score=-INFINITY,self_value=0.0f;
     if(self_q) {
-        __shared__ float partial[kHeadDim/32];
         const bool in_sink=sink_k && count-1<ninfer::exl3::l0_oscar::kSink;
         const std::size_t kv=ninfer::exl3::l0_oscar::window_row(count-1,sink_k!=nullptr,ring_mask)*
             kKVHeads*kHeadDim+kv_head*kHeadDim+tid;
@@ -6321,22 +6325,27 @@ __global__ void attention_fused_flash_merge_heads_kernel(
             __half2float(__ushort_as_half(key_plane[kv]));
         for(int offset=16;offset>0;offset>>=1)
             dot+=__shfl_xor_sync(0xffffffffu,dot,offset);
-        if((tid&31)==0)partial[tid>>5]=dot;
-        __syncthreads();
-        dot=0.0f;
-        #pragma unroll
-        for(int w=0;w<kHeadDim/32;++w)dot+=partial[w];
-        self_score=dot*0.0625f;
+        if((tid&31)==0)self_partial[group][tid>>5]=dot;
         self_value=__half2float(__ushort_as_half(value_plane[kv]));
+    }
+    if(tid==0) group_max[group]=local_max;
+    __syncthreads();
+    float global_max=group_max[0];
+    #pragma unroll
+    for(int g=1;g<kMergeGroups;++g) global_max=fmaxf(global_max,group_max[g]);
+    if(history_live) global_max=fmaxf(global_max,history[kFastFusedFlashValues+head]);
+    if(self_q) {
+        float dot=0.0f;
+        #pragma unroll
+        for(int w=0;w<kHeadDim/32;++w)dot+=self_partial[group][w];
+        self_score=dot*0.0625f;
         global_max=fmaxf(global_max,self_score);
     }
-    float denominator=0.0f,numerator=0.0f;
     // An empty segment (no unmasked key) contributes nothing; its value plane
-    // may be unwritten (L0 OSCAR history segments), so it is selected away
-    // (the same fused multiply-add chain over the live segments) instead of
-    // branched over, which lets the unrolled segment loads overlap.
-    #pragma unroll 8
-    for(int segment=0;segment<live_segments;++segment) {
+    // may be unwritten (L0 OSCAR history segments), so it is selected away.
+    float denominator=0.0f,numerator=0.0f;
+    #pragma unroll 4
+    for(int segment=group;segment<live_segments;segment+=kMergeGroups) {
         const float* slot=slots+segment*kFastFusedFlashStride;
         const float weight=slot[kFastFusedFlashValues+H+head];
         const float maximum=slot[kFastFusedFlashValues+head];
@@ -6345,6 +6354,17 @@ __global__ void attention_fused_flash_merge_heads_kernel(
         const float scale=live?expf(maximum-global_max):0.0f;
         denominator=live?fmaf(weight,scale,denominator):denominator;
         numerator=live?fmaf(value,scale,numerator):numerator;
+    }
+    if(tid==0) group_denominator[group]=denominator;
+    group_numerator[group][tid]=numerator;
+    __syncthreads();
+    if(group!=0) return;
+    denominator=group_denominator[0];
+    numerator=group_numerator[0][tid];
+    #pragma unroll
+    for(int g=1;g<kMergeGroups;++g) {
+        denominator+=group_denominator[g];
+        numerator+=group_numerator[g][tid];
     }
     if(history_live) {
         const float scale=expf(history[kFastFusedFlashValues+head]-global_max);
@@ -6376,7 +6396,7 @@ void launch_fused_flash_merge(const float* workspace,std::uint16_t* output,int r
     if((self_q || history_slot) && !fused_flash_merge_heads_enabled())
         throw std::invalid_argument("verifier self-term merge requires the per-head merge");
     if(fused_flash_merge_heads_enabled())
-        exl3_launch_small(attention_fused_flash_merge_heads_kernel,dim3(rows*kKVHeads*kFastFusedFlashHeads),dim3(256),0,stream,workspace,output,rows,
+        exl3_launch_small(attention_fused_flash_merge_heads_kernel,dim3(rows*kKVHeads*kFastFusedFlashHeads),dim3(kMergeGroups*kHeadDim),0,stream,workspace,output,rows,
                 segments,position,capacity,keys,position_device,0,self_q,self_k,self_v,
                 history_slot,sink_k,sink_v,ring_mask);
     else
