@@ -200,6 +200,16 @@ __global__ void rms_norm_f16_kernel(const std::uint16_t* input, const std::uint1
 // NINFER_EXL3_RESIDUAL_NORM_FUSED (default 1): the post-attention residual
 // add and RMS norm run as rms_norm_f16_kernel<true> (identical half(a+b)
 // residual, materialized, then the same norm); 0 restores two launches.
+// NINFER_EXL3_GDN_O_RESIDUAL_NORM (default 1): the decode O projection's
+// split reduction also applies the residual add and post-attention norm.
+bool gdn_o_residual_norm_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_O_RESIDUAL_NORM");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
 bool residual_norm_fused_enabled() {
     static const bool enabled=[] {
         const char* value=std::getenv("NINFER_EXL3_RESIDUAL_NORM_FUSED");
@@ -850,7 +860,6 @@ template<int kMax>
 __global__ void __launch_bounds__(kGdnChunkThreads) gdn_recurrence_chunk_kernel(
     const std::uint16_t* q,const std::uint16_t* k,const std::uint16_t* v,const float* g,
     const float* beta,float* state,std::uint16_t* output,int rows,const int* chain_rows=nullptr) {
-    EXL3_PDL_SMALL_PROLOGUE();
     constexpr int kColumns=kGdnChunkColumns,kKeysPerWarp=kHeadDim/8,kRawStride=kHeadDim+8;
     __shared__ __align__(16) float q_rows[kGdnChunkMaxRows][kHeadDim];
     __shared__ __align__(16) float k_rows[kGdnChunkMaxRows][kHeadDim];
@@ -870,9 +879,13 @@ __global__ void __launch_bounds__(kGdnChunkThreads) gdn_recurrence_chunk_kernel(
     const int column_base=(static_cast<int>(blockIdx.x)%kTiles)*kColumns;
     float* s=state+head*kHeadDim*kHeadDim+column_base+lane;
     const int key_base=warp*kKeysPerWarp;
+    // The recurrent state is never written by the immediately preceding grids
+    // (its writers - the previous recurrence or a stream-ordered restore copy -
+    // completed before those started), so its 3 MB load overlaps their tail.
     float st[kKeysPerWarp];
     #pragma unroll
     for(int i=0;i<kKeysPerWarp;++i) st[i]=s[(key_base+i)*kHeadDim];
+    EXL3_PDL_SMALL_PROLOGUE();
     const int chain_value=sibling_chain_rows(chain_rows);
     const int qk_head=head/3;
     constexpr unsigned mask=0xffffffffu;
@@ -3058,7 +3071,10 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     };
 
     begin(0);
-    if(!prepared) {
+    // The predecessor's down reduction already wrote h for exactly this input.
+    const bool input_prenormalized=prenormalized_input_==input && prenormalized_rows_==rows;
+    prenormalized_input_=nullptr; prenormalized_rows_=0;
+    if(!prepared && !input_prenormalized) {
         exl3_launch_small(rms_norm_f16_kernel<>,dim3(rows),dim3(512),512 * sizeof(float),stream,
             input,weights_.input_norm,h,rows,kHidden);
         check(cudaGetLastError(),"launch GDN input RMSNorm");
@@ -3375,12 +3391,22 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     }
     }
     check(cudaGetLastError(), "launch GDN gated norm staging"); end(6);
-    begin(7); project(linear_workspaces_[2], weights_.o, weights_.o_metadata, o_input, o,
-                      Exl3TargetProjectionOperator::o); end(7);
-    begin(8);
     const bool gopt_residual=gaming_[Gopt::GdnVerifierResidualNorm] &&
         rows>=1 && rows<=8 && !wide_prefill && preserve_m1_topology;
-    if(gopt_residual) {
+    // The O reduction also writes post = half(input + o) and the
+    // post-attention RMS norm (one fused cluster kernel) when its route allows.
+    if(!gopt_residual && rows>=1 && rows<=8 && !wide_prefill && !profile &&
+       !projection_timing_ && !projection_observer_ && residual_norm_fused_enabled() &&
+       gdn_o_residual_norm_enabled())
+        linear_workspaces_[2]->arm_residual_norm(input,post,weights_.post_attention_norm,
+                                                 mlp_input,kRmsEps);
+    begin(7); project(linear_workspaces_[2], weights_.o, weights_.o_metadata, o_input, o,
+                      Exl3TargetProjectionOperator::o); end(7);
+    const bool o_norm_applied=linear_workspaces_[2]->take_norm_applied();
+    (void)linear_workspaces_[2]->take_residual_applied();
+    begin(8);
+    if(o_norm_applied) {
+    } else if(gopt_residual) {
         exl3_gdn_residual_norm(input,o,weights_.post_attention_norm,post,mlp_input,rows,true,stream);
         gopt_record(gaming_submissions_,Gopt::GdnVerifierResidualNorm);
     } else if(fused_residual_norm_ && wide_prefill && rows>=1 && rows<=1024 && !capture_active_ && !profile &&
@@ -3533,16 +3559,32 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         preserve_m1_topology && !wide_prefill && rows>=1 && rows<=8 &&
         shared_gateup_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
             act,down,rows,0,model_layer_,stream,Exl3TargetSharedFamily::down});
+    const bool fuse_successor_norm=successor_ && !wide_prefill &&
+        gdn_o_residual_norm_enabled() && !successor_->projection_timing_ &&
+        !successor_->projection_observer_;
+    // Production writes the layer output directly (final_output is trace-only),
+    // so no device copy separates this reduction from the next layer.
+    std::uint16_t* const residual_destination=skip_state_trace_?output:final_output;
     if(!shared_down && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
-       !projection_observer_)
-        linear_workspaces_[5]->arm_residual(post,final_output);
+       !projection_observer_) {
+        if(fuse_successor_norm)
+            linear_workspaces_[5]->arm_residual_norm(post,residual_destination,
+                successor_->weights_.input_norm,successor_->half_buffers_[0],kRmsEps);
+        else
+            linear_workspaces_[5]->arm_residual(post,residual_destination);
+    }
     if(!shared_down)project(linear_workspaces_[5], weights_.down, weights_.down_metadata, act, down,
                        Exl3TargetProjectionOperator::down,
                        (fused_gate_up||merged_gate_up)?linear_workspaces_[5]->transformed_device():nullptr);
-    if(!linear_workspaces_[5]->take_residual_applied())
+    if(linear_workspaces_[5]->take_norm_applied()) {
+        successor_->prenormalized_input_=output;
+        successor_->prenormalized_rows_=rows;
+    }
+    const bool residual_applied=linear_workspaces_[5]->take_residual_applied();
+    if(!residual_applied)
         exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post, down, final_output, rows * kHidden);
     check(cudaGetLastError(), "launch GDN final residual"); end(11);
-    if (output != final_output) check(cudaMemcpyAsync(output, final_output, static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream), "copy GDN output");
+    if (output != final_output && !(residual_applied && residual_destination==output)) check(cudaMemcpyAsync(output, final_output, static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream), "copy GDN output");
     if (collect_stage_events) {
         record(total_end, stream); check(cudaEventSynchronize(total_end), "synchronize GDN timing");
         float ms = 0.0f; check(cudaEventElapsedTime(&ms, starts[0], total_end), "read GDN total timing");

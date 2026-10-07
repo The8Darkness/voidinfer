@@ -1467,6 +1467,84 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) reduce_output_resid
     exl3_store_half4(residual_out+offset,sum);
 }
 
+
+// reduce_output_residual_warp_kernel followed by the RMS norm of the residual
+// (5120 features, rms_norm_f16_kernel formula): one 5-CTA cluster per row,
+// each CTA owning 1024 columns. The sum of squares is reduced per warp, per
+// CTA, then over the five CTA sums in rank order through DSMEM, so every CTA
+// derives the same inverse norm and normalizes its own slice.
+constexpr int kResidualNormFeatures=5120;
+constexpr int kResidualNormCluster=kResidualNormFeatures/(kHadamardWarpsPerBlock*kHadamard);
+static_assert(kResidualNormCluster==5,"residual-norm cluster geometry");
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) reduce_output_residual_norm_kernel(
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
+    int split_count,const std::uint16_t* left,std::uint16_t* residual_out,
+    const std::uint16_t* norm_weight,std::uint16_t* norm_out,float eps) {
+    constexpr int kFeatures=kResidualNormFeatures,kSlice=kHadamardWarpsPerBlock*kHadamard;
+    __shared__ float warp_sums[kHadamardWarpsPerBlock];
+    __shared__ float cta_sum;
+    __shared__ float total_sum;
+    cg::cluster_group cluster=cg::this_cluster();
+    const int tid=static_cast<int>(threadIdx.x),lane=tid&31,warp=tid>>5;
+    const int rank=static_cast<int>(cluster.block_rank());
+    const int row=static_cast<int>(blockIdx.x)/kResidualNormCluster;
+    const int column=rank*kSlice+warp*kHadamard+lane*4;
+    // Norm weights do not depend on the preceding grid.
+    std::uint16_t weight_bits[4];
+    exl3_load_half4(norm_weight+column,weight_bits);
+    EXL3_PDL_PROLOGUE();
+    const std::size_t row_base=static_cast<std::size_t>(row)*kFeatures;
+    const std::size_t offset=row_base+column;
+    float v[4];
+    exl3_sum_split_planes(accum+row_base,static_cast<std::size_t>(rows)*kFeatures,
+                          column,split_count,v);
+    std::uint16_t scale[4],base[4];
+    exl3_load_half4(svh+column,scale);
+    exl3_load_half4(left+offset,base);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4],sum[4];
+    float x[4],squares=0.0f;
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+        sum[j]=__half_as_ushort(__float2half_rn(__half2float(__ushort_as_half(base[j]))+
+                                                __half2float(__ushort_as_half(result[j]))));
+        x[j]=__half2float(__ushort_as_half(sum[j]));
+        squares+=x[j]*x[j];
+    }
+    exl3_store_half4(output+offset,result);
+    exl3_store_half4(residual_out+offset,sum);
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) squares+=__shfl_xor_sync(0xffffffffu,squares,o);
+    if(lane==0) warp_sums[warp]=squares;
+    __syncthreads();
+    if(tid==0) {
+        float t=0.0f;
+        #pragma unroll
+        for(int w=0;w<kHadamardWarpsPerBlock;++w) t+=warp_sums[w];
+        cta_sum=t;
+    }
+    cluster.sync();
+    if(tid==0) {
+        float t=0.0f;
+        #pragma unroll
+        for(int r=0;r<kResidualNormCluster;++r) t+=*cluster.map_shared_rank(&cta_sum,r);
+        total_sum=t;
+    }
+    __syncthreads();
+    const float inv=rsqrtf(total_sum/static_cast<float>(kFeatures)+eps);
+    std::uint16_t normed[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const float w=__half2float(__ushort_as_half(weight_bits[j]));
+        normed[j]=__half_as_ushort(__float2half_rn((x[j]*inv)*(w+1.0f)));
+    }
+    exl3_store_half4(norm_out+offset,normed);
+    cluster.sync();  // peers read cta_sum through DSMEM before this CTA exits
+}
+
+
 template<bool ShuffleLocal=false,bool MinimalBarriers=false,
          bool PrefetchSplitPlanes=false,bool Fp16GemmDestination=false>
 void launch_prefill_reduce_output(cudaStream_t stream,const float* accum,
@@ -11869,15 +11947,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down shared-row partials");
-        if (pending_residual_left_ && out_features_ % kHadamard == 0) {
-            exl3_launch_pdl(reduce_output_residual_warp_kernel,
-                dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,rows,out_features_,
-                split_count,pending_residual_left_,pending_residual_out_);
-            residual_applied_=true;
-        } else
+        if (!launch_armed_residual_reduce(stream, weights.svh, output, rows, split_count))
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
         cuda_check(cudaGetLastError(),
                    "launch coherent K6 down row reduction/output");
         process_coherent_down_k6_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -11895,15 +11968,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down shared-row partials");
-        if (pending_residual_left_ && out_features_ % kHadamard == 0) {
-            exl3_launch_pdl(reduce_output_residual_warp_kernel,
-                dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,rows,out_features_,
-                split_count,pending_residual_left_,pending_residual_out_);
-            residual_applied_=true;
-        } else
+        if (!launch_armed_residual_reduce(stream, weights.svh, output, rows, split_count))
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 down row reduction/output");
         process_coherent_down_k7_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -11921,15 +11989,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O shared-row partials");
-        if (pending_residual_left_ && out_features_ % kHadamard == 0) {
-            exl3_launch_pdl(reduce_output_residual_warp_kernel,
-                dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,rows,out_features_,
-                split_count,pending_residual_left_,pending_residual_out_);
-            residual_applied_=true;
-        } else
+        if (!launch_armed_residual_reduce(stream, weights.svh, output, rows, split_count))
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
         cuda_check(cudaGetLastError(),
                    "launch coherent K7 O row reduction/output");
         process_coherent_o_k7_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -11955,15 +12018,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 shared-row partials");
-        if (pending_residual_left_ && out_features_ % kHadamard == 0) {
-            exl3_launch_pdl(reduce_output_residual_warp_kernel,
-                dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-                dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,weights.svh,output,rows,out_features_,
-                split_count,pending_residual_left_,pending_residual_out_);
-            residual_applied_=true;
-        } else
+        if (!launch_armed_residual_reduce(stream, weights.svh, output, rows, split_count))
         launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
         pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
         cuda_check(cudaGetLastError(),
                    "launch coherent wide K6 row reduction/output");
         coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(
@@ -13546,6 +13604,39 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     launch_output_hadamard(stream,
         accum_, weights.svh, output, rows, out_features_, head_active_features);
     cuda_check(cudaGetLastError(), "launch EXL3 output Hadamard");
+}
+
+// Launches the armed residual (and optional norm) reduction; returns false
+// when the shape is not covered (caller falls back).
+bool Exl3CudaLinearWorkspace::launch_armed_residual_reduce(cudaStream_t stream,
+    const std::uint16_t* svh,std::uint16_t* output,int rows,int split_count) {
+    if(!pending_residual_left_ || out_features_%kHadamard!=0) return false;
+    if(pending_norm_weight_ && out_features_==kResidualNormFeatures) {
+        cudaLaunchAttribute attributes[2]{};
+        attributes[0].id=cudaLaunchAttributeClusterDimension;
+        attributes[0].val.clusterDim.x=kResidualNormCluster;
+        attributes[0].val.clusterDim.y=1;
+        attributes[0].val.clusterDim.z=1;
+        attributes[1].id=cudaLaunchAttributeProgrammaticStreamSerialization;
+        attributes[1].val.programmaticStreamSerializationAllowed=1;
+        cudaLaunchConfig_t config{};
+        config.gridDim=dim3(rows*kResidualNormCluster);
+        config.blockDim=dim3(kHadamardWarpsPerBlock*32);
+        config.stream=stream;
+        config.attrs=attributes;
+        config.numAttrs=exl3_pdl_enabled()?2:1;
+        cuda_check(cudaLaunchKernelEx(&config,reduce_output_residual_norm_kernel,
+            static_cast<const float*>(accum_),svh,output,rows,split_count,
+            pending_residual_left_,pending_residual_out_,pending_norm_weight_,
+            pending_norm_out_,pending_norm_eps_),"launch fused residual RMS norm reduction");
+        norm_applied_=true;
+    } else
+        exl3_launch_pdl(reduce_output_residual_warp_kernel,
+            dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+            dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,svh,output,rows,out_features_,
+            split_count,pending_residual_left_,pending_residual_out_);
+    residual_applied_=true;
+    return true;
 }
 
 } // namespace ninfer::exl3

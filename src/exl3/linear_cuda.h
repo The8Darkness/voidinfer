@@ -727,6 +727,20 @@ public:
         residual_applied_=false; pending_residual_left_=nullptr; pending_residual_out_=nullptr;
         return applied;
     }
+    // As arm_residual, and the same reduction also writes
+    // norm_out = rms_norm_f16(residual_out) (5120 features); the caller
+    // checks take_norm_applied() (before take_residual_applied()).
+    void arm_residual_norm(const std::uint16_t* left,std::uint16_t* residual_out,
+        const std::uint16_t* norm_weight,std::uint16_t* norm_out,float eps) noexcept {
+        arm_residual(left,residual_out);
+        pending_norm_weight_=norm_weight; pending_norm_out_=norm_out;
+        pending_norm_eps_=eps; norm_applied_=false;
+    }
+    bool take_norm_applied() noexcept {
+        const bool applied=norm_applied_;
+        norm_applied_=false; pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
+        return applied;
+    }
 
     // Two same-input projections of 1..8 rows (e.g. GDN qkv and z) in one
     // fused-input coherent producer launch and one reduction launch; false
@@ -1442,6 +1456,12 @@ private:
     float* accum_ = nullptr;
     const std::uint16_t* pending_residual_left_ = nullptr;
     std::uint16_t* pending_residual_out_ = nullptr;
+    const std::uint16_t* pending_norm_weight_ = nullptr;
+    std::uint16_t* pending_norm_out_ = nullptr;
+    float pending_norm_eps_ = 0.0f;
+    bool norm_applied_ = false;
+    bool launch_armed_residual_reduce(cudaStream_t stream,const std::uint16_t* svh,
+        std::uint16_t* output,int rows,int split_count);
     bool residual_applied_ = false;
     bool accum_owned_ = true;
     bool transformed_owned_ = true;

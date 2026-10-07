@@ -587,6 +587,10 @@ public:
     // state-before copy (3 MB per layer) and the packed conv-output/head copies;
     // only diagnostics and tests read those trace() fields.
     void set_skip_state_trace(bool skip) noexcept { skip_state_trace_ = skip; }
+    // The next GDN layer of the stack: this layer's decode down reduction also
+    // writes the successor's input RMS norm into the successor's input-norm
+    // buffer, and the successor skips its own norm for exactly that input.
+    void set_successor(Exl3GdnLayer* successor) noexcept { successor_ = successor; }
     // Per-row continuation traces (convolution input, q/k/v, gates) of the
     // last `rows`-row forward that an accepted sibling must carry into
     // `destination` before retained-prefix repair.
@@ -833,6 +837,9 @@ private:
     float* recurrent_state_ = nullptr;
     float* recurrent_state_before_ = nullptr;
     bool skip_state_trace_ = false;
+    Exl3GdnLayer* successor_ = nullptr;
+    const std::uint16_t* prenormalized_input_ = nullptr;
+    int prenormalized_rows_ = 0;
     std::uint16_t* conv_state_ = nullptr;
     std::uint16_t* conv_state_trace_ = nullptr;
     DeviceArena* op_workspace_ = nullptr;
