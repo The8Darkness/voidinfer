@@ -8121,7 +8121,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
                 rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
             l0_history_prefill_kernel<<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
-                kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),256,0,stream>>>(l0_.q_rot,l0_.q_mu,
+                kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,0,stream>>>(l0_.q_rot,l0_.q_mu,
                 l0_.k_codes,l0_.v_codes,l0_.k_meta,l0_.v_meta,l0_.prefill_hist,
                 l0_.prefill_hist_stats,rows,l0_prefill_history);
             l0_history_split_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
