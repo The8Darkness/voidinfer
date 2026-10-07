@@ -2050,7 +2050,7 @@ struct Exl3EngineCore::Impl {
             output.validate_generation_capacity(allowance);
             committed.reserve(allowance);
             if(!base)root=Exl3VeriCacheRequest::initialize_device_root(*context,draft,ids,stream);
-            if(reuse_allowed && ids.size()>=64) {
+            if(reuse_allowed && !split && ids.size()>=64) {
                 // The rendered input is a stable prefix of the next turn even
                 // when the generated reply is later re-rendered differently.
                 const auto admitted=cache.admit_input_authority(root,ids,available());

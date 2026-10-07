@@ -1732,9 +1732,13 @@ public:
         std::optional<std::span<const RetentionDecision>> retention=std::nullopt) {
         if(!byte_budget) throw std::invalid_argument("prefix index byte budget must be positive");
         Admission result;result.configured_budget_bytes=byte_budget;
-        result.effective_budget_bytes=available_physical_bytes>physical_reserve_bytes?
-            std::min(byte_budget,available_physical_bytes-physical_reserve_bytes):0;
         std::unique_lock lock(mutex_);
+        // Retained roots already occupy physical memory and are reclaimable by
+        // eviction: the physical bound is available plus currently retained.
+        const auto retained_bytes=current_stats_locked().accounted_bytes;
+        const auto physical=available_physical_bytes+retained_bytes;
+        result.effective_budget_bytes=physical>physical_reserve_bytes?
+            std::min(byte_budget,physical-physical_reserve_bytes):0;
         if(retention) {
             if(entries_.size()>64 || retention->size()!=entries_.size()) {
                 result.storage=current_stats_locked();return result;

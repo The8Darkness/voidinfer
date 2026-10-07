@@ -17,6 +17,7 @@ namespace ninfer::exl3::l0_l2_fp8 {
 
 constexpr int kRowBytes = 1032;
 constexpr int kRowWords = kRowBytes / 2;   // 516 uint16 per row
+constexpr int kStagingRows = 16384;       // bounded staging window (multiple of 64)
 
 inline bool enabled() {
     static const bool value = [] {

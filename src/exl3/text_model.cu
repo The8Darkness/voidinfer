@@ -11369,33 +11369,39 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         if (impl_->full_layers[layer] && state->l2_fp8_) {
             if(!fresh_pages.empty()) {
                 const int range_first=std::max(prefix_position,fresh_pages.front()->first);
-                const int range_rows=position_-range_first;
                 auto& staging=l0_l2_fp8::staging();
-                staging.reserve(static_cast<std::size_t>(range_rows)*l0_l2_fp8::kRowBytes);
+                // Bounded device staging: windows of whole pages.
+                constexpr int window=l0_l2_fp8::kStagingRows;
+                staging.reserve(static_cast<std::size_t>(window)*l0_l2_fp8::kRowBytes);
                 for(int plane=0;plane<2;++plane) {
-                    const auto* source=static_cast<const std::uint16_t*>(
-                        plane?impl_->cache_v[layer]->ptr:impl_->cache_k[layer]->ptr)+
-                        static_cast<std::size_t>(range_first)*1024;
-                    l0_l2_fp8::pack_kernel<<<(range_rows*4*32+255)/256,256,0,stream>>>(
-                        source,staging.device,range_rows);
-                    cuda_check(cudaGetLastError(),"L0 L2 FP8 pack");
-                    cuda_check(cudaMemcpyAsync(staging.host,staging.device,
-                        static_cast<std::size_t>(range_rows)*l0_l2_fp8::kRowBytes,
-                        cudaMemcpyDeviceToHost,stream),"L0 L2 FP8 export");
-                    cuda_check(cudaStreamSynchronize(stream),"L0 L2 FP8 export");
-                    // Page scatter is host memcpy bound: run the pages in parallel.
-                    std::for_each(std::execution::par,fresh_pages.begin(),fresh_pages.end(),[&](const auto& page) {
-                        const int from=std::max(range_first,page->first);
-                        const int rows=page->first+page->rows-from;
-                        if(rows<=0) return;
-                        auto& output=plane?page->v[full]:page->k[full];
-                        // Cloned prefix rows are already present; append the rest.
-                        output.resize(static_cast<std::size_t>(from-page->first)*l0_l2_fp8::kRowWords);
-                        const auto* words=reinterpret_cast<const std::uint16_t*>(
-                            staging.host+static_cast<std::size_t>(from-range_first)*l0_l2_fp8::kRowBytes);
-                        output.insert(output.end(),words,words+static_cast<std::size_t>(rows)*l0_l2_fp8::kRowWords);
-                    });
-                    state->kv_export_bytes_+=static_cast<std::size_t>(range_rows)*l0_l2_fp8::kRowBytes;
+                    for(int lo=range_first;lo<position_;) {
+                        const int hi=std::min(position_,(lo/64)*64+window);
+                        const int count=hi-lo;
+                        const auto* source=static_cast<const std::uint16_t*>(
+                            plane?impl_->cache_v[layer]->ptr:impl_->cache_k[layer]->ptr)+
+                            static_cast<std::size_t>(lo)*1024;
+                        l0_l2_fp8::pack_kernel<<<(count*4*32+255)/256,256,0,stream>>>(
+                            source,staging.device,count);
+                        cuda_check(cudaGetLastError(),"L0 L2 FP8 pack");
+                        cuda_check(cudaMemcpyAsync(staging.host,staging.device,
+                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,
+                            cudaMemcpyDeviceToHost,stream),"L0 L2 FP8 export");
+                        cuda_check(cudaStreamSynchronize(stream),"L0 L2 FP8 export");
+                        // Page scatter is host memcpy bound: run the pages in parallel.
+                        std::for_each(std::execution::par,fresh_pages.begin(),fresh_pages.end(),[&](const auto& page) {
+                            const int from=std::max(lo,page->first);
+                            const int to=std::min(hi,page->first+page->rows);
+                            if(to<=from) return;
+                            auto& output=plane?page->v[full]:page->k[full];
+                            // Earlier rows (cloned prefix or previous window) are present.
+                            output.resize(static_cast<std::size_t>(from-page->first)*l0_l2_fp8::kRowWords);
+                            const auto* words=reinterpret_cast<const std::uint16_t*>(
+                                staging.host+static_cast<std::size_t>(from-lo)*l0_l2_fp8::kRowBytes);
+                            output.insert(output.end(),words,words+static_cast<std::size_t>(to-from)*l0_l2_fp8::kRowWords);
+                        });
+                        state->kv_export_bytes_+=static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes;
+                        lo=hi;
+                    }
                 }
             }
             ++full;
@@ -11742,20 +11748,25 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                 if(state.l2_fp8_) {
                     require(!warm,"L0 L2 FP8 pages have no TurboAngle warm tail");
                     auto& staging=l0_l2_fp8::staging();
-                    staging.reserve(static_cast<std::size_t>(rows)*l0_l2_fp8::kRowBytes);
-                    std::for_each(std::execution::par,state.kv_pages_.begin(),state.kv_pages_.end(),[&](const auto& page) {
-                        if(page->first<first || page->first>=first+rows) return;
-                        const auto& packed=key?page->k[full]:page->v[full];
-                        std::memcpy(staging.host+static_cast<std::size_t>(page->first-first)*l0_l2_fp8::kRowBytes,
-                            packed.data(),static_cast<std::size_t>(page->rows)*l0_l2_fp8::kRowBytes);
-                    });
-                    cuda_check(cudaMemcpyAsync(staging.device,staging.host,
-                        static_cast<std::size_t>(rows)*l0_l2_fp8::kRowBytes,cudaMemcpyHostToDevice,stream),
-                        "L0 L2 FP8 restore");
-                    l0_l2_fp8::unpack_kernel<<<(rows*4*32+255)/256,256,0,stream>>>(
-                        staging.device,static_cast<std::uint16_t*>(destination),rows);
-                    cuda_check(cudaGetLastError(),"L0 L2 FP8 unpack");
-                    cuda_check(cudaStreamSynchronize(stream),"L0 L2 FP8 restore");
+                    constexpr int window=l0_l2_fp8::kStagingRows;
+                    staging.reserve(static_cast<std::size_t>(window)*l0_l2_fp8::kRowBytes);
+                    // Page-aligned windows (first is page aligned) of bounded staging.
+                    for(int lo=first;lo<first+rows;lo+=window) {
+                        const int count=std::min(window,first+rows-lo);
+                        std::for_each(std::execution::par,state.kv_pages_.begin(),state.kv_pages_.end(),[&](const auto& page) {
+                            if(page->first<lo || page->first>=lo+count) return;
+                            const auto& packed=key?page->k[full]:page->v[full];
+                            std::memcpy(staging.host+static_cast<std::size_t>(page->first-lo)*l0_l2_fp8::kRowBytes,
+                                packed.data(),static_cast<std::size_t>(page->rows)*l0_l2_fp8::kRowBytes);
+                        });
+                        cuda_check(cudaMemcpyAsync(staging.device,staging.host,
+                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,cudaMemcpyHostToDevice,stream),
+                            "L0 L2 FP8 restore");
+                        l0_l2_fp8::unpack_kernel<<<(count*4*32+255)/256,256,0,stream>>>(staging.device,
+                            static_cast<std::uint16_t*>(destination)+static_cast<std::size_t>(lo-first)*1024,count);
+                        cuda_check(cudaGetLastError(),"L0 L2 FP8 unpack");
+                        cuda_check(cudaStreamSynchronize(stream),"L0 L2 FP8 restore");
+                    }
                     return;
                 }
                 for(const auto& page:state.kv_pages_) {
