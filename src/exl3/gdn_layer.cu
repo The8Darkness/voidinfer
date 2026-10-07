@@ -3574,7 +3574,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         check(cudaGetLastError(), "launch GDN MLP activation");
     }
     end(10);
-    if(successor_) prefetch_weights(8,successor_->weights_.qkv.trellis);
+    if(next_layer_prefetch_) prefetch_weights(8,next_layer_prefetch_);
     begin(11);
     const bool shared_down=shared_down_enabled_ && shared_gateup_executor_ &&
         !capture_active_ && !profile && !projection_timing_ && !projection_observer_ &&

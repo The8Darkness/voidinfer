@@ -7707,6 +7707,21 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     if (!input || !output || rows <= 0 || rows > max_rows_) {
         throw std::invalid_argument("invalid EXL3 full-attention layer input/output/rows");
     }
+    // Side-branch L2 prefetch of upcoming GEMV weights (see the GDN layer).
+    static const std::size_t prefetch_bytes=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
+        return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
+    }();
+    static const int prefetch_sites=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_FULL_SITES");
+        return value?std::atoi(value):31;
+    }();
+    const bool prefetch=exl3_l2_prefetch_enabled() && rows==1 && !wide_prefill && !profile &&
+        !mlp_tail_graph;
+    const auto prefetch_weights=[&](int site,const std::uint16_t* trellis) {
+        if(prefetch && trellis && (prefetch_sites&site))
+            exl3_l2_prefetch_fork(stream,trellis,prefetch_bytes);
+    };
     if(exact_prefix_rows_ || exact_page_ranges_.count) {
         exact_position_contract_.require_current(mrope_positions_,rope_offset_);
         if(!supports_segmented_exact_prefix())
@@ -8115,6 +8130,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             throw;
         }
     } else {
+        prefetch_weights(1,weights_.k.trellis);
         begin(1);
         // Suspension is explicit at the layer boundary, outside ordinary linear
         // dispatch. Private attention/KV/MLP state resumes only after Q is complete.
@@ -8125,6 +8141,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         if(!shared_q)project(linear_workspaces_[0],weights_.q,weights_.q_metadata,
             input_norm,qg,Exl3TargetProjectionOperator::q);
         launch(cudaGetLastError(),"launch EXL3 Q projection");end(1);
+        prefetch_weights(2,weights_.o.trellis);
         const bool m1_kv_pair=(fast_same_weights_fp16kv_m1_kv_pair_ ||
             fast_same_weights_fp16kv_m1_kv_wide_pair_) &&
             !preserve_m1_topology && !can_share_target && rows==1 &&
@@ -9598,6 +9615,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         cudaEventDestroy(attention_core_end);
     }
 
+    prefetch_weights(4,weights_.gate.trellis);
     begin(7);
     const bool shared_o=can_share_target && target_o_executor_enabled_ &&
         target_shared_admission(Exl3TargetSharedFamily::o,weights_.o_metadata).has_value() &&
@@ -9629,6 +9647,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,post_resid, weights_.post_attention_norm,
         mlp_in, rows, kHidden);
     launch(cudaGetLastError(), "launch EXL3 attention residual and norm"); end(8);
+    prefetch_weights(8,weights_.down.trellis);
 
     // Fused prefill MLP (quantized route): gate/up stay untransformed and the
     // quantized down input is produced in one pass.
@@ -9756,6 +9775,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     }
     end(11);
     begin(12);
+    prefetch_weights(16,next_layer_prefetch_);
     const bool shared_down=can_share_target && target_down_executor_enabled_ &&
         target_shared_admission(Exl3TargetSharedFamily::down,weights_.down_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
@@ -9773,6 +9793,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     launch(cudaGetLastError(), "launch EXL3 final residual"); end(12);
     }
     }
+    if(prefetch) exl3_l2_prefetch_join(stream);
 
     if (profile) {
         cudaEvent_t total_end{};

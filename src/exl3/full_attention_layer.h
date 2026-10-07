@@ -259,6 +259,10 @@ struct Exl3FullAttentionLayerTimings {
 
 class Exl3FullAttentionLayer {
 public:
+    // Weights of the next layer's first projection, prefetched into L2 on a
+    // side branch before this layer's down projection (M1 decode).
+    void set_next_layer_prefetch(const std::uint16_t* trellis) noexcept { next_layer_prefetch_ = trellis; }
+    const std::uint16_t* first_projection_trellis() const noexcept { return weights_.q.trellis; }
     static std::size_t shared_scratch_bytes(int rows,bool coalesce_input_mlp=false);
     Exl3FullAttentionLayer(const Exl3FullAttentionLayerWeights& weights,
                             int max_rows = 16, Exl3CudaAccumulationView accumulation = {}, Exl3CudaTransformView transformed = {},
@@ -880,6 +884,7 @@ private:
         bool wide_prefill,cudaEvent_t* starts,cudaEvent_t* ends);
     void ensure_fast_cublas_attention_resources(int capacity);
     Exl3FullAttentionLayerWeights weights_{};
+    const std::uint16_t* next_layer_prefetch_ = nullptr;
     int max_rows_ = 0;
     std::size_t workspace_bytes_ = 0;
     std::array<std::uint16_t*, 18> buffers_{};

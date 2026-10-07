@@ -5406,9 +5406,16 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 !keep_state_trace && !impl->host_kv_transaction_recurrent_trace_enabled);
         }
     }
-    for (int layer = 0; layer + 1 < kLayers; ++layer)
+    for (int layer = 0; layer + 1 < kLayers; ++layer) {
         if (impl->gdn_layers[layer] && impl->gdn_layers[layer + 1])
             impl->gdn_layers[layer]->set_successor(impl->gdn_layers[layer + 1].get());
+        const std::uint16_t* next=impl->gdn_layers[layer + 1] ?
+            impl->gdn_layers[layer + 1]->first_projection_trellis() :
+            impl->full_layers[layer + 1] ? impl->full_layers[layer + 1]->first_projection_trellis() :
+            nullptr;
+        if (impl->gdn_layers[layer]) impl->gdn_layers[layer]->set_next_layer_prefetch(next);
+        else if (impl->full_layers[layer]) impl->full_layers[layer]->set_next_layer_prefetch(next);
+    }
     require(impl->persistent_bytes==expected_layer_group,"target complete layer group requirement mismatch");
     require(impl->persistent_bytes==expected_delayed_persistent,"target delayed construction requirement mismatch");
     if (impl->continuation_graph_gdn_qkvz_concurrent) {
