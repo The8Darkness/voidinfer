@@ -874,6 +874,9 @@ private:
     std::array<Exl3CudaLinearWorkspace*, 7> linear_workspaces_{};
     Exl3CudaReconstructGemmWorkspace* reconstruct_gemm_ = nullptr;
     std::uint16_t* k_cache_ = nullptr;
+    // KV-tier fidelity research (kv_fakequant.cuh): aged-row watermark and rotation bank.
+    int* fakequant_watermark_ = nullptr;
+    int fakequant_bank_ = 0;
     std::uint16_t* v_cache_ = nullptr;
     int cache_capacity_ = 0;
     std::uint16_t* direct_staged_k_=nullptr;

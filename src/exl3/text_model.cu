@@ -7874,9 +7874,9 @@ void Exl3TextContext::set_target_projection_observer_for_test(
 void Exl3TextContext::set_layer_observer_for_test(
     Exl3LayerObserver observer, void* user, cudaStream_t stream) {
     if (observer) {
-        require(!impl_->coalesce_attention_input_mlp && impl_->host_kv.enabled && !impl_->graph_active &&
+        require(!impl_->coalesce_attention_input_mlp && !impl_->oscar && !impl_->graph_active &&
                 !impl_->graph_capture_active && !impl_->transaction,
-                "layer observer requires ordinary eager exact-host context");
+                "layer observer requires an ordinary eager exact-host or device-KV context");
         cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
         cuda_check(cudaStreamIsCapturing(stream, &status), "query layer observer capture");
         require(status == cudaStreamCaptureStatusNone, "layer observer rejects capture");

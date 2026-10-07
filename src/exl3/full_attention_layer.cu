@@ -1,5 +1,6 @@
 #include "exl3/pdl_small.cuh"
 #include "exl3/sibling_rows.cuh"
+#include "exl3/kv_fakequant.cuh"
 #include "exl3/full_attention_layer.h"
 #include "exl3/environment_options.h"
 #include "exl3/vericache_serving_coordinator.h"
@@ -6721,6 +6722,10 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
     Exl3CudaTransformView paired_up_transformed)
     : weights_(weights), max_rows_(max_rows),
       reconstruct_gemm_(reconstruct_gemm) {
+    {
+        static int constructed = 0;
+        fakequant_bank_ = constructed++ % 16;
+    }
     coalesce_input_mlp_=coalesce_input_mlp;
     small_m_fused_gate_up_transform_ = read_binary_option("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",
         "small-M fused gate/up transform must be 0 or 1");
@@ -7058,6 +7063,9 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
     k_cache_ = k_cache;
     v_cache_ = v_cache;
     cache_capacity_ = capacity;
+    if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
+        cudaMalloc(&fakequant_watermark_, sizeof(int)) == cudaSuccess)
+        cudaMemset(fakequant_watermark_, 0, sizeof(int));
 }
 
 void Exl3FullAttentionLayer::set_oscar(Exl3OscarContext* oscar, int model_layer) noexcept {
@@ -7883,6 +7891,9 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         exl3_launch_small(append_kv_cache_kernel,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,
             kr, vp, k_cache_, v_cache_, rows, position, cache_capacity_, position_device_);
         launch(cudaGetLastError(), "append EXL3 attention KV cache");
+        if (fakequant_watermark_)
+            kv_fakequant::age(k_cache_, v_cache_, cache_capacity_, position_device_, position,
+                              fakequant_watermark_, fakequant_bank_, stream);
         if(direct_staged_rows_) {
             exl3_launch_small(append_kv_cache_kernel,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,
                 kr, vp, direct_staged_k_, direct_staged_v_, rows, position,

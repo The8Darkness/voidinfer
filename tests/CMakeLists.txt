@@ -692,3 +692,8 @@ foreach(v1_mode IN ITEMS export consume)
   string(TOUPPER ${v1_mode} v1_define)
   target_compile_definitions(${v1_target} PRIVATE NINFER_V1_${v1_define}=1)
 endforeach()
+
+ninfer_add_test(research_exl3_kv_tier_capture
+  SOURCES research_exl3_kv_tier_capture.cpp
+  LIBRARIES ninfer_exl3_text_model ninfer_ops)
+set_tests_properties(research_exl3_kv_tier_capture PROPERTIES SKIP_RETURN_CODE 77)
