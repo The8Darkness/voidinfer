@@ -1,3 +1,4 @@
+#include "exl3/pdl_small.cuh"
 #include "exl3/block_tree_sum.cuh"
 #include "exl3/text_model.h"
 #include "exl3/fixed_allocation_owners.h"

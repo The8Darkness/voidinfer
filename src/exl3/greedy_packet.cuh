@@ -1,5 +1,6 @@
 #pragma once
 #include "exl3/greedy_packet.h"
+#include "exl3/pdl_small.cuh"
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_fp16.h>
@@ -149,6 +150,7 @@ static __global__ void __launch_bounds__(256) exl3_greedy_packet_split_kernel(
     __shared__ unsigned invalid[8];
     __shared__ bool last;
     constexpr unsigned mask=0xffffffffu;
+    EXL3_PDL_SMALL_PROLOGUE();
     const int t=threadIdx.x,part=blockIdx.x,row_index=blockIdx.y;
     const auto* row=scores+static_cast<std::size_t>(row_index)*stride;
     const int vectors=vocabulary/8;
@@ -240,8 +242,8 @@ inline void exl3_launch_greedy_packet(bool warp,int rows,cudaStream_t stream,
     }();
     if(split && rows<=kGreedySplitMaxRows && stride%8==0 &&
        reinterpret_cast<std::uintptr_t>(scores)%16==0)
-        exl3_greedy_packet_split_kernel<<<dim3(kGreedySplitParts,rows),256,0,stream>>>(
-            scores,vocabulary,stride,serial,output);
+        exl3_launch_small(exl3_greedy_packet_split_kernel,dim3(kGreedySplitParts,rows),dim3(256),0,
+            stream,scores,vocabulary,stride,serial,output);
     else if(exl3_greedy_wide_enabled() && stride%8==0 &&
        reinterpret_cast<std::uintptr_t>(scores)%16==0)
         exl3_greedy_packet_wide_kernel<<<rows,1024,0,stream>>>(scores,vocabulary,stride,serial,output);
