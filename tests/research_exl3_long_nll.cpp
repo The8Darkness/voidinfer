@@ -53,8 +53,13 @@ int main() {
             for (const float l : logits) sum += std::exp(static_cast<double>(l) - mx);
             const double nll = -(static_cast<double>(logits[static_cast<std::size_t>(token)]) - mx - std::log(sum));
             total += nll;
-            out << nll << ' ' << arg << ' ' << token << '\n';
-            ctx->decode(token);
+            // LONG_NLL_GREEDY=1: free greedy generation (token = argmax) and the
+            // top-1/top-2 logit margin, for divergence studies between KV tiers.
+            static const bool greedy = std::getenv("LONG_NLL_GREEDY") != nullptr;
+            float second = -INFINITY;
+            for (std::size_t v = 0; v < logits.size(); ++v) if (v != arg && logits[v] > second) second = logits[v];
+            out << nll << ' ' << arg << ' ' << token << ' ' << (mx - second) << '\n';
+            ctx->decode(greedy ? static_cast<std::int64_t>(arg) : token);
         }
         std::cout << "LONG_NLL context=" << context << " continuation=" << continuation
                   << " mean_nll=" << total / continuation << '\n';
