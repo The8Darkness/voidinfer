@@ -1110,6 +1110,11 @@ struct Exl3TextContext::Impl {
         int rows=0;
         int first_layer=0;
     };
+    // Single-row ordinary decode: the 16 GDN-segment graphs and 16 full-layer
+    // graphs captured as one whole-stack graph (no inter-graph launch gaps).
+    HostKVGdnSegmentGraph ordinary_stack_graph{};
+    bool ordinary_stack_graph_ready=false;
+    std::uint64_t ordinary_stack_graph_replays=0;
     static constexpr int host_kv_gdn_segment_count=kLayers/4;
     static constexpr int host_kv_gdn_graph_row_shapes=8;
     std::array<HostKVGdnSegmentGraph,
@@ -2859,6 +2864,80 @@ struct Exl3TextContext::Impl {
                 std::chrono::steady_clock::now()-started).count();
     }
 
+    // NINFER_EXL3_ORDINARY_STACK_GRAPH (default 1). Captured after the
+    // per-segment graphs with the same layer arguments: GDN layers as their
+    // segment graphs (rows 1), full layers at the capacity frontier with the
+    // live position read from position_device_ at replay.
+    void capture_ordinary_stack_graph() {
+        static const bool enabled=[] {
+            const char* value=std::getenv("NINFER_EXL3_ORDINARY_STACK_GRAPH");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        if(!enabled || !ordinary_gdn_segment_graphs_enabled || !ordinary_full_layer_graphs_enabled ||
+           host_kv.enabled || oscar || oscar_only || !capture_taps || graph_active ||
+           graph_capture_active || target_projection_timing || target_projection_observer)
+            return;
+        for(int segment=0;segment<host_kv_gdn_segment_count;++segment) {
+            const int first=segment*4;
+            if(!gdn_layers[first] || !gdn_layers[first+1] || !gdn_layers[first+2] ||
+               !full_layers[first+3]) return;
+        }
+        bind_graph_device();
+        cudaStream_t capture_stream=nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&capture_stream,cudaStreamNonBlocking),
+            "create ordinary stack graph capture stream");
+        const int capture_position=max_context-1;
+        const auto reset_flags=[&] {
+            for(auto& layer:gdn_layers)if(layer)layer->set_capture_active(false);
+            for(auto& layer:full_layers)if(layer) {
+                layer->set_capture_active(false);
+                layer->set_ordinary_full_layer_graph_capture(false);
+            }
+        };
+        try {
+            for(auto& layer:gdn_layers)if(layer)layer->set_capture_active(true);
+            for(int segment=0;segment<host_kv_gdn_segment_count;++segment) {
+                auto& full=full_layers[segment*4+3];
+                full->set_segmented_exact_prefix(nullptr,nullptr,0);
+                full->set_mrope_positions(nullptr,rope_offset);
+                full->set_capture_active(true);
+                full->set_ordinary_full_layer_graph_capture(true);
+            }
+            ordinary_stack_graph.definition.capture(capture_stream,[&] {
+                for(int segment=0;segment<host_kv_gdn_segment_count;++segment) {
+                    const int first=segment*4;
+                    std::uint16_t* current=hidden_a;
+                    for(int layer=first;layer<first+4;++layer) {
+                        auto* next=current==hidden_a?hidden_b:hidden_a;
+                        if(layer<first+3)
+                            gdn_layers[layer]->forward(current,next,1,capture_stream,false,false,false);
+                        else
+                            full_layers[layer]->forward(current,next,1,capture_position,
+                                capture_stream,false,false,false,nullptr);
+                        const int tap=tap_index(layer);
+                        if(tap>=0)cuda_check(cudaMemcpyAsync(taps[tap]->ptr,next,
+                            kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,capture_stream),
+                            "capture ordinary stack hidden tap");
+                        current=next;
+                    }
+                }
+            });
+            reset_flags();
+            ordinary_stack_graph.rows=1;
+            ordinary_stack_graph.first_layer=0;
+            ordinary_stack_graph.executable.instantiate(ordinary_stack_graph.definition);
+            ordinary_stack_graph.executable.upload(capture_stream);
+            cuda_check(cudaStreamSynchronize(capture_stream),"complete ordinary stack graph preparation");
+        } catch(...) {
+            reset_flags();
+            (void)cudaStreamSynchronize(capture_stream);
+            (void)cudaStreamDestroy(capture_stream);
+            throw;
+        }
+        cuda_check(cudaStreamDestroy(capture_stream),"destroy ordinary stack graph capture stream");
+        ordinary_stack_graph_ready=true;
+    }
+
     HostKVFullLayerGraph& ordinary_full_layer_graph(int rows,int segment) {
         require(rows>=1 && rows<=host_kv_full_graph_row_shapes &&
                 segment>=0 && segment<host_kv_full_layer_count,
@@ -3210,6 +3289,14 @@ struct Exl3TextContext::Impl {
             !eager_mlp_gateup_concurrent &&
             rows>=1 && rows<=host_kv_full_graph_row_shapes &&
             (rows==1 || continuation_reference);
+        if(ordinary_stack_graph_ready && use_host_kv_gdn_segment_graphs &&
+           use_ordinary_full_layer_graphs && !host_kv.enabled && rows==1 &&
+           layer_begin==0 && layer_end==kLayers && current==hidden_a && !alternate_hidden) {
+            ordinary_stack_graph.executable.launch(stream);
+            ++ordinary_stack_graph_replays;
+            current=hidden_a;
+            layer_begin=kLayers;  // every layer ran inside the stack graph
+        }
         for (int layer = layer_begin; layer < layer_end; ++layer) {
             if(use_host_kv_gdn_segment_graphs && layer%4==0) {
                 const int segment=layer/4;
@@ -5577,6 +5664,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     result->impl_->capture_host_kv_gdn_segment_graphs();
     result->impl_->capture_host_kv_full_layer_graphs();
     result->impl_->capture_ordinary_full_layer_graphs();
+    result->impl_->capture_ordinary_stack_graph();
     result->impl_->capture_host_kv_mlp_tail_graphs();
     result->reset();
     if(startup_fault==8 || startup_fault==9) {
