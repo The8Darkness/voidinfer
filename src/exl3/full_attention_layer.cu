@@ -8683,11 +8683,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 };
                 history(l0_history_mma_kernel<64>);
                 l0_history_merge_kernel<<<rows*kQHeads,256,0,stream>>>(l0_.hist_work,
-                    l0_.hist_slot,l0_.hist_rotated,rows,l0_.segments,l0_.segment_keys,position,
-                    cache_capacity_,position_device_);
-                l0_history_unrotate_kernel<<<rows*32,192,0,stream>>>(l0_.hist_rotated,
-                    l0_.hist_slot,rows,
-                    a.rvt+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim*kHeadDim);
+                    l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,l0_.segments,
+                    l0_.segment_keys,position,cache_capacity_,position_device_);
+                l0_launch_rotate<float,true>(l0_.hist_rotated,a.rvt16+l0_.bank*bank_elements,
+                    l0_.hist_slot,rows,nullptr,nullptr,stream);
                 launch(cudaGetLastError(),"L0 OSCAR history attention");
                 history_slot=l0_.hist_slot;
             }

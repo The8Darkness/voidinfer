@@ -354,9 +354,10 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
 }
 
 // Merges the live history segments of one (row, query head) in the rotated
-// value basis: numerator into `rotated`, max and denominator into the slot.
+// value basis: normalized FP16 numerator into `rotated` (un-rotated and
+// re-scaled by l0_rotate_kernel), max and denominator into the slot.
 __global__ void __launch_bounds__(256) l0_history_merge_kernel(const float* workspace,
-    float* history_slot,float* rotated,int rows,int segments,int keys,int position,
+    float* history_slot,__half* rotated,int rows,int segments,int keys,int position,
     int capacity,const int* position_device) {
     constexpr int H=kFastFusedFlashHeads;
     const int row=blockIdx.x/kQHeads,qh=blockIdx.x%kQHeads,kv=qh/H,head=qh%H,j=threadIdx.x;
@@ -379,30 +380,12 @@ __global__ void __launch_bounds__(256) l0_history_merge_kernel(const float* work
             den+=slot[kFastFusedFlashValues+H+head]*sc;
             num+=slot[head*kHeadDim+j]*sc;
         }
-    rotated[(static_cast<std::size_t>(row)*kQHeads+qh)*kHeadDim+j]=num;
+    rotated[(static_cast<std::size_t>(row)*kQHeads+qh)*kHeadDim+j]=__float2half_rn(den>0.0f?num/den:0.0f);
     if(j==0) {
         float* out=history_slot+(static_cast<std::size_t>(row)*kKVHeads+kv)*kFastFusedFlashStride;
         out[kFastFusedFlashValues+head]=gmax;
         out[kFastFusedFlashValues+H+head]=den;
     }
-}
-
-// Un-rotates the merged history numerators, o = o' R_v^T: one CTA per (row,
-// KV head, 32-column block), 192 threads = 6 heads x 32 columns.
-__global__ void __launch_bounds__(192) l0_history_unrotate_kernel(const float* rotated,
-    float* history_slot,int rows,const float* rvt) {
-    constexpr int H=kFastFusedFlashHeads;
-    __shared__ float numer[H][kHeadDim];
-    const int row=blockIdx.x/32,kv=(blockIdx.x/8)%4,block=blockIdx.x%8;
-    const int t=threadIdx.x,head=t/32,j=block*32+t%32;
-    if(row>=rows) return;
-    const float* src=rotated+(static_cast<std::size_t>(row)*kQHeads+kv*H)*kHeadDim;
-    for(int i=t;i<H*kHeadDim;i+=blockDim.x) numer[i/kHeadDim][i%kHeadDim]=src[i];
-    __syncthreads();
-    const float* r=rvt+static_cast<std::size_t>(kv)*kHeadDim*kHeadDim;
-    float o=0.0f;
-    for(int i=0;i<kHeadDim;++i) o=fmaf(numer[head][i],r[i*kHeadDim+j],o);
-    history_slot[(static_cast<std::size_t>(row)*kKVHeads+kv)*kFastFusedFlashStride+head*kHeadDim+j]=o;
 }
 
 // L0 OSCAR prefill history: FA2-shaped (64 query rows x 2 query heads per
@@ -700,25 +683,29 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
 
 // Y[v] = X[v] M for the (row, head) vectors of one KV head, v = row * 6 + head
 // at [row][kv * 6 + head][256]: the rotations q R_k and o' R_v^T as FP16
-// tensor-core GEMMs. CTA = 64 vectors x 64 output columns (blockIdx.y = column
-// block, blockIdx.z = KV head), 4 warps of 16 vectors; `mu` (column block 0)
-// also forms q . mu.
-constexpr int kL0RotVectors=64,kL0RotCols=64,kL0RotThreads=128;
-constexpr int kL0RotAStride=kHeadDim+8,kL0RotBStride=kL0RotCols+8;
-constexpr std::size_t kL0RotSmem=
-    (static_cast<std::size_t>(kL0RotVectors)*kL0RotAStride+kHeadDim*kL0RotBStride)*sizeof(half);
+// tensor-core GEMMs. CTA = 64 vectors x Cols output columns (blockIdx.y =
+// column block, blockIdx.z = KV head), 4 warps of 16 vectors; `mu` (column
+// block 0) also forms q . mu. Slot output writes the fused-flash history slot
+// [row][kv][head][256] scaled by the slot denominator (rotated inputs are
+// normalized numerators).
+constexpr int kL0RotVectors=64,kL0RotThreads=128;
+constexpr int kL0RotAStride=kHeadDim+8;
+template<int Cols> constexpr std::size_t l0_rot_smem() {
+    return (static_cast<std::size_t>(kL0RotVectors)*kL0RotAStride+kHeadDim*(Cols+8))*sizeof(half);
+}
 __device__ __forceinline__ void l0_rot_store(__half* y,float a,float b) {
     *reinterpret_cast<__half2*>(y)=__floats2half2_rn(a,b);
 }
 __device__ __forceinline__ void l0_rot_store(float* y,float a,float b) {
     *reinterpret_cast<float2*>(y)=make_float2(a,b);
 }
-template<typename Out>
+template<typename Out,int Cols,bool Slot>
 __global__ void __launch_bounds__(kL0RotThreads) l0_rotate_kernel(const __half* x,
     const __half* m_bank,Out* y,int rows,const float* mu,float* q_mu) {
     constexpr int H=kFastFusedFlashHeads;
-    extern __shared__ __align__(16) unsigned char l0_rot_smem[];
-    half* xs=reinterpret_cast<half*>(l0_rot_smem);
+    constexpr int BStride=Cols+8;
+    extern __shared__ __align__(16) unsigned char l0_rot_smem_raw[];
+    half* xs=reinterpret_cast<half*>(l0_rot_smem_raw);
     half* ms=xs+kL0RotVectors*kL0RotAStride;
     const int kv=static_cast<int>(blockIdx.z),cb=static_cast<int>(blockIdx.y);
     const int v0=static_cast<int>(blockIdx.x)*kL0RotVectors,total=rows*H;
@@ -726,68 +713,87 @@ __global__ void __launch_bounds__(kL0RotThreads) l0_rotate_kernel(const __half* 
     const auto vector_at=[&](int v){
         return (static_cast<std::size_t>(v/H)*kQHeads+kv*H+v%H)*kHeadDim;
     };
+    const __half* m=m_bank+static_cast<std::size_t>(kv)*kHeadDim*kHeadDim+cb*Cols;
+    for(int i=tid;i<kHeadDim*(Cols/8);i+=kL0RotThreads) {
+        const int r=i/(Cols/8),c=(i%(Cols/8))*8;
+        *reinterpret_cast<uint4*>(ms+r*BStride+c)=
+            *reinterpret_cast<const uint4*>(m+static_cast<std::size_t>(r)*kHeadDim+c);
+    }
     for(int i=tid;i<kL0RotVectors*(kHeadDim/8);i+=kL0RotThreads) {
         const int vv=i/(kHeadDim/8),c=(i%(kHeadDim/8))*8,v=v0+vv;
         uint4 value=make_uint4(0,0,0,0);
         if(v<total) value=*reinterpret_cast<const uint4*>(x+vector_at(v)+c);
         *reinterpret_cast<uint4*>(xs+vv*kL0RotAStride+c)=value;
     }
-    const __half* m=m_bank+static_cast<std::size_t>(kv)*kHeadDim*kHeadDim+cb*kL0RotCols;
-    for(int i=tid;i<kHeadDim*(kL0RotCols/8);i+=kL0RotThreads) {
-        const int r=i/(kL0RotCols/8),c=(i%(kL0RotCols/8))*8;
-        *reinterpret_cast<uint4*>(ms+r*kL0RotBStride+c)=
-            *reinterpret_cast<const uint4*>(m+static_cast<std::size_t>(r)*kHeadDim+c);
-    }
     __syncthreads();
-    float acc[kL0RotCols/8][4];
-    #pragma unroll
-    for(int n=0;n<kL0RotCols/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
-    #pragma unroll 4
-    for(int kk=0;kk<kHeadDim;kk+=16) {
-        unsigned a[4];
-        reg_attn_ldmatrix_x4(a,xs+(warp*16+(lane&15))*kL0RotAStride+kk+(lane>>4)*8);
+    if(v0+warp*16<total) {
+        float acc[Cols/8][4];
         #pragma unroll
-        for(int pair=0;pair<kL0RotCols/16;++pair) {
-            unsigned b[4];
-            reg_attn_ldmatrix_x4_trans(b,ms+(kk+(lane&7)+((lane>>3)&1)*8)*kL0RotBStride+
-                pair*16+(lane>>4)*8);
-            reg_attn_mma(acc[2*pair],a,b[0],b[1]);
-            reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+        for(int n=0;n<Cols/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+        #pragma unroll 4
+        for(int kk=0;kk<kHeadDim;kk+=16) {
+            unsigned a[4];
+            reg_attn_ldmatrix_x4(a,xs+(warp*16+(lane&15))*kL0RotAStride+kk+(lane>>4)*8);
+            #pragma unroll
+            for(int pair=0;pair<Cols/16;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4_trans(b,ms+(kk+(lane&7)+((lane>>3)&1)*8)*BStride+
+                    pair*16+(lane>>4)*8);
+                reg_attn_mma(acc[2*pair],a,b[0],b[1]);
+                reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+            }
         }
-    }
-    #pragma unroll
-    for(int r=0;r<2;++r) {
-        const int v=v0+warp*16+g+8*r;
-        if(v>=total) continue;
-        Out* dst=y+vector_at(v)+cb*kL0RotCols+2*t;
         #pragma unroll
-        for(int n=0;n<kL0RotCols/8;++n) l0_rot_store(dst+8*n,acc[n][2*r],acc[n][2*r+1]);
+        for(int r=0;r<2;++r) {
+            const int v=v0+warp*16+g+8*r;
+            if(v>=total) continue;
+            Out* dst;
+            float scale=1.0f;
+            if constexpr(Slot) {
+                float* slot=reinterpret_cast<float*>(y)+
+                    (static_cast<std::size_t>(v/H)*kKVHeads+kv)*kFastFusedFlashStride;
+                scale=slot[kFastFusedFlashValues+H+v%H];
+                dst=reinterpret_cast<Out*>(slot+(v%H)*kHeadDim+cb*Cols+2*t);
+            } else {
+                dst=y+vector_at(v)+cb*Cols+2*t;
+            }
+            #pragma unroll
+            for(int n=0;n<Cols/8;++n) l0_rot_store(dst+8*n,acc[n][2*r]*scale,acc[n][2*r+1]*scale);
+        }
     }
     if(mu && cb==0) {
         const float* mk=mu+static_cast<std::size_t>(kv)*kHeadDim;
         for(int i=0;i<16;++i) {
             const int v=v0+warp*16+i;
+            if(v>=total) break;
             float s=0.0f;
             for(int d=lane;d<kHeadDim;d+=32) s=fmaf(__half2float(xs[(warp*16+i)*kL0RotAStride+d]),mk[d],s);
             for(int o=16;o>0;o>>=1) s+=__shfl_xor_sync(0xffffffffU,s,o);
-            if(lane==0 && v<total) q_mu[(v/H)*kQHeads+kv*H+v%H]=s;
+            if(lane==0) q_mu[(v/H)*kQHeads+kv*H+v%H]=s;
         }
     }
 }
 
-template<typename Out>
-void l0_launch_rotate(const void* x,const __half* m_bank,Out* y,int rows,const float* mu,
+template<typename Out,int Cols,bool Slot>
+void l0_launch_rotate_cols(const void* x,const __half* m_bank,Out* y,int rows,const float* mu,
     float* q_mu,cudaStream_t stream) {
     static const bool configured=[] {
-        cuda_check(cudaFuncSetAttribute(l0_rotate_kernel<Out>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(kL0RotSmem)),
+        cuda_check(cudaFuncSetAttribute(l0_rotate_kernel<Out,Cols,Slot>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(l0_rot_smem<Cols>())),
             "configure L0 rotation shared memory");
         return true;
     }();
     (void)configured;
-    l0_rotate_kernel<Out><<<dim3((rows*kFastFusedFlashHeads+kL0RotVectors-1)/kL0RotVectors,
-        kHeadDim/kL0RotCols,kKVHeads),kL0RotThreads,kL0RotSmem,stream>>>(
+    l0_rotate_kernel<Out,Cols,Slot><<<dim3((rows*kFastFusedFlashHeads+kL0RotVectors-1)/kL0RotVectors,
+        kHeadDim/Cols,kKVHeads),kL0RotThreads,l0_rot_smem<Cols>(),stream>>>(
         reinterpret_cast<const __half*>(x),m_bank,y,rows,mu,q_mu);
+}
+// Few vectors (verifier rows): 16-column blocks spread R over 64 CTAs.
+template<typename Out,bool Slot=false>
+void l0_launch_rotate(const void* x,const __half* m_bank,Out* y,int rows,const float* mu,
+    float* q_mu,cudaStream_t stream) {
+    if(rows<=16) l0_launch_rotate_cols<Out,16,Slot>(x,m_bank,y,rows,mu,q_mu,stream);
+    else l0_launch_rotate_cols<Out,64,Slot>(x,m_bank,y,rows,mu,q_mu,stream);
 }
 
 // Merges the kL0PrefillSplits normalized history partials of one (row, query
