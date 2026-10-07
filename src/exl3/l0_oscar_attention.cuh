@@ -59,6 +59,13 @@ __device__ __forceinline__ void l0_immau(int (&c)[4],const unsigned (&a)[4],unsi
 }
 
 
+// Integer MMA accumulators start at the bits of 1.5 * 2^23: while |sum| <
+// 2^22 the int32 result read as a float is 12582912 + sum exactly, so one
+// FADD replaces a quarter-rate I2F.
+constexpr int kL0IntMagic=0x4B400000;
+__device__ __forceinline__ float l0_int_value(int bits) {
+    return __int_as_float(bits)-12582912.0f;
+}
 template<int kKeys>
 __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
@@ -310,12 +317,12 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
         #pragma unroll
         for(int n=0;n<16;++n) {
             const unsigned mask=0x03030303U<<(2*(n&3));
-            int c[4]={0,0,0,0};
+            int c[4]={kL0IntMagic,kL0IntMagic,kL0IntMagic,kL0IntMagic};
             l0_immau(c,pa,u[0][n>>2]&mask,u[1][n>>2]&mask);
-            acc[n][0]=fmaf(qscale[0],static_cast<float>(c[0]),acc[n][0]);
-            acc[n][1]=fmaf(qscale[0],static_cast<float>(c[1]),acc[n][1]);
-            acc[n][2]=fmaf(qscale[1],static_cast<float>(c[2]),acc[n][2]);
-            acc[n][3]=fmaf(qscale[1],static_cast<float>(c[3]),acc[n][3]);
+            acc[n][0]=fmaf(qscale[0],l0_int_value(c[0]),acc[n][0]);
+            acc[n][1]=fmaf(qscale[0],l0_int_value(c[1]),acc[n][1]);
+            acc[n][2]=fmaf(qscale[1],l0_int_value(c[2]),acc[n][2]);
+            acc[n][3]=fmaf(qscale[1],l0_int_value(c[3]),acc[n][3]);
         }
         (void)kWords;
     }
@@ -442,10 +449,21 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
   constexpr float kLog2Scale=0.0625f*1.4426950408889634f;
   constexpr int kWords=l0::kCodeBytes/4;   // 16 code words per key
   const auto* q=reinterpret_cast<const __half*>(q_rot_bits);
-  __shared__ __align__(16) unsigned kraw[BN*kWords];
-  __shared__ __align__(16) unsigned vraw[BN*kWords];
-  __shared__ __align__(16) float4 kmeta[BN];
-  __shared__ __align__(16) float4 vmeta[BN];
+  // Two raw tile stages (cp.async a tile ahead): codes and FP16 meta.
+  // Key rows of kRowStride words with the 16-byte chunks XOR-swizzled by
+  // (key >> 2) & 3: the QK code loads and the PV byte transposes are
+  // bank-conflict free.
+  constexpr int kRowStride=20;
+  const auto word_at=[](int key,int word) {
+      return key*kRowStride+(((word>>2)^((key>>2)&3))<<2)+(word&3);
+  };
+  __shared__ __align__(16) unsigned kraw_s[2][BN*kRowStride];
+  __shared__ __align__(16) unsigned vraw_s[2][BN*kRowStride];
+  __shared__ __align__(16) uint2 kmeta_s[2][BN];
+  __shared__ __align__(16) uint2 vmeta_s[2][BN];
+  // Per-warp int8 query fragments ([pair m][sb] as uint4, lane-consecutive),
+  // read back each tile instead of holding 32 registers.
+  __shared__ __align__(16) uint4 qa_s[8][8][32];
   const int query_base=blockIdx.x*BM;
   const int kv_head=blockIdx.y;
   const int head_group=blockIdx.z/kL0PrefillSplits,split=blockIdx.z%kL0PrefillSplits;
@@ -466,7 +484,7 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
   // Int8 A fragments: k-step pair m reads code word W = 8 (m >> 1) + 2t + (m & 1)
   // of each key; byte i of (w >> 2j) & 0x03030303 is dim 16 W + 4 i + j. This
   // lane holds rows g, g + 8 at the dims of words {2t, 2t+1, 8+2t, 9+2t}.
-  unsigned qa[4][2][4];
+
   float qs[2][2],qsum[2][2],qmu[2];
   {
     float x[2][4][16];
@@ -516,7 +534,7 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
           w[2]|=(static_cast<unsigned>(static_cast<int>(x[0][m][d+1]))&255u)<<(8*i);
           w[3]|=(static_cast<unsigned>(static_cast<int>(x[1][m][d+1]))&255u)<<(8*i);
         }
-        qa[m][sb][0]=w[0];qa[m][sb][1]=w[1];qa[m][sb][2]=w[2];qa[m][sb][3]=w[3];
+        qa_s[warp][2*m+sb][lane]=make_uint4(w[0],w[1],w[2],w[3]);
       }
   }
   // acc[16 h + n][e]: rows g (e < 2) / g + 8, dims 128 h + 16 (2t + (e & 1)) + n,
@@ -526,65 +544,67 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
   for(int n=0;n<32;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
   float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f},bias[2][2]={{0.f,0.f},{0.f,0.f}};
   const bool warp_live=m_base<active_rows;
-  // Raw tile: K codes, V codes (128 x 16 B each), K and V meta (32 x 16 B each).
-  uint4 stage[2]={make_uint4(0,0,0,0),make_uint4(0,0,0,0)};   // meta parts: low 8 B
-  const auto fetch=[&](int tile_first){
-    #pragma unroll
-    for(int i=0;i<2;++i) {
-      const int c=tid+256*i;
-      if(c>=BN*10) break;
+  // Raw tile: K codes, V codes (128 x 16 B each), K and V meta (32 x 8 B each).
+  const auto fetch=[&](int tile_first,int buf){
+    for(int c=tid;c<BN*10;c+=256) {
       const int part=c<BN*8?c/(BN*4):2+(c-BN*8)/BN;     // 0 K, 1 V, 2 K meta, 3 V meta
       const int idx=c<BN*8?c%(BN*4):(c-BN*8)%BN;
       const int key=tile_first+(part<2?idx/4:idx);
-      uint4 value=make_uint4(0,0,0,0);
-      if(key<split_end) {
-        const std::size_t cell=static_cast<std::size_t>(key)*kKVHeads+kv_head;
-        value=part==0?*reinterpret_cast<const uint4*>(k_codes+cell*l0::kCodeBytes+(idx%4)*16):
-              part==1?*reinterpret_cast<const uint4*>(v_codes+cell*l0::kCodeBytes+(idx%4)*16):
-              part==2?[&]{ const uint2 m=*reinterpret_cast<const uint2*>(k_meta+cell*l0::kMetaFloats); return make_uint4(m.x,m.y,0,0); }():
-                      [&]{ const uint2 m=*reinterpret_cast<const uint2*>(v_meta+cell*l0::kMetaFloats); return make_uint4(m.x,m.y,0,0); }();
-      }
-      stage[i]=value;
+      const bool valid=key<split_end;
+      const std::size_t cell=static_cast<std::size_t>(valid?key:split_begin)*kKVHeads+kv_head;
+      if(part==0) l0_cp16(&kraw_s[buf][word_at(idx/4,(idx%4)*4)],k_codes+cell*l0::kCodeBytes+(idx%4)*16,valid);
+      else if(part==1) l0_cp16(&vraw_s[buf][word_at(idx/4,(idx%4)*4)],v_codes+cell*l0::kCodeBytes+(idx%4)*16,valid);
+      else if(part==2) l0_cp8(&kmeta_s[buf][idx],k_meta+cell*l0::kMetaFloats,valid);
+      else l0_cp8(&vmeta_s[buf][idx],v_meta+cell*l0::kMetaFloats,valid);
     }
+    asm volatile("cp.async.commit_group;\n");
   };
-  const auto publish=[&]{
-    #pragma unroll
-    for(int i=0;i<2;++i) {
-      const int c=tid+256*i;
-      if(c>=BN*10) break;
-      if(c<BN*4) reinterpret_cast<uint4*>(kraw)[c]=stage[i];
-      else if(c<BN*8) reinterpret_cast<uint4*>(vraw)[c-BN*4]=stage[i];
-      else if(c<BN*9) kmeta[c-BN*8]=l0_meta4(&stage[i]);
-      else vmeta[c-BN*9]=l0_meta4(&stage[i]);
-    }
-  };
-  if(split_begin<split_end) fetch(split_begin);
-  for(int first=split_begin;first<split_end;first+=BN){
+  int buf=0;
+  if(split_begin<split_end) fetch(split_begin,0);
+  for(int first=split_begin;first<split_end;first+=BN,buf^=1){
+    asm volatile("cp.async.wait_group 0;\n");
     __syncthreads();
-    publish();
-    __syncthreads();
-    if(first+BN<split_end) fetch(first+BN);
+    if(first+BN<split_end) fetch(first+BN,buf^1);
     if(!warp_live) continue;
+    const unsigned* kraw=kraw_s[buf];
+    const unsigned* vraw=vraw_s[buf];
     // QK. Score n-tile j column c is key 4 (c >> 1) + 2 (j & 1) + (c & 1) + 16 (j >> 1).
     int si[2][BN/8][4];
     #pragma unroll
     for(int h=0;h<2;++h)
       #pragma unroll
-      for(int j=0;j<BN/8;++j) si[h][j][0]=si[h][j][1]=si[h][j][2]=si[h][j][3]=0;
+      for(int j=0;j<BN/8;++j) si[h][j][0]=si[h][j][1]=si[h][j][2]=si[h][j][3]=kL0IntMagic;
+    uint2 kc[BN/8][2];
     #pragma unroll
     for(int j=0;j<BN/8;++j) {
       const int key=4*(g>>1)+2*(j&1)+(g&1)+16*(j>>1);
-      const uint2* kw=reinterpret_cast<const uint2*>(kraw+key*kWords);
-      const uint2 lo=kw[t],hi=kw[4+t];
-      #pragma unroll
-      for(int m=0;m<4;++m) {
-        const unsigned w=m==0?lo.x:m==1?lo.y:m==2?hi.x:hi.y;
-        #pragma unroll
-        for(int sb=0;sb<2;++sb)
-          l0_imma(si[m>>1][j],qa[m][sb],(w>>(4*sb))&0x03030303U,(w>>(4*sb+2))&0x03030303U);
-      }
+      kc[j][0]=*reinterpret_cast<const uint2*>(kraw+word_at(key,2*t));
+      kc[j][1]=*reinterpret_cast<const uint2*>(kraw+word_at(key,8+2*t));
     }
-    // This lane's keys: kk = 4t + i (i < 4) and 16 + 4t + (i - 4); s[e][i] row e.
+    #pragma unroll
+    for(int m=0;m<4;++m)
+      #pragma unroll
+      for(int sb=0;sb<2;++sb) {
+        const uint4 f=qa_s[warp][2*m+sb][lane];
+        const unsigned qa[4]={f.x,f.y,f.z,f.w};
+        #pragma unroll
+        for(int j=0;j<BN/8;++j) {
+          const unsigned w=(m&1)?kc[j][m>>1].y:kc[j][m>>1].x;
+          l0_imma(si[m>>1][j],qa,(w>>(4*sb))&0x03030303U,(w>>(4*sb+2))&0x03030303U);
+        }
+      }
+    // This lane's keys: 4t + (i & 3) + 16 (i >> 2). Per-key factors (shared
+    // by both rows): K scale per group, K zero term -z s per group; same for V.
+    float kf[8][4],vf[8][4];
+    #pragma unroll
+    for(int i=0;i<8;++i) {
+      const int key=4*t+(i&3)+16*(i>>2);
+      const float4 k=l0_meta4(&kmeta_s[buf][key]);
+      const float4 v=l0_meta4(&vmeta_s[buf][key]);
+      kf[i][0]=k.x;kf[i][1]=k.z;kf[i][2]=-k.y*k.x;kf[i][3]=-k.w*k.z;
+      vf[i][0]=v.x;vf[i][1]=v.z;vf[i][2]=-v.y*v.x;vf[i][3]=-v.w*v.z;
+    }
+    const bool whole=first+BN<=split_end;
     float s[2][8];
     float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
     #pragma unroll
@@ -592,10 +612,10 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
       #pragma unroll
       for(int e=0;e<4;++e){
         const int r=e>>1,i=4*(j>>1)+2*(j&1)+(e&1),key=4*t+(i&3)+16*(i>>2);
-        const float4 k=kmeta[key];
-        const bool live=(r?l1r:l0r)&&first+key<split_end;
-        const float v=qs[r][0]*k.x*static_cast<float>(si[0][j][e])+qs[r][1]*k.z*static_cast<float>(si[1][j][e])-
-            qsum[r][0]*k.y*k.x-qsum[r][1]*k.w*k.z+qmu[r];
+        const float base=fmaf(qsum[r][0],kf[i][2],fmaf(qsum[r][1],kf[i][3],qmu[r]));
+        const float v=fmaf(qs[r][0]*kf[i][0],l0_int_value(si[0][j][e]),
+                           fmaf(qs[r][1]*kf[i][1],l0_int_value(si[1][j][e]),base));
+        const bool live=(r?l1r:l0r)&&(whole||first+key<split_end);
         s[r][i]=live?v:-3.402823466e+38F; tmax[r]=fmaxf(tmax[r],s[r][i]);
       }
     #pragma unroll
@@ -603,7 +623,7 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     float scale[2];
     #pragma unroll
     for(int r=0;r<2;++r){ const float nm=fmaxf(run_max[r],tmax[r]); scale[r]=(nm==run_max[r])?1.f:exp2f(run_max[r]-nm); run_max[r]=nm; }
-    // P, P V-scaled per group, and its u8 quantization per (row, group).
+    // P (masked scores give exp2(-huge) = 0), P V-scaled per group.
     float pv[2][2][8];
     float pmax[2][2]={{0.f,0.f},{0.f,0.f}};
     float rs[2]={0.f,0.f},tile_bias[2][2]={{0.f,0.f},{0.f,0.f}};
@@ -611,13 +631,11 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     for(int r=0;r<2;++r)
       #pragma unroll
       for(int i=0;i<8;++i) {
-        const float x=s[r][i];
-        const float p=x==-3.402823466e+38F?0.f:exp2f(x-run_max[r]);
-        const float4 vm=vmeta[4*t+(i&3)+16*(i>>2)];
+        const float p=exp2f(s[r][i]-run_max[r]);
         rs[r]+=p;
-        tile_bias[r][0]=fmaf(-p*vm.y,vm.x,tile_bias[r][0]);
-        tile_bias[r][1]=fmaf(-p*vm.w,vm.z,tile_bias[r][1]);
-        pv[r][0][i]=p*vm.x; pv[r][1][i]=p*vm.z;
+        tile_bias[r][0]=fmaf(p,vf[i][2],tile_bias[r][0]);
+        tile_bias[r][1]=fmaf(p,vf[i][3],tile_bias[r][1]);
+        pv[r][0][i]=p*vf[i][0]; pv[r][1][i]=p*vf[i][1];
         pmax[r][0]=fmaxf(pmax[r][0],pv[r][0][i]); pmax[r][1]=fmaxf(pmax[r][1],pv[r][1][i]);
       }
     float qscale[2][2];
@@ -632,10 +650,11 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
         qscale[r][h]=mx*(1.f/255.f);
         #pragma unroll
         for(int half_index=0;half_index<2;++half_index) {
-          unsigned w=0u;
+          // Round to u8 with the 1.5 * 2^23 magic: the low byte of the sum's bits.
+          unsigned b[4];
           #pragma unroll
-          for(int i=0;i<4;++i) w|=static_cast<unsigned>(__float2uint_rn(pv[r][h][4*half_index+i]*inv))<<(8*i);
-          pa[h][2*half_index+r]=w;
+          for(int i=0;i<4;++i) b[i]=__float_as_uint(fmaf(pv[r][h][4*half_index+i],inv,12582912.0f));
+          pa[h][2*half_index+r]=__byte_perm(__byte_perm(b[0],b[1],0x0040),__byte_perm(b[2],b[3],0x0040),0x5410);
         }
       }
     #pragma unroll
@@ -658,8 +677,9 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
       unsigned u[2][4];
       #pragma unroll
       for(int quad=0;quad<2;++quad) {
-        const unsigned* base=vraw+(16*quad+4*t)*kWords+8*h+g;
-        const unsigned w0=base[0],w1=base[kWords],w2=base[2*kWords],w3=base[3*kWords];
+        const int k0=16*quad+4*t,word=8*h+g;
+        const unsigned w0=vraw[word_at(k0,word)],w1=vraw[word_at(k0+1,word)];
+        const unsigned w2=vraw[word_at(k0+2,word)],w3=vraw[word_at(k0+3,word)];
         const unsigned t0=__byte_perm(w0,w1,0x5140),t1=__byte_perm(w2,w3,0x5140);
         const unsigned t2=__byte_perm(w0,w1,0x7362),t3=__byte_perm(w2,w3,0x7362);
         u[quad][0]=__byte_perm(t0,t1,0x5410);u[quad][1]=__byte_perm(t0,t1,0x7632);
@@ -669,12 +689,12 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
       #pragma unroll
       for(int n=0;n<16;++n) {
         const unsigned mask=0x03030303U<<(2*(n&3));
-        int c[4]={0,0,0,0};
+        int c[4]={kL0IntMagic,kL0IntMagic,kL0IntMagic,kL0IntMagic};
         l0_immau(c,a,u[0][n>>2]&mask,u[1][n>>2]&mask);
-        acc[16*h+n][0]=fmaf(qscale[0][h],static_cast<float>(c[0]),acc[16*h+n][0]);
-        acc[16*h+n][1]=fmaf(qscale[0][h],static_cast<float>(c[1]),acc[16*h+n][1]);
-        acc[16*h+n][2]=fmaf(qscale[1][h],static_cast<float>(c[2]),acc[16*h+n][2]);
-        acc[16*h+n][3]=fmaf(qscale[1][h],static_cast<float>(c[3]),acc[16*h+n][3]);
+        acc[16*h+n][0]=fmaf(qscale[0][h],l0_int_value(c[0]),acc[16*h+n][0]);
+        acc[16*h+n][1]=fmaf(qscale[0][h],l0_int_value(c[1]),acc[16*h+n][1]);
+        acc[16*h+n][2]=fmaf(qscale[1][h],l0_int_value(c[2]),acc[16*h+n][2]);
+        acc[16*h+n][3]=fmaf(qscale[1][h],l0_int_value(c[3]),acc[16*h+n][3]);
       }
     }
   }
