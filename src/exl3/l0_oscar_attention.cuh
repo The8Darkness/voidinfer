@@ -5,39 +5,6 @@
 
 namespace l0 = ninfer::exl3::l0_oscar;
 
-// One decode slot: 8 consecutive dims of one key, K and V. Raw codes and
-// metadata are fetched into registers a tile ahead of their decode.
-struct L0RawSlot {
-    unsigned k_bits=0,v_bits=0;
-    float k_scale=0.f,k_zero=0.f,v_scale=0.f,v_zero=0.f;
-};
-__device__ __forceinline__ L0RawSlot l0_load_slot(const std::uint8_t* k_codes,
-    const std::uint8_t* v_codes,const float* k_meta,const float* v_meta,int key,int kv_head,
-    int dim,bool valid) {
-    L0RawSlot r;
-    if(!valid) return r;
-    const std::size_t cell=static_cast<std::size_t>(key)*kKVHeads+kv_head;
-    const int group=dim>>7;
-    const float2 km=*reinterpret_cast<const float2*>(k_meta+cell*l0::kMetaFloats+2*group);
-    const float2 vm=*reinterpret_cast<const float2*>(v_meta+cell*l0::kMetaFloats+2*group);
-    r.k_scale=km.x;r.k_zero=km.y;r.v_scale=vm.x;r.v_zero=vm.y;
-    r.k_bits=*reinterpret_cast<const std::uint16_t*>(k_codes+cell*l0::kCodeBytes+(dim>>2));
-    r.v_bits=*reinterpret_cast<const std::uint16_t*>(v_codes+cell*l0::kCodeBytes+(dim>>2));
-    return r;
-}
-__device__ __forceinline__ void l0_store_slot(const L0RawSlot& r,half* k_dst,half* v_dst) {
-    // x^ = (code - zero) * scale = code * scale + (-zero * scale): one FMA per value.
-    const float kb=-r.k_zero*r.k_scale,vb=-r.v_zero*r.v_scale;
-    half k8[8],v8[8];
-    #pragma unroll
-    for(int e=0;e<8;++e) {
-        k8[e]=__float2half_rn(fmaf(static_cast<float>((r.k_bits>>(2*e))&3u),r.k_scale,kb));
-        v8[e]=__float2half_rn(fmaf(static_cast<float>((r.v_bits>>(2*e))&3u),r.v_scale,vb));
-    }
-    *reinterpret_cast<uint4*>(k_dst)=*reinterpret_cast<const uint4*>(k8);
-    *reinterpret_cast<uint4*>(v_dst)=*reinterpret_cast<const uint4*>(v8);
-}
-
 // Verifier history attention over INT2 codes, consumed straight from the
 // codes (no FP16 tiles):
 //   QK  s8 MMA (m16n8k32) of the int8-quantized rotated queries (per 128-dim
@@ -56,7 +23,7 @@ constexpr int kL0HistoryThreads=192*kL0KeyStreams;
 constexpr int kL0Queries=48;
 constexpr int kL0StageKeys=64;
 constexpr int kL0Stages=5;
-constexpr int kL0RawKeyBytes=2*l0::kCodeBytes+2*l0::kMetaFloats*4;   // K codes, V codes, K meta, V meta
+constexpr int kL0RawKeyBytes=2*l0::kCodeBytes+2*l0::kMetaFloats*2;   // K codes, V codes, K meta, V meta (FP16)
 constexpr std::size_t kL0StageBytes=static_cast<std::size_t>(kL0StageKeys)*kL0RawKeyBytes;
 constexpr std::size_t kL0MergeBytes=static_cast<std::size_t>(6)*32*70*sizeof(float);
 constexpr std::size_t l0_history_smem_bytes() {
@@ -66,6 +33,17 @@ constexpr std::size_t l0_history_smem_bytes() {
 __device__ __forceinline__ void l0_cp16(void* dst,const void* src,bool valid) {
     const unsigned d=static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"::"r"(d),"l"(src),"r"(valid?16:0));
+}
+__device__ __forceinline__ void l0_cp8(void* dst,const void* src,bool valid) {
+    const unsigned d=static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n"::"r"(d),"l"(src),"r"(valid?8:0));
+}
+// FP16 (scale0, zero0, scale1, zero1) of one key and KV head.
+__device__ __forceinline__ float4 l0_meta4(const void* p) {
+    const uint2 raw=*reinterpret_cast<const uint2*>(p);
+    const float2 a=__half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+    const float2 b=__half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+    return make_float4(a.x,a.y,b.x,b.y);
 }
 __device__ __forceinline__ void l0_imma(int (&c)[4],const unsigned (&a)[4],unsigned b0,unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -79,7 +57,7 @@ __device__ __forceinline__ constexpr float l0_code_scale(int n) {
 template<int kKeys>
 __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
-    const std::uint8_t* v_codes,const float* k_meta,const float* v_meta,
+    const std::uint8_t* v_codes,const __half* k_meta,const __half* v_meta,
     float* workspace,int rows,int position,int capacity,int segments,
     const int* position_device) {
     constexpr int H=kFastFusedFlashHeads;
@@ -101,7 +79,7 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     if(first>=end) return;
     const int segment_end=min(first+span,end);
     const int stages=(segment_end-first+kL0StageKeys-1)/kL0StageKeys;
-    constexpr int kChunksPerKey=kL0RawKeyBytes/16;   // 10
+    constexpr int kChunksPerKey=10;   // 8 x 16 B codes, 2 x 8 B meta
     const auto fetch=[&](int stage) {
         if(stage<stages) {
             unsigned char* dst=l0_smem+(stage%kL0Stages)*kL0StageBytes;
@@ -114,7 +92,8 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
                     part<8?static_cast<const void*>(v_codes+cell*l0::kCodeBytes+(part-4)*16):
                     part==8?static_cast<const void*>(k_meta+cell*l0::kMetaFloats):
                             static_cast<const void*>(v_meta+cell*l0::kMetaFloats);
-                l0_cp16(dst+key_off*kL0RawKeyBytes+part*16,src,valid);
+                if(part<8) l0_cp16(dst+key_off*kL0RawKeyBytes+part*16,src,valid);
+                else l0_cp8(dst+key_off*kL0RawKeyBytes+128+(part-8)*8,src,valid);
             }
         }
         asm volatile("cp.async.commit_group;\n");
@@ -239,8 +218,8 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
             #pragma unroll
             for(int i=0;i<4;++i) {
                 const unsigned char* r=bk+(2*t+(i&1)+8*(i>>1))*kL0RawKeyBytes;
-                km[i]=*reinterpret_cast<const float4*>(r+2*l0::kCodeBytes);
-                vm[i]=*reinterpret_cast<const float2*>(r+2*l0::kCodeBytes+16+8*vgroup);
+                km[i]=l0_meta4(r+2*l0::kCodeBytes);
+                vm[i]=__half22float2(*reinterpret_cast<const __half2*>(r+2*l0::kCodeBytes+8+4*vgroup));
                 vw[i]=*reinterpret_cast<const unsigned*>(r+l0::kCodeBytes+4*(8*vgroup+g));
             }
             float sc[2][4];
@@ -446,7 +425,7 @@ __device__ __forceinline__ void l0_immau(int (&c)[4],const unsigned (&a)[4],unsi
 }
 __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
-    const std::uint8_t* v_codes,const float* k_meta,const float* v_meta,
+    const std::uint8_t* v_codes,const __half* k_meta,const __half* v_meta,
     float* out,float* stats,int rows,int history_end){
   // blockIdx.z = head group * kL0PrefillSplits + split over the history tiles.
   using namespace fa2_prefill;
@@ -538,7 +517,7 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
   float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f},bias[2][2]={{0.f,0.f},{0.f,0.f}};
   const bool warp_live=m_base<active_rows;
   // Raw tile: K codes, V codes (128 x 16 B each), K and V meta (32 x 16 B each).
-  uint4 stage[2]={make_uint4(0,0,0,0),make_uint4(0,0,0,0)};
+  uint4 stage[2]={make_uint4(0,0,0,0),make_uint4(0,0,0,0)};   // meta parts: low 8 B
   const auto fetch=[&](int tile_first){
     #pragma unroll
     for(int i=0;i<2;++i) {
@@ -552,8 +531,8 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
         const std::size_t cell=static_cast<std::size_t>(key)*kKVHeads+kv_head;
         value=part==0?*reinterpret_cast<const uint4*>(k_codes+cell*l0::kCodeBytes+(idx%4)*16):
               part==1?*reinterpret_cast<const uint4*>(v_codes+cell*l0::kCodeBytes+(idx%4)*16):
-              part==2?*reinterpret_cast<const uint4*>(k_meta+cell*l0::kMetaFloats):
-                      *reinterpret_cast<const uint4*>(v_meta+cell*l0::kMetaFloats);
+              part==2?[&]{ const uint2 m=*reinterpret_cast<const uint2*>(k_meta+cell*l0::kMetaFloats); return make_uint4(m.x,m.y,0,0); }():
+                      [&]{ const uint2 m=*reinterpret_cast<const uint2*>(v_meta+cell*l0::kMetaFloats); return make_uint4(m.x,m.y,0,0); }();
       }
       stage[i]=value;
     }
@@ -565,8 +544,8 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
       if(c>=BN*10) break;
       if(c<BN*4) reinterpret_cast<uint4*>(kraw)[c]=stage[i];
       else if(c<BN*8) reinterpret_cast<uint4*>(vraw)[c-BN*4]=stage[i];
-      else if(c<BN*9) reinterpret_cast<uint4*>(kmeta)[c-BN*8]=stage[i];
-      else reinterpret_cast<uint4*>(vmeta)[c-BN*9]=stage[i];
+      else if(c<BN*9) kmeta[c-BN*8]=l0_meta4(&stage[i]);
+      else vmeta[c-BN*9]=l0_meta4(&stage[i]);
     }
   };
   if(split_begin<split_end) fetch(split_begin);

@@ -7155,8 +7155,8 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         };
         alloc(l.k_codes,cells*l0_oscar::kCodeBytes);
         alloc(l.v_codes,cells*l0_oscar::kCodeBytes);
-        alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(float));
-        alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(float));
+        alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+        alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
         alloc(l.state,2*sizeof(int));
         cudaMemset(l.state,0,2*sizeof(int));
         const std::size_t ring_bytes=static_cast<std::size_t>(l0_oscar::kRingRows)*kKVHeads*kHeadDim*2;
@@ -8056,7 +8056,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             const auto& a=l0_oscar::assets();
             l0_oscar::encode_kernel<<<256,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
                 position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
-                l0_.k_meta,l0_.v_meta);
+                reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta));
             l0_oscar::advance_kernel<<<1,1,0,stream>>>(position_device_,position,l0_.state,
                 cache_capacity_);
             launch(cudaGetLastError(),"L0 OSCAR history encode");
@@ -8114,7 +8114,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             std::min(l0_oscar::history_end(position),cache_capacity_):0;
         if (l0_prefill_history>l0_oscar::kSink) {
             if(capture_active_ || rows>l0_.prefill_rows || direct_staged_rows_ ||
-               exact_prefix_rows_ || exact_page_ranges_.count)
+               exact_prefix_rows_ || exact_page_ranges_.count ||
+               position+rows-l0_prefill_history>l0_oscar::kRingRows)
                 throw std::invalid_argument("L0 OSCAR prefill route preconditions");
             const auto& a=l0_oscar::assets();
             constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
@@ -8122,7 +8123,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
             l0_history_prefill_kernel<<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
                 kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,0,stream>>>(l0_.q_rot,l0_.q_mu,
-                l0_.k_codes,l0_.v_codes,l0_.k_meta,l0_.v_meta,l0_.prefill_hist,
+                l0_.k_codes,l0_.v_codes,reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.prefill_hist,
                 l0_.prefill_hist_stats,rows,l0_prefill_history);
             l0_history_split_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
                 l0_.prefill_hist_stats,reinterpret_cast<__half*>(l0_.prefill_numer),
@@ -8677,7 +8678,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     }();
                     (void)configured;
                     kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes(),stream>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
-                        l0_.k_meta,l0_.v_meta,l0_.hist_work,rows,position,cache_capacity_,
+                        reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.hist_work,rows,position,cache_capacity_,
                         l0_.segments,position_device_);
                 };
                 history(l0_history_mma_kernel<64>);

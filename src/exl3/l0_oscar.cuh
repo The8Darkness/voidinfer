@@ -34,8 +34,8 @@ constexpr int kAlign = 64;
 constexpr int kDim = 256;
 constexpr int kKVHeadsL0 = 4;
 constexpr int kCodeBytes = kDim / 4;     // 2-bit codes, dims 4b..4b+3 in byte b
-constexpr int kMetaFloats = 4;           // scale0, zero0, scale1, zero1
-constexpr int kRingRows = 4096;          // > sink-free exact window + one prefill chunk
+constexpr int kMetaFloats = 4;           // scale0, zero0, scale1, zero1 (FP16)
+constexpr int kRingRows = 2048;          // > sink-free exact window (<= 320) + one 1024-row prefill chunk
 
 // Device row of absolute key `key` in a window-ring addressed K or V plane.
 // With sink == nullptr and ring_mask == -1 this is the plain linear cache.
@@ -144,7 +144,7 @@ __device__ __forceinline__ float l0_block_max(float v, float* scratch) {
 __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cache,
     const std::uint16_t* v_cache, int capacity, const int* position_device, int position,
     int* state, Assets a, int bank, std::uint8_t* k_codes, std::uint8_t* v_codes,
-    float* k_meta, float* v_meta) {
+    __half* k_meta, __half* v_meta) {
     __shared__ float x[kDim], y[kDim], scratch[16];
     const int base = position_device ? *position_device : position;
     int wm = state[0];
@@ -189,8 +189,9 @@ __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cach
         const int g = j >> 7;
         float gmn = x[g * 4], gmx = x[8 + g * 4];
         for (int w = 1; w < 4; ++w) { gmn = fminf(gmn, x[g * 4 + w]); gmx = fmaxf(gmx, x[8 + g * 4 + w]); }
-        const float scale = fmaxf(gmx - gmn, 1.0e-8f) / 3.0f;
-        const float zero = -gmn / scale;
+        // Scale and zero are stored as FP16; the codes use the stored values.
+        const float scale = __half2float(__float2half_rn(fmaxf(gmx - gmn, 1.0e-6f) / 3.0f));
+        const float zero = __half2float(__float2half_rn(-gmn / scale));
         const int code = static_cast<int>(fminf(fmaxf(floorf(clipped / scale + zero + 0.5f), 0.0f), 3.0f));
         // pack 4 consecutive dims per byte
         const unsigned packed = __shfl_sync(0xffffffffu, code, (j & 31) & ~3) |
@@ -200,9 +201,9 @@ __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cach
         auto* codes = (kind ? v_codes : k_codes) + cell * kCodeBytes;
         if ((j & 3) == 0) codes[j >> 2] = static_cast<std::uint8_t>(packed);
         if ((j & 127) == 0) {
-            float* meta = (kind ? v_meta : k_meta) + cell * kMetaFloats;
-            meta[2 * g] = scale;
-            meta[2 * g + 1] = zero;
+            __half* meta = (kind ? v_meta : k_meta) + cell * kMetaFloats;
+            meta[2 * g] = __float2half_rn(scale);
+            meta[2 * g + 1] = __float2half_rn(zero);
         }
     }
 }

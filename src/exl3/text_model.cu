@@ -8171,7 +8171,10 @@ void Exl3TextContext::append_prefill_layer_major(
     // The guarded device transaction has already retained its physical target
     // and draft owners. Keep a smaller, still explicit free-space reserve for
     // its bounded projection reuse; ordinary routes retain their 2 GiB floor.
-    const std::size_t reserve_bytes=fast_device_kv_transaction_enabled()?
+    // L0 OSCAR contexts already hold their KV history in compact device codes
+    // and the FP16 planes in host memory: a 1 GiB reserve covers the rest.
+    const std::size_t reserve_bytes=Exl3NativeContextExtent::l0_oscar_enabled()?
+        1024ull*1024*1024:fast_device_kv_transaction_enabled()?
         1536ull*1024*1024:2ull*1024*1024*1024;
     constexpr std::size_t cache_limit=1536ull*1024*1024;
     constexpr std::size_t minimum_cache=256ull*1024*1024;
@@ -8187,8 +8190,12 @@ void Exl3TextContext::append_prefill_layer_major(
             std::to_string(existing_cache/(1024*1024))+
             " free_reserve_mib="+
             std::to_string(reserve_bytes/(1024*1024)));
-    const std::size_t cache_budget=std::min(cache_limit,
-        existing_cache+free_bytes-reserve_bytes);
+    std::size_t cache_budget=std::min(cache_limit,existing_cache+free_bytes-reserve_bytes);
+    // L0 OSCAR blocks re-check the reserve before each block: cache growth
+    // leaves 256 MiB of slack so later small allocations keep the reserve.
+    constexpr std::size_t l0_cache_slack=256ull*1024*1024;
+    if(Exl3NativeContextExtent::l0_oscar_enabled() && cache_budget>=minimum_cache+l0_cache_slack)
+        cache_budget=std::max(existing_cache,cache_budget-l0_cache_slack);
     require(workspace.stats().cached_weight_capacity_bytes<=cache_budget,
             "retained layer-major cache exceeds current device budget");
     const char* injected_layer=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
