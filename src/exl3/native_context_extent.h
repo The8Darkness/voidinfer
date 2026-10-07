@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -16,6 +17,13 @@ struct Exl3NativeContextExtent {
     static constexpr std::uint32_t ordinary_limit = 32768;
     static constexpr std::uint32_t native64k_tokens = 65536;
     static constexpr std::uint32_t candidate128k_tokens = 131072;
+    // L0 OSCAR contexts keep FP16 K/V in mapped host memory and only INT2
+    // history plus exact windows on the device (l0_oscar.cuh).
+    static constexpr std::uint32_t l0_oscar_tokens = 262144;
+    static bool l0_oscar_enabled() {
+        const char* value=std::getenv("NINFER_EXL3_L0_OSCAR");
+        return value && value[0]=='1' && value[1]==0;
+    }
     static constexpr std::uint64_t exact_kv_bytes_per_token = 65536;
     static constexpr std::uint32_t exact_kv_page_tokens = 64;
 
@@ -30,6 +38,7 @@ struct Exl3NativeContextExtent {
     static std::uint32_t configuration_limit(bool native64k,bool candidate128k) {
         if(native64k && candidate128k)
             throw std::invalid_argument("extended 64K and 128K contexts are separate controls");
+        if(l0_oscar_enabled() && !native64k && !candidate128k) return l0_oscar_tokens;
         return candidate128k?candidate128k_tokens:(native64k?native64k_tokens:ordinary_limit);
     }
 

@@ -166,11 +166,19 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     if(custom_prompt &&
        env("NINFER_EXL3_TEST_FAST_DEVICE_RESERVED_CONTEXT")=="1") {
         auto cold=target.create_context(true);
+        if(env("NINFER_EXL3_L0_OSCAR")=="1") {
+            // L0 OSCAR contexts prefill row-major in 1024-row chunks.
+            const std::span<const std::int64_t> all(prefix);
+            cold->prefill(all.first(16));
+            for(std::size_t first=16;first<all.size();first+=1024)
+                cold->append_prefill_wide(all.subspan(first,std::min<std::size_t>(1024,all.size()-first)));
+        } else {
         const auto initial=static_cast<std::size_t>(
             ninfer::exl3::Exl3TextContext::layer_major_initial_rows());
         if(initial)cold->prefill(std::span<const std::int64_t>(prefix).first(initial));
         cold->append_prefill_layer_major(
             std::span<const std::int64_t>(prefix).subspan(initial));
+        }
         cuda_check(cudaStreamSynchronize(nullptr),
             "matched cold target-only prefill completion");
         const auto cold_root=cold->export_exact_host_state();

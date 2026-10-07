@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <string_view>
 #include "ninfer/engine.h"
 
 #include "core/device.h"
@@ -131,11 +133,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
            options.speculative.proposal_head!=ProposalHead::Full)
             throw std::invalid_argument(
                 "coherent-device EXL3 requires C1 greedy text/eager/DFlash2-K7 full proposals");
-        if(options.max_context<2048 || options.max_context>32768 ||
+        // L0 OSCAR (INT2 history in VRAM, FP16 K/V in mapped host memory) admits 256K.
+        const char* l0_oscar=std::getenv("NINFER_EXL3_L0_OSCAR");
+        const int coherent_context_limit=l0_oscar && std::string_view(l0_oscar)=="1"?262144:32768;
+        if(options.max_context<2048 || options.max_context>coherent_context_limit ||
            options.kv_capacity.mode!=KvCapacityMode::Explicit ||
            options.kv_capacity.explicit_tokens<options.max_context)
             throw std::invalid_argument(
-                "coherent-device EXL3 requires ordinary 2048..32768 context and explicit full KV capacity");
+                "coherent-device EXL3 requires ordinary 2048..32768 context (262144 with L0 OSCAR) and explicit full KV capacity");
         if(cache.host_state_slots==0 || *cache.max_shared_prefixes==0 ||
            cache.host_kv_capacity_bytes<
                static_cast<std::uint64_t>(options.max_context)*exact_kv_bytes_per_token)

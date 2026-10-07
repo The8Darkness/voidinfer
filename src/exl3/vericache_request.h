@@ -658,7 +658,7 @@ public:
             bool refused=false;
             try {auto invalid=create_planned(nullptr,8,true,
                 [&](std::uint64_t bytes){return ledger.acquire(bytes);},
-                [](std::uint64_t)->RetainedDescriptorLedger::Ticket{throw Exl3ResourceReservationExhausted{};});}
+                [](std::uint64_t)->RetainedDescriptorLedger::Ticket{throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);});}
             catch(const Exl3ResourceReservationExhausted&){refused=true;}
             need(refused && ledger.bytes()==0 && bounded_shared_live_blocks_for_test<Exl3VeriCacheRequest>()==live,
                 "fresh revision refusal retained request promise or allocated request");

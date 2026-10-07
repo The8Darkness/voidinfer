@@ -47,7 +47,7 @@ public:
         const auto m=static_cast<unsigned>(Exl3ResourceInventory::Domain::host_metadata);
         if(state.issued[r]>state.ceiling[r] || state.issued[m]>state.ceiling[m] ||
             registration>state.ceiling[r]-state.issued[r] || metadata>state.ceiling[m]-state.issued[m])
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto registration_ticket=state.registration.acquire(registration);
         auto metadata_ticket=state.metadata.acquire(metadata);
         state.issued[r]+=registration;state.issued[m]+=metadata;
@@ -61,7 +61,7 @@ public:
         const auto m=static_cast<unsigned>(Exl3ResourceInventory::Domain::host_metadata);
         if(constructor_issued_[r]>constructor_ceiling_[r] || constructor_issued_[m]>constructor_ceiling_[m] ||
             registration>constructor_ceiling_[r]-constructor_issued_[r] || metadata>constructor_ceiling_[m]-constructor_issued_[m])
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto a=constructor_registration_.acquire(registration);auto b=constructor_metadata_.acquire(metadata);
         constructor_issued_[r]+=registration;constructor_issued_[m]+=metadata;return {std::move(a),std::move(b)};
     }
@@ -79,7 +79,7 @@ public:
         const auto m=static_cast<unsigned>(Exl3ResourceInventory::Domain::host_metadata);
         if(state.issued[d]>state.ceiling[d] || state.issued[m]>state.ceiling[m] ||
             device>state.ceiling[d]-state.issued[d] || metadata>state.ceiling[m]-state.issued[m])
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto device_ticket=state.device.acquire(device);
         auto metadata_ticket=state.metadata.acquire(metadata);
         state.issued[d]+=device;state.issued[m]+=metadata;
@@ -95,7 +95,7 @@ public:
         const auto d=static_cast<unsigned>(Domain::device),m=static_cast<unsigned>(Domain::host_metadata);
         if(constructor_issued_[d]>constructor_ceiling_[d] || constructor_issued_[m]>constructor_ceiling_[m] ||
             device>constructor_ceiling_[d]-constructor_issued_[d] || metadata>constructor_ceiling_[m]-constructor_issued_[m])
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto device_ticket=constructor_device_.acquire(device);
         auto metadata_ticket=constructor_metadata_.acquire(metadata);
         constructor_issued_[d]+=device;constructor_issued_[m]+=metadata;
@@ -613,7 +613,7 @@ public:
                 throw std::logic_error("runtime host source already bound");
             if(slot==host_sources_->end() && it->lifetime.expired())slot=it;
         }
-        if(slot==host_sources_->end())throw Exl3ResourceReservationExhausted{};
+        if(slot==host_sources_->end())throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto previous=*slot;*slot=std::move(prepared);
         try{replace_resident_locked({},0);}
         catch(...){*slot=std::move(previous);throw;}

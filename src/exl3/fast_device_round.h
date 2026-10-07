@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fstream>
+#include "exl3/native_context_extent.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/exact_outer_reference.h"
 #include <algorithm>
@@ -99,6 +100,9 @@ public:
     // the target. Only the draft's proven-discarded whole calls omit tap work.
     // This is the same path the harness and guarded Engine must use.
     void begin_fresh(std::span<const std::int64_t> input,bool layer_major) {
+        // L0 OSCAR contexts hold per-row buffers for one 1024-row chunk only and
+        // therefore prefill row-major.
+        if(Exl3NativeContextExtent::l0_oscar_enabled()) layer_major=false;
         if(phase_!=Phase::unstarted)
             throw std::logic_error("fast device fresh request already began");
         if(context_->position()!=0 || input.size()<16 ||
@@ -122,7 +126,8 @@ public:
                     const int rows=static_cast<int>(std::min<std::size_t>(
                         1024,input.size()-first));
                     context_->append_prefill_wide(input.subspan(first,rows),stream_);
-                    commit_captured(rows,static_cast<int>(first));
+                    commit_captured(rows,static_cast<int>(first),
+                        static_cast<int>(input.size())-2048);
                     first+=rows;
                 }
             }
@@ -558,11 +563,17 @@ private:
     static double elapsed(Clock::time_point start) {
         return std::chrono::duration<double,std::milli>(Clock::now()-start).count();
     }
-    void commit_captured(int rows,int first_abs) {
+    // Draft blocks wholly before `ring_begin` (absolute) fall outside the
+    // draft ring and are skipped, as the layer-major schedule does.
+    void commit_captured(int rows,int first_abs,int ring_begin=0) {
         if(rows<1 || rows>1024)
             throw std::invalid_argument("fast device captured forward extent");
         for(int first=0;first<rows;first+=16) {
             const int count=std::min(16,rows-first);
+            if(first_abs+first+count<=ring_begin) {
+                draft_.skip_fresh_prefill_block(count,first_abs+first,stream_);
+                continue;
+            }
             for(std::size_t tap=0;tap<5;++tap)
                 context_->copy_tap_rows_to_device(tap_layers[tap],first,
                     staging_[tap],count,stream_);

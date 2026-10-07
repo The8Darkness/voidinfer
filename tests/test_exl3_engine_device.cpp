@@ -127,8 +127,10 @@ int main() {
         const auto* prefix_text=std::getenv("NINFER_TEST_ENGINE_DEVICE_PREFIX");
         if(!target || !draft || !prefix_text)return 77;
         const int prefix=std::stoi(prefix_text);
-        if(prefix!=4096 && prefix!=16384)
-            throw std::invalid_argument("device Engine witness prefix must be 4K or 16K");
+        const char* l0_flag=std::getenv("NINFER_EXL3_L0_OSCAR");
+        const bool l0_long=l0_flag && std::string_view(l0_flag)=="1" && prefix>16384 && prefix<=260000;
+        if(prefix!=4096 && prefix!=16384 && !l0_long)
+            throw std::invalid_argument("device Engine witness prefix must be 4K or 16K (L0 OSCAR: up to 260000)");
         EngineOptions options;
         options.exl3_package=PinnedExl3PackageOptions{target,draft,{}};
         options.exl3_package->round_implementation=
@@ -149,6 +151,10 @@ int main() {
         options.speculative={SpeculativeBackend::DFlash2,7,ProposalHead::Full};
         options.context_cache.enabled=true;
         options.context_cache.max_shared_prefixes=1;
+        // L0 OSCAR long witnesses: one terminal exact host snapshot of the full context.
+        if(l0_long)options.context_cache.host_kv_capacity_bytes=std::max<std::size_t>(
+            options.context_cache.host_kv_capacity_bytes,
+            static_cast<std::size_t>(options.max_context)*65536);
         options.max_pending_requests=2;
         verify_engine_linked_graph_launch();
         if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_PRE_MODEL_IDS")) {

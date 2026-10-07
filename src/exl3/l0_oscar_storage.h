@@ -18,7 +18,13 @@ struct LayerStorage {
     float* hist_work = nullptr;       // [rows][4][segments][fused-flash stride]
     float* hist_slot = nullptr;       // [rows][4][fused-flash stride]
     float* hist_rotated = nullptr;    // [rows][24][256] rotated history numerators
-    int capacity = 0, rows = 0, segment_keys = 0, segments = 0, bank = 0;
+    // Prefill chunks (rows > 8): history output, then FA2 splits 0..3 plus the
+    // un-rotated history as split 4.
+    float* prefill_hist = nullptr;    // [prefill_rows][24][256] rotated, normalized
+    float* prefill_hist_stats = nullptr;  // [prefill_rows][24][2]
+    float* prefill_split = nullptr;   // [5][prefill_rows][24][256]
+    float* prefill_split_stats = nullptr;  // [5][prefill_rows][24][2]
+    int capacity = 0, rows = 0, prefill_rows = 0, segment_keys = 0, segments = 0, bank = 0;
 };
 
 }  // namespace ninfer::exl3::l0_oscar

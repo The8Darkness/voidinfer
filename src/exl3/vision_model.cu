@@ -329,7 +329,7 @@ std::shared_ptr<const Exl3EncodedMediaResult> Exl3VisionContext::encode_prepared
                     });
                 if(victim==c.encoded_cache.end()) {
                     ++c.encoded_cache_stats.quota_refusals;
-                    throw Exl3ResourceReservationExhausted{};
+                    throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
                 }
                 c.encoded_cache.erase(victim);++c.encoded_cache_stats.evictions;
             }
@@ -402,7 +402,7 @@ void Exl3VisionContext::set_encoded_media_cache_limits(Exl3EncodedMediaCacheLimi
        c.encoded_output_ledger.bytes()>limits.max_encoded_host_bytes ||
        c.replay_payload_ledger.bytes()>limits.max_replay_host_bytes) {
         ++c.encoded_cache_stats.quota_refusals;
-        throw Exl3ResourceReservationExhausted{};
+        throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
     }
     c.encoded_cache_limits=limits;c.encoded_cache_stats.entries=c.encoded_cache.size();
 }

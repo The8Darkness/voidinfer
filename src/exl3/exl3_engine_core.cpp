@@ -182,9 +182,10 @@ void require_exact_profile(){
 }
 void require_coherent_device_profile(const EngineOptions& options) {
     if(options.max_concurrency!=1 || options.enable_vision || options.use_cuda_graph ||
-       options.max_context<2048 || options.max_context>32768)
+       options.max_context<2048 || options.max_context>(Exl3NativeContextExtent::l0_oscar_enabled()?
+           static_cast<int>(Exl3NativeContextExtent::l0_oscar_tokens):32768))
         throw std::invalid_argument(
-            "coherent-device EXL3 requires C1 greedy text and context 2048..32768");
+            "coherent-device EXL3 requires C1 greedy text and context 2048..32768 (262144 with L0 OSCAR)");
     const auto equals=[](const char* name,std::string_view expected) {
         const auto* actual=std::getenv(name);
         if(!actual || std::string_view(actual)!=expected)
@@ -742,7 +743,7 @@ struct Exl3EngineCore::Impl {
             mandatory_metadata.add(Domain::host_metadata,value.max_concurrency,
                 Exl3AttentionStageResources::metadata_bytes());
         if(mandatory_metadata.units[static_cast<unsigned>(Domain::host_metadata)]>host_metadata_limit)
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         // Diagnostic stop before model/lane allocation, after the real budget gate.
         if(context_startup_fault==128)
             throw std::runtime_error("Engine mandatory metadata floor accepted:"+
@@ -1381,7 +1382,7 @@ struct Exl3EngineCore::Impl {
                             throw std::invalid_argument("recurrent growth execution changed");
                         auto credits=coordinator.reserve_registration_constructor_credits(layout.bytes,Exl3RecurrentSlab::physical_metadata_bytes());
                         prepared=factory({std::move(credits.registration),std::move(credits.metadata)});
-                        if(!prepared)throw Exl3ResourceReservationExhausted{};
+                        if(!prepared)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
                         unsigned cancel_phase=executing?2:1;
                         if(recurrent_cancel_after_factory.compare_exchange_strong(cancel_phase,0)) {
                             recurrent_cancel_after_factory_hit.store(executing?2:1);
@@ -1392,7 +1393,7 @@ struct Exl3EngineCore::Impl {
                         // is still owned solely by the reservation transaction.
                         if(lane->execution_active()!=executing || lane->execution_epoch()!=epoch ||
                            active[i]!=request || request->cancelled.load(std::memory_order_acquire))
-                            throw Exl3ResourceReservationExhausted{};
+                            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
                         if(prepared->bytes!=layout.bytes || prepared->offsets!=layout.offsets)
                             throw std::logic_error("recurrent allocation changed reserved layout");
                         auto actual=Exl3RecurrentSlab::resources(prepared);
@@ -1436,7 +1437,7 @@ struct Exl3EngineCore::Impl {
                         throw std::invalid_argument("recurrent borrower execution changed");
                     Exl3SharedControlCredit* header=nullptr;
                     borrowed=Exl3RecurrentSlab::borrow(owner,std::nullopt,&header);
-                    if(!borrowed)throw Exl3ResourceReservationExhausted{};
+                    if(!borrowed)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
                     allocation={std::shared_ptr<const void>(borrowed,header),0,Domain::host_metadata,
                         Exl3RecurrentSlab::control_metadata_bytes(),{},
                         &Exl3RecurrentSlab::attach_borrower_control_credit};

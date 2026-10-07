@@ -233,6 +233,9 @@ struct DeviceAllocation {
     bool device_query_failure_for_test=false;
     bool device_mismatch_for_test=false;
     bool shared_control_admitted=false;
+    // L0 OSCAR: the FP16 K/V planes live in mapped pinned host memory (the L2
+    // FP16 tier); the GPU reads only the exact windows through UVA.
+    bool host_mapped=false;
     Exl3SharedControlCredit* shared_control_credit=nullptr;
     static constexpr std::size_t shared_control_bytes=Exl3ReconstructionControlAllocator<std::byte>::capacity;
     void* ptr = nullptr;
@@ -288,7 +291,7 @@ struct DeviceAllocation {
         int current=-1;auto error=cleanup_failure_for_test?cudaErrorUnknown:
             (device_query_failure_for_test?cudaErrorInitializationError:cudaGetDevice(&current));
         if(error==cudaSuccess && (device_mismatch_for_test || current!=device))error=cudaErrorInvalidDevice;
-        if(error==cudaSuccess)error=cudaFree(ptr);
+        if(error==cudaSuccess)error=host_mapped?cudaFreeHost(ptr):cudaFree(ptr);
         if(error!=cudaSuccess) {
             auto* record=retirement.release();
             record->pointer=ptr;record->bytes=bytes;record->device=device;record->error=static_cast<int>(error);
@@ -344,7 +347,18 @@ struct DeviceAllocation {
         std::optional<RetainedDescriptorLedger::Ticket> metadata_credit={}) : bytes(size) {
         adopt_constructor_credits(std::move(device_credit),std::move(metadata_credit));
         prepare_device();
-        cuda_check(cudaMalloc(&ptr, bytes), label);
+        if(l0_host_kv_plane(label)) {
+            host_mapped=true;
+            cuda_check(cudaHostAlloc(&ptr,bytes,cudaHostAllocMapped|cudaHostAllocPortable),label);
+        } else cuda_check(cudaMalloc(&ptr, bytes), label);
+    }
+    static bool l0_host_kv_plane(const char* label) {
+        static const bool l0=[] {
+            const char* v=std::getenv("NINFER_EXL3_L0_OSCAR");
+            return v && std::strcmp(v,"1")==0;
+        }();
+        return l0 && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
+                               std::strcmp(label,"allocate E4A V cache")==0);
     }
     ~DeviceAllocation() {release();}
     DeviceAllocation(const DeviceAllocation&) = delete;
@@ -1626,7 +1640,8 @@ struct Exl3TextContext::Impl {
         ContinuationGraphBoundary result;
         if(!continuation)return result;
         const auto row_storage=static_cast<std::size_t>(
-            (host_kv.enabled || oscar_only) ? prefill_capacity : max_context);
+            (host_kv.enabled || oscar_only || Exl3NativeContextExtent::l0_oscar_enabled()) ?
+                prefill_capacity : max_context);
         const auto hidden_bytes=row_storage*static_cast<std::size_t>(kHidden)*
             sizeof(std::uint16_t);
         const auto add=[&](const void* address,std::size_t bytes) noexcept {
@@ -3868,7 +3883,8 @@ std::unique_ptr<Exl3TextModel> Exl3TextModel::load(const std::filesystem::path& 
     require(max_context > 0 && max_context <= context_limit,
             extended_context_128_enabled ? "E4C1 extended max_context must be 1..131072" :
             (extended_context_enabled ? "E4C1 extended max_context must be 1..65536" :
-                                        "E4C1 max_context must be 1..32768"));
+             (Exl3NativeContextExtent::l0_oscar_enabled() ? "E4C1 L0 OSCAR max_context must be 1..262144" :
+                                        "E4C1 max_context must be 1..32768")));
     require(!extended_context_128_enabled,
         "128K is a static configuration candidate only; model execution is unsupported");
     auto impl = std::make_unique<Impl>();
@@ -4310,7 +4326,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             (impl->host_kv.enabled && !impl->oscar_only &&
              !impl->continuation_graph_b8_enabled),
         "eager MLP gate/up concurrency requires ordinary exact HostKV");
-    require(max_context_<=32768 || impl->host_kv.enabled || impl->oscar_only,
+    require(max_context_<=32768 || impl->host_kv.enabled || impl->oscar_only ||
+            Exl3NativeContextExtent::l0_oscar_enabled(),
             "extended context requires exact-host KV or OSCAR-only storage");
     const char* wide_prefill = std::getenv("NINFER_EXL3_WIDE_PREFILL");
     impl->wide_prefill_enabled = wide_prefill && std::strcmp(wide_prefill, "1") == 0;
@@ -4558,7 +4575,9 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     const char* target_timing = std::getenv("NINFER_EXL3_TARGET_PROJECTION_TIMING");
     impl->target_projection_timing_opt_in =
         target_timing != nullptr && std::strcmp(target_timing, "1") == 0;
-    const int row_storage=(impl->host_kv.enabled || impl->oscar_only) ? impl->prefill_capacity : max_context_;
+    // L0 OSCAR contexts prefill in bounded chunks: per-row buffers hold one chunk.
+    const int row_storage=(impl->host_kv.enabled || impl->oscar_only ||
+        Exl3NativeContextExtent::l0_oscar_enabled()) ? impl->prefill_capacity : max_context_;
     require(row_storage>0,"target context storage rows must be positive");
     const auto checked_extent=[&](std::size_t bytes_per_row) {
         Exl3ResourceInventory::Requirement required;
@@ -4884,24 +4903,34 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         }
     };
     std::size_t required_kv_bytes=0,required_kv_owners=0;
-    visit_kv_allocations([&](auto&,const char*) {
+    // L0 OSCAR K/V planes live in mapped host memory and own no device bytes.
+    const auto kv_device_bytes=[&](const char* label) {
+        return DeviceAllocation::l0_host_kv_plane(label)?std::size_t{0}:kv_plane_bytes;
+    };
+    visit_kv_allocations([&](auto&,const char* label) {
         ++required_kv_owners;
-        required_kv_bytes=Exl3LinearWorkspaceRequirements::append_owned_bytes(required_kv_bytes,kv_plane_bytes);
+        if(kv_device_bytes(label))
+            required_kv_bytes=Exl3LinearWorkspaceRequirements::append_owned_bytes(required_kv_bytes,
+                kv_device_bytes(label));
     });
     const auto materialize_kv=[&] {
-    const auto expected_kv_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(impl->persistent_bytes,required_kv_bytes);
+    const auto expected_kv_persistent=required_kv_bytes?
+        Exl3LinearWorkspaceRequirements::append_owned_bytes(impl->persistent_bytes,required_kv_bytes):
+        impl->persistent_bytes;
     unsigned allocation_index=0;
     visit_kv_allocations([&](auto& owner,const char* label) {
         const auto fault=allocation_index++==0 && (startup_fault==14 || startup_fault==15)?startup_fault-13:0;
         auto prepared=[&] {
-            if(!authority)return DeviceAllocation::create_shared(kv_plane_bytes,label,fault);
+            // L0 OSCAR planes are mapped host memory: no device reservation credit.
+            if(!authority || DeviceAllocation::l0_host_kv_plane(label))
+                return DeviceAllocation::create_shared(kv_plane_bytes,label,fault);
             auto credits=authority->reserve_constructor_credits(kv_plane_bytes,
                 DeviceAllocation::owner_metadata_bytes()+DeviceAllocation::shared_control_bytes);
             return DeviceAllocation::create_shared(kv_plane_bytes,label,fault,
                 std::move(credits.device),std::move(credits.metadata));
         }();
         owner=std::move(prepared);
-        impl->persistent_bytes+=kv_plane_bytes;
+        impl->persistent_bytes+=kv_device_bytes(label);
     });
     require(impl->persistent_bytes==expected_kv_persistent,"target KV allocation requirement mismatch");
     if(impl->host_kv.enabled)impl->host_kv.layer_workspace_bytes=required_kv_bytes;
@@ -5134,7 +5163,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!greedy || std::strcmp(greedy,"0")==0 || std::strcmp(greedy,"1")==0,"device greedy must be0 or1");
     const bool greedy_enabled=!greedy || std::strcmp(greedy,"1")==0;
     // Check the combined delayed groups before creating any of their storage.
-    auto required_delayed_groups=Exl3LinearWorkspaceRequirements::append_owned_bytes(base_bytes,required_kv_bytes);
+    auto required_delayed_groups=required_kv_bytes?
+        Exl3LinearWorkspaceRequirements::append_owned_bytes(base_bytes,required_kv_bytes):base_bytes;
     required_delayed_groups=Exl3LinearWorkspaceRequirements::append_owned_bytes(required_delayed_groups,required_layer_group);
     if(tap_extent)required_delayed_groups=Exl3LinearWorkspaceRequirements::append_owned_bytes(
         required_delayed_groups,static_cast<std::size_t>(tap_extent));
@@ -5648,9 +5678,12 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             for(std::size_t i=0;i<shared_count;++i)
                 require(shared_seen[i]!=child.get(),"context shared KV allocation appears in multiple physical owner slots");
             shared_seen[shared_count++]=child.get();
-            generic_bytes=Exl3LinearWorkspaceRequirements::append_owned_bytes(generic_bytes,child->bytes);
+            // L0 OSCAR host-mapped K/V planes own no device bytes.
+            if(!child->host_mapped) {
+                generic_bytes=Exl3LinearWorkspaceRequirements::append_owned_bytes(generic_bytes,child->bytes);
+                actual.add({child,0,Domain::device,child->bytes,{},nullptr,&DeviceAllocation::attach_device_credit});
+            }
             generic_metadata=Exl3LinearWorkspaceRequirements::append_owned_bytes(generic_metadata,DeviceAllocation::owner_metadata_bytes());
-            actual.add({child,0,Domain::device,child->bytes,{},nullptr,&DeviceAllocation::attach_device_credit});
             actual.add({child,1,Domain::host_metadata,DeviceAllocation::owner_metadata_bytes(),{},&DeviceAllocation::attach_metadata_credit});
             generic_metadata=Exl3LinearWorkspaceRequirements::append_owned_bytes(generic_metadata,DeviceAllocation::shared_control_bytes);
             actual.add({child,2,Domain::host_metadata,DeviceAllocation::shared_control_bytes,{},&DeviceAllocation::attach_control_credit});
@@ -5872,7 +5905,7 @@ void Exl3TextContext::exercise_exact_page_extension_for_test() {
         auto unique=make_prefix();const auto* original=unique.front().get();
         unsigned reservations=0;
         const auto refuse=[&](std::uint64_t)->RetainedDescriptorLedger::Ticket {
-            ++reservations;throw Exl3ResourceReservationExhausted{};
+            ++reservations;throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         };
         bool refused=false;
         try{extend_exact_pages(unique,1,129,true,nullptr,0,refuse);}
@@ -5890,7 +5923,7 @@ void Exl3TextContext::exercise_exact_page_extension_for_test() {
         RetainedDescriptorLedger metadata;unsigned reservations=0;
         bool refused=false;
         try {extend_exact_pages(prefix,1,129,true,nullptr,0,[&](std::uint64_t bytes) {
-            if(++reservations==2)throw Exl3ResourceReservationExhausted{};
+            if(++reservations==2)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
             return metadata.acquire(bytes);
         });}catch(const Exl3ResourceReservationExhausted&){refused=true;}
         require(refused && reservations==2 && metadata.bytes()==0 && held->rows==1,
@@ -6967,7 +7000,7 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     if(!preserve_exact_payload) {
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl_->gdn_layers[layer]) impl_->gdn_layers[layer]->reset(stream);
-        if (impl_->cache_k[layer]) {
+        if (impl_->cache_k[layer] && !impl_->cache_k[layer]->host_mapped) {
             cuda_check(cudaMemsetAsync(impl_->cache_k[layer]->ptr, 0, impl_->cache_k[layer]->bytes, stream), "reset E4A K cache");
             cuda_check(cudaMemsetAsync(impl_->cache_v[layer]->ptr, 0, impl_->cache_v[layer]->bytes, stream), "reset E4A V cache");
         }
@@ -8029,6 +8062,32 @@ bool Exl3TextContext::layer_major_from_zero() {
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
+    if (Exl3NativeContextExtent::l0_oscar_enabled()) {
+        // L0 OSCAR contexts hold per-row buffers for one chunk: the same suffix
+        // is ingested row-major in 1024-row wide chunks, and the retained tap
+        // tail is filled from each chunk's captured taps.
+        const int tap_rows=retained_taps?retained_taps->rows:0;
+        for (std::size_t first = 0; first < token_ids.size();) {
+            const int rows = static_cast<int>(std::min<std::size_t>(1024, token_ids.size() - first));
+            const int chunk_abs = position_;
+            // A fresh context starts with the established initial prefill.
+            const int take = position_ == 0 ? std::min(rows, 16) : rows;
+            if (position_ == 0) prefill(token_ids.subspan(first, take), stream);
+            else append_prefill_wide(token_ids.subspan(first, take), stream);
+            const int ingested = take;
+            if (retained_taps) {
+                const int lo = std::max(chunk_abs, retained_taps->first_abs);
+                const int hi = std::min(chunk_abs + ingested, retained_taps->first_abs + tap_rows);
+                for (std::size_t tap = 0; lo < hi && tap < kTapLayers.size(); ++tap)
+                    copy_tap_rows_to_device(kTapLayers[tap], lo - chunk_abs,
+                        retained_taps->device + (tap * static_cast<std::size_t>(tap_rows) +
+                            (lo - retained_taps->first_abs)) * kHidden,
+                        hi - lo, stream);
+            }
+            first += static_cast<std::size_t>(ingested);
+        }
+        return;
+    }
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
@@ -9540,7 +9599,7 @@ Exl3PendingGreedyPacket Exl3TextContext::submit_greedy_packet(
         }
         transfer=candidate;break;
     }
-    if(!transfer)throw Exl3ResourceReservationExhausted{};
+    if(!transfer)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
     pending.acquisition_=acquisition;pending.execution_=execution;
     pending.generation_=impl_->request_generation;pending.position_=position_;
     pending.rows_=rows;pending.serial_=++impl_->greedy_serial;

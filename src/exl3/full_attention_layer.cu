@@ -5777,7 +5777,7 @@ template<int N> __device__ __forceinline__ void wait(){ asm volatile("cp.async.w
 template<int S>
 __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,std::uint16_t* output,int rows,int base,int capacity,
-    float* split_output,float* split_stats){
+    float* split_output,float* split_stats,int history_end=0){
   extern __shared__ __align__(16) unsigned char smem_raw[];
   half* sm=reinterpret_cast<half*>(smem_raw);
   const int query_base=(static_cast<int>(gridDim.x)-1-static_cast<int>(blockIdx.x))*BM;
@@ -5791,7 +5791,14 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
   const int active_rows=min(BM,rows-query_base);
   if(active_rows<=0) return;
   const int maximum_count=min(base+query_base+active_rows,capacity);
-  const int tiles=(maximum_count+BN-1)/BN;
+  // L0 OSCAR: key tiles of [kSink, history_end) are served by the INT2
+  // history kernel; virtual tile v maps to the sink tiles, then the tiles past
+  // the history. Identity when history_end <= kSink.
+  const int sink_tiles=ninfer::exl3::l0_oscar::kSink/BN;
+  const int skip=history_end>ninfer::exl3::l0_oscar::kSink?
+      (history_end-ninfer::exl3::l0_oscar::kSink)/BN:0;
+  const int tiles=(maximum_count+BN-1)/BN-skip;
+  const auto real_tile=[&](int tile){ return tile<sink_tiles?tile:tile+skip; };
   const int per=(tiles+S-1)/S;
   const int t_begin=split*per, t_end=min(tiles,t_begin+per);
   unsigned qa[kHeadDim/16][4];
@@ -5811,7 +5818,7 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
   float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
   auto load=[&](int tile,int stage){
     half* ks=sm+stage*kStage; half* vs=ks+BN*kStride;
-    const int first=tile*BN;
+    const int first=real_tile(tile)*BN;
     #pragma unroll
     for(int i=0;i<(BN*kHeadDim/8)/256;++i){
       const int idx=tid+i*256; const int key_off=idx/(kHeadDim/8); const int dim=(idx%(kHeadDim/8))*8;
@@ -5829,7 +5836,7 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
     const int stage=(tile-t_begin)&1;
     if(tile+1<t_end){ load(tile+1,stage^1); wait<1>(); } else wait<0>();
     __syncthreads();
-    const int first=tile*BN;
+    const int first=real_tile(tile)*BN;
     const half* ks=sm+stage*kStage; const half* vs=ks+BN*kStride;
     const bool warp_live=(m_base<active_rows) && first<=warp_max_limit;
     if(warp_live){
@@ -5948,7 +5955,8 @@ bool exl3_fa2_prefill_enabled() {
 template<int S>
 static void launch_fa2_prefill_variant(const std::uint16_t* q,const std::uint16_t* k,
     const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
-    float* split_output,float* split_stats,cudaStream_t stream) {
+    float* split_output,float* split_stats,cudaStream_t stream,int history_end=0,
+    bool merge=true) {
     constexpr std::size_t bytes=fa2_prefill::smem_bytes();
     static const bool configured=[] {
         cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S>,
@@ -5959,8 +5967,10 @@ static void launch_fa2_prefill_variant(const std::uint16_t* q,const std::uint16_
     (void)configured;
     fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S><<<
         dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,kKVHeads,(kQHeads/kKVHeads/2)*S),256,
-        bytes,stream>>>(q,k,v,output,rows,position,capacity,split_output,split_stats);
+        bytes,stream>>>(q,k,v,output,rows,position,capacity,split_output,split_stats,
+            history_end);
     cuda_check(cudaGetLastError(),"launch FA2 prefill attention");
+    if(!merge) return;
     if constexpr(S>1) {
         attention_wmma32_split_merge_kernel<S><<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
             split_output,split_stats,output,rows);
@@ -6274,7 +6284,10 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     const int count=base+query+1;
     std::uint16_t* out=output+(query*kQHeads+kv_head*H+head)*kHeadDim+tid;
     if(count<1 || count>capacity) { *out=0; return; }
-    const int live_segments=min(segments,(count+keys-1)/keys);
+    const int l0_end=history_slot?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    const int live_segments=l0_end>ninfer::exl3::l0_oscar::kSink?
+        min(segments,1+(count-l0_end+keys-1)/keys):min(segments,(count+keys-1)/keys);
     const float* slots=workspace+
         (static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments*kFastFusedFlashStride;
     float global_max=-3.402823466e+38F;
@@ -6377,7 +6390,12 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const int g=lane>>2;
     const int t=lane&3;
     const int base=(position_device?*position_device:position)+query_offset;
-    const int first=segment*kVerifyMmaKeys;
+    // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
+    // history end; the history itself is served by the INT2 kernel.
+    const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
+    const int first=l0_remap&&segment>0?l0_end+(segment-1)*kVerifyMmaKeys:segment*kVerifyMmaKeys;
     const int last_count=base+rows;  // largest live key count of the block
     if(first>=last_count || base+1<1 || last_count>capacity) return;
     const int segment_end=min(first+kVerifyMmaKeys,last_count);
@@ -6572,14 +6590,18 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
     const int count=position+rows;
     const int l0_history=history_slot?1:0;
     int keys=requested_keys?requested_keys:verify_flash_mma_keys();
+    const auto segment_count=[&](int length) {
+        return l0_history?std::min((count+length-1)/length,1+kExl3L0ExactWindowKeys/length):
+            (count+length-1)/length;
+    };
     const auto required=[&](int length) {
-        return static_cast<std::size_t>(rows)*kKVHeads*((count+length-1)/length)*
+        return static_cast<std::size_t>(rows)*kKVHeads*segment_count(length)*
             kFastFusedFlashStride*sizeof(float);
     };
     while(keys<256 && required(keys)>workspace_bytes) keys*=2;
     if(required(keys)>workspace_bytes)
         throw std::invalid_argument("verify flash MMA scratch extent");
-    const int segments=(count+keys-1)/keys;
+    const int segments=segment_count(keys);
     const dim3 grid(segments,kKVHeads);
     if(keys==64)
         exl3_launch_small(attention_verify_flash_mma_kernel<64>,dim3(grid),dim3(96),0,stream,
@@ -7134,6 +7156,21 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             alloc(shared.hist_slot,static_cast<std::size_t>(l.rows)*kKVHeads*kFastFusedFlashStride*sizeof(float));
             alloc(shared.hist_rotated,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
         }
+        static l0_oscar::LayerStorage prefill{};
+        l.prefill_rows=std::max(max_rows_,8);
+        if(prefill.prefill_rows<l.prefill_rows) {
+            prefill.prefill_rows=l.prefill_rows;
+            const std::size_t r=static_cast<std::size_t>(l.prefill_rows);
+            alloc(prefill.q_rot,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
+            alloc(prefill.q_mu,r*kQHeads*sizeof(float));
+            alloc(prefill.prefill_hist,r*kQHeads*kHeadDim*sizeof(float));
+            alloc(prefill.prefill_hist_stats,r*kQHeads*2*sizeof(float));
+            alloc(prefill.prefill_split,5*r*kQHeads*kHeadDim*sizeof(float));
+            alloc(prefill.prefill_split_stats,5*r*kQHeads*2*sizeof(float));
+        }
+        l.prefill_hist=prefill.prefill_hist; l.prefill_hist_stats=prefill.prefill_hist_stats;
+        l.prefill_split=prefill.prefill_split; l.prefill_split_stats=prefill.prefill_split_stats;
+        shared.q_rot=prefill.q_rot; shared.q_mu=prefill.q_mu;
         l.q_rot=shared.q_rot; l.q_mu=shared.q_mu; l.hist_work=shared.hist_work; l.hist_slot=shared.hist_slot; l.hist_rotated=shared.hist_rotated;
     }
     if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
@@ -8022,7 +8059,29 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             exact_attention_gqa_six_scores_ &&
             exact_attention_gqa_six_softmax_triple_values_ &&
             !exact_attention_gqa_six_softmax_fused_scalar_values_;
-        if ((fast_prefill_wmma32_attention_ || fast_prefill_wmma_attention_) &&
+        const int l0_prefill_history=(l0_.k_codes && rows>8 && !fused_flash_eligible)?
+            std::min(l0_oscar::history_end(position),cache_capacity_):0;
+        if (l0_prefill_history>l0_oscar::kSink) {
+            if(capture_active_ || rows>l0_.prefill_rows || direct_staged_rows_ ||
+               exact_prefix_rows_ || exact_page_ranges_.count)
+                throw std::invalid_argument("L0 OSCAR prefill route preconditions");
+            const auto& a=l0_oscar::assets();
+            l0_oscar::query_kernel<<<rows*32,192,0,stream>>>(qr,rows,a,l0_.bank,
+                reinterpret_cast<__half*>(l0_.q_rot),l0_.q_mu);
+            l0_history_prefill_kernel<<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
+                kKVHeads,kQHeads/kKVHeads/2),256,0,stream>>>(l0_.q_rot,l0_.q_mu,
+                l0_.k_codes,l0_.v_codes,l0_.k_meta,l0_.v_meta,l0_.prefill_hist,
+                l0_.prefill_hist_stats,rows,l0_prefill_history);
+            l0_history_unrotate_rows_kernel<<<rows*32,192,0,stream>>>(l0_.prefill_hist,
+                l0_.prefill_hist_stats,l0_.prefill_split,l0_.prefill_split_stats,rows,4,
+                a.rvt+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim*kHeadDim);
+            launch_fa2_prefill_variant<4>(qr,attention_k,attention_v,attn,rows,position,
+                cache_capacity_,l0_.prefill_split,l0_.prefill_split_stats,stream,
+                l0_prefill_history,false);
+            attention_wmma32_split_merge_kernel<5><<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                l0_.prefill_split,l0_.prefill_split_stats,attn,rows);
+            launch(cudaGetLastError(),"L0 OSCAR prefill attention");
+        } else if ((fast_prefill_wmma32_attention_ || fast_prefill_wmma_attention_) &&
             fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
@@ -8527,7 +8586,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             const int segments=(count+fused_keys-1)/fused_keys;
             const std::size_t required=static_cast<std::size_t>(rows)*kKVHeads*
                 segments*kFastFusedFlashStride*sizeof(float);
-            if(required>exl3_exact_attention_score_bytes(exact_score_rows_,
+            // L0 OSCAR sizes its verifier segments to the exact window.
+            if(!l0_.k_codes && required>exl3_exact_attention_score_bytes(exact_score_rows_,
                                                          cache_capacity_))
                 throw std::invalid_argument(
                     "FAST fused flash attention scratch extent");

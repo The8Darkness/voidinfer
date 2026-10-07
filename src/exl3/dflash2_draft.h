@@ -146,7 +146,7 @@ public:
             const auto live=bounded_shared_live_blocks_for_test<Page>();
             unsigned calls=0;bool refused=false;
             const MetadataReservation reserve=[&](std::uint64_t bytes){
-                if(++calls==3)throw Exl3ResourceReservationExhausted{};
+                if(++calls==3)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
                 return ledger.acquire(bytes);
             };
             try {
