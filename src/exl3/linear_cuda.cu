@@ -1103,10 +1103,10 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) input_hadamard_pair
 
 __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_warp_kernel(
     const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
-    int output_features) {
+    int output_features,int active_features) {
     EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
-    const int blocks=output_features/kHadamard;
+    const int blocks=active_features/kHadamard;
     const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
         (static_cast<int>(threadIdx.x)>>5);
     if(task>=static_cast<long long>(rows)*blocks) return;
@@ -1186,14 +1186,16 @@ void launch_input_hadamard(cudaStream_t stream,const std::uint16_t* input,
 }
 
 inline void launch_output_hadamard(cudaStream_t stream,const float* accum,
-    const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features) {
+    const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features,
+    int active_features=0) {
+    if(active_features<=0) active_features=output_features;
     if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
        exl3_hadamard_warp_aligned(accum,svh,output))
         exl3_launch_pdl(output_hadamard_warp_kernel,
-            dim3(exl3_hadamard_warp_grid(rows,output_features)),dim3(kHadamardWarpsPerBlock*32),
-            0,stream,accum,svh,output,rows,output_features);
+            dim3(exl3_hadamard_warp_grid(rows,active_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,accum,svh,output,rows,output_features,active_features);
     else
-        output_hadamard_kernel<<<dim3(rows,output_features/kHadamard),dim3(kHadamard),0,
+        output_hadamard_kernel<<<dim3(rows,active_features/kHadamard),dim3(kHadamard),0,
             stream>>>(accum,svh,output,rows,output_features);
 }
 
@@ -11799,6 +11801,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     Exl3CudaLinearAdmission admission,
     const std::uint16_t* raw_input) {
     const std::uint16_t* fused_suh = raw_input ? weights.suh : nullptr;
+    int head_active_features = out_features_;
     if((admission==Exl3CudaLinearAdmission::draft_shared_q_m16 || admission==Exl3CudaLinearAdmission::draft_shared_kv_m16 || admission==Exl3CudaLinearAdmission::draft_shared_o_m16 || admission==Exl3CudaLinearAdmission::draft_shared_down_m16 || admission==Exl3CudaLinearAdmission::draft_shared_gateup_m16) &&
        !draft_shared_m16_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared transformed draft Q requires admitted M16 workspace");
@@ -13262,6 +13265,11 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         int split_count = 1;
         void* kernel_args[] = {&transformed_input, &trellis, &mul1, &accum,
                                &rows, &input_features, &output_features, &split_count};
+        // The head trellis is k-tile major with one K split: launching only the
+        // leading CTAs computes exactly the leading output columns.
+        if (active_output_features_ > 0 && active_output_features_ < out_features_ &&
+            active_output_features_ % 128 == 0)
+            head_active_features = active_output_features_;
         // Default: 64-column 4-warp CTAs with async-A, the 4x4 cp.async ring
         // and the exact K6 lane-window decoder (measured). Each warp still
         // accumulates its 16 columns over the whole K in order.
@@ -13283,15 +13291,17 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                            reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<
                                6, true, warps, true, false, false, false, true, false,
                                false, false, stages, warps, per>),
-                           dim3(out_features_ / (16 * warps)), dim3(warps * 32), kernel_args,
+                           dim3(head_active_features / (16 * warps)), dim3(warps * 32), kernel_args,
                            narrow_shared, stream),
                        "launch EXL3 H6 narrow single-split GEMV");
-        } else
+        } else {
+        head_active_features = out_features_;
         cuda_check(cudaLaunchKernel(
                        reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<6, true>),
                        dim3(output_blocks), dim3(kThreads), kernel_args,
                        shared_bytes, stream),
                    "launch EXL3 H6 single-split GEMV");
+        }
     } else if (metadata.K >= 5 &&
                (rows == 1 || draft_small_m_candidate(metadata, rows) ||
                  draft_shared_m16_candidate(metadata,rows,admission) ||
@@ -13534,7 +13544,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (target_k5_small_m_batch_candidate(metadata, rows, admission))
         ++target_k5_small_m_batch_calls_;
     launch_output_hadamard(stream,
-        accum_, weights.svh, output, rows, out_features_);
+        accum_, weights.svh, output, rows, out_features_, head_active_features);
     cuda_check(cudaGetLastError(), "launch EXL3 output Hadamard");
 }
 

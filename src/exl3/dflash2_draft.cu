@@ -1703,11 +1703,13 @@ __global__ void dflash_row_shift_kernel(const std::uint16_t* src, std::uint16_t*
 
 // Preserve the original insertion sequence, including its NaN behavior.
 __device__ void dflash_topk16_serial_row(const std::uint16_t* logits, int row, int vocab,
-                                        std::int64_t* cand_ids, float* cand_unary) {
+                                        std::int64_t* cand_ids, float* cand_unary,
+                                        int stride = 0) {
     float values[kTopK];
     int ids[kTopK];
     int count = 0;
-    const std::uint16_t* row_logits = logits + static_cast<std::size_t>(row) * vocab;
+    const std::uint16_t* row_logits =
+        logits + static_cast<std::size_t>(row) * (stride > 0 ? stride : vocab);
     for (int column = 0; column < vocab; ++column) {
         const float value = half_to_float(row_logits[column]);
         if (count < kTopK) {
@@ -2075,14 +2077,14 @@ constexpr int kTopKChunkThreads = 256;
 static_assert(kTopKMaxChunks <= kTopKChunkSort);
 
 __global__ void __launch_bounds__(kTopKChunkThreads) dflash_topk16_chunk_max_kernel(
-    const std::uint16_t* logits, int vocab, float* chunk_max, int* chunk_nan) {
+    const std::uint16_t* logits, int vocab, int stride, float* chunk_max, int* chunk_nan) {
     constexpr int kWarps = kTopKChunkThreads / 32;
     const int row = static_cast<int>(blockIdx.y);
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int chunk = static_cast<int>(blockIdx.x) * kWarps + (static_cast<int>(threadIdx.x) >> 5);
     const int chunks = (vocab + kTopKChunk - 1) / kTopKChunk;
     if (chunk >= chunks) return;
-    const auto* input = logits + static_cast<std::size_t>(row) * vocab;
+    const auto* input = logits + static_cast<std::size_t>(row) * stride;
     float maximum = -CUDART_INF_F;
     bool nan = false;
     #pragma unroll
@@ -2139,8 +2141,8 @@ static_assert(kTopKSelectThreads == 32 * 32, "two-level warp reduction");
 static_assert(kTopKChunkSort <= kTopKSelectThreads * kTopKSelectPerThread);
 
 __global__ void __launch_bounds__(kTopKSelectThreads) dflash_topk16_chunk_select_kernel(
-    const std::uint16_t* logits, int vocab, const float* chunk_max, const int* chunk_nan,
-    std::int64_t* cand_ids, float* cand_unary) {
+    const std::uint16_t* logits, int vocab, int stride, const float* chunk_max,
+    const int* chunk_nan, std::int64_t* cand_ids, float* cand_unary) {
     constexpr int kInvalid = 0x7fffffff;
     __shared__ float warp_values[32];
     __shared__ int warp_ids[32];
@@ -2162,7 +2164,7 @@ __global__ void __launch_bounds__(kTopKSelectThreads) dflash_topk16_chunk_select
     }
     if (t == 0) selected_count = 0;
     if (__syncthreads_or(nan)) {
-        if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary);
+        if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary, stride);
         return;
     }
     // T = 16th largest chunk maximum (with multiplicity).
@@ -2188,10 +2190,10 @@ __global__ void __launch_bounds__(kTopKSelectThreads) dflash_topk16_chunk_select
     __syncthreads();
     const int count = selected_count;
     if (count > kTopKChunkCandidates) {
-        if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary);
+        if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary, stride);
         return;
     }
-    const auto* input = logits + static_cast<std::size_t>(row) * vocab;
+    const auto* input = logits + static_cast<std::size_t>(row) * stride;
     #pragma unroll
     for (int j = 0; j < kTopKSelectPerThread; ++j) {
         const int i = t + j * kTopKSelectThreads;
@@ -2240,16 +2242,18 @@ std::size_t dflash_topk_segment_bytes() {
 }
 
 void launch_dflash_topk16_segmented(const std::uint16_t* logits, int rows, int vocab,
-    std::int64_t* cand_ids, float* cand_unary, void* scratch, cudaStream_t stream) {
-    if (dflash_topk_chunked_enabled()) {
+    std::int64_t* cand_ids, float* cand_unary, void* scratch, cudaStream_t stream,
+    int stride) {
+    if (stride <= 0) stride = vocab;
+    if (dflash_topk_chunked_enabled() || stride != vocab) {
         auto* chunk_max = static_cast<float*>(scratch);
         auto* chunk_nan = reinterpret_cast<int*>(chunk_max + kBlockCap * kTopKMaxChunks);
         const int chunks = (vocab + kTopKChunk - 1) / kTopKChunk;
         constexpr int warps = kTopKChunkThreads / 32;
         dflash_topk16_chunk_max_kernel<<<dim3((chunks + warps - 1) / warps, rows),
-            kTopKChunkThreads, 0, stream>>>(logits, vocab, chunk_max, chunk_nan);
+            kTopKChunkThreads, 0, stream>>>(logits, vocab, stride, chunk_max, chunk_nan);
         dflash_topk16_chunk_select_kernel<<<rows, kTopKSelectThreads, 0, stream>>>(
-            logits, vocab, chunk_max, chunk_nan, cand_ids, cand_unary);
+            logits, vocab, stride, chunk_max, chunk_nan, cand_ids, cand_unary);
         return;
     }
     auto* values = static_cast<float*>(scratch);
@@ -2277,7 +2281,7 @@ void dflash2_topk16_for_test(const std::uint16_t* logits, int rows, int vocab,
         if (!scratch)
             cuda_check(cudaMalloc(&scratch, dflash_topk_segment_bytes()),
                        "top-K segmented test scratch");
-        launch_dflash_topk16_segmented(logits, rows, vocab, ids, values, scratch, stream);
+        launch_dflash_topk16_segmented(logits, rows, vocab, ids, values, scratch, stream, vocab);
     } else if (local_merge) {
         if (nonfinite_flag)
             dflash_topk16_local_merge_kernel<true><<<rows, 256, 0, stream>>>(
@@ -2345,10 +2349,14 @@ __global__ void dflash_count_nonfinite_kernel(const std::uint16_t* buffer,
 // while reducing the guarded result to one device flag. It produces no
 // proposal or target-approval data.
 __global__ void dflash_nonfinite_flag_kernel(const std::uint16_t* buffer,
-                                             int count, unsigned int* out) {
+                                             int count, unsigned int* out,
+                                             int columns = 0, int stride = 0) {
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= count) return;
-    const float value = half_to_float(buffer[index]);
+    const std::size_t element = columns > 0
+        ? static_cast<std::size_t>(index / columns) * stride + index % columns
+        : static_cast<std::size_t>(index);
+    const float value = half_to_float(buffer[element]);
     if ((value != value) || value == INFINITY || value == -INFINITY)
         atomicExch(out, 1u);
 }
@@ -2744,6 +2752,14 @@ struct Exl3Dflash2DraftModel::Impl {
     bool parallel_topk = false;
     bool local_merge_topk = false;
     std::uint64_t local_merge_topk_calls = 0;
+    // NINFER_DFLASH2_HEAD_PREFIX=N (multiple of 128, default 98304 = 99.96% of
+    // code/prose tokens, 0 = off): the draft head
+    // scores only token ids [0, N). The target verifies every proposal, so this
+    // changes acceptance, never output. A host seed token >= N switches back to
+    // the full head for kHeadPrefixHold rounds.
+    int head_prefix = 98304;
+    int head_full_rounds = 0;
+    std::uint64_t head_prefix_calls = 0;
     bool parallel_ring_attention = false;
     bool position_confidence = false;
     bool dense_kmajor = false;
@@ -3401,6 +3417,7 @@ std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::create_execution_i
     child->selector_batched_anchor_chain=parent.selector_batched_anchor_chain;
     child->fast_device_liveness=parent.fast_device_liveness;
     child->fused_topk_liveness=parent.fused_topk_liveness;
+    child->head_prefix=parent.head_prefix;
     child->fused_selector=parent.fused_selector;
     child->position_confidence=parent.position_confidence;
     child->required_execution_bytes=parent.required_execution_bytes;
@@ -4243,6 +4260,12 @@ std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::load_impl(
         "NINFER_DFLASH2_FUSED_TOPK_LIVENESS must be 0 or 1");
     impl->fused_topk_liveness=fused_topk_liveness!=nullptr &&
         std::string(fused_topk_liveness)=="1";
+    if(const char* prefix=std::getenv("NINFER_DFLASH2_HEAD_PREFIX")) {
+        const int value=std::atoi(prefix);
+        require(value>=0 && value%128==0 && value<=kVocab,
+            "NINFER_DFLASH2_HEAD_PREFIX must be a multiple of 128 within the vocabulary");
+        impl->head_prefix=value<kVocab?value:0;
+    }
     require(!impl->fused_topk_liveness ||
                 (impl->fast_device_liveness && impl->local_merge_topk),
         "fused top-K liveness requires fast device liveness and local top-K");
@@ -5409,9 +5432,22 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     launch_rms(current + kHidden, m.norm, m.s.final_norm, proposal_rows, kHidden, true);
     stage_nan("final_norm", m.s.final_norm, proposal_rows * kHidden);
     timing_close(Impl::TimingCategory::DenseMisc, "final_norm");
+    const bool fused_selector_route = m.fused_selector && !m.position_confidence &&
+        !projection_timing.enabled && (!device_seed || proposal_rows <= 7);
+    int head_columns = kVocab;
+    if (m.head_prefix > 0 && !device_seed && m.local_merge_topk && m.fast_device_liveness &&
+        !(m.fused_topk_liveness && fused_selector_route) && dflash_topk_segmented_enabled()) {
+        constexpr int kHeadPrefixHold = 64;
+        if (block_ids[0] >= m.head_prefix) m.head_full_rounds = kHeadPrefixHold;
+        if (m.head_full_rounds > 0) --m.head_full_rounds;
+        else head_columns = m.head_prefix;
+    }
+    if (head_columns < kVocab) ++m.head_prefix_calls;
+    m.ws_head->set_active_output_features(head_columns < kVocab ? head_columns : 0);
     timed_forward(*m.ws_head, target_head, target_head_metadata, m.s.final_norm,
                   m.s.head_out, proposal_rows, -1, "target_h6",
                   Impl::TimingCategory::H6);
+    m.ws_head->set_active_output_features(0);
     launch_dense(m.s.final_norm, m.hidden_proj, m.s.hidden_proj_out, proposal_rows,
                  kHidden, kRank);
 
@@ -5433,8 +5469,8 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
                 m.s.cand_unary, m.s.liveness_flag);
             ++m.fused_topk_liveness_calls;
         } else if (dflash_topk_segmented_enabled()) {
-            launch_dflash_topk16_segmented(m.s.head_out, proposal_rows, kVocab,
-                m.s.cand_ids, m.s.cand_unary, m.s.topk_segments, stream);
+            launch_dflash_topk16_segmented(m.s.head_out, proposal_rows, head_columns,
+                m.s.cand_ids, m.s.cand_unary, m.s.topk_segments, stream, kVocab);
         } else {
             dflash_topk16_local_merge_kernel<false><<<proposal_rows, 256, 0, stream>>>(
                 m.s.head_out, proposal_rows, kVocab, m.s.cand_ids,
@@ -5493,11 +5529,11 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         require(m.s.liveness_flag != nullptr,
                 "E5A2 fast liveness flag allocation missing");
         if (!fused_liveness) {
-            const int count=proposal_rows*kVocab;
+            const int count=proposal_rows*head_columns;
             cuda_check(cudaMemsetAsync(m.s.liveness_flag,0,sizeof(unsigned int),stream),
                        "E5A2 fast liveness zero");
             dflash_nonfinite_flag_kernel<<<(count+255)/256,256,0,stream>>>(
-                m.s.head_out,count,m.s.liveness_flag);
+                m.s.head_out,count,m.s.liveness_flag,head_columns,kVocab);
             cuda_check(cudaGetLastError(),"E5A2 fast liveness launch");
         }
         cuda_check(cudaMemcpyAsync(&fused_bad,m.s.liveness_flag,sizeof(fused_bad),

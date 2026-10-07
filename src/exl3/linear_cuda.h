@@ -677,6 +677,10 @@ public:
         std::uint16_t* output,int rows,cudaStream_t stream=nullptr);
 
     // Admission by an ordinary exact-host context prepared for native M16.
+    // Draft head pruning: the H6 single-split head computes only output
+    // columns [0, features) (a multiple of 128; 0 = all). Columns beyond keep
+    // their previous contents; the row stride stays out_features.
+    void set_active_output_features(int features) noexcept { active_output_features_ = features; }
     void set_native_continuation16(bool enabled) noexcept {
         native_continuation_rows_ = enabled ? 16 : 8;
     }
@@ -1274,6 +1278,7 @@ private:
     bool specialized_shape_ = false;
     bool allow_generic_variants_ = true;
     bool h6_small_m_enabled_ = true;
+    int active_output_features_ = 0;
     bool draft_small_m_enabled_ = false;
     bool target_gateup_small_m_enabled_ = false;
     bool target_gateup_k6_async_a_enabled_ = false;
