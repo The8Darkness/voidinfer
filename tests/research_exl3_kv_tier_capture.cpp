@@ -98,8 +98,15 @@ int main() {
         // Initial prefill is limited to 16 rows; the rest is teacher-forced in 8-row appends.
         const std::span<const std::int64_t> all(tokens.data(), tokens.size());
         context->prefill(all.first(16));
-        for (std::size_t at = 16; at < all.size(); at += 8)
-            context->append_prefill(all.subspan(at, std::min<std::size_t>(8, all.size() - at)));
+        // KV_CAPTURE_WIDE=N uses the wide-prefill route (context built with
+        // NINFER_EXL3_WIDE_PREFILL=1 and the width ladder flags) in N-row calls.
+        const std::size_t wide = std::getenv("KV_CAPTURE_WIDE") ? std::atoi(std::getenv("KV_CAPTURE_WIDE")) : 0;
+        for (std::size_t at = 16; at < all.size();) {
+            const std::size_t rows = std::min<std::size_t>(wide ? wide : 8, all.size() - at);
+            if (wide) context->append_prefill_wide(all.subspan(at, rows));
+            else context->append_prefill(all.subspan(at, rows));
+            at += rows;
+        }
         require(cudaDeviceSynchronize() == cudaSuccess, "synchronize prefill");
         const std::filesystem::path root(out);
         std::filesystem::create_directories(root);

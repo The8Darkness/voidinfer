@@ -7064,8 +7064,8 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
     v_cache_ = v_cache;
     cache_capacity_ = capacity;
     if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
-        cudaMalloc(&fakequant_watermark_, sizeof(int)) == cudaSuccess)
-        cudaMemset(fakequant_watermark_, 0, sizeof(int));
+        cudaMalloc(&fakequant_watermark_, 4 * sizeof(int)) == cudaSuccess)
+        cudaMemset(fakequant_watermark_, 0, 4 * sizeof(int));
 }
 
 void Exl3FullAttentionLayer::set_oscar(Exl3OscarContext* oscar, int model_layer) noexcept {
