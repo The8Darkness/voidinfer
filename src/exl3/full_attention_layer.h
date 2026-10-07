@@ -2,6 +2,7 @@
 
 #include "exl3/linear_cuda.h"
 #include "exl3/sibling_rows.h"
+#include "exl3/l0_oscar_storage.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/attention_page_ranges.h"
 #include "exl3/attention_position_contract.h"
@@ -876,6 +877,8 @@ private:
     std::uint16_t* k_cache_ = nullptr;
     // KV-tier fidelity research (kv_fakequant.cuh): aged-row watermark and rotation bank.
     int* fakequant_watermark_ = nullptr;
+    // L0 OSCAR INT2 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
+    l0_oscar::LayerStorage l0_{};
     int fakequant_bank_ = 0;
     std::uint16_t* v_cache_ = nullptr;
     int cache_capacity_ = 0;

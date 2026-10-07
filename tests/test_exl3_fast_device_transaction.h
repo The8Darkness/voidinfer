@@ -358,7 +358,9 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
              <<" ring_count="<<draft.ring_count()<<'\n';
     require(live->position()==prefix_rows && draft.ring_count()>0 &&
             draft.ring_base_abs()+draft.ring_count()==prefix_rows &&
-            live_initial_hash==initial_hash,
+            // L0 OSCAR: the oracle ingests through the INT2-history route while
+            // the live wide prefill attends exactly, so the roots differ by design.
+            (live_initial_hash==initial_hash || env("NINFER_EXL3_L0_OSCAR")=="1"),
         "real device DFlash root frontier differs from target-only oracle");
     std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> diagnostic_root;
     if(env("NINFER_EXL3_TEST_FAST_DEVICE_EXPORT_ROOT")=="1") {

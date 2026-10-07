@@ -1,6 +1,7 @@
 #include "exl3/pdl_small.cuh"
 #include "exl3/sibling_rows.cuh"
 #include "exl3/kv_fakequant.cuh"
+#include "exl3/l0_oscar.cuh"
 #include "exl3/full_attention_layer.h"
 #include "exl3/environment_options.h"
 #include "exl3/vericache_serving_coordinator.h"
@@ -6259,7 +6260,8 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     const float* workspace,std::uint16_t* output,int rows,int segments,
     int position,int capacity,int keys,const int* position_device,
     int query_offset,const std::uint16_t* self_q=nullptr,
-    const std::uint16_t* self_k=nullptr,const std::uint16_t* self_v=nullptr) {
+    const std::uint16_t* self_k=nullptr,const std::uint16_t* self_v=nullptr,
+    const float* history_slot=nullptr) {
     EXL3_PDL_SMALL_PROLOGUE();
     constexpr int H=kFastFusedFlashHeads;
     const int block=static_cast<int>(blockIdx.x);
@@ -6282,6 +6284,11 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     // Self term (verifier MMA route): the segments hold only the keys before
     // the row's logical position; its own key, at physical slot count - 1, is
     // the final term, so chain and sibling rows share one arithmetic.
+    // L0 OSCAR history: one already-merged, un-rotated slot (l0_oscar.cuh).
+    const float* history=history_slot?history_slot+
+        (static_cast<std::size_t>(query)*kKVHeads+kv_head)*kFastFusedFlashStride:nullptr;
+    const bool history_live=history && history[kFastFusedFlashValues+H+head]>0.0f;
+    if(history_live) global_max=fmaxf(global_max,history[kFastFusedFlashValues+head]);
     float self_score=-INFINITY,self_value=0.0f;
     if(self_q) {
         __shared__ float partial[kHeadDim/32];
@@ -6304,9 +6311,17 @@ __global__ void attention_fused_flash_merge_heads_kernel(
     float denominator=0.0f,numerator=0.0f;
     for(int segment=0;segment<live_segments;++segment) {
         const float* slot=slots+segment*kFastFusedFlashStride;
+        // An empty segment (no unmasked key) contributes nothing; its value
+        // plane may be unwritten (L0 OSCAR history segments).
+        if(slot[kFastFusedFlashValues+H+head]==0.0f) continue;
         const float scale=expf(slot[kFastFusedFlashValues+head]-global_max);
         denominator+=slot[kFastFusedFlashValues+H+head]*scale;
         numerator+=slot[head*kHeadDim+tid]*scale;
+    }
+    if(history_live) {
+        const float scale=expf(history[kFastFusedFlashValues+head]-global_max);
+        denominator+=history[kFastFusedFlashValues+H+head]*scale;
+        numerator+=history[head*kHeadDim+tid]*scale;
     }
     if(self_q) {
         const float weight=expf(self_score-global_max);
@@ -6327,12 +6342,14 @@ bool fused_flash_merge_heads_enabled() {
 void launch_fused_flash_merge(const float* workspace,std::uint16_t* output,int rows,
     int segments,int position,int capacity,int keys,const int* position_device,
     cudaStream_t stream,const std::uint16_t* self_q=nullptr,
-    const std::uint16_t* self_k=nullptr,const std::uint16_t* self_v=nullptr) {
-    if(self_q && !fused_flash_merge_heads_enabled())
+    const std::uint16_t* self_k=nullptr,const std::uint16_t* self_v=nullptr,
+    const float* history_slot=nullptr) {
+    if((self_q || history_slot) && !fused_flash_merge_heads_enabled())
         throw std::invalid_argument("verifier self-term merge requires the per-head merge");
     if(fused_flash_merge_heads_enabled())
         exl3_launch_small(attention_fused_flash_merge_heads_kernel,dim3(rows*kKVHeads*kFastFusedFlashHeads),dim3(256),0,stream,workspace,output,rows,
-                segments,position,capacity,keys,position_device,0,self_q,self_k,self_v);
+                segments,position,capacity,keys,position_device,0,self_q,self_k,self_v,
+                history_slot);
     else
         attention_cached_gqa_six_fused_flash_merge_kernel<<<
             rows*kKVHeads,256,0,stream>>>(workspace,output,rows,segments,position,
@@ -6343,7 +6360,7 @@ template<int kVerifyMmaKeys>
 __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,float* workspace,int rows,int position,
-    int capacity,int segments,const int* position_device,int query_offset) {
+    int capacity,int segments,const int* position_device,int query_offset,int l0_history=0) {
     EXL3_PDL_SMALL_PROLOGUE();
     constexpr int H=kFastFusedFlashHeads;
     constexpr int kVectors=kHeadDim/8;
@@ -6364,6 +6381,22 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const int last_count=base+rows;  // largest live key count of the block
     if(first>=last_count || base+1<1 || last_count>capacity) return;
     const int segment_end=min(first+kVerifyMmaKeys,last_count);
+    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT2
+    // history kernel; a segment wholly inside it only publishes an empty slot.
+    const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
+    const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    if(first>=history_begin && segment_end<=history_end) {
+        if(tid<rows*H) {
+            const int row=tid/H,head=tid%H;
+            float* slot=workspace+
+                ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*
+                    kFastFusedFlashStride;
+            slot[kFastFusedFlashValues+head]=-INFINITY;
+            slot[kFastFusedFlashValues+H+head]=0.0f;
+        }
+        return;
+    }
 
     // Fragment rows: pair = row*6 + head for this warp's m16 tile.
     const int pair0=warp*16+g;
@@ -6426,7 +6459,8 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
             #pragma unroll
             for(int e=0;e<4;++e) {
                 const int key=chunk_first+8*j+2*t+(e&1);
-                const bool valid=e<2?(live0&&key<prefix0):(live1&&key<prefix1);
+                const bool valid=(e<2?(live0&&key<prefix0):(live1&&key<prefix1))&&
+                    !(key>=history_begin&&key<history_end);
                 s[j][e]=valid?s[j][e]*0.0625f:-INFINITY;
                 tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]);
             }
@@ -6502,6 +6536,8 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     }
 }
 
+#include "exl3/l0_oscar_attention.cuh"
+
 bool verify_flash_mma_enabled() {
     static const bool enabled=[] {
         const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA");
@@ -6531,8 +6567,10 @@ int verify_flash_mma_keys() {
 int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
     const std::uint16_t* v,float* workspace,std::size_t workspace_bytes,
     std::uint16_t* output,int rows,int position,int capacity,
-    const int* position_device,cudaStream_t stream,int requested_keys=0) {
+    const int* position_device,cudaStream_t stream,int requested_keys=0,
+    const float* history_slot=nullptr) {
     const int count=position+rows;
+    const int l0_history=history_slot?1:0;
     int keys=requested_keys?requested_keys:verify_flash_mma_keys();
     const auto required=[&](int length) {
         return static_cast<std::size_t>(rows)*kKVHeads*((count+length-1)/length)*
@@ -6545,15 +6583,15 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
     const dim3 grid(segments,kKVHeads);
     if(keys==64)
         exl3_launch_small(attention_verify_flash_mma_kernel<64>,dim3(grid),dim3(96),0,stream,
-            q,k,v,workspace,rows,position,capacity,segments,position_device,0);
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history);
     else if(keys==128)
         exl3_launch_small(attention_verify_flash_mma_kernel<128>,dim3(grid),dim3(96),0,stream,
-            q,k,v,workspace,rows,position,capacity,segments,position_device,0);
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history);
     else
         exl3_launch_small(attention_verify_flash_mma_kernel<256>,dim3(grid),dim3(96),0,stream,
-            q,k,v,workspace,rows,position,capacity,segments,position_device,0);
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history);
     launch_fused_flash_merge(workspace,output,rows,segments,position,capacity,keys,
-        position_device,stream,q,k,v);
+        position_device,stream,q,k,v,history_slot);
     return keys;
 }
 
@@ -7063,6 +7101,41 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
     k_cache_ = k_cache;
     v_cache_ = v_cache;
     cache_capacity_ = capacity;
+    if (l0_oscar::enabled() && !l0_.k_codes) {
+        if (kv_fakequant::config().mode)
+            throw std::invalid_argument("L0 OSCAR and KV fake-quant are exclusive");
+        (void)l0_oscar::assets();
+        auto& l=l0_;
+        l.capacity=capacity; l.rows=8; l.bank=fakequant_bank_;
+        l.segment_keys=l0_oscar::history_segment_keys(capacity);
+        l.segments=(capacity+l.segment_keys-1)/l.segment_keys;
+        const std::size_t cells=static_cast<std::size_t>(capacity)*kKVHeads;
+        const auto alloc=[](auto*& p,std::size_t bytes) {
+            if(cudaMalloc(reinterpret_cast<void**>(&p),bytes)!=cudaSuccess)
+                throw std::runtime_error("L0 OSCAR storage allocation");
+        };
+        alloc(l.k_codes,cells*l0_oscar::kCodeBytes);
+        alloc(l.v_codes,cells*l0_oscar::kCodeBytes);
+        alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(float));
+        alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(float));
+        alloc(l.state,2*sizeof(int));
+        cudaMemset(l.state,0,2*sizeof(int));
+        // Query and history scratch is consumed within one layer's attention on
+        // the layer stream, so all full-attention layers of the process share it
+        // (one target context executes layers sequentially).
+        static l0_oscar::LayerStorage shared{};
+        if(shared.segments<l.segments) {
+            // Earlier layers keep their (smaller) scratch; it is never released.
+            shared.segments=l.segments;
+            alloc(shared.q_rot,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(std::uint16_t));
+            alloc(shared.q_mu,static_cast<std::size_t>(l.rows)*kQHeads*sizeof(float));
+            alloc(shared.hist_work,static_cast<std::size_t>(l.rows)*kKVHeads*l.segments*
+                kFastFusedFlashStride*sizeof(float));
+            alloc(shared.hist_slot,static_cast<std::size_t>(l.rows)*kKVHeads*kFastFusedFlashStride*sizeof(float));
+            alloc(shared.hist_rotated,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
+        }
+        l.q_rot=shared.q_rot; l.q_mu=shared.q_mu; l.hist_work=shared.hist_work; l.hist_slot=shared.hist_slot; l.hist_rotated=shared.hist_rotated;
+    }
     if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
         cudaMalloc(&fakequant_watermark_, 4 * sizeof(int)) == cudaSuccess)
         cudaMemset(fakequant_watermark_, 0, 4 * sizeof(int));
@@ -7891,6 +7964,15 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         exl3_launch_small(append_kv_cache_kernel,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,
             kr, vp, k_cache_, v_cache_, rows, position, cache_capacity_, position_device_);
         launch(cudaGetLastError(), "append EXL3 attention KV cache");
+        if (l0_.k_codes) {
+            const auto& a=l0_oscar::assets();
+            l0_oscar::encode_kernel<<<256,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
+                position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
+                l0_.k_meta,l0_.v_meta);
+            l0_oscar::advance_kernel<<<1,1,0,stream>>>(position_device_,position,l0_.state,
+                cache_capacity_);
+            launch(cudaGetLastError(),"L0 OSCAR history encode");
+        }
         if (fakequant_watermark_)
             kv_fakequant::age(k_cache_, v_cache_, cache_capacity_, position_device_, position,
                               fakequant_watermark_, fakequant_bank_, stream);
@@ -8450,10 +8532,40 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 throw std::invalid_argument(
                     "FAST fused flash attention scratch extent");
             const bool mma=fast_fused_flash_attention_keys256_&&verify_flash_mma_enabled();
+            if(l0_.k_codes && !mma)
+                throw std::invalid_argument("L0 OSCAR history requires the verifier MMA route");
+            const float* history_slot=nullptr;
+            if(l0_.k_codes) {
+                if(rows>l0_.rows) throw std::invalid_argument("L0 OSCAR history rows");
+                const auto& a=l0_oscar::assets();
+                l0_oscar::query_kernel<<<rows*32,192,0,stream>>>(qr,rows,a,l0_.bank,
+                    reinterpret_cast<__half*>(l0_.q_rot),l0_.q_mu);
+                const dim3 grid(l0_.segments,kKVHeads);
+                const auto history=[&](auto kernel) {
+                    kernel<<<grid,96,0,stream>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
+                        l0_.k_meta,l0_.v_meta,l0_.hist_work,rows,position,cache_capacity_,
+                        l0_.segments,position_device_);
+                };
+                switch(l0_.segment_keys) {
+                case 64: history(l0_history_mma_kernel<64>); break;
+                case 128: history(l0_history_mma_kernel<128>); break;
+                case 256: history(l0_history_mma_kernel<256>); break;
+                default: history(l0_history_mma_kernel<512>); break;
+                }
+                l0_history_merge_kernel<<<rows*kQHeads,256,0,stream>>>(l0_.hist_work,
+                    l0_.hist_slot,l0_.hist_rotated,rows,l0_.segments,l0_.segment_keys,position,
+                    cache_capacity_,position_device_);
+                l0_history_unrotate_kernel<<<rows*32,192,0,stream>>>(l0_.hist_rotated,
+                    l0_.hist_slot,rows,
+                    a.rvt+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim*kHeadDim);
+                launch(cudaGetLastError(),"L0 OSCAR history attention");
+                history_slot=l0_.hist_slot;
+            }
             if(mma)
                 launch_verify_flash_mma(qr,attention_k,attention_v,exact_scores_,
                     exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
-                    attn,rows,position,cache_capacity_,position_device_,stream);
+                    attn,rows,position,cache_capacity_,position_device_,stream,0,
+                    history_slot);
             else if(fast_fused_flash_attention_keys256_&&fused_flash_staged_k_enabled())
                 attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256,true><<<
                     rows*kKVHeads*segments,256,0,stream>>>(
