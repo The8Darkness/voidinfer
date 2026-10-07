@@ -5,7 +5,13 @@ static void require(bool ok) { if(!ok)throw std::runtime_error("gaming option co
 int main() {
     try {
         for(const auto* flag:gopt_flags)_putenv_s(flag,"");
-        for(bool value:Exl3GamingOptions::from_environment().enabled)require(!value);
+        // Unset flags are off except GOPT-002, the measured default.
+        {
+            const auto defaults=Exl3GamingOptions::from_environment().enabled;
+            for(unsigned i=0;i<defaults.size();++i)
+                require(defaults[i]==(i==static_cast<unsigned>(Gopt::GdnConvTrace)));
+        }
+        for(const auto* flag:gopt_flags)_putenv_s(flag,"0");
         for(const auto* flag:gopt_flags) {
             _putenv_s(flag,"1");
             auto options=Exl3GamingOptions::from_environment();

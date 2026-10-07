@@ -15,6 +15,11 @@ struct Exl3SiblingRowCopy {
     int count = 0;
     int stride = 1;
     int slot_elements = 0;
+    // Window-ring entries (L0 OSCAR): src/dst are ring bases and the rows
+    // src_row/dst_row relative to the attempt base wrap with ring_mask.
+    int ring_mask = 0;
+    int src_row = 0;
+    int dst_row = 0;
 };
 using Exl3SiblingRowCopies = std::vector<Exl3SiblingRowCopy>;
 

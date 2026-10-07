@@ -20,6 +20,8 @@ struct Exl3NativeContextExtent {
     // L0 OSCAR contexts keep FP16 K/V in mapped host memory and only INT2
     // history plus exact windows on the device (l0_oscar.cuh).
     static constexpr std::uint32_t l0_oscar_tokens = 262144;
+    // L0 OSCAR per-row buffers (hidden states, taps) hold one layer-major prefill block.
+    static constexpr int l0_prefill_block_rows = 8192;
     static bool l0_oscar_enabled() {
         const char* value=std::getenv("NINFER_EXL3_L0_OSCAR");
         return value && value[0]=='1' && value[1]==0;

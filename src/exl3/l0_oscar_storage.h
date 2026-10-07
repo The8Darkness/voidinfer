@@ -13,6 +13,13 @@ struct LayerStorage {
     float* k_meta = nullptr;
     float* v_meta = nullptr;
     int* state = nullptr;
+    // Device copy of the exact window: absolute row r >= kSink lives in ring
+    // slot r & (kRingRows - 1), rows < kSink in the sink planes. The mapped
+    // host planes stay the complete FP16 record (L2) for export and aging.
+    std::uint16_t* k_ring = nullptr;
+    std::uint16_t* v_ring = nullptr;
+    std::uint16_t* k_sink = nullptr;
+    std::uint16_t* v_sink = nullptr;
     std::uint16_t* q_rot = nullptr;   // FP16 [rows][24][256]
     float* q_mu = nullptr;            // [rows][24]
     float* hist_work = nullptr;       // [rows][4][segments][fused-flash stride]

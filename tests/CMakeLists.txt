@@ -697,3 +697,8 @@ ninfer_add_test(research_exl3_kv_tier_capture
   SOURCES research_exl3_kv_tier_capture.cpp
   LIBRARIES ninfer_exl3_text_model ninfer_ops)
 set_tests_properties(research_exl3_kv_tier_capture PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(research_exl3_long_nll
+  SOURCES research_exl3_long_nll.cpp
+  LIBRARIES ninfer_exl3_text_model ninfer_ops)
+set_tests_properties(research_exl3_long_nll PROPERTIES SKIP_RETURN_CODE 77)

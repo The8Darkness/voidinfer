@@ -100,9 +100,6 @@ public:
     // the target. Only the draft's proven-discarded whole calls omit tap work.
     // This is the same path the harness and guarded Engine must use.
     void begin_fresh(std::span<const std::int64_t> input,bool layer_major) {
-        // L0 OSCAR contexts hold per-row buffers for one 1024-row chunk only and
-        // therefore prefill row-major.
-        if(Exl3NativeContextExtent::l0_oscar_enabled()) layer_major=false;
         if(phase_!=Phase::unstarted)
             throw std::logic_error("fast device fresh request already began");
         if(context_->position()!=0 || input.size()<16 ||

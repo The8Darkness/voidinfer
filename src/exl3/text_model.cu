@@ -1174,6 +1174,8 @@ struct Exl3TextContext::Impl {
     cudaEvent_t repair_fork=nullptr;
     cudaEvent_t repair_join=nullptr;
     bool repair_pending=false;
+    // L0 OSCAR: re-entry of append_prefill_layer_major for one bounded block.
+    bool l0_layer_major_block=false;
     int verifier_siblings=0;
     // Sibling promotion descriptor tables, one per (source, destination, rows).
     struct SiblingCopyTable {
@@ -1640,8 +1642,9 @@ struct Exl3TextContext::Impl {
         ContinuationGraphBoundary result;
         if(!continuation)return result;
         const auto row_storage=static_cast<std::size_t>(
-            (host_kv.enabled || oscar_only || Exl3NativeContextExtent::l0_oscar_enabled()) ?
-                prefill_capacity : max_context);
+            (host_kv.enabled || oscar_only) ? prefill_capacity :
+                (Exl3NativeContextExtent::l0_oscar_enabled() ?
+                    std::min<int>(max_context,Exl3NativeContextExtent::l0_prefill_block_rows) : max_context));
         const auto hidden_bytes=row_storage*static_cast<std::size_t>(kHidden)*
             sizeof(std::uint16_t);
         const auto add=[&](const void* address,std::size_t bytes) noexcept {
@@ -4576,8 +4579,9 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     impl->target_projection_timing_opt_in =
         target_timing != nullptr && std::strcmp(target_timing, "1") == 0;
     // L0 OSCAR contexts prefill in bounded chunks: per-row buffers hold one chunk.
-    const int row_storage=(impl->host_kv.enabled || impl->oscar_only ||
-        Exl3NativeContextExtent::l0_oscar_enabled()) ? impl->prefill_capacity : max_context_;
+    const int row_storage=(impl->host_kv.enabled || impl->oscar_only) ? impl->prefill_capacity :
+        (Exl3NativeContextExtent::l0_oscar_enabled() ?
+            std::min<int>(max_context_,Exl3NativeContextExtent::l0_prefill_block_rows) : max_context_);
     require(row_storage>0,"target context storage rows must be positive");
     const auto checked_extent=[&](std::size_t bytes_per_row) {
         Exl3ResourceInventory::Requirement required;
@@ -8062,29 +8066,56 @@ bool Exl3TextContext::layer_major_from_zero() {
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
-    if (Exl3NativeContextExtent::l0_oscar_enabled()) {
-        // L0 OSCAR contexts hold per-row buffers for one chunk: the same suffix
-        // is ingested row-major in 1024-row wide chunks, and the retained tap
-        // tail is filled from each chunk's captured taps.
-        const int tap_rows=retained_taps?retained_taps->rows:0;
-        for (std::size_t first = 0; first < token_ids.size();) {
-            const int rows = static_cast<int>(std::min<std::size_t>(1024, token_ids.size() - first));
-            const int chunk_abs = position_;
-            // A fresh context starts with the established initial prefill.
-            const int take = position_ == 0 ? std::min(rows, 16) : rows;
-            if (position_ == 0) prefill(token_ids.subspan(first, take), stream);
-            else append_prefill_wide(token_ids.subspan(first, take), stream);
-            const int ingested = take;
-            if (retained_taps) {
-                const int lo = std::max(chunk_abs, retained_taps->first_abs);
-                const int hi = std::min(chunk_abs + ingested, retained_taps->first_abs + tap_rows);
-                for (std::size_t tap = 0; lo < hi && tap < kTapLayers.size(); ++tap)
-                    copy_tap_rows_to_device(kTapLayers[tap], lo - chunk_abs,
-                        retained_taps->device + (tap * static_cast<std::size_t>(tap_rows) +
-                            (lo - retained_taps->first_abs)) * kHidden,
-                        hi - lo, stream);
+    if (Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->l0_layer_major_block) {
+        // L0 OSCAR contexts hold per-row buffers for one block of
+        // kL0PrefillBlockRows: the suffix is ingested layer-major block by
+        // block (the last block holds the retained tap tail), and blocks of at
+        // most 1024 rows row-major in wide chunks.
+        const auto row_major=[&](std::span<const std::int64_t> ids,const RetainedTapTail* retained) {
+            const int tap_rows=retained?retained->rows:0;
+            for (std::size_t first = 0; first < ids.size();) {
+                const int rows = static_cast<int>(std::min<std::size_t>(1024, ids.size() - first));
+                const int chunk_abs = position_;
+                const int take = position_ == 0 ? std::min(rows, 16) : rows;
+                if (position_ == 0) prefill(ids.subspan(first, take), stream);
+                else append_prefill_wide(ids.subspan(first, take), stream);
+                if (retained) {
+                    const int lo = std::max(chunk_abs, retained->first_abs);
+                    const int hi = std::min(chunk_abs + take, retained->first_abs + tap_rows);
+                    for (std::size_t tap = 0; lo < hi && tap < kTapLayers.size(); ++tap)
+                        copy_tap_rows_to_device(kTapLayers[tap], lo - chunk_abs,
+                            retained->device + (tap * static_cast<std::size_t>(tap_rows) +
+                                (lo - retained->first_abs)) * kHidden,
+                            hi - lo, stream);
+                }
+                first += static_cast<std::size_t>(take);
             }
-            first += static_cast<std::size_t>(ingested);
+        };
+        constexpr std::size_t block=Exl3NativeContextExtent::l0_prefill_block_rows;
+        // Equal blocks of at most `block` rows: every block of a multi-block
+        // suffix exceeds block / 2 rows, so the last one holds the tap tail.
+        const std::size_t total=token_ids.size();
+        const std::size_t count=(total+block-1)/block;
+        std::vector<std::pair<std::size_t,std::size_t>> parts;
+        for (std::size_t p=0,at=0;p<count;++p) {
+            const std::size_t rows=(total-at)/(count-p);
+            parts.push_back({at,rows});
+            at+=rows;
+        }
+        for (std::size_t p = 0; p < parts.size(); ++p) {
+            auto ids = token_ids.subspan(parts[p].first, parts[p].second);
+            const RetainedTapTail* retained = p + 1 == parts.size() ? retained_taps : nullptr;
+            if (position_ == 0 && !layer_major_from_zero()) {
+                const auto initial = std::min<std::size_t>(16, ids.size());
+                prefill(ids.first(initial), stream);
+                ids = ids.subspan(initial);
+            }
+            if (ids.size() > 1024) {
+                impl_->l0_layer_major_block = true;
+                try { append_prefill_layer_major(ids, stream, retained); }
+                catch (...) { impl_->l0_layer_major_block = false; throw; }
+                impl_->l0_layer_major_block = false;
+            } else if (!ids.empty()) row_major(ids, retained);
         }
         return;
     }
@@ -8893,12 +8924,17 @@ void Exl3TextContext::prepare_continuation_impl(int capacity,Exl3VeriCacheServin
 __global__ void sibling_row_copy_kernel(const Exl3SiblingRowCopy* entries,
     const int* position_device,int attempted_rows) {
     const auto entry=entries[blockIdx.x];
+    const int attempt_base=*position_device-attempted_rows+1;
     const std::ptrdiff_t shift=entry.slot_elements?
-        static_cast<std::ptrdiff_t>(*position_device-attempted_rows+1)*entry.slot_elements:0;
+        static_cast<std::ptrdiff_t>(attempt_base)*entry.slot_elements:0;
+    const std::ptrdiff_t src_shift=entry.ring_mask?
+        static_cast<std::ptrdiff_t>((attempt_base+entry.src_row)&entry.ring_mask)*entry.slot_elements:shift;
+    const std::ptrdiff_t dst_shift=entry.ring_mask?
+        static_cast<std::ptrdiff_t>((attempt_base+entry.dst_row)&entry.ring_mask)*entry.slot_elements:shift;
     for(int i=static_cast<int>(blockIdx.y*blockDim.x+threadIdx.x);i<entry.count;
         i+=static_cast<int>(gridDim.y*blockDim.x)) {
-        const std::ptrdiff_t offset=shift+static_cast<std::ptrdiff_t>(i)*entry.stride;
-        entry.dst[offset]=entry.src[offset];
+        const std::ptrdiff_t offset=static_cast<std::ptrdiff_t>(i)*entry.stride;
+        entry.dst[dst_shift+offset]=entry.src[src_shift+offset];
     }
 }
 
@@ -11638,6 +11674,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
             } else if(!impl_->host_kv.enabled) {
                 restore_kv(impl_->cache_k[layer]->ptr,true,0,state.position_);
                 restore_kv(impl_->cache_v[layer]->ptr,false,0,state.position_);
+                impl_->full_layers[layer]->l0_refresh_window(state.position_,stream);
                 if(oscar) impl_->oscar->append_kv_layer(layer,
                     static_cast<const std::uint16_t*>(impl_->cache_k[layer]->ptr),
                     static_cast<const std::uint16_t*>(impl_->cache_v[layer]->ptr),state.position_,0,stream);

@@ -5,164 +5,371 @@
 
 namespace l0 = ninfer::exl3::l0_oscar;
 
-// One CTA per (history segment, KV head) for up to eight query rows, as
-// attention_verify_flash_mma_kernel, over keys [kSink + segment * kKeys, ...)
-// below history_end(base). Tiles are decoded from INT2 codes into the rotated
-// (and, for K, centered) basis; queries are the rotated q R_k and every score
-// gains the row's q . mu. Slots hold rotated-basis value numerators.
+// One decode slot: 8 consecutive dims of one key, K and V. Raw codes and
+// metadata are fetched into registers a tile ahead of their decode.
+struct L0RawSlot {
+    unsigned k_bits=0,v_bits=0;
+    float k_scale=0.f,k_zero=0.f,v_scale=0.f,v_zero=0.f;
+};
+__device__ __forceinline__ L0RawSlot l0_load_slot(const std::uint8_t* k_codes,
+    const std::uint8_t* v_codes,const float* k_meta,const float* v_meta,int key,int kv_head,
+    int dim,bool valid) {
+    L0RawSlot r;
+    if(!valid) return r;
+    const std::size_t cell=static_cast<std::size_t>(key)*kKVHeads+kv_head;
+    const int group=dim>>7;
+    const float2 km=*reinterpret_cast<const float2*>(k_meta+cell*l0::kMetaFloats+2*group);
+    const float2 vm=*reinterpret_cast<const float2*>(v_meta+cell*l0::kMetaFloats+2*group);
+    r.k_scale=km.x;r.k_zero=km.y;r.v_scale=vm.x;r.v_zero=vm.y;
+    r.k_bits=*reinterpret_cast<const std::uint16_t*>(k_codes+cell*l0::kCodeBytes+(dim>>2));
+    r.v_bits=*reinterpret_cast<const std::uint16_t*>(v_codes+cell*l0::kCodeBytes+(dim>>2));
+    return r;
+}
+__device__ __forceinline__ void l0_store_slot(const L0RawSlot& r,half* k_dst,half* v_dst) {
+    // x^ = (code - zero) * scale = code * scale + (-zero * scale): one FMA per value.
+    const float kb=-r.k_zero*r.k_scale,vb=-r.v_zero*r.v_scale;
+    half k8[8],v8[8];
+    #pragma unroll
+    for(int e=0;e<8;++e) {
+        k8[e]=__float2half_rn(fmaf(static_cast<float>((r.k_bits>>(2*e))&3u),r.k_scale,kb));
+        v8[e]=__float2half_rn(fmaf(static_cast<float>((r.v_bits>>(2*e))&3u),r.v_scale,vb));
+    }
+    *reinterpret_cast<uint4*>(k_dst)=*reinterpret_cast<const uint4*>(k8);
+    *reinterpret_cast<uint4*>(v_dst)=*reinterpret_cast<const uint4*>(v8);
+}
+
+// Verifier history attention over INT2 codes, consumed straight from the
+// codes (no FP16 tiles):
+//   QK  s8 MMA (m16n8k32) of the int8-quantized rotated queries (per 128-dim
+//       group scale) against the raw codes; the per-key K scale and zero are
+//       applied to the int32 sums of each group.
+//   PV  FP16 MMA whose B operand is the code itself read in place as an FP16
+//       subnormal (c 4^e 2^-24); the per-key V scale is folded into P and
+//       the V zero term is carried as a per-row bias.
+// CTA = (history segment, KV head), 12 warps = (m-tile of 16 query vectors,
+// 128-dim value group, key stream). Raw codes and metadata stream through a
+// cp.async ring of 64-key stages shared by all warps; each stream takes one
+// 16-key block of every 32 keys. The two streams merge in shared memory.
+constexpr int kL0HistoryStreams=1;          // partial slots per segment
+constexpr int kL0KeyStreams=2;              // in-CTA key streams
+constexpr int kL0HistoryThreads=192*kL0KeyStreams;
+constexpr int kL0Queries=48;
+constexpr int kL0StageKeys=64;
+constexpr int kL0Stages=5;
+constexpr int kL0RawKeyBytes=2*l0::kCodeBytes+2*l0::kMetaFloats*4;   // K codes, V codes, K meta, V meta
+constexpr std::size_t kL0StageBytes=static_cast<std::size_t>(kL0StageKeys)*kL0RawKeyBytes;
+constexpr std::size_t kL0MergeBytes=static_cast<std::size_t>(6)*32*70*sizeof(float);
+constexpr std::size_t l0_history_smem_bytes() {
+    return kL0Stages*kL0StageBytes>kL0MergeBytes?kL0Stages*kL0StageBytes:kL0MergeBytes;
+}
+
+__device__ __forceinline__ void l0_cp16(void* dst,const void* src,bool valid) {
+    const unsigned d=static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"::"r"(d),"l"(src),"r"(valid?16:0));
+}
+__device__ __forceinline__ void l0_imma(int (&c)[4],const unsigned (&a)[4],unsigned b0,unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3]) : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
+}
+// Undoes the subnormal code scale of PV n-tile n (see the PV loop).
+__device__ __forceinline__ constexpr float l0_code_scale(int n) {
+    return 16777216.0f/static_cast<float>(1<<(2*((n&7)<5?(n&7):(n&7)-5)));
+}
+
 template<int kKeys>
-__global__ void __launch_bounds__(96) l0_history_mma_kernel(
+__global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
     const std::uint8_t* v_codes,const float* k_meta,const float* v_meta,
     float* workspace,int rows,int position,int capacity,int segments,
     const int* position_device) {
     constexpr int H=kFastFusedFlashHeads;
-    constexpr int kVectors=kHeadDim/8;
+    constexpr float kLog2Scale=0.0625f*1.4426950408889634f;
     const auto* q_rot=reinterpret_cast<const __half*>(q_rot_bits);
-    __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
-    __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
+    extern __shared__ __align__(16) unsigned char l0_smem[];
+    __shared__ __align__(16) signed char q8[kL0Queries][kHeadDim];
+    __shared__ __align__(16) unsigned qfrag[3][4][32][8];
+    __shared__ float qinfo[kL0Queries][5];   // qs0, qs1, qsum0, qsum1, mu (log2 units)
     const int segment=static_cast<int>(blockIdx.x);
     const int kv_head=static_cast<int>(blockIdx.y);
     const int tid=static_cast<int>(threadIdx.x);
     const int warp=tid>>5,lane=tid&31,g=lane>>2,t=lane&3;
+    const int stream=warp/6,vgroup=(warp/3)&1,mtile=warp%3;
     const int base=position_device?*position_device:position;
     const int end=min(l0::history_end(base),capacity);
-    const int first=l0::kSink+segment*kKeys;
+    const int span=l0::history_span(end,segments);
+    const int first=l0::kSink+segment*span;
     if(first>=end) return;
-    const int segment_end=min(first+kKeys,end);
-    const int pair0=warp*16+g,pair1=pair0+8;
-    const int row0=pair0/H,head0=pair0%H,row1=pair1/H,head1=pair1%H;
-    const bool live0=row0<rows,live1=row1<rows;
-    const float mu0=live0?q_mu[row0*kQHeads+kv_head*H+head0]:0.0f;
-    const float mu1=live1?q_mu[row1*kQHeads+kv_head*H+head1]:0.0f;
-    const auto* q0=reinterpret_cast<const unsigned*>(q_rot+
-        (static_cast<std::size_t>(live0?row0:0)*kQHeads+kv_head*H+head0)*kHeadDim+2*t);
-    const auto* q1=reinterpret_cast<const unsigned*>(q_rot+
-        (static_cast<std::size_t>(live1?row1:0)*kQHeads+kv_head*H+head1)*kHeadDim+2*t);
-    float acc[kHeadDim/8][4];
+    const int segment_end=min(first+span,end);
+    const int stages=(segment_end-first+kL0StageKeys-1)/kL0StageKeys;
+    constexpr int kChunksPerKey=kL0RawKeyBytes/16;   // 10
+    const auto fetch=[&](int stage) {
+        if(stage<stages) {
+            unsigned char* dst=l0_smem+(stage%kL0Stages)*kL0StageBytes;
+            const int key0=first+stage*kL0StageKeys;
+            for(int c=tid;c<kL0StageKeys*kChunksPerKey;c+=kL0HistoryThreads) {
+                const int key_off=c/kChunksPerKey,part=c%kChunksPerKey,key=key0+key_off;
+                const bool valid=key<segment_end;
+                const std::size_t cell=static_cast<std::size_t>(valid?key:first)*kKVHeads+kv_head;
+                const void* src=part<4?static_cast<const void*>(k_codes+cell*l0::kCodeBytes+part*16):
+                    part<8?static_cast<const void*>(v_codes+cell*l0::kCodeBytes+(part-4)*16):
+                    part==8?static_cast<const void*>(k_meta+cell*l0::kMetaFloats):
+                            static_cast<const void*>(v_meta+cell*l0::kMetaFloats);
+                l0_cp16(dst+key_off*kL0RawKeyBytes+part*16,src,valid);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n");
+    };
     #pragma unroll
-    for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
-    float running_max[2]={-INFINITY,-INFINITY};
-    float denominator[2]={0.0f,0.0f};
-    for(int chunk_first=first;chunk_first<segment_end;chunk_first+=kVerifyMmaChunk) {
+    for(int s=0;s<kL0Stages-1;++s) fetch(s);
+    // Quantize the 48 query vectors per 128-dim group: two threads per
+    // (vector, group), all loads in flight before the reductions.
+    if(tid<4*kL0Queries) {
+        const int unit=tid>>1,part=tid&1,v=unit>>1,group=unit&1,row=v/H,head=v%H;
+        const int dim0=group*128+part*64;
+        uint4 raw[8];
+        #pragma unroll
+        for(int i=0;i<8;++i) raw[i]=make_uint4(0,0,0,0);
+        if(row<rows) {
+            const uint4* src=reinterpret_cast<const uint4*>(q_rot+
+                (static_cast<std::size_t>(row)*kQHeads+kv_head*H+head)*kHeadDim+dim0);
+            #pragma unroll
+            for(int i=0;i<8;++i) raw[i]=src[i];
+        }
+        float amax=0.f,sum=0.f;
+        #pragma unroll
+        for(int i=0;i<8;++i) {
+            const __half2* h2=reinterpret_cast<const __half2*>(&raw[i]);
+            #pragma unroll
+            for(int k=0;k<4;++k) {
+                const float2 f=__half22float2(h2[k]);
+                amax=fmaxf(amax,fmaxf(fabsf(f.x),fabsf(f.y)));sum+=f.x+f.y;
+            }
+        }
+        amax=fmaxf(amax,__shfl_xor_sync(0xffffffffU,amax,1));
+        sum+=__shfl_xor_sync(0xffffffffU,sum,1);
+        const float inv=amax>0.f?127.f/amax:0.f;
+        #pragma unroll
+        for(int i=0;i<8;++i) {
+            const __half2* h2=reinterpret_cast<const __half2*>(&raw[i]);
+            unsigned packed[2];
+            #pragma unroll
+            for(int k=0;k<2;++k) {
+                const float2 f0=__half22float2(h2[2*k]),f1=__half22float2(h2[2*k+1]);
+                packed[k]=(__float2int_rn(f0.x*inv)&255)|((__float2int_rn(f0.y*inv)&255)<<8)|
+                    ((__float2int_rn(f1.x*inv)&255)<<16)|((__float2int_rn(f1.y*inv)&255)<<24);
+            }
+            *reinterpret_cast<uint2*>(&q8[v][dim0+8*i])=make_uint2(packed[0],packed[1]);
+        }
+        if(part==0) {
+            qinfo[v][group]=amax/127.f*kLog2Scale;
+            qinfo[v][2+group]=sum*kLog2Scale;
+            if(group==0) qinfo[v][4]=row<rows?q_mu[row*kQHeads+kv_head*H+head]*kLog2Scale:0.f;
+        }
+    }
+    __syncthreads();
+    // A fragments: k-step pair m uses code word W = 8 (m >> 1) + 2t + (m & 1)
+    // of each key; byte i of (w >> 2j) & 0x03030303 is dim 16 W + 4 i + j.
+    for(int e=tid;e<3*4*32;e+=kL0HistoryThreads) {
+        const int mt=e/128,m=(e/32)%4,ln=e%32,gg=ln>>2,tt=ln&3;
+        const int W=8*(m>>1)+2*tt+(m&1);
+        const signed char* r0=q8[mt*16+gg];
+        const signed char* r1=q8[mt*16+gg+8];
+        unsigned out[8];
+        #pragma unroll
+        for(int sb=0;sb<2;++sb) {
+            unsigned a0=0,a1=0,a2=0,a3=0;
+            #pragma unroll
+            for(int i=0;i<4;++i) {
+                const int d=16*W+4*i+2*sb;
+                a0|=static_cast<unsigned>(static_cast<unsigned char>(r0[d]))<<(8*i);
+                a1|=static_cast<unsigned>(static_cast<unsigned char>(r1[d]))<<(8*i);
+                a2|=static_cast<unsigned>(static_cast<unsigned char>(r0[d+1]))<<(8*i);
+                a3|=static_cast<unsigned>(static_cast<unsigned char>(r1[d+1]))<<(8*i);
+            }
+            out[4*sb]=a0;out[4*sb+1]=a1;out[4*sb+2]=a2;out[4*sb+3]=a3;
+        }
+        *reinterpret_cast<uint4*>(&qfrag[mt][m][ln][0])=make_uint4(out[0],out[1],out[2],out[3]);
+        *reinterpret_cast<uint4*>(&qfrag[mt][m][ln][4])=make_uint4(out[4],out[5],out[6],out[7]);
+    }
+    const int v0=mtile*16+g,v1=v0+8;
+    float acc[16][4];
+    #pragma unroll
+    for(int n=0;n<16;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+    float mx[2]={-INFINITY,-INFINITY},den[2]={0.f,0.f},bias[2]={0.f,0.f};
+    for(int stage=0;stage<stages;++stage) {
+        asm volatile("cp.async.wait_group %0;\n"::"n"(kL0Stages-2));
         __syncthreads();
-        for(int index=tid;index<kVerifyMmaChunk*kVectors;index+=blockDim.x) {
-            const int key_offset=index/kVectors;
-            const int dim=(index%kVectors)*8;
-            const int key=chunk_first+key_offset;
-            half kv8[8],vv8[8];
-            if(key<segment_end) {
-                const std::size_t cell=static_cast<std::size_t>(key)*kKVHeads+kv_head;
-                const int group=dim>>7;
-                const float ks=k_meta[cell*l0::kMetaFloats+2*group];
-                const float kz=k_meta[cell*l0::kMetaFloats+2*group+1];
-                const float vs=v_meta[cell*l0::kMetaFloats+2*group];
-                const float vz=v_meta[cell*l0::kMetaFloats+2*group+1];
-                const unsigned kb=*reinterpret_cast<const std::uint16_t*>(k_codes+cell*l0::kCodeBytes+(dim>>2));
-                const unsigned vb=*reinterpret_cast<const std::uint16_t*>(v_codes+cell*l0::kCodeBytes+(dim>>2));
+        fetch(stage+kL0Stages-1);
+        const unsigned char* raw=l0_smem+(stage%kL0Stages)*kL0StageBytes;
+        float qi[2][5];
+        #pragma unroll
+        for(int i=0;i<5;++i) { qi[0][i]=qinfo[v0][i]; qi[1][i]=qinfo[v1][i]; }
+        #pragma unroll
+        for(int blk=0;blk<kL0StageKeys/(16*kL0KeyStreams);++blk) {
+            const int key_off=16*(kL0KeyStreams*blk+stream);
+            const int kb=first+stage*kL0StageKeys+key_off;
+            const unsigned char* bk=raw+key_off*kL0RawKeyBytes;
+            // QK: int32 sums per group.
+            int s[2][2][4];
+            #pragma unroll
+            for(int h=0;h<2;++h)
                 #pragma unroll
-                for(int e=0;e<8;++e) {
-                    kv8[e]=__float2half_rn((static_cast<float>((kb>>(2*e))&3u)-kz)*ks);
-                    vv8[e]=__float2half_rn((static_cast<float>((vb>>(2*e))&3u)-vz)*vs);
+                for(int j=0;j<2;++j) s[h][j][0]=s[h][j][1]=s[h][j][2]=s[h][j][3]=0;
+            uint2 kc[2][2];
+            #pragma unroll
+            for(int j=0;j<2;++j) {
+                const uint2* w=reinterpret_cast<const uint2*>(bk+(8*j+g)*kL0RawKeyBytes);
+                kc[j][0]=w[t];kc[j][1]=w[4+t];
+            }
+            #pragma unroll
+            for(int m=0;m<4;++m) {
+                const uint4 f0=*reinterpret_cast<const uint4*>(&qfrag[mtile][m][lane][0]);
+                const uint4 f1=*reinterpret_cast<const uint4*>(&qfrag[mtile][m][lane][4]);
+                const unsigned a[2][4]={{f0.x,f0.y,f0.z,f0.w},{f1.x,f1.y,f1.z,f1.w}};
+                #pragma unroll
+                for(int j=0;j<2;++j) {
+                    const unsigned w=(m&1)?kc[j][m>>1].y:kc[j][m>>1].x;
+                    #pragma unroll
+                    for(int sb=0;sb<2;++sb)
+                        l0_imma(s[m>>1][j],a[sb],(w>>(4*sb))&0x03030303U,(w>>(4*sb+2))&0x03030303U);
                 }
-            } else {
+            }
+            // Keys of this lane's score columns: 2t + (i & 1) + 8 (i >> 1).
+            float4 km[4];float2 vm[4];unsigned vw[4];
+            #pragma unroll
+            for(int i=0;i<4;++i) {
+                const unsigned char* r=bk+(2*t+(i&1)+8*(i>>1))*kL0RawKeyBytes;
+                km[i]=*reinterpret_cast<const float4*>(r+2*l0::kCodeBytes);
+                vm[i]=*reinterpret_cast<const float2*>(r+2*l0::kCodeBytes+16+8*vgroup);
+                vw[i]=*reinterpret_cast<const unsigned*>(r+l0::kCodeBytes+4*(8*vgroup+g));
+            }
+            float sc[2][4];
+            float tmax[2]={-INFINITY,-INFINITY};
+            #pragma unroll
+            for(int j=0;j<2;++j)
                 #pragma unroll
-                for(int e=0;e<8;++e) kv8[e]=vv8[e]=__float2half_rn(0.0f);
-            }
-            *reinterpret_cast<uint4*>(k_s+key_offset*kVerifyMmaStride+dim)=*reinterpret_cast<const uint4*>(kv8);
-            *reinterpret_cast<uint4*>(v_s+key_offset*kVerifyMmaStride+dim)=*reinterpret_cast<const uint4*>(vv8);
-        }
-        __syncthreads();
-        float s[4][4];
-        #pragma unroll
-        for(int j=0;j<4;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.0f;
-        #pragma unroll
-        for(int kk=0;kk<kHeadDim;kk+=16) {
-            const unsigned a[4]={live0?q0[kk/2]:0u,live1?q1[kk/2]:0u,
-                                 live0?q0[kk/2+4]:0u,live1?q1[kk/2+4]:0u};
+                for(int e=0;e<4;++e) {
+                    const int r=e>>1,i=2*j+(e&1);
+                    const float4 k=km[i];
+                    const float v=qi[r][0]*k.x*static_cast<float>(s[0][j][e])+qi[r][1]*k.z*static_cast<float>(s[1][j][e])-
+                        qi[r][2]*k.y*k.x-qi[r][3]*k.w*k.z+qi[r][4];
+                    sc[j][e]=kb+8*j+2*t+(e&1)<segment_end?v:-INFINITY;
+                    tmax[r]=fmaxf(tmax[r],sc[j][e]);
+                }
             #pragma unroll
-            for(int pair=0;pair<2;++pair) {
-                unsigned b[4];
-                reg_attn_ldmatrix_x4(b,k_s+(pair*16+(lane&7)+((lane>>4)<<3))*
-                    kVerifyMmaStride+kk+((lane>>3)&1)*8);
-                reg_attn_mma(s[2*pair],a,b[0],b[1]);
-                reg_attn_mma(s[2*pair+1],a,b[2],b[3]);
+            for(int r=0;r<2;++r) {
+                tmax[r]=fmaxf(tmax[r],__shfl_xor_sync(0xffffffffU,tmax[r],1));
+                tmax[r]=fmaxf(tmax[r],__shfl_xor_sync(0xffffffffU,tmax[r],2));
             }
-        }
-        float tile_max[2]={-INFINITY,-INFINITY};
-        #pragma unroll
-        for(int j=0;j<4;++j)
-            #pragma unroll
-            for(int e=0;e<4;++e) {
-                const int key=chunk_first+8*j+2*t+(e&1);
-                const bool valid=key<segment_end&&(e<2?live0:live1);
-                s[j][e]=valid?(s[j][e]+(e<2?mu0:mu1))*0.0625f:-INFINITY;
-                tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]);
+            // Lazy rescale: the running max moves only when a score exceeds it
+            // by more than 2^kSlack, so P stays <= 2^kSlack (FP16-safe after the
+            // V scale).
+            constexpr float kSlack=8.0f;
+            const bool grow0=tmax[0]>mx[0]+kSlack,grow1=tmax[1]>mx[1]+kSlack;
+            if(__any_sync(0xffffffffU,grow0||grow1)) {
+                float alpha[2];
+                #pragma unroll
+                for(int r=0;r<2;++r) {
+                    const float next=(r?grow1:grow0)?tmax[r]:mx[r];
+                    alpha[r]=mx[r]==-INFINITY?(next==-INFINITY?1.0f:0.0f):exp2f(mx[r]-next);
+                    mx[r]=next;
+                    den[r]*=alpha[r];bias[r]*=alpha[r];
+                }
+                #pragma unroll
+                for(int n=0;n<16;++n) {
+                    acc[n][0]*=alpha[0];acc[n][1]*=alpha[0];
+                    acc[n][2]*=alpha[1];acc[n][3]*=alpha[1];
+                }
             }
-        #pragma unroll
-        for(int i=0;i<2;++i) {
-            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],1));
-            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],2));
-        }
-        float scale[2];
-        #pragma unroll
-        for(int i=0;i<2;++i) {
-            const float next=fmaxf(running_max[i],tile_max[i]);
-            scale[i]=next==-INFINITY?1.0f:expf(running_max[i]-next);
-            running_max[i]=next;
-        }
-        half p[4][4];
-        float sums[2]={0.0f,0.0f};
-        #pragma unroll
-        for(int j=0;j<4;++j)
+            unsigned pa[4];
             #pragma unroll
-            for(int e=0;e<4;++e) {
-                const float m=running_max[e>>1];
-                p[j][e]=__float2half_rn(s[j][e]==-INFINITY?0.0f:expf(s[j][e]-m));
-                sums[e>>1]+=__half2float(p[j][e]);
+            for(int j=0;j<2;++j) {
+                float p[4];
+                #pragma unroll
+                for(int e=0;e<4;++e) {
+                    const int r=e>>1,i=2*j+(e&1);
+                    p[e]=sc[j][e]==-INFINITY?0.f:exp2f(sc[j][e]-mx[r]);
+                    den[r]+=p[e];
+                    bias[r]-=p[e]*vm[i].y*vm[i].x;
+                }
+                pa[2*j]=reg_attn_pack(__float2half_rn(p[0]*vm[2*j].x),__float2half_rn(p[1]*vm[2*j+1].x));
+                pa[2*j+1]=reg_attn_pack(__float2half_rn(p[2]*vm[2*j].x),__float2half_rn(p[3]*vm[2*j+1].x));
             }
-        #pragma unroll
-        for(int i=0;i<2;++i) {
-            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],1);
-            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],2);
-            denominator[i]=denominator[i]*scale[i]+sums[i];
-        }
-        #pragma unroll
-        for(int n=0;n<kHeadDim/8;++n) {
-            acc[n][0]*=scale[0];acc[n][1]*=scale[0];
-            acc[n][2]*=scale[1];acc[n][3]*=scale[1];
-        }
-        #pragma unroll
-        for(int kk=0;kk<2;++kk) {
-            const unsigned a[4]={reg_attn_pack(p[2*kk][0],p[2*kk][1]),
-                                 reg_attn_pack(p[2*kk][2],p[2*kk][3]),
-                                 reg_attn_pack(p[2*kk+1][0],p[2*kk+1][1]),
-                                 reg_attn_pack(p[2*kk+1][2],p[2*kk+1][3])};
+            // PV: n-tile n covers dims 128 vgroup + 16 c + n (column c = lane g
+            // of B). Codes stay in place: n < 5 reads c 4^n 2^-24, n >= 5 reads
+            // after a 10-bit shift as c 4^(n-5) 2^-24 (FP16 subnormals).
+            const unsigned z0lo=__byte_perm(vw[0],vw[1],0x5410),z0hi=__byte_perm(vw[0],vw[1],0x7632);
+            const unsigned z1lo=__byte_perm(vw[2],vw[3],0x5410),z1hi=__byte_perm(vw[2],vw[3],0x7632);
             #pragma unroll
-            for(int pair=0;pair<kHeadDim/16;++pair) {
-                unsigned b[4];
-                reg_attn_ldmatrix_x4_trans(b,v_s+(16*kk+(lane&7)+((lane>>3)&1)*8)*
-                    kVerifyMmaStride+pair*16+(lane>>4)*8);
-                reg_attn_mma(acc[2*pair],a,b[0],b[1]);
-                reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+            for(int n=0;n<16;++n) {
+                const unsigned z0=n<8?z0lo:z0hi,z1=n<8?z1lo:z1hi;
+                const int sh=(n&7)<5?0:10,e=(n&7)<5?(n&7):(n&7)-5;
+                const unsigned mask=0x00030003U<<(2*e);
+                reg_attn_mma(acc[n],pa,(z0>>sh)&mask,(z1>>sh)&mask);
             }
         }
     }
+    asm volatile("cp.async.wait_group 0;\n");
     #pragma unroll
-    for(int i=0;i<2;++i) {
-        if(!(i==0?live0:live1)) continue;
-        const int row=i==0?row0:row1,head=i==0?head0:head1;
-        float* slot=workspace+
-            ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*kFastFusedFlashStride;
+    for(int r=0;r<2;++r)
         #pragma unroll
-        for(int n=0;n<kHeadDim/8;++n) {
-            const int dim=8*n+2*t;
-            slot[head*kHeadDim+dim]=acc[n][2*i];
-            slot[head*kHeadDim+dim+1]=acc[n][2*i+1];
+        for(int o=1;o<=2;o<<=1) {
+            den[r]+=__shfl_xor_sync(0xffffffffU,den[r],o);
+            bias[r]+=__shfl_xor_sync(0xffffffffU,bias[r],o);
         }
-        if(t==0) {
-            slot[kFastFusedFlashValues+head]=running_max[i];
-            slot[kFastFusedFlashValues+H+head]=denominator[i];
+    // Merge stream 1 into stream 0 through shared memory (the ring is idle).
+    __syncthreads();
+    float* xfer=reinterpret_cast<float*>(l0_smem)+static_cast<std::size_t>(warp%6)*32*70;
+    if(stream==1) {
+        #pragma unroll
+        for(int n=0;n<16;++n)
+            #pragma unroll
+            for(int e=0;e<4;++e) xfer[(4*n+e)*32+lane]=acc[n][e];
+        xfer[64*32+lane]=mx[0];xfer[65*32+lane]=mx[1];
+        xfer[66*32+lane]=den[0];xfer[67*32+lane]=den[1];
+        xfer[68*32+lane]=bias[0];xfer[69*32+lane]=bias[1];
+    }
+    __syncthreads();
+    if(stream==1) return;
+    {
+        const float om[2]={xfer[64*32+lane],xfer[65*32+lane]};
+        const float od[2]={xfer[66*32+lane],xfer[67*32+lane]};
+        const float ob[2]={xfer[68*32+lane],xfer[69*32+lane]};
+        float a_self[2],a_other[2];
+        #pragma unroll
+        for(int r=0;r<2;++r) {
+            const float m=fmaxf(mx[r],om[r]);
+            a_self[r]=mx[r]==-INFINITY?0.f:exp2f(mx[r]-m);
+            a_other[r]=om[r]==-INFINITY?0.f:exp2f(om[r]-m);
+            mx[r]=m;
+            den[r]=den[r]*a_self[r]+od[r]*a_other[r];
+            bias[r]=bias[r]*a_self[r]+ob[r]*a_other[r];
+        }
+        #pragma unroll
+        for(int n=0;n<16;++n)
+            #pragma unroll
+            for(int e=0;e<4;++e)
+                acc[n][e]=acc[n][e]*a_self[e>>1]+xfer[(4*n+e)*32+lane]*a_other[e>>1];
+    }
+    const int slots=segments*kL0HistoryStreams;
+    #pragma unroll
+    for(int r=0;r<2;++r) {
+        const int v=r?v1:v0,row=v/H,head=v%H;
+        if(row>=rows) continue;
+        float* slot=workspace+
+            ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*slots+segment)*kFastFusedFlashStride;
+        #pragma unroll
+        for(int c=0;c<2;++c) {
+            float* dst=slot+head*kHeadDim+128*vgroup+16*(2*t+c);
+            #pragma unroll
+            for(int n=0;n<16;n+=4)
+                *reinterpret_cast<float4*>(dst+n)=make_float4(
+                    acc[n][2*r+c]*l0_code_scale(n)+bias[r],acc[n+1][2*r+c]*l0_code_scale(n+1)+bias[r],
+                    acc[n+2][2*r+c]*l0_code_scale(n+2)+bias[r],acc[n+3][2*r+c]*l0_code_scale(n+3)+bias[r]);
+        }
+        if(t==0&&vgroup==0) {
+            slot[kFastFusedFlashValues+head]=mx[r]*0.6931471805599453f;
+            slot[kFastFusedFlashValues+H+head]=den[r];
         }
     }
 }
@@ -177,8 +384,12 @@ __global__ void __launch_bounds__(256) l0_history_merge_kernel(const float* work
     if(row>=rows) return;
     const int base=position_device?*position_device:position;
     const int end=min(l0::history_end(base),capacity);
-    const int live=end>l0::kSink?min(segments,(end-l0::kSink+keys-1)/keys):0;
-    const float* slots=workspace+(static_cast<std::size_t>(row)*kKVHeads+kv)*segments*kFastFusedFlashStride;
+    (void)keys;
+    const int span=l0::history_span(end,segments);
+    // Two partial slots (key streams) per history segment.
+    const int live=(end>l0::kSink?min(segments,(end-l0::kSink+span-1)/span):0)*kL0HistoryStreams;
+    const float* slots=workspace+(static_cast<std::size_t>(row)*kKVHeads+kv)*segments*
+        kL0HistoryStreams*kFastFusedFlashStride;
     float gmax=-INFINITY;
     for(int s=0;s<live;++s) gmax=fmaxf(gmax,slots[s*kFastFusedFlashStride+kFastFusedFlashValues+head]);
     float den=0.0f,num=0.0f;
@@ -219,17 +430,25 @@ __global__ void __launch_bounds__(192) l0_history_unrotate_kernel(const float* r
 // CTA, 32-key tiles) over the INT2 history [kSink, history_end) of a prefill
 // chunk whose rows all follow it. Rotated queries with the q . mu constant;
 // writes the normalized rotated-basis output and (max, denominator).
+constexpr int kL0PrefillSplits=4;
 __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
     const std::uint8_t* v_codes,const float* k_meta,const float* v_meta,
     float* out,float* stats,int rows,int history_end){
+  // blockIdx.z = head group * kL0PrefillSplits + split over the history tiles.
   using namespace fa2_prefill;
   const auto* q=reinterpret_cast<const std::uint16_t*>(q_rot_bits);
   __shared__ __align__(16) half ks[BN*kStride];
   __shared__ __align__(16) half vs[BN*kStride];
   const int query_base=blockIdx.x*BM;
   const int kv_head=blockIdx.y;
-  const int head_group=blockIdx.z;
+  const int head_group=blockIdx.z/kL0PrefillSplits,split=blockIdx.z%kL0PrefillSplits;
+  const int history_tiles=(history_end-l0::kSink)/BN;
+  const int split_tiles=(history_tiles+kL0PrefillSplits-1)/kL0PrefillSplits;
+  const int split_begin=l0::kSink+split*split_tiles*BN;
+  const int split_end=min(history_end,split_begin+split_tiles*BN);
+  out+=static_cast<std::size_t>(split)*rows*kQHeads*kHeadDim;
+  stats+=static_cast<std::size_t>(split)*rows*kQHeads*2;
   const int tid=threadIdx.x, warp=tid>>5, lane=tid&31;
   const int head_local=warp>>2, m_base=(warp&3)*16;
   const int g=lane>>2, t=lane&3;
@@ -255,28 +474,26 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
   for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
   float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
   const bool warp_live=m_base<active_rows;
-  for(int first=l0::kSink;first<history_end;first+=BN){
+  constexpr int kSlots=(BN*kHeadDim/8)/256;
+  L0RawSlot raw[kSlots];
+  const auto fetch=[&](int tile_first){
+    #pragma unroll
+    for(int i=0;i<kSlots;++i){
+      const int idx=tid+i*256;
+      raw[i]=l0_load_slot(k_codes,v_codes,k_meta,v_meta,tile_first+idx/(kHeadDim/8),kv_head,
+          (idx%(kHeadDim/8))*8,tile_first+idx/(kHeadDim/8)<split_end);
+    }
+  };
+  if(split_begin<split_end) fetch(split_begin);
+  for(int first=split_begin;first<split_end;first+=BN){
     __syncthreads();
     #pragma unroll
-    for(int i=0;i<(BN*kHeadDim/8)/256;++i){
+    for(int i=0;i<kSlots;++i){
       const int idx=tid+i*256; const int key_off=idx/(kHeadDim/8); const int dim=(idx%(kHeadDim/8))*8;
-      const int key=first+key_off;
-      const std::size_t cell=static_cast<std::size_t>(key)*kKVHeads+kv_head;
-      const int group=dim>>7;
-      const float kscale=k_meta[cell*l0::kMetaFloats+2*group], kzero=k_meta[cell*l0::kMetaFloats+2*group+1];
-      const float vscale=v_meta[cell*l0::kMetaFloats+2*group], vzero=v_meta[cell*l0::kMetaFloats+2*group+1];
-      const unsigned kb=*reinterpret_cast<const std::uint16_t*>(k_codes+cell*l0::kCodeBytes+(dim>>2));
-      const unsigned vb=*reinterpret_cast<const std::uint16_t*>(v_codes+cell*l0::kCodeBytes+(dim>>2));
-      half k8[8],v8[8];
-      #pragma unroll
-      for(int e=0;e<8;++e){
-        k8[e]=__float2half_rn((static_cast<float>((kb>>(2*e))&3u)-kzero)*kscale);
-        v8[e]=__float2half_rn((static_cast<float>((vb>>(2*e))&3u)-vzero)*vscale);
-      }
-      *reinterpret_cast<uint4*>(ks+key_off*kStride+dim)=*reinterpret_cast<const uint4*>(k8);
-      *reinterpret_cast<uint4*>(vs+key_off*kStride+dim)=*reinterpret_cast<const uint4*>(v8);
+      l0_store_slot(raw[i],ks+key_off*kStride+dim,vs+key_off*kStride+dim);
     }
     __syncthreads();
+    if(first+BN<split_end) fetch(first+BN);
     if(!warp_live) continue;
     float s[BN/8][4];
     #pragma unroll
@@ -361,7 +578,31 @@ __global__ void __launch_bounds__(192) l0_history_unrotate_rows_kernel(const flo
     const int t=threadIdx.x,head=t/32,j=block*32+t%32;
     if(row>=rows) return;
     const std::size_t at=(static_cast<std::size_t>(row)*kQHeads+kv*H)*kHeadDim;
-    for(int i=t;i<H*kHeadDim;i+=blockDim.x) numer[i/kHeadDim][i%kHeadDim]=rotated[at+i];
+    const std::size_t split_elements=static_cast<std::size_t>(rows)*kQHeads*kHeadDim;
+    const std::size_t split_stat_stride=static_cast<std::size_t>(rows)*kQHeads*2;
+    // Merge the history splits (normalized partials) of this row's six heads.
+    __shared__ float weight[kL0PrefillSplits][H];
+    __shared__ float merged_max[H],merged_den[H];
+    if(t<H) {
+        const std::size_t stat=(static_cast<std::size_t>(row)*kQHeads+kv*H+t)*2;
+        float m=-3.402823466e+38F;
+        for(int s=0;s<kL0PrefillSplits;++s)
+            if(rotated_stats[s*split_stat_stride+stat+1]>0.f) m=fmaxf(m,rotated_stats[s*split_stat_stride+stat]);
+        float den=0.f;
+        for(int s=0;s<kL0PrefillSplits;++s) {
+            const float d=rotated_stats[s*split_stat_stride+stat+1];
+            const float w=d>0.f?d*expf(rotated_stats[s*split_stat_stride+stat]-m):0.f;
+            weight[s][t]=w;den+=w;
+        }
+        for(int s=0;s<kL0PrefillSplits;++s) weight[s][t]=den>0.f?weight[s][t]/den:0.f;
+        merged_max[t]=m;merged_den[t]=den;
+    }
+    __syncthreads();
+    for(int i=t;i<H*kHeadDim;i+=blockDim.x) {
+        float v=0.f;
+        for(int s=0;s<kL0PrefillSplits;++s) v+=weight[s][i/kHeadDim]*rotated[s*split_elements+at+i];
+        numer[i/kHeadDim][i%kHeadDim]=v;
+    }
     __syncthreads();
     const float* r=rvt+static_cast<std::size_t>(kv)*kHeadDim*kHeadDim;
     float o=0.0f;
@@ -369,9 +610,8 @@ __global__ void __launch_bounds__(192) l0_history_unrotate_rows_kernel(const flo
     const std::size_t elements=static_cast<std::size_t>(rows)*kQHeads*kHeadDim;
     split_output[static_cast<std::size_t>(slot)*elements+at+head*kHeadDim+j]=o;
     if(block==0 && t%32==0) {
-        const std::size_t stat=(static_cast<std::size_t>(row)*kQHeads+kv*H+head)*2;
         const std::size_t dst=(static_cast<std::size_t>(slot)*rows*kQHeads+row*kQHeads+kv*H+head)*2;
-        split_stats[dst]=rotated_stats[stat];
-        split_stats[dst+1]=rotated_stats[stat+1];
+        split_stats[dst]=merged_max[head];
+        split_stats[dst+1]=merged_den[head];
     }
 }

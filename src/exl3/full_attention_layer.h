@@ -654,6 +654,9 @@ public:
     // Decode-only graph path: kernels read the current position through this
     // stable device pointer instead of a captured host scalar.
     void set_position_device(const int* position_device) noexcept;
+    // L0 OSCAR: after the host K/V planes were restored to `position`, reload
+    // the device window (sink and recent rows) and re-encode the history.
+    void l0_refresh_window(int position, cudaStream_t stream);
     // K/V cache rows an accepted sibling carries into its chain slot.
     void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,
                                    int destination) const;

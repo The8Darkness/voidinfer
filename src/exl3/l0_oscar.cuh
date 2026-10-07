@@ -35,6 +35,31 @@ constexpr int kDim = 256;
 constexpr int kKVHeadsL0 = 4;
 constexpr int kCodeBytes = kDim / 4;     // 2-bit codes, dims 4b..4b+3 in byte b
 constexpr int kMetaFloats = 4;           // scale0, zero0, scale1, zero1
+constexpr int kRingRows = 4096;          // > sink-free exact window + one prefill chunk
+
+// Device row of absolute key `key` in a window-ring addressed K or V plane.
+// With sink == nullptr and ring_mask == -1 this is the plain linear cache.
+__host__ __device__ __forceinline__ std::size_t window_row(int key, bool sink, int ring_mask) {
+    return static_cast<std::size_t>(sink && key < kSink ? key : (key & ring_mask));
+}
+
+// Writes appended rows into the window ring (and the sink rows).
+__global__ void window_append_kernel(const std::uint16_t* k, const std::uint16_t* v,
+    std::uint16_t* k_ring, std::uint16_t* v_ring, std::uint16_t* k_sink, std::uint16_t* v_sink,
+    int rows, int position, const int* position_device) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= rows * kKVHeadsL0 * kDim) return;
+    const int row = index / (kKVHeadsL0 * kDim), offset = index % (kKVHeadsL0 * kDim);
+    const int slot = (position_device ? *position_device : position) + row;
+    const std::size_t ring = static_cast<std::size_t>(slot & (kRingRows - 1)) * kKVHeadsL0 * kDim + offset;
+    k_ring[ring] = k[index];
+    v_ring[ring] = v[index];
+    if (slot < kSink) {
+        const std::size_t sink = static_cast<std::size_t>(slot) * kKVHeadsL0 * kDim + offset;
+        k_sink[sink] = k[index];
+        v_sink[sink] = v[index];
+    }
+}
 
 struct Assets {
     const float* rk = nullptr;   // [16][4][256][256]   x' = x R
@@ -204,6 +229,18 @@ __global__ void __launch_bounds__(192) query_kernel(const std::uint16_t* q, int 
         if (c == 0) q_mu[row * 24 + kv * 6 + h] = m;
     }
 }
+
+// Keys per verifier history segment for the live history [kSink, end):
+// `segments` near-equal spans, whole 32-key tiles. Shared by the history
+// kernel and its merge so both derive identical segment bounds on device.
+__host__ __device__ __forceinline__ int history_span(int end, int segments) {
+    const int keys = end > kSink ? end - kSink : 0;
+    const int per = (keys + segments - 1) / segments;
+    return per < 32 ? 32 : ((per + 31) / 32) * 32;
+}
+// One verifier history CTA per (segment, KV head): 42 x 4 CTAs fill the 170
+// SMs of the target GPU once.
+constexpr int kHistorySegments = 42;
 
 // History segment length for a context capacity: at most 512 segments.
 inline int history_segment_keys(int capacity) {
