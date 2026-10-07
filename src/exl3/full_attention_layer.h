@@ -659,11 +659,14 @@ public:
     void l0_refresh_window(int position, cudaStream_t stream);
     // Parks / reinstalls the encoded INT2 history (rows [0, watermark)).
     // Export returns the watermark; import follows l0_refresh_window.
-    int l0_export_history(std::vector<std::uint8_t>& codes, std::vector<std::uint16_t>& meta,
-                          cudaStream_t stream) const;
-    void l0_import_history(const std::vector<std::uint8_t>& codes,
-                           const std::vector<std::uint16_t>& meta, int rows, int position,
-                           cudaStream_t stream);
+    int l0_history_watermark(cudaStream_t stream) const;
+    // Rows [first, first + rows): codes K then V ([rows][4][64] each), FP16
+    // meta K then V ([rows][4][4] each).
+    void l0_download_history(int first, int rows, std::uint8_t* codes, std::uint16_t* meta,
+                             cudaStream_t stream) const;
+    void l0_upload_history(int first, int rows, const std::uint8_t* codes,
+                           const std::uint16_t* meta, cudaStream_t stream);
+    void l0_set_history_watermark(int rows, int position, cudaStream_t stream);
     // K/V cache rows an accepted sibling carries into its chain slot.
     void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,
                                    int destination) const;

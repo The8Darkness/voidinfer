@@ -135,6 +135,26 @@ public:
         }catch(...) {phase_=Phase::poisoned;throw;}
     }
 
+    // Prompt suffix after a restored root: wide target chunks, every block's
+    // taps committed to the (contiguous) draft ring.
+    void ingest_suffix(std::span<const std::int64_t> input,int first) {
+        if(phase_!=Phase::unstarted || first<=0 || context_->position()!=first ||
+           static_cast<std::size_t>(first)>=input.size() ||
+           draft_.ring_base_abs()+draft_.ring_count()!=first)
+            throw std::invalid_argument("fast device suffix ingestion frontier");
+        phase_=Phase::executing;
+        try {
+            for(std::size_t at=static_cast<std::size_t>(first);at<input.size();) {
+                const int rows=static_cast<int>(std::min<std::size_t>(1024,input.size()-at));
+                context_->append_prefill_wide(input.subspan(at,rows),stream_);
+                commit_captured(rows,static_cast<int>(at));
+                at+=static_cast<std::size_t>(rows);
+            }
+            check(cudaStreamSynchronize(stream_),"fast device suffix ingestion completion");
+            phase_=Phase::unstarted;
+        }catch(...) {phase_=Phase::poisoned;throw;}
+    }
+
     void begin_prefilled() {
         if(phase_!=Phase::unstarted)
             throw std::logic_error("fast device round already began");

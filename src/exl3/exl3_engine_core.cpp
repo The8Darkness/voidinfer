@@ -1926,10 +1926,65 @@ struct Exl3EngineCore::Impl {
         try {
             (void)context->reset_for_request(identity.contract());
             const auto epoch=context->request_generation();
-            {
+            // Conversation reuse (NINFER_EXL3_COHERENT_ROOT_REUSE=1): the longest
+            // retained device root whose tokens prefix this input is restored
+            // (target exact state + draft ring) and only the suffix is ingested.
+            static const bool root_reuse=[] {
+                const auto* value=std::getenv("NINFER_EXL3_COHERENT_ROOT_REUSE");
+                if(!value || !*value || std::string_view(value)=="0")return false;
+                if(std::string_view(value)!="1")
+                    throw std::invalid_argument("NINFER_EXL3_COHERENT_ROOT_REUSE must be 0 or 1");
+                return true;
+            }();
+            const bool reuse_allowed=root_reuse && options.context_cache.enabled &&
+                request.options.execution.allow_prefix_reuse && prepared.identity.reusable;
+            std::shared_ptr<const Exl3VeriCacheRequest> reused;
+            if(reuse_allowed)
+                for(const auto& candidate:cache.roots())
+                    if(candidate && candidate->compact_draft() && !candidate->prepared_identity() &&
+                       candidate->token_count()>=64 && candidate->token_count()<ids.size() &&
+                       (!reused || candidate->token_count()>reused->token_count()) &&
+                       candidate->matches_tokens(std::span<const std::int64_t>(ids).first(candidate->token_count())))
+                        reused=candidate;
+            // The turn-closure frontier is the rendered prefix the next turn of
+            // this conversation agrees with: it gets its own retained root.
+            std::size_t stable=ids.size();
+            if(prepared.identity.rewrite_checkpoint)
+                stable=std::min<std::size_t>(stable,prepared.identity.rewrite_checkpoint->frontier);
+            const bool split=reuse_allowed && stable>=64 && stable<ids.size() &&
+                (!reused || stable>reused->token_count());
+            const auto span_ids=std::span<const std::int64_t>(ids);
+            const auto extend_device=[&](const std::shared_ptr<const Exl3VeriCacheRequest>& from,std::size_t end,
+                                         bool resident) {
+                const auto first=from->token_count();
+                return from->append_device_prompt(*context,draft,span_ids.subspan(first,end-first),[&] {
+                    Exl3FastDeviceRound ingest(context,draft,staging_owners[lane_index]->pointers,
+                        1,epoch,false,stream);
+                    ingest.ingest_suffix(span_ids.first(end),static_cast<int>(first));
+                },stream,resident);
+            };
+            std::shared_ptr<const Exl3VeriCacheRequest> base=reused;
+            bool base_resident=false;
+            if(split) {
+                if(base) base=extend_device(base,stable,false);
+                else {
+                    {
+                        Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
+                            1,epoch,false,stream);
+                        fresh.begin_fresh(span_ids.first(stable),stable>1040);
+                    }
+                    base=Exl3VeriCacheRequest::initialize_device_root(*context,draft,
+                        span_ids.first(stable),stream);
+                }
+                base_resident=true;
+                (void)cache.admit_input_authority(base,span_ids.first(stable),available());
+            }
+            if(base) {
+                root=extend_device(base,ids.size(),base_resident);
+            } else {
                 Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
                     1,epoch,false,stream);
-                fresh.begin_fresh(ids,true);
+                fresh.begin_fresh(ids,ids.size()>1040);
             }
             const bool root_diagnostic=[] {
                 const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
@@ -1963,14 +2018,17 @@ struct Exl3EngineCore::Impl {
                     static_cast<long long>(restored_second));
             }
             {
+                const std::size_t reused_tokens=reused?reused->token_count():0;
                 std::lock_guard lock(mutex);
-                stats.computed_prefill_tokens+=ids.size();
-                stats.last_selected_frontier_tokens=0;
-                ++stats.root_selections;
+                stats.computed_prefill_tokens+=ids.size()-reused_tokens;
+                stats.reused_prompt_tokens+=reused_tokens;
+                stats.last_selected_frontier_tokens=reused_tokens;
+                if(reused) {++stats.shared_stable_prefix_selections;++stats.prefix_preparation_cache_hits;}
+                else ++stats.root_selections;
                 ++stats.prefix_preparation_returns;
             }
-            result.reused_prompt_tokens=0;
-            result.prefix_reuse_path=PrefixReusePath::Root;
+            result.reused_prompt_tokens=reused?static_cast<std::uint32_t>(reused->token_count()):0;
+            result.prefix_reuse_path=reused?PrefixReusePath::SharedStablePrefix:PrefixReusePath::Root;
             result.timings.prefill_seconds=seconds(prefill);
             if(request.cancelled) {
                 result.finish_reason=FinishReason::Cancelled;
@@ -1991,7 +2049,13 @@ struct Exl3EngineCore::Impl {
                 FinishReason::ContextCapacity:FinishReason::OutputLimit;
             output.validate_generation_capacity(allowance);
             committed.reserve(allowance);
-            root=Exl3VeriCacheRequest::initialize_device_root(*context,draft,ids,stream);
+            if(!base)root=Exl3VeriCacheRequest::initialize_device_root(*context,draft,ids,stream);
+            if(reuse_allowed && ids.size()>=64) {
+                // The rendered input is a stable prefix of the next turn even
+                // when the generated reply is later re-rendered differently.
+                const auto admitted=cache.admit_input_authority(root,ids,available());
+                if(admitted.admitted) {std::lock_guard lock(mutex);++stats.completed_prefix_admissions;}
+            }
             {
                 std::lock_guard admission(admission_mutex);
                 const auto ticket=coordinator.admit(root);

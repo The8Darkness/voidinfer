@@ -383,13 +383,22 @@ private:
     std::array<std::vector<std::uint16_t>, 48> convolution_;
     std::vector<std::uint16_t> logits_, embedding_;
     std::array<std::vector<std::uint16_t>, 5> taps_;
-    // L0 OSCAR INT2 history parked with the state: per full-attention layer,
-    // the codes ([rows][4][64] K then V) and FP16 meta ([rows][4][4] K then V)
-    // of the encoded rows [0, l0_rows_), so a resume skips re-encoding.
+    // L0 OSCAR INT2 history parked with the state, so a resume skips
+    // re-encoding: per full-attention layer, immutable chunks of
+    // kL0ChunkRows encoded rows (codes [rows][4][64] K then V, FP16 meta
+    // [rows][4][4] K then V) covering [0, l0_rows_). Complete chunks are
+    // shared with later states of the same lineage.
+public:
+    static constexpr int kL0ChunkRows = 4096;
+    struct L0CodeChunk {
+        int first = 0, rows = 0;
+        std::vector<std::uint8_t> codes;
+        std::vector<std::uint16_t> meta;
+    };
+private:
     int l0_rows_ = 0;
     bool l2_fp8_ = false;   // kv_pages_ hold FP8 rows (l0_l2_fp8.cuh)
-    std::array<std::vector<std::uint8_t>, 16> l0_codes_;
-    std::array<std::vector<std::uint16_t>, 16> l0_meta_;
+    std::array<std::vector<std::shared_ptr<const L0CodeChunk>>, 16> l0_chunks_;
     friend class Exl3TextContext;
 };
 

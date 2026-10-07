@@ -1162,6 +1162,46 @@ public:
         return result;
     }
 
+    // Device-route prompt extension: restores this root (target exact state and
+    // draft ring), lets `ingest` execute the suffix on the target and commit its
+    // taps to the draft, then snapshots the extended root.
+    std::shared_ptr<const Exl3VeriCacheRequest> append_device_prompt(
+        Exl3TextContext& exact,Exl3Dflash2DraftModel& draft,
+        std::span<const std::int64_t> suffix,const std::function<void()>& ingest,
+        cudaStream_t stream=nullptr,bool resident=false) const {
+        if(!state_ || !projected_ || prepared_identity_ || suffix.empty() || !ingest ||
+           exact.model_identity()!=state_->model_identity() ||
+           suffix.size()>static_cast<std::size_t>(exact.max_context()-state_->position()))
+            throw std::invalid_argument("device prompt root/suffix extent");
+        for(const auto token:suffix)
+            if(token<0 || token>=248320)
+                throw std::invalid_argument("device prompt token extent");
+        // `resident`: the caller's context and drafter still hold exactly this root.
+        if(resident) {
+            if(exact.position()!=state_->position() ||
+               draft.ring_base_abs()+draft.ring_count()!=exact.position())
+                throw std::logic_error("device prompt resident root frontier");
+        } else {
+            exact.restore_exact_host_state(*state_,stream);
+            restore_draft(draft,{},stream);
+        }
+        ingest();
+        if(exact.position()!=state_->position()+static_cast<int>(suffix.size()) ||
+           draft.ring_base_abs()+draft.ring_count()!=exact.position())
+            throw std::logic_error("device prompt ingestion frontier");
+        const auto& reserve=exact.request_metadata_reservation();
+        auto target_state=exact.export_exact_host_state(stream);
+        auto draft_ring=draft.export_host_ring(stream,true,reserve);
+        auto result=create_planned(this,0,false,reserve,reserve);
+        result->parent_revision_=revision_;
+        result->replay_anchor_revision_=
+            replay_anchor_revision_?replay_anchor_revision_:revision_;
+        result->history_=history_.append(suffix,reserve);
+        result->state_=std::move(target_state);
+        result->projected_=std::move(draft_ring);
+        return result;
+    }
+
     // User-supplied prompt suffix, distinct from speculative token publication.
     // Forks the exact root, preserving only proven shared-prefix ownership.
     std::shared_ptr<const Exl3VeriCacheRequest> append_prompt(
