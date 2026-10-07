@@ -16,6 +16,7 @@
 #include "exl3/recurrent_export_pool.h"
 #include "exl3/greedy_packet.h"
 #include "exl3/mtp_runner.h"
+#include "exl3/l0_pinned_pool.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -392,8 +393,13 @@ public:
     static constexpr int kL0ChunkRows = 4096;
     struct L0CodeChunk {
         int first = 0, rows = 0;
-        std::vector<std::uint8_t> codes;
-        std::vector<std::uint16_t> meta;
+        Exl3L0PinnedPool::Block block;   // page-locked: codes, then meta
+        std::uint8_t* codes() const noexcept { return block.data; }
+        std::uint16_t* meta() const noexcept {
+            return reinterpret_cast<std::uint16_t*>(block.data + code_bytes());
+        }
+        std::size_t code_bytes() const noexcept { return static_cast<std::size_t>(rows) * 2 * 4 * 64; }
+        std::size_t meta_bytes() const noexcept { return static_cast<std::size_t>(rows) * 2 * 4 * 4 * 2; }
     };
 private:
     int l0_rows_ = 0;

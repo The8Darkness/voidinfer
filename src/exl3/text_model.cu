@@ -10776,7 +10776,7 @@ std::size_t Exl3ExactHostState::payload_bytes() const noexcept {
     for (const auto& x : convolution_) bytes += x.size() * 2;
     for (const auto& x : taps_) bytes += x.size() * 2;
     for (const auto& layer : l0_chunks_)
-        for (const auto& chunk : layer) bytes += chunk->codes.size() + chunk->meta.size() * 2;
+        for (const auto& chunk : layer) bytes += chunk->code_bytes() + chunk->meta_bytes();
     return bytes;
 }
 
@@ -11499,9 +11499,8 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                    shared[index]->rows==count) {chunks.push_back(shared[index]);continue;}
                 auto chunk=std::make_shared<Exl3ExactHostState::L0CodeChunk>();
                 chunk->first=first;chunk->rows=count;
-                chunk->codes.resize(static_cast<std::size_t>(count)*2*4*64);
-                chunk->meta.resize(static_cast<std::size_t>(count)*2*4*4);
-                layer->l0_download_history(first,count,chunk->codes.data(),chunk->meta.data(),stream);
+                chunk->block=Exl3L0PinnedPool::instance().take();
+                layer->l0_download_history(first,count,chunk->codes(),chunk->meta(),stream);
                 chunks.push_back(std::move(chunk));
             }
             ++full;
@@ -11832,7 +11831,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                         if(chunk->rows==Exl3ExactHostState::kL0ChunkRows) prefix.push_back(chunk);
                     for(const auto& chunk:state.l0_chunks_[full])
                         impl_->full_layers[layer]->l0_upload_history(chunk->first,chunk->rows,
-                            chunk->codes.data(),chunk->meta.data(),stream);
+                            chunk->codes(),chunk->meta(),stream);
                     impl_->full_layers[layer]->l0_set_history_watermark(state.l0_rows_,state.position_,stream);
                 }
                 if(oscar) impl_->oscar->append_kv_layer(layer,

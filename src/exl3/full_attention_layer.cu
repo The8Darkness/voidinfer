@@ -7276,8 +7276,7 @@ void Exl3FullAttentionLayer::l0_upload_history(int first,int rows,const std::uin
     cuda_check(cudaMemcpyAsync(l0_.v_codes+first*code_row,codes+code_bytes,code_bytes,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume codes");
     cuda_check(cudaMemcpyAsync(l0_.k_meta+first*meta_row,meta,meta_elements*2,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume meta");
     cuda_check(cudaMemcpyAsync(l0_.v_meta+first*meta_row,meta+meta_elements,meta_elements*2,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume meta");
-    // Pageable sources: complete before the chunk may be released.
-    cuda_check(cudaStreamSynchronize(stream),"L0 OSCAR resume history");
+    // Pinned sources owned by the restored state; the watermark update syncs.
 }
 
 void Exl3FullAttentionLayer::l0_set_history_watermark(int rows,int position,cudaStream_t stream) {
