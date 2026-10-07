@@ -355,6 +355,12 @@ struct Exl3GdnControlSide {
     int heads = 0;
 };
 
+// Side-stream L2 prefetch of a weight range after the work queued on
+// `stream` (NINFER_EXL3_L2_PREFETCH, default 1); join before capture ends.
+bool exl3_l2_prefetch_enabled();
+void exl3_l2_prefetch_fork(cudaStream_t stream,const void* data,std::size_t bytes);
+void exl3_l2_prefetch_join(cudaStream_t stream);
+
 class Exl3CudaLinearWorkspace {
 public:
     explicit Exl3CudaLinearWorkspace(int max_rows = 16);

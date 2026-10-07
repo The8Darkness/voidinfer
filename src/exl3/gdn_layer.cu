@@ -3102,6 +3102,25 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         !profile && !projection_timing_ && !projection_observer_ &&
         preserve_m1_topology && wide_prefill && rows==1024 &&
         !dual_transform && !concurrent_qkvz;
+    // Side-branch L2 prefetch of the head of each upcoming GEMV's weights,
+    // forked before the preceding GEMV so it lands while the intervening
+    // reductions/small kernels leave DRAM idle (NINFER_EXL3_L2_PREFETCH_MB,
+    // default 8; NINFER_EXL3_L2_PREFETCH_SITES bitmask 1=O 2=gate 4=down
+    // 8=successor qkv). The side stream rejoins at the end of the layer.
+    static const std::size_t prefetch_bytes=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
+        return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
+    }();
+    static const int prefetch_sites=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_SITES");
+        return value?std::atoi(value):15;
+    }();
+    // Single-row decode only (multi-row verify measured slower).
+    const bool prefetch=exl3_l2_prefetch_enabled() && rows==1 && !wide_prefill && !profile;
+    const auto prefetch_weights=[&](int site,const std::uint16_t* trellis) {
+        if(prefetch && (prefetch_sites&site)) exl3_l2_prefetch_fork(stream,trellis,prefetch_bytes);
+    };
+    prefetch_weights(1,weights_.o.trellis);
     if(prepared) {
         begin(1); end(1);
         begin(2); end(2);
@@ -3400,6 +3419,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
        gdn_o_residual_norm_enabled())
         linear_workspaces_[2]->arm_residual_norm(input,post,weights_.post_attention_norm,
                                                  mlp_input,kRmsEps);
+    prefetch_weights(2,weights_.gate.trellis);
     begin(7); project(linear_workspaces_[2], weights_.o, weights_.o_metadata, o_input, o,
                       Exl3TargetProjectionOperator::o); end(7);
     const bool o_norm_applied=linear_workspaces_[2]->take_norm_applied();
@@ -3447,6 +3467,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         weights_.up_metadata.in_features == kHidden &&
         weights_.gate_metadata.out_features == kIntermediate &&
         weights_.up_metadata.out_features == kIntermediate;
+    prefetch_weights(4,weights_.down.trellis);
     const bool merged_gate_up = !gdn_m1_gate_up_pair && rows >= 1 && rows <= 8 && !profile &&
         !projection_timing_ && !projection_observer_ && !wide_prefill &&
         !shared_gateup_enabled_ && !small_m_fused_gate_up_transform_ &&
@@ -3553,6 +3574,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         check(cudaGetLastError(), "launch GDN MLP activation");
     }
     end(10);
+    if(successor_) prefetch_weights(8,successor_->weights_.qkv.trellis);
     begin(11);
     const bool shared_down=shared_down_enabled_ && shared_gateup_executor_ &&
         !capture_active_ && !profile && !projection_timing_ && !projection_observer_ &&
@@ -3584,6 +3606,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     if(!residual_applied)
         exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post, down, final_output, rows * kHidden);
     check(cudaGetLastError(), "launch GDN final residual"); end(11);
+    if(prefetch) exl3_l2_prefetch_join(stream);
     if (output != final_output && !(residual_applied && residual_destination==output)) check(cudaMemcpyAsync(output, final_output, static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream), "copy GDN output");
     if (collect_stage_events) {
         record(total_end, stream); check(cudaEventSynchronize(total_end), "synchronize GDN timing");

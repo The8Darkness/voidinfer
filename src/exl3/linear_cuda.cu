@@ -13655,4 +13655,64 @@ bool Exl3CudaLinearWorkspace::launch_armed_residual_reduce(cudaStream_t stream,
     return true;
 }
 
+
+// L2 prefetch of a weight range on a side stream that starts when the work
+// already queued on `stream` completes (CUDA graph: a parallel branch from
+// the current node). Bulk prefetches are fire-and-forget hints, so a GEMV
+// queued later streams part of its weights from L2 while the intervening
+// small kernels keep DRAM otherwise idle. exl3_l2_prefetch_join rejoins the
+// side stream (required before a capture ends).
+namespace {
+__global__ void exl3_l2_prefetch_kernel(const char* data,std::size_t bytes) {
+    constexpr std::size_t kChunk=32768;
+    for(std::size_t offset=(static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x)*kChunk;
+        offset<bytes;offset+=static_cast<std::size_t>(gridDim.x)*blockDim.x*kChunk) {
+        const unsigned size=static_cast<unsigned>(bytes-offset<kChunk?bytes-offset:kChunk)&~15u;
+        if(size) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                              ::"l"(data+offset),"r"(size):"memory");
+    }
+}
+struct Exl3PrefetchStreams {
+    cudaStream_t side=nullptr;
+    cudaEvent_t fork=nullptr,join=nullptr;
+    bool pending=false;
+};
+Exl3PrefetchStreams& exl3_prefetch_streams() {
+    static Exl3PrefetchStreams streams=[] {
+        Exl3PrefetchStreams value;
+        cuda_check(cudaStreamCreateWithFlags(&value.side,cudaStreamNonBlocking),"prefetch stream");
+        cuda_check(cudaEventCreateWithFlags(&value.fork,cudaEventDisableTiming),"prefetch fork");
+        cuda_check(cudaEventCreateWithFlags(&value.join,cudaEventDisableTiming),"prefetch join");
+        return value;
+    }();
+    return streams;
+}
+}  // namespace
+
+bool exl3_l2_prefetch_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+void exl3_l2_prefetch_fork(cudaStream_t stream,const void* data,std::size_t bytes) {
+    if(!data || !bytes) return;
+    auto& streams=exl3_prefetch_streams();
+    cuda_check(cudaEventRecord(streams.fork,stream),"prefetch fork record");
+    cuda_check(cudaStreamWaitEvent(streams.side,streams.fork,0),"prefetch fork wait");
+    exl3_l2_prefetch_kernel<<<8,128,0,streams.side>>>(static_cast<const char*>(data),bytes);
+    cuda_check(cudaGetLastError(),"launch L2 prefetch");
+    streams.pending=true;
+}
+
+void exl3_l2_prefetch_join(cudaStream_t stream) {
+    auto& streams=exl3_prefetch_streams();
+    if(!streams.pending) return;
+    cuda_check(cudaEventRecord(streams.join,streams.side),"prefetch join record");
+    cuda_check(cudaStreamWaitEvent(stream,streams.join,0),"prefetch join wait");
+    streams.pending=false;
+}
+
 } // namespace ninfer::exl3
