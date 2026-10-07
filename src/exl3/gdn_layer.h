@@ -583,8 +583,9 @@ public:
     void set_capture_active(bool active) noexcept { capture_active_ = active; }
     // Verifier row layout (sibling_rows.cuh); nullptr keeps every row a chain row.
     void set_chain_rows_device(const int* chain_rows) noexcept { chain_rows_device_ = chain_rows; }
-    // Production contexts skip the per-forward recurrent state-before trace
-    // copy (3 MB per layer); only diagnostics and tests read trace().state_before.
+    // Production contexts skip trace-only work: the per-forward recurrent
+    // state-before copy (3 MB per layer) and the packed conv-output/head copies;
+    // only diagnostics and tests read those trace() fields.
     void set_skip_state_trace(bool skip) noexcept { skip_state_trace_ = skip; }
     // Per-row continuation traces (convolution input, q/k/v, gates) of the
     // last `rows`-row forward that an accepted sibling must carry into

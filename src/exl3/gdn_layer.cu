@@ -3241,7 +3241,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     }
     if(!gaming_[Gopt::GdnConvTrace])
         exl3_launch_small(copy_conv_state_trace_kernel,dim3((kConvStateElements + 255) / 256),dim3(256),0,stream,conv_state_, conv_state_trace_);
-    if (!fast_same_weights_fp16kv_gdn_decode_conv && !conv_tiled_packed)
+    // conv_output (packed BF16 q|k|v) is trace-only: production skips it.
+    if (!fast_same_weights_fp16kv_gdn_decode_conv && !conv_tiled_packed && !skip_state_trace_)
         exl3_launch_small(pack_qkv_bf16_kernel,dim3((rows * kQkv + 255) / 256),dim3(256),0,stream,q, k, v, conv_output, rows);
     const bool fused_gated_norm=gdn_fused_gated_norm_enabled() && !gaming_[Gopt::GdnOutputPack];
     if(!fused_gated_norm)
@@ -3351,7 +3352,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     }
     begin(6);
     if(fused_gated_norm) {
-        if (!wide_prefill)
+        if (!wide_prefill && !skip_state_trace_)
             exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
         exl3_launch_small(gdn_gated_norm_f16io_kernel,dim3((rows*kHeads+15)/16),dim3(512),0,stream,
             reinterpret_cast<const __nv_bfloat162*>(core),reinterpret_cast<const half2*>(z),
