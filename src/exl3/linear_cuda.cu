@@ -3589,14 +3589,15 @@ __global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_ou
 // Reduces both split-plane sets exactly as prefill_reduce_output_warp_kernel
 // (ascending planes, output Hadamard, SVH) and applies the silu_mul_kernel
 // activation; one warp per 128-column block.
-__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_gate_up_reduce_silu_kernel(
+template<int Warps=kHadamardWarpsPerBlock>
+__global__ void __launch_bounds__(Warps*32) exl3_gate_up_reduce_silu_kernel(
     const float* accum_gate,const float* accum_up,const std::uint16_t* svh_gate,
     const std::uint16_t* svh_up,std::uint16_t* gate,std::uint16_t* up,
     std::uint16_t* activation,int rows,int output_features,int split_count,
     const std::uint16_t* down_suh,std::uint16_t* down_transformed) {
     EXL3_PDL_PROLOGUE();
     const int lane=static_cast<int>(threadIdx.x)&31;
-    const int task=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+    const int task=static_cast<int>(blockIdx.x)*Warps+
         (static_cast<int>(threadIdx.x)>>5);
     const int blocks=output_features/kHadamard;
     if(task>=rows*blocks) return;
@@ -9448,13 +9449,28 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
     else launch_k(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per,false>);
     cuda_check(cudaGetLastError(),"launch merged M1 gate/up producers");
-    exl3_launch_pdl(exl3_gate_up_reduce_silu_kernel,
-        dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
-        dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,up_accum,
-        gate_weights.svh,up_weights.svh,gate_output,up_output,activation,rows,out_features_,
-        split_count,
-        down_workspace?down_weights->suh:nullptr,
-        down_workspace?down_workspace->transformed_:nullptr);
+    // NINFER_EXL3_GATE_UP_REDUCE_WARPS (1, 2, 4 or 8; default 2) warps per CTA:
+    // narrow CTAs spread the split-plane reads over more SMs.
+    static const int reduce_warps=[] {
+        const char* value=std::getenv("NINFER_EXL3_GATE_UP_REDUCE_WARPS");
+        const int parsed=value?std::atoi(value):2;
+        if(parsed!=1&&parsed!=2&&parsed!=4&&parsed!=8)
+            throw std::invalid_argument("NINFER_EXL3_GATE_UP_REDUCE_WARPS must be 1, 2, 4 or 8");
+        return parsed;
+    }();
+    const auto launch_reduce=[&](auto kernel,int warps) {
+        exl3_launch_pdl(kernel,
+            dim3((rows*(out_features_/kHadamard)+warps-1)/warps),
+            dim3(warps*32),0,stream,accum_,up_accum,
+            gate_weights.svh,up_weights.svh,gate_output,up_output,activation,rows,out_features_,
+            split_count,
+            down_workspace?down_weights->suh:nullptr,
+            down_workspace?down_workspace->transformed_:nullptr);
+    };
+    if(reduce_warps==1) launch_reduce(exl3_gate_up_reduce_silu_kernel<1>,1);
+    else if(reduce_warps==2) launch_reduce(exl3_gate_up_reduce_silu_kernel<2>,2);
+    else if(reduce_warps==4) launch_reduce(exl3_gate_up_reduce_silu_kernel<4>,4);
+    else launch_reduce(exl3_gate_up_reduce_silu_kernel<8>,8);
     cuda_check(cudaGetLastError(),"launch merged M1 gate/up reduction and activation");
     coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
     coherent_wide_k6_rows_[coherent_wide_k6_operation_].fetch_add(rows,std::memory_order_relaxed);

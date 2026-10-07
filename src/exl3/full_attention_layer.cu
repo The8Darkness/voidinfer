@@ -6331,14 +6331,20 @@ __global__ void attention_fused_flash_merge_heads_kernel(
         global_max=fmaxf(global_max,self_score);
     }
     float denominator=0.0f,numerator=0.0f;
+    // An empty segment (no unmasked key) contributes nothing; its value plane
+    // may be unwritten (L0 OSCAR history segments), so it is selected away
+    // (the same fused multiply-add chain over the live segments) instead of
+    // branched over, which lets the unrolled segment loads overlap.
+    #pragma unroll 8
     for(int segment=0;segment<live_segments;++segment) {
         const float* slot=slots+segment*kFastFusedFlashStride;
-        // An empty segment (no unmasked key) contributes nothing; its value
-        // plane may be unwritten (L0 OSCAR history segments).
-        if(slot[kFastFusedFlashValues+H+head]==0.0f) continue;
-        const float scale=expf(slot[kFastFusedFlashValues+head]-global_max);
-        denominator+=slot[kFastFusedFlashValues+H+head]*scale;
-        numerator+=slot[head*kHeadDim+tid]*scale;
+        const float weight=slot[kFastFusedFlashValues+H+head];
+        const float maximum=slot[kFastFusedFlashValues+head];
+        const float value=slot[head*kHeadDim+tid];
+        const bool live=weight!=0.0f;
+        const float scale=live?expf(maximum-global_max):0.0f;
+        denominator=live?fmaf(weight,scale,denominator):denominator;
+        numerator=live?fmaf(value,scale,numerator):numerator;
     }
     if(history_live) {
         const float scale=expf(history[kFastFusedFlashValues+head]-global_max);
@@ -6566,6 +6572,201 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     }
 }
 
+// Decode-shaped variant (rows*6 query heads fit one m16 tile, i.e. rows <= 2):
+// four warps each compute the identical scores and softmax for the single
+// tile but own a quarter of the PV head dimensions, so the per-thread
+// accumulator is 8x4 instead of 32x4 and many more CTAs stay resident.
+// Every stored value is produced by the same operations as the verify kernel.
+template<int kVerifyMmaKeys>
+__global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
+    const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,float* workspace,int rows,int position,
+    int capacity,int segments,const int* position_device,int query_offset,int l0_history=0,
+    const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
+    EXL3_PDL_SMALL_PROLOGUE();
+    constexpr int H=kFastFusedFlashHeads;
+    constexpr int kVectors=kHeadDim/8;
+    // A sibling row (sibling_row_offset) sees the prefix before its logical
+    // position plus its own key at its physical slot.
+    const int chain=sibling_chain_rows(position_device?position_device+1:nullptr);
+    __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
+    __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
+    const int segment=static_cast<int>(blockIdx.x);
+    const int kv_head=static_cast<int>(blockIdx.y);
+    const int tid=static_cast<int>(threadIdx.x);
+    const int warp=tid>>5;
+    const int lane=tid&31;
+    const int g=lane>>2;
+    const int t=lane&3;
+    const int base=(position_device?*position_device:position)+query_offset;
+    // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
+    // history end; the history itself is served by the INT2 kernel.
+    const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
+    const int first=l0_remap&&segment>0?l0_end+(segment-1)*kVerifyMmaKeys:segment*kVerifyMmaKeys;
+    const int last_count=base+rows;  // largest live key count of the block
+    if(first>=last_count || base+1<1 || last_count>capacity) return;
+    const int segment_end=min(first+kVerifyMmaKeys,last_count);
+    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT2
+    // history kernel; a segment wholly inside it only publishes an empty slot.
+    const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
+    const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    if(first>=history_begin && segment_end<=history_end) {
+        if(tid<rows*H) {
+            const int row=tid/H,head=tid%H;
+            float* slot=workspace+
+                ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*
+                    kFastFusedFlashStride;
+            slot[kFastFusedFlashValues+head]=-INFINITY;
+            slot[kFastFusedFlashValues+H+head]=0.0f;
+        }
+        return;
+    }
+
+    // Fragment rows: pair = row*6 + head for this warp's m16 tile.
+    const int pair0=g;
+    const int pair1=pair0+8;
+    const int row0=pair0/H,head0=pair0%H;
+    const int row1=pair1/H,head1=pair1%H;
+    const bool live0=row0<rows,live1=row1<rows;
+    const int count0=base+row0+1,count1=base+row1+1;
+    // Keys before the logical position; the own key is the merge's self term.
+    const int prefix0=base+sibling_row_offset(row0,chain);
+    const int prefix1=base+sibling_row_offset(row1,chain);
+    const auto* q0=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(live0?row0:0)*kQHeads+kv_head*H+head0)*kHeadDim+2*t);
+    const auto* q1=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(live1?row1:0)*kQHeads+kv_head*H+head1)*kHeadDim+2*t);
+
+    constexpr int kDimSplit=4,kLocalN=kHeadDim/8/kDimSplit;
+    float acc[kLocalN][4];
+    #pragma unroll
+    for(int n=0;n<kLocalN;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+    float running_max[2]={-INFINITY,-INFINITY};
+    float denominator[2]={0.0f,0.0f};
+
+    for(int chunk_first=first;chunk_first<segment_end;chunk_first+=kVerifyMmaChunk) {
+        __syncthreads();
+        for(int index=tid;index<kVerifyMmaChunk*kVectors;index+=blockDim.x) {
+            const int key_offset=index/kVectors;
+            const int dim=(index%kVectors)*8;
+            const int key=chunk_first+key_offset;
+            uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
+            if(key<segment_end) {
+                const bool in_sink=sink_k && key<ninfer::exl3::l0_oscar::kSink;
+                const std::size_t offset=(ninfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
+                    ring_mask)*kKVHeads+kv_head)*kHeadDim+dim;
+                key_bits=*reinterpret_cast<const uint4*>((in_sink?sink_k:k_cache)+offset);
+                value_bits=*reinterpret_cast<const uint4*>((in_sink?sink_v:v_cache)+offset);
+            }
+            *reinterpret_cast<uint4*>(k_s+key_offset*kVerifyMmaStride+dim)=key_bits;
+            *reinterpret_cast<uint4*>(v_s+key_offset*kVerifyMmaStride+dim)=value_bits;
+        }
+        __syncthreads();
+
+        float s[4][4];
+        #pragma unroll
+        for(int j=0;j<4;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.0f;
+        #pragma unroll
+        for(int kk=0;kk<kHeadDim;kk+=16) {
+            const unsigned a[4]={live0?q0[kk/2]:0u,live1?q1[kk/2]:0u,
+                                 live0?q0[kk/2+4]:0u,live1?q1[kk/2+4]:0u};
+            #pragma unroll
+            for(int pair=0;pair<2;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4(b,k_s+(pair*16+(lane&7)+((lane>>4)<<3))*
+                    kVerifyMmaStride+kk+((lane>>3)&1)*8);
+                reg_attn_mma(s[2*pair],a,b[0],b[1]);
+                reg_attn_mma(s[2*pair+1],a,b[2],b[3]);
+            }
+        }
+        float tile_max[2]={-INFINITY,-INFINITY};
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const int key=chunk_first+8*j+2*t+(e&1);
+                const bool valid=(e<2?(live0&&key<prefix0):(live1&&key<prefix1))&&
+                    !(key>=history_begin&&key<history_end);
+                s[j][e]=valid?s[j][e]*0.0625f:-INFINITY;
+                tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]);
+            }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],1));
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],2));
+        }
+        float scale[2];
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            const float next=fmaxf(running_max[i],tile_max[i]);
+            scale[i]=next==-INFINITY?1.0f:expf(running_max[i]-next);
+            running_max[i]=next;
+        }
+        half p[4][4];
+        float sums[2]={0.0f,0.0f};
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const float m=running_max[e>>1];
+                p[j][e]=__float2half_rn(s[j][e]==-INFINITY?0.0f:expf(s[j][e]-m));
+                sums[e>>1]+=__half2float(p[j][e]);
+            }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],1);
+            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],2);
+            denominator[i]=denominator[i]*scale[i]+sums[i];
+        }
+        #pragma unroll
+        for(int n=0;n<kLocalN;++n) {
+            acc[n][0]*=scale[0];acc[n][1]*=scale[0];
+            acc[n][2]*=scale[1];acc[n][3]*=scale[1];
+        }
+        #pragma unroll
+        for(int kk=0;kk<2;++kk) {
+            const unsigned a[4]={reg_attn_pack(p[2*kk][0],p[2*kk][1]),
+                                 reg_attn_pack(p[2*kk][2],p[2*kk][3]),
+                                 reg_attn_pack(p[2*kk+1][0],p[2*kk+1][1]),
+                                 reg_attn_pack(p[2*kk+1][2],p[2*kk+1][3])};
+            #pragma unroll
+            for(int local=0;local<kLocalN/2;++local) {
+                const int pair=warp*(kLocalN/2)+local;
+                unsigned b[4];
+                reg_attn_ldmatrix_x4_trans(b,v_s+(16*kk+(lane&7)+((lane>>3)&1)*8)*
+                    kVerifyMmaStride+pair*16+(lane>>4)*8);
+                reg_attn_mma(acc[2*local],a,b[0],b[1]);
+                reg_attn_mma(acc[2*local+1],a,b[2],b[3]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+        const int row=i==0?row0:row1;
+        const int head=i==0?head0:head1;
+        const int count=i==0?count0:count1;
+        if(!(i==0?live0:live1) || first>=count) continue;
+        float* slot=workspace+
+            ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*
+                kFastFusedFlashStride;
+        #pragma unroll
+        for(int n=0;n<kLocalN;++n) {
+            const int dim=8*(warp*kLocalN+n)+2*t;
+            slot[head*kHeadDim+dim]=acc[n][2*i];
+            slot[head*kHeadDim+dim+1]=acc[n][2*i+1];
+        }
+        if(t==0 && warp==0) {
+            slot[kFastFusedFlashValues+head]=running_max[i];
+            slot[kFastFusedFlashValues+H+head]=denominator[i];
+        }
+    }
+}
+
+
 #include "exl3/l0_oscar_attention.cuh"
 
 bool verify_flash_mma_enabled() {
@@ -6616,6 +6817,24 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
         throw std::invalid_argument("verify flash MMA scratch extent");
     const int segments=segment_count(keys);
     const dim3 grid(segments,kKVHeads);
+    static const bool decode_kernel=[] {
+        const char* value=std::getenv("NINFER_EXL3_DECODE_FLASH_MMA");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(decode_kernel && rows*kFastFusedFlashHeads<=16) {
+        if(keys==64)
+            exl3_launch_small(attention_decode_flash_mma_kernel<64>,dim3(grid),dim3(128),0,stream,
+                q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+                sink_k,sink_v,ring_mask);
+        else if(keys==128)
+            exl3_launch_small(attention_decode_flash_mma_kernel<128>,dim3(grid),dim3(128),0,stream,
+                q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+                sink_k,sink_v,ring_mask);
+        else
+            exl3_launch_small(attention_decode_flash_mma_kernel<256>,dim3(grid),dim3(128),0,stream,
+                q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+                sink_k,sink_v,ring_mask);
+    } else
     if(keys==64)
         exl3_launch_small(attention_verify_flash_mma_kernel<64>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
