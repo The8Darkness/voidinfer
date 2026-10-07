@@ -18,6 +18,8 @@
 #include "exl3/retirement_state.h"
 #include "exl3/continuation_graph_drain_policy.h"
 #include "exl3/turboangle_host.h"
+#include "exl3/l0_l2_fp8.cuh"
+#include <execution>
 #include "ops/softmax_attention/oscar_mixed/launch.h"
 #include "core/nvtx_range.h"
 #include "core/decode_graph.h"
@@ -115,7 +117,7 @@ struct ExactPageExtension {
 ExactPageExtension extend_exact_pages(
     const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& prefix,int old_position,int new_position,
     bool reuse_unique_tail=false,Exl3HostKVStats* stats=nullptr,unsigned fault_for_test=0,
-    const Exl3TextContext::SnapshotMetadataReservation& reserve_metadata={}) {
+    const Exl3TextContext::SnapshotMetadataReservation& reserve_metadata={},int row_words=1024) {
     require(fault_for_test<=2,"exact page extension fault index");
     const auto started=stats?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(stats) ++stats->page_extension_calls;
@@ -179,9 +181,13 @@ ExactPageExtension extend_exact_pages(
         if(page!=deferred_tail) {
           page->first=first;page->rows=rows;
           for(int bank=0;bank<16;++bank) {
-            page->k[bank].reserve(Exl3ExactKVPage::token_capacity*1024);
-            page->v[bank].reserve(Exl3ExactKVPage::token_capacity*1024);
-            page->k[bank].resize(rows*1024);page->v[bank].resize(rows*1024);
+            page->k[bank].reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*row_words);
+            page->v[bank].reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*row_words);
+            // Non-FP16 rows (L0 L2 FP8) are appended by the exporter: no zero fill.
+            if(row_words==1024) {
+                page->k[bank].resize(static_cast<std::size_t>(rows)*row_words);
+                page->v[bank].resize(static_cast<std::size_t>(rows)*row_words);
+            }
           }
         }
         result.all.push_back(page);result.fresh.push_back(std::move(page));
@@ -10763,6 +10769,7 @@ std::size_t Exl3ExactHostState::payload_bytes() const noexcept {
     for (std::size_t i=0;i<48;++i) bytes += recurrent_plane(i).size_bytes();
     for (const auto& x : convolution_) bytes += x.size() * 2;
     for (const auto& x : taps_) bytes += x.size() * 2;
+    for (std::size_t i=0;i<16;++i) bytes += l0_codes_[i].size() + l0_meta_[i].size() * 2;
     return bytes;
 }
 
@@ -10770,6 +10777,7 @@ void Exl3ExactHostState::visit_kv_for_test(const std::function<void(
     int, int, int, std::span<const std::uint16_t>,
     std::span<const std::uint16_t>)>& visitor) const {
     require(static_cast<bool>(visitor), "KV visitor missing");
+    require(!l2_fp8_, "KV visitor requires FP16 pages");
     int first = 0;
     for (const auto& page : kv_pages_) {
         require(page && page->first == first && page->rows > 0 &&
@@ -10793,7 +10801,9 @@ bool Exl3ExactHostState::native_extent_valid(const int maximum_position) const n
     for(const auto& page:kv_pages_) {
         if(!page || page->first!=first || page->rows<=0 ||
            page->rows>Exl3ExactKVPage::token_capacity || page->rows>position_-first)return false;
-        const auto elements=static_cast<std::size_t>(page->rows)*1024;
+        if(page->fp8!=l2_fp8_)return false;
+        const auto elements=static_cast<std::size_t>(page->rows)*
+            (l2_fp8_?l0_l2_fp8::kRowWords:1024);
         for(int bank=0;bank<16;++bank)
             if(page->k[bank].size()!=elements || page->v[bank].size()!=elements)return false;
         first+=page->rows;
@@ -11235,7 +11245,15 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     const int prefix_position=share_prefix?impl_->exact_prefix_position:0;
     const std::vector<std::shared_ptr<const Exl3ExactKVPage>> empty_prefix;
     const auto& prefix_pages=share_prefix?impl_->exact_prefix_pages:empty_prefix;
-    auto extension=extend_exact_pages(prefix_pages,prefix_position,position_,false,nullptr,0,impl_->request_metadata_reservation);
+    // L0 OSCAR FP8 L2: fresh pages hold FP8 rows (prefix pages must match).
+    const bool l2_fp8=Exl3NativeContextExtent::l0_oscar_enabled() && l0_l2_fp8::enabled();
+    auto extension=extend_exact_pages(prefix_pages,prefix_position,position_,false,nullptr,0,
+        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024);
+    for(const auto& page:extension.all)
+        require(page->fp8==l2_fp8 || std::find(extension.fresh.begin(),extension.fresh.end(),page)!=extension.fresh.end(),
+                "L0 L2 FP8 prefix page format");
+    if(l2_fp8) for(const auto& page:extension.fresh) page->fp8=true;
+    state->l2_fp8_=l2_fp8;
     state->kv_pages_=std::move(extension.all);
     if(snapshot_credit) {
         require(snapshot_credit->bytes()==state->snapshot_metadata_bytes(),"snapshot metadata prepared capacity changed");
@@ -11339,7 +11357,40 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     Exl3ExportCopyPlan<48> convolution_plan;
     Exl3ExportCopyPlan<batched_kv_capacity> batched_kv_plan;
     for (int layer = 0; layer < kLayers; ++layer) {
-        if (impl_->full_layers[layer]) {
+        if (impl_->full_layers[layer] && state->l2_fp8_) {
+            if(!fresh_pages.empty()) {
+                const int range_first=std::max(prefix_position,fresh_pages.front()->first);
+                const int range_rows=position_-range_first;
+                auto& staging=l0_l2_fp8::staging();
+                staging.reserve(static_cast<std::size_t>(range_rows)*l0_l2_fp8::kRowBytes);
+                for(int plane=0;plane<2;++plane) {
+                    const auto* source=static_cast<const std::uint16_t*>(
+                        plane?impl_->cache_v[layer]->ptr:impl_->cache_k[layer]->ptr)+
+                        static_cast<std::size_t>(range_first)*1024;
+                    l0_l2_fp8::pack_kernel<<<(range_rows*4*32+255)/256,256,0,stream>>>(
+                        source,staging.device,range_rows);
+                    cuda_check(cudaGetLastError(),"L0 L2 FP8 pack");
+                    cuda_check(cudaMemcpyAsync(staging.host,staging.device,
+                        static_cast<std::size_t>(range_rows)*l0_l2_fp8::kRowBytes,
+                        cudaMemcpyDeviceToHost,stream),"L0 L2 FP8 export");
+                    cuda_check(cudaStreamSynchronize(stream),"L0 L2 FP8 export");
+                    // Page scatter is host memcpy bound: run the pages in parallel.
+                    std::for_each(std::execution::par,fresh_pages.begin(),fresh_pages.end(),[&](const auto& page) {
+                        const int from=std::max(range_first,page->first);
+                        const int rows=page->first+page->rows-from;
+                        if(rows<=0) return;
+                        auto& output=plane?page->v[full]:page->k[full];
+                        // Cloned prefix rows are already present; append the rest.
+                        output.resize(static_cast<std::size_t>(from-page->first)*l0_l2_fp8::kRowWords);
+                        const auto* words=reinterpret_cast<const std::uint16_t*>(
+                            staging.host+static_cast<std::size_t>(from-range_first)*l0_l2_fp8::kRowBytes);
+                        output.insert(output.end(),words,words+static_cast<std::size_t>(rows)*l0_l2_fp8::kRowWords);
+                    });
+                    state->kv_export_bytes_+=static_cast<std::size_t>(range_rows)*l0_l2_fp8::kRowBytes;
+                }
+            }
+            ++full;
+        } else if (impl_->full_layers[layer]) {
             for(const auto& page:fresh_pages) {
                 const int skip=std::clamp(prefix_position-page->first,0,page->rows);
                 const std::size_t elements=static_cast<std::size_t>(page->rows-skip)*1024;
@@ -11416,6 +11467,16 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap)
         download(state->taps_[tap], impl_->taps[tap]->ptr,
                  static_cast<std::size_t>(impl_->tap_rows) * kHidden);
+    if(Exl3NativeContextExtent::l0_oscar_enabled()) {
+        std::size_t full=0;
+        int rows=-1;
+        for(const auto& layer:impl_->full_layers) if(layer) {
+            const int layer_rows=layer->l0_export_history(state->l0_codes_[full],state->l0_meta_[full],stream);
+            require(rows<0 || layer_rows==rows,"L0 OSCAR park watermark differs across layers");
+            rows=layer_rows; ++full;
+        }
+        state->l0_rows_=std::max(rows,0);
+    }
     if(share_prefix) {
         impl_->exact_prefix_pages=state->kv_pages_;
         impl_->exact_prefix_position=position_;
@@ -11462,6 +11523,7 @@ std::shared_ptr<const Exl3TurboAngleWarmPages> Exl3TextContext::make_turboangle_
 std::shared_ptr<const Exl3TurboAngleWarmPages> Exl3TextContext::make_turboangle_l1_pages(
     std::shared_ptr<const Exl3ExactHostState> source) {
     require(source && source->position_>0,"TurboAngle L1 source extent");
+    require(!source->l2_fp8_,"TurboAngle pages require FP16 L2");
     const int rows=source->position_;
     return make_turboangle_pages(std::move(source),rows);
 }
@@ -11497,6 +11559,7 @@ std::shared_ptr<const Exl3TurboAngleWarmPages> Exl3TextContext::extend_turboangl
 std::shared_ptr<const Exl3TurboAngleWarmPages> Exl3TextContext::make_turboangle_pages(
     std::shared_ptr<const Exl3ExactHostState> source,int rows) {
     require(source && rows>0 && rows<=source->position_,"TurboAngle page extent");
+    require(!source->l2_fp8_,"TurboAngle pages require FP16 L2");
     auto warm=std::shared_ptr<Exl3TurboAngleWarmPages>(new Exl3TurboAngleWarmPages);
     warm->source_=std::move(source); warm->rows_=rows; warm->first_=warm->source_->position_-rows;
     for(int bank=0;bank<16;++bank) {
@@ -11644,6 +11707,25 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
         if (impl_->full_layers[layer]) {
             impl_->full_layers[layer]->invalidate_retained_prefix();
             const auto restore_kv=[&](void* destination,bool key,int first,int rows) {
+                if(state.l2_fp8_) {
+                    require(!warm,"L0 L2 FP8 pages have no TurboAngle warm tail");
+                    auto& staging=l0_l2_fp8::staging();
+                    staging.reserve(static_cast<std::size_t>(rows)*l0_l2_fp8::kRowBytes);
+                    std::for_each(std::execution::par,state.kv_pages_.begin(),state.kv_pages_.end(),[&](const auto& page) {
+                        if(page->first<first || page->first>=first+rows) return;
+                        const auto& packed=key?page->k[full]:page->v[full];
+                        std::memcpy(staging.host+static_cast<std::size_t>(page->first-first)*l0_l2_fp8::kRowBytes,
+                            packed.data(),static_cast<std::size_t>(page->rows)*l0_l2_fp8::kRowBytes);
+                    });
+                    cuda_check(cudaMemcpyAsync(staging.device,staging.host,
+                        static_cast<std::size_t>(rows)*l0_l2_fp8::kRowBytes,cudaMemcpyHostToDevice,stream),
+                        "L0 L2 FP8 restore");
+                    l0_l2_fp8::unpack_kernel<<<(rows*4*32+255)/256,256,0,stream>>>(
+                        staging.device,static_cast<std::uint16_t*>(destination),rows);
+                    cuda_check(cudaGetLastError(),"L0 L2 FP8 unpack");
+                    cuda_check(cudaStreamSynchronize(stream),"L0 L2 FP8 restore");
+                    return;
+                }
                 for(const auto& page:state.kv_pages_) {
                     if(page->first<first || page->first>=first+rows) continue;
                     const auto& original=key?page->k[full]:page->v[full];
@@ -11682,6 +11764,9 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                 restore_kv(impl_->cache_k[layer]->ptr,true,0,state.position_);
                 restore_kv(impl_->cache_v[layer]->ptr,false,0,state.position_);
                 impl_->full_layers[layer]->l0_refresh_window(state.position_,stream);
+                if(state.l0_rows_>0)
+                    impl_->full_layers[layer]->l0_import_history(state.l0_codes_[full],
+                        state.l0_meta_[full],state.l0_rows_,state.position_,stream);
                 if(oscar) impl_->oscar->append_kv_layer(layer,
                     static_cast<const std::uint16_t*>(impl_->cache_k[layer]->ptr),
                     static_cast<const std::uint16_t*>(impl_->cache_v[layer]->ptr),state.position_,0,stream);

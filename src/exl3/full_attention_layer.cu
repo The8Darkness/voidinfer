@@ -7242,6 +7242,45 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
     cuda_check(cudaMemsetAsync(l0_.state,0,2*sizeof(int),stream),"L0 OSCAR history reset");
 }
 
+int Exl3FullAttentionLayer::l0_export_history(std::vector<std::uint8_t>& codes,
+    std::vector<std::uint16_t>& meta,cudaStream_t stream) const {
+    if(!l0_.k_codes) return 0;
+    int state[2]={0,0};
+    cuda_check(cudaMemcpyAsync(state,l0_.state,sizeof(state),cudaMemcpyDeviceToHost,stream),
+               "L0 OSCAR park watermark");
+    cuda_check(cudaStreamSynchronize(stream),"L0 OSCAR park watermark");
+    const int rows=std::clamp(state[0],0,l0_.capacity);
+    const std::size_t code_bytes=static_cast<std::size_t>(rows)*kKVHeads*l0_oscar::kCodeBytes;
+    const std::size_t meta_elements=static_cast<std::size_t>(rows)*kKVHeads*l0_oscar::kMetaFloats;
+    codes.resize(2*code_bytes); meta.resize(2*meta_elements);
+    if(rows) {
+        cuda_check(cudaMemcpyAsync(codes.data(),l0_.k_codes,code_bytes,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park codes");
+        cuda_check(cudaMemcpyAsync(codes.data()+code_bytes,l0_.v_codes,code_bytes,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park codes");
+        cuda_check(cudaMemcpyAsync(meta.data(),l0_.k_meta,meta_elements*2,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park meta");
+        cuda_check(cudaMemcpyAsync(meta.data()+meta_elements,l0_.v_meta,meta_elements*2,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park meta");
+        cuda_check(cudaStreamSynchronize(stream),"L0 OSCAR park history");
+    }
+    return rows;
+}
+
+void Exl3FullAttentionLayer::l0_import_history(const std::vector<std::uint8_t>& codes,
+    const std::vector<std::uint16_t>& meta,int rows,int position,cudaStream_t stream) {
+    if(!l0_.k_codes || rows<=0) return;
+    const std::size_t code_bytes=static_cast<std::size_t>(rows)*kKVHeads*l0_oscar::kCodeBytes;
+    const std::size_t meta_elements=static_cast<std::size_t>(rows)*kKVHeads*l0_oscar::kMetaFloats;
+    if(rows>l0_.capacity || rows>std::max(l0_oscar::history_end(position),l0_oscar::kSink) ||
+       codes.size()!=2*code_bytes || meta.size()!=2*meta_elements)
+        throw std::invalid_argument("L0 OSCAR parked history extent");
+    cuda_check(cudaMemcpyAsync(l0_.k_codes,codes.data(),code_bytes,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume codes");
+    cuda_check(cudaMemcpyAsync(l0_.v_codes,codes.data()+code_bytes,code_bytes,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume codes");
+    cuda_check(cudaMemcpyAsync(l0_.k_meta,meta.data(),meta_elements*2,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume meta");
+    cuda_check(cudaMemcpyAsync(l0_.v_meta,meta.data()+meta_elements,meta_elements*2,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume meta");
+    const int state[2]={rows,position};
+    cuda_check(cudaMemcpyAsync(l0_.state,state,sizeof(state),cudaMemcpyHostToDevice,stream),"L0 OSCAR resume watermark");
+    // Pageable sources: complete before the vectors may be released.
+    cuda_check(cudaStreamSynchronize(stream),"L0 OSCAR resume history");
+}
+
 void Exl3FullAttentionLayer::set_position_device(const int* position_device) noexcept {
     position_device_ = position_device;
 }

@@ -15,6 +15,9 @@ namespace ninfer::exl3 {
 struct Exl3ExactKVPage {
     static constexpr int token_capacity=64;
     int first=0,rows=0;
+    // FP16 [rows][4][256] per bank, or (L0 L2 FP8 pages, l0_l2_fp8.cuh) rows of
+    // 516 words: 1024 e4m3 bytes + 4 FP16 head scales.
+    bool fp8=false;
     std::array<std::vector<std::uint16_t>,16> k,v;
     static std::shared_ptr<Exl3ExactKVPage> create(
         const std::function<RetainedDescriptorLedger::Ticket(std::uint64_t)>& reserve={}) {
