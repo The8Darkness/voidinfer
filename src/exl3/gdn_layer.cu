@@ -2702,6 +2702,200 @@ void Exl3GdnLayer::finish_bulk_mlp(DeferredMlpBuffers buffers,
         static_cast<std::size_t>(final_offset)*kHidden;
 }
 
+// Stateful core of one GDN forward: causal convolution against this layer's
+// conv state, the gated delta recurrence on its recurrent state (with the
+// rollback traces), and the gated RMS norm. Projections, output projection
+// and MLP stay in forward(); batched multi-agent rounds run this once per
+// agent segment on that agent's layer object.
+void Exl3GdnLayer::gdn_middle(const GdnMiddle& m) {
+    std::uint16_t* qkv=m.qkv; std::uint16_t* conv_input=m.conv_input;
+    std::uint16_t* q=m.q; std::uint16_t* k=m.k; std::uint16_t* v=m.v;
+    std::uint16_t* conv_output=m.conv_output; std::uint16_t* z=m.z; std::uint16_t* z_bf16=m.z_bf16;
+    std::uint16_t* core=m.core; std::uint16_t* gdn_norm=m.gdn_norm; std::uint16_t* head_trace=m.head_trace;
+    std::uint16_t* o_input=m.o_input; float* g_trace=m.g_trace; float* beta_trace=m.beta_trace;
+    const int rows=m.rows; cudaStream_t stream=m.stream;
+    const bool wide_prefill=m.wide_prefill; const bool preserve_m1_topology=m.preserve_m1_topology;
+    const bool merged_qkvz_side=m.merged_qkvz_side;
+    const bool eligible_retained_prefix=m.eligible_retained_prefix;
+    const void* base_checkpoint_recurrent=m.base_checkpoint_recurrent;
+    const auto begin = [&](int i) { if (m.collect_stage_events) record(m.starts[i], stream); };
+    const auto end = [&](int i) { if (m.collect_stage_events) record(m.ends[i], stream); };
+    begin(4);
+    const bool fast_same_weights_fp16kv_gdn_decode_conv =
+        fast_same_weights_fp16kv_gdn_decode_conv_ && rows >= 1 && rows <= 8 &&
+        !wide_prefill;
+    bool conv_tiled_packed=false;
+    if (fast_same_weights_fp16kv_gdn_decode_conv) {
+        launch_gopt_conv(gaming_[Gopt::GdnConvTrace],true,qkv,weights_.conv_weight,
+            conv_state_,conv_input,q,k,v,conv_output,conv_state_trace_,rows,stream);
+        if(gaming_[Gopt::GdnConvTrace]) {
+            check(cudaGetLastError(), "launch GOPT convolution trace");
+            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
+        }
+        ++fast_same_weights_fp16kv_gdn_decode_conv_calls_;
+    } else if (rows>=kConvTileRows && gdn_conv_prefill_tiled_enabled()) {
+        gdn_conv_prefill_tiled_kernel<<<dim3(kQkv/kConvTileChannels,
+            (rows+kConvTileRows-1)/kConvTileRows),256,0,stream>>>(
+            qkv,weights_.conv_weight,conv_state_,conv_input,q,k,v,conv_output,rows);
+        if(gaming_[Gopt::GdnConvTrace]) {
+            gdn_conv_prefill_state_kernel<true><<<(kQkv+255)/256,256,0,stream>>>(
+                qkv,conv_state_,rows,conv_state_trace_);
+            check(cudaGetLastError(),"launch GOPT tiled conv trace");
+            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
+        } else {
+            gdn_conv_prefill_state_kernel<false><<<(kQkv+255)/256,256,0,stream>>>(
+                qkv,conv_state_,rows,nullptr);
+        }
+        conv_tiled_packed=true;
+    } else {
+        if (!merged_qkvz_side)
+            exl3_launch_small(transpose_f16_to_bf16_kernel,dim3((rows * kQkv + 255) / 256),dim3(256),0,stream,qkv, conv_input, rows, kQkv);
+        launch_gopt_conv(gaming_[Gopt::GdnConvTrace],false,qkv,weights_.conv_weight,
+            conv_state_,conv_input,q,k,v,conv_output,conv_state_trace_,rows,stream,
+            chain_rows_device_);
+        if(gaming_[Gopt::GdnConvTrace]) {
+            check(cudaGetLastError(),"launch GOPT ordinary conv trace");
+            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
+        }
+    }
+    if(!gaming_[Gopt::GdnConvTrace])
+        exl3_launch_small(copy_conv_state_trace_kernel,dim3((kConvStateElements + 255) / 256),dim3(256),0,stream,conv_state_, conv_state_trace_);
+    // conv_output (packed BF16 q|k|v) is trace-only: production skips it.
+    if (!fast_same_weights_fp16kv_gdn_decode_conv && !conv_tiled_packed && !skip_state_trace_)
+        exl3_launch_small(pack_qkv_bf16_kernel,dim3((rows * kQkv + 255) / 256),dim3(256),0,stream,q, k, v, conv_output, rows);
+    const bool fused_gated_norm=gdn_fused_gated_norm_enabled() && !gaming_[Gopt::GdnOutputPack];
+    if(!fused_gated_norm)
+        exl3_launch_small(convert_f16_to_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,z, z_bf16, rows * kZ);
+    check(cudaGetLastError(), "launch GDN convolution staging"); end(4);
+    begin(5);
+    // Diagnostic only: sample the reached recurrence on the unchanged Fast90
+    // route. The synchronizing event result is never used as request timing.
+    static std::atomic<int> prefill_recurrence_samples{0};
+    const char* recurrence_sample_option=std::getenv(
+        "NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
+    const bool recurrence_sample=rows==1024 && wide_prefill &&
+        recurrence_sample_option &&
+        std::strcmp(recurrence_sample_option,"1")==0 &&
+        prefill_recurrence_samples.fetch_add(1,std::memory_order_relaxed)<16;
+    cudaEvent_t recurrence_start=nullptr,recurrence_end=nullptr;
+    if(recurrence_sample) {
+        check(cudaEventCreate(&recurrence_start),"create GDN recurrence sample start");
+        check(cudaEventCreate(&recurrence_end),"create GDN recurrence sample end");
+    }
+    // A verifier transaction may already have saved this exact root in the
+    // state-before trace. Preserve it for rollback/accepted-prefix repair and
+    // avoid submitting the duplicate full recurrent-state copy.
+    if (!skip_state_trace_ && !(eligible_retained_prefix &&
+          base_checkpoint_recurrent == recurrent_state_before_))
+        check(cudaMemcpyAsync(recurrent_state_before_, recurrent_state_, kStateBytes,
+                              cudaMemcpyDeviceToDevice, stream),
+              "save GDN state trace");
+    const Exl3GdnStageFusionContract stage_fusion{
+        static_cast<std::size_t>(rows),prefill_resident_,wide_prefill,
+        preserve_m1_topology};
+    const bool small_resident=gaming_[Gopt::GdnSmallResident] &&
+        gopt_small_gdn(rows,preserve_m1_topology,wide_prefill,prefill_normalized_!=nullptr);
+    if (small_resident || stage_fusion.exact_route_supported()) {
+        float* normalized_q = prefill_normalized_;
+        float* normalized_k = normalized_q + max_rows_ * kKeyHeads * kHeadDim;
+        float* alpha = normalized_k + max_rows_ * kKeyHeads * kHeadDim;
+        gdn_prefill_normalize_kernel<<<rows * kKeyHeads, 32, 0, stream>>>(
+            q, k, g_trace, normalized_q, normalized_k, alpha);
+        check(cudaGetLastError(), "launch prefill GDN normalization");
+        const auto recurrent_row_bytes=static_cast<std::size_t>(rows)*
+            Exl3GdnRecurrentLayout::value_heads*
+            Exl3GdnRecurrentLayout::value_columns*sizeof(std::uint16_t);
+        const Exl3GdnRecurrentVectorAccess vector_access{
+            recurrent_state_,kStateBytes,v,recurrent_row_bytes,core,
+            recurrent_row_bytes,static_cast<std::size_t>(rows),
+            Exl3GdnRecurrentLayout::value_columns};
+        const bool vector_pair_supported=prefill_resident_pair_vector_io_ &&
+            vector_access.pair_columns_supported();
+        if(recurrence_sample)
+            check(cudaEventRecord(recurrence_start,stream),
+                  "record GDN recurrence sample start");
+        if(small_resident) {
+            gdn_recurrence_prefill_resident_pair_columns_kernel<false><<<
+                kHeads*(kHeadDim/(4*2)),4*32,0,stream>>>(
+                normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
+            check(cudaGetLastError(),"launch GOPT small-M resident GDN");
+            gopt_record(gaming_submissions_,Gopt::GdnSmallResident);
+        } else if(prefill_resident_quad_columns_)
+            gdn_recurrence_prefill_resident_quad_columns_kernel<<<
+                kHeads*(kHeadDim/(4*4)),4*32,0,stream>>>(
+                normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
+        else if(gdn_chunked_prefill_enabled() && wide_prefill && rows>=64 &&
+                rows<=max_rows_ && max_rows_<=1024 && max_rows_%gdn_chunked::kC==0)
+            gdn_chunked::launch(normalized_q,normalized_k,v,alpha,beta_trace,
+                recurrent_state_,core,rows,gdn_chunked_workspace(),stream);
+        else if(prefill_resident_pair_columns_) {
+            if(vector_pair_supported)
+                gdn_recurrence_prefill_resident_pair_columns_kernel<true><<<
+                    kHeads*(kHeadDim/(4*2)),4*32,0,stream>>>(
+                    normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
+            else if(!prefill_resident_pair_vector_io_)
+                gdn_recurrence_prefill_resident_pair_columns_kernel<false><<<
+                    kHeads*(kHeadDim/(4*2)),4*32,0,stream>>>(
+                    normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
+            else
+                gdn_recurrence_prefill_resident_kernel<<<
+                    kHeads*(kHeadDim/4),4*32,0,stream>>>(
+                    normalized_q,normalized_k,v,alpha,beta_trace,
+                    recurrent_state_,core,rows);
+        }
+        else
+            gdn_recurrence_prefill_resident_kernel<<<kHeads * (kHeadDim / 4), 4 * 32, 0, stream>>>(
+                normalized_q, normalized_k, v, alpha, beta_trace, recurrent_state_, core, rows);
+    } else {
+        if(recurrence_sample)
+            check(cudaEventRecord(recurrence_start,stream),
+                  "record GDN recurrence sample start");
+        launch_gdn_recurrence_sm120(
+            q, k, v, g_trace, beta_trace, recurrent_state_, core, rows, stream,
+            chain_rows_device_);
+    }
+    check(cudaGetLastError(), "launch GDN recurrence"); end(5);
+    if(recurrence_sample) {
+        check(cudaEventRecord(recurrence_end,stream),
+              "record GDN recurrence sample end");
+        check(cudaEventSynchronize(recurrence_end),
+              "synchronize GDN recurrence sample");
+        float elapsed_ms=0.0f;
+        check(cudaEventElapsedTime(&elapsed_ms,recurrence_start,recurrence_end),
+              "read GDN recurrence sample");
+        std::fprintf(stderr,
+            "GDN_PREFILL_RECURRENCE_SAMPLE layer=%d rows=%d gpu_ms=%.6f\n",
+            model_layer_,rows,elapsed_ms);
+        cudaEventDestroy(recurrence_start);
+        cudaEventDestroy(recurrence_end);
+    }
+    begin(6);
+    if(fused_gated_norm) {
+        if (!wide_prefill && !skip_state_trace_)
+            exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
+        exl3_launch_small(gdn_gated_norm_f16io_kernel,dim3((rows*kHeads+15)/16),dim3(512),0,stream,
+            reinterpret_cast<const __nv_bfloat162*>(core),reinterpret_cast<const half2*>(z),
+            reinterpret_cast<const __nv_bfloat162*>(weights_.gdn_norm),
+            reinterpret_cast<half2*>(o_input),rows*kHeads,kRmsEps);
+    } else {
+    Tensor tz(z_bf16, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tcore(core, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tnorm(gdn_norm, DType::BF16, {kHeadDim, kHeads, rows});
+    Tensor nw(const_cast<std::uint16_t*>(weights_.gdn_norm), DType::BF16, {kHeadDim});
+    ninfer::ops::gated_rmsnorm(tcore, nw, tz, kRmsEps, tnorm, stream);
+    if(gaming_[Gopt::GdnOutputPack]) {
+        gopt_gdn_output_pack_kernel<<<(rows*kZ+255)/256,256,0,stream>>>(
+            core,gdn_norm,head_trace,o_input,rows*kZ);
+        check(cudaGetLastError(),"launch GOPT GDN output packing");
+        gopt_record(gaming_submissions_,Gopt::GdnOutputPack);
+    } else {
+        // head_trace is not part of the published trace; wide prefill skips the copy.
+        if (!wide_prefill)
+            exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
+        exl3_launch_small(transpose_bf16_to_f16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,gdn_norm, o_input, rows, kZ);
+    }
+    }
+    check(cudaGetLastError(), "launch GDN gated norm staging"); end(6);
+}
+
 void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, int rows,
                            cudaStream_t stream, bool profile, bool preserve_m1_topology,
                            bool wide_prefill,const BulkPrefillBuffers* prepared,
@@ -3239,180 +3433,10 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         begin(3);
         launch_control(); end(3);
     }
-    begin(4);
-    const bool fast_same_weights_fp16kv_gdn_decode_conv =
-        fast_same_weights_fp16kv_gdn_decode_conv_ && rows >= 1 && rows <= 8 &&
-        !wide_prefill;
-    bool conv_tiled_packed=false;
-    if (fast_same_weights_fp16kv_gdn_decode_conv) {
-        launch_gopt_conv(gaming_[Gopt::GdnConvTrace],true,qkv,weights_.conv_weight,
-            conv_state_,conv_input,q,k,v,conv_output,conv_state_trace_,rows,stream);
-        if(gaming_[Gopt::GdnConvTrace]) {
-            check(cudaGetLastError(), "launch GOPT convolution trace");
-            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
-        }
-        ++fast_same_weights_fp16kv_gdn_decode_conv_calls_;
-    } else if (rows>=kConvTileRows && gdn_conv_prefill_tiled_enabled()) {
-        gdn_conv_prefill_tiled_kernel<<<dim3(kQkv/kConvTileChannels,
-            (rows+kConvTileRows-1)/kConvTileRows),256,0,stream>>>(
-            qkv,weights_.conv_weight,conv_state_,conv_input,q,k,v,conv_output,rows);
-        if(gaming_[Gopt::GdnConvTrace]) {
-            gdn_conv_prefill_state_kernel<true><<<(kQkv+255)/256,256,0,stream>>>(
-                qkv,conv_state_,rows,conv_state_trace_);
-            check(cudaGetLastError(),"launch GOPT tiled conv trace");
-            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
-        } else {
-            gdn_conv_prefill_state_kernel<false><<<(kQkv+255)/256,256,0,stream>>>(
-                qkv,conv_state_,rows,nullptr);
-        }
-        conv_tiled_packed=true;
-    } else {
-        if (!merged_qkvz_side)
-            exl3_launch_small(transpose_f16_to_bf16_kernel,dim3((rows * kQkv + 255) / 256),dim3(256),0,stream,qkv, conv_input, rows, kQkv);
-        launch_gopt_conv(gaming_[Gopt::GdnConvTrace],false,qkv,weights_.conv_weight,
-            conv_state_,conv_input,q,k,v,conv_output,conv_state_trace_,rows,stream,
-            chain_rows_device_);
-        if(gaming_[Gopt::GdnConvTrace]) {
-            check(cudaGetLastError(),"launch GOPT ordinary conv trace");
-            gopt_record(gaming_submissions_,Gopt::GdnConvTrace);
-        }
-    }
-    if(!gaming_[Gopt::GdnConvTrace])
-        exl3_launch_small(copy_conv_state_trace_kernel,dim3((kConvStateElements + 255) / 256),dim3(256),0,stream,conv_state_, conv_state_trace_);
-    // conv_output (packed BF16 q|k|v) is trace-only: production skips it.
-    if (!fast_same_weights_fp16kv_gdn_decode_conv && !conv_tiled_packed && !skip_state_trace_)
-        exl3_launch_small(pack_qkv_bf16_kernel,dim3((rows * kQkv + 255) / 256),dim3(256),0,stream,q, k, v, conv_output, rows);
-    const bool fused_gated_norm=gdn_fused_gated_norm_enabled() && !gaming_[Gopt::GdnOutputPack];
-    if(!fused_gated_norm)
-        exl3_launch_small(convert_f16_to_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,z, z_bf16, rows * kZ);
-    check(cudaGetLastError(), "launch GDN convolution staging"); end(4);
-    begin(5);
-    // Diagnostic only: sample the reached recurrence on the unchanged Fast90
-    // route. The synchronizing event result is never used as request timing.
-    static std::atomic<int> prefill_recurrence_samples{0};
-    const char* recurrence_sample_option=std::getenv(
-        "NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
-    const bool recurrence_sample=rows==1024 && wide_prefill &&
-        recurrence_sample_option &&
-        std::strcmp(recurrence_sample_option,"1")==0 &&
-        prefill_recurrence_samples.fetch_add(1,std::memory_order_relaxed)<16;
-    cudaEvent_t recurrence_start=nullptr,recurrence_end=nullptr;
-    if(recurrence_sample) {
-        check(cudaEventCreate(&recurrence_start),"create GDN recurrence sample start");
-        check(cudaEventCreate(&recurrence_end),"create GDN recurrence sample end");
-    }
-    // A verifier transaction may already have saved this exact root in the
-    // state-before trace. Preserve it for rollback/accepted-prefix repair and
-    // avoid submitting the duplicate full recurrent-state copy.
-    if (!skip_state_trace_ && !(eligible_retained_prefix &&
-          base_checkpoint_recurrent == recurrent_state_before_))
-        check(cudaMemcpyAsync(recurrent_state_before_, recurrent_state_, kStateBytes,
-                              cudaMemcpyDeviceToDevice, stream),
-              "save GDN state trace");
-    const Exl3GdnStageFusionContract stage_fusion{
-        static_cast<std::size_t>(rows),prefill_resident_,wide_prefill,
-        preserve_m1_topology};
-    const bool small_resident=gaming_[Gopt::GdnSmallResident] &&
-        gopt_small_gdn(rows,preserve_m1_topology,wide_prefill,prefill_normalized_!=nullptr);
-    if (small_resident || stage_fusion.exact_route_supported()) {
-        float* normalized_q = prefill_normalized_;
-        float* normalized_k = normalized_q + max_rows_ * kKeyHeads * kHeadDim;
-        float* alpha = normalized_k + max_rows_ * kKeyHeads * kHeadDim;
-        gdn_prefill_normalize_kernel<<<rows * kKeyHeads, 32, 0, stream>>>(
-            q, k, g_trace, normalized_q, normalized_k, alpha);
-        check(cudaGetLastError(), "launch prefill GDN normalization");
-        const auto recurrent_row_bytes=static_cast<std::size_t>(rows)*
-            Exl3GdnRecurrentLayout::value_heads*
-            Exl3GdnRecurrentLayout::value_columns*sizeof(std::uint16_t);
-        const Exl3GdnRecurrentVectorAccess vector_access{
-            recurrent_state_,kStateBytes,v,recurrent_row_bytes,core,
-            recurrent_row_bytes,static_cast<std::size_t>(rows),
-            Exl3GdnRecurrentLayout::value_columns};
-        const bool vector_pair_supported=prefill_resident_pair_vector_io_ &&
-            vector_access.pair_columns_supported();
-        if(recurrence_sample)
-            check(cudaEventRecord(recurrence_start,stream),
-                  "record GDN recurrence sample start");
-        if(small_resident) {
-            gdn_recurrence_prefill_resident_pair_columns_kernel<false><<<
-                kHeads*(kHeadDim/(4*2)),4*32,0,stream>>>(
-                normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
-            check(cudaGetLastError(),"launch GOPT small-M resident GDN");
-            gopt_record(gaming_submissions_,Gopt::GdnSmallResident);
-        } else if(prefill_resident_quad_columns_)
-            gdn_recurrence_prefill_resident_quad_columns_kernel<<<
-                kHeads*(kHeadDim/(4*4)),4*32,0,stream>>>(
-                normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
-        else if(gdn_chunked_prefill_enabled() && wide_prefill && rows>=64 &&
-                rows<=max_rows_ && max_rows_<=1024 && max_rows_%gdn_chunked::kC==0)
-            gdn_chunked::launch(normalized_q,normalized_k,v,alpha,beta_trace,
-                recurrent_state_,core,rows,gdn_chunked_workspace(),stream);
-        else if(prefill_resident_pair_columns_) {
-            if(vector_pair_supported)
-                gdn_recurrence_prefill_resident_pair_columns_kernel<true><<<
-                    kHeads*(kHeadDim/(4*2)),4*32,0,stream>>>(
-                    normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
-            else if(!prefill_resident_pair_vector_io_)
-                gdn_recurrence_prefill_resident_pair_columns_kernel<false><<<
-                    kHeads*(kHeadDim/(4*2)),4*32,0,stream>>>(
-                    normalized_q,normalized_k,v,alpha,beta_trace,recurrent_state_,core,rows);
-            else
-                gdn_recurrence_prefill_resident_kernel<<<
-                    kHeads*(kHeadDim/4),4*32,0,stream>>>(
-                    normalized_q,normalized_k,v,alpha,beta_trace,
-                    recurrent_state_,core,rows);
-        }
-        else
-            gdn_recurrence_prefill_resident_kernel<<<kHeads * (kHeadDim / 4), 4 * 32, 0, stream>>>(
-                normalized_q, normalized_k, v, alpha, beta_trace, recurrent_state_, core, rows);
-    } else {
-        if(recurrence_sample)
-            check(cudaEventRecord(recurrence_start,stream),
-                  "record GDN recurrence sample start");
-        launch_gdn_recurrence_sm120(
-            q, k, v, g_trace, beta_trace, recurrent_state_, core, rows, stream,
-            chain_rows_device_);
-    }
-    check(cudaGetLastError(), "launch GDN recurrence"); end(5);
-    if(recurrence_sample) {
-        check(cudaEventRecord(recurrence_end,stream),
-              "record GDN recurrence sample end");
-        check(cudaEventSynchronize(recurrence_end),
-              "synchronize GDN recurrence sample");
-        float elapsed_ms=0.0f;
-        check(cudaEventElapsedTime(&elapsed_ms,recurrence_start,recurrence_end),
-              "read GDN recurrence sample");
-        std::fprintf(stderr,
-            "GDN_PREFILL_RECURRENCE_SAMPLE layer=%d rows=%d gpu_ms=%.6f\n",
-            model_layer_,rows,elapsed_ms);
-        cudaEventDestroy(recurrence_start);
-        cudaEventDestroy(recurrence_end);
-    }
-    begin(6);
-    if(fused_gated_norm) {
-        if (!wide_prefill && !skip_state_trace_)
-            exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
-        exl3_launch_small(gdn_gated_norm_f16io_kernel,dim3((rows*kHeads+15)/16),dim3(512),0,stream,
-            reinterpret_cast<const __nv_bfloat162*>(core),reinterpret_cast<const half2*>(z),
-            reinterpret_cast<const __nv_bfloat162*>(weights_.gdn_norm),
-            reinterpret_cast<half2*>(o_input),rows*kHeads,kRmsEps);
-    } else {
-    Tensor tz(z_bf16, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tcore(core, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tnorm(gdn_norm, DType::BF16, {kHeadDim, kHeads, rows});
-    Tensor nw(const_cast<std::uint16_t*>(weights_.gdn_norm), DType::BF16, {kHeadDim});
-    ninfer::ops::gated_rmsnorm(tcore, nw, tz, kRmsEps, tnorm, stream);
-    if(gaming_[Gopt::GdnOutputPack]) {
-        gopt_gdn_output_pack_kernel<<<(rows*kZ+255)/256,256,0,stream>>>(
-            core,gdn_norm,head_trace,o_input,rows*kZ);
-        check(cudaGetLastError(),"launch GOPT GDN output packing");
-        gopt_record(gaming_submissions_,Gopt::GdnOutputPack);
-    } else {
-        // head_trace is not part of the published trace; wide prefill skips the copy.
-        if (!wide_prefill)
-            exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,core, head_trace, rows);
-        exl3_launch_small(transpose_bf16_to_f16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,gdn_norm, o_input, rows, kZ);
-    }
-    }
-    check(cudaGetLastError(), "launch GDN gated norm staging"); end(6);
+    gdn_middle(GdnMiddle{qkv,conv_input,q,k,v,conv_output,z,z_bf16,core,gdn_norm,head_trace,
+        o_input,g_trace,beta_trace,rows,stream,wide_prefill,preserve_m1_topology,
+        merged_qkvz_side,eligible_retained_prefix,base_checkpoint_recurrent,
+        collect_stage_events,starts,ends});
     const bool gopt_residual=gaming_[Gopt::GdnVerifierResidualNorm] &&
         rows>=1 && rows<=8 && !wide_prefill && preserve_m1_topology;
     // The O reduction also writes post = half(input + o) and the

@@ -792,6 +792,20 @@ public:
     static constexpr std::size_t kConvStateStorageBytes = Exl3GdnRecurrentLayout::convolution_storage_bytes;
 
 private:
+    // Arguments of gdn_middle(): the stateful core between the input
+    // projections and the output projection (see gdn_layer.cu).
+    struct GdnMiddle {
+        std::uint16_t *qkv,*conv_input,*q,*k,*v,*conv_output,*z,*z_bf16,*core,*gdn_norm,*head_trace,*o_input;
+        float *g_trace,*beta_trace;
+        int rows;
+        cudaStream_t stream;
+        bool wide_prefill,preserve_m1_topology,merged_qkvz_side,eligible_retained_prefix;
+        const void* base_checkpoint_recurrent;
+        bool collect_stage_events;
+        cudaEvent_t* starts;
+        cudaEvent_t* ends;
+    };
+    void gdn_middle(const GdnMiddle& m);
     friend class Exl3TextContext;
     // The TextContext passes the bounded shared owner for this layer. Every
     // exposed history buffer is layer-owned, while model_owner separately
