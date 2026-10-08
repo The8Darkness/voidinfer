@@ -957,6 +957,7 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
                 row,shape.in_features,shape.out_features);
         std::array<std::vector<std::uint16_t>,16> row_snapshots;
         for(int rows:{1,2,3,4,7,8,9,12,16}) {
+            if(env_or_empty("NINFER_EXL3_TEST_ROW_TIMING")=="1")break;
             require(rows>8 || std::string(old.dispatch_name(metadata,rows,
                         Admission::ordinary))!=dispatch &&
                     std::string(candidate.dispatch_name(metadata,rows,
@@ -1025,6 +1026,27 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
                 cuda_check(cudaEventRecord(stop),"timing stop");cuda_check(cudaEventSynchronize(stop),"timing sync");
                 float elapsed=0;cuda_check(cudaEventElapsedTime(&elapsed,start,stop),"timing read");
                 std::cout<<"ROW_TIMING op="<<shape.name<<" M="<<rows<<" us="<<elapsed*1000.0f/200<<'\n';
+                cudaEventDestroy(start);cudaEventDestroy(stop);
+            }
+            // Wider batched rounds (4/8 agents): the routes a 64-row workspace takes.
+            Exl3CudaLinearWorkspace wide(shape.in_features,shape.out_features,64,
+                false,shape.gate_up,false,shape.o,shape.z,true,false,
+                {},{},shape.qkv,false,shape.q);
+            DeviceBuffer d_wide_in,d_wide_out;
+            auto* wide_in=allocate_device<std::uint16_t>(d_wide_in,64u*shape.in_features,"wide timing input");
+            auto* wide_out=allocate_device<std::uint16_t>(d_wide_out,64u*shape.out_features,"wide timing output");
+            for(int r=0;r<4;++r)cuda_check(cudaMemcpy(wide_in+static_cast<std::size_t>(r)*16*shape.in_features,input,
+                16u*shape.in_features*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice),"wide timing input copy");
+            for(int rows:{8,16,24,32,48,64}) {
+                cudaEvent_t start,stop;
+                cuda_check(cudaEventCreate(&start),"timing event");cuda_check(cudaEventCreate(&stop),"timing event");
+                for(int i=0;i<20;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?Admission::target_wide_prefill:Admission::ordinary);
+                cuda_check(cudaEventRecord(start),"timing start");
+                for(int i=0;i<200;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?Admission::target_wide_prefill:Admission::ordinary);
+                cuda_check(cudaEventRecord(stop),"timing stop");cuda_check(cudaEventSynchronize(stop),"timing sync");
+                float elapsed=0;cuda_check(cudaEventElapsedTime(&elapsed,start,stop),"timing read");
+                std::cout<<"ROW_TIMING_WIDE op="<<shape.name<<" M="<<rows<<" us="<<elapsed*1000.0f/200
+                         <<" dispatch="<<wide.dispatch_name(metadata,rows,rows>16?Admission::target_wide_prefill:Admission::ordinary)<<'\n';
                 cudaEventDestroy(start);cudaEventDestroy(stop);
             }
             continue;

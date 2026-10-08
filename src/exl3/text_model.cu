@@ -1195,13 +1195,14 @@ struct Exl3TextContext::Impl {
     // Batched multi-agent continuation: one captured 16-row layer stack per
     // (peer, row shape), replayed by continue_rows_batched.
     struct BatchedGraph {
-        const void* peer=nullptr;
-        int own_rows=0,peer_rows=0;
+        std::vector<const void*> peers;
+        std::vector<int> peer_rows;
+        int own_rows=0;
         std::uint16_t* stack_output=nullptr;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable executable;
     };
-    std::unique_ptr<BatchedGraph> batched_graph;
+    std::vector<std::unique_ptr<BatchedGraph>> batched_graphs;
     // Continuation (verifier) rows 2..8 replay captured full-layer graphs too;
     // the retained-prefix capability is re-armed on the host after replay.
     bool ordinary_full_layer_multirow_graphs_enabled=false;
@@ -5681,7 +5682,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(impl->persistent_bytes==expected_layer_group,"target complete layer group requirement mismatch");
     trace_stage("layers");
     if(tiered) {
-        constexpr int small_rows=16;
+        constexpr int small_rows=32;   // four agents' verifier rows
         const auto small=Exl3LinearWorkspaceRequirements::derive(17408,17408,small_rows);
         // Coherent continuation routes use up to 10 K partitions, and paired
         // gate/up projections stack two planes in one accumulation view.
@@ -9463,26 +9464,35 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     ++last_decode_h2d_;
 }
 
-// Pairs every layer of a batched owner with the peer's layer of the same index
-// for the lifetime of one batched forward (eager or captured).
+// Pairs every layer of a batched owner with its peers' layers of the same
+// index for the lifetime of one batched forward (eager or captured).
 struct Exl3TextContext::BatchBinding {
     Impl& owner;
     std::array<Exl3FullAttentionLayer::Batch,kLayers> full{};
     std::array<Exl3GdnLayer::Batch,kLayers> gdn{};
-    BatchBinding(Impl& owner_,Impl& peer,int own_rows,int peer_rows,int peer_position,
-                 cudaStream_t peer_stream=nullptr) : owner(owner_) {
+    BatchBinding(Impl& owner_,std::span<Impl* const> peers,std::span<const int> peer_rows,
+                 std::span<const int> peer_positions,std::span<const cudaStream_t> peer_streams,
+                 int own_rows) : owner(owner_) {
+        require(!peers.empty() && peers.size()<=Exl3FullAttentionLayer::kMaxBatchPeers &&
+                peers.size()<=Exl3GdnLayer::kMaxBatchPeers,"batched peer count");
         for(int layer=0;layer<kLayers;++layer) {
             if(owner.full_layers[layer]) {
-                require(static_cast<bool>(peer.full_layers[layer]),"batched layer topology");
                 full[layer].own_rows=own_rows;
-                full[layer].peer_count=1;
-                full[layer].peers[0]={peer.full_layers[layer].get(),peer_rows,peer_position,peer_stream};
+                full[layer].peer_count=static_cast<int>(peers.size());
+                for(std::size_t p=0;p<peers.size();++p) {
+                    require(static_cast<bool>(peers[p]->full_layers[layer]),"batched layer topology");
+                    full[layer].peers[p]={peers[p]->full_layers[layer].get(),peer_rows[p],peer_positions[p],
+                        peer_streams.empty()?nullptr:peer_streams[p]};
+                }
                 owner.full_layers[layer]->set_batch(&full[layer]);
             } else if(owner.gdn_layers[layer]) {
-                require(static_cast<bool>(peer.gdn_layers[layer]),"batched layer topology");
                 gdn[layer].own_rows=own_rows;
-                gdn[layer].peer_count=1;
-                gdn[layer].peers[0]={peer.gdn_layers[layer].get(),peer_rows,peer_stream};
+                gdn[layer].peer_count=static_cast<int>(peers.size());
+                for(std::size_t p=0;p<peers.size();++p) {
+                    require(static_cast<bool>(peers[p]->gdn_layers[layer]),"batched layer topology");
+                    gdn[layer].peers[p]={peers[p]->gdn_layers[layer].get(),peer_rows[p],
+                        peer_streams.empty()?nullptr:peer_streams[p]};
+                }
                 owner.gdn_layers[layer]->set_batch(&gdn[layer]);
             }
         }
@@ -9497,10 +9507,27 @@ struct Exl3TextContext::BatchBinding {
 
 void Exl3TextContext::prepare_batched_continuation_graph(Exl3TextContext& peer,
     int own_rows,int peer_rows) {
-    require(&peer!=this && peer.impl_->model==impl_->model &&
-            own_rows>=2 && own_rows<=8 && peer_rows>=2 && peer_rows<=8,
+    Exl3TextContext* const peers[1]={&peer};
+    const int rows[1]={peer_rows};
+    prepare_batched_continuation_graph(std::span<Exl3TextContext* const>(peers),own_rows,
+        std::span<const int>(rows));
+}
+
+void Exl3TextContext::prepare_batched_continuation_graph(std::span<Exl3TextContext* const> peers,
+    int own_rows,std::span<const int> peer_rows) {
+    require(!peers.empty() && peers.size()==peer_rows.size() &&
+            peers.size()<=kMaxBatchedPeers && own_rows>=2 && own_rows<=8,
         "batched continuation graph shape");
-    Exl3TextContext* contexts[2]={this,&peer};
+    int rows=own_rows;
+    std::vector<Exl3TextContext*> contexts{this};
+    for(std::size_t p=0;p<peers.size();++p) {
+        require(peers[p]!=this && peers[p]->impl_->model==impl_->model &&
+                peer_rows[p]>=2 && peer_rows[p]<=8 &&
+                std::count(peers.begin(),peers.end(),peers[p])==1,
+            "batched continuation graph peers");
+        rows+=peer_rows[p];
+        contexts.push_back(peers[p]);
+    }
     for(auto* context:contexts) {
         auto& impl=*context->impl_;
         require(impl.capture_taps && !impl.graph_active && !impl.graph_capture_active &&
@@ -9508,18 +9535,22 @@ void Exl3TextContext::prepare_batched_continuation_graph(Exl3TextContext& peer,
                 (!impl.transaction || !impl.transaction->active),
             "batched continuation graph capture requires idle device-KV contexts");
     }
-    const int rows=own_rows+peer_rows;
     require(impl_->prefill_capacity>=rows,"batched continuation exceeds the owner's row capacity");
     // Captured launches read the live positions from each context's
-    // position_device; capture at the end of the context like the per-layer
-    // graphs so capacity-sized grids cover every replay position.
-    // The owner's attention geometry covers all rows of the launch.
+    // position_device; capture at the end of each context like the per-layer
+    // graphs so capacity-sized grids cover every replay position. The owner's
+    // attention geometry covers all rows of the launch.
     const int own_position=impl_->max_context-rows;
-    const int peer_position=peer.impl_->max_context-peer_rows;
     auto graph=std::make_unique<Impl::BatchedGraph>();
-    graph->peer=peer.impl_.get();
     graph->own_rows=own_rows;
-    graph->peer_rows=peer_rows;
+    std::vector<Impl*> peer_impls;
+    std::vector<int> peer_positions;
+    for(std::size_t p=0;p<peers.size();++p) {
+        peer_impls.push_back(peers[p]->impl_.get());
+        peer_positions.push_back(peers[p]->impl_->max_context-peer_rows[p]);
+        graph->peers.push_back(peers[p]->impl_.get());
+        graph->peer_rows.push_back(peer_rows[p]);
+    }
     cudaStream_t capture_stream=nullptr;
     cuda_check(cudaStreamCreateWithFlags(&capture_stream,cudaStreamNonBlocking),
         "create batched continuation capture stream");
@@ -9535,7 +9566,7 @@ void Exl3TextContext::prepare_batched_continuation_graph(Exl3TextContext& peer,
         impl_->graph_capture_active=active;
     };
     try {
-        BatchBinding binding(*impl_,*peer.impl_,own_rows,peer_rows,peer_position);
+        BatchBinding binding(*impl_,peer_impls,peer_rows,peer_positions,{},own_rows);
         set_capture(true);
         graph->definition.capture(capture_stream,[&] {
             impl_->process_rows(impl_->token_ids,rows,own_position,capture_stream,nullptr,true,true,true,
@@ -9553,26 +9584,41 @@ void Exl3TextContext::prepare_batched_continuation_graph(Exl3TextContext& peer,
         throw;
     }
     cuda_check(cudaStreamDestroy(capture_stream),"destroy batched continuation capture stream");
-    impl_->batched_graph=std::move(graph);
+    impl_->batched_graphs.push_back(std::move(graph));
 }
 
 void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
     std::span<const std::int64_t> own_tokens,std::span<const std::int64_t> peer_tokens,
     cudaStream_t stream,cudaStream_t peer_stream) {
-    if(!peer_stream)peer_stream=stream;
-    const cudaStream_t state_streams[2]={stream,peer_stream};
-    require(&peer!=this && peer.impl_->model==impl_->model,
-        "batched continuation needs a distinct context of the same model");
-    const int own_rows=static_cast<int>(own_tokens.size());
-    const int peer_rows=static_cast<int>(peer_tokens.size());
-    const int rows=own_rows+peer_rows;
-    Exl3TextContext* contexts[2]={this,&peer};
-    const std::span<const std::int64_t> tokens[2]={own_tokens,peer_tokens};
-    bool arm_retained_prefix[2]{};
-    for(int c=0;c<2;++c) {
+    const BatchedPeer peers[1]={{&peer,peer_tokens,peer_stream}};
+    continue_rows_batched(std::span<const BatchedPeer>(peers),own_tokens,stream);
+}
+
+void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
+    std::span<const std::int64_t> own_tokens,cudaStream_t stream) {
+    require(!peers.empty() && peers.size()<=kMaxBatchedPeers,"batched continuation peer count");
+    const std::size_t count_contexts=peers.size()+1;
+    std::array<Exl3TextContext*,kMaxBatchedPeers+1> contexts{};
+    std::array<std::span<const std::int64_t>,kMaxBatchedPeers+1> tokens{};
+    std::array<cudaStream_t,kMaxBatchedPeers+1> state_streams{};
+    contexts[0]=this;tokens[0]=own_tokens;state_streams[0]=stream;
+    for(std::size_t p=0;p<peers.size();++p) {
+        require(peers[p].context && peers[p].context!=this &&
+                peers[p].context->impl_->model==impl_->model,
+            "batched continuation needs distinct contexts of the same model");
+        for(std::size_t q=0;q<p;++q)
+            require(peers[q].context!=peers[p].context,"batched continuation peers repeat");
+        contexts[p+1]=peers[p].context;
+        tokens[p+1]=peers[p].tokens;
+        state_streams[p+1]=peers[p].stream?peers[p].stream:stream;
+    }
+    int rows=0;
+    std::array<bool,kMaxBatchedPeers+1> arm_retained_prefix{};
+    for(std::size_t c=0;c<count_contexts;++c) {
         auto& context=*contexts[c];
         auto& impl=*context.impl_;
         const int count=static_cast<int>(tokens[c].size());
+        rows+=count;
         impl.join_repair(stream);
         require(!impl.host_kv.enabled && !impl.host_kv_failed && !impl.oscar &&
                 (!impl.transaction || !impl.transaction->rollback_required),
@@ -9597,14 +9643,18 @@ void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
     require(capture_status==cudaStreamCaptureStatusNone,
         "batched continuation is unavailable during external stream capture");
     require(impl_->prefill_capacity>=rows,"batched continuation exceeds the owner's row capacity");
-    // Owner: rows [0, own_rows); peer: rows [own_rows, rows).
-    std::array<std::int64_t,16> ids{};
-    std::copy(own_tokens.begin(),own_tokens.end(),ids.begin());
-    std::copy(peer_tokens.begin(),peer_tokens.end(),ids.begin()+own_rows);
+    // Owner: rows [0, own_rows); each peer's rows follow in order.
+    std::array<std::int64_t,8*(kMaxBatchedPeers+1)> ids{};
+    std::array<int,kMaxBatchedPeers+1> first_row{};
+    for(std::size_t c=0,offset=0;c<count_contexts;++c) {
+        first_row[c]=static_cast<int>(offset);
+        std::copy(tokens[c].begin(),tokens[c].end(),ids.begin()+static_cast<std::ptrdiff_t>(offset));
+        offset+=tokens[c].size();
+    }
     cuda_check(cudaMemcpyAsync(impl_->token_ids,ids.data(),static_cast<std::size_t>(rows)*sizeof(std::int64_t),
         cudaMemcpyHostToDevice,stream),"upload batched continuation token IDs");
-    int base_positions[2]{};
-    for(int c=0;c<2;++c) {
+    std::array<int,kMaxBatchedPeers+1> base_positions{};
+    for(std::size_t c=0;c<count_contexts;++c) {
         auto& context=*contexts[c];
         auto& impl=*context.impl_;
         impl.retain_host_kv_forward_stream(stream);
@@ -9626,15 +9676,24 @@ void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
         }
         for(auto& layer:impl.full_layers)if(layer)layer->invalidate_retained_prefix();
     }
-    auto* graph=impl_->batched_graph.get();
-    if(graph && graph->peer==peer.impl_.get() && graph->own_rows==own_rows &&
-       graph->peer_rows==peer_rows && graph->executable.ready()) {
+    const int own_rows=static_cast<int>(own_tokens.size());
+    Impl::BatchedGraph* graph=nullptr;
+    for(auto& candidate:impl_->batched_graphs) {
+        if(candidate->own_rows!=own_rows || candidate->peers.size()!=peers.size() ||
+           !candidate->executable.ready())continue;
+        bool match=true;
+        for(std::size_t p=0;p<peers.size() && match;++p)
+            match=candidate->peers[p]==peers[p].context->impl_.get() &&
+                candidate->peer_rows[p]==static_cast<int>(peers[p].tokens.size());
+        if(match){graph=candidate.get();break;}
+    }
+    if(graph) {
         // Replay bypasses the host-side retained-prefix arming of the eager
         // forwards; reproduce it per agent exactly as the per-layer graphs do.
         graph->executable.launch(stream);
         ++batched_graph_replays_;
         impl_->last_stack_output=graph->stack_output;
-        for(int c=0;c<2;++c) {
+        for(std::size_t c=0;c<count_contexts;++c) {
             if(!arm_retained_prefix[c])continue;
             auto& impl=*contexts[c]->impl_;
             const int count=static_cast<int>(tokens[c].size());
@@ -9649,27 +9708,46 @@ void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
         }
     } else {
         ++batched_eager_forwards_;
-        BatchBinding binding(*impl_,*peer.impl_,own_rows,peer_rows,base_positions[1],peer_stream);
+        std::array<Impl*,kMaxBatchedPeers> peer_impls{};
+        std::array<int,kMaxBatchedPeers> peer_rows{},peer_positions{};
+        std::array<cudaStream_t,kMaxBatchedPeers> peer_streams{};
+        for(std::size_t p=0;p<peers.size();++p) {
+            peer_impls[p]=peers[p].context->impl_.get();
+            peer_rows[p]=static_cast<int>(peers[p].tokens.size());
+            peer_positions[p]=base_positions[p+1];
+            peer_streams[p]=state_streams[p+1];
+        }
+        BatchBinding binding(*impl_,std::span<Impl* const>(peer_impls.data(),peers.size()),
+            std::span<const int>(peer_rows.data(),peers.size()),
+            std::span<const int>(peer_positions.data(),peers.size()),
+            std::span<const cudaStream_t>(peer_streams.data(),peers.size()),own_rows);
         impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
             false,false,nullptr,0,kLayers,nullptr,nullptr,true);
     }
-    // The owner's taps hold every row; the peer's rows move to its own taps.
-    for(std::size_t tap=0;tap<impl_->taps.size();++tap)
-        cuda_check(cudaMemcpyAsync(peer.impl_->taps[tap]->ptr,
-            static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr)+static_cast<std::size_t>(own_rows)*kHidden,
-            static_cast<std::size_t>(peer_rows)*kHidden*sizeof(std::uint16_t),
-            cudaMemcpyDeviceToDevice,stream),"move batched peer taps");
-    cuda_check(cudaMemcpyAsync(peer.impl_->embedding_trace->ptr,
-        static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+static_cast<std::size_t>(own_rows)*kHidden,
-        static_cast<std::size_t>(peer_rows)*kHidden*sizeof(std::uint16_t),
-        cudaMemcpyDeviceToDevice,stream),"move batched peer embedding trace");
+    // The owner's taps hold every row; each peer's rows move to its own taps.
+    for(std::size_t p=0;p<peers.size();++p) {
+        auto& peer=*peers[p].context->impl_;
+        const auto row=static_cast<std::size_t>(first_row[p+1]);
+        const auto count=peers[p].tokens.size();
+        for(std::size_t tap=0;tap<impl_->taps.size();++tap)
+            cuda_check(cudaMemcpyAsync(peer.taps[tap]->ptr,
+                static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr)+row*kHidden,
+                count*kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),"move batched peer taps");
+        cuda_check(cudaMemcpyAsync(peer.embedding_trace->ptr,
+            static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+row*kHidden,
+            count*kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
+            "move batched peer embedding trace");
+        peer.embedding_rows=peer.tap_rows=static_cast<int>(count);
+        peer.last_stack_output=impl_->last_stack_output+row*kHidden;
+    }
     impl_->embedding_rows=impl_->tap_rows=own_rows;
-    peer.impl_->embedding_rows=peer.impl_->tap_rows=peer_rows;
-    const auto* hidden=impl_->last_stack_output;
-    peer.impl_->last_stack_output=impl_->last_stack_output+static_cast<std::size_t>(own_rows)*kHidden;
-    impl_->finish_batched_continuation(hidden,own_rows,base_positions[0],stream);
-    peer.impl_->finish_batched_continuation(peer.impl_->last_stack_output,peer_rows,base_positions[1],stream);
-    for(int c=0;c<2;++c) {
+    impl_->finish_batched_continuation(impl_->last_stack_output,own_rows,base_positions[0],stream);
+    for(std::size_t p=0;p<peers.size();++p) {
+        auto& peer=*peers[p].context->impl_;
+        peer.finish_batched_continuation(peer.last_stack_output,
+            static_cast<int>(peers[p].tokens.size()),base_positions[p+1],stream);
+    }
+    for(std::size_t c=0;c<count_contexts;++c) {
         auto& context=*contexts[c];
         auto& impl=*context.impl_;
         const int count=static_cast<int>(tokens[c].size());

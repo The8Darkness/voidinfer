@@ -984,6 +984,20 @@ public:
     // Captures the batched layer stack for this (peer, own_rows, peer_rows)
     // shape while both contexts are idle; continue_rows_batched replays it.
     void prepare_batched_continuation_graph(Exl3TextContext& peer, int own_rows, int peer_rows);
+    // N-agent batched rounds: up to kMaxBatchedPeers peers follow the owner's
+    // rows in order (each 2..8 rows); each peer's transaction state belongs to
+    // its `stream` (defaults to the owner's stream).
+    static constexpr std::size_t kMaxBatchedPeers = 3;
+    struct BatchedPeer {
+        Exl3TextContext* context = nullptr;
+        std::span<const std::int64_t> tokens;
+        cudaStream_t stream = nullptr;
+    };
+    void continue_rows_batched(std::span<const BatchedPeer> peers,
+                               std::span<const std::int64_t> own_tokens,
+                               cudaStream_t stream = nullptr);
+    void prepare_batched_continuation_graph(std::span<Exl3TextContext* const> peers, int own_rows,
+                                            std::span<const int> peer_rows);
     // Whether an L0 OSCAR prompt block can take the layer-major schedule now.
     bool l0_layer_major_headroom() const;
     // Batched multi-agent rounds: the DFlash2 verifier's target continuation

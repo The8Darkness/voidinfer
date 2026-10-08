@@ -9702,8 +9702,11 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                            : (target_o_k7_candidate
                                    ? Exl3CudaLinearAdmission::target_continuation_o
                                    : Exl3CudaLinearAdmission::ordinary));
+            // Batched rounds: 16 rows fit the coherent continuation routes;
+            // wider batches (3-4 agents) take the staged wide-prefill route.
             const auto launch_admission = batch_ && rows > 8 && !target_small_m_candidate
-                ? batched_continuation_admission(operation) : admission;
+                ? (rows > 16 ? Exl3CudaLinearAdmission::target_wide_prefill
+                             : batched_continuation_admission(operation)) : admission;
             if(transformed_input)
                 workspace->forward_from_transformed(
                     weights,metadata,transformed_input,destination,rows,

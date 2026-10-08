@@ -212,6 +212,64 @@ int main() {
                       << " B_equal=" << (sb == cb) << '\n';
             return 0;
         }
+        if (mode == 8) {
+            // N-agent batched continuation (OVL_AGENTS contexts, owner + peers)
+            // vs. separate continuations from the same verified roots.
+            const int agents = env_int("OVL_AGENTS", 4);
+            const int n = env_int("OVL_BATCH_ROWS", 8);
+            std::vector<std::unique_ptr<Exl3TextContext>> extra;
+            std::vector<Exl3TextContext*> all{d.get(), v.get()};
+            for (int a = 2; a < agents; ++a) {
+                extra.push_back(model->create_context(true));
+                extra.back()->prepare_continuation(8);
+                ingest(*extra.back(), sd, static_cast<std::size_t>(a) * 2048);
+                all.push_back(extra.back().get());
+            }
+            std::cerr << "OVL free after " << agents << " contexts " << free_mib() << " MiB\n";
+            std::vector<std::span<const std::int64_t>> rows_of;
+            for (int a = 0; a < agents; ++a)
+                rows_of.emplace_back(ids.data() + context + 64 * a, static_cast<std::size_t>(n));
+            std::vector<Exl3TextContext*> peer_list(all.begin() + 1, all.end());
+            std::vector<int> peer_rows(peer_list.size(), n);
+            if (env_int("OVL_GRAPH", 1)) d->prepare_batched_continuation_graph(peer_list, n, peer_rows);
+            for (auto* c : all) c->save_verified_root(sd);
+            check(cudaStreamSynchronize(sd), "roots");
+            std::vector<Exl3TextContext::BatchedPeer> peers;
+            for (int a = 1; a < agents; ++a) peers.push_back({all[a], rows_of[a], nullptr});
+            const auto separate = [&] { for (int a = 0; a < agents; ++a) all[a]->continue_rows(rows_of[a], sd); };
+            const auto batched = [&] { d->continue_rows_batched(peers, rows_of[0], sd); };
+            const auto rewind = [&] { for (auto* c : all) c->restore_verified_root(sd); };
+            separate();
+            std::vector<std::vector<float>> ref;
+            for (auto* c : all) ref.push_back(c->continuation_logits_host(sd));
+            rewind();
+            batched();
+            for (int a = 0; a < agents; ++a) {
+                const auto got = all[a]->continuation_logits_host(sd);
+                const std::size_t vocab = got.size() / static_cast<std::size_t>(n);
+                double max_abs = 0; int agree = 0;
+                for (int r = 0; r < n; ++r) {
+                    const auto* x = ref[a].data() + r * vocab; const auto* y = got.data() + r * vocab;
+                    agree += std::max_element(x, x + vocab) - x == std::max_element(y, y + vocab) - y;
+                    for (std::size_t j = 0; j < vocab; ++j) max_abs = std::max(max_abs, std::abs(double(x[j]) - y[j]));
+                }
+                std::cout << "OVL nbatch agent=" << a << " argmax_agree=" << agree << "/" << n
+                          << " max_abs_logit_diff=" << max_abs << '\n';
+            }
+            rewind();
+            const auto time = [&](auto&& f, const char* what) {
+                for (int i = 0; i < 3; ++i) { f(); rewind(); }
+                check(cudaStreamSynchronize(sd), "warm");
+                const auto start = Clock::now();
+                for (int i = 0; i < 20; ++i) { f(); rewind(); }
+                check(cudaStreamSynchronize(sd), "timed");
+                std::cout << "OVL nbatch time agents=" << agents << " " << what << " ms=" << ms(start) / 20 << " (incl. rewind)\n";
+            };
+            time(separate, "separate");
+            time(batched, "batched");
+            time(rewind, "rewind-only");
+            return 0;
+        }
         if (mode == 5) {
             // Batched multi-agent continuation vs. two separate continuations
             // from the same verified roots (logits per row, then timing).

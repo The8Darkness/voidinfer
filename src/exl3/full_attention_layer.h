@@ -682,10 +682,11 @@ public:
     // stream: the peer's own (transaction) stream; launches use the owner's.
     struct BatchPeer { Exl3FullAttentionLayer* layer = nullptr; int rows = 0; int position = 0;
                        cudaStream_t stream = nullptr; };
+    static constexpr std::size_t kMaxBatchPeers = 3;
     struct Batch {
         int own_rows = 0;
         int peer_count = 0;
-        std::array<BatchPeer, 1> peers{};
+        std::array<BatchPeer, 3> peers{};
     };
     void set_batch(const Batch* batch) noexcept { batch_ = batch; }
     // Context owning this layer: L0 decode scratch is shared by the layers of

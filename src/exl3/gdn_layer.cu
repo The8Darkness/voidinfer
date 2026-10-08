@@ -72,7 +72,8 @@ constexpr std::array<int,22> kHalfBufferFeatures={{kHidden,kQkv,kZ,kQkv,2048,204
     kZ,kZ,kZ,kZ,kZ,kHidden,kHidden,kHidden,kIntermediate,kIntermediate,
     kIntermediate,kHidden,kHidden,kZ}};
 constexpr std::array<std::size_t,5> kSplitHalfIndices{{3,4,5,6,9}};
-constexpr int kPrivateRetentionRows = 16;
+// Batched multi-agent rounds of up to four agents' verifier rows (4 x 8).
+constexpr int kPrivateRetentionRows = 32;
 constexpr std::size_t kSplitHalfFeatures =
     static_cast<std::size_t>(kHalfBufferFeatures[3]) +
     static_cast<std::size_t>(kHalfBufferFeatures[4]) +
@@ -3288,8 +3289,11 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                            : (target_o_k7_candidate
                                   ? Exl3CudaLinearAdmission::target_continuation_o
                                   : Exl3CudaLinearAdmission::ordinary));
+            // Batched rounds: 16 rows fit the coherent continuation routes;
+            // wider batches (3-4 agents) take the staged wide-prefill route.
             const auto launch_admission = batch_ && rows > 8 && !target_small_m_candidate
-                ? batched_continuation_admission(operation) : admission;
+                ? (rows > 16 ? Exl3CudaLinearAdmission::target_wide_prefill
+                             : batched_continuation_admission(operation)) : admission;
             if (transformed_input)
                 workspace->forward_from_transformed(
                     weights, metadata, transformed_input, destination, rows,

@@ -225,7 +225,7 @@ enum class Exl3GdnHistoryStorage : std::uint8_t {
 // needed to reconstruct rejected B2/B4/B8 work remain private; the shared wide
 // slab is admitted only when no graph/rejection history can survive the call.
 struct Exl3GdnScratchReuseContract {
-    static constexpr std::size_t private_history_rows=16;
+    static constexpr std::size_t private_history_rows=32;
     static constexpr std::size_t wide_features_per_row=26624;
     std::size_t row_capacity = 0;
     std::size_t private_row_capacity = 0;
@@ -233,7 +233,7 @@ struct Exl3GdnScratchReuseContract {
     std::size_t shared_wide_bytes = 0;
 
     static bool verifier_rows_supported(std::size_t rows) noexcept {
-        return (rows>=1 && rows<=8) || rows==16;
+        return (rows>=1 && rows<=8) || rows==16 || rows==24 || rows==32;
     }
     static bool retained_rows_supported(std::size_t rows) noexcept {
         return rows>=2 && rows<=8;
@@ -785,10 +785,11 @@ public:
     // agent's context, same model layer) runs its own stateful core on its rows.
     // stream: the peer's own (transaction) stream; launches use the owner's.
     struct BatchPeer { Exl3GdnLayer* layer = nullptr; int rows = 0; cudaStream_t stream = nullptr; };
+    static constexpr std::size_t kMaxBatchPeers = 3;
     struct Batch {
         int own_rows = 0;
         int peer_count = 0;
-        std::array<BatchPeer, 1> peers{};
+        std::array<BatchPeer, 3> peers{};
     };
     void set_batch(const Batch* batch) noexcept { batch_ = batch; }
     // Borrowed child pointers for enclosing-context lifetime inventory only.
