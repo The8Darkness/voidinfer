@@ -27,6 +27,7 @@ constexpr int kL0RawKeyBytes=2*l0::kCodeBytes+2*l0::kMetaFloats*2;   // K codes,
 constexpr std::size_t kL0StageBytes=static_cast<std::size_t>(kL0StageKeys)*kL0RawKeyBytes;
 constexpr std::size_t kL0MergeBytes=static_cast<std::size_t>(6)*32*70*sizeof(float);
 #include "exl3/l0_hot.cuh"
+#include "exl3/l0_exact.cuh"
 constexpr std::size_t l0_history_smem_bytes() {
     constexpr std::size_t a=kL0Stages*kL0StageBytes>kL0MergeBytes?kL0Stages*kL0StageBytes:kL0MergeBytes;
     return a>l0_hot_smem_bytes()?a:l0_hot_smem_bytes();

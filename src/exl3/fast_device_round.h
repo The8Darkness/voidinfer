@@ -22,6 +22,39 @@
 
 namespace ninfer::exl3 {
 
+// VeriCache (NINFER_EXL3_VERICACHE): L0 OSCAR drafts blocks of
+// NINFER_EXL3_VERICACHE_BLOCK tokens (default 512; 64 in exact mode, where
+// corrections discard the rest of a block) that are verified against exact FP16-L2
+// history before publication. "exact": every token equals the exact greedy
+// token; "1"/"tolerance": tokens whose exact logit trails the exact top by at
+// most NINFER_EXL3_VERICACHE_DELTA (default 1.0) are kept. The prompt is
+// ingested with exact history as well.
+struct Exl3VeriCacheConfig {
+    bool enabled=false;
+    float delta=1.0f;
+    // Tolerance blocks of 1024 rows (one wide verifier pass) amortize the
+    // per-pass weight reconstruction best; exact mode keeps short blocks.
+    int block=1024;
+    static const Exl3VeriCacheConfig& get() {
+        static const Exl3VeriCacheConfig value=[] {
+            Exl3VeriCacheConfig c;
+            const char* mode=std::getenv("NINFER_EXL3_VERICACHE");
+            const std::string m=mode?mode:"0";
+            if(m=="0"||m.empty()) return c;
+            if(m!="1" && m!="tolerance" && m!="exact")
+                throw std::invalid_argument("NINFER_EXL3_VERICACHE must be 0, 1, tolerance or exact");
+            c.enabled=true;
+            if(m=="exact") {c.delta=0.0f;c.block=64;}
+            else if(const char* d=std::getenv("NINFER_EXL3_VERICACHE_DELTA")) c.delta=std::strtof(d,nullptr);
+            if(const char* b=std::getenv("NINFER_EXL3_VERICACHE_BLOCK")) c.block=std::atoi(b);
+            if(c.block<1 || c.block>1024 || !(c.delta>=0.0f))
+                throw std::invalid_argument("NINFER_EXL3_VERICACHE_BLOCK must be 1..1024 and DELTA >= 0");
+            return c;
+        }();
+        return value;
+    }
+};
+
 // One physical C1 greedy request. The caller owns the five 16-row staging
 // slabs and the exclusively borrowed draft. Their lifetimes must cover finish
 // or reset. The context owner is retained so no tap or seed can outlive it.
@@ -53,6 +86,12 @@ public:
         std::uint64_t rounds=0,verified_rows=0,replayed_rows=0;
         std::uint64_t staged_bytes=0,reused_seeds=0,seed_fallbacks=0;
         double proposal_ms=0,verifier_ms=0,ring_commit_ms=0;
+        std::uint64_t verified_blocks=0,corrected_blocks=0;
+        std::uint64_t accepted_checked=0,accepted_off_greedy=0;
+        // NINFER_EXL3_VERICACHE_STATS: synchronized step wall times.
+        double restore_ms=0,forward_ms=0,scores_ms=0,fix_ms=0,commit_ms=0;
+        double verify_ms=0,accepted_gap_sum=0;
+        float max_accepted_gap=0;
     };
     struct Prepared {
         std::uint64_t ticket=0;
@@ -506,6 +545,135 @@ public:
         if(first)std::rethrow_exception(first);
         clear_pending();clear_device_pending();frontier_=0;totals_={};phase_=Phase::unstarted;
     }
+    // ===== VeriCache block verification (L0 OSCAR contexts) =====
+    // Tokens drafted after the verified root are re-run in one exact pass
+    // (history from the FP16 L2 planes) and checked row by row. delta == 0:
+    // the first token that differs from the exact greedy token is replaced;
+    // delta > 0: only tokens whose exact logit trails the exact top by more
+    // than delta are. The rest of the block is discarded on a replacement.
+    struct VerifiedBlock {
+        std::vector<std::int64_t> tokens;
+        bool corrected=false;
+        float max_gap=0.0f;
+        double verify_ms=0.0;
+    };
+    // Saves the verified root (target device checkpoint + draft ring slots for
+    // the next `rows` commits) at the current frontier.
+    void begin_verification(int rows) {
+        if(phase_!=Phase::ready || rows<1 || rows>2047)
+            throw std::logic_error("fast device verification begin");
+        context_->save_verified_root(stream_);
+        draft_.save_ring_checkpoint(rows,stream_);
+        verified_frontier_=frontier_;
+        verify_rows_=rows;
+    }
+    int verified_frontier() const noexcept {return verified_frontier_;}
+    // Verifies frontier_ - verified_frontier tokens (`tokens`, in order). On
+    // return target and draft hold verified_frontier + result.tokens.size()
+    // rows of exact state; the root stays until commit_verification.
+    // A block ending in a terminal token is verified on a closed round; the
+    // phase is preserved.
+    VerifiedBlock verify(std::span<const std::int64_t> tokens,float delta) {
+        const auto settled_phase=phase_;
+        if((phase_!=Phase::ready && phase_!=Phase::closed) || tokens.empty() ||
+           static_cast<int>(tokens.size())!=frontier_-verified_frontier_)
+            throw std::logic_error("fast device verification extent: tokens "+std::to_string(tokens.size())+
+                " frontier "+std::to_string(frontier_)+" verified "+std::to_string(verified_frontier_));
+        phase_=Phase::executing;
+        try {
+            const auto start=Clock::now();
+            static const bool timed=std::getenv("NINFER_EXL3_VERICACHE_STATS")!=nullptr;
+            auto mark=start;
+            const auto step=[&](double& total) {
+                if(!timed)return;
+                check(cudaStreamSynchronize(stream_),"vericache step timing");
+                const auto now=Clock::now();
+                total+=std::chrono::duration<double,std::milli>(now-mark).count();
+                mark=now;
+            };
+            VerifiedBlock result;
+            context_->restore_verified_root(stream_);
+            step(totals_.restore_ms);
+            exact_forward(tokens);
+            step(totals_.forward_ms);
+            std::vector<std::int64_t> next(tokens.begin()+1,tokens.end());
+            next.push_back(-1);
+            const auto scores=context_->exact_row_scores(next,stream_);
+            step(totals_.scores_ms);
+            std::size_t reject=tokens.size();
+            std::int64_t correction=-1;
+            for(std::size_t i=0;i+1<tokens.size();++i) {
+                const bool bad=delta>0?scores[i].gap>delta:scores[i].greedy!=tokens[i+1];
+                if(bad) {reject=i+1;correction=scores[i].greedy;break;}
+                // Accepted rows: how far each kept token trails the exact top.
+                result.max_gap=std::max(result.max_gap,scores[i].gap);
+                totals_.accepted_gap_sum+=scores[i].gap;
+                totals_.accepted_off_greedy+=scores[i].gap>0.0f?1:0;
+                ++totals_.accepted_checked;
+            }
+            totals_.max_accepted_gap=std::max(totals_.max_accepted_gap,result.max_gap);
+            result.tokens.assign(tokens.begin(),tokens.begin()+static_cast<std::ptrdiff_t>(reject));
+            if(correction>=0) {
+                result.tokens.push_back(correction);
+                result.corrected=true;
+                exact_forward_from_root(result.tokens);
+                draft_.restore_ring_checkpoint(stream_);
+                commit_captured(static_cast<int>(result.tokens.size()),verified_frontier_);
+                step(totals_.fix_ms);
+            }
+            check(cudaStreamSynchronize(stream_),"fast device verification completion");
+            frontier_=context_->position();
+            if(draft_.ring_base_abs()+draft_.ring_count()!=frontier_ ||
+               frontier_!=verified_frontier_+static_cast<int>(result.tokens.size()))
+                throw std::logic_error("fast device verification frontier");
+            result.verify_ms=elapsed(start);
+            ++totals_.verified_blocks;
+            totals_.corrected_blocks+=result.corrected?1:0;
+            totals_.verify_ms+=result.verify_ms;
+            phase_=settled_phase;
+            return result;
+        } catch(...) {
+            context_->set_l0_exact_history(false);
+            phase_=Phase::poisoned;
+            throw;
+        }
+    }
+    // Keeps the first `retained` verified tokens (all, or the prefix the output
+    // session accepted) and moves the verified root there.
+    void commit_verification(std::span<const std::int64_t> retained) {
+        const auto settled_phase=phase_;
+        const auto commit_start=Clock::now();
+        if((phase_!=Phase::ready && phase_!=Phase::closed) ||
+           static_cast<int>(retained.size())>frontier_-verified_frontier_)
+            throw std::logic_error("fast device verification commit extent");
+        phase_=Phase::executing;
+        try {
+            if(static_cast<int>(retained.size())<frontier_-verified_frontier_) {
+                if(retained.empty()) {
+                    context_->restore_verified_root(stream_);
+                } else {
+                    exact_forward_from_root(retained);
+                }
+                draft_.restore_ring_checkpoint(stream_);
+                if(!retained.empty())
+                    commit_captured(static_cast<int>(retained.size()),verified_frontier_);
+                check(cudaStreamSynchronize(stream_),"fast device verification rewind");
+                frontier_=context_->position();
+            }
+            context_->save_verified_root(stream_);
+            draft_.save_ring_checkpoint(verify_rows_,stream_);
+            verified_frontier_=frontier_;
+            if(std::getenv("NINFER_EXL3_VERICACHE_STATS")) {
+                check(cudaStreamSynchronize(stream_),"vericache commit timing");
+                totals_.commit_ms+=elapsed(commit_start);
+            }
+            // The caller finishes on a published terminal; otherwise (e.g. the
+            // terminal token was corrected away) drafting continues.
+            (void)settled_phase;
+            phase_=Phase::ready;
+        } catch(...) {phase_=Phase::poisoned;throw;}
+    }
+
     bool poisoned() const noexcept {return phase_==Phase::poisoned;}
     bool has_pending() const noexcept {
         return phase_==Phase::pending || phase_==Phase::device_pending;
@@ -573,6 +741,20 @@ private:
         totals_.reused_seeds+=value.verification.device_seed_reused;
         totals_.seed_fallbacks+=value.verification.device_seed_fallback;
         ++totals_.rounds;
+    }
+    // Restores the verified root and runs `tokens` with exact history.
+    void exact_forward_from_root(std::span<const std::int64_t> tokens) {
+        context_->restore_verified_root(stream_);
+        exact_forward(tokens);
+    }
+    void exact_forward(std::span<const std::int64_t> tokens) {
+        context_->set_l0_exact_history(true);
+        // Row-major wide prefill keeps full-precision projections (the
+        // layer-major route's block-quantized ones would make the verifier
+        // noisier than the draft it checks).
+        if(tokens.size()>8)context_->append_prefill_wide(tokens,stream_);
+        else context_->append_prefill(tokens,stream_);
+        context_->set_l0_exact_history(false);
     }
     static void check(cudaError_t error,const char* operation) {
         if(error!=cudaSuccess)
@@ -822,7 +1004,7 @@ private:
     bool reuse_seed_=false;
     cudaStream_t stream_=nullptr;
     Phase phase_=Phase::unstarted;
-    int frontier_=0;
+    int frontier_=0,verified_frontier_=0,verify_rows_=0;
     Totals totals_{};
     std::uint64_t pending_ticket_=0;
     std::optional<Step> pending_;

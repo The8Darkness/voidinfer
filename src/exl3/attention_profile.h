@@ -32,6 +32,24 @@ inline bool exl3_l0_oscar_enabled() {
     if(std::strcmp(value,"0")==0) return false;
     throw std::invalid_argument("NINFER_EXL3_L0_OSCAR must be 0 or 1");
 }
+// Exact recent window of L0 OSCAR contexts in committed rows
+// (NINFER_EXL3_L0_RECENT, 0..960 in steps of 64, default 960; the 2048-row device ring
+// also holds the 64-row alignment tail and a 1024-row prefill chunk). 0 keeps only
+// the 64-token sink and the current 64-row tail exact on the device; the rest
+// of the history is INT2 (pure OSCAR, e.g. under VeriCache verification).
+
+inline int exl3_l0_recent_rows() {
+    static const int value=[] {
+        const char* v=std::getenv("NINFER_EXL3_L0_RECENT");
+        if(!v || !*v) return 960;
+        char* end=nullptr;
+        const long rows=std::strtol(v,&end,10);
+        if(*end || rows<0 || rows>960 || rows%64)
+            throw std::invalid_argument("NINFER_EXL3_L0_RECENT must be 0..960 in steps of 64");
+        return static_cast<int>(rows);
+    }();
+    return value;
+}
 // Rotation assets of the loaded target (<model directory>/l0_oscar), used
 // unless NINFER_EXL3_L0_OSCAR_ROT names another directory.
 inline std::string& exl3_l0_oscar_model_assets() {

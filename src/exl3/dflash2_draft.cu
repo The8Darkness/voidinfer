@@ -3024,6 +3024,40 @@ struct Exl3Dflash2DraftModel::Impl {
             }
         }
     }
+    // VeriCache block checkpoint: the slots the next `rows` commits overwrite
+    // (the rows they evict) plus the ring metadata at `frontier`.
+    struct RingCheckpoint {
+        struct Arena {
+            std::uint16_t* ptr = nullptr;
+            ~Arena() { if (ptr) cudaFree(ptr); }
+        } arena;
+        int capacity = 0, rows = 0, count = 0;
+        long long base_abs = 0, frontier = 0;
+        bool active = false;
+    } ring_checkpoint;
+    void copy_ring_checkpoint_slots(bool restore, cudaStream_t stream) {
+        constexpr std::size_t row_elements = static_cast<std::size_t>(kKVHeads) * kHeadDim;
+        auto& cp = ring_checkpoint;
+        const int first_slot = static_cast<int>(cp.frontier & kRingMask);
+        for (int layer = 0; layer < kLayers; ++layer)
+            for (int plane = 0; plane < 2; ++plane) {
+                auto* ring = plane == 0 ? ring_k[layer] : ring_v[layer];
+                auto* saved = cp.arena.ptr +
+                    (static_cast<std::size_t>(layer) * 2 + plane) * cp.capacity * row_elements;
+                for (int offset = 0; offset < cp.rows;) {
+                    const int slot = (first_slot + offset) & kRingMask;
+                    const int count = std::min(cp.rows - offset, kRingCap - slot);
+                    auto* ring_segment = ring + static_cast<std::size_t>(slot) * row_elements;
+                    auto* saved_segment = saved + static_cast<std::size_t>(offset) * row_elements;
+                    cuda_check(cudaMemcpyAsync(restore ? ring_segment : saved_segment,
+                                               restore ? saved_segment : ring_segment,
+                                               static_cast<std::size_t>(count) * row_elements * sizeof(std::uint16_t),
+                                               cudaMemcpyDeviceToDevice, stream),
+                               restore ? "draft ring checkpoint restore" : "draft ring checkpoint snapshot");
+                    offset += count;
+                }
+            }
+    }
     std::uint64_t* ring_digest_partial = nullptr;  // [kRingCap]
 
     int block_capacity = kBlockCap;
@@ -3950,6 +3984,42 @@ void Exl3Dflash2DraftModel::begin_prefill_ring_undo(int rows, long long abs_pos0
         m.ring_count = 0;
         throw;
     }
+}
+
+void Exl3Dflash2DraftModel::save_ring_checkpoint(int rows, cudaStream_t stream) {
+    require_no_fresh_prefill();
+    auto& m = *impl_;
+    require(m.ring_undo.phase == Impl::RingUndo::Phase::Idle && !m.host_ring_failed &&
+            rows >= 1 && rows <= kRingKeep,
+            "draft ring checkpoint requires an idle healthy ring and 1..2047 rows");
+    auto& cp = m.ring_checkpoint;
+    if (cp.capacity < rows) {
+        if (cp.arena.ptr) { cuda_check(cudaStreamSynchronize(stream), "draft ring checkpoint drain"); cudaFree(cp.arena.ptr); cp.arena.ptr = nullptr; }
+        const std::size_t bytes = static_cast<std::size_t>(kLayers) * 2 * rows * kKVHeads * kHeadDim * sizeof(std::uint16_t);
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&cp.arena.ptr), bytes), "draft ring checkpoint arena");
+        cp.capacity = rows;
+    }
+    cp.rows = rows;
+    cp.base_abs = m.ring_base_abs;
+    cp.count = m.ring_count;
+    cp.frontier = m.ring_base_abs + m.ring_count;
+    m.copy_ring_checkpoint_slots(false, stream);
+    cp.active = true;
+}
+
+void Exl3Dflash2DraftModel::restore_ring_checkpoint(cudaStream_t stream) {
+    require_no_fresh_prefill();
+    auto& m = *impl_;
+    auto& cp = m.ring_checkpoint;
+    const long long frontier = m.ring_base_abs + m.ring_count;
+    require(cp.active && m.ring_undo.phase == Impl::RingUndo::Phase::Idle &&
+            frontier >= cp.frontier && frontier - cp.frontier <= cp.rows,
+            "draft ring checkpoint restore extent");
+    m.copy_ring_checkpoint_slots(true, stream);
+    m.ring_base_abs = cp.base_abs;
+    m.ring_count = cp.count;
+    m.invalidate_ring_witness();
+    m.host_ring_parent.reset();
 }
 
 void Exl3Dflash2DraftModel::accept_prefill_ring_undo(cudaStream_t stream) {

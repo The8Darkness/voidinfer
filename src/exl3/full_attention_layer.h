@@ -671,6 +671,14 @@ public:
     void l0_upload_history(int first, int rows, const std::uint8_t* codes,
                            const std::uint16_t* meta, cudaStream_t stream);
     void l0_set_history_watermark(int rows, int position, cudaStream_t stream);
+    // L0 OSCAR exact history (l0_exact.cuh): while set, history attention reads
+    // the FP16 L2 planes instead of the INT2 codes and hot rows (VeriCache
+    // verifier passes and lossless ingestion). No effect without L0 storage.
+    void set_l0_exact_history(bool exact) noexcept { l0_exact_ = l0_exact_prefill_ = exact; }
+
+    // Rewind L0 aging and hot rows to a verified root at `position` (VeriCache):
+    // rows from history_end(position) on will be rewritten and re-encoded.
+    void l0_rewind(int position, cudaStream_t stream);
     // K/V cache rows an accepted sibling carries into its chain slot.
     void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,
                                    int destination) const;
@@ -897,6 +905,9 @@ private:
     int* fakequant_watermark_ = nullptr;
     // L0 OSCAR INT2 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
     l0_oscar::LayerStorage l0_{};
+    bool l0_exact_ = false;          // verifier/decode rows (<= 8)
+    bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)
+
     int fakequant_bank_ = 0;
     std::uint16_t* v_cache_ = nullptr;
     int cache_capacity_ = 0;

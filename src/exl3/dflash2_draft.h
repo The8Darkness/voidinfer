@@ -461,6 +461,12 @@ public:
     void begin_prefill_ring_undo(int rows, long long abs_pos0,
                                  cudaStream_t stream = nullptr);
     void accept_prefill_ring_undo(cudaStream_t stream = nullptr);
+    // VeriCache block checkpoint: save snapshots the ring slots the next `rows`
+    // commits overwrite and the ring metadata at the current frontier; restore
+    // (frontier at most `rows` past the checkpoint) returns the ring to that
+    // frontier so verified rows can be recommitted. Same eager stream.
+    void save_ring_checkpoint(int rows, cudaStream_t stream = nullptr);
+    void restore_ring_checkpoint(cudaStream_t stream = nullptr);
     void rollback_prefill_ring_undo(cudaStream_t stream = nullptr);
     // Explicit eager fresh initialization on an empty logical ring. Submit the
     // original ordered1..16-row calls on the declared stream through exact end.
