@@ -1037,17 +1037,33 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             auto* wide_out=allocate_device<std::uint16_t>(d_wide_out,64u*shape.out_features,"wide timing output");
             for(int r=0;r<4;++r)cuda_check(cudaMemcpy(wide_in+static_cast<std::size_t>(r)*16*shape.in_features,input,
                 16u*shape.in_features*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice),"wide timing input copy");
-            for(int rows:{8,16,24,32,48,64}) {
+            for(int rows:{8,16,24,32}) {
                 cudaEvent_t start,stop;
                 cuda_check(cudaEventCreate(&start),"timing event");cuda_check(cudaEventCreate(&stop),"timing event");
-                for(int i=0;i<20;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?Admission::target_wide_prefill:Admission::ordinary);
+                for(int i=0;i<20;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?shape.continuation:Admission::ordinary);
                 cuda_check(cudaEventRecord(start),"timing start");
-                for(int i=0;i<200;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?Admission::target_wide_prefill:Admission::ordinary);
+                for(int i=0;i<200;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?shape.continuation:Admission::ordinary);
                 cuda_check(cudaEventRecord(stop),"timing stop");cuda_check(cudaEventSynchronize(stop),"timing sync");
                 float elapsed=0;cuda_check(cudaEventElapsedTime(&elapsed,start,stop),"timing read");
                 std::cout<<"ROW_TIMING_WIDE op="<<shape.name<<" M="<<rows<<" us="<<elapsed*1000.0f/200
-                         <<" dispatch="<<wide.dispatch_name(metadata,rows,rows>16?Admission::target_wide_prefill:Admission::ordinary)<<'\n';
+                         <<" dispatch="<<wide.dispatch_name(metadata,rows,rows>16?shape.continuation:Admission::ordinary)<<'\n';
                 cudaEventDestroy(start);cudaEventDestroy(stop);
+            }
+            {
+                // M32 rows equal the M16 result of the same rows bit for bit.
+                std::vector<std::uint16_t> wide32(32u*shape.out_features),half16(32u*shape.out_features);
+                wide.forward(weights,metadata,wide_in,wide_out,32,nullptr,shape.continuation);
+                cuda_check(cudaMemcpy(wide32.data(),wide_out,wide32.size()*2,cudaMemcpyDeviceToHost),"m32 read");
+                std::cout<<"M32 dispatch16="<<wide.dispatch_name(metadata,16,shape.continuation)<<" dispatch32="<<wide.dispatch_name(metadata,32,shape.continuation)<<std::endl;
+                for(int h=0;h<2;++h) {
+                    wide.forward(weights,metadata,wide_in+static_cast<std::size_t>(h)*16*shape.in_features,
+                        wide_out,16,nullptr,shape.continuation);
+                    cuda_check(cudaMemcpy(half16.data()+static_cast<std::size_t>(h)*16*shape.out_features,wide_out,
+                        16u*shape.out_features*2,cudaMemcpyDeviceToHost),"m16 read");
+                }
+                std::size_t differ=0;
+                for(std::size_t i=0;i<wide32.size();++i)differ+=wide32[i]!=half16[i];
+                std::cout<<"ROW_M32_EXACT op="<<shape.name<<" differing="<<differ<<'\n';
             }
             continue;
         }
