@@ -225,6 +225,67 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
     k_out[index] = __half_as_ushort(__float2half_rn(value));
 }
 
+// Decode Q/K preparation in one launch: split_qg_kernel, the per-head
+// rms_norm_kernel (256 threads, block_tree_sum_exact<256>) for Q and K, and
+// rope_kernel/rope_k_kernel (plain positions), with the same expressions and
+// the same half roundings. One block per (row, head); Q heads first.
+__global__ void __launch_bounds__(256) decode_qk_prepare_kernel(const std::uint16_t* qg,
+    const std::uint16_t* kp,const std::uint16_t* q_norm_weight,const std::uint16_t* k_norm_weight,
+    std::uint16_t* qn,std::uint16_t* gate,std::uint16_t* kn,std::uint16_t* qr,std::uint16_t* kr,
+    int rows,int position,const int* position_device,const int* chain_rows) {
+    EXL3_PDL_SMALL_PROLOGUE();
+    __shared__ float shared[256];
+    __shared__ float normalized[kHeadDim];
+    constexpr int kHeadsPerRow=kQHeads+kKVHeads;
+    const int row=static_cast<int>(blockIdx.x)/kHeadsPerRow;
+    const int head=static_cast<int>(blockIdx.x)%kHeadsPerRow;
+    const int channel=static_cast<int>(threadIdx.x);
+    if(row>=rows) return;
+    const bool is_q=head<kQHeads;
+    std::uint16_t bits;
+    std::size_t index;
+    if(is_q) {
+        index=(static_cast<std::size_t>(row)*kQHeads+head)*kHeadDim+channel;
+        const int source=head*(2*kHeadDim)+channel;
+        bits=qg[static_cast<std::size_t>(row)*kQProjection+source];
+        gate[index]=qg[static_cast<std::size_t>(row)*kQProjection+source+kHeadDim];
+    } else {
+        index=(static_cast<std::size_t>(row)*kKVHeads+(head-kQHeads))*kHeadDim+channel;
+        bits=kp[index];
+    }
+    const std::uint16_t w_bits=(is_q?q_norm_weight:k_norm_weight)[channel];
+    const float value=__half2float(__ushort_as_half(bits));
+    float partial=0.0f;
+    partial+=value*value;
+    const float inv=rsqrtf(block_tree_sum_exact<256>(partial,shared,channel)/
+                           static_cast<float>(kHeadDim)+kRmsEps);
+    const float x=__half2float(__ushort_as_half(bits))*inv;
+    const float w=__half2float(__ushort_as_half(w_bits));
+    const std::uint16_t norm_bits=__half_as_ushort(__float2half_rn(x*(w+1.0f)));
+    (is_q?qn:kn)[index]=norm_bits;
+    normalized[channel]=__half2float(__ushort_as_half(norm_bits));
+    __syncthreads();
+    const int base_position=position_device?*position_device:position;
+    const int pos=base_position+sibling_row_offset(row,sibling_chain_rows(chain_rows));
+    float out=normalized[channel];
+    if(channel<kRopeDim) {
+        const int pair=channel<kRopeDim/2?channel:channel-kRopeDim/2;
+        const int mate=channel<kRopeDim/2?channel+kRopeDim/2:channel-kRopeDim/2;
+        const float mate_value=normalized[mate];
+        if(is_q) {
+            const float inv_frequency=powf(kRopeTheta,-2.0f*static_cast<float>(pair)/
+                                                       static_cast<float>(kRopeDim));
+            const float angle=static_cast<float>(pos)*inv_frequency;
+            out=out*cosf(angle)+(channel<kRopeDim/2?-mate_value:mate_value)*sinf(angle);
+        } else {
+            const float angle=static_cast<float>(pos)*
+                powf(kRopeTheta,-2.0f*static_cast<float>(pair)/static_cast<float>(kRopeDim));
+            out=out*cosf(angle)+(channel<kRopeDim/2?-mate_value:mate_value)*sinf(angle);
+        }
+    }
+    (is_q?qr:kr)[index]=__half_as_ushort(__float2half_rn(out));
+}
+
 __global__ void attention_kernel(const std::uint16_t* q,
                                  const std::uint16_t* k,
                                  const std::uint16_t* v,
@@ -8242,6 +8303,20 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         end(3);
     }
 
+    // Decode rows: split, Q/K norms and RoPE in one launch (bit-identical).
+    static const bool fused_qk_prepare=[] {
+        const char* value=std::getenv("NINFER_EXL3_DECODE_QK_PREPARE");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    const bool qk_prepared=fused_qk_prepare && rows>=1 && rows<=8 && !wide_prefill &&
+        !profile && !mrope_positions_ && !rope_offset_;
+    if(qk_prepared) {
+        exl3_launch_small(decode_qk_prepare_kernel,dim3(rows*(kQHeads+kKVHeads)),dim3(256),0,stream,
+            qg,kp,weights_.q_norm,weights_.k_norm,qn,gp,kn,qr,kr,rows,position,position_device_,
+            position_device_?position_device_+1:nullptr);
+        launch(cudaGetLastError(), "launch EXL3 fused decode Q/K preparation");
+        begin(4); end(4); begin(5); end(5);
+    } else {
     exl3_launch_small(split_qg_kernel,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qg, qn, gp, rows);
     launch(cudaGetLastError(), "launch EXL3 Q/gate split");
     begin(4);
@@ -8261,6 +8336,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0,chain_rows);
     }
     launch(cudaGetLastError(), "launch EXL3 RoPE"); end(5);
+    }
 
     const char* attention_core_sample_option=std::getenv(
         "NINFER_EXL3_TEST_ATTENTION_CORE_SAMPLE");
