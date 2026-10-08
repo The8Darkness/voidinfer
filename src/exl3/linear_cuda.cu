@@ -9369,7 +9369,7 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
 
 static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission, int in_features, int out_features,
-    std::size_t capacity);
+    std::size_t capacity, int max_rows);
 
 static bool coherent_fused_input_for(int rows);
 static bool merged_gate_up_enabled();
@@ -9394,7 +9394,7 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
     const std::uint16_t* input,std::uint16_t* gate_output,std::uint16_t* up_output,
     std::uint16_t* activation,int rows,cudaStream_t stream,
     const Exl3CudaLinearWeights* down_weights,Exl3CudaLinearWorkspace* down_workspace) {
-    if(rows<1 || rows>8 || rows>max_rows_ || rows>up_workspace.max_rows_ ||
+    if(rows<1 || rows>16 || rows>max_rows_ || rows>up_workspace.max_rows_ ||
        !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
@@ -9494,7 +9494,7 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair(
     std::uint16_t* second_output,const std::uint16_t* input,int rows,cudaStream_t stream,
     const Exl3GdnControlSide* control,std::uint16_t* first_bf16) {
     if(control && (in_features_%128!=0 || control->heads<=0))return false;
-    if(rows<1 || rows>8 || rows>max_rows_ || rows>second_workspace.max_rows_ ||
+    if(rows<1 || rows>16 || rows>max_rows_ || rows>second_workspace.max_rows_ ||
        !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
@@ -9512,7 +9512,7 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair(
                                   const Exl3CudaLinearMetadata& metadata) {
         if(const int kv=coherent_kv_split_for(metadata,rows,Exl3CudaLinearAdmission::ordinary,
                workspace.in_features_,workspace.out_features_,
-               workspace.accumulation_capacity_bytes_))
+               workspace.accumulation_capacity_bytes_,workspace.max_rows_))
             return -kv;
         if(metadata.K<=7 &&
            workspace.coherent_wide_k6_candidate(metadata,rows,Exl3CudaLinearAdmission::ordinary))
@@ -9597,7 +9597,7 @@ void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
        !target_head_small_m_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared head requires admitted H6 small-M workspace");
     if (coherent_kv_split_for(metadata, rows, admission, in_features_, out_features_,
-            accumulation_capacity_bytes_)) {
+            accumulation_capacity_bytes_, max_rows_)) {
         if (coherent_fused_input_for(rows)) {
             forward_from_transformed(weights, metadata, transformed_, output,
                                      rows, stream, admission, input);
@@ -10730,7 +10730,7 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
     Exl3CudaLinearAdmission admission) const noexcept {
     if (!coherent_wide_k6_enabled_ || !allow_generic_variants_ ||
         coherent_wide_k6_resident_capacity_ <= 0 ||
-        rows < 1 || rows > 8 || rows > max_rows_ ||
+        rows < 1 || rows > 16 || rows > max_rows_ ||
         metadata.in_features != in_features_ ||
         metadata.out_features != out_features_ ||
         !(metadata.K == 6 ||
@@ -10759,14 +10759,19 @@ int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows)
     const int split = value ? std::atoi(value) : 10;
     if (split != 5 && split != 8 && split != 10)
         throw std::invalid_argument("coherent split override must be 5, 8 or 10");
-    const auto required = static_cast<std::size_t>(rows) *
+    // The split follows the workspace's row capacity, not this call's rows:
+    // a row's result must not depend on how many rows share the launch
+    // (batched multi-agent rounds).
+    (void)rows;
+    const auto required = static_cast<std::size_t>(max_rows_) *
         static_cast<std::size_t>(out_features_) * split * sizeof(float);
     return accumulation_capacity_bytes_ >= required ? split : base;
 }
 
 int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexcept {
     constexpr int split10 = 10;
-    const auto required = static_cast<std::size_t>(rows) *
+    (void)rows;   // row-independent, as in coherent_split_override
+    const auto required = static_cast<std::size_t>(max_rows_) *
         static_cast<std::size_t>(out_features_) * split10 * sizeof(float);
     return coherent_wide_k6_split10_enabled_ &&
         accumulation_capacity_bytes_ >= required ? split10 :
@@ -10780,7 +10785,7 @@ bool Exl3CudaLinearWorkspace::coherent_down_k6_candidate(
     // rows of an M16 MMA tile. Scalar, verifier, and correction share this
     // body and five disjoint K partitions.
     return coherent_down_k6_enabled_ && allow_generic_variants_ &&
-        coherent_down_k6_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        coherent_down_k6_resident_capacity_ > 0 && rows >= 1 && rows <= 16 &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
          admission == Exl3CudaLinearAdmission::target_continuation_down) &&
@@ -10799,7 +10804,7 @@ bool Exl3CudaLinearWorkspace::coherent_down_k7_candidate(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
     return coherent_down_k7_enabled_ && allow_generic_variants_ &&
-        coherent_down_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        coherent_down_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 16 &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
          admission == Exl3CudaLinearAdmission::target_continuation_down) &&
@@ -10813,7 +10818,7 @@ bool Exl3CudaLinearWorkspace::coherent_o_k7_candidate(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
     return coherent_o_k7_enabled_ && allow_generic_variants_ &&
-        coherent_o_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        coherent_o_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 16 &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
          admission == Exl3CudaLinearAdmission::target_continuation_o) &&
@@ -11875,16 +11880,18 @@ static int coherent_kv_split_setting() {
 
 static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission, int in_features, int out_features,
-    std::size_t capacity) {
+    std::size_t capacity, int max_rows) {
     const int split = coherent_kv_split_setting();
-    if (!split || rows < 1 || rows > 8 || in_features != 5120 || out_features != 1024 ||
+    if (!split || rows < 1 || rows > 16 || rows > max_rows || in_features != 5120 || out_features != 1024 ||
         metadata.in_features != in_features || metadata.out_features != out_features ||
         metadata.K < 6 || metadata.K > 8 || metadata.mcg || !metadata.mul1 ||
         metadata.has_bias ||
         (admission != Exl3CudaLinearAdmission::ordinary &&
          admission != Exl3CudaLinearAdmission::target_continuation_kv))
         return 0;
-    const auto required = static_cast<std::size_t>(rows) * out_features * split * sizeof(float);
+    // Sized by the workspace's row capacity so the route and split never
+    // depend on how many rows share a launch (batched multi-agent rounds).
+    const auto required = static_cast<std::size_t>(max_rows) * out_features * split * sizeof(float);
     return capacity >= required ? split : 0;
 }
 
@@ -11930,7 +11937,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         .require_disjoint_borrowed_views(transformed_input,accum_);
 
     if (const int kv_split = coherent_kv_split_for(metadata, rows, admission,
-            in_features_, out_features_, accumulation_capacity_bytes_)) {
+            in_features_, out_features_, accumulation_capacity_bytes_, max_rows_)) {
         if (metadata.K == 6)
             launch_coherent_packed_partials<6>(0, 0, stream, transformed_input,
                 weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,

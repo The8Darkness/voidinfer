@@ -322,13 +322,13 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
         reinterpret_cast<const std::uint16_t*>(upload(d_suh, host[1], "down suh")),
         reinterpret_cast<const std::uint16_t*>(upload(d_svh, host[2], "down svh")),
         reinterpret_cast<const std::int32_t*>(upload(d_mul1, host[3], "down mul1"))};
-    auto* input = allocate_device<std::uint16_t>(d_input, 8u * input_features, "down input");
+    auto* input = allocate_device<std::uint16_t>(d_input, 16u * input_features, "down input");
     auto* control_output = allocate_device<std::uint16_t>(
-        d_control, 8u * output_features, "down control output");
+        d_control, 16u * output_features, "down control output");
     constexpr std::size_t guard_elements = 32;
     auto* candidate_output = allocate_device<std::uint16_t>(
-        d_candidate, 8u * output_features + guard_elements, "down candidate output");
-    std::vector<std::uint16_t> input_bits(8u * input_features);
+        d_candidate, 16u * output_features + guard_elements, "down candidate output");
+    std::vector<std::uint16_t> input_bits(16u * input_features);
     for (std::size_t index = 0; index < input_bits.size(); ++index) {
         const std::uint16_t magnitude = static_cast<std::uint16_t>(
             0x2800u + ((index * 73u + index / input_features * 31u) % 0x800u));
@@ -357,7 +357,7 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
     _putenv_s("NINFER_EXL3_FAST_FP16_M2_8_DOWN_K6", "0");
     _putenv_s("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6", "0");
     _putenv_s("NINFER_EXL3_COHERENT_DOWN_K6", "0");
-    Exl3CudaLinearWorkspace control(input_features, output_features, 8,
+    Exl3CudaLinearWorkspace control(input_features, output_features, 16,
                                     false, false, true);
     const bool fused_down =
         !coherent && env_or_empty("NINFER_EXL3_TEST_FAST_SMALL_M_FUSED_DOWN") == "1";
@@ -367,7 +367,7 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
         _putenv_s("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6", "1");
     else
         _putenv_s("NINFER_EXL3_FAST_FP16_M2_8", "1");
-    Exl3CudaLinearWorkspace candidate(input_features, output_features, 8,
+    Exl3CudaLinearWorkspace candidate(input_features, output_features, 16,
                                       false, false, true);
     using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
     const auto calls = [&]() {
@@ -384,7 +384,7 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
     if (coherent) {
         require(candidate.coherent_down_k6_resident_capacity_for_test() > 0,
                 "coherent K6 down has no resident block capacity");
-        for (int row = 0; row < 8; ++row)
+        for (int row = 0; row < 16; ++row)
             row_oracles.push_back(coherent_down_witness::evaluate(
                 input_bits, host[1].typed<std::uint16_t>("F16"),
                 host[2].typed<std::uint16_t>("F16"),
@@ -397,14 +397,14 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
                 "coherent correction M1 admission did not select shared core");
     }
     const std::vector<int> row_counts = coherent
-        ? std::vector<int>{1, 2, 3, 4, 7, 8}
+        ? std::vector<int>{1, 2, 3, 4, 7, 8, 9, 12, 16}
         : std::vector<int>{2, 4, 8};
-    std::array<std::vector<std::uint16_t>, 8> coherent_row_snapshots;
+    std::array<std::vector<std::uint16_t>, 16> coherent_row_snapshots;
     for (int rows : row_counts) {
         const auto admission = rows == 1 ? Admission::ordinary
                                          : Admission::target_continuation_down;
         cuda_check(cudaMemset(candidate_output, 0xa5,
-            (8u * output_features + guard_elements) * sizeof(std::uint16_t)),
+            (16u * output_features + guard_elements) * sizeof(std::uint16_t)),
             "initialize coherent down output and tail guard");
         control.forward(weights, metadata, input, control_output, rows,
                         nullptr, admission);
@@ -447,7 +447,7 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
                         "coherent_down_k6_shared_rows_n8_split5",
                     "coherent K6 down dispatch admission/fallback mismatch");
             std::vector<std::uint16_t> guard(
-                8u * output_features + guard_elements - expected.size());
+                16u * output_features + guard_elements - expected.size());
             cuda_check(cudaMemcpy(guard.data(), candidate_output + expected.size(),
                                   guard.size() * sizeof(std::uint16_t),
                                   cudaMemcpyDeviceToHost),
@@ -526,7 +526,7 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
             "selected down path was not dispatched for each row count");
     if (coherent)
         require(Exl3CudaLinearWorkspace::process_coherent_down_k6_rows_for_test() -
-                    before_rows == 27,
+                    before_rows == 64,
                 "coherent K6 down dispatched row count mismatch");
     if (fused_down) {
         const auto control_us = benchmark(control, weights, metadata, input,
@@ -567,11 +567,11 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
         reinterpret_cast<const std::uint16_t*>(upload(d_suh,host[1],"K7 O suh")),
         reinterpret_cast<const std::uint16_t*>(upload(d_svh,host[2],"K7 O svh")),
         reinterpret_cast<const std::int32_t*>(upload(d_mul1,host[3],"K7 O mul1"))};
-    auto* input=allocate_device<std::uint16_t>(d_input,8u*in_features,"K7 O input");
-    auto* control=allocate_device<std::uint16_t>(d_control,8u*out_features,"K7 O control");
+    auto* input=allocate_device<std::uint16_t>(d_input,16u*in_features,"K7 O input");
+    auto* control=allocate_device<std::uint16_t>(d_control,16u*out_features,"K7 O control");
     auto* candidate=allocate_device<std::uint16_t>(d_candidate,
-        8u*out_features+guard,"K7 O candidate");
-    std::vector<std::uint16_t> input_bits(8u*in_features);
+        16u*out_features+guard,"K7 O candidate");
+    std::vector<std::uint16_t> input_bits(16u*in_features);
     for(std::size_t i=0;i<input_bits.size();++i) {
         const auto magnitude=static_cast<std::uint16_t>(
             0x2800u+((i*73u+i/in_features*31u)%0x800u));
@@ -582,10 +582,10 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
                           cudaMemcpyHostToDevice),"K7 O input upload");
     const Exl3CudaLinearMetadata metadata{in_features,out_features,7,false,true,false};
     _putenv_s("NINFER_EXL3_COHERENT_O_K7","0");
-    Exl3CudaLinearWorkspace old(in_features,out_features,8,
+    Exl3CudaLinearWorkspace old(in_features,out_features,16,
         false,false,false,true);
     _putenv_s("NINFER_EXL3_COHERENT_O_K7","1");
-    Exl3CudaLinearWorkspace shared(in_features,out_features,8,
+    Exl3CudaLinearWorkspace shared(in_features,out_features,16,
         false,false,false,true);
     require(shared.coherent_o_k7_resident_capacity_for_test()>0,
         "coherent K7 O has no resident block capacity");
@@ -594,14 +594,14 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
     const auto before_rows=Exl3CudaLinearWorkspace::
         process_coherent_o_k7_rows_for_test();
     std::vector<coherent_down_witness::Result> oracle;
-    for(int row=0;row<8;++row)
+    for(int row=0;row<16;++row)
         oracle.push_back(coherent_down_witness::evaluate_o_k7(
             input_bits,host[1].typed<std::uint16_t>("F16"),
             host[2].typed<std::uint16_t>("F16"),
             host[0].typed<std::uint16_t>("I16"),
             static_cast<std::uint32_t>(host[3].typed<std::int32_t>("I32")[0]),row));
-    std::array<std::vector<std::uint16_t>,8> row_snapshots;
-    for(int rows:{1,2,3,4,7,8}) {
+    std::array<std::vector<std::uint16_t>,16> row_snapshots;
+    for(int rows:{1,2,3,4,7,8,9,12,16}) {
         const auto admission=rows==1?Admission::ordinary:
             Admission::target_continuation_o;
         require(std::string(shared.dispatch_name(metadata,rows,admission))==
@@ -610,7 +610,7 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
                     "coherent_o_k7_shared_rows_n8_split5",
             "coherent K7 O dispatch or fallback mismatch");
         cuda_check(cudaMemset(candidate,0xa5,
-            (8u*out_features+guard)*sizeof(std::uint16_t)),
+            (16u*out_features+guard)*sizeof(std::uint16_t)),
             "K7 O tail canary");
         old.forward(weights,metadata,input,control,rows,nullptr,admission);
         shared.forward(weights,metadata,input,candidate,rows,nullptr,admission);
@@ -620,7 +620,7 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
                               cudaMemcpyDeviceToHost),"K7 O control download");
         cuda_check(cudaMemcpy(actual.data(),candidate,actual.size()*sizeof(std::uint16_t),
                               cudaMemcpyDeviceToHost),"K7 O shared download");
-        std::vector<std::uint16_t> tail(8u*out_features+guard-actual.size());
+        std::vector<std::uint16_t> tail(16u*out_features+guard-actual.size());
         cuda_check(cudaMemcpy(tail.data(),candidate+actual.size(),
             tail.size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost),
             "K7 O tail download");
@@ -669,11 +669,11 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
         "K7 O correction download");
     require(scalar==correction,"coherent K7 O scalar/correction M1 mismatch");
     require(Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test()-
-                before_calls==8 &&
+                before_calls==11 &&
             Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test()-
-                before_rows==27,
+                before_rows==64,
         "coherent K7 O dispatch counts or rows mismatch");
-    std::cout<<"COHERENT_O_K7_OPERATOR PASS calls=8 rows=27\n";
+    std::cout<<"COHERENT_O_K7_OPERATOR PASS calls=11 rows=64\n";
 }
 
 void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
@@ -704,11 +704,11 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
         reinterpret_cast<const std::uint16_t*>(upload(d_suh,host[1],"K7 down suh")),
         reinterpret_cast<const std::uint16_t*>(upload(d_svh,host[2],"K7 down svh")),
         reinterpret_cast<const std::int32_t*>(upload(d_mul1,host[3],"K7 down mul1"))};
-    auto* input=allocate_device<std::uint16_t>(d_input,8u*in_features,"K7 down input");
-    auto* control=allocate_device<std::uint16_t>(d_control,8u*out_features,"K7 down control");
+    auto* input=allocate_device<std::uint16_t>(d_input,16u*in_features,"K7 down input");
+    auto* control=allocate_device<std::uint16_t>(d_control,16u*out_features,"K7 down control");
     auto* candidate=allocate_device<std::uint16_t>(d_candidate,
-        8u*out_features+guard,"K7 down candidate");
-    std::vector<std::uint16_t> input_bits(8u*in_features);
+        16u*out_features+guard,"K7 down candidate");
+    std::vector<std::uint16_t> input_bits(16u*in_features);
     for(std::size_t i=0;i<input_bits.size();++i) {
         const auto magnitude=static_cast<std::uint16_t>(
             0x2800u+((i*73u+i/in_features*31u)%0x800u));
@@ -719,10 +719,10 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
                           cudaMemcpyHostToDevice),"K7 down input upload");
     const Exl3CudaLinearMetadata metadata{in_features,out_features,7,false,true,false};
     _putenv_s("NINFER_EXL3_COHERENT_DOWN_K7","0");
-    Exl3CudaLinearWorkspace old(in_features,out_features,8,
+    Exl3CudaLinearWorkspace old(in_features,out_features,16,
         false,false,true,false);
     _putenv_s("NINFER_EXL3_COHERENT_DOWN_K7","1");
-    Exl3CudaLinearWorkspace shared(in_features,out_features,8,
+    Exl3CudaLinearWorkspace shared(in_features,out_features,16,
         false,false,true,false);
     require(shared.coherent_down_k7_shared_bytes_for_test()==12800,
         "coherent K7 down shared resource declaration mismatch");
@@ -732,7 +732,7 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
                 Exl3CudaLinearMetadata{in_features,out_features,6,false,true,false},
                 1,Admission::ordinary))!=
                 "coherent_down_k7_shared_rows_n8_split5" &&
-            std::string(shared.dispatch_name(metadata,9,Admission::ordinary))!=
+            std::string(shared.dispatch_name(metadata,17,Admission::ordinary))!=
                 "coherent_down_k7_shared_rows_n8_split5",
         "coherent K7 down escaped its metadata or row contract");
     const auto before_calls=Exl3CudaLinearWorkspace::
@@ -740,14 +740,14 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
     const auto before_rows=Exl3CudaLinearWorkspace::
         process_coherent_down_k7_rows_for_test();
     std::vector<coherent_down_witness::Result> oracle;
-    for(int row=0;row<8;++row)
+    for(int row=0;row<16;++row)
         oracle.push_back(coherent_down_witness::evaluate_down_k7(
             input_bits,host[1].typed<std::uint16_t>("F16"),
             host[2].typed<std::uint16_t>("F16"),
             host[0].typed<std::uint16_t>("I16"),
             static_cast<std::uint32_t>(host[3].typed<std::int32_t>("I32")[0]),row));
-    std::array<std::vector<std::uint16_t>,8> row_snapshots;
-    for(int rows:{1,2,3,4,7,8}) {
+    std::array<std::vector<std::uint16_t>,16> row_snapshots;
+    for(int rows:{1,2,3,4,7,8,9,12,16}) {
         const auto admission=rows==1?Admission::ordinary:
             Admission::target_continuation_down;
         require(std::string(shared.dispatch_name(metadata,rows,admission))==
@@ -763,7 +763,7 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
                     "coherent_down_k7_shared_rows_n8_split5",
             "coherent K7 down scalar and correction admission differ");
         cuda_check(cudaMemset(candidate,0xa5,
-            (8u*out_features+guard)*sizeof(std::uint16_t)),
+            (16u*out_features+guard)*sizeof(std::uint16_t)),
             "K7 down tail canary");
         old.forward(weights,metadata,input,control,rows,nullptr,admission);
         shared.forward(weights,metadata,input,candidate,rows,nullptr,admission);
@@ -782,7 +782,7 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
             "coherent K7 down alternate-admission download");
         require(other==actual,
             "coherent K7 down scalar/correction arithmetic differs");
-        std::vector<std::uint16_t> tail(8u*out_features+guard-actual.size());
+        std::vector<std::uint16_t> tail(16u*out_features+guard-actual.size());
         cuda_check(cudaMemcpy(tail.data(),candidate+actual.size(),
             tail.size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost),
             "K7 down tail download");
@@ -834,11 +834,11 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
         "K7 down correction download");
     require(scalar==correction,"coherent K7 down scalar/correction M1 mismatch");
     require(Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test()-
-                before_calls==14 &&
+                before_calls==20 &&
             Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test()-
-                before_rows==52,
+                before_rows==126,
         "coherent K7 down dispatch counts or rows mismatch");
-    std::cout<<"COHERENT_DOWN_K7_OPERATOR PASS calls=14 rows=52\n";
+    std::cout<<"COHERENT_DOWN_K7_OPERATOR PASS calls=20 rows=126\n";
 }
 
 void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
@@ -900,7 +900,7 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             reinterpret_cast<const std::uint16_t*>(upload(d_suh,host[1],"wide suh")),
             reinterpret_cast<const std::uint16_t*>(upload(d_svh,host[2],"wide svh")),
             reinterpret_cast<const std::int32_t*>(upload(d_mul1,host[3],"wide mul1"))};
-        std::vector<std::uint16_t> input_bits(8u*shape.in_features);
+        std::vector<std::uint16_t> input_bits(16u*shape.in_features);
         for(std::size_t i=0;i<input_bits.size();++i) {
             const auto magnitude=static_cast<std::uint16_t>(
                 0x2800u+((i*73u+i/shape.in_features*31u)%0x800u));
@@ -911,7 +911,7 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
         cuda_check(cudaMemcpy(input,input_bits.data(),
             input_bits.size()*sizeof(std::uint16_t),cudaMemcpyHostToDevice),
             "wide input upload");
-        const std::size_t extent=8u*shape.out_features+guard;
+        const std::size_t extent=16u*shape.out_features+guard;
         auto* scalar=allocate_device<std::uint16_t>(d_scalar,extent,"wide scalar");
         auto* verifier=allocate_device<std::uint16_t>(d_verifier,extent,"wide verifier");
         const Exl3CudaLinearMetadata metadata{
@@ -922,8 +922,8 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             {},{},shape.qkv,false,shape.q);
         _putenv_s("NINFER_EXL3_TARGET_COHERENT_WIDE_K6","1");
         _putenv_s("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",split10?"1":"0");
-        Exl3CudaLinearWorkspace candidate(shape.in_features,shape.out_features,
-            split10?16:8,
+        // 16 rows: batched rounds of two agents' verifier rows share one launch.
+        Exl3CudaLinearWorkspace candidate(shape.in_features,shape.out_features,16,
             false,shape.gate_up,false,shape.o,shape.z,false,false,
             {},{},shape.qkv,false,shape.q);
         std::string dispatch=shape.dispatch;
@@ -936,7 +936,7 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
         require(std::string(candidate.dispatch_name(
                 Exl3CudaLinearMetadata{shape.in_features,shape.out_features,7,
                     false,true,false},1,Admission::ordinary))!=dispatch &&
-                std::string(candidate.dispatch_name(metadata,9,
+                std::string(candidate.dispatch_name(metadata,17,
                     Admission::ordinary))!=dispatch &&
                 std::string(candidate.dispatch_name(metadata,1,
                     Admission::target_continuation_down))!=dispatch,
@@ -947,17 +947,17 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             coherent_wide_k6_rows_for_test(shape.operation);
         const auto before_split10=Exl3CudaLinearWorkspace::
             coherent_wide_k6_split10_calls_for_test(shape.operation);
-        std::array<coherent_wide_k6_witness::Output,8> oracle;
-        for(int row=0;row<8;++row)
+        std::array<coherent_wide_k6_witness::Output,16> oracle;
+        for(int row=0;row<16;++row)
             oracle[row]=coherent_wide_k6_witness::evaluate(
                 input_bits,host[1].typed<std::uint16_t>("F16"),
                 host[2].typed<std::uint16_t>("F16"),
                 host[0].typed<std::uint16_t>("I16"),
                 static_cast<std::uint32_t>(host[3].typed<std::int32_t>("I32")[0]),
                 row,shape.in_features,shape.out_features);
-        std::array<std::vector<std::uint16_t>,8> row_snapshots;
-        for(int rows:{1,2,3,4,7,8}) {
-            require(std::string(old.dispatch_name(metadata,rows,
+        std::array<std::vector<std::uint16_t>,16> row_snapshots;
+        for(int rows:{1,2,3,4,7,8,9,12,16}) {
+            require(rows>8 || std::string(old.dispatch_name(metadata,rows,
                         Admission::ordinary))!=dispatch &&
                     std::string(candidate.dispatch_name(metadata,rows,
                         Admission::ordinary))==dispatch &&
@@ -1014,12 +1014,27 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             require(max_abs<=0.02 && relative_l2<=0.002,
                 std::string("coherent wide K6 FP64 bound: ")+shape.name);
         }
+        if(env_or_empty("NINFER_EXL3_TEST_ROW_TIMING")=="1") {
+            // Batched-round economics: one launch per projection at each width.
+            for(int rows:{1,8,16}) {
+                cudaEvent_t start,stop;
+                cuda_check(cudaEventCreate(&start),"timing event");cuda_check(cudaEventCreate(&stop),"timing event");
+                for(int i=0;i<20;++i)candidate.forward(weights,metadata,input,scalar,rows,nullptr,shape.continuation);
+                cuda_check(cudaEventRecord(start),"timing start");
+                for(int i=0;i<200;++i)candidate.forward(weights,metadata,input,scalar,rows,nullptr,shape.continuation);
+                cuda_check(cudaEventRecord(stop),"timing stop");cuda_check(cudaEventSynchronize(stop),"timing sync");
+                float elapsed=0;cuda_check(cudaEventElapsedTime(&elapsed,start,stop),"timing read");
+                std::cout<<"ROW_TIMING op="<<shape.name<<" M="<<rows<<" us="<<elapsed*1000.0f/200<<'\n';
+                cudaEventDestroy(start);cudaEventDestroy(stop);
+            }
+            continue;
+        }
         require(Exl3CudaLinearWorkspace::coherent_wide_k6_calls_for_test(
-                    shape.operation)-before_calls==12 &&
+                    shape.operation)-before_calls==18 &&
                 Exl3CudaLinearWorkspace::coherent_wide_k6_rows_for_test(
-                    shape.operation)-before_rows==50 &&
+                    shape.operation)-before_rows==124 &&
                 Exl3CudaLinearWorkspace::coherent_wide_k6_split10_calls_for_test(
-                    shape.operation)-before_split10==(split10?12u:0u),
+                    shape.operation)-before_split10==(split10?18u:0u),
             std::string("coherent wide K6 actual calls/rows: ")+shape.name);
     }
 }
