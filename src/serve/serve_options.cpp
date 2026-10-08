@@ -517,13 +517,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
            (sampling.min_p && *sampling.min_p!=0.0f))
             throw std::invalid_argument(
                 "coherent-device EXL3 requires explicit greedy sampling without distribution overrides");
-        if(options.max_concurrency!=1 || options.enable_vision || options.use_cuda_graph ||
+        if((options.max_concurrency!=1 && options.max_concurrency!=2) || options.enable_vision || options.use_cuda_graph ||
            options.hierarchical_vericache.enabled ||
            options.speculative.backend!=SpeculativeBackend::DFlash2 ||
            options.speculative.draft_tokens!=7 ||
            options.speculative.proposal_head!=ProposalHead::Full)
             throw std::invalid_argument(
-                "coherent-device EXL3 requires C1 text/eager/DFlash2-K7 full proposals");
+                "coherent-device EXL3 requires C1/C2 text/eager/DFlash2-K7 full proposals");
         // L0 OSCAR (INT2 history in VRAM, FP16 K/V in mapped host memory) admits 256K.
         const char* l0_oscar=std::getenv("NINFER_EXL3_L0_OSCAR");
         const int coherent_context_limit=!l0_oscar || std::string_view(l0_oscar)!="0"?262144:32768;

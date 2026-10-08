@@ -181,7 +181,7 @@ void require_exact_profile(){
             "host-kv-fp16","fp16");
 }
 void require_coherent_device_profile(const EngineOptions& options) {
-    if(options.max_concurrency!=1 || options.enable_vision || options.use_cuda_graph ||
+    if((options.max_concurrency!=1 && options.max_concurrency!=2) || options.enable_vision || options.use_cuda_graph ||
        options.max_context<2048 || options.max_context>(Exl3NativeContextExtent::l0_oscar_enabled()?
            static_cast<int>(Exl3NativeContextExtent::l0_oscar_tokens):32768))
         throw std::invalid_argument(
@@ -1888,7 +1888,7 @@ struct Exl3EngineCore::Impl {
         auto& output=request.output;
         const auto& prepared=targets::qwen3_6::PreparedPromptAccess::view(request.prompt);
         const auto ids=request.ready_work.input_tokens();
-        if(lane_index!=0 || prepared.has_media() || ids.size()<2048 ||
+        if(prepared.has_media() || ids.size()<2048 ||
            ids.size()>options.max_context || request.sampling ||
            !request.options.stop.strings.empty() ||
            request.options.execution.thinking.budget.has_value() ||

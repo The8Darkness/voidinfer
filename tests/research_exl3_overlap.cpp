@@ -93,10 +93,12 @@ int main() {
             }
             check(cudaStreamSynchronize(s), "ingest");
         };
+        const auto free_mib = [] { std::size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return static_cast<long long>(f >> 20); };
+        std::cerr << "OVL free after load " << free_mib() << " MiB\n";
         std::unique_ptr<Exl3TextContext> d, v;
-        if (mode != 1) { d = model->create_context(true); d->prepare_continuation(8); ingest(*d, sd); }
+        if (mode != 1) { d = model->create_context(true); std::cerr << "OVL free after D create " << free_mib() << " MiB\n"; d->prepare_continuation(8); ingest(*d, sd); std::cerr << "OVL free after D ingest " << free_mib() << " MiB\n"; }
         if (mode != 0) {
-            v = model->create_context(true); v->prepare_continuation(8); ingest(*v, sd);
+            v = model->create_context(true); std::cerr << "OVL free after V create " << free_mib() << " MiB\n"; v->prepare_continuation(8); ingest(*v, sd); std::cerr << "OVL free after V ingest " << free_mib() << " MiB\n";
             v->save_verified_root(sv);
             check(cudaStreamSynchronize(sv), "root");
         }
@@ -128,6 +130,44 @@ int main() {
             check(cudaStreamSynchronize(sd), "decode");
             d_ms = ms(start);
         };
+        if (mode == 4) {
+            // Cost of one target continuation forward by row count (batched-round estimate).
+            for (const int n : {1, 2, 4, 8, 9, 12, 16, 32}) {
+                if (n == 1) {
+                    const auto start = Clock::now();
+                    for (int i = 0; i < 20; ++i) d->decode(ids[static_cast<std::size_t>(context + i)], sd);
+                    check(cudaStreamSynchronize(sd), "m1");
+                    std::cout << "OVL rows=1 ms=" << ms(start) / 20 << '\n';
+                    continue;
+                }
+                const std::span<const std::int64_t> chunk(ids.data() + context, static_cast<std::size_t>(n));
+                const auto run = [&] { if (n <= 8) d->continue_rows(chunk, sd); else d->append_prefill_wide(chunk, sd); };
+                run(); check(cudaStreamSynchronize(sd), "warm");
+                const auto start = Clock::now();
+                for (int i = 0; i < 20; ++i) run();
+                check(cudaStreamSynchronize(sd), "rows");
+                std::cout << "OVL rows=" << n << " ms=" << ms(start) / 20 << '\n';
+            }
+            return 0;
+        }
+        if (mode == 3) {
+            // Both contexts decode greedy tokens concurrently (time-sliced lanes).
+            double v_ms = 0;
+            std::thread other([&] {
+                const auto start = Clock::now();
+                for (int i = 0; i < tokens; ++i) {
+                    const auto logits = v->logits_host(sv);
+                    v->decode(static_cast<std::int64_t>(std::max_element(logits.begin(), logits.end()) - logits.begin()), sv);
+                }
+                check(cudaStreamSynchronize(sv), "decode v");
+                v_ms = ms(start);
+            });
+            decoder();
+            other.join();
+            std::cout << "OVL mode=3 d_ms_per_token=" << d_ms / tokens << " v_ms_per_token=" << v_ms / tokens
+                      << " aggregate_tok_s=" << 2.0 * tokens * 1000.0 / std::max(d_ms, v_ms) << '\n';
+            return 0;
+        }
         if (mode == 0) decoder();
         else if (mode == 1) verifier();
         else {
