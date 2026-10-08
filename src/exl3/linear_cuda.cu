@@ -6952,9 +6952,9 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     // Requires the MXFP8 route.
     const char* nvfp4=std::getenv("NINFER_EXL3_PREFILL_NVFP4");
     if(nvfp4 && std::strcmp(nvfp4,"0")!=0 && std::strcmp(nvfp4,"1")!=0 &&
-       std::strcmp(nvfp4,"2")!=0 && std::strcmp(nvfp4,"3")!=0) {
+       std::strcmp(nvfp4,"2")!=0 && std::strcmp(nvfp4,"3")!=0 && std::strcmp(nvfp4,"4")!=0) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0, 1, 2 or 3");
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0..4");
     }
     impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 2) : 0;
     const char* fused_decode=std::getenv("NINFER_EXL3_PREFILL_FUSED_DECODE");
@@ -7929,8 +7929,11 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         (metadata.in_features == 5120 && metadata.out_features == 17408) ||
         (metadata.in_features == 17408 && metadata.out_features == 5120);
     // Mode 3 mirrors the NInfer Qwen3.8 NVFP4 artifact: MLP layers 0..55.
+    const bool gdn_qkvz_shape = metadata.in_features == 5120 &&
+        (metadata.out_features == 10240 || metadata.out_features == 6144);
     const bool nvfp4 = mxfp8 && (impl_->nvfp4_mode == 1 ||
         (impl_->nvfp4_mode == 2 && mlp_shape) ||
+        (impl_->nvfp4_mode == 4 && (mlp_shape || gdn_qkvz_shape)) ||
         (impl_->nvfp4_mode == 3 && mlp_shape && impl_->prefill_layer >= 0 &&
          impl_->prefill_layer < 56));
     // NVFP4 slot: packed values (k*n/2), block scales (n x k/16), then the
