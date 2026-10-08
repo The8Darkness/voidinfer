@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -7527,29 +7528,36 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             cuda_check(cudaDeviceSynchronize(),"L0 OSCAR hot rows initialization");
         }
         // Query and history scratch is consumed within one layer's attention on
-        // the layer stream, so all full-attention layers of the process share it
-        // (one target context executes layers sequentially).
-        static l0_oscar::LayerStorage shared{};
+        // the layer stream, so the full-attention layers of one context share it
+        // (a context executes its layers sequentially). Concurrent contexts
+        // (Engine lanes) decode at the same time: one set per owning context.
+        static std::map<const void*,l0_oscar::LayerStorage> per_context;
+        auto& shared=per_context[l0_scratch_owner_];
         // Partial slots per (row, KV head): the INT2 segments, then one per CTA with hot tiles.
         const int slot_stride=l.segments*kL0HistoryStreams+std::min(l0_hot_tiles(l.hot_slots),l.segments);
         if(shared.segments<slot_stride) {
             // Earlier layers keep their (smaller) scratch; it is never released.
             shared.segments=slot_stride;
-            alloc(shared.q_rot,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(std::uint16_t));
-            alloc(shared.q_mu,static_cast<std::size_t>(l.rows)*kQHeads*sizeof(float));
             alloc(shared.hist_work,static_cast<std::size_t>(l.rows)*kKVHeads*slot_stride*
                 kFastFusedFlashStride*sizeof(float));
             alloc(shared.hist_slot,static_cast<std::size_t>(l.rows)*kKVHeads*kFastFusedFlashStride*sizeof(float));
             alloc(shared.hist_rotated,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
             alloc(shared.hist_hot,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
         }
+        // Prompt-ingestion scratch stays process-wide: concurrent contexts
+        // ingest one at a time (the Engine serializes prefill).
         static l0_oscar::LayerStorage prefill{};
         l.prefill_rows=std::max(max_rows_,8);
+        // Rotated queries serve both decode and prefill rows: per context.
+        if(shared.prefill_rows<l.prefill_rows) {
+            shared.prefill_rows=l.prefill_rows;
+            const std::size_t r=static_cast<std::size_t>(l.prefill_rows);
+            alloc(shared.q_rot,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
+            alloc(shared.q_mu,r*kQHeads*sizeof(float));
+        }
         if(prefill.prefill_rows<l.prefill_rows) {
             prefill.prefill_rows=l.prefill_rows;
             const std::size_t r=static_cast<std::size_t>(l.prefill_rows);
-            alloc(prefill.q_rot,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
-            alloc(prefill.q_mu,r*kQHeads*sizeof(float));
             alloc(prefill.prefill_hist,4*r*kQHeads*kHeadDim*sizeof(float));
             alloc(prefill.prefill_hist_stats,4*r*kQHeads*2*sizeof(float));
             alloc(prefill.prefill_numer,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
@@ -7559,7 +7567,6 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         l.prefill_hist=prefill.prefill_hist; l.prefill_hist_stats=prefill.prefill_hist_stats;
         l.prefill_numer=prefill.prefill_numer;
         l.prefill_split=prefill.prefill_split; l.prefill_split_stats=prefill.prefill_split_stats;
-        shared.q_rot=prefill.q_rot; shared.q_mu=prefill.q_mu;
         l.q_rot=shared.q_rot; l.q_mu=shared.q_mu; l.hist_work=shared.hist_work; l.hist_slot=shared.hist_slot; l.hist_rotated=shared.hist_rotated; l.hist_hot=shared.hist_hot;
     }
     if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
@@ -8022,7 +8029,9 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
             const auto& a=l0_oscar::assets();
             // Hot slots won last round are filled from L2 beside the encode.
             struct HotBranch { cudaStream_t side=nullptr; cudaEvent_t fork=nullptr,join=nullptr; };
-            static const HotBranch hot_branch=[] {
+            // Per thread: concurrent Engine lanes enqueue their rounds from
+            // their own threads.
+            static thread_local const HotBranch hot_branch=[] {
                 HotBranch b;
                 cuda_check(cudaStreamCreateWithFlags(&b.side,cudaStreamNonBlocking),"L0 hot fill stream");
                 cuda_check(cudaEventCreateWithFlags(&b.fork,cudaEventDisableTiming),"L0 hot fill fork");
@@ -9879,7 +9888,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 qg+row*weights_.q_metadata.out_features,
                 kp+row*weights_.k_metadata.out_features,
                 vp+row*weights_.v_metadata.out_features,
-                attn+row*kQHeads*kHeadDim,peer.rows,peer.position,stream,preserve_m1_topology);
+                attn+row*kQHeads*kHeadDim,peer.rows,peer.position,stream,
+                peer.stream?peer.stream:stream,preserve_m1_topology);
             first+=peer.rows;
         }
         if(first!=rows)throw std::logic_error("full-attention batched segment rows");
@@ -10102,7 +10112,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
 // output returns to the owner's O-projection input.
 void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
     const std::uint16_t* kp_source,const std::uint16_t* vp_source,std::uint16_t* attn_destination,
-    int rows,int position,cudaStream_t stream,bool preserve_m1_topology) {
+    int rows,int position,cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology) {
     if(rows<1 || rows>max_rows_ || position<0)
         throw std::invalid_argument("full-attention peer segment rows/position");
     retained_prefix_available_ = false;
@@ -10131,7 +10141,7 @@ void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
         retained_prefix_available_ = true;
         retained_prefix_rows_ = rows;
         retained_prefix_position_ = position;
-        retained_prefix_stream_ = stream;
+        retained_prefix_stream_ = state_stream;
     }
 }
 

@@ -16,12 +16,14 @@ static float value(std::uint16_t h) {
     return h&32768?-magnitude:magnitude;
 }
 static void compare_route(const std::vector<std::uint16_t>& input,int rows,int vocab,int stride,bool warp) {
-    std::uint16_t* device=nullptr;Exl3GreedyRow* output=nullptr;
+    std::uint16_t* device=nullptr;Exl3GreedyRow* output=nullptr;void* split=nullptr;
     try {
         check(cudaMalloc(reinterpret_cast<void**>(&device),input.size()*2));
         check(cudaMalloc(reinterpret_cast<void**>(&output),rows*sizeof(Exl3GreedyRow)));
         check(cudaMemcpy(device,input.data(),input.size()*2,cudaMemcpyHostToDevice));
-        exl3_launch_greedy_packet(warp,rows,nullptr,device,vocab,stride,91,output);
+        check(cudaMalloc(&split,Exl3GreedySplitScratch::bytes()));
+        check(cudaMemset(split,0,Exl3GreedySplitScratch::bytes()));
+        exl3_launch_greedy_packet(warp,rows,nullptr,device,vocab,stride,91,output,Exl3GreedySplitScratch::carve(split));
         check(cudaGetLastError());
         std::vector<Exl3GreedyRow> actual(rows);
         check(cudaMemcpy(actual.data(),output,rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost));

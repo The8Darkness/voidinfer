@@ -778,7 +778,8 @@ public:
     // Batched multi-agent rounds: while set, forward() runs its row-independent
     // work over own_rows + every peer's rows, and each peer layer (another
     // agent's context, same model layer) runs its own stateful core on its rows.
-    struct BatchPeer { Exl3GdnLayer* layer = nullptr; int rows = 0; };
+    // stream: the peer's own (transaction) stream; launches use the owner's.
+    struct BatchPeer { Exl3GdnLayer* layer = nullptr; int rows = 0; cudaStream_t stream = nullptr; };
     struct Batch {
         int own_rows = 0;
         int peer_count = 0;
@@ -823,7 +824,8 @@ private:
         bool eligible = false;
         Exl3GdnHistoryStorage storage{};
     };
-    SegmentState begin_segment(int rows, cudaStream_t stream, bool preserve_m1_topology);
+    SegmentState begin_segment(int rows, cudaStream_t stream, bool preserve_m1_topology,
+                               cudaStream_t state_stream = nullptr);
     void end_segment(const SegmentState& segment, int rows, cudaStream_t stream,
                      bool preserve_m1_topology);
     struct PeerSegmentSource {
@@ -834,7 +836,7 @@ private:
         bool merged_qkvz_side;
     };
     void run_peer_segment(const PeerSegmentSource& source, cudaStream_t stream,
-                          bool preserve_m1_topology);
+                          cudaStream_t state_stream, bool preserve_m1_topology);
     const Batch* batch_ = nullptr;
     friend class Exl3TextContext;
     // The TextContext passes the bounded shared owner for this layer. Every

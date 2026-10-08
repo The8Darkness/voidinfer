@@ -33,6 +33,7 @@
 namespace ninfer::exl3 {
 
 class Exl3TextContext;
+class Exl3BatchedVerifyCoordinator;
 class Exl3VeriCacheServingCoordinator;
 struct Exl3GreedyPacketTransfer;
 
@@ -975,12 +976,23 @@ public:
     // row-independent projection; each context keeps its own KV, recurrent
     // state, taps, logits, positions and transaction exactly as continue_rows
     // would leave them.
+    // Launches on `stream`; the peer's transaction state belongs to
+    // `peer_stream` (defaults to `stream`), which must wait for this forward.
     void continue_rows_batched(Exl3TextContext& peer, std::span<const std::int64_t> own_tokens,
                                std::span<const std::int64_t> peer_tokens,
-                               cudaStream_t stream = nullptr);
+                               cudaStream_t stream = nullptr, cudaStream_t peer_stream = nullptr);
     // Captures the batched layer stack for this (peer, own_rows, peer_rows)
     // shape while both contexts are idle; continue_rows_batched replays it.
     void prepare_batched_continuation_graph(Exl3TextContext& peer, int own_rows, int peer_rows);
+    // Whether an L0 OSCAR prompt block can take the layer-major schedule now.
+    bool l0_layer_major_headroom() const;
+    // Batched multi-agent rounds: the DFlash2 verifier's target continuation
+    // goes through this coordinator (shared by the Engine's lanes) when set.
+    void set_batched_verify(Exl3BatchedVerifyCoordinator* coordinator) noexcept {
+        batched_verify_ = coordinator;
+    }
+    void continue_rows_for_verification(std::span<const std::int64_t> token_ids,
+                                        cudaStream_t stream = nullptr);
 
     // Greedy token and logit gap of each row of the last completed forward:
     // row i yields its argmax and max_logit - logit(next[i]) (0 when next[i]
@@ -1281,6 +1293,7 @@ private:
                                         int fail_after_model_layer,
                                         cudaStream_t stream);
     std::unique_ptr<Impl> impl_;
+    Exl3BatchedVerifyCoordinator* batched_verify_ = nullptr;
     int position_ = 0;
     std::uint16_t* logits_ = nullptr;
     std::size_t persistent_bytes_ = 0;

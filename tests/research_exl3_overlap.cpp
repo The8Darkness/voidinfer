@@ -18,6 +18,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <mutex>
 #include <vector>
 
 namespace {
@@ -99,7 +100,7 @@ int main() {
         std::unique_ptr<Exl3TextContext> d, v;
         if (mode != 1) { d = model->create_context(true); std::cerr << "OVL free after D create " << free_mib() << " MiB\n"; d->prepare_continuation(8); ingest(*d, sd); std::cerr << "OVL free after D ingest " << free_mib() << " MiB\n"; }
         if (mode != 0) {
-            v = model->create_context(true); std::cerr << "OVL free after V create " << free_mib() << " MiB\n"; v->prepare_continuation(8); ingest(*v, sd, mode == 5 ? 4096 : 0); std::cerr << "OVL free after V ingest " << free_mib() << " MiB\n";
+            v = model->create_context(true); std::cerr << "OVL free after V create " << free_mib() << " MiB\n"; v->prepare_continuation(8); ingest(*v, sd, (mode >= 5 && !env_int("OVL_SAME_PROMPT", 0)) ? 4096 : 0); std::cerr << "OVL free after V ingest " << free_mib() << " MiB\n";
             v->save_verified_root(sv);
             check(cudaStreamSynchronize(sv), "root");
         }
@@ -131,6 +132,86 @@ int main() {
             check(cudaStreamSynchronize(sd), "decode");
             d_ms = ms(start);
         };
+        if (mode == 6 || mode == 7) {
+            // Concurrency correctness: two contexts, each decoding (mode 6: M1
+            // decode; mode 7: 8-row continuations) alone and then concurrently
+            // on two threads from the same roots; the token streams must match.
+            const int steps = env_int("OVL_STEPS", 32);
+            const auto first_token = [&](Exl3TextContext& ctx, cudaStream_t s) {
+                const auto logits = ctx.logits_host(s);
+                return static_cast<std::int64_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+            };
+            const std::int64_t first_a = first_token(*d, sd), first_b = first_token(*v, sv);
+            d->save_verified_root(sd); v->save_verified_root(sv);
+            check(cudaDeviceSynchronize(), "roots");
+            std::mutex step_lock; const bool lock_steps = env_int("OVL_LOCK", 0) != 0;
+            const auto run = [&](Exl3TextContext& ctx, cudaStream_t s, std::vector<std::int64_t>& out) {
+                for (int i = 0; i < steps; ++i) {
+                    std::unique_lock guard(step_lock, std::defer_lock); if (lock_steps) guard.lock();
+                    std::int64_t token = &ctx == d.get() ? first_a : first_b;
+                    if (i > 0) {
+                        const auto logits = ctx.logits_host(s);
+                        token = static_cast<std::int64_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+                    }
+                    out.push_back(token);
+                    if (mode == 6) ctx.decode(token, s);
+                    else {
+                        std::vector<std::int64_t> rows(8, token);
+                        for (int r = 1; r < 8; ++r) rows[r] = ids[static_cast<std::size_t>(context + i * 8 + r)];
+                        ctx.continue_rows(rows, s);
+                    }
+                    if (lock_steps) check(cudaStreamSynchronize(s), "locked step");
+                }
+                check(cudaStreamSynchronize(s), "run");
+            };
+            std::vector<std::int64_t> sa, sb, ca, cb;
+            run(*d, sd, sa); run(*v, sv, sb);
+            d->restore_verified_root(sd); v->restore_verified_root(sv);
+            check(cudaDeviceSynchronize(), "rewind");
+            if (env_int("OVL_PREFILL_LOAD", 0)) {
+                // B ingests more prompt (wide prefill chunks) while A decodes.
+                std::atomic<bool> done{false};
+                std::thread loader([&] {
+                    int at = context + 4096;
+                    while (!done.load()) {
+                        const std::span<const std::int64_t> chunk(ids.data() + at, 1024);
+                        v->append_prefill_wide(chunk, sv);
+                        check(cudaStreamSynchronize(sv), "load sync");
+                        at += 1024;
+                        if (v->position() + 1024 >= v->max_context()) break;
+                    }
+                });
+                run(*d, sd, ca);
+                done = true;
+                loader.join();
+                cb = sb;
+            } else            if (env_int("OVL_BURN", 0)) {
+                // Contention only: B floods the GPU with unrelated memsets.
+                std::atomic<bool> done{false};
+                void* junk = nullptr;
+                check(cudaMalloc(&junk, 512u << 20), "burn buffer");
+                std::thread burner([&] {
+                    while (!done.load()) {
+                        for (int i = 0; i < 8; ++i) check(cudaMemsetAsync(junk, i, 512u << 20, sv), "burn");
+                        check(cudaStreamSynchronize(sv), "burn sync");
+                    }
+                });
+                run(*d, sd, ca);
+                done = true;
+                burner.join();
+                cudaFree(junk);
+                cb = sb;
+            } else if (env_int("OVL_SERIAL", 0)) { run(*d, sd, ca); run(*v, sv, cb); }
+            else {
+                std::thread other([&] { run(*v, sv, cb); });
+                run(*d, sd, ca);
+                other.join();
+            }
+            std::cout << "OVL cross-context same_stream=" << (sa == sb) << " ";
+            std::cout << "OVL concurrency mode=" << mode << " steps=" << steps << " A_equal=" << (sa == ca)
+                      << " B_equal=" << (sb == cb) << '\n';
+            return 0;
+        }
         if (mode == 5) {
             // Batched multi-agent continuation vs. two separate continuations
             // from the same verified roots (logits per row, then timing).

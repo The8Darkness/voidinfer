@@ -392,7 +392,7 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
         const auto seed=reuse_seed?ready_seed->token:exl3_branch_greedy(exact,stream);
         if(timeline)stage_end(timeline->seed_ms);
         if(siblings)exact.set_verifier_siblings(sibling_offsets);
-        exact.continue_rows(tentative,stream);
+        exact.continue_rows_for_verification(tentative,stream);
         if(timeline)stage_end(timeline->submit_ms);
         result.verification_rows=tentative.size();
         result.native_invocations=1;

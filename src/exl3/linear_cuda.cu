@@ -13690,7 +13690,8 @@ struct Exl3PrefetchStreams {
     bool pending=false;
 };
 Exl3PrefetchStreams& exl3_prefetch_streams() {
-    static Exl3PrefetchStreams streams=[] {
+    // Per thread: concurrent Engine lanes enqueue from their own threads.
+    static thread_local Exl3PrefetchStreams streams=[] {
         Exl3PrefetchStreams value;
         cuda_check(cudaStreamCreateWithFlags(&value.side,cudaStreamNonBlocking),"prefetch stream");
         cuda_check(cudaEventCreateWithFlags(&value.fork,cudaEventDisableTiming),"prefetch fork");

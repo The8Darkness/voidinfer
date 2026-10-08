@@ -15,6 +15,7 @@
 #include "exl3/exl3_frontend_resources.h"
 #include "exl3/dflash2_execution.h"
 #include "exl3/fast_device_round.h"
+#include "exl3/batched_verify_coordinator.h"
 #include "exl3/engine_scratch_requirements.h"
 #include "exl3/resource_availability.h"
 #include "exl3/engine_target_q.h"
@@ -47,6 +48,7 @@
 #include <condition_variable>
 #include <deque>
 #include <thread>
+#include <shared_mutex>
 #include <Windows.h>
 
 namespace ninfer::exl3 {
@@ -424,6 +426,14 @@ struct Exl3EngineCore::Impl {
     RuntimeStats stats;
     MemorySummary memory;
     std::array<std::thread,2> workers;
+    // Batched multi-agent rounds of the two coherent-device lanes
+    // (NINFER_EXL3_BATCHED_ROUNDS, default on for C2).
+    std::unique_ptr<Exl3BatchedVerifyCoordinator> batched_verify;
+    // Concurrent coherent-device lanes: prompt ingestion runs alone on the
+    // device (exclusive; process-wide prefill scratch, and DFlash2 rounds are
+    // not qualified to overlap another lane's ingestion), decode rounds of all
+    // lanes run together (shared).
+    std::shared_mutex coherent_prefill_mutex;
     Exl3RetirementState retirement;
     int retirement_fault=0;
     std::exception_ptr first_execution_failure;
@@ -1610,6 +1620,21 @@ struct Exl3EngineCore::Impl {
             stats.driver_unknown_device_bytes=attribution.driver_unknown_bytes;
             stats.driver_unknown_device_bytes_available=true;
         }
+        if(coherent_device && value.max_concurrency==2) {
+            const char* batched=std::getenv("NINFER_EXL3_BATCHED_ROUNDS");
+            if(!batched || std::string_view(batched)!="0") {
+                const char* wait=std::getenv("NINFER_EXL3_BATCHED_ROUND_WAIT_US");
+                batched_verify=std::make_unique<Exl3BatchedVerifyCoordinator>(
+                    std::chrono::microseconds(wait?std::atoi(wait):5000));
+                auto first=lanes[0]->context_owner_for_device_round();
+                auto second=lanes[1]->context_owner_for_device_round();
+                // Each lane may lead a batched forward: one graph per direction.
+                first->prepare_batched_continuation_graph(*second,8,8);
+                second->prepare_batched_continuation_graph(*first,8,8);
+                first->set_batched_verify(batched_verify.get());
+                second->set_batched_verify(batched_verify.get());
+            }
+        }
         try{for(std::uint32_t i=0;i<value.max_concurrency;++i)workers[i]=std::thread([this,i]{loop(i);});}
         catch(...){
             {std::lock_guard lock(mutex);stopping=true;}
@@ -1924,6 +1949,9 @@ struct Exl3EngineCore::Impl {
             std::fprintf(stderr,"\n");
         }
         const auto& vericache=Exl3VeriCacheConfig::get();
+        std::unique_lock prefill_lock(coherent_prefill_mutex);
+        // Rounds already submitted by other lanes finish before ingestion.
+        if(options.max_concurrency>1)check(cudaDeviceSynchronize());
         try {
             (void)context->reset_for_request(identity.contract());
             const auto epoch=context->request_generation();
@@ -2067,11 +2095,26 @@ struct Exl3EngineCore::Impl {
                     throw std::logic_error("coherent-device physical/coordinator acquisition");
             }
             draft.bind_ring_scope(host_lease->acquisition,epoch);
+            // This lane's DFlash2 rounds may meet the other lane's at verification.
+            struct BatchedLane {
+                Exl3BatchedVerifyCoordinator* coordinator;
+                explicit BatchedLane(Exl3BatchedVerifyCoordinator* value) : coordinator(value) {
+                    if(coordinator)coordinator->set_active(true);
+                }
+                ~BatchedLane() {
+                    if(!coordinator)return;
+                    coordinator->set_active(false);
+                    if(std::getenv("NINFER_EXL3_BATCHED_STATS"))std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu solo=%llu\n",
+                        static_cast<unsigned long long>(coordinator->batched_rounds()),static_cast<unsigned long long>(coordinator->solo_rounds()));
+                }
+            } batched_lane(batched_verify.get());
             round=std::make_unique<Exl3FastDeviceRound>(context,draft,
                 staging_owners[lane_index]->pointers,host_lease->acquisition,
                 epoch,false,stream);
             if(vericache.enabled)context->set_l0_exact_history(false);
             round->begin_prefilled();
+            check(cudaStreamSynchronize(stream));
+            prefill_lock.unlock();
             device_lease=coordinator.enter_device_logical(*host_lease,
                 std::static_pointer_cast<const void>(lane),context->position(),
                 allowance,options.max_context);
@@ -2104,6 +2147,7 @@ struct Exl3EngineCore::Impl {
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
                 while(!request.cancelled && remaining) {
+                    std::shared_lock round_lock(coherent_prefill_mutex);
                     if(!output.pending_control_tokens().empty())
                         throw std::invalid_argument(
                             "coherent-device EXL3 does not admit injected control tokens");
@@ -2222,6 +2266,7 @@ struct Exl3EngineCore::Impl {
                 }
             } else
             while(remaining && !request.cancelled) {
+                std::shared_lock round_lock(coherent_prefill_mutex);
                 if(round_phases)phase_mark=Clock::now();
                 if(!output.pending_control_tokens().empty())
                     throw std::invalid_argument(

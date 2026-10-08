@@ -679,13 +679,18 @@ public:
     // work over own_rows + every peer's rows, and each peer layer (another
     // agent's context, same model layer) runs its own stateful core on its rows
     // at its own position.
-    struct BatchPeer { Exl3FullAttentionLayer* layer = nullptr; int rows = 0; int position = 0; };
+    // stream: the peer's own (transaction) stream; launches use the owner's.
+    struct BatchPeer { Exl3FullAttentionLayer* layer = nullptr; int rows = 0; int position = 0;
+                       cudaStream_t stream = nullptr; };
     struct Batch {
         int own_rows = 0;
         int peer_count = 0;
         std::array<BatchPeer, 1> peers{};
     };
     void set_batch(const Batch* batch) noexcept { batch_ = batch; }
+    // Context owning this layer: L0 decode scratch is shared by the layers of
+    // one context only (set before set_kv_cache).
+    void set_l0_scratch_owner(const void* owner) noexcept { l0_scratch_owner_ = owner; }
 
     // Rewind L0 aging and hot rows to a verified root at `position` (VeriCache):
     // rows from history_end(position) on will be rewritten and re-encoded.
@@ -930,8 +935,9 @@ private:
     void attention_middle(const AttentionMiddle& m);
     void run_peer_segment(const std::uint16_t* qg_source,const std::uint16_t* kp_source,
         const std::uint16_t* vp_source,std::uint16_t* attn_destination,int rows,int position,
-        cudaStream_t stream,bool preserve_m1_topology);
+        cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology);
     const Batch* batch_ = nullptr;
+    const void* l0_scratch_owner_ = nullptr;
     bool l0_exact_ = false;          // verifier/decode rows (<= 8)
     bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)
 

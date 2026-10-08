@@ -1,6 +1,7 @@
 #include "exl3/pdl_small.cuh"
 #include "exl3/block_tree_sum.cuh"
 #include "exl3/text_model.h"
+#include "exl3/batched_verify_coordinator.h"
 #include "exl3/fixed_allocation_owners.h"
 #include "exl3/host_kv_transfer_requirements.h"
 #include "exl3/exact_page_extension_plan.h"
@@ -1515,6 +1516,18 @@ struct Exl3TextContext::Impl {
     std::uint64_t native_mtp_hidden_capture_generation = 0;
     std::uint16_t* final_norm = nullptr;
     std::uint16_t* logits = nullptr;
+    // Per-context cross-CTA slices of the split greedy argmax (concurrent
+    // contexts must not share them). Allocated outside any capture.
+    void* greedy_split_storage=nullptr;
+    Exl3GreedySplitScratch greedy_split_scratch() {
+        if(!greedy_split_storage) {
+            cuda_check(cudaMalloc(&greedy_split_storage,Exl3GreedySplitScratch::bytes()),
+                "allocate greedy split scratch");
+            cuda_check(cudaMemset(greedy_split_storage,0,Exl3GreedySplitScratch::bytes()),
+                "clear greedy split scratch");
+        }
+        return Exl3GreedySplitScratch::carve(greedy_split_storage);
+    }
     // Final residual rows of the last completed layer stack (exact_row_scores).
     std::uint16_t* last_stack_output = nullptr;
     // VeriCache verified root: device GDN recurrent/convolution checkpoint and
@@ -5486,6 +5499,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                     static_cast<std::uint64_t>(impl->prefill_capacity)*kHidden*sizeof(std::uint16_t);
             }
             impl->full_layers[layer]->set_reconstructed_exact(reconstructed_exact_view);
+            impl->full_layers[layer]->set_l0_scratch_owner(impl.get());
             impl->full_layers[layer]->set_kv_cache(
                 impl->oscar_only?nullptr:static_cast<std::uint16_t*>(impl->host_kv.enabled?impl->host_layer_k->ptr:impl->cache_k[layer]->ptr),
                 impl->oscar_only?nullptr:static_cast<std::uint16_t*>(impl->host_kv.enabled?impl->host_layer_v->ptr:impl->cache_v[layer]->ptr), max_context_);
@@ -8254,6 +8268,28 @@ bool Exl3TextContext::layer_major_from_zero() {
     return enabled;
 }
 
+void Exl3TextContext::continue_rows_for_verification(
+    std::span<const std::int64_t> token_ids,cudaStream_t stream) {
+    if(batched_verify_)batched_verify_->continue_rows(*this,token_ids,stream);
+    else continue_rows(token_ids,stream);
+}
+
+bool Exl3TextContext::l0_layer_major_headroom() const {
+    // Mirrors the projection-cache admission of the layer-major schedule for
+    // L0 OSCAR contexts (1 GiB reserve plus a 256 MiB minimum cache).
+    static const bool row_major=[] {
+        const char* value=std::getenv("NINFER_EXL3_L0_ROW_MAJOR_PREFILL");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    if(row_major)return false;
+    std::size_t free_bytes=0,total_bytes=0;
+    cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes),"query layer-major headroom");
+    const std::size_t existing=impl_->numeric_prefill_projection_workspace?
+        impl_->numeric_prefill_projection_workspace->stats().cached_weight_capacity_bytes:0;
+    constexpr std::size_t reserve=1024ull*1024*1024,minimum_cache=256ull*1024*1024;
+    return free_bytes>=reserve && existing+free_bytes-reserve>=minimum_cache;
+}
+
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
@@ -8301,7 +8337,11 @@ void Exl3TextContext::append_prefill_layer_major(
                 prefill(ids.first(initial), stream);
                 ids = ids.subspan(initial);
             }
-            if (ids.size() > 1024) {
+            // The layer-major schedule reuses reconstructed projections from a
+            // bounded device cache; when concurrent lanes leave too little
+            // free memory for it the block runs row-major (same arithmetic
+            // profile as the shorter blocks, slower prefill).
+            if (ids.size() > 1024 && l0_layer_major_headroom()) {
                 impl_->l0_layer_major_block = true;
                 try { append_prefill_layer_major(ids, stream, retained); }
                 catch (...) { impl_->l0_layer_major_block = false; throw; }
@@ -8750,9 +8790,11 @@ std::size_t Exl3TextContext::continuation_bytes_required(int capacity) const {
         static_cast<std::size_t>(capacity)*kVocab*sizeof(std::uint16_t));
 }
 void Exl3TextContext::prepare_continuation(int capacity) {
+    (void)impl_->greedy_split_scratch();
     prepare_continuation_impl(capacity,nullptr);
 }
 void Exl3TextContext::prepare_continuation_reserved(Exl3VeriCacheServingCoordinator& authority,int capacity,unsigned startup_fault_for_test) {
+    (void)impl_->greedy_split_scratch();
     prepare_continuation_impl(capacity,&authority,startup_fault_for_test);
 }
 std::size_t Exl3TextContext::continuation_owner_metadata_bytes() noexcept {
@@ -9271,19 +9313,20 @@ struct Exl3TextContext::BatchBinding {
     Impl& owner;
     std::array<Exl3FullAttentionLayer::Batch,kLayers> full{};
     std::array<Exl3GdnLayer::Batch,kLayers> gdn{};
-    BatchBinding(Impl& owner_,Impl& peer,int own_rows,int peer_rows,int peer_position) : owner(owner_) {
+    BatchBinding(Impl& owner_,Impl& peer,int own_rows,int peer_rows,int peer_position,
+                 cudaStream_t peer_stream=nullptr) : owner(owner_) {
         for(int layer=0;layer<kLayers;++layer) {
             if(owner.full_layers[layer]) {
                 require(static_cast<bool>(peer.full_layers[layer]),"batched layer topology");
                 full[layer].own_rows=own_rows;
                 full[layer].peer_count=1;
-                full[layer].peers[0]={peer.full_layers[layer].get(),peer_rows,peer_position};
+                full[layer].peers[0]={peer.full_layers[layer].get(),peer_rows,peer_position,peer_stream};
                 owner.full_layers[layer]->set_batch(&full[layer]);
             } else if(owner.gdn_layers[layer]) {
                 require(static_cast<bool>(peer.gdn_layers[layer]),"batched layer topology");
                 gdn[layer].own_rows=own_rows;
                 gdn[layer].peer_count=1;
-                gdn[layer].peers[0]={peer.gdn_layers[layer].get(),peer_rows};
+                gdn[layer].peers[0]={peer.gdn_layers[layer].get(),peer_rows,peer_stream};
                 owner.gdn_layers[layer]->set_batch(&gdn[layer]);
             }
         }
@@ -9359,7 +9402,9 @@ void Exl3TextContext::prepare_batched_continuation_graph(Exl3TextContext& peer,
 
 void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
     std::span<const std::int64_t> own_tokens,std::span<const std::int64_t> peer_tokens,
-    cudaStream_t stream) {
+    cudaStream_t stream,cudaStream_t peer_stream) {
+    if(!peer_stream)peer_stream=stream;
+    const cudaStream_t state_streams[2]={stream,peer_stream};
     require(&peer!=this && peer.impl_->model==impl_->model,
         "batched continuation needs a distinct context of the same model");
     const int own_rows=static_cast<int>(own_tokens.size());
@@ -9388,7 +9433,7 @@ void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
         require(impl.capture_taps && !impl.graph_active && !impl.graph_capture_active,
             "batched continuation requires eager target execution");
         arm_retained_prefix[c]=impl.transaction && impl.transaction->active &&
-            impl.transaction->fresh_snapshot && impl.transaction->stream==stream;
+            impl.transaction->fresh_snapshot && impl.transaction->stream==state_streams[c];
     }
     cudaStreamCaptureStatus capture_status=cudaStreamCaptureStatusNone;
     cuda_check(cudaStreamIsCapturing(stream,&capture_status),
@@ -9438,14 +9483,15 @@ void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
             const int count=static_cast<int>(tokens[c].size());
             for(int layer=0;layer<kLayers;++layer) {
                 if(impl.full_layers[layer])
-                    impl.full_layers[layer]->arm_captured_retained_prefix(count,base_positions[c],stream);
+                    impl.full_layers[layer]->arm_captured_retained_prefix(
+                        count,base_positions[c],state_streams[c]);
                 else if(impl.gdn_layers[layer])
                     impl.gdn_layers[layer]->arm_captured_retained_prefix(
-                        impl.transaction->gdn_checkpoints[layer],count,stream);
+                        impl.transaction->gdn_checkpoints[layer],count,state_streams[c]);
             }
         }
     } else {
-        BatchBinding binding(*impl_,*peer.impl_,own_rows,peer_rows,base_positions[1]);
+        BatchBinding binding(*impl_,*peer.impl_,own_rows,peer_rows,base_positions[1],peer_stream);
         impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
             false,false,nullptr,0,kLayers,nullptr,nullptr,true);
     }
@@ -10195,7 +10241,7 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
     result.serial=++impl_->greedy_serial;
     auto* output=static_cast<Exl3GreedyRow*>(impl_->greedy_rows->ptr);
     try {
-        exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,result.serial,output);
+        exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,result.serial,output,impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"greedy packet reduction");
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         // Context-owned destination survives exceptions/partial transfers. No
@@ -10254,7 +10300,7 @@ Exl3PendingGreedyPacket Exl3TextContext::submit_greedy_packet(
             defer_host_readback?transfer->consumer_event:transfer->event));
     try {
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,
-            pending.serial_,static_cast<Exl3GreedyRow*>(transfer->device->ptr));
+            pending.serial_,static_cast<Exl3GreedyRow*>(transfer->device->ptr),impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"pending greedy packet reduction");
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         cuda_check(cudaEventRecord(transfer->device_event,stream),
@@ -10455,7 +10501,7 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet_from_scores_for_test(
     try {
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,
             static_cast<const std::uint16_t*>(represented.ptr),vocabulary,stride,
-            result.serial,output);
+            result.serial,output,impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"greedy packet fixture reduction");
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         cuda_check(cudaMemcpyAsync(impl_->greedy_host_rows.data(),output,

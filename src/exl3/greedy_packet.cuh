@@ -138,13 +138,31 @@ static __global__ void __launch_bounds__(1024) exl3_greedy_packet_wide_kernel(
 // slices in order. Comparisons only, so the packet is identical.
 constexpr int kGreedySplitParts=64;
 constexpr int kGreedySplitMaxRows=16;
-static __device__ float exl3_greedy_split_best[kGreedySplitMaxRows][kGreedySplitParts];
-static __device__ int exl3_greedy_split_index[kGreedySplitMaxRows][kGreedySplitParts];
-static __device__ unsigned exl3_greedy_split_bad[kGreedySplitMaxRows][kGreedySplitParts];
-static __device__ unsigned exl3_greedy_split_arrivals[kGreedySplitMaxRows];
+// Cross-CTA slices of one caller (a context): concurrent contexts reduce on
+// their own scratch. arrivals must start zeroed; the last CTA resets it.
+struct Exl3GreedySplitScratch {
+    float* best=nullptr;        // [kGreedySplitMaxRows][kGreedySplitParts]
+    int* index=nullptr;         // [kGreedySplitMaxRows][kGreedySplitParts]
+    unsigned* bad=nullptr;      // [kGreedySplitMaxRows][kGreedySplitParts]
+    unsigned* arrivals=nullptr; // [kGreedySplitMaxRows]
+    static constexpr std::size_t bytes() {
+        return static_cast<std::size_t>(kGreedySplitMaxRows)*kGreedySplitParts*
+            (sizeof(float)+sizeof(int)+sizeof(unsigned))+kGreedySplitMaxRows*sizeof(unsigned);
+    }
+    static Exl3GreedySplitScratch carve(void* base) {
+        Exl3GreedySplitScratch s;
+        auto* bytes_base=static_cast<char*>(base);
+        constexpr std::size_t plane=static_cast<std::size_t>(kGreedySplitMaxRows)*kGreedySplitParts;
+        s.best=reinterpret_cast<float*>(bytes_base);
+        s.index=reinterpret_cast<int*>(bytes_base+plane*sizeof(float));
+        s.bad=reinterpret_cast<unsigned*>(bytes_base+plane*(sizeof(float)+sizeof(int)));
+        s.arrivals=reinterpret_cast<unsigned*>(bytes_base+plane*(sizeof(float)+sizeof(int)+sizeof(unsigned)));
+        return s;
+    }
+};
 static __global__ void __launch_bounds__(256) exl3_greedy_packet_split_kernel(
     const std::uint16_t* scores,int vocabulary,int stride,std::uint64_t serial,
-    Exl3GreedyRow* output) {
+    Exl3GreedyRow* output,Exl3GreedySplitScratch scratch) {
     __shared__ float maxima[8];
     __shared__ int indices[8];
     __shared__ unsigned invalid[8];
@@ -194,11 +212,12 @@ static __global__ void __launch_bounds__(256) exl3_greedy_packet_split_kernel(
             if(other>best || (other==best && oi<index)) {best=other;index=oi;}
         }
         if(t==0) {
-            exl3_greedy_split_best[row_index][part]=best;
-            exl3_greedy_split_index[row_index][part]=index;
-            exl3_greedy_split_bad[row_index][part]=bad;
+            const int slot=row_index*kGreedySplitParts+part;
+            scratch.best[slot]=best;
+            scratch.index[slot]=index;
+            scratch.bad[slot]=bad;
             __threadfence();
-            last=atomicAdd(&exl3_greedy_split_arrivals[row_index],1u)==kGreedySplitParts-1;
+            last=atomicAdd(&scratch.arrivals[row_index],1u)==kGreedySplitParts-1;
         }
     }
     __syncthreads();
@@ -206,9 +225,10 @@ static __global__ void __launch_bounds__(256) exl3_greedy_packet_split_kernel(
     __threadfence();
     best=-CUDART_INF_F;index=vocabulary;bad=0;
     for(int p=t;p<kGreedySplitParts;p+=32) {
-        const float other=__ldcg(&exl3_greedy_split_best[row_index][p]);
-        const int oi=__ldcg(&exl3_greedy_split_index[row_index][p]);
-        bad|=__ldcg(&exl3_greedy_split_bad[row_index][p]);
+        const int slot=row_index*kGreedySplitParts+p;
+        const float other=__ldcg(&scratch.best[slot]);
+        const int oi=__ldcg(&scratch.index[slot]);
+        bad|=__ldcg(&scratch.bad[slot]);
         if(other>best || (other==best && oi<index)) {best=other;index=oi;}
     }
     for(int offset=16;offset;offset>>=1) {
@@ -218,7 +238,7 @@ static __global__ void __launch_bounds__(256) exl3_greedy_packet_split_kernel(
         if(other>best || (other==best && oi<index)) {best=other;index=oi;}
     }
     if(t==0) {
-        exl3_greedy_split_arrivals[row_index]=0u;
+        scratch.arrivals[row_index]=0u;
         output[row_index].serial=serial;
         output[row_index].token=index;
         output[row_index].nonfinite=bad;
@@ -235,15 +255,15 @@ inline bool exl3_greedy_wide_enabled() {
 
 inline void exl3_launch_greedy_packet(bool warp,int rows,cudaStream_t stream,
     const std::uint16_t* scores,int vocabulary,int stride,std::uint64_t serial,
-    Exl3GreedyRow* output) {
+    Exl3GreedyRow* output,const Exl3GreedySplitScratch& scratch) {
     static const bool split=[] {
         const char* value=std::getenv("NINFER_EXL3_GREEDY_SPLIT");
         return !value || (value[0]!='0');
     }();
-    if(split && rows<=kGreedySplitMaxRows && stride%8==0 &&
+    if(split && scratch.arrivals && rows<=kGreedySplitMaxRows && stride%8==0 &&
        reinterpret_cast<std::uintptr_t>(scores)%16==0)
         exl3_launch_small(exl3_greedy_packet_split_kernel,dim3(kGreedySplitParts,rows),dim3(256),0,
-            stream,scores,vocabulary,stride,serial,output);
+            stream,scores,vocabulary,stride,serial,output,scratch);
     else if(exl3_greedy_wide_enabled() && stride%8==0 &&
        reinterpret_cast<std::uintptr_t>(scores)%16==0)
         exl3_greedy_packet_wide_kernel<<<rows,1024,0,stream>>>(scores,vocabulary,stride,serial,output);

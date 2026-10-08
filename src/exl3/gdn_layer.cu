@@ -3452,7 +3452,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             peer.layer->run_peer_segment(PeerSegmentSource{
                 h+row*kHidden,qkv+row*kQkv,conv_input+row*kQkv,z+row*kZ,
                 a+row*kHeads,b+row*kHeads,g_trace+row*kHeads,beta_trace+row*kHeads,
-                o_input+row*kZ,peer.rows,false},stream,preserve_m1_topology);
+                o_input+row*kZ,peer.rows,false},stream,peer.stream?peer.stream:stream,
+                preserve_m1_topology);
             first+=peer.rows;
         }
         if(first!=rows)throw std::logic_error("GDN batched segment rows");
@@ -3674,7 +3675,10 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
 }
 
 Exl3GdnLayer::SegmentState Exl3GdnLayer::begin_segment(
-    int rows,cudaStream_t stream,bool preserve_m1_topology) {
+    int rows,cudaStream_t stream,bool preserve_m1_topology,cudaStream_t state_stream) {
+    // A batched peer launches on the owner's stream but its transaction
+    // (checkpoint, retained prefix) belongs to its own stream.
+    const cudaStream_t owner_stream=state_stream?state_stream:stream;
     invalidate_continuation_history();
     SegmentState segment;
     segment.base_generation = current_checkpoint_generation_;
@@ -3684,7 +3688,7 @@ Exl3GdnLayer::SegmentState Exl3GdnLayer::begin_segment(
     segment.eligible = preserve_m1_topology &&
         Exl3GdnScratchReuseContract::retained_rows_supported(
             static_cast<std::size_t>(rows)) && segment.base_generation != 0 &&
-        stream == base_checkpoint_stream;
+        owner_stream == base_checkpoint_stream;
     if (segment.eligible) {
         cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
         check(cudaStreamIsCapturing(stream, &capture_status),
@@ -3726,10 +3730,10 @@ void Exl3GdnLayer::end_segment(const SegmentState& segment,int rows,
 // in this layer for its rollback repair), and the gated-norm output returns to
 // the owner's O-projection input.
 void Exl3GdnLayer::run_peer_segment(const PeerSegmentSource& source,cudaStream_t stream,
-    bool preserve_m1_topology) {
+    cudaStream_t state_stream,bool preserve_m1_topology) {
     const int rows=source.rows;
     if(rows<1 || rows>max_rows_)throw std::invalid_argument("GDN peer segment rows");
-    const SegmentState segment=begin_segment(rows,stream,preserve_m1_topology);
+    const SegmentState segment=begin_segment(rows,stream,preserve_m1_topology,state_stream);
     if(segment.storage==Exl3GdnHistoryStorage::shared_wide)
         throw std::invalid_argument("GDN peer segment requires private history storage");
     const auto copy=[&](void* destination,const void* from,std::size_t bytes,const char* what) {
@@ -3752,7 +3756,7 @@ void Exl3GdnLayer::run_peer_segment(const PeerSegmentSource& source,cudaStream_t
         float_buffers_[5],float_buffers_[4],rows,stream,false,preserve_m1_topology,
         source.merged_qkvz_side,segment.eligible,segment.base_recurrent,false,no_events,no_events});
     copy(source.o_input,half_buffers_[12],n*kZ*sizeof(std::uint16_t),"GDN peer gated norm output");
-    end_segment(segment,rows,stream,preserve_m1_topology);
+    end_segment(segment,rows,state_stream,preserve_m1_topology);
 }
 
 void Exl3GdnLayer::forward_pair_staged_serial_for_test(
