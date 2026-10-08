@@ -762,6 +762,12 @@ struct Exl3TextModel::Impl {
     const std::uint16_t* embedding = nullptr;
     const std::uint16_t* final_norm = nullptr;
     std::size_t model_bytes = 0;
+    // Prompt-scale FP16 reconstruct + GEMM workspace shared by the contexts of
+    // concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): only
+    // prompt ingestion and VeriCache verifier passes use it, and the Engine
+    // runs those one lane at a time.
+    mutable std::mutex shared_numeric_mutex;
+    mutable std::shared_ptr<Exl3CudaReconstructGemmWorkspace> shared_numeric_workspace;
 
     TensorPayload load_tensor(const IndexedSafetensors& input, const std::string& name) {
         const auto start = std::chrono::steady_clock::now();
@@ -1398,8 +1404,10 @@ struct Exl3TextContext::Impl {
     Exl3CudaLinearWorkspace::Owner prefill_qkv_v_workspace;
     std::size_t prefill_qkv_private_workspace_bytes = 0;
     int prefill_qkv_layer_count = 0;
-    std::unique_ptr<Exl3CudaReconstructGemmWorkspace>
+    std::shared_ptr<Exl3CudaReconstructGemmWorkspace>
         numeric_prefill_projection_workspace;
+    // Borrowed from the model's shared prompt workspace (counted by its owner).
+    bool numeric_prefill_workspace_borrowed = false;
     bool fast_same_weights_fp16kv_prefill_enabled = false;
     Exl3TextContext::FastSameWeightsFp16KvPrefillStats
         fast_same_weights_fp16kv_prefill_stats;
@@ -5251,12 +5259,26 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         ? 17408 : (numeric_prefill_k7_enabled ? kHidden : 17408);
     const bool numeric_workspace_transpose =
         fast_same_weights_all_model_shapes || !numeric_prefill_k7_enabled;
-    const auto numeric_requirement=numeric_prefill_workspace_enabled?
+    static const bool share_prompt_workspace=[] {
+        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    std::shared_ptr<Exl3CudaReconstructGemmWorkspace> shared_numeric;
+    if(share_prompt_workspace && numeric_prefill_workspace_enabled) {
+        std::lock_guard lock(impl->model->shared_numeric_mutex);
+        shared_numeric=impl->model->shared_numeric_workspace;
+    }
+    const auto numeric_requirement=numeric_prefill_workspace_enabled && !shared_numeric?
         Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
             numeric_workspace_in,numeric_workspace_out,
             impl->gdn_bulk_capacity ? impl->gdn_bulk_capacity : impl->prefill_capacity,
             numeric_workspace_transpose):0;
     const auto materialize_numeric=[&] {
+      if(shared_numeric) {
+        impl->numeric_prefill_projection_workspace=shared_numeric;
+        impl->numeric_prefill_workspace_borrowed=true;
+        return;
+      }
       if(numeric_requirement) {
         const auto expected_numeric_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
             impl->persistent_bytes,numeric_requirement);
@@ -5268,6 +5290,11 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 fast_same_weights_all_model_shapes);
         require(impl->numeric_prefill_projection_workspace->workspace_bytes()==numeric_requirement,
             "target numeric projection requirement mismatch");
+        if(share_prompt_workspace) {
+            std::lock_guard lock(impl->model->shared_numeric_mutex);
+            if(!impl->model->shared_numeric_workspace)
+                impl->model->shared_numeric_workspace=impl->numeric_prefill_projection_workspace;
+        }
         impl->persistent_bytes=expected_numeric_persistent;
       }
     };
@@ -6962,7 +6989,7 @@ std::uint64_t Exl3TextContext::Impl::allocation_owner_metadata_bytes() const {
         requirement.add(Domain::host_metadata,1,Exl3CudaLinearWorkspace::metadata_bytes());
     if(impl_->prefill_qkv_v_workspace)
         requirement.add(Domain::host_metadata,1,Exl3CudaLinearWorkspace::metadata_bytes());
-    if(impl_->numeric_prefill_projection_workspace)
+    if(impl_->numeric_prefill_projection_workspace && !impl_->numeric_prefill_workspace_borrowed)
         requirement.add(Domain::host_metadata,1,sizeof(Exl3CudaReconstructGemmWorkspace));
     for(const auto& staging:impl_->host_kv_pinned_staging)if(staging)
         requirement.add(Domain::host_metadata,1,sizeof(PinnedHostBuffer));

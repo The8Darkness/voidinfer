@@ -481,6 +481,10 @@ struct Exl3EngineCore::Impl {
                 _putenv_s("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS","4096");
             if(!std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
                 _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","256");
+            // Prompt-scale passes are exclusive across lanes: one reconstruct
+            // workspace serves every lane.
+            if(!std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
+                _putenv_s("NINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
         }
         const auto flag=[](const char* name) {
             const auto* value=std::getenv(name);
