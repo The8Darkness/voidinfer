@@ -328,7 +328,7 @@ private:
 // leave the mutex for numerical work.
 class Exl3ReadyWorkSnapshotAuthority {
 public:
-    static constexpr std::size_t maximum_lanes=2;
+    static constexpr std::size_t maximum_lanes=8;
     struct Ticket {
         Ticket(const Ticket&)=delete;
         Ticket& operator=(const Ticket&)=delete;

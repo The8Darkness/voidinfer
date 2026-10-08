@@ -8,7 +8,7 @@ struct Exl3EngineTapRequirements {
     static constexpr unsigned layers=5,rows=16,columns=5120;
     static constexpr std::uint64_t plane_bytes=std::uint64_t(rows)*columns*sizeof(std::uint16_t);
     static Exl3ResourceInventory::Requirement for_lanes(unsigned lanes,std::uint64_t owner_metadata_bytes=0) {
-        if(lanes!=1 && lanes!=2)
+        if(lanes<1 || lanes>8)
             throw std::invalid_argument("Engine tap requirement supports physical C1/C2");
         Exl3ResourceInventory::Requirement result;
         result.configuration=lanes;

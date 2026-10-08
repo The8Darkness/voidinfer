@@ -67,12 +67,14 @@ struct DraftTapStaging {
     std::array<std::uint16_t*,Exl3EngineTapRequirements::layers> pointers{};
     ~DraftTapStaging(){for(auto p:pointers)if(p)cudaFree(p);}
 };
+// Physical Engine lanes (coherent-device C1..C8; the ordinary route C1/C2).
+constexpr std::size_t kMaxLanes=8;
 struct ExecutionStream {
-    inline static std::array<std::atomic<cudaStream_t>,2> unresolved{};
-    inline static std::array<std::atomic<bool>,2> occupied{};
+    inline static std::array<std::atomic<cudaStream_t>,kMaxLanes> unresolved{};
+    inline static std::array<std::atomic<bool>,kMaxLanes> occupied{};
     inline static std::atomic<int> first_destroy_error{0};
     cudaStream_t value=nullptr;
-    unsigned retirement_slot=2;
+    unsigned retirement_slot=kMaxLanes;
     int destroy_fault_for_test=0;
     static std::size_t occupied_count() noexcept {
         std::size_t count=0;for(const auto& slot:occupied)if(slot.load())++count;return count;
@@ -97,15 +99,15 @@ struct ExecutionStream {
     cudaError_t retire_idle() noexcept {
         if(!value){
             if(retirement_slot<occupied.size())occupied[retirement_slot].store(false);
-            retirement_slot=2;return cudaSuccess;
+            retirement_slot=kMaxLanes;return cudaSuccess;
         }
         const auto error=destroy_fault_for_test?static_cast<cudaError_t>(destroy_fault_for_test):cudaStreamDestroy(value);
-        if(error==cudaSuccess){occupied[retirement_slot].store(false);retirement_slot=2;value=nullptr;return error;}
+        if(error==cudaSuccess){occupied[retirement_slot].store(false);retirement_slot=kMaxLanes;value=nullptr;return error;}
         int expected=0;first_destroy_error.compare_exchange_strong(expected,static_cast<int>(error));
         // This slot was reserved before CUDA stream creation and is never reused
         // after failure. Teardown cannot exhaust capacity or allocate storage.
         unresolved[retirement_slot].store(value);
-        retirement_slot=2;value=nullptr;return error;
+        retirement_slot=kMaxLanes;value=nullptr;return error;
     }
     ~ExecutionStream(){retire_idle();}
 };
@@ -183,7 +185,7 @@ void require_exact_profile(){
             "host-kv-fp16","fp16");
 }
 void require_coherent_device_profile(const EngineOptions& options) {
-    if((options.max_concurrency!=1 && options.max_concurrency!=2) || options.enable_vision || options.use_cuda_graph ||
+    if(options.max_concurrency<1 || options.max_concurrency>kMaxLanes || options.enable_vision || options.use_cuda_graph ||
        options.max_context<2048 || options.max_context>(Exl3NativeContextExtent::l0_oscar_enabled()?
            static_cast<int>(Exl3NativeContextExtent::l0_oscar_tokens):32768))
         throw std::invalid_argument(
@@ -335,10 +337,10 @@ struct Exl3EngineCore::Impl {
     std::shared_ptr<Exl3TextModel> target;
     std::shared_ptr<Exl3VisionModel> vision_model;
     std::shared_ptr<Exl3VisionContext> vision;
-    std::array<std::shared_ptr<ExecutionStream>,2> streams;
-    std::array<std::shared_ptr<Exl3Dflash2DraftModel>,2> drafts;
-    std::array<std::shared_ptr<Exl3Dflash2Execution>,2> lanes;
-    std::array<std::shared_ptr<DraftTapStaging>,2> staging_owners;
+    std::array<std::shared_ptr<ExecutionStream>,kMaxLanes> streams;
+    std::array<std::shared_ptr<Exl3Dflash2DraftModel>,kMaxLanes> drafts;
+    std::array<std::shared_ptr<Exl3Dflash2Execution>,kMaxLanes> lanes;
+    std::array<std::shared_ptr<DraftTapStaging>,kMaxLanes> staging_owners;
     std::shared_ptr<Exl3EngineTargetQ> shared_q;
     std::shared_ptr<Exl3EngineGreedyPacketBatch> greedy_packet_batch;
     std::shared_ptr<Exl3KVRegistrationCache> kv_registrations;
@@ -391,18 +393,18 @@ struct Exl3EngineCore::Impl {
     std::mutex admission_mutex;
     std::condition_variable changed;
     ReservedRequestQueue<Request> queue;
-    std::array<std::shared_ptr<Request>,2> active;
+    std::array<std::shared_ptr<Request>,kMaxLanes> active;
     Exl3ReadyWorkSnapshotAuthority ready_work_authority;
     struct LaneFrontier {
         std::weak_ptr<const Exl3VeriCacheRequest> root;
         std::uint64_t request_generation=0;
         Exl3ReadyLocalityCost locality;
     };
-    std::array<LaneFrontier,2> lane_frontiers;
+    std::array<LaneFrontier,kMaxLanes> lane_frontiers;
     // True from the first request-local prefill operation through the last
     // numerical/transfer cleanup in execute().  It is an overlap witness only;
     // it never grants another request access to this lane's state.
-    std::array<std::atomic<bool>,2> numerical_active{};
+    std::array<std::atomic<bool>,kMaxLanes> numerical_active{};
     std::uint64_t next_host_preparation_generation=1;
     bool stopping=false,failed=false;
     unsigned result_allocation_fault=0;
@@ -425,10 +427,12 @@ struct Exl3EngineCore::Impl {
     std::size_t outstanding=0;
     RuntimeStats stats;
     MemorySummary memory;
-    std::array<std::thread,2> workers;
-    // Batched multi-agent rounds of the two coherent-device lanes
-    // (NINFER_EXL3_BATCHED_ROUNDS, default on for C2).
-    std::unique_ptr<Exl3BatchedVerifyCoordinator> batched_verify;
+    std::array<std::thread,kMaxLanes> workers;
+    // Batched multi-agent rounds of the coherent-device lanes
+    // (NINFER_EXL3_BATCHED_ROUNDS, default on for C2+): one coordinator per
+    // group of up to four lanes (the widest batched forward).
+    std::vector<std::unique_ptr<Exl3BatchedVerifyCoordinator>> batched_verify;
+    std::array<Exl3BatchedVerifyCoordinator*,kMaxLanes> lane_batched_verify{};
     // Concurrent coherent-device lanes: prompt ingestion runs alone on the
     // device (exclusive; process-wide prefill scratch, and DFlash2 rounds are
     // not qualified to overlap another lane's ingestion), decode rounds of all
@@ -473,8 +477,8 @@ struct Exl3EngineCore::Impl {
         coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
         if(coherent_device)require_coherent_device_profile(value);
         else require_exact_profile();
-        if(coherent_device && value.max_concurrency==2) {
-            // Two resident lanes: halve the per-context L0 prompt-block row
+        if(coherent_device && value.max_concurrency>=2) {
+            // Several resident lanes: halve the per-context L0 prompt-block row
             // buffers and let exclusive prompt ingestion use a smaller
             // layer-major reserve, so both lanes keep the fast prefill.
             if(!std::getenv("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS"))
@@ -696,7 +700,7 @@ struct Exl3EngineCore::Impl {
         const auto host_metadata_limit=exl3_host_metadata_limit(std::getenv("NINFER_EXL3_ENGINE_HOST_METADATA_LIMIT_BYTES"));
         if(!share_pages && prefix_rows&&std::string(prefix_rows)=="16384"&&value.max_concurrency!=1)
             throw std::invalid_argument("EXL3 Engine device prefix rows16384 require physicalC1");
-        if((value.max_concurrency!=1 && value.max_concurrency!=2) || value.enable_vision || value.use_cuda_graph || value.hierarchical_vericache.enabled ||
+        if((value.max_concurrency!=1 && value.max_concurrency!=2 && !(coherent_device && value.max_concurrency<=kMaxLanes)) || value.enable_vision || value.use_cuda_graph || value.hierarchical_vericache.enabled ||
             !value.max_pending_requests || !value.pending_timeout_ms || value.max_context<16 ||
             value.speculative.backend!=SpeculativeBackend::DFlash2 || value.speculative.draft_tokens!=7)
             throw std::invalid_argument("EXL3 text requires C1 or explicit C2/eager/DFlash2-K7 and disabled Vision");
@@ -974,7 +978,7 @@ struct Exl3EngineCore::Impl {
             stats.draft_linear_owner_metadata_bytes+=7*Exl3CudaLinearWorkspace::metadata_bytes();
             stats.draft_generic_owner_metadata_bytes+=drafts[0]->generic_owner_metadata_bytes();
         }
-        if(value.max_concurrency==2) {
+        for(std::uint32_t lane=1;lane<value.max_concurrency;++lane) {
             Exl3ResourceInventory::Requirement required;required.configuration=0x44524654434C;
             required.add(Domain::device,1,drafts[0]->execution_bytes_required());
             required.add(Domain::host_metadata,1,drafts[0]->execution_owner_metadata_bytes());
@@ -983,21 +987,21 @@ struct Exl3EngineCore::Impl {
                 if(draft_clone_fault==5 || draft_clone_fault==6)throw std::logic_error("draft clone cap refusal reached allocator");
                 if(draft_clone_fault==1)throw std::runtime_error("injected Engine draft clone preconstruction failure");
                 if(draft_clone_fault==7)Exl3CudaLinearWorkspace::fail_constructor_cleanup_for_test(true);
-                drafts[1]->materialize_private_execution(&coordinator);
+                drafts[lane]->materialize_private_execution(&coordinator);
                 if(draft_clone_fault==2)throw std::runtime_error("injected Engine draft clone precommit failure");
-                if(draft_clone_fault==8 && !drafts[1]->fail_generic_retirement_for_test())throw std::logic_error("draft generic failure owner missing");
-                auto actual=drafts[1]->execution_resources(drafts[1],draft_clone_fault==3 || draft_clone_fault==8,draft_clone_fault==4);
+                if(draft_clone_fault==8 && !drafts[lane]->fail_generic_retirement_for_test())throw std::logic_error("draft generic failure owner missing");
+                auto actual=drafts[lane]->execution_resources(drafts[lane],draft_clone_fault==3 || draft_clone_fault==8,draft_clone_fault==4);
                 return actual;
-            },[&]() noexcept {drafts[1].reset();},[&]() noexcept {
+            },[&]() noexcept {drafts[lane].reset();},[&]() noexcept {
                 if(Exl3Dflash2DraftModel::generic_quarantined_allocations() || Exl3CudaLinearWorkspace::quarantined_workspaces())
                     coordinator.seal_failed_startup_retirement();
             });
-            drafts[1]->finish_constructor_credits();
-            scratch+=drafts[1]->execution_bytes();
+            drafts[lane]->finish_constructor_credits();
+            scratch+=drafts[lane]->execution_bytes();
             memory.workspace={scratch,scratch,scratch};memory.runtime_reservation_bytes=scratch;
-            stats.draft_execution_owner_metadata_bytes+=drafts[1]->execution_owner_metadata_bytes();
+            stats.draft_execution_owner_metadata_bytes+=drafts[lane]->execution_owner_metadata_bytes();
             stats.draft_linear_owner_metadata_bytes+=7*Exl3CudaLinearWorkspace::metadata_bytes();
-            stats.draft_generic_owner_metadata_bytes+=drafts[1]->generic_owner_metadata_bytes();
+            stats.draft_generic_owner_metadata_bytes+=drafts[lane]->generic_owner_metadata_bytes();
         }
         {
             for(std::uint32_t i=0;i<value.max_concurrency;++i) {
@@ -1012,8 +1016,8 @@ struct Exl3EngineCore::Impl {
                         throw std::logic_error("Engine stream startup reservation identity");
                     if(context_startup_fault==31)throw std::logic_error("stream credit refusal reached allocator");
                     if(stream_fault==1)throw std::runtime_error("injected Engine stream preconstruction failure");
-                    stream_owner=make_bounded_shared<ExecutionStream>(value.max_concurrency==2);
-                    if(value.max_concurrency==2)
+                    stream_owner=make_bounded_shared<ExecutionStream>(value.max_concurrency>=2);
+                    if(value.max_concurrency>=2)
                         check(cudaStreamCreateWithFlags(&stream_owner->value,cudaStreamNonBlocking));
                     if(value.max_concurrency==2 && context_startup_fault==79+i) {
                         stream_owner->destroy_fault_for_test=static_cast<int>(cudaErrorUnknown);
@@ -1098,7 +1102,7 @@ struct Exl3EngineCore::Impl {
             memory.workspace={scratch,scratch,scratch};memory.runtime_reservation_bytes=scratch;
         }
         {
-            std::array<Exl3TextContext*,2> contexts{};
+            std::array<Exl3TextContext*,kMaxLanes> contexts{};
             for(std::uint32_t i=0;i<value.max_concurrency;++i)contexts[i]=&lanes[i]->context();
             Exl3TextContext::reserve_reconstruction_lanes(coordinator,
                 std::span(contexts.data(),value.max_concurrency),reconstruction_fallback);
@@ -1285,14 +1289,14 @@ struct Exl3EngineCore::Impl {
             }
         }
         const auto taps=Exl3EngineTapRequirements::for_lanes(value.max_concurrency,sizeof(DraftTapStaging));
-        std::array<std::shared_ptr<DraftTapStaging>,2> prepared_staging;
+        std::array<std::shared_ptr<DraftTapStaging>,kMaxLanes> prepared_staging;
         coordinator.allocate_startup_resources(taps,[&](std::uint64_t configuration) {
             if(configuration!=value.max_concurrency)
                 throw std::logic_error("Engine tap allocation configuration changed");
             Exl3ResourceInventory actual;
             // Keep partial allocations private until the complete C1/C2 batch
             // has been acquired. This factory enqueues no consumers.
-            std::array<std::shared_ptr<DraftTapStaging>,2> pending;
+            std::array<std::shared_ptr<DraftTapStaging>,kMaxLanes> pending;
             unsigned allocated_planes=0;
             for(std::uint32_t i=0;i<value.max_concurrency;++i) {
                 pending[i]=std::make_shared<DraftTapStaging>();
@@ -1633,20 +1637,49 @@ struct Exl3EngineCore::Impl {
             stats.driver_unknown_device_bytes=attribution.driver_unknown_bytes;
             stats.driver_unknown_device_bytes_available=true;
         }
-        if(coherent_device && value.max_concurrency==2) {
+        if(coherent_device && value.max_concurrency>=2) {
             const char* batched=std::getenv("NINFER_EXL3_BATCHED_ROUNDS");
             if(!batched || std::string_view(batched)!="0") {
                 const char* wait=std::getenv("NINFER_EXL3_BATCHED_ROUND_WAIT_US");
-                batched_verify=std::make_unique<Exl3BatchedVerifyCoordinator>(
-                    std::chrono::microseconds(wait?std::atoi(wait):5000));
-                auto first=lanes[0]->context_owner_for_device_round();
-                auto second=lanes[1]->context_owner_for_device_round();
-                // Each lane may lead a batched forward: one graph per direction.
-                first->prepare_batched_continuation_graph(*second,8,8);
-                second->prepare_batched_continuation_graph(*first,8,8);
-                first->set_batched_verify(batched_verify.get());
-                second->set_batched_verify(batched_verify.get());
+                // Lanes [4g, 4g+4) share coordinator g; the earliest lane of a
+                // group leads its forward, one captured graph per group.
+                constexpr std::uint32_t group_lanes=Exl3BatchedVerifyCoordinator::kMaxGroup;
+                for(std::uint32_t first=0;first<value.max_concurrency;first+=group_lanes) {
+                    const auto end=std::min<std::uint32_t>(first+group_lanes,value.max_concurrency);
+                    if(end-first<2)break;
+                    auto group=std::make_unique<Exl3BatchedVerifyCoordinator>(
+                        std::chrono::microseconds(wait?std::atoi(wait):5000));
+                    for(std::uint32_t i=first;i<end;++i) {
+                        group->register_context(*lanes[i]->context_owner_for_device_round());
+                        lane_batched_verify[i]=group.get();
+                    }
+                    const char* graphs=std::getenv("NINFER_EXL3_BATCHED_GRAPHS");
+                    if(!graphs || std::string_view(graphs)!="0")
+                    for(const auto& members:group->groups()) {
+                        std::vector<Exl3TextContext*> peers(members.begin()+1,members.end());
+                        const std::vector<int> rows(peers.size(),8);
+                        members[0]->prepare_batched_continuation_graph(peers,8,rows);
+                    }
+                    for(std::uint32_t i=first;i<end;++i)
+                        lanes[i]->context_owner_for_device_round()->set_batched_verify(group.get());
+                    batched_verify.push_back(std::move(group));
+                }
             }
+        }
+        if(std::getenv("NINFER_EXL3_MEMORY_TRACE")) {
+            const auto mib=[](std::uint64_t bytes){return bytes/1048576.0;};
+            std::fprintf(stderr,"ENGINE_MEMORY lanes=%u context=%.1f continuation=%.1f repair=%.1f lane=%.1f reconstruction=%.1f taps=%.1f attention_stage=%.1f draft_scratch_total=%.1f MiB\n",
+                value.max_concurrency,mib(stats.reserved_context_startup_device_bytes),
+                mib(stats.reserved_continuation_startup_device_bytes),
+                mib(stats.reserved_repair_checkpoint_startup_device_bytes),
+                mib(stats.reserved_lane_startup_device_bytes),mib(stats.reconstruction_device_bytes),
+                mib(stats.reserved_engine_tap_device_bytes),mib(stats.attention_stage_device_bytes),
+                mib(memory.runtime_reservation_bytes));
+            std::size_t free_bytes=0,total_bytes=0;cudaMemGetInfo(&free_bytes,&total_bytes);
+            std::fprintf(stderr,"ENGINE_MEMORY target_weights=%.1f draft_weights=%.1f draft_execution=%.1f x%u free=%.1f MiB"
+                ,mib(target->model_bytes()),mib(drafts[0]->weight_bytes()),mib(drafts[0]->execution_bytes()),
+                value.max_concurrency,mib(free_bytes));
+            std::fputc(10,stderr);
         }
         try{for(std::uint32_t i=0;i<value.max_concurrency;++i)workers[i]=std::thread([this,i]{loop(i);});}
         catch(...){
@@ -1770,7 +1803,7 @@ struct Exl3EngineCore::Impl {
     };
     std::optional<PreferredLane> preferred_lane_locked(const Request& request) {
         if(!request_affinity || options.max_concurrency<2)return std::nullopt;
-        std::array<Exl3ReadyLaneLocality,2> candidates{};
+        std::array<Exl3ReadyLaneLocality,kMaxLanes> candidates{};
         const auto input=request.ready_work.input_tokens();
         for(std::size_t index=0;index<options.max_concurrency;++index) {
             auto& candidate=candidates[index];candidate.lane=index;
@@ -2117,11 +2150,17 @@ struct Exl3EngineCore::Impl {
                 ~BatchedLane() {
                     if(!coordinator)return;
                     coordinator->set_active(false);
-                    if(std::getenv("NINFER_EXL3_BATCHED_STATS"))std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu eager=%llu solo=%llu timeouts=%llu wait_ms=%.1f\n",
-                        static_cast<unsigned long long>(coordinator->batched_rounds()),static_cast<unsigned long long>(coordinator->eager_rounds()),static_cast<unsigned long long>(coordinator->solo_rounds()),
-                        static_cast<unsigned long long>(coordinator->timeouts()),coordinator->wait_us()/1000.0);
+                    if(std::getenv("NINFER_EXL3_BATCHED_STATS")) {
+                        const auto widths=coordinator->width_histogram();
+                        std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu (w2=%llu w3=%llu w4=%llu) eager=%llu solo=%llu timeouts=%llu wait_ms=%.1f\n",
+                            static_cast<unsigned long long>(coordinator->batched_rounds()),
+                            static_cast<unsigned long long>(widths[2]),static_cast<unsigned long long>(widths[3]),
+                            static_cast<unsigned long long>(widths[4]),
+                            static_cast<unsigned long long>(coordinator->eager_rounds()),static_cast<unsigned long long>(coordinator->solo_rounds()),
+                            static_cast<unsigned long long>(coordinator->timeouts()),coordinator->wait_us()/1000.0);
+                    }
                 }
-            } batched_lane(batched_verify.get());
+            } batched_lane(lane_batched_verify[lane_index]);
             round=std::make_unique<Exl3FastDeviceRound>(context,draft,
                 staging_owners[lane_index]->pointers,host_lease->acquisition,
                 epoch,false,stream);
@@ -2160,8 +2199,26 @@ struct Exl3EngineCore::Impl {
                 round->begin_verification(vericache.block);
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
+                // NINFER_EXL3_LANE_TRACE: per-request lane time attribution.
+                static const bool lane_trace=std::getenv("NINFER_EXL3_LANE_TRACE")!=nullptr;
+                double lt_lock=0,lt_prepare=0,lt_settle=0,lt_verify=0;std::uint64_t lt_rounds=0;
+                const auto lt_begin=Clock::now();
+                struct LaneTraceReport {
+                    bool enabled;std::size_t lane;const double& lock;const double& prepare;const double& settle;
+                    const double& verify;const std::uint64_t& rounds;Clock::time_point begin;
+                    ~LaneTraceReport() {
+                        if(!enabled)return;
+                        const double total=std::chrono::duration<double,std::milli>(Clock::now()-begin).count();
+                        std::fprintf(stderr,"LANE_TRACE lane=%zu total_ms=%.0f rounds=%llu lock_ms=%.0f prepare_ms=%.0f settle_ms=%.0f verify_ms=%.0f per_round_ms=%.1f\n",
+                            lane,total,static_cast<unsigned long long>(rounds),lock,prepare,settle,verify,
+                            rounds?(prepare+settle)/rounds:0.0);
+                    }
+                } lt_report{lane_trace,lane_index,lt_lock,lt_prepare,lt_settle,lt_verify,lt_rounds,lt_begin};
+                const auto lt_ms=[](Clock::time_point from){return std::chrono::duration<double,std::milli>(Clock::now()-from).count();};
                 while(!request.cancelled && remaining) {
+                    auto lt_mark=Clock::now();
                     std::shared_lock round_lock(coherent_prefill_mutex);
+                    lt_lock+=lt_ms(lt_mark);lt_mark=Clock::now();
                     if(!output.pending_control_tokens().empty())
                         throw std::invalid_argument(
                             "coherent-device EXL3 does not admit injected control tokens");
@@ -2174,6 +2231,7 @@ struct Exl3EngineCore::Impl {
                         const auto width=static_cast<int>(std::min<std::size_t>(
                             {8,room,block-unverified.size()}));
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
+                        lt_prepare+=lt_ms(lt_mark);lt_mark=Clock::now();++lt_rounds;
                         pending_ticket=prepared_round.ticket;
                         const auto& candidate=prepared_round.candidate;
                         route.record_attempt(candidate.width,0,0);
@@ -2189,6 +2247,7 @@ struct Exl3EngineCore::Impl {
                                 candidate.committed_tokens.size());
                         } catch(...) {pending_ticket.reset();throw;}
                         pending_ticket.reset();
+                        lt_settle+=lt_ms(lt_mark);
                         unverified.insert(unverified.end(),settled.committed_tokens.begin(),
                             settled.committed_tokens.end());
                         terminal_seen=settled.terminal;
@@ -2201,9 +2260,11 @@ struct Exl3EngineCore::Impl {
                     // Verifier and fix passes use the process-wide prompt-scale
                     // scratch: they run alone on the device like ingestion.
                     round_lock.unlock();
+                    lt_mark=Clock::now();
                     std::unique_lock verify_lock(coherent_prefill_mutex);
                     if(options.max_concurrency>1)check(cudaDeviceSynchronize());
                     const auto verified=round->verify(unverified,vericache.delta);
+                    lt_verify+=lt_ms(lt_mark);
                     unverified.clear();
                     terminal_seen=false;
                     std::vector<std::int64_t> retained;
@@ -2546,8 +2607,10 @@ struct Exl3EngineCore::Impl {
                         "EXL3 host preparation cancelled");
                 throw std::logic_error("Engine host preparation completion identity");
             }
-            const bool peer_numerical=options.max_concurrency==2 &&
-                numerical_active[1-lane_index].load(std::memory_order_acquire);
+            bool peer_numerical=false;
+            for(std::size_t other=0;other<options.max_concurrency;++other)
+                peer_numerical=peer_numerical || (other!=lane_index &&
+                    numerical_active[other].load(std::memory_order_acquire));
             if(host_preparation_observer)
                 host_preparation_observer(lane_index,host_ticket->generation,
                     peer_numerical);

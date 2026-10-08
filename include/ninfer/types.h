@@ -1026,7 +1026,7 @@ struct RuntimeStats {
     std::uint64_t registered_kv_external_readers=0;
     std::uint64_t registered_kv_external_reader_high_water=0;
     // Same bytes partitioned by the two physical Engine lanes; not additive to total.
-    std::array<std::uint64_t,2> registered_kv_upload_lane_bytes{};
+    std::array<std::uint64_t,8> registered_kv_upload_lane_bytes{};
     std::uint64_t registered_kv_upload_failures=0;
     std::uint64_t registered_kv_upload_peak_pending=0;
     std::uint64_t shared_device_page_fill_bytes=0,shared_device_page_copy_bytes=0;

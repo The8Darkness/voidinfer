@@ -2935,8 +2935,8 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     // tiles share every decoded B fragment; each output row keeps the M16
     // MMA sequence of its own tile.
     static_assert(MTiles == 1 || (MTiles == 2 && DeepStages > 0 && AsyncA && !FusedInput &&
-                                  !RegisterPipeline && !Fp16Accumulate && !PredecodedB),
-                  "M32 requires the deep async-A FP32 producer");
+                                  !RegisterPipeline && !PredecodedB),
+                  "M32 requires the deep async-A producer");
     // Deep async-A stages may stream the constant packed weights of their
     // preload groups before the dependency wait; everything else waits first.
     constexpr bool kEarlyWeights = DeepStages > 0 && AsyncA && !RegisterPipeline;
@@ -2970,10 +2970,12 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                   "global slices require async-A partial-only accumulation");
     // DeepStages keeps DeepStages-1 packed tiles in flight per CTA. It changes
     // only copy scheduling; every output sees the same MMA sequence.
+    // Deep stages with Fp16Accumulate (batched rounds): FP16 MMA partials
+    // fold into the FP32 accumulators after every stage group.
     static_assert(DeepStages == 0 ||
                       (DeepStages >= 3 && DeepStages <= 8 && AsyncA &&
-                       !RegisterPipeline && !Fp16Accumulate),
-                  "deep cp.async staging requires the async-A FP32 path");
+                       !RegisterPipeline && (!Fp16Accumulate || !FusedInput)),
+                  "deep cp.async staging requires the async-A path");
     constexpr int tile_half = PredecodedB ? 256 : 16 * Bits;
     constexpr int raw_stage_half = output_tiles_per_block * tile_half;
     static_assert(TilesPerStage == 1 ||
@@ -3054,7 +3056,13 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
 
     Exl3FragC c[fragments_per_warp];
     Exl3FragC c2[MTiles == 2 ? fragments_per_warp : 1];
+    Exl3FragCHalf c2_half[MTiles == 2 ? fragments_per_warp : 1];
     Exl3FragCHalf c_half[fragments_per_warp];
+    #pragma unroll
+    for (int n = 0; n < (MTiles == 2 ? fragments_per_warp : 1); ++n) {
+        c2_half[n].values[0] = __float2half2_rn(0.0f);
+        c2_half[n].values[1] = __float2half2_rn(0.0f);
+    }
     #pragma unroll
     for (int n = 0; n < (MTiles == 2 ? fragments_per_warp : 1); ++n) {
         #pragma unroll
@@ -3079,6 +3087,19 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                 c[n].values[3] += high.y;
                 c_half[n].values[0] = __float2half2_rn(0.0f);
                 c_half[n].values[1] = __float2half2_rn(0.0f);
+            }
+            if constexpr (MTiles == 2) {
+                #pragma unroll
+                for (int n = 0; n < fragments_per_warp; ++n) {
+                    const float2 low = __half22float2(c2_half[n].values[0]);
+                    const float2 high = __half22float2(c2_half[n].values[1]);
+                    c2[n].values[0] += low.x;
+                    c2[n].values[1] += low.y;
+                    c2[n].values[2] += high.x;
+                    c2[n].values[3] += high.y;
+                    c2_half[n].values[0] = __float2half2_rn(0.0f);
+                    c2_half[n].values[1] = __float2half2_rn(0.0f);
+                }
             }
         }
     };
@@ -3277,14 +3298,24 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                     exl3_dq4_generic<Bits, K7ThreeWord>(
                         packed, (lane << 3) + 4, b1, mul1_multiplier);
                 }
+                if constexpr (Fp16Accumulate) {
+                    exl3_mma_m16n8k16_half(a, b0, c_half[n2]);
+                    exl3_mma_m16n8k16_half(a, b1, c_half[n2 + 1]);
+                    if constexpr (MTiles == 2) {
+                        exl3_mma_m16n8k16_half(a2, b0, c2_half[n2]);
+                        exl3_mma_m16n8k16_half(a2, b1, c2_half[n2 + 1]);
+                    }
+                } else {
                 exl3_mma_m16n8k16(a, b0, c[n2]);
                 exl3_mma_m16n8k16(a, b1, c[n2 + 1]);
                 if constexpr (MTiles == 2) {
                     exl3_mma_m16n8k16(a2, b0, c2[n2]);
                     exl3_mma_m16n8k16(a2, b1, c2[n2 + 1]);
                 }
+                }
             }
           }
+          fold_half_accumulators();
         }
         exl3_cp_async_wait();
         __syncthreads();
@@ -10805,15 +10836,16 @@ int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows)
 
 int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexcept {
     constexpr int split10 = 10;
-    // 17..32-row (M32) calls: 5 K partitions (measured; the M32 producer is
-    // issue-bound, so fewer partial planes win). NINFER_EXL3_COHERENT_M32_SPLIT
-    // overrides (1..10).
+    // 17..32-row (M32) calls: 5 K partitions for the MLP gate/up (fewer
+    // partial planes win there), 10 elsewhere (measured, 128-column CTAs).
+    // NINFER_EXL3_COHERENT_M32_SPLIT overrides (1..10).
     if (rows > kBatchedRows) {
         static const int m32 = [] {
             const char* value = std::getenv("NINFER_EXL3_COHERENT_M32_SPLIT");
-            return value ? std::max(1, std::min(10, std::atoi(value))) : 5;
+            return value ? std::max(1, std::min(10, std::atoi(value))) : 0;
         }();
-        return m32;
+        if (m32) return m32;
+        if (coherent_wide_k6_operation_ == 4) return 5;
     }
     const auto required = static_cast<std::size_t>(rows > kBatchedRows ? rows :
         std::min(max_rows_, kBatchedRows)) *
@@ -11729,24 +11761,25 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
 // Coherent packed producer (K6 down, K7 down/O, wide K6) with the selected
 // cp.async depth and CTA width. Every warp keeps 16 output columns and the
 // full split K range, so narrower CTAs only enlarge the grid.
-template <int Bits, int Stages, int Warps, int Per = 1, int MTiles = 1>
+template <int Bits, int Stages, int Warps, int Per = 1, int MTiles = 1, bool Fp16Acc = false,
+          int TilesPerWarp = 1>
 static void launch_coherent_packed_variant(
     cudaStream_t stream, const std::uint16_t* transformed,
     const std::uint16_t* trellis, const std::int32_t* mul1, float* accum,
     int rows, int input_features, int output_features, int split_count,
     const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
-    constexpr int tiles = Warps;
+    constexpr int tiles = Warps * TilesPerWarp;
     constexpr int stage_count = (Stages ? Stages : 2) * Per;
     const std::size_t shared =
         static_cast<std::size_t>(stage_count) * 256u * MTiles * sizeof(half) +
         static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t) +
         16u * MTiles * tiles * 16u * sizeof(float);
     const int grid = output_features / (16 * tiles) * split_count;
-    if constexpr (MTiles == 2) {
-        static_assert(Stages > 0, "M32 coherent producer requires deep stages");
-        if (raw_input) throw std::logic_error("M32 coherent producer reads transformed rows");
+    if constexpr (MTiles == 2 || Fp16Acc || TilesPerWarp != 1) {
+        static_assert(Stages > 0, "M32/FP16-accumulate coherent producer requires deep stages");
+        if (raw_input) throw std::logic_error("M32/FP16-accumulate coherent producer reads transformed rows");
         const auto kernel = exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
-            false, Bits == 6, false, false, false, Stages, Warps, Per, 2>;
+            false, Bits == 6, Fp16Acc, false, false, Stages, Warps, Per, MTiles>;
         if (shared > 48u * 1024u) {
             static const bool configured = [shared, kernel] {
                 cuda_check(cudaFuncSetAttribute(kernel,
@@ -11904,12 +11937,58 @@ static void launch_coherent_packed_partials(
     if (raw_input && (rows < 1 || rows > 8 || stages == 0))
         throw std::logic_error("fused-input coherent producer requires the deep route and 1..8 rows");
     const int per_setting = coherent_tiles_per_stage_setting();
+    // Batched rounds (more than 8 rows): NINFER_EXL3_COHERENT_FP16_ACC=1 runs
+    // the MMAs with FP16 accumulation (twice the GeForce tensor rate; FP32
+    // folds after every stage group). Single-agent rounds keep FP32.
+    static const bool fp16_acc = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_FP16_ACC");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const bool batched_fp16 = fp16_acc && rows > 8 && !raw_input && stages == 4 && warps == 4 &&
+        (per_setting ? per_setting : 2) == 2;
+    // Batched rows (more than 8): 128-column CTAs re-read the A rows half
+    // as often (A traffic, not weights, bounds M16/M32; measured gate 49->35 us
+    // at M16, 72->52 us at M32). NINFER_EXL3_COHERENT_BATCH_TPW = 1, 2 or 4.
+    static const int batch_tpw = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_BATCH_TPW");
+        return value ? std::atoi(value) : 2;
+    }();
+    static const int batch_min_rows = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_BATCH_TPW_MIN_ROWS");
+        return value ? std::atoi(value) : 9;
+    }();
+    if (rows >= batch_min_rows && (batch_tpw == 2 || batch_tpw == 4) && !raw_input && stages == 4 &&
+        warps == 4 && (per_setting ? per_setting : 2) == 2 && output_features % (64 * batch_tpw) == 0) {
+        if (batch_tpw == 4) {
+            if (rows > kBatchedRows)
+                launch_coherent_packed_variant<Bits, 4, 4, 2, 2, false, 4>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count);
+            else
+                launch_coherent_packed_variant<Bits, 4, 4, 2, 1, false, 4>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count);
+        } else if (rows > kBatchedRows)
+            launch_coherent_packed_variant<Bits, 4, 4, 2, 2, false, 2>(stream, transformed, trellis, mul1, accum,
+                rows, input_features, output_features, split_count);
+        else
+            launch_coherent_packed_variant<Bits, 4, 4, 2, 1, false, 2>(stream, transformed, trellis, mul1, accum,
+                rows, input_features, output_features, split_count);
+        return;
+    }
     if (rows > kBatchedRows) {
         // Batched rounds of 3-4 agents: the measured default topology only.
         if (rows > 2 * kBatchedRows || stages != 4 || warps != 4 ||
             (per_setting ? per_setting : 2) != 2)
             throw std::logic_error("M32 coherent producer requires 17..32 rows and the default topology");
-        launch_coherent_packed_variant<Bits, 4, 4, 2, 2>(stream, transformed, trellis, mul1, accum,
+        if (batched_fp16)
+            launch_coherent_packed_variant<Bits, 4, 4, 2, 2, true>(stream, transformed, trellis, mul1, accum,
+                rows, input_features, output_features, split_count);
+        else
+            launch_coherent_packed_variant<Bits, 4, 4, 2, 2>(stream, transformed, trellis, mul1, accum,
+                rows, input_features, output_features, split_count);
+        return;
+    }
+    if (batched_fp16) {
+        launch_coherent_packed_variant<Bits, 4, 4, 2, 1, true>(stream, transformed, trellis, mul1, accum,
             rows, input_features, output_features, split_count);
         return;
     }

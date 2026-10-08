@@ -236,8 +236,13 @@ int main() {
             check(cudaStreamSynchronize(sd), "roots");
             std::vector<Exl3TextContext::BatchedPeer> peers;
             for (int a = 1; a < agents; ++a) peers.push_back({all[a], rows_of[a], nullptr});
-            const auto separate = [&] { for (int a = 0; a < agents; ++a) all[a]->continue_rows(rows_of[a], sd); };
-            const auto batched = [&] { d->continue_rows_batched(peers, rows_of[0], sd); };
+            // OVL_SIBLINGS=1: each agent's last two rows are sibling leaves
+            // (verification tree layout) as in the Engine's DFlash2 rounds.
+            const bool siblings = env_int("OVL_SIBLINGS", 0) != 0;
+            const std::vector<int> sibling_offsets{1, 3};
+            const auto arm = [&] { if (siblings) for (auto* c : all) c->set_verifier_siblings(sibling_offsets); };
+            const auto separate = [&] { arm(); for (int a = 0; a < agents; ++a) all[a]->continue_rows(rows_of[a], sd); };
+            const auto batched = [&] { arm(); d->continue_rows_batched(peers, rows_of[0], sd); };
             const auto rewind = [&] { for (auto* c : all) c->restore_verified_root(sd); };
             separate();
             std::vector<std::vector<float>> ref;

@@ -773,6 +773,17 @@ struct Exl3TextModel::Impl {
     Exl3CudaLinearWeights lm_head{};
     Exl3CudaLinearMetadata lm_head_metadata{};
     const std::uint16_t* embedding = nullptr;
+    // NINFER_EXL3_HOST_EMBEDDING (default 1): the BF16 token embedding
+    // (2.5 GB) lives in mapped pinned host memory; lookups read a few rows
+    // per step over PCIe, and the device memory serves more Engine lanes.
+    struct HostEmbedding {
+        void* host = nullptr;
+        HostEmbedding() = default;
+        HostEmbedding(const HostEmbedding&) = delete;
+        HostEmbedding& operator=(const HostEmbedding&) = delete;
+        ~HostEmbedding() { if (host) (void)cudaFreeHost(host); }
+    };
+    std::unique_ptr<HostEmbedding> host_embedding;
     const std::uint16_t* final_norm = nullptr;
     std::size_t model_bytes = 0;
     // Prompt-scale FP16 reconstruct + GEMM workspace shared by the contexts of
@@ -977,8 +988,28 @@ struct Exl3TextModel::Impl {
                 std::chrono::steady_clock::now() - start).count();
             load_stats.parallel_staged = true;
         }
-        embedding = static_cast<const std::uint16_t*>(load_raw_tensor(
-            "model.language_model.embed_tokens.weight", "embedding", "BF16"));
+        static const bool host_embedding_enabled = [] {
+            const char* value = std::getenv("NINFER_EXL3_HOST_EMBEDDING");
+            require(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0,
+                    "NINFER_EXL3_HOST_EMBEDDING must be 0 or 1");
+            return !value || std::strcmp(value, "1") == 0;
+        }();
+        if (host_embedding_enabled) {
+            const auto tensor = load_tensor(collection, "model.language_model.embed_tokens.weight");
+            require(tensor.info.dtype == "BF16", "embedding raw tensor metadata mismatch");
+            host_embedding = std::make_unique<HostEmbedding>();
+            cuda_check(cudaHostAlloc(&host_embedding->host, tensor.bytes().size(),
+                                     cudaHostAllocMapped | cudaHostAllocWriteCombined),
+                       "allocate mapped host embedding");
+            std::memcpy(host_embedding->host, tensor.bytes().data(), tensor.bytes().size());
+            void* device = nullptr;
+            cuda_check(cudaHostGetDevicePointer(&device, host_embedding->host, 0),
+                       "map host embedding");
+            embedding = static_cast<const std::uint16_t*>(device);
+        } else {
+            embedding = static_cast<const std::uint16_t*>(load_raw_tensor(
+                "model.language_model.embed_tokens.weight", "embedding", "BF16"));
+        }
         final_norm = load_norm("model.language_model.norm.weight", kHidden);
 
         for (int i = 0; i < kLayers; ++i) {
@@ -6072,11 +6103,11 @@ void Exl3TextContext::reserve_reconstruction_lanes(Exl3VeriCacheServingCoordinat
     std::span<Exl3TextContext*> contexts,bool allow_budget_fallback) {
     require(ReconstructionBacking::quarantined_allocations.load(std::memory_order_acquire)==0,
         "unresolved reconstruction allocation cleanup; reservation refused");
-    require(!contexts.empty() && contexts.size()<=2,"reconstruction reservation lane count");
+    require(!contexts.empty() && contexts.size()<=8,"reconstruction reservation lane count");
     using Inventory=Exl3ResourceInventory;
     Inventory::Requirement required;required.configuration=0x524543534c;
-    std::array<std::size_t,2> attached_persistent{};
-    std::array<std::size_t,2> attached_public_persistent{};
+    std::array<std::size_t,8> attached_persistent{};
+    std::array<std::size_t,8> attached_public_persistent{};
     bool needed=false;
     for(std::size_t i=0;i<contexts.size();++i) {
         auto* context=contexts[i];
@@ -6108,7 +6139,7 @@ void Exl3TextContext::reserve_reconstruction_lanes(Exl3VeriCacheServingCoordinat
         required.add(Inventory::Domain::host_metadata,1,sizeof(ReconstructionBacking)+ReconstructionBacking::control_bytes+sizeof(DeviceAllocation::Retained));
     }
     if(!needed)return;
-    std::array<std::shared_ptr<ReconstructionBacking>,2> pending;
+    std::array<std::shared_ptr<ReconstructionBacking>,8> pending;
     const auto quarantine_before=ReconstructionBacking::quarantined_allocations.load(std::memory_order_acquire);
     bool factory_entered=false;
     try {

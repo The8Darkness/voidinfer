@@ -3290,13 +3290,9 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                                   ? Exl3CudaLinearAdmission::target_continuation_o
                                   : Exl3CudaLinearAdmission::ordinary));
             // Batched rounds (2-4 agents, up to 32 rows) take the coherent
-            // continuation routes (M16, or M32 for 17..32 rows); 17..32-row
-            // MLP gate/up take the staged wide-prefill route (measured faster).
+            // continuation routes (M16, or M32 for 17..32 rows).
             const auto launch_admission = batch_ && rows > 8 && !target_small_m_candidate
-                ? (rows > 16 && (operation == Exl3TargetProjectionOperator::gate ||
-                                 operation == Exl3TargetProjectionOperator::up)
-                       ? Exl3CudaLinearAdmission::target_wide_prefill
-                       : batched_continuation_admission(operation)) : admission;
+                ? batched_continuation_admission(operation) : admission;
             if (transformed_input)
                 workspace->forward_from_transformed(
                     weights, metadata, transformed_input, destination, rows,

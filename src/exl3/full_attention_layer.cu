@@ -7730,7 +7730,10 @@ void Exl3FullAttentionLayer::validate_retained_prefix_reappend(
     if (!retained_prefix_available_ || retained_rows <= 0 ||
         retained_rows > attempted_rows || attempted_rows != retained_prefix_rows_) {
         throw std::invalid_argument(
-            "EXL3 full-attention retained prefix is absent or row count is invalid");
+            "EXL3 full-attention retained prefix is absent or row count is invalid (available=" +
+            std::to_string(retained_prefix_available_) + " retained=" + std::to_string(retained_rows) +
+            " attempted=" + std::to_string(attempted_rows) + " recorded=" +
+            std::to_string(retained_prefix_rows_) + " layer=" + std::to_string(model_layer_) + ")");
     }
     if (base_position != retained_prefix_position_) {
         throw std::invalid_argument(
@@ -9703,13 +9706,9 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                                    ? Exl3CudaLinearAdmission::target_continuation_o
                                    : Exl3CudaLinearAdmission::ordinary));
             // Batched rounds (2-4 agents, up to 32 rows) take the coherent
-            // continuation routes (M16, or M32 for 17..32 rows); 17..32-row
-            // MLP gate/up take the staged wide-prefill route (measured faster).
+            // continuation routes (M16, or M32 for 17..32 rows).
             const auto launch_admission = batch_ && rows > 8 && !target_small_m_candidate
-                ? (rows > 16 && (operation == Exl3TargetProjectionOperator::gate ||
-                                 operation == Exl3TargetProjectionOperator::up)
-                       ? Exl3CudaLinearAdmission::target_wide_prefill
-                       : batched_continuation_admission(operation)) : admission;
+                ? batched_continuation_admission(operation) : admission;
             if(transformed_input)
                 workspace->forward_from_transformed(
                     weights,metadata,transformed_input,destination,rows,
