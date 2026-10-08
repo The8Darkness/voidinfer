@@ -38,7 +38,7 @@ public:
     static Exl3L0PinnedPool& instance() { static Exl3L0PinnedPool pool; return pool; }
 
     Block take() {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if (free_.empty()) {
             void* slab = nullptr;
             if (cudaHostAlloc(&slab, kBlockBytes * kSlabBlocks, cudaHostAllocPortable) != cudaSuccess)
@@ -54,7 +54,7 @@ public:
 
 private:
     void give_back(std::uint8_t* p) noexcept {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         free_.push_back(p);
     }
     std::mutex mutex_;

@@ -189,7 +189,7 @@ std::size_t Exl3VisionContext::device_bytes()const noexcept{return impl_->bytes;
 Exl3VisionOutput Exl3VisionContext::encode_numeric_candidate(
     const targets::qwen3_6::PreparedMediaPayload& payload,const targets::qwen3_6::VisionItemControl& control,
     const std::function<bool()>& cancelled,const std::function<void(int,std::span<const float>)>& observer){
-    auto& c=*impl_;std::unique_lock lock(c.mutex);require(!c.poisoned,"poisoned context");
+    auto& c=*impl_;std::unique_lock<std::recursive_mutex> lock(c.mutex);require(!c.poisoned,"poisoned context");
     int device;check(cudaGetDevice(&device),"encode device");require(device==c.model->device,"encode device mismatch");
     require(payload.storage==VisionPatchStorage::Float16,"requires FP16 patches");
     require(payload.preprocess.valid(control.modality==targets::qwen3_6::PromptModality::Video),
@@ -288,7 +288,7 @@ std::shared_ptr<const Exl3EncodedMediaResult> Exl3VisionContext::encode_prepared
     const auto cancellation_requested=[&] {
         const bool requested=cancelled && cancelled();
         if(requested && !cancellation_counted) {
-            std::lock_guard lock(c.encoded_cache_mutex);
+            std::lock_guard<std::mutex> lock(c.encoded_cache_mutex);
             ++c.encoded_cache_stats.cancelled_consumers;
             cancellation_counted=true;
         }
@@ -303,7 +303,7 @@ std::shared_ptr<const Exl3EncodedMediaResult> Exl3VisionContext::encode_prepared
     std::shared_ptr<Exl3EncodedMediaEntry> entry;
     bool producer=false;
     {
-        std::lock_guard lock(c.encoded_cache_mutex);
+        std::lock_guard<std::mutex> lock(c.encoded_cache_mutex);
         for(const auto& candidate:c.encoded_cache)
             if(candidate->matches(payload,item,encoder,control)) {
                 entry=candidate;++c.encoded_cache_stats.hits;break;
@@ -353,13 +353,13 @@ std::shared_ptr<const Exl3EncodedMediaResult> Exl3VisionContext::encode_prepared
             auto encoded=encode_numeric_candidate(*payload,control,cancellation_requested);
             check_cancel();
             entry->publish(std::move(encoded.embeddings));
-            std::lock_guard lock(c.encoded_cache_mutex);
+            std::lock_guard<std::mutex> lock(c.encoded_cache_mutex);
             --c.encoded_cache_stats.inflight_producers;
             if(!c.encoded_cache_stats.inflight_producers)
                 c.encoded_cache_stats.inflight_scratch_device_bytes=0;
         } catch(...) {
             entry->fail();
-            std::lock_guard lock(c.encoded_cache_mutex);
+            std::lock_guard<std::mutex> lock(c.encoded_cache_mutex);
             ++c.encoded_cache_stats.failed_producers;
             --c.encoded_cache_stats.inflight_producers;
             if(!c.encoded_cache_stats.inflight_producers)
@@ -374,7 +374,7 @@ std::shared_ptr<const Exl3EncodedMediaResult> Exl3VisionContext::encode_prepared
 }
 
 Exl3EncodedMediaCacheStats Exl3VisionContext::encoded_media_cache_stats() const {
-    auto& c=*impl_;std::lock_guard lock(c.encoded_cache_mutex);
+    auto& c=*impl_;std::lock_guard<std::mutex> lock(c.encoded_cache_mutex);
     auto result=c.encoded_cache_stats;result.entries=c.encoded_cache.size();
     result.retained_encoded_host_bytes=c.encoded_output_ledger.bytes();
     result.retained_replay_host_bytes=c.replay_payload_ledger.bytes();
@@ -384,7 +384,7 @@ Exl3EncodedMediaCacheStats Exl3VisionContext::encoded_media_cache_stats() const 
 void Exl3VisionContext::set_encoded_media_cache_limits(Exl3EncodedMediaCacheLimits limits) {
     if(!limits.max_entries || !limits.max_encoded_host_bytes || !limits.max_replay_host_bytes)
         throw std::invalid_argument("encoded cache limits");
-    auto& c=*impl_;std::lock_guard lock(c.encoded_cache_mutex);
+    auto& c=*impl_;std::lock_guard<std::mutex> lock(c.encoded_cache_mutex);
     if(c.encoded_cache_stats.inflight_producers)
         throw std::logic_error("encoded cache policy change while producer active");
     while((c.encoded_cache.size()>limits.max_entries ||

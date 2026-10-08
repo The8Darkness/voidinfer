@@ -41,7 +41,7 @@ public:
     };
     static std::optional<ExternalRead> acquire_external_read(std::shared_ptr<Exl3KVRegistrationCache> owner) {
         if(!owner || !owner.use_count())return std::nullopt;
-        std::unique_lock lock(owner->mutex_,std::try_to_lock);
+        std::unique_lock<std::mutex> lock(owner->mutex_,std::try_to_lock);
         if(!lock.owns_lock() || owner->external_readers_.load()==std::numeric_limits<std::uint64_t>::max())
             return std::nullopt;
         // Serialized with the complete retirement transaction, not only its
@@ -59,7 +59,7 @@ public:
         std::shared_ptr<Exl3KVRegistrationCache> owner) {
         if(!owner || !owner.use_count())return std::nullopt;
         if(owner->refuse_read_pairs_for_test_.load(std::memory_order_relaxed))return std::nullopt;
-        std::unique_lock lock(owner->mutex_,std::try_to_lock);
+        std::unique_lock<std::mutex> lock(owner->mutex_,std::try_to_lock);
         if(!lock.owns_lock() || owner->external_readers_.load()>
             std::numeric_limits<std::uint64_t>::max()-2)return std::nullopt;
         owner->add_external_readers(2);
@@ -137,7 +137,7 @@ private:
         if(!provider.acquire || !provider.release)
             throw std::invalid_argument("KV registration provider incomplete");
         if(!extent.registration_eligible())return {};
-        std::unique_lock lock(mutex_,std::try_to_lock);
+        std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);
         if(!lock.owns_lock())return {}; // peer uses exact staging; never waits on cache/provider lock
         if(Exl3RegisteredKVBacking::quarantined_bytes())throw std::runtime_error("unresolved KV registration retirement");
         std::size_t empty=capacity;

@@ -186,7 +186,7 @@ public:
         if(!source.owns_pending_execution())
             throw std::runtime_error("batched greedy packet missing final-use owners");
         Offer offer(context,std::move(pending),std::move(source),cancelled_flag);
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if(failed_)std::rethrow_exception(first_failure_);
         if(!busy_ && waiting_ && compatible(*waiting_,offer) &&
            !is_cancelled(*waiting_) && !is_cancelled(offer)) {
@@ -227,26 +227,26 @@ public:
         return std::move(*offer.result);
     }
     Stats stats() {
-        std::lock_guard lock(mutex_);return {batches_,batched_rows_,singles_,cancelled_,failures_};
+        std::lock_guard<std::mutex> lock(mutex_);return {batches_,batched_rows_,singles_,cancelled_,failures_};
     }
     void notify_cancellation() {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(waiting_ && is_cancelled(*waiting_))changed_.notify_all();
     }
     void set_timeout_for_test(std::chrono::microseconds timeout) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(waiting_ || busy_ || timeout.count()<1 || timeout>std::chrono::milliseconds(5))
             throw std::invalid_argument("greedy packet batch timeout requires idle 1us..5ms");
         timeout_=timeout;
     }
     void invalidate_next_row_for_test(unsigned one_based_row) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(waiting_ || busy_ || invalid_row_for_test_ || one_based_row<1 || one_based_row>16)
             throw std::invalid_argument("greedy packet invalid-row seam requires idle row1..16");
         invalid_row_for_test_=one_based_row;
     }
     void observe_next_pair_for_test(std::function<void()> observer) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!observer || waiting_ || busy_ || pair_observer_for_test_)
             throw std::invalid_argument("greedy packet pair observer requires idle owner");
         pair_observer_for_test_=std::move(observer);

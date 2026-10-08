@@ -117,7 +117,7 @@ public:
         // Serialize optional reservations among contexts, including the free
         // memory query and allocation. Other required allocations remain owned
         // by the normal full-context resource admission.
-        std::lock_guard lock(admission_);
+        std::lock_guard<std::mutex> lock(admission_);
         std::size_t available=0,total=0;
         if(cudaMemGetInfo(&available,&total)!=cudaSuccess)throw std::runtime_error("device prefix memory query failed");
         if(available<bytes_+reserve)return;
@@ -215,7 +215,7 @@ public:
     // Caller owns the sole cache reference and proves no submitted prefix work.
     // Failed free leaves storage/accounting attached until owner retirement.
     bool retire_pristine() {
-        std::unique_lock lock(use_mutex_,std::try_to_lock);
+        std::unique_lock<std::mutex> lock(use_mutex_,std::try_to_lock);
         if(!lock.owns_lock() || !reusable())return false;
         for(int i=0;i<tag_count_;++i)if(!tags_[i].expired())return false;
         const auto error=cleanup_device();

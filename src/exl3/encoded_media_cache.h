@@ -104,7 +104,7 @@ public:
                 control_.merged_count,std::move(output_credit_),
                 std::move(external_output_credit_)});
         {
-            std::lock_guard lock(mutex_);
+            std::lock_guard<std::mutex> lock(mutex_);
             if(completion_!=Completion::pending)
                 throw std::logic_error("encoded media entry completion already published");
             result_=std::move(ready);completion_=Completion::ready;
@@ -114,7 +114,7 @@ public:
 
     void fail() noexcept {
         {
-            std::lock_guard lock(mutex_);
+            std::lock_guard<std::mutex> lock(mutex_);
             if(completion_!=Completion::pending)return;
             completion_=Completion::failed;
         }
@@ -122,11 +122,11 @@ public:
     }
 
     [[nodiscard]] Completion completion() const noexcept {
-        std::lock_guard lock(mutex_);return completion_;
+        std::lock_guard<std::mutex> lock(mutex_);return completion_;
     }
 
     [[nodiscard]] std::shared_ptr<const Exl3EncodedMediaResult> ready_result() const {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(completion_!=Completion::ready || !result_)
             throw std::logic_error("encoded media entry is not ready");
         return result_;
@@ -134,7 +134,7 @@ public:
 
     [[nodiscard]] std::shared_ptr<const Exl3EncodedMediaResult> wait_ready(
         const std::function<bool()>& cancelled={}) const {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         while(completion_==Completion::pending) {
             if(cancelled && cancelled())
                 throw std::runtime_error("encoded media cache wait cancelled");

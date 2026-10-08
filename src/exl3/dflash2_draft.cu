@@ -3384,7 +3384,7 @@ std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::create_execution()
     return create_execution_impl(false);
 }
 void Exl3Dflash2DraftModel::materialize_private_execution(Exl3VeriCacheServingCoordinator* authority) {
-    std::unique_lock lock(execution_mutex_,std::try_to_lock);
+    std::unique_lock<std::mutex> lock(execution_mutex_,std::try_to_lock);
     require(lock.owns_lock() && !impl_->ws_fc,"draft private construction requires deferred idle clone");
     int device=0;cuda_check(cudaGetDevice(&device),"draft materialization device");
     require(device==impl_->device,"draft materialization/weight device mismatch");
@@ -3396,7 +3396,7 @@ void Exl3Dflash2DraftModel::finish_constructor_credits() noexcept {
     for(auto* child:impl_->linear_owners())if(child)child->release_constructor_credits_after_commit();
 }
 std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::create_execution_impl(bool defer_private) const {
-    std::unique_lock lock(execution_mutex_,std::try_to_lock);
+    std::unique_lock<std::mutex> lock(execution_mutex_,std::try_to_lock);
     require(lock.owns_lock(),"cannot clone an acquired draft execution resource");
     const auto& parent=*impl_;int device=0;cuda_check(cudaGetDevice(&device),"draft execution device");
     require(device==parent.device,"draft execution/weight device mismatch");
@@ -3458,7 +3458,7 @@ void Exl3Dflash2DraftModel::require_host_control_idle_for_test() const {
 }
 
 void Exl3Dflash2DraftModel::set_shared_q_executor(Exl3DraftSharedQExecutor executor,bool block_kv,bool block_o,bool block_down,bool block_gateup) {
-    std::unique_lock lock(execution_mutex_,std::try_to_lock);
+    std::unique_lock<std::mutex> lock(execution_mutex_,std::try_to_lock);
     require(lock.owns_lock() && impl_->ring_acquisition==0,
         "draft shared Q installation requires unacquired execution");
     require_no_fresh_prefill();impl_->shared_q_executor=std::move(executor);

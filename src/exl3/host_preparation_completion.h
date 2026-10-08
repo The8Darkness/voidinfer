@@ -38,7 +38,7 @@ public:
     };
 
     std::optional<Ticket> begin(std::uint64_t generation) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!generation || generation<=generation_ ||
            (phase_!=Phase::idle && phase_!=Phase::accepted &&
             phase_!=Phase::cancelled && phase_!=Phase::failed))
@@ -47,7 +47,7 @@ public:
         return Ticket{generation};
     }
     bool complete(Ticket ticket,Plan plan) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!current(ticket) || phase_!=Phase::pending ||
            !plan.input_fingerprint || plan.cacheable_tokens>plan.input_tokens)
             return false;
@@ -55,7 +55,7 @@ public:
     }
     std::optional<Plan> accept(Ticket ticket,
         std::uint64_t input_fingerprint,std::size_t input_tokens) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!current(ticket) || phase_!=Phase::ready || !plan_ ||
            plan_->input_fingerprint!=input_fingerprint ||
            plan_->input_tokens!=input_tokens)
@@ -63,7 +63,7 @@ public:
         phase_=Phase::accepted;return plan_;
     }
     bool cancel(std::uint64_t generation) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!generation)return false;
         if(generation<generation_)return false;
         if(generation>generation_) {
@@ -75,13 +75,13 @@ public:
         phase_=Phase::cancelled;plan_.reset();return true;
     }
     bool fail(Ticket ticket) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!current(ticket) || (phase_!=Phase::pending && phase_!=Phase::ready))
             return false;
         phase_=Phase::failed;plan_.reset();return true;
     }
     Snapshot snapshot() const {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         return {phase_,generation_,plan_.has_value()};
     }
 private:

@@ -1554,7 +1554,7 @@ public:
         std::uint64_t lookup_selections=0; // Selections, not completed reuse or saved work.
     };
     std::vector<RetentionMetadata> retention_metadata() const {
-        std::shared_lock lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         std::vector<RetentionMetadata> result;result.reserve(entries_.size());
         for(const auto& entry:entries_) {
             const std::array<const Entry*,1> one{&entry};
@@ -1568,7 +1568,7 @@ public:
         std::uint64_t generation,std::optional<std::uint64_t> preparation_microseconds,
         std::optional<std::uint64_t> observed_accesses) {
         if(!root || !generation)return false;
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         for(auto& entry:entries_)if(entry.root==root && entry.generation==generation) {
             entry.preparation_microseconds=preparation_microseconds;
             entry.observed_accesses=observed_accesses;return true;
@@ -1586,30 +1586,30 @@ public:
     Exl3VeriCachePrefixIndex& operator=(const Exl3VeriCachePrefixIndex&)=delete;
 
     std::size_t size() const noexcept {
-        std::shared_lock lock(mutex_);return entries_.size();
+        std::shared_lock<std::shared_mutex> lock(mutex_);return entries_.size();
     }
     std::size_t capacity() const noexcept {return capacity_;}
     void exhaust_generations_for_test() {
-        std::unique_lock lock(mutex_);next_generation_=std::numeric_limits<std::uint64_t>::max();
+        std::unique_lock<std::shared_mutex> lock(mutex_);next_generation_=std::numeric_limits<std::uint64_t>::max();
     }
     void fail_next_publication_growth_for_test() {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         if(fail_publication_growth_)throw std::logic_error("prefix growth failure already armed");
         fail_publication_growth_=true;
     }
     void fail_next_policy_commit_for_test() {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         if(fail_policy_commit_)throw std::logic_error("prefix policy failure already armed");
         fail_policy_commit_=true;
     }
     std::size_t identity_allocated_bytes() const noexcept {
-        std::shared_lock lock(mutex_);std::size_t bytes=0;
+        std::shared_lock<std::shared_mutex> lock(mutex_);std::size_t bytes=0;
         for(const auto& entry:entries_)
             bytes+=entry.contract.capacity();
         return bytes;
     }
     StorageStats storage_stats() const {
-        std::shared_lock lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         std::vector<const Entry*> entries;entries.reserve(entries_.size());
         for(const auto& entry:entries_) entries.push_back(&entry);
         return account(entries);
@@ -1624,7 +1624,7 @@ public:
             throw std::invalid_argument("prefix index token/state extent mismatch");
         const auto hash=hasher_?hasher_(root->token_suffix(),compatibility_contract):hash_contract(root->token_fingerprint(),compatibility_contract);
         const auto model=root->state()->model_identity();
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         // Obtain any new vector slot before erasing a replacement or FIFO root.
         // Entry moves below transfer only already-owned buffers and shared roots.
         if(entries_.size()<capacity_ && entries_.capacity()==entries_.size()) {
@@ -1654,7 +1654,7 @@ public:
         if(tokens.empty() || compatibility_contract.empty()) return {};
         const auto hash=hasher_?hasher_(tokens,compatibility_contract):stable_hash(tokens,compatibility_contract);
         const auto model=exact.model_identity();
-        std::shared_lock lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         // Newest exact publication wins; collisions and stale predecessors are
         // harmless because the complete identity is checked before return.
         for(auto it=entries_.rbegin();it!=entries_.rend();++it)
@@ -1676,7 +1676,7 @@ public:
         const Exl3PreparedIdentity* prepared=nullptr) const {
         if(tokens.empty() || compatibility_contract.empty() || minimum_tokens>tokens.size()) return {};
         const auto model=exact.model_identity();
-        std::shared_lock lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         const auto end=length_order_.begin()+entries_.size();
         auto candidate=std::lower_bound(length_order_.begin(),end,tokens.size(),
             [&](std::size_t index,std::size_t size){return entries_[index].root->token_count()>size;});
@@ -1698,7 +1698,7 @@ public:
         std::string_view compatibility_contract,const Exl3PreparedIdentity& incoming,
         std::size_t minimum_tokens=1) const {
         if(tokens.empty() || compatibility_contract.empty() || minimum_tokens>tokens.size())return {};
-        const auto model=exact.model_identity();std::shared_lock lock(mutex_);
+        const auto model=exact.model_identity();std::shared_lock<std::shared_mutex> lock(mutex_);
         const auto end=length_order_.begin()+entries_.size();
         auto candidate=std::lower_bound(length_order_.begin(),end,tokens.size(),
             [&](std::size_t index,std::size_t size){return entries_[index].root->token_count()>size;});
@@ -1732,7 +1732,7 @@ public:
         std::optional<std::span<const RetentionDecision>> retention=std::nullopt) {
         if(!byte_budget) throw std::invalid_argument("prefix index byte budget must be positive");
         Admission result;result.configured_budget_bytes=byte_budget;
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         // Retained roots already occupy physical memory and are reclaimable by
         // eviction: the physical bound is available plus currently retained.
         const auto retained_bytes=current_stats_locked().accounted_bytes;
@@ -1825,7 +1825,7 @@ public:
         if(!byte_budget) throw std::invalid_argument("prefix index byte budget must be positive");
         const auto effective=available_physical_bytes>physical_reserve_bytes?
             std::min(byte_budget,available_physical_bytes-physical_reserve_bytes):0;
-        std::unique_lock lock(mutex_);std::size_t count=0;auto stats=current_stats_locked();
+        std::unique_lock<std::shared_mutex> lock(mutex_);std::size_t count=0;auto stats=current_stats_locked();
         while(!entries_.empty() && stats.accounted_bytes>effective) {
             entries_.erase(entries_.begin());rebuild_lengths();++count;stats=current_stats_locked();
         }
@@ -1845,7 +1845,7 @@ public:
         std::uint64_t available_physical_bytes,std::uint64_t physical_reserve_bytes,
         std::span<const RetentionDecision> decisions) {
         if(!byte_budget)throw std::invalid_argument("prefix policy byte budget must be positive");
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         PolicyTrim result;result.storage=current_stats_locked();
         const auto effective=available_physical_bytes>physical_reserve_bytes?
             std::min(byte_budget,available_physical_bytes-physical_reserve_bytes):0;
@@ -1889,13 +1889,13 @@ public:
     }
 
     std::vector<std::shared_ptr<const Exl3VeriCacheRequest>> roots() const {
-        std::shared_lock lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         std::vector<std::shared_ptr<const Exl3VeriCacheRequest>> result;result.reserve(entries_.size());
         for(const auto& entry:entries_) result.push_back(entry.root);
         return result;
     }
     void copy_roots_into(std::vector<std::shared_ptr<const Exl3VeriCacheRequest>>& output) const {
-        std::shared_lock lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         if(output.capacity()<entries_.size())
             throw std::length_error("prefix root snapshot exceeds reserved capacity");
         output.clear();
@@ -1907,7 +1907,7 @@ public:
         if(tokens.empty() || compatibility_contract.empty()) return false;
         const auto hash=hasher_?hasher_(tokens,compatibility_contract):stable_hash(tokens,compatibility_contract);
         const auto model=exact.model_identity();
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         for(auto it=entries_.begin();it!=entries_.end();++it)
             if(it->hash==hash && it->model_identity==model &&
                 it->contract==compatibility_contract &&
@@ -1920,7 +1920,7 @@ public:
     }
 
     void clear() noexcept {
-        std::unique_lock lock(mutex_);entries_.clear();
+        std::unique_lock<std::shared_mutex> lock(mutex_);entries_.clear();
     }
 
 private:
@@ -2090,7 +2090,7 @@ public:
         if(prompt.empty() || cacheable_prefix_tokens>prompt.size() ||
             (cacheable_prefix_tokens && cacheable_prefix_tokens<policy_.minimum_prefix_tokens))
             throw std::invalid_argument("serving cacheable prefix extent");
-        std::unique_lock service_lock(service_mutex_);
+        std::unique_lock<std::mutex> service_lock(service_mutex_);
         const auto extend=[&](const auto& root,std::span<const std::int64_t> suffix) {
             if(!root->compact_draft())return root->append_prompt(exact,suffix,prefill_rows,progress);
             if(!draft || !staging)throw std::invalid_argument("compact cached prefix needs resident drafter");
@@ -2174,7 +2174,7 @@ public:
         std::string contract;
         std::uint64_t epoch=0;
         {
-            std::unique_lock service_lock(service_mutex_);
+            std::unique_lock<std::mutex> service_lock(service_mutex_);
             contract=contract_;epoch=service_epoch_;
         }
         const auto require_epoch=[&] {
@@ -2250,7 +2250,7 @@ public:
                 metrics.reused_prompt_tokens<cacheable_prefix_tokens) {
                 const auto cold_preparation_us=std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now()-prefill_start).count();
-                std::unique_lock service_lock(service_mutex_);require_epoch();
+                std::unique_lock<std::mutex> service_lock(service_mutex_);require_epoch();
                 const auto admission=index_.admit(prefix,contract,policy_.byte_budget,
                     available_physical_bytes,policy_.physical_reserve_bytes);
                 if(admission.admitted && !metrics.cache_hit && !metrics.preparation_reused && cold_preparation_us>=0)
@@ -2272,7 +2272,7 @@ public:
         metrics.prefill_ms=std::chrono::duration<double,std::milli>(
             std::chrono::steady_clock::now()-prefill_start).count();
         {
-            std::unique_lock service_lock(service_mutex_);require_epoch();
+            std::unique_lock<std::mutex> service_lock(service_mutex_);require_epoch();
             // Bind fallback accounting to the same namespace epoch as the
             // returned root. Reload must not substitute a new cache's metadata
             // after the final identity check.
@@ -2295,7 +2295,7 @@ public:
         if(!root || !root->state() ||
             root->token_count()<policy_.minimum_prefix_tokens)
             throw std::invalid_argument("completed serving prefix extent");
-        std::unique_lock service_lock(service_mutex_);
+        std::unique_lock<std::mutex> service_lock(service_mutex_);
         return index_.admit(std::move(root),contract_,policy_.byte_budget,
             available_physical_bytes,policy_.physical_reserve_bytes);
     }
@@ -2309,7 +2309,7 @@ public:
         if(!root || root->prepared_identity() || input.size()<policy_.minimum_prefix_tokens ||
             !root->matches_tokens(input))
             throw std::invalid_argument("input authority exact token identity");
-        std::unique_lock lock(service_mutex_);
+        std::unique_lock<std::mutex> lock(service_mutex_);
         const auto observed_root=root;
         auto admission=index_.admit(std::move(root),contract_,policy_.byte_budget,
             available_physical_bytes,policy_.physical_reserve_bytes,retention);
@@ -2322,12 +2322,12 @@ public:
     // One-shot cold concurrent preparation fault after numerical completion,
     // before index mutation. Warm hits do not consume it.
     void fail_next_preparation_admission_for_test() {
-        std::lock_guard lock(service_mutex_);
+        std::lock_guard<std::mutex> lock(service_mutex_);
         if(fail_preparation_admission_)throw std::logic_error("preparation admission fault already armed");
         fail_preparation_admission_=true;
     }
     void reset_for_model_reload(Exl3VeriCacheServingIdentity identity) {
-        auto next=identity.contract();std::unique_lock lock(service_mutex_);
+        auto next=identity.contract();std::unique_lock<std::mutex> lock(service_mutex_);
         if(service_epoch_==std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("serving prefix reload epoch overflow");
         index_.clear();contract_=std::move(next);++service_epoch_;
@@ -2338,7 +2338,7 @@ public:
     }
     Exl3VeriCachePrefixIndex::StorageStats trim(std::uint64_t available_physical_bytes,
         std::size_t* evicted=nullptr) {
-        std::unique_lock lock(service_mutex_);
+        std::unique_lock<std::mutex> lock(service_mutex_);
         return index_.trim_to_budget(policy_.byte_budget,available_physical_bytes,
             policy_.physical_reserve_bytes,evicted);
     }
@@ -2348,7 +2348,7 @@ public:
     Exl3VeriCachePrefixIndex::PolicyTrim trim_with_retention_policy(
         std::uint64_t available_physical_bytes,
         std::span<const Exl3VeriCachePrefixIndex::RetentionDecision> decisions) {
-        std::unique_lock lock(service_mutex_);
+        std::unique_lock<std::mutex> lock(service_mutex_);
         return index_.trim_with_retention_policy(policy_.byte_budget,available_physical_bytes,
             policy_.physical_reserve_bytes,decisions);
     }
@@ -2427,7 +2427,7 @@ public:
         std::uint64_t metadata_bytes=0;
     };
     PreparationStorageStats preparation_storage_stats() const {
-        std::lock_guard lock(service_mutex_);PreparationStorageStats result;
+        std::lock_guard<std::mutex> lock(service_mutex_);PreparationStorageStats result;
         for(const auto& flight:preparation_pool_)if(flight) {
             ++result.slots;result.participants+=flight->participants;
             if(flight->root)++result.retained_roots;
@@ -2457,7 +2457,7 @@ private:
             std::shared_ptr<PrefixPreparation> flight;
             ~Participant() {
                 if(!flight)return;
-                std::lock_guard lock(cache.service_mutex_);
+                std::lock_guard<std::mutex> lock(cache.service_mutex_);
                 if(--flight->participants==0) {
                     flight->root.reset();flight->model.reset();flight->failure={};
                     flight->tokens.clear();flight->done=false;
@@ -2465,7 +2465,7 @@ private:
             }
         } participant{*this,{}};
         {
-            std::unique_lock lock(service_mutex_);
+            std::unique_lock<std::mutex> lock(service_mutex_);
             if(epoch!=service_epoch_ || contract!=contract_)
                 throw std::runtime_error("serving prefix preparation epoch changed");
             // Initial lookup ran outside this lock. A producer may have admitted
@@ -2528,7 +2528,7 @@ private:
         // Bounded saturation falls back to independent caller-owned work.
         if(!flight) {
             auto root=build(progress);
-            std::unique_lock lock(service_mutex_);
+            std::unique_lock<std::mutex> lock(service_mutex_);
             if(epoch!=service_epoch_ || contract!=contract_)
                 throw std::runtime_error("serving prefix preparation epoch changed");
             if(std::exchange(fail_preparation_admission_,false))throw std::bad_alloc();
@@ -2548,7 +2548,7 @@ private:
                     std::rethrow_exception(producer_callback_failure);
             };
             auto root=build(shared_progress);
-            std::unique_lock lock(service_mutex_);
+            std::unique_lock<std::mutex> lock(service_mutex_);
             if(epoch!=service_epoch_ || contract!=contract_)
                 throw std::runtime_error("serving prefix preparation epoch changed");
             if(std::exchange(fail_preparation_admission_,false))throw std::bad_alloc();
@@ -2560,7 +2560,7 @@ private:
             if(producer_callback_failure)std::rethrow_exception(producer_callback_failure);
             return {std::move(root),false};
         } catch(...) {
-            std::unique_lock lock(service_mutex_);
+            std::unique_lock<std::mutex> lock(service_mutex_);
             // A producer's deferred callback error must not overwrite an
             // already published successful result for surviving consumers.
             if(flight->done)throw;
