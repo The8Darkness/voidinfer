@@ -128,7 +128,7 @@ int main() {
         if(!target || !draft || !prefix_text)return 77;
         const int prefix=std::stoi(prefix_text);
         const char* l0_flag=std::getenv("NINFER_EXL3_L0_OSCAR");
-        const bool l0_long=l0_flag && std::string_view(l0_flag)=="1" && prefix>16384 && prefix<=260000;
+        const bool l0_long=(!l0_flag || std::string_view(l0_flag)!="0") && prefix>16384 && prefix<=260000;
         // Ordinary FP16 device KV admits 2048..32768 total context; longer prompts need L0 OSCAR.
         if((prefix<2048 || prefix>32768) && !l0_long)
             throw std::invalid_argument("device Engine witness prefix must be 2K..32K (L0 OSCAR: up to 260000)");

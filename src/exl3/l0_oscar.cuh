@@ -8,16 +8,20 @@
 //   asymmetric INT2: scale = (max - min) / 3, zero = -min / scale,
 //   code = clamp(floor(x / scale + zero + 0.5), 0, 3), x^ = (code - zero) scale.
 // R and mu are per-KV-head OSCAR-2 'center' rotations fitted offline
-// (NINFER_EXL3_L0_OSCAR_ROT: k_rot_perhead.bin, v_rot_perhead.bin [16][4][256][256],
-// k_mean.bin [16][4][256], fp32). Attention over history uses the rotated query
-// q R_k with the constant q . mu added to every history score, accumulates
-// values in the rotated basis and un-rotates the merged history numerator once
-// (o = o' R_v^T) before the exact-segment merge.
+// (<model directory>/l0_oscar or NINFER_EXL3_L0_OSCAR_ROT: k_rot_perhead.bin,
+// v_rot_perhead.bin [16][4][256][256], k_mean.bin [16][4][256], fp32). Attention
+// over history uses the rotated query q R_k with the constant q . mu added to
+// every history score, accumulates values in the rotated basis and un-rotates
+// the merged history numerator once (o = o' R_v^T) before the exact-segment
+// merge. The history rows the verifier attends to most are served exactly
+// from FP16 copies of their L2 rows instead (hot rows, l0_hot.cuh).
+#include "exl3/attention_profile.h"
 #include "exl3/l0_oscar_storage.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -70,24 +74,19 @@ struct Assets {
     const __half* rvt16 = nullptr;
 };
 
-inline bool enabled() {
-    static const bool value = [] {
-        const char* v = std::getenv("NINFER_EXL3_L0_OSCAR");
-        if (!v || !*v || std::strcmp(v, "0") == 0) return false;
-        if (std::strcmp(v, "1") != 0) throw std::invalid_argument("NINFER_EXL3_L0_OSCAR must be 0 or 1");
-        return true;
-    }();
-    return value;
-}
+inline bool enabled() { return exl3_l0_oscar_enabled(); }
 
 inline const Assets& assets() {
     static const Assets value = [] {
-        const char* dir = std::getenv("NINFER_EXL3_L0_OSCAR_ROT");
-        if (!dir || !*dir) throw std::invalid_argument("L0 OSCAR requires NINFER_EXL3_L0_OSCAR_ROT");
+        const char* env = std::getenv("NINFER_EXL3_L0_OSCAR_ROT");
+        const std::string dir = env && *env ? std::string(env) : exl3_l0_oscar_model_assets();
+        if (dir.empty())
+            throw std::invalid_argument("L0 OSCAR needs rotation assets: <model directory>/l0_oscar or "
+                                        "NINFER_EXL3_L0_OSCAR_ROT (NINFER_EXL3_L0_OSCAR=0 selects FP16 device KV)");
         constexpr std::size_t bank = 16ull * 4 * kDim * kDim;
         std::vector<float> rk(bank), rv(bank), rvt(bank), mu(16ull * 4 * kDim);
         const auto read = [&](const char* name, std::vector<float>& out) {
-            std::ifstream f(std::string(dir) + "/" + name, std::ios::binary);
+            std::ifstream f(dir + "/" + name, std::ios::binary);
             f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size() * 4));
             if (!f) throw std::runtime_error(std::string("L0 OSCAR asset read: ") + name);
         };
@@ -140,15 +139,92 @@ __device__ __forceinline__ float l0_block_max(float v, float* scratch) {
     return r;
 }
 
+// Exact hot rows (l0_hot.cuh). The verifier history kernel skips rows marked
+// in `bits` and emits rows whose INT2 probability (relative to the previous
+// round's history LSE, `ref`) exceeds tau; an exact FP16 pass covers the hot
+// slots, and each round replaces the stalest slots with the best candidates,
+// filled from the FP16 L2 planes. NINFER_EXL3_L0_HOT = slots per KV head and
+// layer (default 1024, a multiple of 32; 0 = off).
+constexpr int kHotCandidates = 1024;   // per KV head and round
+constexpr int kHotMaxInsert = 64;      // per KV head and round
+struct HotConfig {
+    int slots = 1024;               // per KV head and layer
+    float log2_tau = -8.965784f;    // candidates: p > 2e-3 of the history mass
+    int insert = 32;                // slots replaced per KV head and round at most
+    float lambda = 0.01f;           // priority decay per committed token (ln units)
+};
+inline const HotConfig& hot_config() {
+    static const HotConfig value = [] {
+        HotConfig c;
+        if (const char* v = std::getenv("NINFER_EXL3_L0_HOT")) {
+            char* end = nullptr;
+            const long slots = std::strtol(v, &end, 10);
+            if (!*v || *end || slots < 0 || slots > 4096 || slots % 32)
+                throw std::invalid_argument("NINFER_EXL3_L0_HOT must be 0..4096 slots, a multiple of 32");
+            c.slots = static_cast<int>(slots);
+        }
+        return c;
+    }();
+    return value;
+}
+struct HotView {
+    std::uint16_t* k = nullptr;
+    std::uint16_t* v = nullptr;
+    int* row = nullptr;
+    float* prio = nullptr;
+    unsigned* bits = nullptr;
+    int* count = nullptr;
+    int* cand_row = nullptr;
+    float* cand_val = nullptr;
+    float* ref = nullptr;
+    int* won = nullptr;
+    int slots = 0, words = 0;
+};
+inline HotView hot_view(const LayerStorage& l) {
+    return {l.hot_k, l.hot_v, l.hot_row, l.hot_prio, l.hot_bits, l.hot_count, l.hot_cand_row,
+            l.hot_cand_val, l.hot_ref, l.hot_won, l.hot_slots, l.hot_words};
+}
+// HotView::won: [4] slots won last round, [4][kHotMaxInsert] slots, [4][kHotMaxInsert] rows.
+constexpr int kHotWonSlots = 4;
+constexpr int kHotWonRows = kHotWonSlots + 4 * kHotMaxInsert;
+// Forgets every hot row (a new request or a restored history).
+__device__ __forceinline__ void hot_clear(const HotView& h, int index, int stride) {
+    for (int i = index; i < 4 * h.words; i += stride) h.bits[i] = 0u;
+    for (int i = index; i < 4 * h.slots; i += stride) h.row[i] = -1;
+    for (int i = index; i < 24; i += stride) h.ref[i] = 3.0e38f;
+    for (int i = index; i < 4; i += stride) { h.count[i] = 0; h.won[i] = 0; }
+}
+// Fills the hot slots won last round from the FP16 planes (16-byte mapped
+// reads); runs on a forked branch beside the encode of the same append.
+__global__ void hot_fill_kernel(HotView hot, const std::uint16_t* k_cache, const std::uint16_t* v_cache) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= 4 * kHotMaxInsert * 2 * (kDim / 8)) return;
+    const int kv = i / (kHotMaxInsert * 2 * (kDim / 8)), rest = i % (kHotMaxInsert * 2 * (kDim / 8));
+    const int p = rest / (2 * (kDim / 8)), kind = (rest / (kDim / 8)) & 1, c = rest % (kDim / 8);
+    if (p >= hot.won[kv]) return;
+    const int slot = hot.won[kHotWonSlots + kv * kHotMaxInsert + p];
+    const int row = hot.won[kHotWonRows + kv * kHotMaxInsert + p];
+    reinterpret_cast<uint4*>((kind ? hot.v : hot.k) + (static_cast<std::size_t>(kv) * hot.slots + slot) * kDim)[c] =
+        reinterpret_cast<const uint4*>((kind ? v_cache : k_cache) + (static_cast<std::size_t>(row) * kKVHeadsL0 + kv) * kDim)[c];
+}
+__global__ void hot_clear_kernel(HotView h) {
+    hot_clear(h, static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x), static_cast<int>(gridDim.x * blockDim.x));
+}
+
 // One CTA (256 threads = dims) per (row, head, K|V) task over newly aged rows.
 __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cache,
     const std::uint16_t* v_cache, int capacity, const int* position_device, int position,
     int* state, Assets a, int bank, std::uint8_t* k_codes, std::uint8_t* v_codes,
-    __half* k_meta, __half* v_meta) {
+    __half* k_meta, __half* v_meta, HotView hot) {
     __shared__ float x[kDim], y[kDim], scratch[16];
     const int base = position_device ? *position_device : position;
     int wm = state[0];
-    if (base < state[1]) wm = kSink;  // a new request restarted the context
+    const int thread = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int threads = static_cast<int>(gridDim.x * blockDim.x);
+    if (base < state[1]) {  // a new request restarted the context
+        wm = kSink;
+        if (hot.slots) hot_clear(hot, thread, threads);
+    }
     wm = max(wm, kSink);
     const int end = min(history_end(base), capacity);
     const int tasks = max(end - wm, 0) * 8;

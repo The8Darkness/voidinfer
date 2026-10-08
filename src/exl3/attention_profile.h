@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <cstddef>
 #include <limits>
+#include <string>
 
 namespace ninfer::exl3 {
 enum class Exl3SegmentedAttentionRoute {inherited,scalar,q_shared,gqa_pair,query_pair};
@@ -22,9 +23,20 @@ inline constexpr Exl3SegmentedAttentionRoute exl3_segmented_attention_route(
 // L0 OSCAR contexts keep only the sink and the recent window exact: verifier
 // segments cover at most this many keys past the history (l0_oscar.cuh).
 constexpr int kExl3L0ExactWindowKeys=2048;
+// L0 OSCAR (INT2 KV history in VRAM with exact hot rows, FP16 planes in mapped
+// host memory) is the default KV tier: NINFER_EXL3_L0_OSCAR unset or 1
+// enables it, 0 selects ordinary FP16 device KV.
 inline bool exl3_l0_oscar_enabled() {
     const char* value=std::getenv("NINFER_EXL3_L0_OSCAR");
-    return value && value[0]=='1' && value[1]==0;
+    if(!value || !*value || std::strcmp(value,"1")==0) return true;
+    if(std::strcmp(value,"0")==0) return false;
+    throw std::invalid_argument("NINFER_EXL3_L0_OSCAR must be 0 or 1");
+}
+// Rotation assets of the loaded target (<model directory>/l0_oscar), used
+// unless NINFER_EXL3_L0_OSCAR_ROT names another directory.
+inline std::string& exl3_l0_oscar_model_assets() {
+    static std::string directory;
+    return directory;
 }
 inline int exl3_exact_attention_capacity(int capacity) {
     return exl3_l0_oscar_enabled() && capacity>kExl3L0ExactWindowKeys+64?

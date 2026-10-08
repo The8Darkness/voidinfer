@@ -10,9 +10,9 @@ CUDA 13.1 and 13.3 builds give identical greedy state hashes and tokens at 4K/16
 | Cold prefill, target-only | Default (layer-major, MXFP8/NVFP4 block-quantized projections, FA2 attention) | 10.1K tok/s at 4K, 9.6K at 16K |
 | Base greedy decode, target-only | Default (whole-stack decode graph, fused reductions, L2 prefetch) | 79.2 tok/s at 4K, 75.7 at 16K |
 | DFlash2 K=7 decode, public Engine (coherent-device C1) | Default (verification trees, ≤8 verify rows) | 211 tok/s at 4K, 186 at 16K (code-review workload); 241 tok/s geomean on NInfer's 12 scenario prompts |
-| L0 OSCAR long context | Opt-in `NINFER_EXL3_L0_OSCAR=1`; required above the FP16-KV VRAM limit | DFlash2 178 / 164 / 180 tok/s at 32K / 64K / 128K; prefill 7.3K / 6.4K / 5.1K tok/s; +0.016 nats/token paired NLL vs FP16 KV |
-| FP16 device KV with DFlash2 | Default | Fits 16K; the layer-major prefill headroom guard refuses 31K |
-| Model quality vs NInfer (identical tokens) | — | FP16 KV better by 0.017–0.020 nats/token (95% CI excludes 0); L0 OSCAR statistically tied |
+| L0 OSCAR KV tier with exact hot rows | Default at every context (`NINFER_EXL3_L0_OSCAR=0` opts out; `NINFER_EXL3_L0_HOT=0` drops the hot rows); rotations from `<model directory>/l0_oscar` | DFlash2 code workload 18.3 / 18.5 / 18.8 / 19.4 / 20.3 ms per round at 4K / 16K / 32K / 64K / 128K (hot rows +0.2–0.4 ms); prefill 6.9K / 7.7K / 7.3K / 6.4K / 5.1K tok/s; verify-quality gate vs FP16 KV: +0.006 nats/token, mean abs. delta 0.036, top-1 97.1% (INT2 history alone: +0.024, 0.067, 95.1%) |
+| FP16 device KV with DFlash2 | `NINFER_EXL3_L0_OSCAR=0` | 17.7 ms per round at 4K; fits 16K, the layer-major prefill headroom guard refuses 31K |
+| Model quality vs NInfer (identical tokens) | — | FP16 KV better by 0.017–0.020 nats/token (95% CI excludes 0); L0 OSCAR (INT2 only, before hot rows) statistically tied |
 
 Head-to-head results against NInfer are in [ninfer-comparison-2026-10-08.md](ninfer-comparison-2026-10-08.md).
 The 2026-09-22 publication table below remains as the historical record of that snapshot.

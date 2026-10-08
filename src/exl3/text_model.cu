@@ -361,10 +361,7 @@ struct DeviceAllocation {
         } else cuda_check(cudaMalloc(&ptr, bytes), label);
     }
     static bool l0_host_kv_plane(const char* label) {
-        static const bool l0=[] {
-            const char* v=std::getenv("NINFER_EXL3_L0_OSCAR");
-            return v && std::strcmp(v,"1")==0;
-        }();
+        const bool l0=Exl3NativeContextExtent::l0_oscar_enabled();
         return l0 && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
                                std::strcmp(label,"allocate E4A V cache")==0);
     }
@@ -3998,6 +3995,8 @@ std::unique_ptr<Exl3TextModel> Exl3TextModel::load(const std::filesystem::path& 
         "128K is a static configuration candidate only; model execution is unsupported");
     auto impl = std::make_unique<Impl>();
     impl->directory = model_directory;
+    if(std::filesystem::is_directory(model_directory/"l0_oscar"))
+        exl3_l0_oscar_model_assets()=(model_directory/"l0_oscar").string();
     impl->load_options = options;
     impl->load_from_disk();
     auto result = std::unique_ptr<Exl3TextModel>(new Exl3TextModel(std::move(impl)));

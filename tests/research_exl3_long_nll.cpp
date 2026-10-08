@@ -3,7 +3,9 @@
 // 1024-row wide chunks), then teacher-forces LONG_NLL_CONTINUATION tokens one
 // decode row at a time, recording -log p(token) and the argmax per row.
 // Comparing runs (FP16 vs L0 OSCAR, or two L0 rotation sets) on the same ids
-// gives paired long-context quality. Not a test.
+// gives paired long-context quality. LONG_NLL_ROWS=k (2..8) feeds k teacher
+// rows per step through the multi-row verifier route instead and scores the
+// token after each step. Not a test.
 #include "exl3/text_model.h"
 
 #include <cuda_runtime.h>
@@ -43,6 +45,7 @@ int main() {
         cudaDeviceSynchronize();
         std::ofstream out(out_path);
         double total = 0.0;
+        int scored = 0;
         for (int i = 0; i < continuation; ++i) {
             const auto logits = ctx->logits_host();
             const std::int64_t token = ids[context + i];
@@ -53,16 +56,26 @@ int main() {
             for (const float l : logits) sum += std::exp(static_cast<double>(l) - mx);
             const double nll = -(static_cast<double>(logits[static_cast<std::size_t>(token)]) - mx - std::log(sum));
             total += nll;
+            ++scored;
             // LONG_NLL_GREEDY=1: free greedy generation (token = argmax) and the
             // top-1/top-2 logit margin, for divergence studies between KV tiers.
             static const bool greedy = std::getenv("LONG_NLL_GREEDY") != nullptr;
             float second = -INFINITY;
             for (std::size_t v = 0; v < logits.size(); ++v) if (v != arg && logits[v] > second) second = logits[v];
             out << nll << ' ' << arg << ' ' << token << ' ' << (mx - second) << '\n';
+            // LONG_NLL_ROWS=k (2..8): teacher-force k rows per verifier-route
+            // step (append_prefill) and score only the token after each step.
+            static const int step = std::getenv("LONG_NLL_ROWS") ? std::atoi(std::getenv("LONG_NLL_ROWS")) : 1;
+            if (step > 1) {
+                const int take = std::min(step, continuation - i);
+                ctx->append_prefill(all.subspan(static_cast<std::size_t>(context + i), static_cast<std::size_t>(take)));
+                i += take - 1;
+                continue;
+            }
             ctx->decode(greedy ? static_cast<std::int64_t>(arg) : token);
         }
         std::cout << "LONG_NLL context=" << context << " continuation=" << continuation
-                  << " mean_nll=" << total / continuation << '\n';
+                  << " scored=" << scored << " mean_nll=" << total / scored << '\n';
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "LONG_NLL FAIL: " << e.what() << '\n';
