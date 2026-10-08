@@ -1923,9 +1923,12 @@ struct Exl3EngineCore::Impl {
                 std::fprintf(stderr,"%lld,",static_cast<long long>(token));
             std::fprintf(stderr,"\n");
         }
+        const auto& vericache=Exl3VeriCacheConfig::get();
         try {
             (void)context->reset_for_request(identity.contract());
             const auto epoch=context->request_generation();
+            // VeriCache verifies against exact history: ingest the prompt exactly too.
+            if(vericache.enabled)context->set_l0_exact_history(true);
             // Conversation reuse (NINFER_EXL3_COHERENT_ROOT_REUSE=1): the longest
             // retained device root whose tokens prefix this input is restored
             // (target exact state + draft ring) and only the suffix is ingested.
@@ -2067,6 +2070,7 @@ struct Exl3EngineCore::Impl {
             round=std::make_unique<Exl3FastDeviceRound>(context,draft,
                 staging_owners[lane_index]->pointers,host_lease->acquisition,
                 epoch,false,stream);
+            if(vericache.enabled)context->set_l0_exact_history(false);
             round->begin_prefilled();
             device_lease=coordinator.enter_device_logical(*host_lease,
                 std::static_pointer_cast<const void>(lane),context->position(),
@@ -2093,6 +2097,130 @@ struct Exl3EngineCore::Impl {
                 phase_ms[index]+=std::chrono::duration<double,std::milli>(now-phase_mark).count();
                 phase_mark=now;
             };
+            if(vericache.enabled) {
+                // Draft numerically ahead with L0 rounds, verify each block, then
+                // publish only verified tokens (in <= 16-token output previews).
+                round->begin_verification(vericache.block);
+                std::vector<std::int64_t> unverified;
+                bool terminal_seen=false;
+                while(!request.cancelled && remaining) {
+                    if(!output.pending_control_tokens().empty())
+                        throw std::invalid_argument(
+                            "coherent-device EXL3 does not admit injected control tokens");
+                    const auto budget=output.model_token_budget_remaining(remaining);
+                    if(!budget)throw std::logic_error(
+                        "coherent-device output has no model budget or control path");
+                    const std::size_t room=budget>unverified.size()?budget-unverified.size():0;
+                    const std::size_t block=static_cast<std::size_t>(vericache.block);
+                    if(!terminal_seen && room && unverified.size()<block) {
+                        const auto width=static_cast<int>(std::min<std::size_t>(
+                            {8,room,block-unverified.size()}));
+                        const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
+                        pending_ticket=prepared_round.ticket;
+                        const auto& candidate=prepared_round.candidate;
+                        route.record_attempt(candidate.width,0,0);
+                        route.record_target_work(candidate.verification.verification_rows,
+                            candidate.verification.replay_rows);
+                        if(result.speculative.first_proposed_tokens.empty())
+                            for(int row=0;row<candidate.width;++row)
+                                result.speculative.first_proposed_tokens.push_back(
+                                    static_cast<TokenId>(candidate.proposal[row]));
+                        Exl3FastDeviceRound::Step settled;
+                        try {
+                            settled=round->settle_device_pending(*pending_ticket,
+                                candidate.committed_tokens.size());
+                        } catch(...) {pending_ticket.reset();throw;}
+                        pending_ticket.reset();
+                        unverified.insert(unverified.end(),settled.committed_tokens.begin(),
+                            settled.committed_tokens.end());
+                        terminal_seen=settled.terminal;
+                        ++result.speculative.rounds;
+                        result.speculative.accepted_tokens+=settled.verification.accepted;
+                        result.speculative.accepted_prefix_per_round.push_back(
+                            static_cast<std::uint8_t>(settled.verification.accepted));
+                        continue;
+                    }
+                    const auto verified=round->verify(unverified,vericache.delta);
+                    unverified.clear();
+                    terminal_seen=false;
+                    std::vector<std::int64_t> retained;
+                    bool finished=false;
+                    for(std::size_t at=0;at<verified.tokens.size();) {
+                        const auto chunk=std::span<const std::int64_t>(verified.tokens).subspan(
+                            at,std::min<std::size_t>(16,verified.tokens.size()-at));
+                        const auto boundary=request.publication_boundary.begin(
+                            device_lease->acquisition,epoch,
+                            Exl3ControlPublicationBoundary::Kind::model);
+                        if(!request.publication_boundary.numerical_ready(boundary))
+                            throw std::logic_error("coherent-device verified readiness ordering");
+                        auto tokens=request.round_tokens.assign(chunk);
+                        const auto decision=output.preview_model(tokens.span(),remaining,limit);
+                        if(!request.publication_boundary.prepare_output(boundary))
+                            throw std::logic_error("coherent-device verified preview ordering");
+                        request.require_output_storage();
+                        if(!decision.accepted_tokens) {
+                            if(!request.publication_boundary.abandon_private(boundary))
+                                throw std::logic_error("coherent-device verified empty preview ordering");
+                            publish_preview(request);
+                            if(decision.finished()) {result.finish_reason=decision.finish_reason;finished=true;}
+                            break;
+                        }
+                        if(decision.accepted_tokens!=tokens.size())
+                            tokens=request.round_tokens.truncate(decision.accepted_tokens);
+                        const auto selected=request.round_tokens.repair().span();
+                        if(selected.size()>remaining)
+                            throw std::logic_error("coherent-device selected output exceeds allowance");
+                        request.require_result_slots(selected.size());
+                        if(!request.publication_boundary.resume_numerical(boundary) ||
+                           !request.publication_boundary.numerical_ready(boundary) ||
+                           !request.publication_boundary.prepare_output(boundary) ||
+                           !request.publication_boundary.begin_publication(boundary))
+                            throw std::logic_error("coherent-device verified publication ordering");
+                        const auto publication=coordinator.publish_device_logical_window(
+                            *device_lease,selected);
+                        device_lease=publication.lease;
+                        if(!request.publication_boundary.resident_committed(boundary))
+                            throw std::logic_error("coherent-device verified logical commit ordering");
+                        committed.insert(committed.end(),selected.begin(),selected.end());
+                        retained.insert(retained.end(),selected.begin(),selected.end());
+                        result.generated_token_ids.insert(
+                            result.generated_token_ids.end(),tokens.begin(),tokens.end());
+                        remaining-=static_cast<std::uint32_t>(selected.size());
+                        const bool hidden_terminal=decision.finish_reason==FinishReason::StopToken &&
+                            !request.options.stop.publish_stop_token;
+                        if(hidden_terminal)++result.token_accounting.hidden_terminal_tokens;
+                        result.token_accounting.visible_model_tokens+=
+                            selected.size()-(hidden_terminal?1u:0u);
+                        route.record_publication(selected.size(),
+                            selected.size()-(hidden_terminal?1u:0u),hidden_terminal?1u:0u);
+                        if(result.timings.first_token_seconds==0)
+                            result.timings.first_token_seconds=
+                                seconds(request.submitted)+result.timings.prepare_seconds;
+                        publish_preview(request,boundary);
+                        at+=selected.size();
+                        if(decision.finished()) {result.finish_reason=decision.finish_reason;finished=true;break;}
+                        if(selected.size()<chunk.size())break;
+                    }
+                    round->commit_verification(retained);
+                    if(finished)break;
+                }
+                // Unverified drafted tokens (cancellation) are never published: rewind.
+                if(round->frontier()!=round->verified_frontier())round->commit_verification({});
+                if(std::getenv("NINFER_EXL3_VERICACHE_STATS")) {
+                    const auto& t=round->totals();
+                    std::fprintf(stderr,"VERICACHE blocks=%llu corrected=%llu verify_ms=%.1f block=%d delta=%.3f "
+                        "checked=%llu off_greedy=%llu mean_gap=%.5f max_gap=%.4f "
+                        "restore_ms=%.1f forward_ms=%.1f scores_ms=%.1f fix_ms=%.1f commit_ms=%.1f\n",
+                        static_cast<unsigned long long>(t.verified_blocks),
+                        static_cast<unsigned long long>(t.corrected_blocks),t.verify_ms,
+                        vericache.block,vericache.delta,
+                        static_cast<unsigned long long>(t.accepted_checked),
+                        static_cast<unsigned long long>(t.accepted_off_greedy),
+                        t.accepted_checked?t.accepted_gap_sum/static_cast<double>(t.accepted_checked):0.0,
+                        static_cast<double>(t.max_accepted_gap),t.restore_ms,t.forward_ms,t.scores_ms,
+                        t.fix_ms,t.commit_ms);
+                }
+            } else
             while(remaining && !request.cancelled) {
                 if(round_phases)phase_mark=Clock::now();
                 if(!output.pending_control_tokens().empty())

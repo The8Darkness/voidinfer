@@ -966,6 +966,26 @@ public:
     Exl3TextDecodeAttribution profile_decode(std::int64_t token_id,
                                              cudaStream_t stream = nullptr);
 
+    // L0 OSCAR exact history (VeriCache verifier, lossless ingestion): while
+    // set, every full-attention layer attends to its history from the FP16 L2
+    // planes instead of the INT2 codes and hot rows.
+    void set_l0_exact_history(bool exact) noexcept;
+
+    // Greedy token and logit gap of each row of the last completed forward:
+    // row i yields its argmax and max_logit - logit(next[i]) (0 when next[i]
+    // < 0 or is the argmax). Requires a prepared continuation (head scratch).
+    // VeriCache verified root on the device: save at a verified frontier,
+    // restore to re-run (or correct) the tokens drafted after it. Restore also
+    // rewinds L0 aging and hot rows; the caller rewrites [root, position).
+    void save_verified_root(cudaStream_t stream = nullptr);
+    void restore_verified_root(cudaStream_t stream = nullptr);
+    int verified_root_position() const noexcept;
+    struct RowScore {
+        std::int64_t greedy = -1;
+        float gap = 0.0f;
+    };
+    std::vector<RowScore> exact_row_scores(std::span<const std::int64_t> next,
+                                           cudaStream_t stream = nullptr);
     int position() const noexcept { return position_; }
     const std::uint16_t* logits_device() const noexcept;
     std::vector<float> logits_host(cudaStream_t stream = nullptr) const;

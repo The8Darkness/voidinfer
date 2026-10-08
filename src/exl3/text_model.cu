@@ -1505,6 +1505,16 @@ struct Exl3TextContext::Impl {
     std::uint64_t native_mtp_hidden_capture_generation = 0;
     std::uint16_t* final_norm = nullptr;
     std::uint16_t* logits = nullptr;
+    // Final residual rows of the last completed layer stack (exact_row_scores).
+    std::uint16_t* last_stack_output = nullptr;
+    // VeriCache verified root: device GDN recurrent/convolution checkpoint and
+    // frontier metadata, independent of the per-round transaction.
+    struct VerifiedRoot {
+        std::unique_ptr<DeviceAllocation> recurrent, conv;
+        std::array<Exl3GdnLayerCheckpoint, kLayers> checkpoints{};
+        int position = -1, last_rows = 0, tap_rows = 0, embedding_rows = 0;
+    };
+    std::unique_ptr<VerifiedRoot> verified_root;
     Exl3CudaLinearWorkspace::Owner head_workspace;
     std::unique_ptr<DeviceAllocation> greedy_rows;
     std::array<std::shared_ptr<Exl3GreedyPacketTransfer>,2> greedy_transfers;
@@ -3771,6 +3781,7 @@ struct Exl3TextContext::Impl {
             current = next;
         }
         if (events) record(events->layer_stack_end, stream, "record E4B1 layer stack end");
+        last_stack_output = current;
         if (skip_head) {
             require(!host_kv.enabled && !forward_publish_device_prefix &&
                     !events && !graph_active && !graph_capture_active,
@@ -9346,6 +9357,190 @@ void Exl3TextContext::finish_exact_continuation(cudaStream_t stream) {
     impl_->continuation->rows=0;
 }
 
+namespace {
+// One CTA per row: argmax over the FP16 logits (lowest index on ties) and the
+// gap max - logit(next[row]).
+__global__ void __launch_bounds__(1024) exact_row_score_kernel(const std::uint16_t* logits,
+    const std::int64_t* next,std::int64_t* greedy,float* gap) {
+    __shared__ float best_value[32];
+    __shared__ int best_index[32];
+    const int row=static_cast<int>(blockIdx.x),tid=static_cast<int>(threadIdx.x);
+    const auto* in=reinterpret_cast<const __half*>(logits)+static_cast<std::size_t>(row)*kVocab;
+    float value=-INFINITY;
+    int index=kVocab;
+    for(int i=tid;i<kVocab;i+=blockDim.x) {
+        const float v=__half2float(in[i]);
+        if(v>value) { value=v; index=i; }
+    }
+    for(int o=16;o>0;o>>=1) {
+        const float ov=__shfl_xor_sync(0xffffffffU,value,o);
+        const int oi=__shfl_xor_sync(0xffffffffU,index,o);
+        if(ov>value || (ov==value && oi<index)) { value=ov; index=oi; }
+    }
+    if((tid&31)==0) { best_value[tid>>5]=value; best_index[tid>>5]=index; }
+    __syncthreads();
+    if(tid==0) {
+        for(int w=1;w<static_cast<int>(blockDim.x>>5);++w)
+            if(best_value[w]>value || (best_value[w]==value && best_index[w]<index)) {
+                value=best_value[w]; index=best_index[w];
+            }
+        greedy[row]=index;
+        const std::int64_t token=next[row];
+        gap[row]=token>=0 && token<kVocab && token!=index?value-__half2float(in[token]):0.0f;
+    }
+}
+} // namespace
+
+void Exl3TextContext::save_verified_root(cudaStream_t stream) {
+    require(position_>0 && impl_->last_rows>0 && !impl_->graph_capture_active &&
+            (!impl_->transaction || !impl_->transaction->active),
+            "verified root needs a completed forward outside a transaction");
+    if(!impl_->verified_root) {
+        auto root=std::make_unique<Impl::VerifiedRoot>();
+        std::size_t recurrent_bytes=0,conv_bytes=0;
+        for(const auto& layer:impl_->gdn_layers) if(layer) {
+            recurrent_bytes+=layer->recurrent_state_bytes();
+            conv_bytes+=layer->physical_conv_state_bytes();
+        }
+        root->recurrent=std::make_unique<DeviceAllocation>(recurrent_bytes,"allocate verified root recurrent state");
+        root->conv=std::make_unique<DeviceAllocation>(conv_bytes,"allocate verified root convolution state");
+        auto* recurrent=static_cast<std::byte*>(root->recurrent->ptr);
+        auto* conv=static_cast<std::byte*>(root->conv->ptr);
+        for(int layer=0;layer<kLayers;++layer) {
+            if(!impl_->gdn_layers[layer]) continue;
+            const auto recurrent_size=impl_->gdn_layers[layer]->recurrent_state_bytes();
+            const auto conv_size=impl_->gdn_layers[layer]->physical_conv_state_bytes();
+            auto& checkpoint=root->checkpoints[layer];
+            checkpoint={static_cast<void*>(recurrent),recurrent_size,conv,conv_size};
+            checkpoint.model_owner=impl_->model->host_state_identity;
+            checkpoint.model_layer=layer;
+            checkpoint.recurrent_layer_stride_bytes=Exl3GdnRecurrentLayout::recurrent_bytes;
+            checkpoint.convolution_layer_stride_bytes=Exl3GdnRecurrentLayout::convolution_storage_bytes;
+            recurrent+=recurrent_size;
+            conv+=conv_size;
+        }
+        impl_->verified_root=std::move(root);
+    }
+    auto& root=*impl_->verified_root;
+    impl_->join_repair(stream);
+    for(int layer=0;layer<kLayers;++layer)
+        if(impl_->gdn_layers[layer])
+            impl_->gdn_layers[layer]->save_checkpoint(root.checkpoints[layer],position_,stream);
+    root.position=position_;
+    root.last_rows=impl_->last_rows;
+    root.tap_rows=impl_->tap_rows;
+    root.embedding_rows=impl_->embedding_rows;
+}
+
+void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
+    require(impl_->verified_root && impl_->verified_root->position>0 && !impl_->graph_capture_active &&
+            (!impl_->transaction || !impl_->transaction->active),
+            "verified root restore needs a saved root outside a transaction");
+    auto& root=*impl_->verified_root;
+    impl_->join_repair(stream);
+    for(int layer=0;layer<kLayers;++layer)
+        if(impl_->gdn_layers[layer]) {
+            impl_->gdn_layers[layer]->validate_saved_checkpoint(root.checkpoints[layer],root.position);
+            impl_->gdn_layers[layer]->restore_checkpoint(root.checkpoints[layer],stream);
+        }
+    for(auto& layer:impl_->full_layers)
+        if(layer) {
+            layer->invalidate_retained_prefix();
+            layer->l0_rewind(root.position,stream);
+        }
+    const std::array<int,3> layout{root.position-1,0,0};
+    cuda_check(cudaMemcpyAsync(impl_->position_device,layout.data(),sizeof(layout),cudaMemcpyHostToDevice,stream),
+        "restore verified root device position");
+    position_=root.position;
+    impl_->last_rows=root.last_rows;
+    impl_->tap_rows=root.tap_rows;
+    impl_->embedding_rows=root.embedding_rows;
+    if(impl_->continuation) impl_->continuation->rows=0;
+    impl_->tap_generation.fetch_add(1,std::memory_order_release);
+    impl_->qkv_trace_valid=false;
+    impl_->invalidate_native_mtp_hidden_capture();
+}
+
+int Exl3TextContext::verified_root_position() const noexcept {
+    return impl_->verified_root?impl_->verified_root->position:-1;
+}
+
+void Exl3TextContext::set_l0_exact_history(bool exact) noexcept {
+    for(auto& layer:impl_->full_layers) if(layer) layer->set_l0_exact_history(exact);
+}
+
+std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
+    std::span<const std::int64_t> next,cudaStream_t stream) {
+    const int rows=impl_->last_rows;
+    require(impl_->continuation && impl_->continuation->capacity>0 && impl_->last_stack_output &&
+            rows>0 && next.size()==static_cast<std::size_t>(rows) &&
+            !impl_->graph_active && !impl_->graph_capture_active,
+            "exact row scores need a completed eager forward and prepared continuation head");
+    auto& scratch=*impl_->continuation;
+    // Private 16-row native head (the continuation head holds 8 rows): half
+    // the head weight streams per verified block. Never freed (process-lived,
+    // like the row buffers).
+    struct Buffers {
+        std::int64_t* next=nullptr; std::int64_t* greedy=nullptr; float* gap=nullptr; int rows=0;
+        Exl3CudaLinearWorkspace* head=nullptr; std::uint16_t* norm=nullptr; std::uint16_t* logits=nullptr;
+        bool head_tried=false;
+    };
+    static thread_local Buffers buffers;
+    constexpr int kScoreRows=16;
+    if(!buffers.head_tried) {
+        buffers.head_tried=true;
+        auto* head=new Exl3CudaLinearWorkspace(kHidden,kVocab,kScoreRows);
+        head->set_native_continuation16(true);
+        if(std::strcmp(head->dispatch_name(impl_->model->lm_head_metadata,kScoreRows),"h6_small_m_single_split")==0) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.norm),
+                static_cast<std::size_t>(kScoreRows)*kHidden*sizeof(std::uint16_t)),"row score head rows");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.logits),
+                static_cast<std::size_t>(kScoreRows)*kVocab*sizeof(std::uint16_t)),"row score head logits");
+            buffers.head=head;
+        } else delete head;
+    }
+    if(buffers.rows<rows) {
+        cudaFree(buffers.next); cudaFree(buffers.greedy); cudaFree(buffers.gap);
+        const int capacity=std::max(rows,1024);
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.next),capacity*sizeof(std::int64_t)),"row score buffers");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.greedy),capacity*sizeof(std::int64_t)),"row score buffers");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.gap),capacity*sizeof(float)),"row score buffers");
+        buffers.rows=capacity;
+    }
+    cuda_check(cudaMemcpyAsync(buffers.next,next.data(),next.size_bytes(),cudaMemcpyHostToDevice,stream),
+        "upload row score next tokens");
+    auto* norm=buffers.head?buffers.norm:static_cast<std::uint16_t*>(scratch.final_norm->ptr);
+    auto* all_logits=buffers.head?buffers.logits:static_cast<std::uint16_t*>(scratch.logits->ptr);
+    auto& head_workspace=buffers.head?*buffers.head:*scratch.head_workspace;
+    const int chunk=buffers.head?kScoreRows:scratch.capacity;
+    for(int first=0;first<rows;first+=chunk) {
+        const int count=std::min(chunk,rows-first);
+        for(int row=0;row<count;++row) {
+            final_rms_norm_kernel<<<1,512,0,stream>>>(
+                impl_->last_stack_output+static_cast<std::size_t>(first+row)*kHidden,
+                impl_->model->final_norm,norm+static_cast<std::size_t>(row)*kHidden);
+        }
+        const char* dispatch=head_workspace.dispatch_name(impl_->model->lm_head_metadata,count);
+        if(std::strcmp(dispatch,"h6_small_m_single_split")==0)
+            head_workspace.forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+                norm,all_logits,count,stream);
+        else for(int row=0;row<count;++row)
+            impl_->head_workspace->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+                norm+static_cast<std::size_t>(row)*kHidden,all_logits+static_cast<std::size_t>(row)*kVocab,1,stream);
+        exact_row_score_kernel<<<count,1024,0,stream>>>(all_logits,buffers.next+first,
+            buffers.greedy+first,buffers.gap+first);
+        cuda_check(cudaGetLastError(),"launch exact row scores");
+    }
+    std::vector<std::int64_t> greedy(rows);
+    std::vector<float> gap(rows);
+    cuda_check(cudaMemcpyAsync(greedy.data(),buffers.greedy,rows*sizeof(std::int64_t),cudaMemcpyDeviceToHost,stream),"row score greedy");
+    cuda_check(cudaMemcpyAsync(gap.data(),buffers.gap,rows*sizeof(float),cudaMemcpyDeviceToHost,stream),"row score gaps");
+    cuda_check(cudaStreamSynchronize(stream),"row scores");
+    std::vector<RowScore> result(rows);
+    for(int i=0;i<rows;++i) result[i]={greedy[i],gap[i]};
+    return result;
+}
+
 void Exl3TextContext::finish_exact_prefill(cudaStream_t stream) {
     require(!impl_->continuation || impl_->continuation->rows==0,"exact prefill still has continuation output");
     canonicalize_exact_rows(stream);
@@ -11926,8 +12121,8 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                     // Parked INT2 history: the FP16 planes are read only for the
                     // sink, the exact window and rows not yet encoded; older rows
                     // stay stale (export shares the restored pages for them).
-                    // l0_oscar::history_end: sink 64, recent 256, 64-row alignment.
-                    const int history_end=std::max(64,((state.position_-256)/64)*64);
+                    // l0_oscar::history_end: sink 64, exact recent window, 64-row alignment.
+                    const int history_end=std::max(64,((state.position_-exl3_l0_recent_rows())/64)*64);
                     const int window=std::min(state.l0_rows_,history_end);
                     const int first=(window/Exl3ExactKVPage::token_capacity)*Exl3ExactKVPage::token_capacity;
                     constexpr std::size_t row=1024;

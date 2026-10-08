@@ -7462,6 +7462,7 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         if (kv_fakequant::config().mode)
             throw std::invalid_argument("L0 OSCAR and KV fake-quant are exclusive");
         (void)l0_oscar::assets();
+        l0_oscar::set_recent_rows();
         auto& l=l0_;
         l.capacity=capacity; l.rows=8; l.bank=fakequant_bank_;
         // Verifier history: a fixed number of device-sized spans (l0_oscar::history_span).
@@ -7482,6 +7483,15 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         const std::size_t sink_bytes=static_cast<std::size_t>(l0_oscar::kSink)*kKVHeads*kHeadDim*2;
         alloc(l.k_ring,ring_bytes); alloc(l.v_ring,ring_bytes);
         alloc(l.k_sink,sink_bytes); alloc(l.v_sink,sink_bytes);
+        // NINFER_EXL3_L0_EXACT (research): 1 = exact history everywhere,
+        // prefill / decode = only for prefill chunks / verifier rows.
+        if(const char* exact=std::getenv("NINFER_EXL3_L0_EXACT")) {
+            const std::string_view mode(exact);
+            if(mode!="0" && mode!="1" && mode!="prefill" && mode!="decode")
+                throw std::invalid_argument("NINFER_EXL3_L0_EXACT must be 0, 1, prefill or decode");
+            l0_exact_=mode=="1" || mode=="decode";
+            l0_exact_prefill_=mode=="1" || mode=="prefill";
+        }
         l.hot_slots=l0_oscar::hot_config().slots;
         if(l.hot_slots) {
             const std::size_t slots=static_cast<std::size_t>(kKVHeads)*l.hot_slots;
@@ -7582,6 +7592,12 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
         l0_oscar::hot_clear_kernel<<<64,256,0,stream>>>(l0_oscar::hot_view(l0_));
         cuda_check(cudaGetLastError(),"L0 OSCAR hot rows reset");
     }
+}
+
+void Exl3FullAttentionLayer::l0_rewind(int position, cudaStream_t stream) {
+    if(!l0_.k_codes) return;
+    l0_oscar::rewind_kernel<<<16,256,0,stream>>>(l0_.state,l0_oscar::hot_view(l0_),position);
+    cuda_check(cudaGetLastError(),"L0 OSCAR verified-root rewind");
 }
 
 int Exl3FullAttentionLayer::l0_history_watermark(cudaStream_t stream) const {
@@ -8559,6 +8575,12 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                exact_prefix_rows_ || exact_page_ranges_.count ||
                position+rows-l0_prefill_history>l0_oscar::kRingRows)
                 throw std::invalid_argument("L0 OSCAR prefill route preconditions");
+            if(l0_exact_prefill_) {
+                // Exact history from the FP16 L2 planes, merged straight into split 4.
+                l0_exact_history_staged(qr,k_cache_,v_cache_,l0_.prefill_hist,l0_.prefill_hist_stats,
+                    l0_.prefill_split+static_cast<std::size_t>(4)*rows*kQHeads*kHeadDim,l0_.prefill_split_stats,4,rows,
+                    l0_prefill_history,stream);
+            } else {
             const auto& a=l0_oscar::assets();
             constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
             l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
@@ -8573,6 +8595,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             l0_launch_rotate(l0_.prefill_numer,a.rvt16+l0_.bank*bank_elements,
                 l0_.prefill_split+static_cast<std::size_t>(4)*rows*kQHeads*kHeadDim,rows,
                 nullptr,nullptr,stream);
+            }
             launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
                 cache_capacity_,l0_.prefill_split,l0_.prefill_split_stats,stream,
                 l0_prefill_history,false,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
@@ -9109,6 +9132,20 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 if(rows>l0_.rows) throw std::invalid_argument("L0 OSCAR history rows");
                 const auto& a=l0_oscar::assets();
                 constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
+                if(l0_exact_) {
+                    // Exact history from the FP16 L2 planes: the rotated term is
+                    // zero and l0_rotate_kernel adds the original-basis numerator.
+                    const int splits=std::max(1,std::min(l0_.segments,4*l0_.prefill_rows/rows));
+                    l0_launch_exact_history(qr,k_cache_,v_cache_,0,l0_.prefill_hist,l0_.prefill_hist_stats,rows,
+                        l0_oscar::kSink,-1,position,position_device_,cache_capacity_,splits,stream);
+                    l0_exact_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
+                        l0_.prefill_hist_stats,splits,rows,l0_.hist_hot,nullptr,0,l0_.hist_slot,
+                        reinterpret_cast<__half*>(l0_.hist_rotated));
+                    l0_launch_rotate<float,true>(l0_.hist_rotated,a.rvt16+l0_.bank*bank_elements,
+                        l0_.hist_slot,rows,nullptr,nullptr,stream,l0_.hist_hot);
+                    launch(cudaGetLastError(),"L0 OSCAR exact history attention");
+                    history_slot=l0_.hist_slot;
+                } else {
                 l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
                     rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
                 const auto& hot_config=l0_oscar::hot_config();
@@ -9141,6 +9178,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     l0_.hist_slot,rows,nullptr,nullptr,stream,hot_ctas?l0_.hist_hot:nullptr);
                 launch(cudaGetLastError(),"L0 OSCAR history attention");
                 history_slot=l0_.hist_slot;
+                }
             }
             if(mma && l0_.k_ring)
                 launch_verify_flash_mma(qr,l0_.k_ring,l0_.v_ring,exact_scores_,

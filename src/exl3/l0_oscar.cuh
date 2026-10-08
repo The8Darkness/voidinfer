@@ -33,7 +33,25 @@
 namespace ninfer::exl3::l0_oscar {
 
 constexpr int kSink = 64;
-constexpr int kRecent = 256;
+// Exact recent window (exl3_l0_recent_rows): device code reads the copy
+// installed at L0 storage setup (set_recent_rows) in this translation unit.
+static __constant__ int recent_rows_device = 256;
+inline void set_recent_rows() {
+    static const bool installed = [] {
+        const int rows = exl3_l0_recent_rows();
+        if (cudaMemcpyToSymbol(recent_rows_device, &rows, sizeof(rows)) != cudaSuccess)
+            throw std::runtime_error("L0 OSCAR recent window installation");
+        return true;
+    }();
+    (void)installed;
+}
+__host__ __device__ __forceinline__ int recent_rows() {
+#ifdef __CUDA_ARCH__
+    return recent_rows_device;
+#else
+    return exl3_l0_recent_rows();
+#endif
+}
 constexpr int kAlign = 64;
 constexpr int kDim = 256;
 constexpr int kKVHeadsL0 = 4;
@@ -122,10 +140,10 @@ inline const Assets& assets() {
     return value;
 }
 
-// History extent [kSink, history_end(base)): committed rows at least kRecent
+// History extent [kSink, history_end(base)): committed rows at least recent_rows()
 // behind the committed base, aligned down to kAlign.
 __host__ __device__ __forceinline__ int history_end(int base) {
-    const int end = ((base - kRecent) / kAlign) * kAlign;
+    const int end = ((base - recent_rows()) / kAlign) * kAlign;
     return end > kSink ? end : kSink;
 }
 
@@ -144,11 +162,11 @@ __device__ __forceinline__ float l0_block_max(float v, float* scratch) {
 // round's history LSE, `ref`) exceeds tau; an exact FP16 pass covers the hot
 // slots, and each round replaces the stalest slots with the best candidates,
 // filled from the FP16 L2 planes. NINFER_EXL3_L0_HOT = slots per KV head and
-// layer (default 1024, a multiple of 32; 0 = off).
+// layer (default 512, a multiple of 32; 0 = off).
 constexpr int kHotCandidates = 1024;   // per KV head and round
 constexpr int kHotMaxInsert = 64;      // per KV head and round
 struct HotConfig {
-    int slots = 1024;               // per KV head and layer
+    int slots = 512;                // per KV head and layer
     float log2_tau = -8.965784f;    // candidates: p > 2e-3 of the history mass
     int insert = 32;                // slots replaced per KV head and round at most
     float lambda = 0.01f;           // priority decay per committed token (ln units)
@@ -156,6 +174,7 @@ struct HotConfig {
 inline const HotConfig& hot_config() {
     static const HotConfig value = [] {
         HotConfig c;
+
         if (const char* v = std::getenv("NINFER_EXL3_L0_HOT")) {
             char* end = nullptr;
             const long slots = std::strtol(v, &end, 10);
@@ -281,6 +300,27 @@ __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cach
             meta[2 * g] = __float2half_rn(scale);
             meta[2 * g + 1] = __float2half_rn(zero);
         }
+    }
+}
+
+// Rewind to a verified root at `position`: rows from history_end(position) on
+// are re-encoded from the (rewritten) L2 planes, and hot rows among them are
+// dropped together with pending candidates.
+__global__ void rewind_kernel(int* state, HotView hot, int position) {
+    const int end = history_end(position);
+    const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index == 0) {
+        state[0] = min(state[0], end);
+        state[1] = position;
+    }
+    if (!hot.slots) return;
+    if (index < 4) { hot.count[index] = 0; hot.won[index] = 0; }
+    for (int i = index; i < 4 * hot.slots; i += static_cast<int>(gridDim.x * blockDim.x)) {
+        const int row = hot.row[i];
+        if (row < end) continue;
+        const int kv = i / hot.slots;
+        atomicAnd(hot.bits + kv * hot.words + (row >> 5), ~(1u << (row & 31)));
+        hot.row[i] = -1;
     }
 }
 

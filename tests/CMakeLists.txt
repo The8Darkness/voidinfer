@@ -702,6 +702,14 @@ ninfer_add_test(research_exl3_long_nll
   SOURCES research_exl3_long_nll.cpp
   LIBRARIES ninfer_exl3_text_model ninfer_ops)
 set_tests_properties(research_exl3_long_nll PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(research_exl3_vericache
+  SOURCES research_exl3_vericache.cpp
+  LIBRARIES ninfer_exl3_text_model ninfer_ops)
+set_tests_properties(research_exl3_vericache PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(research_exl3_overlap
+  SOURCES research_exl3_overlap.cpp
+  LIBRARIES ninfer_exl3_text_model ninfer_ops CUDA::cuda_driver)
+set_tests_properties(research_exl3_overlap PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(research_exl3_l0_agents
   SOURCES research_exl3_l0_agents.cpp
   LIBRARIES ninfer_exl3_text_model ninfer_ops)

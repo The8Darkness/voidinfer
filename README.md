@@ -59,18 +59,36 @@ fused weight decode, FA2-style GQA attention with FP16-accumulated tensor-core s
 chunk-parallel Gated-DeltaNet recurrence.
 
 **L0 OSCAR with exact hot rows (default KV tier).** Attention history beyond an exact 64-token sink
-and the recent window is stored as calibrated-rotation INT2 codes on the device, with FP16 planes
+and the exact 960-token recent window is stored as calibrated-rotation INT2 codes on the device, with FP16 planes
 in pinned host memory (L2). History attention runs on int8 MMAs for QK and u8 MMAs for PV.
 Attention mass is concentrated: a small, slowly changing set of history rows carries most of it.
-So each layer keeps 1,024 rows per KV head as exact FP16 copies on the device (the hot rows, 64 MiB
-in total). The INT2 kernel skips them, and every history CTA first attends exactly to its share of
+So each layer keeps 512 rows per KV head as exact FP16 copies on the device (the hot rows, 32 MiB
+in total; `NINFER_EXL3_L0_HOT` sets 0..4096). The INT2 kernel skips them, and every history CTA first attends exactly to its share of
 them. The INT2 pass also nominates rows whose probability crosses 0.2% of the history mass as a
 side effect, and the stalest hot rows are swapped for those candidates each round (copied from L2
 beside the next round's encode). On the DFlash2 verify-quality gate (4K/16K × code/prose, 2,016
 teacher-forced rows) this cuts the paired NLL loss against FP16 KV from +0.024 to +0.006
-nats/token and raises top-1 agreement from 95.1% to 97.1%. It costs 0.2–0.4 ms per speculative
+nats/token and raises top-1 agreement from 95.1% to 96.8%. It costs 0.2–0.4 ms per speculative
 round (1–2%). Rounds take 18.3 ms at 4K and 18.5–20.3 ms from 16K to 128K; parked agent contexts
 resume in 0.3–1.9 s.
+
+**VeriCache (opt-in, `NINFER_EXL3_VERICACHE=1`).** Block-parallel verification of L0 output
+against the exact FP16 history, after VeriCache (arXiv 2605.17613). The prompt is ingested with exact
+FP16 history attention. DFlash2 then drafts blocks of up to 1,024 tokens on L0 without publishing
+them. One wide exact pass over the block rescores every row against FP16 history streamed from host
+RAM. In tolerance mode (default, `NINFER_EXL3_VERICACHE_DELTA=1.0`), a token is accepted when its
+exact logit is within δ of the exact top logit. The first token outside δ is replaced by the exact
+argmax and the rest of the block is redrafted. `NINFER_EXL3_VERICACHE=exact` requires exact-greedy
+agreement on 64-token blocks. Tokens are published only after verification, and the verified prefix
+becomes the next exact root (device GDN checkpoint plus L0 rewind).
+
+Measured with DFlash2 on the code workload, 1,024 output tokens:
+
+* Tolerance mode costs +8% per round at 16K (20.06 vs 18.56 ms) and +9% at 64K (21.21 vs 19.45 ms).
+* A typical 1,024-token block needs no correction, and 13–23 accepted tokens are not the exact
+  argmax (all within δ).
+* The verifier pass is compute-bound: weight reconstruction plus FP16 GEMMs, and history attention
+  at about 1 ms per 1K context per pass.
 
 **Engineering discipline.** Every speed-up is gated by an exact oracle or a paired quality check.
 Rejected ideas stay documented with their measurements (see
@@ -99,6 +117,9 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
   `NINFER_EXL3_L0_OSCAR=0` selects FP16 device KV (DFlash2 contexts to ~16K on 32 GiB) and
   `NINFER_EXL3_L0_HOT=0` turns the hot rows off. The OSCAR rotations are read from
   `<model directory>/l0_oscar` (or `NINFER_EXL3_L0_OSCAR_ROT`).
+* VeriCache is opt-in on the coherent-device Engine route and costs +8–9% round time.
+  Plain concurrent streams do not overlap the verifier pass with drafting. SM partitions (green
+  contexts) would first need the cooperative decode GEMVs re-gridded for a smaller SM budget.
 * The public Engine route is DFlash2-only; base decode is measured on the target-only route.
 * Research routes and default-off kernels keep explicit dispositions in
   [docs/current-status.md](docs/current-status.md) and are not presented as supported defaults.
