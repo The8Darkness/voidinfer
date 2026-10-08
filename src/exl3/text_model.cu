@@ -1171,6 +1171,16 @@ struct Exl3TextContext::Impl {
         ordinary_full_layer_graphs{};
     bool ordinary_full_layer_graphs_enabled=false;
     bool ordinary_full_layer_graph_extended_replay=false;
+    // Batched multi-agent continuation: one captured 16-row layer stack per
+    // (peer, row shape), replayed by continue_rows_batched.
+    struct BatchedGraph {
+        const void* peer=nullptr;
+        int own_rows=0,peer_rows=0;
+        std::uint16_t* stack_output=nullptr;
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable executable;
+    };
+    std::unique_ptr<BatchedGraph> batched_graph;
     // Continuation (verifier) rows 2..8 replay captured full-layer graphs too;
     // the retained-prefix capability is re-armed on the host after replay.
     bool ordinary_full_layer_multirow_graphs_enabled=false;
@@ -3827,7 +3837,7 @@ struct Exl3TextContext::Impl {
         last_stack_output = current;
         if (skip_head) {
             require(!host_kv.enabled && !forward_publish_device_prefix &&
-                    !events && !graph_active && !graph_capture_active,
+                    !events && !graph_active && (!graph_capture_active || continuation_reference),
                     "layer-major partial forward requires ordinary eager ownership");
             return;
         }
@@ -9255,6 +9265,98 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     ++last_decode_h2d_;
 }
 
+// Pairs every layer of a batched owner with the peer's layer of the same index
+// for the lifetime of one batched forward (eager or captured).
+struct Exl3TextContext::BatchBinding {
+    Impl& owner;
+    std::array<Exl3FullAttentionLayer::Batch,kLayers> full{};
+    std::array<Exl3GdnLayer::Batch,kLayers> gdn{};
+    BatchBinding(Impl& owner_,Impl& peer,int own_rows,int peer_rows,int peer_position) : owner(owner_) {
+        for(int layer=0;layer<kLayers;++layer) {
+            if(owner.full_layers[layer]) {
+                require(static_cast<bool>(peer.full_layers[layer]),"batched layer topology");
+                full[layer].own_rows=own_rows;
+                full[layer].peer_count=1;
+                full[layer].peers[0]={peer.full_layers[layer].get(),peer_rows,peer_position};
+                owner.full_layers[layer]->set_batch(&full[layer]);
+            } else if(owner.gdn_layers[layer]) {
+                require(static_cast<bool>(peer.gdn_layers[layer]),"batched layer topology");
+                gdn[layer].own_rows=own_rows;
+                gdn[layer].peer_count=1;
+                gdn[layer].peers[0]={peer.gdn_layers[layer].get(),peer_rows};
+                owner.gdn_layers[layer]->set_batch(&gdn[layer]);
+            }
+        }
+    }
+    ~BatchBinding() {
+        for(auto& layer:owner.full_layers)if(layer)layer->set_batch(nullptr);
+        for(auto& layer:owner.gdn_layers)if(layer)layer->set_batch(nullptr);
+    }
+    BatchBinding(const BatchBinding&)=delete;
+    BatchBinding& operator=(const BatchBinding&)=delete;
+};
+
+void Exl3TextContext::prepare_batched_continuation_graph(Exl3TextContext& peer,
+    int own_rows,int peer_rows) {
+    require(&peer!=this && peer.impl_->model==impl_->model &&
+            own_rows>=2 && own_rows<=8 && peer_rows>=2 && peer_rows<=8,
+        "batched continuation graph shape");
+    Exl3TextContext* contexts[2]={this,&peer};
+    for(auto* context:contexts) {
+        auto& impl=*context->impl_;
+        require(impl.capture_taps && !impl.graph_active && !impl.graph_capture_active &&
+                !impl.host_kv.enabled && !impl.oscar &&
+                (!impl.transaction || !impl.transaction->active),
+            "batched continuation graph capture requires idle device-KV contexts");
+    }
+    const int rows=own_rows+peer_rows;
+    require(impl_->prefill_capacity>=rows,"batched continuation exceeds the owner's row capacity");
+    // Captured launches read the live positions from each context's
+    // position_device; capture at the end of the context like the per-layer
+    // graphs so capacity-sized grids cover every replay position.
+    // The owner's attention geometry covers all rows of the launch.
+    const int own_position=impl_->max_context-rows;
+    const int peer_position=peer.impl_->max_context-peer_rows;
+    auto graph=std::make_unique<Impl::BatchedGraph>();
+    graph->peer=peer.impl_.get();
+    graph->own_rows=own_rows;
+    graph->peer_rows=peer_rows;
+    cudaStream_t capture_stream=nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&capture_stream,cudaStreamNonBlocking),
+        "create batched continuation capture stream");
+    const auto set_capture=[&](bool active) {
+        for(auto* context:contexts) {
+            auto& impl=*context->impl_;
+            for(auto& layer:impl.full_layers)if(layer) {
+                layer->set_capture_active(active);
+                layer->set_ordinary_full_layer_graph_capture(active);
+            }
+            for(auto& layer:impl.gdn_layers)if(layer)layer->set_capture_active(active);
+        }
+        impl_->graph_capture_active=active;
+    };
+    try {
+        BatchBinding binding(*impl_,*peer.impl_,own_rows,peer_rows,peer_position);
+        set_capture(true);
+        graph->definition.capture(capture_stream,[&] {
+            impl_->process_rows(impl_->token_ids,rows,own_position,capture_stream,nullptr,true,true,true,
+                false,false,nullptr,0,kLayers,nullptr,nullptr,true);
+        });
+        set_capture(false);
+        graph->stack_output=impl_->last_stack_output;
+        graph->executable.instantiate(graph->definition);
+        graph->executable.upload(capture_stream);
+        cuda_check(cudaStreamSynchronize(capture_stream),"prepare batched continuation graph");
+    } catch(...) {
+        set_capture(false);
+        (void)cudaStreamSynchronize(capture_stream);
+        (void)cudaStreamDestroy(capture_stream);
+        throw;
+    }
+    cuda_check(cudaStreamDestroy(capture_stream),"destroy batched continuation capture stream");
+    impl_->batched_graph=std::move(graph);
+}
+
 void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
     std::span<const std::int64_t> own_tokens,std::span<const std::int64_t> peer_tokens,
     cudaStream_t stream) {
@@ -9323,33 +9425,30 @@ void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
         }
         for(auto& layer:impl.full_layers)if(layer)layer->invalidate_retained_prefix();
     }
-    // Pair every layer of the owner with the peer's layer of the same index.
-    std::array<Exl3FullAttentionLayer::Batch,kLayers> full_batches{};
-    std::array<Exl3GdnLayer::Batch,kLayers> gdn_batches{};
-    const auto clear_batches=[&] {
-        for(auto& layer:impl_->full_layers)if(layer)layer->set_batch(nullptr);
-        for(auto& layer:impl_->gdn_layers)if(layer)layer->set_batch(nullptr);
-    };
-    for(int layer=0;layer<kLayers;++layer) {
-        if(impl_->full_layers[layer]) {
-            require(static_cast<bool>(peer.impl_->full_layers[layer]),"batched layer topology");
-            full_batches[layer].own_rows=own_rows;
-            full_batches[layer].peer_count=1;
-            full_batches[layer].peers[0]={peer.impl_->full_layers[layer].get(),peer_rows,base_positions[1]};
-            impl_->full_layers[layer]->set_batch(&full_batches[layer]);
-        } else if(impl_->gdn_layers[layer]) {
-            require(static_cast<bool>(peer.impl_->gdn_layers[layer]),"batched layer topology");
-            gdn_batches[layer].own_rows=own_rows;
-            gdn_batches[layer].peer_count=1;
-            gdn_batches[layer].peers[0]={peer.impl_->gdn_layers[layer].get(),peer_rows};
-            impl_->gdn_layers[layer]->set_batch(&gdn_batches[layer]);
+    auto* graph=impl_->batched_graph.get();
+    if(graph && graph->peer==peer.impl_.get() && graph->own_rows==own_rows &&
+       graph->peer_rows==peer_rows && graph->executable.ready()) {
+        // Replay bypasses the host-side retained-prefix arming of the eager
+        // forwards; reproduce it per agent exactly as the per-layer graphs do.
+        graph->executable.launch(stream);
+        impl_->last_stack_output=graph->stack_output;
+        for(int c=0;c<2;++c) {
+            if(!arm_retained_prefix[c])continue;
+            auto& impl=*contexts[c]->impl_;
+            const int count=static_cast<int>(tokens[c].size());
+            for(int layer=0;layer<kLayers;++layer) {
+                if(impl.full_layers[layer])
+                    impl.full_layers[layer]->arm_captured_retained_prefix(count,base_positions[c],stream);
+                else if(impl.gdn_layers[layer])
+                    impl.gdn_layers[layer]->arm_captured_retained_prefix(
+                        impl.transaction->gdn_checkpoints[layer],count,stream);
+            }
         }
-    }
-    try {
+    } else {
+        BatchBinding binding(*impl_,*peer.impl_,own_rows,peer_rows,base_positions[1]);
         impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
             false,false,nullptr,0,kLayers,nullptr,nullptr,true);
-    } catch(...) {clear_batches();throw;}
-    clear_batches();
+    }
     // The owner's taps hold every row; the peer's rows move to its own taps.
     for(std::size_t tap=0;tap<impl_->taps.size();++tap)
         cuda_check(cudaMemcpyAsync(peer.impl_->taps[tap]->ptr,

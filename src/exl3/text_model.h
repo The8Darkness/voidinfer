@@ -978,6 +978,9 @@ public:
     void continue_rows_batched(Exl3TextContext& peer, std::span<const std::int64_t> own_tokens,
                                std::span<const std::int64_t> peer_tokens,
                                cudaStream_t stream = nullptr);
+    // Captures the batched layer stack for this (peer, own_rows, peer_rows)
+    // shape while both contexts are idle; continue_rows_batched replays it.
+    void prepare_batched_continuation_graph(Exl3TextContext& peer, int own_rows, int peer_rows);
 
     // Greedy token and logit gap of each row of the last completed forward:
     // row i yields its argmax and max_logit - logit(next[i]) (0 when next[i]
@@ -1262,6 +1265,7 @@ private:
     static std::shared_ptr<const Exl3TurboAngleWarmPages> make_turboangle_pages(
         std::shared_ptr<const Exl3ExactHostState> source, int rows);
     struct Impl;
+    struct BatchBinding;
     explicit Exl3TextContext(std::unique_ptr<Impl> impl);
     void reset_impl(cudaStream_t stream,bool preserve_exact_payload);
     Exl3RequestResetStats reset_for_request_impl(std::string_view contract,

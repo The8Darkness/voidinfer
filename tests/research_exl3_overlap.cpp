@@ -137,6 +137,7 @@ int main() {
             const int n = env_int("OVL_BATCH_ROWS", 8);
             const std::span<const std::int64_t> ta(ids.data() + context, static_cast<std::size_t>(n));
             const std::span<const std::int64_t> tb(ids.data() + context + 64, static_cast<std::size_t>(n));
+            if (env_int("OVL_GRAPH", 1)) d->prepare_batched_continuation_graph(*v, n, n);
             d->save_verified_root(sd); v->save_verified_root(sd);
             check(cudaStreamSynchronize(sd), "roots");
             const auto separate = [&] { d->continue_rows(ta, sd); v->continue_rows(tb, sd); };
