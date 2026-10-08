@@ -1,4 +1,5 @@
 #pragma once
+#include "exl3/gaming_optimizations.h"
 #include "exl3/target_q_continuation.h"
 #include "exl3/exact_kv_extent.h"
 #include "exl3/resource_inventory.h"
@@ -15,6 +16,7 @@
 #include "exl3/recurrent_export_pool.h"
 #include "exl3/greedy_packet.h"
 #include "exl3/mtp_runner.h"
+#include "exl3/l0_pinned_pool.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -332,6 +334,9 @@ public:
     // exact state produced by separate model processes; it is not an identity
     // or persistence format.
     std::uint64_t represented_payload_hash_for_test() const noexcept;
+    // Diagnostic only: names the first unequal represented field and element.
+    std::string represented_first_difference_for_test(
+        const Exl3ExactHostState& other) const;
     // Diagnostic-only value copy for comparisons across Engine lifetimes.
     // No model, registration, slab or source-page owner survives in this copy.
     std::shared_ptr<const Exl3ExactHostState> detached_payload_for_test() const;
@@ -379,6 +384,27 @@ private:
     std::array<std::vector<std::uint16_t>, 48> convolution_;
     std::vector<std::uint16_t> logits_, embedding_;
     std::array<std::vector<std::uint16_t>, 5> taps_;
+    // L0 OSCAR INT2 history parked with the state, so a resume skips
+    // re-encoding: per full-attention layer, immutable chunks of
+    // kL0ChunkRows encoded rows (codes [rows][4][64] K then V, FP16 meta
+    // [rows][4][4] K then V) covering [0, l0_rows_). Complete chunks are
+    // shared with later states of the same lineage.
+public:
+    static constexpr int kL0ChunkRows = 4096;
+    struct L0CodeChunk {
+        int first = 0, rows = 0;
+        Exl3L0PinnedPool::Block block;   // page-locked: codes, then meta
+        std::uint8_t* codes() const noexcept { return block.data; }
+        std::uint16_t* meta() const noexcept {
+            return reinterpret_cast<std::uint16_t*>(block.data + code_bytes());
+        }
+        std::size_t code_bytes() const noexcept { return static_cast<std::size_t>(rows) * 2 * 4 * 64; }
+        std::size_t meta_bytes() const noexcept { return static_cast<std::size_t>(rows) * 2 * 4 * 4 * 2; }
+    };
+private:
+    int l0_rows_ = 0;
+    bool l2_fp8_ = false;   // kv_pages_ hold FP8 rows (l0_l2_fp8.cuh)
+    std::array<std::vector<std::shared_ptr<const L0CodeChunk>>, 16> l0_chunks_;
     friend class Exl3TextContext;
 };
 
@@ -479,7 +505,8 @@ public:
     // reconstruction to its existing separate coordinator transaction.
     std::shared_ptr<Exl3TextContext> create_context_reserved(
         Exl3VeriCacheServingCoordinator&,bool capture_taps=true,
-        unsigned startup_fault_for_test=0,bool enable_qualified_media=false) const;
+        unsigned startup_fault_for_test=0,bool enable_qualified_media=false,
+        bool allow_ordinary_graphs=true) const;
     int layer_count() const noexcept { return 64; }
     int full_attention_layer_count() const noexcept { return 16; }
     int gdn_layer_count() const noexcept { return 48; }
@@ -500,7 +527,8 @@ private:
     ContextConstruction create_context_impl(bool capture_taps,bool allocate_device_prefix,
         bool defer_reconstruction,Exl3VeriCacheServingCoordinator* authority,unsigned startup_fault=0,
         const std::function<void(const Exl3ResourceInventory::Requirement&)>& extend={},
-        Exl3ResourceInventory* actual_result=nullptr,bool enable_qualified_media=false) const;
+        Exl3ResourceInventory* actual_result=nullptr,bool enable_qualified_media=false,
+        bool allow_ordinary_graphs=true) const;
     struct Impl;
     explicit Exl3TextModel(std::unique_ptr<Impl> impl);
     std::shared_ptr<Impl> impl_; // immutable uploaded backing also retained by contexts
@@ -644,7 +672,14 @@ public:
     void append_media_embeddings_numeric(std::span<const float> embeddings,
         std::span<const std::int32_t> positions_xyz,cudaStream_t stream=nullptr);
     int rope_offset() const noexcept;
+    GoptSubmissions gaming_submissions() const noexcept;
     Exl3HostKVStats host_kv_stats() const noexcept;
+    struct DeviceTransactionCheckpointGraphStats {
+        std::uint64_t captures=0,replays=0;
+        double capture_ms=0.0;
+    };
+    DeviceTransactionCheckpointGraphStats
+        device_transaction_checkpoint_graph_stats() const noexcept;
     struct HostKVGdnSegmentGraphStats {
         std::uint64_t captures=0,replays=0;
         double capture_ms=0.0;
@@ -652,6 +687,7 @@ public:
     };
     HostKVGdnSegmentGraphStats host_kv_gdn_segment_graph_stats() const noexcept;
     std::uint64_t fast_same_weights_fp16kv_gdn_decode_conv_calls() const noexcept;
+    std::uint64_t fast_same_weights_fp16kv_gdn_m1_gate_up_pair_submissions() const noexcept;
     struct HostKVFullLayerGraphStats {
         std::uint64_t captures=0,replays=0;
         std::uint64_t six_softmax_triple_captures=0;
@@ -671,6 +707,14 @@ public:
         double capture_ms=0.0;
     };
     OrdinaryFullLayerGraphStats ordinary_full_layer_graph_stats() const noexcept;
+    // Process-wide ordinary device-KV graph capture/replay counts for linked
+    // qualification of Engine-owned contexts.
+    struct OrdinaryGraphProcessStats {
+        std::uint64_t gdn_segment_captures=0,gdn_segment_replays=0;
+        std::uint64_t full_layer_captures=0,full_layer_replays=0;
+        std::uint64_t mlp_tail_captures=0,mlp_tail_replays=0;
+    };
+    static OrdinaryGraphProcessStats ordinary_graph_process_stats_for_test() noexcept;
     struct HostKVMlpTailGraphStats {
         std::uint64_t captures=0,replays=0;
         double capture_ms=0.0;
@@ -787,6 +831,32 @@ public:
     // Requires a context constructed with NINFER_EXL3_WIDE_PREFILL=1.
     void append_prefill_wide(std::span<const std::int64_t> token_ids,
                              cudaStream_t stream = nullptr);
+    // Experimental ordinary device-KV suffix schedule: process each layer's
+    // causal 1024-row chunks while its reconstructed projections are resident.
+    // The entire suffix is freshly computed; only final-chunk taps/logits are
+    // published, as with sequential append_prefill_wide calls.
+    // Optional borrowed device tail receives five post-layer FP16 planes in
+    // tap order {5,19,33,47,61}. Its exact absolute interval ends at the
+    // completed prefix. The caller owns the arena through this synchronous
+    // stream completion and must drain the stream before releasing it on error.
+    struct RetainedTapTail {
+        std::uint16_t* device = nullptr;
+        std::size_t bytes = 0;
+        int first_abs = 0;
+        int rows = 0;
+    };
+    void append_prefill_layer_major(std::span<const std::int64_t> token_ids,
+                                    cudaStream_t stream = nullptr,
+                                    const RetainedTapTail* retained_taps = nullptr);
+    // Fresh-prompt layer-major policy (NINFER_EXL3_LAYER_MAJOR_FROM_ZERO, default
+    // 1, process latched; 0 = initial16 control): a reset context admits
+    // layer-major prefill at position 0, so the
+    // whole prompt runs as 1024-row layer-major chunks instead of an ordered
+    // initial16 forward followed by the layer-major suffix. Numerical policy:
+    // the first 16 rows use the chunk projection route.
+    static bool layer_major_from_zero();
+    // Rows a fresh layer-major prompt executes before the layer-major suffix.
+    static int layer_major_initial_rows() { return layer_major_from_zero() ? 0 : 16; }
 
     // Qualification/reference path for a bounded eager target continuation.
     // Setup allocates fixed scratch once. Execution and host getters are ordered
@@ -966,6 +1036,13 @@ public:
     // or rollback if that later publication fails.
     void retain_transaction_prefix(int retained_rows,
                                    cudaStream_t stream = nullptr);
+    // The next continue_rows() treats its last offsets.size() rows as sibling
+    // leaves at the given logical offsets (sibling_rows.cuh); one-shot.
+    void set_verifier_siblings(std::span<const int> offsets);
+    // Copies an accepted sibling leaf row of the last continuation into its
+    // chain slot (all per-row traces, K/V rows, taps, embedding and logits)
+    // before retain_transaction_prefix(destination + 1).
+    void promote_sibling_row(int source_row,int destination_row,cudaStream_t stream);
     // Qualification-only deterministic failure injection. Uses the identical
     // retention implementation and throws after repairing fail_after_model_layer
     // (0..63), before logits, position, or row metadata publication.

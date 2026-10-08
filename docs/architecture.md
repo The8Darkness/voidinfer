@@ -46,10 +46,23 @@ both retire intermediate roots and include final teardown in the recorded worklo
 | CLI and server | `apps/cli/`, `apps/serve/`, `src/serve/` |
 | Artifact loading | `src/artifact/`, `src/targets/` |
 | EXL3 model/runtime | `src/exl3/` |
+| Strict EXL3 setup controls | `src/exl3/environment_options.h`; callers in `full_attention_layer.cu`, `linear_cuda.cu`, `exl3_engine_core.cpp` |
 | CUDA operations | `src/ops/`, `include/ninfer/ops/` |
 | KV, recurrent, and host state | `src/core/`, `src/targets/qwen3_6/impl/runtime/` |
 | Exact DFlash2 authority | `tests/test_exl3_dflash2_accept.cpp`, `tests/test_exl3_real_dflash_execution.h` |
 | Serving contracts | `src/serve/`, `tests/test_*schema*`, `tests/test_*http*` |
+
+Strict opt-in setup controls share a small host parser: absent and `0` disable,
+`1` enables, and other strings (including empty) raise the caller's existing
+diagnostic. Callers retain ownership/dependency checks and the time at which the
+environment is read. Presence-only controls, permissive legacy controls and
+default-on options retain their separate contracts; this is not a feature registry.
+
+Qualification fixtures use `tests/scoped_environment.h` to restore selected
+Windows process-local variables on normal exit or exception. Each fixture still
+owns its option list, numerical oracle and dispatch/state assertions. The shared
+header is included at file scope in the DFlash2 harness, before the anonymous
+namespace containing its fixture headers.
 
 The principal tradeoff is explicit specialization: Blackwell- and model-specific code can reduce
 overhead and expose ownership precisely, but it increases qualification cost and limits portability.

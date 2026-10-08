@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <cstddef>
@@ -18,10 +19,25 @@ inline constexpr Exl3SegmentedAttentionRoute exl3_segmented_attention_route(
     if(q_shared)return Exl3SegmentedAttentionRoute::q_shared;
     return Exl3SegmentedAttentionRoute::scalar;
 }
+// L0 OSCAR contexts keep only the sink and the recent window exact: verifier
+// segments cover at most this many keys past the history (l0_oscar.cuh).
+constexpr int kExl3L0ExactWindowKeys=2048;
+inline bool exl3_l0_oscar_enabled() {
+    const char* value=std::getenv("NINFER_EXL3_L0_OSCAR");
+    return value && value[0]=='1' && value[1]==0;
+}
+inline int exl3_exact_attention_capacity(int capacity) {
+    return exl3_l0_oscar_enabled() && capacity>kExl3L0ExactWindowKeys+64?
+        kExl3L0ExactWindowKeys+64:capacity;
+}
 inline std::size_t exl3_exact_attention_score_bytes(int rows,int capacity) {
+    capacity=exl3_exact_attention_capacity(capacity);
     if(rows<1 || rows>16 || capacity<rows)
         throw std::invalid_argument("exact attention scratch row/capacity geometry");
-    const auto row_bytes=static_cast<std::size_t>(rows)*24*sizeof(float);
+    // 100 floats per row and key: the 24 query-head score plane, or the
+    // 64-key flash-segment slots (6 heads x (256 values + 2 stats) x 4 KV
+    // heads / 64 keys = 96.75) so verifier rows keep 64-key segments.
+    const auto row_bytes=static_cast<std::size_t>(rows)*100*sizeof(float);
     if(static_cast<std::size_t>(capacity)>std::numeric_limits<std::size_t>::max()/row_bytes)
         throw std::overflow_error("exact attention scratch byte extent");
     return row_bytes*static_cast<std::size_t>(capacity);

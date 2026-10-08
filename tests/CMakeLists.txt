@@ -62,6 +62,14 @@ function(ninfer_add_op_test name)
   endif()
 endfunction()
 
+# Gaming-preparation campaign: CPU contract executable has no CUDA linkage.
+ninfer_add_host_contract_test(ninfer_exl3_gaming_contract_test
+  SOURCES test_exl3_gaming_contract.cpp)
+# Phase B only: explicit GPU leaf differentials and represented-state fixtures.
+ninfer_add_test(ninfer_exl3_gaming_operators_test
+  SOURCES test_exl3_gaming_operators.cu
+  LIBRARIES ninfer_exl3_dflash2)
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}
@@ -131,6 +139,10 @@ ninfer_add_test(ninfer_exl3_mtp_hidden_handoff_test
   SOURCES test_exl3_mtp_hidden_handoff.cpp
   LIBRARIES ninfer_exl3_text_model)
 set_tests_properties(ninfer_exl3_mtp_hidden_handoff_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_exl3_mtp_accuracy_probe_test
+  SOURCES test_exl3_mtp_accuracy_probe.cpp
+  LIBRARIES ninfer_exl3_text_model)
+set_tests_properties(ninfer_exl3_mtp_accuracy_probe_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_exl3_dflash2_minimal_test
   SOURCES test_exl3_dflash2_minimal.cpp
   LIBRARIES ninfer_exl3_dflash2)
@@ -560,6 +572,12 @@ target_include_directories(ninfer_exl3_engine_lifecycle_test PRIVATE
 target_link_options(ninfer_exl3_engine_lifecycle_test PRIVATE
   $<$<CXX_COMPILER_ID:MSVC>:/STACK:8388608>)
 set_tests_properties(ninfer_exl3_engine_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_exl3_engine_device_test
+  SOURCES test_exl3_engine_device.cpp
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_exl3_engine_device_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_exl3_engine_device_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_exl3_frontend_reference_test
   SOURCES test_exl3_frontend_reference.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -643,6 +661,10 @@ ninfer_add_host_contract_test(ninfer_exl3_physical_resource_attribution_test
   SOURCES test_exl3_physical_resource_attribution.cpp)
 ninfer_add_host_contract_test(ninfer_exl3_candidate_contracts_test
   SOURCES test_exl3_candidate_contracts.cpp)
+if(WIN32)
+  ninfer_add_host_contract_test(ninfer_exl3_environment_options_test
+    SOURCES test_exl3_environment_options.cpp)
+endif()
 ninfer_add_host_contract_test(ninfer_exl3_continuation_graph_drain_policy_test
   SOURCES test_exl3_continuation_graph_drain_policy.cpp)
 ninfer_add_host_contract_test(ninfer_exl3_resource_inventory_test
@@ -670,3 +692,17 @@ foreach(v1_mode IN ITEMS export consume)
   string(TOUPPER ${v1_mode} v1_define)
   target_compile_definitions(${v1_target} PRIVATE NINFER_V1_${v1_define}=1)
 endforeach()
+
+ninfer_add_test(research_exl3_kv_tier_capture
+  SOURCES research_exl3_kv_tier_capture.cpp
+  LIBRARIES ninfer_exl3_text_model ninfer_ops)
+set_tests_properties(research_exl3_kv_tier_capture PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(research_exl3_long_nll
+  SOURCES research_exl3_long_nll.cpp
+  LIBRARIES ninfer_exl3_text_model ninfer_ops)
+set_tests_properties(research_exl3_long_nll PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(research_exl3_l0_agents
+  SOURCES research_exl3_l0_agents.cpp
+  LIBRARIES ninfer_exl3_text_model ninfer_ops)
+set_tests_properties(research_exl3_l0_agents PROPERTIES SKIP_RETURN_CODE 77)

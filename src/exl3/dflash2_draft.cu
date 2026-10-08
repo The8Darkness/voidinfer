@@ -1,3 +1,4 @@
+#include "exl3/gaming_operator_fixture.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/linear_workspace_requirements.h"
@@ -677,31 +678,58 @@ __global__ void dflash_embed_kernel(const std::int64_t* ids,
 // target stores shifted norms and is NOT used here). Input storage is F16 except
 // on the residual path (x_a/x_b use BF16); output is always F16 because every
 // RMSNorm output is renormalized to O(1) scale. Accumulation stays FP32.
-template <DFlashFmt kInFmt>
-__global__ void dflash_rms_norm_kernel(const std::uint16_t* input,
+template <DFlashFmt kInFmt,bool Residual=false>
+__global__ void __launch_bounds__(256) dflash_rms_norm_kernel(const std::uint16_t* input,
                                        const std::uint16_t* weight,
                                        std::uint16_t* output,
                                        int rows,
-                                       int features) {
+                                       int features,
+                                       const std::uint16_t* right=nullptr,
+                                       std::uint16_t* materialized=nullptr) {
+    // 256 threads; each keeps its strided values in registers, and the sum
+    // reproduces the 256-wide shared-memory tree (strides 128, 64, 32 through
+    // shared memory, 16..1 by shuffles).
+    constexpr int kThreads = 256;
+    constexpr int kPerThread = 32;
     const int row = static_cast<int>(blockIdx.x);
     if (row >= rows) return;
     extern __shared__ float shared[];
     const int lane = static_cast<int>(threadIdx.x);
+    float values[kPerThread];
     float sum = 0.0f;
-    for (int i = lane; i < features; i += blockDim.x) {
-        const float value = dflash_load(input[row * features + i], kInFmt);
-        sum += value * value;
+    #pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+        const int i = lane + j * kThreads;
+        if (i < features) {
+            const int index=row*features+i;
+            auto bits=input[index];
+            if constexpr(Residual) {
+                bits=float_to_bf16(bf16_to_float(bits)+bf16_to_float(right[index]));
+                materialized[index]=bits;
+            }
+            values[j] = dflash_load(bits, kInFmt);
+            sum += values[j] * values[j];
+        }
     }
     shared[lane] = sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) shared[lane] += shared[lane + stride];
-        __syncthreads();
+    if (lane < 128) shared[lane] += shared[lane + 128];
+    __syncthreads();
+    if (lane < 64) shared[lane] += shared[lane + 64];
+    __syncthreads();
+    if (lane < 32) {
+        float total = shared[lane] + shared[lane + 32];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            total += __shfl_down_sync(0xffffffffu, total, offset);
+        if (lane == 0) shared[0] = total;
     }
+    __syncthreads();
     const float inv = rsqrtf(shared[0] / static_cast<float>(features) + kRmsEps);
-    for (int i = lane; i < features; i += blockDim.x) {
-        const float value = dflash_load(input[row * features + i], kInFmt) * inv;
-        output[row * features + i] = float_to_half(value * half_to_float(weight[i]));
+    #pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+        const int i = lane + j * kThreads;
+        if (i < features)
+            output[row * features + i] = float_to_half(values[j] * inv * half_to_float(weight[i]));
     }
 }
 
@@ -712,18 +740,22 @@ __global__ void dflash_rms_norm_kernel(const std::uint16_t* input,
 //   y[t][i] = (base[s][0][i] + dyn[t][0][g]) * x[t][i]
 //           + (base[s][1][i] + dyn[t][1][g]) * x[t-1][i]   (x[-1] == 0)
 // dyn is the [rows][kConvDynamic] projection; s selects the stream half (0 prepare, 1 finish).
-template <DFlashFmt kOutFmt>
+template <DFlashFmt kOutFmt,bool Residual=false>
 __global__ void dflash_dyn_conv_kernel(const std::uint16_t* x,
                                        const std::uint16_t* dyn,
                                        const std::uint16_t* base, // [2][kConvKernel][kHidden]
                                        std::uint16_t* y,
                                        int rows,
-                                       int stream) {
+                                       int stream,
+                                       const std::uint16_t* residual=nullptr,
+                                       std::uint16_t* residual_out=nullptr) {
     const int row = static_cast<int>(blockIdx.x);
     if (row >= rows) return;
-    const int lane = static_cast<int>(threadIdx.x);
     const std::uint16_t* base_row = base + stream * (kConvKernel * kHidden);
-    for (int i = lane; i < kHidden; i += blockDim.x) {
+    // Grid (rows, kHidden / blockDim): one channel per thread.
+    {
+        const int i = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
+        if (i >= kHidden) return;
         const int g = i / kConvGroup;
         const float x0 = half_to_float(x[row * kHidden + i]);
         const float x1 = row > 0 ? half_to_float(x[(row - 1) * kHidden + i]) : 0.0f;
@@ -734,7 +766,10 @@ __global__ void dflash_dyn_conv_kernel(const std::uint16_t* x,
                                           kConvGroups + g]);
         const float b0 = half_to_float(base_row[i]);
         const float b1 = half_to_float(base_row[kHidden + i]);
-        y[row * kHidden + i] = dflash_store((b0 + d0) * x0 + (b1 + d1) * x1, kOutFmt);
+        const auto bits=dflash_store((b0 + d0) * x0 + (b1 + d1) * x1, kOutFmt);
+        y[row * kHidden + i] = bits;
+        if constexpr(Residual)residual_out[row*kHidden+i]=float_to_bf16(
+            bf16_to_float(residual[row*kHidden+i])+bf16_to_float(bits));
     }
 }
 
@@ -789,6 +824,115 @@ __global__ void dflash_dense_gemm_t_kernel(const std::uint16_t* a,
     }
 }
 
+// K-major dense rows kernel: 16 output columns x up to 8 rows per 128-thread
+// CTA, with K tiles of both operands streamed through a cp.async ring. Every
+// output keeps the single ascending FP32 chain of dflash_dense_gemm_t_kernel,
+// so the stored F16 bits are identical; only operand delivery changes.
+constexpr int kDenseRowsCols=8;
+constexpr int kDenseRowsTileK=128;
+constexpr int kDenseRowsStages=4;
+constexpr int kDenseRowsMax=8;
+constexpr int kDenseRowsThreads=kDenseRowsCols*kDenseRowsMax;
+constexpr int kDenseRowsParts=kDenseRowsCols/8;
+
+__device__ __forceinline__ void dflash_cp_async_16(void* shared_ptr,const void* global_ptr) {
+    const auto shared_address=
+        static_cast<std::uint32_t>(__cvta_generic_to_shared(shared_ptr));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(shared_address), "l"(global_ptr));
+}
+
+__global__ void __launch_bounds__(kDenseRowsThreads) dflash_dense_rows_kmajor_kernel(
+    const std::uint16_t* a,const std::uint16_t* b,std::uint16_t* c,int m,int k,int n) {
+    __shared__ __align__(16) std::uint16_t weights[kDenseRowsStages][kDenseRowsTileK][kDenseRowsCols];
+    __shared__ __align__(16) std::uint16_t inputs[kDenseRowsStages][kDenseRowsMax][kDenseRowsTileK];
+    const int tid=static_cast<int>(threadIdx.x);
+    const int col0=static_cast<int>(blockIdx.x)*kDenseRowsCols;
+    const int col=tid%kDenseRowsCols;
+    const int row=tid/kDenseRowsCols;
+    const int tiles=k/kDenseRowsTileK;
+    auto load=[&](int tile,int stage) {
+        const int k0=tile*kDenseRowsTileK;
+        for(int chunk=tid;chunk<kDenseRowsTileK*kDenseRowsParts;chunk+=kDenseRowsThreads) {
+            const int r=chunk/kDenseRowsParts,part=chunk%kDenseRowsParts;
+            dflash_cp_async_16(&weights[stage][r][part*8],
+                b+static_cast<std::size_t>(k0+r)*n+col0+part*8);
+        }
+        for(int chunk=tid;chunk<m*(kDenseRowsTileK/8);chunk+=kDenseRowsThreads) {
+            const int r=chunk/(kDenseRowsTileK/8),part=chunk%(kDenseRowsTileK/8);
+            dflash_cp_async_16(&inputs[stage][r][part*8],
+                a+static_cast<std::size_t>(r)*k+k0+part*8);
+        }
+    };
+    #pragma unroll
+    for(int stage=0;stage<kDenseRowsStages-1;++stage) {
+        if(stage<tiles) load(stage,stage);
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+    float acc=0.0f;
+    for(int tile=0;tile<tiles;++tile) {
+        asm volatile("cp.async.wait_group %0;\n" :: "n"(kDenseRowsStages-2));
+        __syncthreads();
+        const int next=tile+kDenseRowsStages-1;
+        if(next<tiles) load(next,next%kDenseRowsStages);
+        asm volatile("cp.async.commit_group;\n" ::);
+        const int stage=tile%kDenseRowsStages;
+        if(row<m) {
+            #pragma unroll 4
+            for(int i=0;i<kDenseRowsTileK;i+=8) {
+                const uint4 packed=*reinterpret_cast<const uint4*>(&inputs[stage][row][i]);
+                const auto* input_bits=reinterpret_cast<const std::uint16_t*>(&packed);
+                #pragma unroll
+                for(int j=0;j<8;++j)
+                    acc+=half_to_float(input_bits[j])*half_to_float(weights[stage][i+j][col]);
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    if(row<m) c[static_cast<std::size_t>(row)*n+col0+col]=float_to_half(acc);
+}
+
+bool dflash_dense_rows_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_DFLASH2_DENSE_ROWS_PIPELINE");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+bool launch_dflash_dense_rows_kmajor(const std::uint16_t* in,const std::uint16_t* weights,
+    std::uint16_t* out,int rows,int k,int n,cudaStream_t stream) {
+    if(!dflash_dense_rows_enabled() || rows<1 || rows>kDenseRowsMax ||
+       k%kDenseRowsTileK!=0 || n%kDenseRowsCols!=0 ||
+       (reinterpret_cast<std::uintptr_t>(in)|reinterpret_cast<std::uintptr_t>(weights))%16!=0)
+        return false;
+    dflash_dense_rows_kmajor_kernel<<<n/kDenseRowsCols,kDenseRowsThreads,0,stream>>>(in,weights,out,rows,k,n);
+    return true;
+}
+
+template<bool WeightsKMajor>
+__global__ void gopt_draft_dense_rowpair_kernel(const std::uint16_t* a,
+    const std::uint16_t* b,std::uint16_t* c,int m,int k,int n) {
+    const int row=static_cast<int>(blockIdx.y)*2;
+    const int col=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;
+    extern __shared__ std::uint16_t shared_a[];
+    for(int i=threadIdx.x;i<k;i+=blockDim.x) {
+        shared_a[i]=a[static_cast<std::size_t>(row)*k+i];
+        shared_a[k+i]=row+1<m?a[static_cast<std::size_t>(row+1)*k+i]:0;
+    }
+    __syncthreads();
+    if(col>=n)return;
+    float acc0=0.0f,acc1=0.0f;
+    for(int i=0;i<k;++i) {
+        const auto bits=WeightsKMajor?b[static_cast<std::size_t>(i)*n+col]:b[static_cast<std::size_t>(col)*k+i];
+        const float weight=half_to_float(bits);
+        acc0+=half_to_float(shared_a[i])*weight;
+        acc1+=half_to_float(shared_a[k+i])*weight;
+    }
+    c[row*n+col]=float_to_half(acc0);
+    if(row+1<m)c[(row+1)*n+col]=float_to_half(acc1);
+}
+
 // RoPE for the draft's own 128-dim rotary (half-split, theta 1e7). Per-row
 // absolute positions come from device memory. input/output are [rows][heads][head_dim].
 __global__ void dflash_rope_kernel(const std::uint16_t* input,
@@ -815,6 +959,22 @@ __global__ void dflash_rope_kernel(const std::uint16_t* input,
     const float vm = half_to_float(input[logical_row * heads * head_dim + head * head_dim + mate]);
     const float r = v * cosine + (channel < half ? -vm : vm) * sine;
     output[index] = float_to_half(r);
+}
+
+__global__ void gopt_draft_rope_pair_kernel(const std::uint16_t* input,
+    std::uint16_t* output,const int* positions,int rows,int heads) {
+    const int i=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;
+    constexpr int half=kRopeDim/2;
+    if(i>=rows*heads*half)return;
+    const int segment=i/half,pair=i%half;
+    const int base=segment*kHeadDim;
+    const float angle=static_cast<float>(positions[segment/heads])*
+        powf(kRopeTheta,-2.0f*static_cast<float>(pair)/static_cast<float>(kRopeDim));
+    const float sine=sinf(angle),cosine=cosf(angle);
+    const float lo=half_to_float(input[base+pair]);
+    const float hi=half_to_float(input[base+pair+half]);
+    output[base+pair]=float_to_half(lo*cosine+(-hi)*sine);
+    output[base+pair+half]=float_to_half(hi*cosine+lo*sine);
 }
 
 // Attention over S context keys + L block keys. The draft block is non-causal
@@ -1044,6 +1204,360 @@ __global__ void dflash_attention_ring_parallel_kernel(const std::uint16_t* q,
     out[q_idx * kHeadDim + t] = float_to_half(acc / denominator);
 }
 
+// Staged ring attention: identical per-key dot, max, exp, denominator and
+// chronological V accumulation as dflash_attention_ring_parallel_kernel, but K
+// rows arrive through a coalesced shared tile, the max uses an exact
+// order-free reduction, and V loads are issued eight keys ahead.
+constexpr int kRingStageKeys=128;
+constexpr int kRingStageDims=32;
+
+__device__ __forceinline__ const std::uint16_t* dflash_ring_key_row(
+    const std::uint16_t* ring, const std::uint16_t* blk, int ring_start_slot,
+    int ctx_start, int context, int key, int kv_head) {
+    constexpr int kv_row = kKVHeads * kHeadDim;
+    return key < context ?
+        ring + static_cast<std::size_t>((ring_start_slot + ctx_start + key) & kRingMask) *
+            kv_row + kv_head * kHeadDim :
+        blk + (key - context) * kv_row + kv_head * kHeadDim;
+}
+
+__global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
+    const std::uint16_t* q, const std::uint16_t* ring_k, const std::uint16_t* ring_v,
+    int ring_start_slot, int ctx_keys, const std::uint16_t* k_blk,
+    const std::uint16_t* v_blk, std::uint16_t* out, int queries, int block_keys,
+    float scale) {
+    const int q_idx = static_cast<int>(blockIdx.x);
+    const int query = q_idx / kQHeads;
+    const int head = q_idx % kQHeads;
+    if (query >= queries) return;
+    const int t = static_cast<int>(threadIdx.x);
+    const int kv_head = head / (kQHeads / kKVHeads);
+    const auto* q_row = q + q_idx * kHeadDim;
+    __shared__ __align__(16) float query_values[kHeadDim];
+    __shared__ __align__(16) float scores[kRingKeep + kBlockCap + 8];
+    __shared__ __half2 key_tile[kRingStageKeys][kRingStageDims / 2 + 1];
+    __shared__ float warp_max[kHeadDim / 32];
+    __shared__ float maximum;
+    __shared__ float denominator;
+    query_values[t] = half_to_float(q_row[t]);
+    int ctx_start = ctx_keys + query - (kRingCap - 1);
+    if (ctx_start < 0) ctx_start = 0;
+    const int context = ctx_keys - ctx_start;
+    const int keys = context + block_keys;
+    __syncthreads();
+    constexpr int kParts = kRingStageDims / 8;
+    for (int first = 0; first < keys; first += kRingStageKeys) {
+        const int extent = min(kRingStageKeys, keys - first);
+        float dot = 0.0f;
+        for (int c = 0; c < kHeadDim; c += kRingStageDims) {
+            for (int w = t; w < extent * kParts; w += kHeadDim) {
+                const int local = w / kParts, part = w % kParts;
+                const uint4 packed = *reinterpret_cast<const uint4*>(dflash_ring_key_row(
+                    ring_k, k_blk, ring_start_slot, ctx_start, context, first + local,
+                    kv_head) + c + part * 8);
+                key_tile[local][part * 4 + 0] = *reinterpret_cast<const __half2*>(&packed.x);
+                key_tile[local][part * 4 + 1] = *reinterpret_cast<const __half2*>(&packed.y);
+                key_tile[local][part * 4 + 2] = *reinterpret_cast<const __half2*>(&packed.z);
+                key_tile[local][part * 4 + 3] = *reinterpret_cast<const __half2*>(&packed.w);
+            }
+            __syncthreads();
+            if (t < extent) {
+                #pragma unroll
+                for (int word = 0; word < kRingStageDims / 2; word += 2) {
+                    const int d = c + 2 * word;
+                    const float2 low = __half22float2(key_tile[t][word]);
+                    const float2 high = __half22float2(key_tile[t][word + 1]);
+                    const float4 q4 = *reinterpret_cast<const float4*>(&query_values[d]);
+                    dot += q4.x * low.x;
+                    dot += q4.y * low.y;
+                    dot += q4.z * high.x;
+                    dot += q4.w * high.y;
+                }
+            }
+            __syncthreads();
+        }
+        if (t < extent) scores[first + t] = dot;
+    }
+    __syncthreads();
+    // fmaxf is exact and order-free for non-NaN values, and any mix of signed
+    // zeros yields identical exp(score*scale - max) values below.
+    float local_max = -3.402823466e+38F;
+    for (int key = t; key < keys; key += kHeadDim)
+        local_max = fmaxf(local_max, scores[key] * scale);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
+    if ((t & 31) == 0) warp_max[t >> 5] = local_max;
+    __syncthreads();
+    if (t == 0) {
+        float m = warp_max[0];
+        #pragma unroll
+        for (int w = 1; w < kHeadDim / 32; ++w) m = fmaxf(m, warp_max[w]);
+        maximum = m;
+    }
+    __syncthreads();
+    for (int key = t; key < keys; key += kHeadDim)
+        scores[key] = expf(scores[key] * scale - maximum);
+    __syncthreads();
+    if (t == 0) {
+        float sum = 0.0f;
+        for (int key = 0; key < keys; ++key) sum += scores[key];
+        denominator = sum;
+    }
+    float acc = 0.0f;
+    int key = 0;
+    constexpr int kRingVBatch = 32;
+    for (; key + kRingVBatch <= keys; key += kRingVBatch) {
+        float values[kRingVBatch];
+        #pragma unroll
+        for (int j = 0; j < kRingVBatch; ++j)
+            values[j] = half_to_float(dflash_ring_key_row(ring_v, v_blk, ring_start_slot,
+                ctx_start, context, key + j, kv_head)[t]);
+        #pragma unroll
+        for (int j = 0; j < kRingVBatch; ++j) acc += scores[key + j] * values[j];
+    }
+    for (; key < keys; ++key)
+        acc += scores[key] * half_to_float(dflash_ring_key_row(ring_v, v_blk,
+            ring_start_slot, ctx_start, context, key, kv_head)[t]);
+    __syncthreads();
+    out[q_idx * kHeadDim + t] = float_to_half(acc / denominator);
+}
+
+bool dflash_ring_staged_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_RING_STAGED");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Tensor-core split-K draft ring attention. One CTA per (64-key chunk, kv
+// head) computes S = Q K^T for the kv head's 32 query rows (8 queries x 4 q
+// heads) and the chunk's P V with m16n8k16 FP16 MMAs (FP32 accumulation),
+// writing per-row max/sum and unnormalized FP32 outputs for the combine.
+constexpr int kMmaChunk = 64;
+constexpr int kMmaRows = kBlockCap * (kQHeads / kKVHeads);  // 32
+constexpr int kMmaThreads = 256;
+constexpr int kMmaStride = kHeadDim + 8;  // halves: rows 4 banks apart
+
+__device__ __forceinline__ void dflash_mma16816(float (&c)[4], const std::uint32_t (&a)[4],
+                                                std::uint32_t b0, std::uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__global__ void __launch_bounds__(kMmaThreads) dflash_attention_ring_mma_kernel(
+    const std::uint16_t* q, const std::uint16_t* ring_k, const std::uint16_t* ring_v,
+    int ring_start_slot, int ctx_keys, const std::uint16_t* k_blk,
+    const std::uint16_t* v_blk, int queries, int block_keys, float scale,
+    float* partial_o, float* partial_ml) {
+    constexpr int group = kQHeads / kKVHeads;
+    const int chunk = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    const int chunks = static_cast<int>(gridDim.x);
+    const int t = static_cast<int>(threadIdx.x);
+    const int lane = t & 31, warp = t >> 5;
+    const int g = lane >> 2, tig = lane & 3;
+    const int rows = queries * group;
+    const int lo = max(0, ctx_keys - (kRingCap - 1));
+    const int context = ctx_keys - lo;
+    const int keys = context + block_keys;
+    const int first = chunk * kMmaChunk;
+    __shared__ __align__(16) __half qs[kMmaRows][kMmaStride];
+    __shared__ __align__(16) __half ks[kMmaChunk][kMmaStride];
+    __shared__ __align__(16) __half vs[kMmaChunk][kMmaStride];
+    // Scores reuse the K tile once every S fragment is in registers.
+    static_assert(sizeof(float) * kMmaRows * (kMmaChunk + 4) <= sizeof(ks));
+    auto ss = reinterpret_cast<float (*)[kMmaChunk + 4]>(&ks[0][0]);
+    constexpr int kv_row = kKVHeads * kHeadDim;
+    for (int i = t; i < kMmaRows * (kHeadDim / 8); i += kMmaThreads) {
+        const int r = i / (kHeadDim / 8), part = i % (kHeadDim / 8);
+        uint4 value = make_uint4(0, 0, 0, 0);
+        if (r < rows) {
+            const int q_idx = (r / group) * kQHeads + kv_head * group + r % group;
+            value = *reinterpret_cast<const uint4*>(
+                q + static_cast<std::size_t>(q_idx) * kHeadDim + part * 8);
+        }
+        *reinterpret_cast<uint4*>(&qs[r][part * 8]) = value;
+    }
+    for (int i = t; i < kMmaChunk * (kHeadDim / 8); i += kMmaThreads) {
+        const int local = i / (kHeadDim / 8), part = i % (kHeadDim / 8);
+        const int key = first + local;
+        uint4 kp = make_uint4(0, 0, 0, 0), vp = make_uint4(0, 0, 0, 0);
+        if (key < keys) {
+            const std::size_t row = key < context
+                ? static_cast<std::size_t>((ring_start_slot + lo + key) & kRingMask) * kv_row
+                : static_cast<std::size_t>(key - context) * kv_row;
+            const std::uint16_t* kb = key < context ? ring_k : k_blk;
+            const std::uint16_t* vb = key < context ? ring_v : v_blk;
+            kp = *reinterpret_cast<const uint4*>(kb + row + kv_head * kHeadDim + part * 8);
+            vp = *reinterpret_cast<const uint4*>(vb + row + kv_head * kHeadDim + part * 8);
+        }
+        *reinterpret_cast<uint4*>(&ks[local][part * 8]) = kp;
+        *reinterpret_cast<uint4*>(&vs[local][part * 8]) = vp;
+    }
+    __syncthreads();
+    // S tiles: warp owns m-tile (warp & 1) and n-tiles 2 (warp >> 1) + {0, 1}.
+    {
+        const int m0 = (warp & 1) * 16;
+        float c[2][4] = {};
+        #pragma unroll
+        for (int k0 = 0; k0 < kHeadDim; k0 += 16) {
+            std::uint32_t a[4];
+            a[0] = *reinterpret_cast<const std::uint32_t*>(&qs[m0 + g][k0 + 2 * tig]);
+            a[1] = *reinterpret_cast<const std::uint32_t*>(&qs[m0 + g + 8][k0 + 2 * tig]);
+            a[2] = *reinterpret_cast<const std::uint32_t*>(&qs[m0 + g][k0 + 8 + 2 * tig]);
+            a[3] = *reinterpret_cast<const std::uint32_t*>(&qs[m0 + g + 8][k0 + 8 + 2 * tig]);
+            #pragma unroll
+            for (int n = 0; n < 2; ++n) {
+                const int key = ((warp >> 1) * 2 + n) * 8 + g;
+                dflash_mma16816(c[n], a,
+                    *reinterpret_cast<const std::uint32_t*>(&ks[key][k0 + 2 * tig]),
+                    *reinterpret_cast<const std::uint32_t*>(&ks[key][k0 + 8 + 2 * tig]));
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int r = m0 + g + (e >> 1) * 8;
+                const int local = ((warp >> 1) * 2 + n) * 8 + 2 * tig + (e & 1);
+                const int key = first + local;
+                // Query r / group sees context keys from ctx_keys + query - 2047 on.
+                const bool valid = r < rows && key < keys &&
+                    (key >= context || lo + key >= ctx_keys + r / group - (kRingCap - 1));
+                ss[r][local] = valid ? c[n][e] * scale : -INFINITY;
+            }
+        }
+    }
+    __syncthreads();
+    // Row max / exp / sum: warp w owns rows 4w..4w+3, two keys per lane.
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int r = warp * 4 + j;
+        const float x0 = ss[r][lane], x1 = ss[r][lane + 32];
+        float m = fmaxf(x0, x1);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const float p0 = m == -INFINITY ? 0.0f : expf(x0 - m);
+        const float p1 = m == -INFINITY ? 0.0f : expf(x1 - m);
+        ss[r][lane] = p0; ss[r][lane + 32] = p1;
+        float l = p0 + p1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+        if (lane == 0 && r < rows) {
+            float* ml = partial_ml +
+                ((static_cast<std::size_t>(kv_head) * kMmaRows + r) * chunks + chunk) * 2;
+            ml[0] = m; ml[1] = l;
+        }
+    }
+    __syncthreads();
+    // O tiles: warp owns m-tile (warp & 1) and d n-tiles 4 (warp >> 1) + {0..3}.
+    {
+        const int m0 = (warp & 1) * 16;
+        float c[4][4] = {};
+        #pragma unroll
+        for (int k0 = 0; k0 < kMmaChunk; k0 += 16) {
+            std::uint32_t a[4];
+            const auto pack = [](float x, float y) {
+                const __half2 h = __floats2half2_rn(x, y);
+                return *reinterpret_cast<const std::uint32_t*>(&h);
+            };
+            a[0] = pack(ss[m0 + g][k0 + 2 * tig], ss[m0 + g][k0 + 2 * tig + 1]);
+            a[1] = pack(ss[m0 + g + 8][k0 + 2 * tig], ss[m0 + g + 8][k0 + 2 * tig + 1]);
+            a[2] = pack(ss[m0 + g][k0 + 8 + 2 * tig], ss[m0 + g][k0 + 9 + 2 * tig]);
+            a[3] = pack(ss[m0 + g + 8][k0 + 8 + 2 * tig], ss[m0 + g + 8][k0 + 9 + 2 * tig]);
+            #pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                const int d = ((warp >> 1) * 4 + n) * 8 + g;
+                const auto pair = [&](int key) {
+                    const __half2 h = __halves2half2(vs[key][d], vs[key + 1][d]);
+                    return *reinterpret_cast<const std::uint32_t*>(&h);
+                };
+                dflash_mma16816(c[n], a, pair(k0 + 2 * tig), pair(k0 + 8 + 2 * tig));
+            }
+        }
+        #pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int r = m0 + g + (e >> 1) * 8;
+                const int d = ((warp >> 1) * 4 + n) * 8 + 2 * tig + (e & 1);
+                if (r < rows)
+                    partial_o[((static_cast<std::size_t>(kv_head) * kMmaRows + r) * chunks + chunk) *
+                              kHeadDim + d] = c[n][e];
+            }
+        }
+    }
+}
+
+// Combines the chunk partials of one (row, kv head) per CTA (FP32 rescale by
+// exp(chunk max - row max), then one division).
+__global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_combine_kernel(
+    const float* partial_o, const float* partial_ml, std::uint16_t* out, int queries,
+    int chunks) {
+    constexpr int group = kQHeads / kKVHeads;
+    const int r = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    if (r >= queries * group) return;
+    const int d = static_cast<int>(threadIdx.x);
+    const std::size_t base = static_cast<std::size_t>(kv_head) * kMmaRows + r;
+    const float* ml = partial_ml + base * chunks * 2;
+    float m = -INFINITY;
+    for (int c = 0; c < chunks; ++c) m = fmaxf(m, ml[2 * c]);
+    float l = 0.0f, acc = 0.0f;
+    const float* po = partial_o + base * chunks * kHeadDim;
+    for (int c = 0; c < chunks; ++c) {
+        const float mc = ml[2 * c];
+        if (mc == -INFINITY) continue;
+        const float w = expf(mc - m);
+        l = fmaf(ml[2 * c + 1], w, l);
+        acc = fmaf(po[static_cast<std::size_t>(c) * kHeadDim + d], w, acc);
+    }
+    const int q_idx = (r / group) * kQHeads + kv_head * group + r % group;
+    out[static_cast<std::size_t>(q_idx) * kHeadDim + d] = float_to_half(acc / l);
+}
+
+// Split-K tensor-core route for long ring contexts (default; NINFER_DFLASH2_
+// RING_SPLIT=0 keeps the per-(query, head) staged kernel). Short contexts stay
+// on the staged kernel, which wins below kRingSplitMinKeys.
+constexpr int kRingSplitMinKeys = 256;
+constexpr int kRingSplitMaxChunks = (kRingKeep + kBlockCap + kMmaChunk - 1) / kMmaChunk;
+constexpr std::size_t kRingSplitPartialFloats =
+    static_cast<std::size_t>(kKVHeads) * kMmaRows * kRingSplitMaxChunks * kHeadDim;
+constexpr std::size_t kRingSplitMlFloats =
+    static_cast<std::size_t>(kKVHeads) * kMmaRows * kRingSplitMaxChunks * 2;
+
+bool dflash_ring_split_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_RING_SPLIT");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool dflash_ring_split_selected(int ctx_keys) {
+    return dflash_ring_split_enabled() && ctx_keys >= kRingSplitMinKeys;
+}
+
+void launch_ring_attention_split(const std::uint16_t* q, const std::uint16_t* ring_k,
+    const std::uint16_t* ring_v, int ring_start_slot, int ctx_keys,
+    const std::uint16_t* k_blk, const std::uint16_t* v_blk, std::uint16_t* out,
+    int queries, int block_keys, float scale, float* partial_o, float* partial_ml,
+    cudaStream_t stream) {
+    const int context = ctx_keys - std::max(0, ctx_keys - (kRingCap - 1));
+    const int chunks = (context + block_keys + kMmaChunk - 1) / kMmaChunk;
+    dflash_attention_ring_mma_kernel<<<dim3(chunks, kKVHeads), kMmaThreads, 0, stream>>>(
+        q, ring_k, ring_v, ring_start_slot, ctx_keys, k_blk, v_blk, queries, block_keys,
+        scale, partial_o, partial_ml);
+    dflash_attention_ring_combine_kernel<<<dim3(queries * (kQHeads / kKVHeads), kKVHeads),
+        kHeadDim, 0, stream>>>(partial_o, partial_ml, out, queries, chunks);
+}
+
 // E5A3: per-slot FNV-1a digest of ring K/V bytes, XOR-folded on host by ring_digest().
 // One thread per slot; slot order is preserved by the host fold via slot labels.
 __global__ void dflash_ring_digest_kernel(const std::uint16_t* ring_k,
@@ -1087,10 +1601,15 @@ __global__ void dflash_tap_concat_kernel(const std::uint16_t* const* taps,
 }
 
 // RMSNorm over (row, head) segments of width head_dim (draft q/k norm, raw weights).
+template<bool Rotate=false>
 __global__ void dflash_head_norm_kernel(const std::uint16_t* input,
                                         const std::uint16_t* weight,
                                         std::uint16_t* output,
-                                        int segments, int head_dim) {
+                                        int segments, int head_dim,
+                                        const int* positions=nullptr,
+                                        std::uint16_t* rotated=nullptr,int heads=0,
+                                        bool paired=false) {
+    __shared__ std::uint16_t represented[Rotate?128:1];
     const int segment = static_cast<int>(blockIdx.x);
     if (segment >= segments) return;
     extern __shared__ float shared[];
@@ -1109,9 +1628,69 @@ __global__ void dflash_head_norm_kernel(const std::uint16_t* input,
     }
     const float inv = rsqrtf(shared[0] / static_cast<float>(head_dim) + kRmsEps);
     for (int i = lane; i < head_dim; i += blockDim.x) {
-        output[static_cast<std::size_t>(segment) * head_dim + i] =
-            float_to_half(half_to_float(base[i]) * inv * half_to_float(weight[i]));
+        const auto bits=float_to_half(half_to_float(base[i]) * inv * half_to_float(weight[i]));
+        output[static_cast<std::size_t>(segment) * head_dim + i] = bits;
+        if constexpr(Rotate)represented[i]=bits;
     }
+    if constexpr(Rotate) {
+        __syncthreads();
+        constexpr int half=kRopeDim/2;
+        if(lane<(paired?half:kRopeDim)) {
+            const int pair=lane<half?lane:lane-half;
+            const float angle=static_cast<float>(positions[segment/heads])*
+                powf(kRopeTheta,-2.0f*static_cast<float>(pair)/static_cast<float>(kRopeDim));
+            const float sine=sinf(angle),cosine=cosf(angle);
+            const auto dst=static_cast<std::size_t>(segment)*head_dim;
+            if(paired) {
+                const float lo=half_to_float(represented[pair]);
+                const float hi=half_to_float(represented[pair+half]);
+                rotated[dst+pair]=float_to_half(lo*cosine+(-hi)*sine);
+                rotated[dst+pair+half]=float_to_half(hi*cosine+lo*sine);
+            } else {
+                const float v=half_to_float(represented[lane]);
+                const float vm=half_to_float(represented[lane<half?lane+half:lane-half]);
+                rotated[dst+lane]=float_to_half(v*cosine+(lane<half?-vm:vm)*sine);
+            }
+        }
+    }
+}
+
+// GOPT-012: the committed K/V ring is the only consumer of these represented
+// values. Keep the baseline RMS reduction and RoPE expression, then write the
+// resulting half directly to the ring beside its unmodified V element.
+__global__ void gopt_draft_ring_norm_rope_kernel(const std::uint16_t* input,
+    const std::uint16_t* vrow,const std::uint16_t* weight,const int* positions,
+    std::uint16_t* ring_k,std::uint16_t* ring_v,int segments) {
+    const int segment=static_cast<int>(blockIdx.x);
+    if(segment>=segments)return;
+    constexpr int heads=kKVHeads,dim=kHeadDim,half=kRopeDim/2;
+    const int lane=static_cast<int>(threadIdx.x);
+    extern __shared__ float shared[];
+    __shared__ std::uint16_t represented[dim];
+    const auto src=static_cast<std::size_t>(segment)*dim;
+    const float value=half_to_float(input[src+lane]);
+    shared[lane]=value*value;
+    __syncthreads();
+    for(int stride=blockDim.x/2;stride>0;stride>>=1) {
+        if(lane<stride)shared[lane]+=shared[lane+stride];
+        __syncthreads();
+    }
+    const float inv=rsqrtf(shared[0]/static_cast<float>(dim)+kRmsEps);
+    represented[lane]=float_to_half(value*inv*half_to_float(weight[lane]));
+    __syncthreads();
+    const int pair=lane<half?lane:lane-half;
+    const int mate=lane<half?lane+half:lane-half;
+    const int position=positions[segment/heads];
+    const float angle=static_cast<float>(position)*
+        powf(kRopeTheta,-2.0f*static_cast<float>(pair)/static_cast<float>(kRopeDim));
+    const float sine=sinf(angle),cosine=cosf(angle);
+    const float k=half_to_float(represented[lane]);
+    const float km=half_to_float(represented[mate]);
+    const float rotated=k*cosine+(lane<half?-km:km)*sine;
+    const auto dst=static_cast<std::size_t>(position&kRingMask)*(heads*dim)+
+        static_cast<std::size_t>(segment%heads)*dim;
+    ring_k[dst+lane]=float_to_half(rotated);
+    ring_v[dst+lane]=vrow[src+lane];
 }
 
 // In-place shift of a tap-history row buffer to drop the oldest rows.
@@ -1124,11 +1703,13 @@ __global__ void dflash_row_shift_kernel(const std::uint16_t* src, std::uint16_t*
 
 // Preserve the original insertion sequence, including its NaN behavior.
 __device__ void dflash_topk16_serial_row(const std::uint16_t* logits, int row, int vocab,
-                                        std::int64_t* cand_ids, float* cand_unary) {
+                                        std::int64_t* cand_ids, float* cand_unary,
+                                        int stride = 0) {
     float values[kTopK];
     int ids[kTopK];
     int count = 0;
-    const std::uint16_t* row_logits = logits + static_cast<std::size_t>(row) * vocab;
+    const std::uint16_t* row_logits =
+        logits + static_cast<std::size_t>(row) * (stride > 0 ? stride : vocab);
     for (int column = 0; column < vocab; ++column) {
         const float value = half_to_float(row_logits[column]);
         if (count < kTopK) {
@@ -1227,9 +1808,11 @@ __global__ void dflash_topk16_parallel_kernel(const std::uint16_t* logits, int r
 // merges its 32 runs, then thread zero merges the eight warp survivors. This is
 // the same bounded merge shape used by the selector-lattice kernels, adapted to
 // the draft head's FP16 logits and original int64 output contract.
+template <bool TrackNonfinite>
 __global__ void dflash_topk16_local_merge_kernel(const std::uint16_t* logits, int rows,
                                                  int vocab, std::int64_t* cand_ids,
-                                                 float* cand_unary) {
+                                                 float* cand_unary,
+                                                 unsigned int* nonfinite_flag) {
     const int row = static_cast<int>(blockIdx.x);
     if (row >= rows) return;
     constexpr int kThreads = 256;
@@ -1246,9 +1829,13 @@ __global__ void dflash_topk16_local_merge_kernel(const std::uint16_t* logits, in
         local_ids[i] = kInvalid;
     }
     bool nan = false;
+    bool nonfinite = false;
     for (int column = t; column < vocab; column += kThreads) {
         const float value = half_to_float(input[column]);
         nan = nan || isnan(value);
+        if constexpr (TrackNonfinite)
+            nonfinite = nonfinite || value != value ||
+                value == INFINITY || value == -INFINITY;
         if (value < local_values[kTopK - 1] ||
             (value == local_values[kTopK - 1] && column >= local_ids[kTopK - 1])) {
             continue;
@@ -1263,6 +1850,10 @@ __global__ void dflash_topk16_local_merge_kernel(const std::uint16_t* logits, in
         }
         local_values[slot] = value;
         local_ids[slot] = column;
+    }
+    if constexpr (TrackNonfinite) {
+        if (__syncthreads_or(nonfinite) && t == 0)
+            atomicExch(nonfinite_flag, 1u);
     }
     if (__syncthreads_or(nan)) {
         if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary);
@@ -1339,17 +1930,366 @@ __global__ void dflash_topk16_local_merge_kernel(const std::uint16_t* logits, in
     }
 }
 
+// Segmented top-16: the (value desc, id asc) order is strict, so the top-16
+// of the union of per-segment top-16 lists is exactly the row's top-16. Any
+// NaN in a row routes the whole row to the serial kernel, as before.
+constexpr int kTopKSegments = 32;
+constexpr int kTopKSegmentThreads = 128;
+
+__device__ __forceinline__ void dflash_topk16_insert(float* values, int* ids,
+                                                     float value, int id) {
+    constexpr int kInvalid = 0x7fffffff;
+    if (id == kInvalid || value < values[kTopK - 1] ||
+        (value == values[kTopK - 1] && id >= ids[kTopK - 1]))
+        return;
+    int slot = kTopK - 1;
+    while (slot > 0 &&
+           (value > values[slot - 1] || (value == values[slot - 1] && id < ids[slot - 1]))) {
+        values[slot] = values[slot - 1];
+        ids[slot] = ids[slot - 1];
+        --slot;
+    }
+    values[slot] = value;
+    ids[slot] = id;
+}
+
+// Lane zero merges the 32 register lists of its warp into shared[base..+16).
+__device__ __forceinline__ void dflash_topk16_warp_merge(const float* local_values,
+    const int* local_ids, float* shared_values, int* shared_ids) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    #pragma unroll
+    for (int rank = 0; rank < kTopK; ++rank) {
+        for (int source = 0; source < 32; ++source) {
+            const float value = __shfl_sync(0xffffffffU, local_values[rank], source);
+            const int id = __shfl_sync(0xffffffffU, local_ids[rank], source);
+            if (lane == 0) dflash_topk16_insert(shared_values, shared_ids, value, id);
+        }
+    }
+}
+
+__global__ void __launch_bounds__(kTopKSegmentThreads) dflash_topk16_segment_kernel(
+    const std::uint16_t* logits, int vocab, float* segment_values, int* segment_ids,
+    int* segment_nan) {
+    constexpr int kInvalid = 0x7fffffff;
+    constexpr int kWarps = kTopKSegmentThreads / 32;
+    const int segment = static_cast<int>(blockIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    const int t = static_cast<int>(threadIdx.x);
+    const int span = (vocab + kTopKSegments - 1) / kTopKSegments;
+    const int begin = segment * span;
+    const int end = min(vocab, begin + span);
+    const auto* input = logits + static_cast<std::size_t>(row) * vocab;
+    float local_values[kTopK];
+    int local_ids[kTopK];
+    #pragma unroll
+    for (int i = 0; i < kTopK; ++i) {
+        local_values[i] = -CUDART_INF_F;
+        local_ids[i] = kInvalid;
+    }
+    bool nan = false;
+    for (int column = begin + t; column < end; column += kTopKSegmentThreads) {
+        const float value = half_to_float(input[column]);
+        nan = nan || isnan(value);
+        dflash_topk16_insert(local_values, local_ids, value, column);
+    }
+    __shared__ float warp_values[kWarps * kTopK];
+    __shared__ int warp_ids[kWarps * kTopK];
+    for (int i = t; i < kWarps * kTopK; i += kTopKSegmentThreads) {
+        warp_values[i] = -CUDART_INF_F;
+        warp_ids[i] = kInvalid;
+    }
+    const bool any_nan = __syncthreads_or(nan);
+    const int out = (row * kTopKSegments + segment) * kTopK;
+    if (any_nan) {
+        if (t == 0) segment_nan[row * kTopKSegments + segment] = 1;
+        return;
+    }
+    const int base = (t >> 5) * kTopK;
+    dflash_topk16_warp_merge(local_values, local_ids, warp_values + base, warp_ids + base);
+    __syncthreads();
+    if (t == 0) {
+        float values[kTopK];
+        int ids[kTopK];
+        #pragma unroll
+        for (int rank = 0; rank < kTopK; ++rank) {
+            values[rank] = -CUDART_INF_F;
+            ids[rank] = kInvalid;
+        }
+        for (int candidate = 0; candidate < kWarps * kTopK; ++candidate)
+            dflash_topk16_insert(values, ids, warp_values[candidate], warp_ids[candidate]);
+        #pragma unroll
+        for (int rank = 0; rank < kTopK; ++rank) {
+            segment_values[out + rank] = values[rank];
+            segment_ids[out + rank] = ids[rank];
+        }
+        segment_nan[row * kTopKSegments + segment] = 0;
+    }
+}
+
+__global__ void __launch_bounds__(32) dflash_topk16_segment_merge_kernel(
+    const std::uint16_t* logits, int vocab, const float* segment_values,
+    const int* segment_ids, const int* segment_nan, std::int64_t* cand_ids,
+    float* cand_unary) {
+    static_assert(kTopKSegments == 32, "one lane per segment");
+    constexpr int kInvalid = 0x7fffffff;
+    const int row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (__any_sync(0xffffffffU, segment_nan[row * kTopKSegments + lane] != 0)) {
+        if (lane == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary);
+        return;
+    }
+    float local_values[kTopK];
+    int local_ids[kTopK];
+    const int in = (row * kTopKSegments + lane) * kTopK;
+    #pragma unroll
+    for (int rank = 0; rank < kTopK; ++rank) {
+        local_values[rank] = segment_values[in + rank];
+        local_ids[rank] = segment_ids[in + rank];
+    }
+    __shared__ float values[kTopK];
+    __shared__ int ids[kTopK];
+    if (lane < kTopK) {
+        values[lane] = -CUDART_INF_F;
+        ids[lane] = kInvalid;
+    }
+    __syncwarp();
+    dflash_topk16_warp_merge(local_values, local_ids, values, ids);
+    __syncwarp();
+    if (lane < kTopK) {
+        cand_ids[static_cast<std::size_t>(row) * kTopK + lane] = ids[lane];
+        cand_unary[static_cast<std::size_t>(row) * kTopK + lane] = values[lane];
+    }
+}
+
+
+// Chunked exact top-16 (default; NINFER_DFLASH2_TOPK_CHUNKED=0 keeps the
+// segmented insertion route). With T the 16th largest of the per-128-logit
+// chunk maxima, every top-16 logit lies in a chunk whose maximum is >= T, so
+// sorting the (value desc, id asc) pairs of those chunks yields exactly the
+// serial insertion order. NaN rows and rows with more than kTopKChunkCandidates
+// such chunks (ties) take dflash_topk16_serial_row.
+constexpr int kTopKChunk = 128;
+constexpr int kTopKMaxChunks = (kVocab + 256 + kTopKChunk - 1) / kTopKChunk;
+constexpr int kTopKChunkSort = 2048;  // chunk-maximum capacity per row
+constexpr int kTopKChunkCandidates = 32;
+constexpr int kTopKCandidateSort = kTopKChunkCandidates * kTopKChunk;
+constexpr int kTopKChunkThreads = 256;
+static_assert(kTopKMaxChunks <= kTopKChunkSort);
+
+__global__ void __launch_bounds__(kTopKChunkThreads) dflash_topk16_chunk_max_kernel(
+    const std::uint16_t* logits, int vocab, int stride, float* chunk_max, int* chunk_nan) {
+    constexpr int kWarps = kTopKChunkThreads / 32;
+    const int row = static_cast<int>(blockIdx.y);
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int chunk = static_cast<int>(blockIdx.x) * kWarps + (static_cast<int>(threadIdx.x) >> 5);
+    const int chunks = (vocab + kTopKChunk - 1) / kTopKChunk;
+    if (chunk >= chunks) return;
+    const auto* input = logits + static_cast<std::size_t>(row) * stride;
+    float maximum = -CUDART_INF_F;
+    bool nan = false;
+    #pragma unroll
+    for (int i = 0; i < kTopKChunk / 32; ++i) {
+        const int column = chunk * kTopKChunk + lane + 32 * i;
+        if (column < vocab) {
+            const float value = half_to_float(input[column]);
+            nan = nan || isnan(value);
+            maximum = fmaxf(maximum, value);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+    nan = __any_sync(0xffffffffu, nan);
+    if (lane == 0) {
+        chunk_max[static_cast<std::size_t>(row) * kTopKMaxChunks + chunk] = maximum;
+        chunk_nan[static_cast<std::size_t>(row) * kTopKMaxChunks + chunk] = nan ? 1 : 0;
+    }
+}
+
+// a precedes b in (value desc, id asc) order.
+__device__ __forceinline__ bool dflash_topk_precedes(float av, int ai, float bv, int bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+// Block-wide first pair in (value desc, id asc) order; every thread gets it.
+__device__ __forceinline__ void dflash_block_first(float& value, int& id, float* warp_values,
+                                                   int* warp_ids) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float v = __shfl_xor_sync(0xffffffffu, value, offset);
+        const int i = __shfl_xor_sync(0xffffffffu, id, offset);
+        if (dflash_topk_precedes(v, i, value, id)) { value = v; id = i; }
+    }
+    if (lane == 0) { warp_values[warp] = value; warp_ids[warp] = id; }
+    __syncthreads();
+    value = warp_values[lane];
+    id = warp_ids[lane];
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float v = __shfl_xor_sync(0xffffffffu, value, offset);
+        const int i = __shfl_xor_sync(0xffffffffu, id, offset);
+        if (dflash_topk_precedes(v, i, value, id)) { value = v; id = i; }
+    }
+    __syncthreads();
+}
+
+constexpr int kTopKSelectThreads = 1024;
+constexpr int kTopKSelectPerThread = kTopKCandidateSort / kTopKSelectThreads;
+static_assert(kTopKSelectThreads == 32 * 32, "two-level warp reduction");
+static_assert(kTopKChunkSort <= kTopKSelectThreads * kTopKSelectPerThread);
+
+__global__ void __launch_bounds__(kTopKSelectThreads) dflash_topk16_chunk_select_kernel(
+    const std::uint16_t* logits, int vocab, int stride, const float* chunk_max,
+    const int* chunk_nan, std::int64_t* cand_ids, float* cand_unary) {
+    constexpr int kInvalid = 0x7fffffff;
+    __shared__ float warp_values[32];
+    __shared__ int warp_ids[32];
+    __shared__ int selected[kTopKChunkCandidates];
+    __shared__ int selected_count;
+    const int row = static_cast<int>(blockIdx.x);
+    const int t = static_cast<int>(threadIdx.x);
+    const int chunks = (vocab + kTopKChunk - 1) / kTopKChunk;
+    const float* maxima = chunk_max + static_cast<std::size_t>(row) * kTopKMaxChunks;
+    float values[kTopKSelectPerThread];
+    int ids[kTopKSelectPerThread];
+    bool nan = false;
+    #pragma unroll
+    for (int j = 0; j < kTopKSelectPerThread; ++j) {
+        const int c = t + j * kTopKSelectThreads;
+        values[j] = c < chunks ? maxima[c] : -CUDART_INF_F;
+        ids[j] = c < chunks ? c : kInvalid;
+        if (c < chunks) nan = nan || chunk_nan[static_cast<std::size_t>(row) * kTopKMaxChunks + c];
+    }
+    if (t == 0) selected_count = 0;
+    if (__syncthreads_or(nan)) {
+        if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary, stride);
+        return;
+    }
+    // T = 16th largest chunk maximum (with multiplicity).
+    float threshold = -CUDART_INF_F;
+    for (int rank = 0; rank < kTopK; ++rank) {
+        float value = -CUDART_INF_F;
+        int id = kInvalid;
+        #pragma unroll
+        for (int j = 0; j < kTopKSelectPerThread; ++j)
+            if (dflash_topk_precedes(values[j], ids[j], value, id)) { value = values[j]; id = ids[j]; }
+        dflash_block_first(value, id, warp_values, warp_ids);
+        threshold = value;
+        #pragma unroll
+        for (int j = 0; j < kTopKSelectPerThread; ++j)
+            if (ids[j] == id) { values[j] = -CUDART_INF_F; ids[j] = kInvalid; }
+    }
+    for (int c = t; c < chunks; c += kTopKSelectThreads) {
+        if (maxima[c] >= threshold) {
+            const int slot = atomicAdd(&selected_count, 1);
+            if (slot < kTopKChunkCandidates) selected[slot] = c;
+        }
+    }
+    __syncthreads();
+    const int count = selected_count;
+    if (count > kTopKChunkCandidates) {
+        if (t == 0) dflash_topk16_serial_row(logits, row, vocab, cand_ids, cand_unary, stride);
+        return;
+    }
+    const auto* input = logits + static_cast<std::size_t>(row) * stride;
+    #pragma unroll
+    for (int j = 0; j < kTopKSelectPerThread; ++j) {
+        const int i = t + j * kTopKSelectThreads;
+        const int slot = i / kTopKChunk;
+        const int column = slot < count ? selected[slot] * kTopKChunk + i % kTopKChunk : vocab;
+        values[j] = column < vocab ? half_to_float(input[column]) : -CUDART_INF_F;
+        ids[j] = column < vocab ? column : kInvalid;
+    }
+    for (int rank = 0; rank < kTopK; ++rank) {
+        float value = -CUDART_INF_F;
+        int id = kInvalid;
+        #pragma unroll
+        for (int j = 0; j < kTopKSelectPerThread; ++j)
+            if (dflash_topk_precedes(values[j], ids[j], value, id)) { value = values[j]; id = ids[j]; }
+        dflash_block_first(value, id, warp_values, warp_ids);
+        if (t == 0) {
+            cand_ids[static_cast<std::size_t>(row) * kTopK + rank] = id;
+            cand_unary[static_cast<std::size_t>(row) * kTopK + rank] = value;
+        }
+        #pragma unroll
+        for (int j = 0; j < kTopKSelectPerThread; ++j)
+            if (ids[j] == id) { values[j] = -CUDART_INF_F; ids[j] = kInvalid; }
+    }
+}
+
+bool dflash_topk_chunked_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_TOPK_CHUNKED");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool dflash_topk_segmented_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_TOPK_SEGMENTED");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+std::size_t dflash_topk_segment_bytes() {
+    return std::max(static_cast<std::size_t>(kBlockCap) * kTopKSegments *
+            (kTopK * (sizeof(float) + sizeof(int)) + sizeof(int)),
+        static_cast<std::size_t>(kBlockCap) * kTopKMaxChunks * (sizeof(float) + sizeof(int)));
+}
+
+void launch_dflash_topk16_segmented(const std::uint16_t* logits, int rows, int vocab,
+    std::int64_t* cand_ids, float* cand_unary, void* scratch, cudaStream_t stream,
+    int stride) {
+    if (stride <= 0) stride = vocab;
+    if (dflash_topk_chunked_enabled() || stride != vocab) {
+        auto* chunk_max = static_cast<float*>(scratch);
+        auto* chunk_nan = reinterpret_cast<int*>(chunk_max + kBlockCap * kTopKMaxChunks);
+        const int chunks = (vocab + kTopKChunk - 1) / kTopKChunk;
+        constexpr int warps = kTopKChunkThreads / 32;
+        dflash_topk16_chunk_max_kernel<<<dim3((chunks + warps - 1) / warps, rows),
+            kTopKChunkThreads, 0, stream>>>(logits, vocab, stride, chunk_max, chunk_nan);
+        dflash_topk16_chunk_select_kernel<<<rows, kTopKSelectThreads, 0, stream>>>(
+            logits, vocab, stride, chunk_max, chunk_nan, cand_ids, cand_unary);
+        return;
+    }
+    auto* values = static_cast<float*>(scratch);
+    auto* ids = reinterpret_cast<int*>(values + kBlockCap * kTopKSegments * kTopK);
+    auto* nan = ids + kBlockCap * kTopKSegments * kTopK;
+    dflash_topk16_segment_kernel<<<dim3(kTopKSegments, rows), kTopKSegmentThreads, 0, stream>>>(
+        logits, vocab, values, ids, nan);
+    dflash_topk16_segment_merge_kernel<<<rows, 32, 0, stream>>>(
+        logits, vocab, values, ids, nan, cand_ids, cand_unary);
+}
+
 void dflash2_topk16_for_test(const std::uint16_t* logits, int rows, int vocab,
                            std::int64_t* ids, float* values, bool parallel,
                            bool local_merge,
-                           cudaStream_t stream) {
+                           cudaStream_t stream,
+                           unsigned int* nonfinite_flag) {
     require(rows >= 0 && rows < kBlockCap && vocab >= kTopK && vocab <= kVocab + 256,
             "top-K test entry requires rows0..7 and vocab16..248576");
     if (rows == 0) return;
     require(logits && ids && values, "top-K test entry received null buffers");
-    if (local_merge)
-        dflash_topk16_local_merge_kernel<<<rows, 256, 0, stream>>>(
-            logits, rows, vocab, ids, values);
+    require(!nonfinite_flag || local_merge,
+            "fused top-K liveness test requires local merge");
+    if (local_merge && !nonfinite_flag && dflash_topk_segmented_enabled()) {
+        static void* scratch = nullptr;
+        if (!scratch)
+            cuda_check(cudaMalloc(&scratch, dflash_topk_segment_bytes()),
+                       "top-K segmented test scratch");
+        launch_dflash_topk16_segmented(logits, rows, vocab, ids, values, scratch, stream, vocab);
+    } else if (local_merge) {
+        if (nonfinite_flag)
+            dflash_topk16_local_merge_kernel<true><<<rows, 256, 0, stream>>>(
+                logits, rows, vocab, ids, values, nonfinite_flag);
+        else
+            dflash_topk16_local_merge_kernel<false><<<rows, 256, 0, stream>>>(
+                logits, rows, vocab, ids, values, nullptr);
+    }
     else if (parallel)
         dflash_topk16_parallel_kernel<<<rows, 256, 0, stream>>>(logits, rows, vocab, ids, values);
     else
@@ -1367,7 +2307,21 @@ void dflash2_ring_attention_for_test(const std::uint16_t* q,
     if (queries == 0) return;
     require(q && k && v && out && (count == 0 || (ring_k && ring_v)),
             "ring attention test null buffers");
-    if (parallel)
+    if (parallel && dflash_ring_split_selected(count)) {
+        static float* partial_o = nullptr;
+        static float* partial_ml = nullptr;
+        if (!partial_o) {
+            cuda_check(cudaMalloc(&partial_o, kRingSplitPartialFloats * sizeof(float)),
+                       "ring split qualification partials");
+            cuda_check(cudaMalloc(&partial_ml, kRingSplitMlFloats * sizeof(float)),
+                       "ring split qualification max/sum");
+        }
+        launch_ring_attention_split(q, ring_k, ring_v, start, count, k, v, out, queries,
+                                    block, scale, partial_o, partial_ml, stream);
+    } else if (parallel && dflash_ring_staged_enabled())
+        dflash_attention_ring_staged_kernel<<<queries * kQHeads, kHeadDim, 0, stream>>>(
+            q, ring_k, ring_v, start, count, k, v, out, queries, block, scale);
+    else if (parallel)
         dflash_attention_ring_parallel_kernel<<<queries * kQHeads, kHeadDim, 0, stream>>>(
             q, ring_k, ring_v, start, count, k, v, out, queries, block, scale);
     else
@@ -1395,12 +2349,20 @@ __global__ void dflash_count_nonfinite_kernel(const std::uint16_t* buffer,
 // while reducing the guarded result to one device flag. It produces no
 // proposal or target-approval data.
 __global__ void dflash_nonfinite_flag_kernel(const std::uint16_t* buffer,
-                                             int count, unsigned int* out) {
+                                             int count, unsigned int* out,
+                                             int columns = 0, int stride = 0) {
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= count) return;
-    const float value = half_to_float(buffer[index]);
+    const std::size_t element = columns > 0
+        ? static_cast<std::size_t>(index / columns) * stride + index % columns
+        : static_cast<std::size_t>(index);
+    const float value = half_to_float(buffer[element]);
     if ((value != value) || value == INFINITY || value == -INFINITY)
         atomicExch(out, 1u);
+}
+
+bool dflash2_ring_attention_split_for_test(int count) {
+    return dflash_ring_split_selected(count);
 }
 
 void dflash2_dense_t_for_test(const std::uint16_t* input,
@@ -1410,7 +2372,8 @@ void dflash2_dense_t_for_test(const std::uint16_t* input,
         "draft dense qualification geometry");
     require(input && weights && output,"draft dense qualification pointers");
     const dim3 grid((n+255)/256,rows);
-    if(weights_kmajor)
+    if(weights_kmajor && launch_dflash_dense_rows_kmajor(input,weights,output,rows,k,n,stream)) {
+    } else if(weights_kmajor)
         dflash_dense_gemm_t_kernel<true><<<grid,256,
             static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(
             input,weights,output,rows,k,n);
@@ -1463,52 +2426,58 @@ __global__ void dflash_selector_edges_kernel(int position, std::int64_t anchor,
 // candidate order, FP32 reduction order, and strict-greater tie rule while
 // keeping the bounded autoregressive chain on one block. The proposal output
 // slot used by device-seed validity is intentionally untouched.
-__global__ void dflash_selector_fused_chain_kernel(
+// One warp per candidate. Lane L holds the products of ranks L + 32 k and
+// reproduces the 256-wide shared-memory tree (strides 128, 64, 32 in registers,
+// then 16..1 by shuffles), so every score and the selected chain are those of
+// the former one-product-per-thread reduction.
+constexpr int kSelectorFusedThreads = kTopK * 32;
+static_assert(kRank == 256, "selector tree is laid out for rank 256");
+
+__global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_chain_kernel(
     int proposal_rows, std::int64_t initial_anchor,
     const std::int64_t* device_anchor, const std::int64_t* cand_ids,
     const std::uint16_t* hidden, const std::uint16_t* pred_cb,
     const std::uint16_t* succ_cb, const float* cand_unary,
     std::int64_t* proposal_out) {
-    const int lane = static_cast<int>(threadIdx.x);
-    if (blockIdx.x != 0 || lane >= 256) return;
-    __shared__ float reduced[256];
+    const int t = static_cast<int>(threadIdx.x);
+    const int lane = t & 31;
+    const int candidate_index = t >> 5;
+    if (blockIdx.x != 0 || t >= kSelectorFusedThreads) return;
+    __shared__ float scores[kTopK];
     __shared__ std::int64_t anchor;
-    if (lane == 0)
+    if (t == 0)
         anchor = device_anchor != nullptr ? device_anchor[0] : initial_anchor;
     __syncthreads();
 
     for (int position = 0; position < proposal_rows; ++position) {
         const auto* pred_row = pred_cb + static_cast<std::size_t>(anchor) * kRank;
         const auto* hid_row = hidden + static_cast<std::size_t>(position) * kRank;
-        float best_score = -CUDART_INF_F;
-        int best = 0;
-        for (int candidate_index = 0; candidate_index < kTopK; ++candidate_index) {
-            const auto candidate = cand_ids[
-                static_cast<std::size_t>(position) * kTopK + candidate_index];
-            const auto* succ_row = succ_cb + static_cast<std::size_t>(candidate) * kRank;
-            float acc = 0.0f;
-            for (int r = lane; r < kRank; r += blockDim.x) {
-                acc += half_to_float(pred_row[r]) * half_to_float(hid_row[r]) *
-                       half_to_float(succ_row[r]);
-            }
-            reduced[lane] = acc;
-            __syncthreads();
-            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-                if (lane < stride) reduced[lane] += reduced[lane + stride];
-                __syncthreads();
-            }
-            if (lane == 0) {
-                const float score = cand_unary[
-                    static_cast<std::size_t>(position) * kTopK + candidate_index] +
-                    reduced[0];
-                if (candidate_index == 0 || score > best_score) {
-                    best_score = score;
-                    best = candidate_index;
-                }
-            }
-            __syncthreads();
+        const auto candidate = cand_ids[
+            static_cast<std::size_t>(position) * kTopK + candidate_index];
+        const auto* succ_row = succ_cb + static_cast<std::size_t>(candidate) * kRank;
+        float r[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int rank = lane + 32 * k;
+            r[k] = half_to_float(pred_row[rank]) * half_to_float(hid_row[rank]) *
+                   half_to_float(succ_row[rank]);
         }
-        if (lane == 0) {
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) r[k] += r[k + 4];
+        #pragma unroll
+        for (int k = 0; k < 2; ++k) r[k] += r[k + 2];
+        float value = r[0] + r[1];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        if (lane == 0)
+            scores[candidate_index] = cand_unary[
+                static_cast<std::size_t>(position) * kTopK + candidate_index] + value;
+        __syncthreads();
+        if (t == 0) {
+            float best_score = scores[0];
+            int best = 0;
+            for (int c = 1; c < kTopK; ++c)
+                if (scores[c] > best_score) { best_score = scores[c]; best = c; }
             const auto selected = cand_ids[
                 static_cast<std::size_t>(position) * kTopK + best];
             proposal_out[position] = selected;
@@ -1705,11 +2674,88 @@ __global__ void dflash_selector_batched_anchor_chain_kernel(
     }
 }
 
+void gopt_draft_rope_fixture(bool paired,const std::uint16_t* input,
+    std::uint16_t* output,const int* positions,int rows,int heads,cudaStream_t stream) {
+    if(paired)gopt_draft_rope_pair_kernel<<<(rows*heads*64+255)/256,256,0,stream>>>(input,output,positions,rows,heads);
+    else dflash_rope_kernel<<<(rows*heads*128+255)/256,256,0,stream>>>(input,output,positions,rows,heads,128);
+    cuda_check(cudaGetLastError(),"GOPT rotary fixture");
+}
+void gopt_draft_head_fixture(bool fused,bool paired,const std::uint16_t* input,
+    const std::uint16_t* weight,std::uint16_t* normalized,std::uint16_t* rotated,
+    const int* positions,int rows,int heads,cudaStream_t stream) {
+    if(fused)dflash_head_norm_kernel<true><<<rows*heads,128,128*sizeof(float),stream>>>(
+        input,weight,normalized,rows*heads,128,positions,rotated,heads,paired);
+    else dflash_head_norm_kernel<false><<<rows*heads,128,128*sizeof(float),stream>>>(
+        input,weight,normalized,rows*heads,128);
+    cuda_check(cudaGetLastError(),"GOPT head fixture");
+    if(!fused)gopt_draft_rope_fixture(paired,normalized,rotated,positions,rows,heads,stream);
+}
+void gopt_draft_ring_norm_fixture(bool fused,const std::uint16_t* k,
+    const std::uint16_t* v,const std::uint16_t* weight,const int* positions,
+    std::uint16_t* normalized,std::uint16_t* rotated,std::uint16_t* ring_k,
+    std::uint16_t* ring_v,int rows,int first,cudaStream_t stream) {
+    static_assert(kHeadDim==128 && kRopeDim==128);
+    if(fused)gopt_draft_ring_norm_rope_kernel<<<rows*kKVHeads,128,128*sizeof(float),stream>>>(
+        k,v,weight,positions,ring_k,ring_v,rows*kKVHeads);
+    else {
+        dflash_head_norm_kernel<<<rows*kKVHeads,128,128*sizeof(float),stream>>>(
+            k,weight,normalized,rows*kKVHeads,kHeadDim);
+        dflash_rope_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+            normalized,rotated,positions,rows,kKVHeads,kHeadDim);
+        dflash_prefill_ring_scatter_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+            rotated,v,ring_k,ring_v,rows,first);
+    }
+    cuda_check(cudaGetLastError(),"GOPT ring norm/RoPE fixture");
+}
+void gopt_draft_conv_fixture(bool fused,const std::uint16_t* input,
+    const std::uint16_t* dynamic,const std::uint16_t* base,std::uint16_t* conv,
+    const std::uint16_t* residual,std::uint16_t* output,int rows,cudaStream_t stream) {
+    if(fused)dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<dim3(rows, kHidden / 256), 256,0,stream>>>(
+        input,dynamic,base,conv,rows,1,residual,output);
+    else dflash_dyn_conv_kernel<DFlashFmt::BF16,false><<<dim3(rows, kHidden / 256), 256,0,stream>>>(
+        input,dynamic,base,conv,rows,1);
+    cuda_check(cudaGetLastError(),"GOPT draft conv fixture");
+    if(!fused)dflash_residual_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(residual,conv,output,rows*kHidden);
+    cuda_check(cudaGetLastError(),"GOPT draft residual fixture");
+}
+void gopt_draft_norm_fixture(bool fused,const std::uint16_t* left,
+    const std::uint16_t* right,const std::uint16_t* weight,std::uint16_t* residual,
+    std::uint16_t* normalized,int rows,cudaStream_t stream) {
+    if(fused)dflash_rms_norm_kernel<DFlashFmt::BF16,true><<<rows,256,256*sizeof(float),stream>>>(
+        left,weight,normalized,rows,kHidden,right,residual);
+    else {
+        dflash_residual_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(left,right,residual,rows*kHidden);
+        dflash_rms_norm_kernel<DFlashFmt::BF16><<<rows,256,256*sizeof(float),stream>>>(residual,weight,normalized,rows,kHidden);
+    }
+    cuda_check(cudaGetLastError(),"GOPT residual norm fixture");
+}
+void gopt_draft_dense_fixture(bool paired,bool kmajor,const std::uint16_t* input,
+    const std::uint16_t* weight,std::uint16_t* output,int rows,int k,int n,cudaStream_t stream) {
+    if(paired && rows>=2 && rows<=8 && k<=kHidden) {
+        if(kmajor)gopt_draft_dense_rowpair_kernel<true><<<dim3((n+255)/256,(rows+1)/2),256,2*k*sizeof(std::uint16_t),stream>>>(input,weight,output,rows,k,n);
+        else gopt_draft_dense_rowpair_kernel<false><<<dim3((n+255)/256,(rows+1)/2),256,2*k*sizeof(std::uint16_t),stream>>>(input,weight,output,rows,k,n);
+    } else {
+        if(kmajor)dflash_dense_gemm_t_kernel<true><<<dim3((n+255)/256,rows),256,k*sizeof(std::uint16_t),stream>>>(input,weight,output,rows,k,n);
+        else dflash_dense_gemm_t_kernel<false><<<dim3((n+255)/256,rows),256,k*sizeof(std::uint16_t),stream>>>(input,weight,output,rows,k,n);
+    }
+    cuda_check(cudaGetLastError(),"GOPT dense fixture");
+}
+
 struct Exl3Dflash2DraftModel::Impl {
+    Exl3GamingOptions gaming=Exl3GamingOptions::from_environment();
+    GoptSubmissions gaming_submissions{};
     int device=0;
     bool parallel_topk = false;
     bool local_merge_topk = false;
     std::uint64_t local_merge_topk_calls = 0;
+    // NINFER_DFLASH2_HEAD_PREFIX=N (multiple of 128, default 98304 = 99.96% of
+    // code/prose tokens, 0 = off): the draft head
+    // scores only token ids [0, N). The target verifies every proposal, so this
+    // changes acceptance, never output. A host seed token >= N switches back to
+    // the full head for kHeadPrefixHold rounds.
+    int head_prefix = 98304;
+    int head_full_rounds = 0;
+    std::uint64_t head_prefix_calls = 0;
     bool parallel_ring_attention = false;
     bool position_confidence = false;
     bool dense_kmajor = false;
@@ -1717,7 +2763,12 @@ struct Exl3Dflash2DraftModel::Impl {
     bool selector_batched_anchor_chain = false;
     std::uint64_t selector_batched_anchor_chain_calls = 0;
     bool fast_device_liveness = false;
+    bool fused_topk_liveness = false;
+    std::uint64_t fused_topk_liveness_calls = 0;
     bool fused_selector = false;
+    bool proposal_candidates = false;
+    std::vector<std::int64_t> last_candidate_ids;
+    std::vector<float> last_candidate_unary;
     std::uint64_t fused_selector_calls = 0;
     std::uint64_t device_liveness_checks = 0;
     std::vector<DraftPositionConfidence> last_position_confidence;
@@ -1885,12 +2936,15 @@ struct Exl3Dflash2DraftModel::Impl {
         std::uint16_t* final_norm = nullptr;    // [P][5120]
         std::uint16_t* head_out = nullptr;      // [P][248320]
         unsigned int* liveness_flag = nullptr;  // [1], FAST_DEVICE_LIVENESS only
+        float* ring_partial_o = nullptr;        // split ring attention partials
+        float* ring_partial_ml = nullptr;       // split ring attention max/sum
         std::uint16_t* hidden_proj_out = nullptr; // [P][256]
         std::int32_t* pos_ctx = nullptr;    // [S]
         std::int32_t* pos_blk = nullptr;    // [L]
         std::int64_t* ids = nullptr;        // [L]
         std::int64_t* cand_ids = nullptr;   // [P][16]
         float* cand_unary = nullptr;        // [P][16]
+        void* topk_segments = nullptr;      // segmented top-K scratch
         float* edge_scores = nullptr;       // [16]
         std::int64_t* proposal_out = nullptr; // [P]
         DraftPositionConfidence* confidence_out = nullptr; // [P], T73A only
@@ -1909,6 +2963,23 @@ struct Exl3Dflash2DraftModel::Impl {
     // + V (raw), slot(p) = p & (kRingCap-1). Committed span is contiguous.
     std::array<std::uint16_t*, kLayers> ring_k{};
     std::array<std::uint16_t*, kLayers> ring_v{};
+    // One device-only undo arena: five K/V pairs, at most eight physical slots.
+    std::uint16_t* ring_undo_arena = nullptr;
+    struct RingUndo {
+        enum class Phase : std::uint8_t { Idle, Armed, InFlight, Applied };
+        Phase phase = Phase::Idle;
+        cudaStream_t stream = nullptr;
+        int rows = 0;
+        long long abs_pos0 = 0;
+        long long base_abs = 0;
+        int count = 0;
+        std::shared_ptr<const Exl3DraftHostRing> host_parent;
+        bool host_failed = false;
+        std::uint64_t revision = 0, witness_revision = 0;
+        std::uint64_t acquisition = 0, execution = 0;
+        std::uint64_t witness_acquisition = 0, witness_execution = 0;
+        bool witness_ready = false;
+    } ring_undo;
     long long ring_base_abs = 0;
     int ring_count = 0;
     FreshPrefillStatus fresh_prefill;
@@ -1928,6 +2999,30 @@ struct Exl3Dflash2DraftModel::Impl {
         if(ring_revision==std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("draft ring revision exhausted");
         ++ring_revision;
+    }
+    void copy_ring_undo_slots(bool restore, cudaStream_t stream) {
+        constexpr std::size_t row_elements = static_cast<std::size_t>(kKVHeads) * kHeadDim;
+        const int first_slot = static_cast<int>(ring_undo.abs_pos0 & kRingMask);
+        for (int layer = 0; layer < kLayers; ++layer) {
+            for (int plane = 0; plane < 2; ++plane) {
+                auto* ring = plane == 0 ? ring_k[layer] : ring_v[layer];
+                auto* saved = ring_undo_arena +
+                    (static_cast<std::size_t>(layer) * 2 + plane) * 8 * row_elements;
+                for (int offset = 0; offset < ring_undo.rows;) {
+                    const int slot = (first_slot + offset) & kRingMask;
+                    const int count = std::min(ring_undo.rows - offset, kRingCap - slot);
+                    auto* ring_segment = ring + static_cast<std::size_t>(slot) * row_elements;
+                    auto* saved_segment = saved + static_cast<std::size_t>(offset) * row_elements;
+                    cuda_check(cudaMemcpyAsync(restore ? ring_segment : saved_segment,
+                                              restore ? saved_segment : ring_segment,
+                                              static_cast<std::size_t>(count) * row_elements *
+                                                  sizeof(std::uint16_t),
+                                              cudaMemcpyDeviceToDevice, stream),
+                               restore ? "draft ring undo restore" : "draft ring undo snapshot");
+                    offset += count;
+                }
+            }
+        }
     }
     std::uint64_t* ring_digest_partial = nullptr;  // [kRingCap]
 
@@ -2033,13 +3128,19 @@ struct Exl3Dflash2DraftModel::Impl {
         if (fast_device_liveness)
             alloc(sizeof(unsigned int), reinterpret_cast<void**>(&s.liveness_flag),
                   "dflash fast liveness flag");
+        alloc(kRingSplitPartialFloats * sizeof(float), reinterpret_cast<void**>(&s.ring_partial_o),
+              "dflash ring split partials");
+        alloc(kRingSplitMlFloats * sizeof(float), reinterpret_cast<void**>(&s.ring_partial_ml),
+              "dflash ring split max/sum");
         alloc(rowsB(kBlockCap) * kRank * two, reinterpret_cast<void**>(&s.hidden_proj_out), "dflash hidden proj");
         alloc(rowsB(kContextCap) * sizeof(std::int32_t), reinterpret_cast<void**>(&s.pos_ctx), "dflash ctx positions");
         alloc(rowsB(kBlockCap) * sizeof(std::int32_t), reinterpret_cast<void**>(&s.pos_blk), "dflash block positions");
         alloc(rowsB(kBlockCap) * sizeof(std::int64_t), reinterpret_cast<void**>(&s.ids), "dflash token ids");
         alloc(rowsB(kBlockCap) * kTopK * sizeof(std::int64_t), reinterpret_cast<void**>(&s.cand_ids), "dflash cand ids");
         alloc(rowsB(kBlockCap) * kTopK * sizeof(float), reinterpret_cast<void**>(&s.cand_unary), "dflash cand unary");
+        alloc(dflash_topk_segment_bytes(), &s.topk_segments, "dflash segmented top-K scratch");
         alloc(kTopK * sizeof(float), reinterpret_cast<void**>(&s.edge_scores), "dflash edge scores");
+        // [0, kBlockCap) proposals (slot 7: device-seed status).
         alloc(rowsB(kBlockCap) * sizeof(std::int64_t), reinterpret_cast<void**>(&s.proposal_out), "dflash proposal out");
         if (position_confidence)
             alloc(rowsB(kBlockCap) * sizeof(DraftPositionConfidence),
@@ -2057,6 +3158,8 @@ struct Exl3Dflash2DraftModel::Impl {
             allocate_counted(bytes,reinterpret_cast<void**>(&ring_k[layer]),"dflash ring K",ring_bytes);
             allocate_counted(bytes,reinterpret_cast<void**>(&ring_v[layer]),"dflash ring V",ring_bytes);
         }
+        allocate_counted(static_cast<std::size_t>(kLayers)*2*8*kv_elems*two,
+            reinterpret_cast<void**>(&ring_undo_arena),"dflash ring undo arena",ring_bytes);
         {
             allocate_counted(static_cast<std::size_t>(kRingCap)*sizeof(std::uint64_t),
                 reinterpret_cast<void**>(&ring_digest_partial),"dflash ring digest",ring_bytes);
@@ -2065,6 +3168,10 @@ struct Exl3Dflash2DraftModel::Impl {
 };
 Exl3Dflash2DraftModel::Exl3Dflash2DraftModel(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
+
+GoptSubmissions Exl3Dflash2DraftModel::gaming_submissions() const noexcept {
+    return impl_?impl_->gaming_submissions:GoptSubmissions{};
+}
 
 Exl3Dflash2DraftModel::~Exl3Dflash2DraftModel() = default;
 
@@ -2277,7 +3384,7 @@ std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::create_execution()
     return create_execution_impl(false);
 }
 void Exl3Dflash2DraftModel::materialize_private_execution(Exl3VeriCacheServingCoordinator* authority) {
-    std::unique_lock lock(execution_mutex_,std::try_to_lock);
+    std::unique_lock<std::mutex> lock(execution_mutex_,std::try_to_lock);
     require(lock.owns_lock() && !impl_->ws_fc,"draft private construction requires deferred idle clone");
     int device=0;cuda_check(cudaGetDevice(&device),"draft materialization device");
     require(device==impl_->device,"draft materialization/weight device mismatch");
@@ -2289,7 +3396,7 @@ void Exl3Dflash2DraftModel::finish_constructor_credits() noexcept {
     for(auto* child:impl_->linear_owners())if(child)child->release_constructor_credits_after_commit();
 }
 std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::create_execution_impl(bool defer_private) const {
-    std::unique_lock lock(execution_mutex_,std::try_to_lock);
+    std::unique_lock<std::mutex> lock(execution_mutex_,std::try_to_lock);
     require(lock.owns_lock(),"cannot clone an acquired draft execution resource");
     const auto& parent=*impl_;int device=0;cuda_check(cudaGetDevice(&device),"draft execution device");
     require(device==parent.device,"draft execution/weight device mismatch");
@@ -2306,6 +3413,8 @@ std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::create_execution_i
     child->dense_kmajor=parent.dense_kmajor;
     child->selector_batched_anchor_chain=parent.selector_batched_anchor_chain;
     child->fast_device_liveness=parent.fast_device_liveness;
+    child->fused_topk_liveness=parent.fused_topk_liveness;
+    child->head_prefix=parent.head_prefix;
     child->fused_selector=parent.fused_selector;
     child->position_confidence=parent.position_confidence;
     child->required_execution_bytes=parent.required_execution_bytes;
@@ -2330,6 +3439,9 @@ const float* Exl3Dflash2DraftModel::last_topk_values_device_for_test() const noe
 std::uint64_t Exl3Dflash2DraftModel::local_topk_calls() const noexcept {
     return impl_->local_merge_topk_calls;
 }
+std::uint64_t Exl3Dflash2DraftModel::fused_topk_liveness_calls() const noexcept {
+    return impl_->fused_topk_liveness_calls;
+}
 const std::vector<Exl3Dflash2DraftModel::DraftPositionConfidence>&
 Exl3Dflash2DraftModel::last_position_confidence_for_test() const noexcept {
     return impl_->last_position_confidence;
@@ -2346,7 +3458,7 @@ void Exl3Dflash2DraftModel::require_host_control_idle_for_test() const {
 }
 
 void Exl3Dflash2DraftModel::set_shared_q_executor(Exl3DraftSharedQExecutor executor,bool block_kv,bool block_o,bool block_down,bool block_gateup) {
-    std::unique_lock lock(execution_mutex_,std::try_to_lock);
+    std::unique_lock<std::mutex> lock(execution_mutex_,std::try_to_lock);
     require(lock.owns_lock() && impl_->ring_acquisition==0,
         "draft shared Q installation requires unacquired execution");
     require_no_fresh_prefill();impl_->shared_q_executor=std::move(executor);
@@ -2371,6 +3483,12 @@ void Exl3Dflash2DraftModel::set_ring_attention_observer_for_test(
 
 void Exl3Dflash2DraftModel::reset(cudaStream_t stream) {
     Exl3DraftHostRing::require_transfer_healthy();
+    if (impl_->ring_undo.phase != Impl::RingUndo::Phase::Idle &&
+        stream != impl_->ring_undo.stream) {
+        impl_->host_ring_failed = true;
+        require(false, "draft ring undo reset stream mismatch");
+    }
+    impl_->ring_undo = {};
     impl_->invalidate_ring_witness();
     if (impl_->fresh_prefill.active && stream != impl_->fresh_prefill_stream) {
         impl_->fresh_prefill.failed = true;
@@ -2416,6 +3534,38 @@ bool Exl3DraftHostRing::same_represented_payload_for_test(const Exl3DraftHostRin
         }
     }
     return true;
+}
+
+std::size_t Exl3DraftHostRing::write_represented_payload_for_test(
+    const std::filesystem::path& path) const {
+    std::ofstream out(path,std::ios::binary | std::ios::trunc);
+    if(!out)throw std::runtime_error("draft represented ring file open failed");
+    constexpr std::uint64_t magic=0x31474e4952443545ULL;
+    out.write(reinterpret_cast<const char*>(&magic),sizeof(magic));
+    out.write(reinterpret_cast<const char*>(&base_),sizeof(base_));
+    out.write(reinterpret_cast<const char*>(&count_),sizeof(count_));
+    std::size_t bytes=sizeof(magic)+sizeof(base_)+sizeof(count_);
+    std::size_t page_index=0;
+    for(long long row=base_;row<position();++row) {
+        while(page_index<pages_.size() &&
+              pages_[page_index]->first+pages_[page_index]->rows<=row)
+            ++page_index;
+        if(page_index==pages_.size() || pages_[page_index]->first>row)
+            throw std::logic_error("draft represented ring page gap");
+        const auto& page=*pages_[page_index];
+        const auto offset=static_cast<std::size_t>(row-page.first)*1024;
+        for(int layer=0;layer<5;++layer) {
+            for(const auto* plane:{&page.k[layer],&page.v[layer]}) {
+                if(plane->size()<offset+1024)
+                    throw std::logic_error("draft represented ring plane extent");
+                out.write(reinterpret_cast<const char*>(plane->data()+offset),2048);
+                bytes+=2048;
+            }
+        }
+    }
+    out.flush();
+    if(!out)throw std::runtime_error("draft represented ring file write failed");
+    return bytes;
 }
 
 std::uint64_t Exl3DraftHostRing::visit_allocations(
@@ -2528,6 +3678,8 @@ std::shared_ptr<const Exl3DraftHostRing> Exl3Dflash2DraftModel::export_host_ring
 
 void Exl3Dflash2DraftModel::bind_ring_scope(std::uint64_t acquisition,std::uint64_t execution) {
     Exl3DraftHostRing::require_transfer_healthy();
+    require(impl_->ring_undo.phase == Impl::RingUndo::Phase::Idle,
+            "draft ring undo must finish before scope binding");
     impl_->invalidate_ring_witness();
     impl_->ring_acquisition=acquisition;impl_->ring_execution=execution;
 }
@@ -2536,6 +3688,7 @@ bool Exl3Dflash2DraftModel::rebind_ring_scope_if_resident(
     std::uint64_t acquisition,std::uint64_t execution) {
     Exl3DraftHostRing::require_transfer_healthy();
     auto& m=*impl_;
+    if (m.ring_undo.phase != Impl::RingUndo::Phase::Idle) return false;
     if(!acquisition || !execution || !m.ring_acquisition || !m.ring_execution ||
        !host_ring_resident(state))return false;
     m.ring_acquisition=acquisition;m.ring_execution=execution;
@@ -2547,7 +3700,8 @@ bool Exl3Dflash2DraftModel::host_ring_resident(const std::shared_ptr<const Exl3D
     // Strong immutable parent ownership precludes same-address replacement.
     // Every ring writer invalidates the content revision before submission;
     // exports/restores bind it only after successful stream completion.
-    return Exl3DraftHostRing::uncertain_transfer_count()==0 && state && !m.fresh_prefill.active && !m.host_ring_failed &&
+    return Exl3DraftHostRing::uncertain_transfer_count()==0 && state && !m.fresh_prefill.active &&
+        m.ring_undo.phase == Impl::RingUndo::Phase::Idle && !m.host_ring_failed &&
         m.ring_witness_ready && m.witness_revision==m.ring_revision &&
         m.witness_acquisition==m.ring_acquisition && m.witness_execution==m.ring_execution &&
         state==m.host_ring_parent && state->model_identity_==m.host_ring_identity &&
@@ -2617,6 +3771,8 @@ void Exl3Dflash2DraftModel::rewind_to(int count, cudaStream_t) {
 std::array<std::uint64_t, 5> Exl3Dflash2DraftModel::ring_digest(cudaStream_t stream) {
     Exl3DraftHostRing::require_transfer_healthy();
     Impl& m = *impl_;
+    require(m.ring_undo.phase == Impl::RingUndo::Phase::Idle,
+            "draft ring digest requires a settled undo scope");
     std::array<std::uint64_t, 5> out{};
     const int start_slot = static_cast<int>(m.ring_base_abs & kRingMask);
     for (int layer = 0; layer < kLayers; ++layer) {
@@ -2638,8 +3794,38 @@ std::array<std::uint64_t, 5> Exl3Dflash2DraftModel::ring_digest(cudaStream_t str
     return out;
 }
 
+std::array<std::uint64_t, 5> Exl3Dflash2DraftModel::physical_ring_digest_for_test(
+    cudaStream_t stream) {
+    Exl3DraftHostRing::require_transfer_healthy();
+    Impl& m = *impl_;
+    require(m.ring_undo.phase == Impl::RingUndo::Phase::Idle,
+            "physical ring digest requires a settled undo scope");
+    std::array<std::uint64_t, 5> out{};
+    for (int layer = 0; layer < kLayers; ++layer) {
+        dflash_ring_digest_kernel<<<(kRingCap + 255) / 256, 256, 0, stream>>>(
+            m.ring_k[layer], m.ring_v[layer], 0, kRingCap,
+            m.ring_digest_partial);
+        cuda_check(cudaGetLastError(), "physical ring digest launch");
+        std::vector<std::uint64_t> partial(kRingCap);
+        cuda_check(cudaMemcpyAsync(partial.data(), m.ring_digest_partial,
+                                   partial.size() * sizeof(std::uint64_t),
+                                   cudaMemcpyDeviceToHost, stream),
+                   "physical ring digest download");
+        cuda_check(cudaStreamSynchronize(stream), "physical ring digest sync");
+        std::uint64_t h = 1469598103934665603ULL;
+        for (const auto v : partial) {
+            h ^= v + 0x9e3779b97f4a7c15ULL;
+            h *= 1099511628211ULL;
+        }
+        out[static_cast<std::size_t>(layer)] = h;
+    }
+    return out;
+}
+
 void Exl3Dflash2DraftModel::require_no_fresh_prefill() {
     Exl3DraftHostRing::require_transfer_healthy();
+    require(impl_->ring_undo.phase == Impl::RingUndo::Phase::Idle,
+            "draft ring undo must finish before ordinary operation");
     if (impl_->fresh_prefill.active || impl_->fresh_prefill.failed) {
         impl_->fresh_prefill.failed = true;
         require(false, "fresh prefill must finish or reset before ordinary operation");
@@ -2664,8 +3850,34 @@ void Exl3Dflash2DraftModel::begin_fresh_prefill(long long start, long long end,
     impl_->fresh_prefill_stream = stream;
 }
 
+void Exl3Dflash2DraftModel::skip_fresh_prefill_block(int rows,
+    long long abs_pos0, cudaStream_t stream) {
+    require(impl_->ring_undo.phase == Impl::RingUndo::Phase::Idle,
+            "draft ring undo must finish before fresh prefill skip");
+    auto& f = impl_->fresh_prefill;
+    try {
+        Exl3DraftHostRing::require_transfer_healthy();
+        require(f.active && !f.failed, "fresh prefill skip requires active scope");
+        require(stream == impl_->fresh_prefill_stream,
+                "fresh prefill skip stream mismatch");
+        require(rows >= 1 && rows <= 16 && abs_pos0 == f.submitted_cursor &&
+                abs_pos0 >= f.start && abs_pos0 + rows <= f.end - kRingCap,
+                "fresh prefill skip requires an ordered whole discarded call");
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream, &capture),
+                   "fresh prefill skip capture status");
+        require(capture == cudaStreamCaptureStatusNone,
+                "fresh prefill skip requires eager stream");
+        f.submitted_rows += rows;
+        f.skipped_rows += rows;
+        f.submitted_cursor += rows;
+    } catch (...) { f.failed = true; throw; }
+}
+
 void Exl3Dflash2DraftModel::finish_fresh_prefill(cudaStream_t stream) {
     Exl3DraftHostRing::require_transfer_healthy();
+    require(impl_->ring_undo.phase == Impl::RingUndo::Phase::Idle,
+            "draft ring undo must finish before fresh prefill finish");
     auto& f = impl_->fresh_prefill;
     try {
         require(f.active && !f.failed, "fresh prefill scope unavailable");
@@ -2698,10 +3910,124 @@ void Exl3Dflash2DraftModel::commit_target_block(const std::uint16_t* const* taps
     catch(...) {impl_->host_ring_failed=true;impl_->host_ring_parent.reset();throw;}
 }
 
+void Exl3Dflash2DraftModel::begin_prefill_ring_undo(int rows, long long abs_pos0,
+    cudaStream_t stream) {
+    require_no_fresh_prefill();
+    auto& m = *impl_;
+    require(m.ring_undo.phase == Impl::RingUndo::Phase::Idle,
+            "draft ring undo already active");
+    require(!m.host_ring_failed && m.ring_undo_arena && m.ring_count == kRingKeep,
+            "draft ring undo requires a healthy saturated ring");
+    require(m.ring_acquisition != 0 && m.ring_execution != 0,
+            "draft ring undo requires a bound request scope");
+    require(rows >= 1 && rows <= 8 && abs_pos0 == m.ring_base_abs + m.ring_count &&
+            abs_pos0 >= 0 && abs_pos0 <= 2147483647LL - rows,
+            "draft ring undo extent must be one contiguous 1..8-row commit");
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cuda_check(cudaStreamIsCapturing(stream, &capture), "draft ring undo capture status");
+    require(capture == cudaStreamCaptureStatusNone, "draft ring undo requires eager stream");
+    auto& undo = m.ring_undo;
+    undo.phase = Impl::RingUndo::Phase::Armed;
+    undo.stream = stream;
+    undo.rows = rows;
+    undo.abs_pos0 = abs_pos0;
+    undo.base_abs = m.ring_base_abs;
+    undo.count = m.ring_count;
+    undo.host_parent = m.host_ring_parent;
+    undo.host_failed = m.host_ring_failed;
+    undo.revision = m.ring_revision;
+    undo.witness_revision = m.witness_revision;
+    undo.acquisition = m.ring_acquisition;
+    undo.execution = m.ring_execution;
+    undo.witness_acquisition = m.witness_acquisition;
+    undo.witness_execution = m.witness_execution;
+    undo.witness_ready = m.ring_witness_ready;
+    try { m.copy_ring_undo_slots(false, stream); }
+    catch (...) {
+        m.ring_undo = {};
+        m.host_ring_failed = true;
+        m.host_ring_parent.reset();
+        m.ring_count = 0;
+        throw;
+    }
+}
+
+void Exl3Dflash2DraftModel::accept_prefill_ring_undo(cudaStream_t stream) {
+    auto& m = *impl_;
+    require(m.ring_undo.phase == Impl::RingUndo::Phase::Applied &&
+            stream == m.ring_undo.stream && !m.host_ring_failed &&
+            m.ring_acquisition == m.ring_undo.acquisition &&
+            m.ring_execution == m.ring_undo.execution,
+            "draft ring undo accept requires one completed matching commit");
+    try { cuda_check(cudaStreamSynchronize(stream), "draft ring undo commit completion"); }
+    catch (...) {
+        m.ring_undo = {};
+        m.host_ring_failed = true;
+        m.host_ring_parent.reset();
+        m.ring_count = 0;
+        throw;
+    }
+    m.ring_undo = {};
+}
+
+void Exl3Dflash2DraftModel::rollback_prefill_ring_undo(cudaStream_t stream) {
+    auto& m = *impl_;
+    require(m.ring_undo.phase != Impl::RingUndo::Phase::Idle &&
+            stream == m.ring_undo.stream &&
+            m.ring_acquisition == m.ring_undo.acquisition &&
+            m.ring_execution == m.ring_undo.execution,
+            "draft ring undo rollback requires its original stream");
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cuda_check(cudaStreamIsCapturing(stream, &capture), "draft ring undo rollback capture status");
+    require(capture == cudaStreamCaptureStatusNone,
+            "draft ring undo rollback requires eager stream");
+    try {
+        // Snapshot, forward projections, and restore are ordered on the same
+        // stream. Completion must precede restoring the host-side ring witness.
+        m.copy_ring_undo_slots(true, stream);
+        cuda_check(cudaStreamSynchronize(stream), "draft ring undo rollback completion");
+        auto& undo = m.ring_undo;
+        m.ring_base_abs = undo.base_abs;
+        m.ring_count = undo.count;
+        m.host_ring_parent = std::move(undo.host_parent);
+        m.host_ring_failed = undo.host_failed;
+        m.ring_revision = undo.revision;
+        m.witness_revision = undo.witness_revision;
+        m.ring_acquisition = undo.acquisition;
+        m.ring_execution = undo.execution;
+        m.witness_acquisition = undo.witness_acquisition;
+        m.witness_execution = undo.witness_execution;
+        m.ring_witness_ready = undo.witness_ready;
+        undo = {};
+    } catch (...) {
+        m.ring_undo = {};
+        m.host_ring_failed = true;
+        m.host_ring_parent.reset();
+        m.ring_count = 0;
+        throw;
+    }
+}
+
 void Exl3Dflash2DraftModel::commit_prefill_block(const std::uint16_t* const* taps,
     int rows, long long abs_pos0, cudaStream_t stream) {
     Exl3DraftHostRing::require_transfer_healthy();
     auto& m = *impl_; auto& f = m.fresh_prefill;
+    if (m.ring_undo.phase != Impl::RingUndo::Phase::Idle) {
+        require(m.ring_undo.phase == Impl::RingUndo::Phase::Armed && !f.active &&
+                !f.failed && stream == m.ring_undo.stream && rows == m.ring_undo.rows &&
+                abs_pos0 == m.ring_undo.abs_pos0,
+                "draft ring undo commit must match its armed interval and stream");
+        m.ring_undo.phase = Impl::RingUndo::Phase::InFlight;
+        try {
+            commit_prefill_block_internal(taps, rows, abs_pos0, stream);
+            m.ring_undo.phase = Impl::RingUndo::Phase::Applied;
+        } catch (...) {
+            m.host_ring_failed = true;
+            m.host_ring_parent.reset();
+            throw;
+        }
+        return;
+    }
     if (!f.active) {
         require_no_fresh_prefill();
         try {commit_prefill_block_internal(taps, rows, abs_pos0, stream);}
@@ -2784,15 +4110,23 @@ void Exl3Dflash2DraftModel::commit_target_block_internal(const std::uint16_t* co
             const auto& lay = m.layers[layer];
             m.ws_kv->forward(lay.k, lay.km, m.s.hctx, m.s.kctx, 1, stream);
             m.ws_kv->forward(lay.v, lay.vm, m.s.hctx, m.s.vctx, 1, stream);
-            dflash_head_norm_kernel<<<kKVHeads, 128, 128 * sizeof(float), stream>>>(
-                m.s.kctx, lay.k_norm, m.s.kctx_n, kKVHeads, kHeadDim);
-            dflash_rope_kernel<<<(kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(
-                m.s.kctx_n, m.s.kctx_r, m.s.pos_ctx, 1, kKVHeads, kHeadDim);
-            cuda_check(cudaGetLastError(), "E5A3 commit rope");
             const int slot = static_cast<int>(pos & kRingMask);
-            dflash_ring_scatter_kernel<<<(kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(
-                m.s.kctx_r, m.s.vctx, m.ring_k[layer], m.ring_v[layer], slot);
-            cuda_check(cudaGetLastError(), "E5A3 commit ring scatter");
+            if(m.gaming[Gopt::DraftRingNormRope]) {
+                gopt_draft_ring_norm_rope_kernel<<<kKVHeads,128,128*sizeof(float),stream>>>(
+                    m.s.kctx,m.s.vctx,lay.k_norm,m.s.pos_ctx,
+                    m.ring_k[layer],m.ring_v[layer],kKVHeads);
+                cuda_check(cudaGetLastError(),"GOPT commit ring norm/RoPE");
+                gopt_record(m.gaming_submissions,Gopt::DraftRingNormRope);
+            } else {
+                dflash_head_norm_kernel<<<kKVHeads, 128, 128 * sizeof(float), stream>>>(
+                    m.s.kctx, lay.k_norm, m.s.kctx_n, kKVHeads, kHeadDim);
+                dflash_rope_kernel<<<(kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(
+                    m.s.kctx_n, m.s.kctx_r, m.s.pos_ctx, 1, kKVHeads, kHeadDim);
+                cuda_check(cudaGetLastError(), "E5A3 commit rope");
+                dflash_ring_scatter_kernel<<<(kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(
+                    m.s.kctx_r, m.s.vctx, m.ring_k[layer], m.ring_v[layer], slot);
+                cuda_check(cudaGetLastError(), "E5A3 commit ring scatter");
+            }
         }
         if (m.ring_count < kRingKeep) {
             ++m.ring_count;
@@ -2842,14 +4176,22 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
             const auto& lay = m.layers[layer];
             m.ws_kv->forward(lay.k,lay.km,m.s.hctx,m.s.kctx,count,stream);
             m.ws_kv->forward(lay.v,lay.vm,m.s.hctx,m.s.vctx,count,stream);
-            dflash_head_norm_kernel<<<count*kKVHeads,128,128*sizeof(float),stream>>>(
-                m.s.kctx,lay.k_norm,m.s.kctx_n,count*kKVHeads,kHeadDim);
-            dflash_rope_kernel<<<(count*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
-                m.s.kctx_n,m.s.kctx_r,m.s.pos_ctx,count,kKVHeads,kHeadDim);
-            cuda_check(cudaGetLastError(), "draft prefill rope");
-            dflash_prefill_ring_scatter_kernel<<<(count*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
-                m.s.kctx_r,m.s.vctx,m.ring_k[layer],m.ring_v[layer],count,pos);
-            cuda_check(cudaGetLastError(), "draft prefill ring scatter");
+            if(m.gaming[Gopt::DraftRingNormRope]) {
+                gopt_draft_ring_norm_rope_kernel<<<count*kKVHeads,128,128*sizeof(float),stream>>>(
+                    m.s.kctx,m.s.vctx,lay.k_norm,m.s.pos_ctx,
+                    m.ring_k[layer],m.ring_v[layer],count*kKVHeads);
+                cuda_check(cudaGetLastError(),"GOPT prefill ring norm/RoPE");
+                gopt_record(m.gaming_submissions,Gopt::DraftRingNormRope);
+            } else {
+                dflash_head_norm_kernel<<<count*kKVHeads,128,128*sizeof(float),stream>>>(
+                    m.s.kctx,lay.k_norm,m.s.kctx_n,count*kKVHeads,kHeadDim);
+                dflash_rope_kernel<<<(count*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+                    m.s.kctx_n,m.s.kctx_r,m.s.pos_ctx,count,kKVHeads,kHeadDim);
+                cuda_check(cudaGetLastError(), "draft prefill rope");
+                dflash_prefill_ring_scatter_kernel<<<(count*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+                    m.s.kctx_r,m.s.vctx,m.ring_k[layer],m.ring_v[layer],count,pos);
+                cuda_check(cudaGetLastError(), "draft prefill ring scatter");
+            }
         }
         const int dropped = std::max(0,m.ring_count+count-kRingKeep);
         m.ring_count = std::min(kRingKeep,m.ring_count+count);
@@ -2909,6 +4251,21 @@ std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::load_impl(
         "NINFER_DFLASH2_FAST_DEVICE_LIVENESS must be 0 or 1");
     impl->fast_device_liveness=fast_device_liveness!=nullptr &&
         std::string(fast_device_liveness)=="1";
+    const char* fused_topk_liveness=std::getenv("NINFER_DFLASH2_FUSED_TOPK_LIVENESS");
+    require(fused_topk_liveness==nullptr || std::string(fused_topk_liveness)=="0" ||
+            std::string(fused_topk_liveness)=="1",
+        "NINFER_DFLASH2_FUSED_TOPK_LIVENESS must be 0 or 1");
+    impl->fused_topk_liveness=fused_topk_liveness!=nullptr &&
+        std::string(fused_topk_liveness)=="1";
+    if(const char* prefix=std::getenv("NINFER_DFLASH2_HEAD_PREFIX")) {
+        const int value=std::atoi(prefix);
+        require(value>=0 && value%128==0 && value<=kVocab,
+            "NINFER_DFLASH2_HEAD_PREFIX must be a multiple of 128 within the vocabulary");
+        impl->head_prefix=value<kVocab?value:0;
+    }
+    require(!impl->fused_topk_liveness ||
+                (impl->fast_device_liveness && impl->local_merge_topk),
+        "fused top-K liveness requires fast device liveness and local top-K");
     const char* fused_selector=std::getenv("NINFER_DFLASH2_FUSED_SELECTOR");
     require(fused_selector==nullptr || std::string(fused_selector)=="0" ||
             std::string(fused_selector)=="1",
@@ -3140,6 +4497,19 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached(
     return propose_internal(block_ids, block_pos0, nullptr, 0, 0, 0,
                             target_embedding_bf16, target_head,
                             target_head_metadata, mask_token_id, stream, true);
+}
+
+void Exl3Dflash2DraftModel::set_proposal_candidates(bool enabled) {
+    require(!enabled || impl_->fused_selector, "draft candidates require the fused selector");
+    impl_->proposal_candidates = enabled;
+}
+
+const std::vector<std::int64_t>& Exl3Dflash2DraftModel::last_candidate_ids() const noexcept {
+    return impl_->last_candidate_ids;
+}
+
+const std::vector<float>& Exl3Dflash2DraftModel::last_candidate_unary() const noexcept {
+    return impl_->last_candidate_unary;
 }
 
 std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_view(
@@ -3462,7 +4832,19 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     };
     auto launch_dense = [&](const std::uint16_t* in, const std::uint16_t* weight_outmajor,
                             std::uint16_t* out, int rows, int k, int n) {
-        if(m.dense_kmajor) {
+        if(m.gaming[Gopt::DraftDenseRowPair] && rows>=2 && rows<=8 && k<=kHidden) {
+            if(m.dense_kmajor)
+                gopt_draft_dense_rowpair_kernel<true><<<dim3((n+255)/256,(rows+1)/2),256,
+                    static_cast<std::size_t>(2*k)*sizeof(std::uint16_t),stream>>>(in,weight_outmajor,out,rows,k,n);
+            else
+                gopt_draft_dense_rowpair_kernel<false><<<dim3((n+255)/256,(rows+1)/2),256,
+                    static_cast<std::size_t>(2*k)*sizeof(std::uint16_t),stream>>>(in,weight_outmajor,out,rows,k,n);
+            cuda_check(cudaGetLastError(),"launch GOPT draft dense row pair");
+            gopt_record(m.gaming_submissions,Gopt::DraftDenseRowPair);
+        } else if(m.dense_kmajor &&
+                  launch_dflash_dense_rows_kmajor(in,weight_outmajor,out,rows,k,n,stream)) {
+            ++m.dense_kmajor_launches;
+        } else if(m.dense_kmajor) {
             dflash_dense_gemm_t_kernel<true><<<dim3((n+255)/256,rows),256,
                 static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(
                 in,weight_outmajor,out,rows,k,n);
@@ -3478,9 +4860,9 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
                                const std::uint16_t* base, std::uint16_t* y, int rows,
                                int conv_stream, bool out_bf16 = false) {
         if (out_bf16) {
-            dflash_dyn_conv_kernel<DFlashFmt::BF16><<<rows, 256, 0, stream>>>(x, dyn, base, y, rows, conv_stream);
+            dflash_dyn_conv_kernel<DFlashFmt::BF16><<<dim3(rows, kHidden / 256), 256, 0, stream>>>(x, dyn, base, y, rows, conv_stream);
         } else {
-            dflash_dyn_conv_kernel<DFlashFmt::F16><<<rows, 256, 0, stream>>>(x, dyn, base, y, rows, conv_stream);
+            dflash_dyn_conv_kernel<DFlashFmt::F16><<<dim3(rows, kHidden / 256), 256, 0, stream>>>(x, dyn, base, y, rows, conv_stream);
         }
         cuda_check(cudaGetLastError(), "E5A2 launch draft dynamic conv");
     };
@@ -3491,7 +4873,13 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     };
     auto launch_rope = [&](const std::uint16_t* in, std::uint16_t* out,
                            const std::int32_t* positions, int rows, int heads) {
-        dflash_rope_kernel<<<(rows * heads * kHeadDim + 255) / 256, 256, 0, stream>>>(
+        if(m.gaming[Gopt::DraftRopePair]) {
+            static_assert(kRopeDim==kHeadDim);
+            gopt_draft_rope_pair_kernel<<<(rows*heads*(kHeadDim/2)+255)/256,256,0,stream>>>(
+                in,out,positions,rows,heads);
+            cuda_check(cudaGetLastError(),"launch GOPT draft paired RoPE");
+            gopt_record(m.gaming_submissions,Gopt::DraftRopePair);
+        } else dflash_rope_kernel<<<(rows * heads * kHeadDim + 255) / 256, 256, 0, stream>>>(
             in, out, positions, rows, heads, kHeadDim);
         cuda_check(cudaGetLastError(), "E5A2 launch draft RoPE");
     };
@@ -3865,11 +5253,14 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         // Block normalized input, kernel projection, conv stream 0.
         launch_rms(current, lay.input_norm, m.s.ln, block_len, kHidden, true);
         stage_nan("ln_" + std::to_string(layer_index), m.s.ln, block_len * kHidden);
+        if (use_ring) timing_close(Impl::TimingCategory::DenseMisc, "attn_norm");
         launch_dense(m.s.ln, lay.attn_kernel_proj, m.s.dyn, block_len, kHidden,
                      kConvDynamic);
+        if (use_ring) timing_close(Impl::TimingCategory::DenseMisc, "attn_dense_projection");
         launch_dyn_conv(m.s.ln, m.s.dyn, lay.attn_base, m.s.conv, block_len, 0);
         stage_nan("conv_" + std::to_string(layer_index), m.s.conv, block_len * kHidden);
-        timing_close(Impl::TimingCategory::DenseMisc, "attn_norm_dense_dynconv");
+        timing_close(Impl::TimingCategory::DenseMisc,
+                     use_ring ? "attn_dynconv" : "attn_norm_dense_dynconv");
 
         // Block Q/K/V projections from the convolved input.
         timed_forward(*m.ws_q, lay.q, lay.qm, m.s.conv, m.s.qproj,
@@ -3879,10 +5270,23 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         timed_forward(*m.ws_kv, lay.v, lay.vm, m.s.conv, m.s.vblk,
                       block_len, layer_index, "v", Impl::TimingCategory::Projection);
         stage_maxabs("vblk_" + std::to_string(layer_index), m.s.vblk, block_len * kKVHeads * kHeadDim);
-        launch_head_norm(m.s.qproj, lay.q_norm, m.s.qn, block_len * kQHeads, kHeadDim);
-        launch_head_norm(m.s.kblk, lay.k_norm, m.s.kblk_n, block_len * kKVHeads, kHeadDim);
-        launch_rope(m.s.qn, m.s.qr, m.s.pos_blk, block_len, kQHeads);
-        launch_rope(m.s.kblk_n, m.s.kblk_r, m.s.pos_blk, block_len, kKVHeads);
+        if(m.gaming[Gopt::DraftHeadNormRope]) {
+            static_assert(kHeadDim==128 && kRopeDim==128);
+            const bool paired=m.gaming[Gopt::DraftRopePair];
+            dflash_head_norm_kernel<true><<<block_len*kQHeads,128,128*sizeof(float),stream>>>(
+                m.s.qproj,lay.q_norm,m.s.qn,block_len*kQHeads,kHeadDim,m.s.pos_blk,m.s.qr,kQHeads,paired);
+            cuda_check(cudaGetLastError(),"launch GOPT draft Q norm/RoPE");
+            dflash_head_norm_kernel<true><<<block_len*kKVHeads,128,128*sizeof(float),stream>>>(
+                m.s.kblk,lay.k_norm,m.s.kblk_n,block_len*kKVHeads,kHeadDim,m.s.pos_blk,m.s.kblk_r,kKVHeads,paired);
+            cuda_check(cudaGetLastError(),"launch GOPT draft K norm/RoPE");
+            gopt_record(m.gaming_submissions,Gopt::DraftHeadNormRope);
+            if(paired)gopt_record(m.gaming_submissions,Gopt::DraftRopePair);
+        } else {
+            launch_head_norm(m.s.qproj, lay.q_norm, m.s.qn, block_len * kQHeads, kHeadDim);
+            launch_head_norm(m.s.kblk, lay.k_norm, m.s.kblk_n, block_len * kKVHeads, kHeadDim);
+            launch_rope(m.s.qn, m.s.qr, m.s.pos_blk, block_len, kQHeads);
+            launch_rope(m.s.kblk_n, m.s.kblk_r, m.s.pos_blk, block_len, kKVHeads);
+        }
 
         // Attention over the S context keys + L block keys (non-causal block).
         if (use_ring) {
@@ -3897,7 +5301,15 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             const int ring_start = shared_segment_enabled?shared_segment.ring_start_slot():
                 static_cast<int>(m.ring_base_abs & kRingMask);
             const int private_ring_count=shared_segment_enabled?shared_segment.ring_count:m.ring_count;
-            if (m.parallel_ring_attention)
+            if (m.parallel_ring_attention && dflash_ring_split_selected(private_ring_count))
+                launch_ring_attention_split(m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index],
+                    ring_start, private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len,
+                    block_len, scale, m.s.ring_partial_o, m.s.ring_partial_ml, stream);
+            else if (m.parallel_ring_attention && dflash_ring_staged_enabled())
+                dflash_attention_ring_staged_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
+                    m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
+                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
+            else if (m.parallel_ring_attention)
                 dflash_attention_ring_parallel_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
                     private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
@@ -3930,24 +5342,41 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         stage_nan("attno_" + std::to_string(layer_index), m.s.oproj, block_len * kHidden);
         stage_maxabs("oproj_" + std::to_string(layer_index), m.s.oproj, block_len * kHidden);
         if (!use_ring && layer_index == 0) diff_l0_oproj(block_len);
-        launch_dyn_conv(m.s.oproj, m.s.dyn, lay.attn_base, m.s.convf, block_len, 1, true);
+        if(m.gaming[Gopt::DraftConvResidual]) {
+            dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<dim3(block_len, kHidden / 256), 256,0,stream>>>(
+                m.s.oproj,m.s.dyn,lay.attn_base,m.s.convf,block_len,1,current,other);
+            cuda_check(cudaGetLastError(),"launch GOPT draft conv/residual");
+            gopt_record(m.gaming_submissions,Gopt::DraftConvResidual);
+        } else launch_dyn_conv(m.s.oproj, m.s.dyn, lay.attn_base, m.s.convf, block_len, 1, true);
         if (!use_ring && layer_index == 0)
             diff_l0_conv_finish(block_len, m.s.oproj, m.s.dyn, lay.attn_base,
                                 m.s.convf, "attn_convf");
         stage_maxabs("attn_convf_" + std::to_string(layer_index), m.s.convf, block_len * kHidden, true);
-        launch_residual(current, m.s.convf, other, block_len * kHidden);
+        if(!m.gaming[Gopt::DraftConvResidual] && !m.gaming[Gopt::DraftResidualNorm])
+            launch_residual(current, m.s.convf, other, block_len * kHidden);
+        if(m.gaming[Gopt::DraftResidualNorm]) {
+            dflash_rms_norm_kernel<DFlashFmt::BF16,true><<<block_len,256,256*sizeof(float),stream>>>(
+                current,lay.post_norm,m.s.ln2,block_len,kHidden,m.s.convf,other);
+            cuda_check(cudaGetLastError(),"launch GOPT draft residual/norm");
+            gopt_record(m.gaming_submissions,Gopt::DraftResidualNorm);
+        }
         stage_nan("residA_" + std::to_string(layer_index), other, block_len * kHidden, true);
         stage_maxabs("residA_" + std::to_string(layer_index), other, block_len * kHidden, true);
 
         // MLP with its own dynamic conv.
-        launch_rms(other, lay.post_norm, m.s.ln2, block_len, kHidden, true);
+        if(!m.gaming[Gopt::DraftResidualNorm])
+            launch_rms(other, lay.post_norm, m.s.ln2, block_len, kHidden, true);
         stage_nan("mlp_ln2_" + std::to_string(layer_index), m.s.ln2, block_len * kHidden);
+        if (use_ring) timing_close(Impl::TimingCategory::DenseMisc,
+                                   "attn_finish_residual_mlp_norm");
         launch_dense(m.s.ln2, lay.mlp_kernel_proj, m.s.dyn2, block_len, kHidden,
                      kConvDynamic);
+        if (use_ring) timing_close(Impl::TimingCategory::DenseMisc, "mlp_dense_projection");
         launch_dyn_conv(m.s.ln2, m.s.dyn2, lay.mlp_base, m.s.conv2, block_len, 0);
         stage_nan("mlp_conv2_" + std::to_string(layer_index), m.s.conv2, block_len * kHidden);
         timing_close(Impl::TimingCategory::DenseMisc,
-                     "attn_finish_residual_mlp_norm_dense_dynconv");
+                     use_ring ? "mlp_dynconv" :
+                         "attn_finish_residual_mlp_norm_dense_dynconv");
         {
         // conv2 is immutable through these two synchronous projection calls.
         // No lifetime atomics are touched on the default independent route.
@@ -3976,12 +5405,18 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
                       block_len, layer_index, "down", Impl::TimingCategory::Projection);
         stage_nan("mlp_down_" + std::to_string(layer_index), m.s.down, block_len * kHidden);
         stage_maxabs("mlp_down_" + std::to_string(layer_index), m.s.down, block_len * kHidden);
-        launch_dyn_conv(m.s.down, m.s.dyn2, lay.mlp_base, m.s.convf2, block_len, 1, true);
+        if(m.gaming[Gopt::DraftConvResidual]) {
+            dflash_dyn_conv_kernel<DFlashFmt::BF16,true><<<dim3(block_len, kHidden / 256), 256,0,stream>>>(
+                m.s.down,m.s.dyn2,lay.mlp_base,m.s.convf2,block_len,1,other,other);
+            cuda_check(cudaGetLastError(),"launch GOPT draft conv/residual");
+            gopt_record(m.gaming_submissions,Gopt::DraftConvResidual);
+        } else launch_dyn_conv(m.s.down, m.s.dyn2, lay.mlp_base, m.s.convf2, block_len, 1, true);
         if (!use_ring && layer_index == 0)
             diff_l0_conv_finish(block_len, m.s.down, m.s.dyn2, lay.mlp_base,
                                 m.s.convf2, "mlp_convf2");
         stage_nan("mlp_convf2_" + std::to_string(layer_index), m.s.convf2, block_len * kHidden, true);
-        launch_residual(other, m.s.convf2, other, block_len * kHidden);
+        if(!m.gaming[Gopt::DraftConvResidual])
+            launch_residual(other, m.s.convf2, other, block_len * kHidden);
         stage_nan("residM_" + std::to_string(layer_index), other, block_len * kHidden, true);
         stage_maxabs("residM_" + std::to_string(layer_index), other, block_len * kHidden, true);
         timing_close(Impl::TimingCategory::DenseMisc, "mlp_finish_residual");
@@ -3997,16 +5432,50 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     launch_rms(current + kHidden, m.norm, m.s.final_norm, proposal_rows, kHidden, true);
     stage_nan("final_norm", m.s.final_norm, proposal_rows * kHidden);
     timing_close(Impl::TimingCategory::DenseMisc, "final_norm");
+    const bool fused_selector_route = m.fused_selector && !m.position_confidence &&
+        !projection_timing.enabled && (!device_seed || proposal_rows <= 7);
+    int head_columns = kVocab;
+    if (m.head_prefix > 0 && !device_seed && m.local_merge_topk && m.fast_device_liveness &&
+        !(m.fused_topk_liveness && fused_selector_route) && dflash_topk_segmented_enabled()) {
+        constexpr int kHeadPrefixHold = 64;
+        if (block_ids[0] >= m.head_prefix) m.head_full_rounds = kHeadPrefixHold;
+        if (m.head_full_rounds > 0) --m.head_full_rounds;
+        else head_columns = m.head_prefix;
+    }
+    if (head_columns < kVocab) ++m.head_prefix_calls;
+    m.ws_head->set_active_output_features(head_columns < kVocab ? head_columns : 0);
     timed_forward(*m.ws_head, target_head, target_head_metadata, m.s.final_norm,
                   m.s.head_out, proposal_rows, -1, "target_h6",
                   Impl::TimingCategory::H6);
+    m.ws_head->set_active_output_features(0);
     launch_dense(m.s.final_norm, m.hidden_proj, m.s.hidden_proj_out, proposal_rows,
                  kHidden, kRank);
 
     // Candidate selector: top-16 by unary, then predecessor codebook edge scores.
+    const bool fused_selector = m.fused_selector && !m.position_confidence &&
+        !projection_timing.enabled && (!device_seed || proposal_rows <= 7);
+    const bool fused_liveness = m.fused_topk_liveness && fused_selector;
+    if (fused_liveness) {
+        require(m.s.liveness_flag != nullptr,
+                "fused top-K liveness flag allocation missing");
+        cuda_check(cudaMemsetAsync(m.s.liveness_flag, 0,
+                                   sizeof(unsigned int), stream),
+                   "zero fused top-K liveness flag");
+    }
     if (m.local_merge_topk) {
-        dflash_topk16_local_merge_kernel<<<proposal_rows, 256, 0, stream>>>(
-            m.s.head_out, proposal_rows, kVocab, m.s.cand_ids, m.s.cand_unary);
+        if (fused_liveness) {
+            dflash_topk16_local_merge_kernel<true><<<proposal_rows, 256, 0, stream>>>(
+                m.s.head_out, proposal_rows, kVocab, m.s.cand_ids,
+                m.s.cand_unary, m.s.liveness_flag);
+            ++m.fused_topk_liveness_calls;
+        } else if (dflash_topk_segmented_enabled()) {
+            launch_dflash_topk16_segmented(m.s.head_out, proposal_rows, head_columns,
+                m.s.cand_ids, m.s.cand_unary, m.s.topk_segments, stream, kVocab);
+        } else {
+            dflash_topk16_local_merge_kernel<false><<<proposal_rows, 256, 0, stream>>>(
+                m.s.head_out, proposal_rows, kVocab, m.s.cand_ids,
+                m.s.cand_unary, nullptr);
+        }
         ++m.local_merge_topk_calls;
     } else if (m.parallel_topk)
         dflash_topk16_parallel_kernel<<<proposal_rows, 256, 0, stream>>>(
@@ -4055,22 +5524,27 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     // row must FAIL loudly instead of degenerating. FAST_DEVICE_LIVENESS keeps
     // the exact predicate and synchronization boundary but avoids materializing
     // the complete vocabulary rows on the host.
+    unsigned int fused_bad = 0;
     if (m.fast_device_liveness) {
         require(m.s.liveness_flag != nullptr,
                 "E5A2 fast liveness flag allocation missing");
-        const int count=proposal_rows*kVocab;
-        cuda_check(cudaMemsetAsync(m.s.liveness_flag,0,sizeof(unsigned int),stream),
-                   "E5A2 fast liveness zero");
-        dflash_nonfinite_flag_kernel<<<(count+255)/256,256,0,stream>>>(
-            m.s.head_out,count,m.s.liveness_flag);
-        cuda_check(cudaGetLastError(),"E5A2 fast liveness launch");
-        unsigned int bad=0;
-        cuda_check(cudaMemcpyAsync(&bad,m.s.liveness_flag,sizeof(bad),
+        if (!fused_liveness) {
+            const int count=proposal_rows*head_columns;
+            cuda_check(cudaMemsetAsync(m.s.liveness_flag,0,sizeof(unsigned int),stream),
+                       "E5A2 fast liveness zero");
+            dflash_nonfinite_flag_kernel<<<(count+255)/256,256,0,stream>>>(
+                m.s.head_out,count,m.s.liveness_flag,head_columns,kVocab);
+            cuda_check(cudaGetLastError(),"E5A2 fast liveness launch");
+        }
+        cuda_check(cudaMemcpyAsync(&fused_bad,m.s.liveness_flag,sizeof(fused_bad),
                                    cudaMemcpyDeviceToHost,stream),
                    "E5A2 fast liveness read");
-        cuda_check(cudaStreamSynchronize(stream),"E5A2 fast liveness sync");
+        if (!fused_liveness)
+            cuda_check(cudaStreamSynchronize(stream),"E5A2 fast liveness sync");
         ++m.device_liveness_checks;
-        require(bad==0,"E5A2 draft head logits non-finite; proposals would be degenerate");
+        if (!fused_liveness)
+            require(fused_bad==0,
+                "E5A2 draft head logits non-finite; proposals would be degenerate");
     } else {
         std::vector<std::uint16_t> logits_h(
             static_cast<std::size_t>(proposal_rows) * kVocab);
@@ -4096,10 +5570,8 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         m.last_position_confidence.clear();
     std::int64_t anchor = block_ids[0];
     require(anchor >= 0 && anchor < kVocab, "E5A2 draft anchor outside vocabulary");
-    const bool fused_selector = m.fused_selector && !m.position_confidence &&
-        !projection_timing.enabled && (!device_seed || proposal_rows <= 7);
     if (fused_selector) {
-        dflash_selector_fused_chain_kernel<<<1, 256, 0, stream>>>(
+        dflash_selector_fused_chain_kernel<<<1, kSelectorFusedThreads, 0, stream>>>(
             proposal_rows, anchor, device_seed ? m.s.ids : nullptr,
             m.s.cand_ids, m.s.hidden_proj_out, m.pred_cb, m.succ_cb,
             m.s.cand_unary, m.s.proposal_out);
@@ -4110,10 +5582,27 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
                                        sizeof(std::int64_t),
                                    cudaMemcpyDeviceToHost, stream),
                    "E5A2 read fused draft proposals");
+        const auto candidates =
+            m.proposal_candidates ? static_cast<std::size_t>(proposal_rows) * kTopK : 0;
+        m.last_candidate_ids.resize(candidates);
+        m.last_candidate_unary.resize(candidates);
+        if (candidates) {
+            cuda_check(cudaMemcpyAsync(m.last_candidate_ids.data(), m.s.cand_ids,
+                                       candidates * sizeof(std::int64_t),
+                                       cudaMemcpyDeviceToHost, stream),
+                       "E5A2 read fused draft candidate IDs");
+            cuda_check(cudaMemcpyAsync(m.last_candidate_unary.data(), m.s.cand_unary,
+                                       candidates * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream),
+                       "E5A2 read fused draft candidate scores");
+        }
         timing_close(Impl::TimingCategory::Selector,
                      "selector_fused_final_sync");
         cuda_check(cudaStreamSynchronize(stream),
                    "E5A2 synchronize fused draft selector");
+        if (fused_liveness)
+            require(fused_bad==0,
+                "E5A2 draft head logits non-finite; proposals would be degenerate");
         for (int p = 0; p < proposal_rows; ++p) {
             const auto selected = result[static_cast<std::size_t>(p)];
             require(selected >= 0 && selected < kVocab,
@@ -4274,6 +5763,14 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
                       << segment.metadata.out_features << ',' << segment.dispatch << ','
                       << std::setprecision(9) << segment_ms[i] << '\n';
         }
+        std::cout << "P2_PROJECTION_TIMING_MISC_HEADER,proposal,route,scope,gpu_ms\n";
+        for (std::size_t i = 0; i < projection_timing.segments.size(); ++i) {
+            const auto& segment = projection_timing.segments[i];
+            if (segment.category != Impl::TimingCategory::DenseMisc) continue;
+            std::cout << "P2_PROJECTION_TIMING_MISC," << projection_timing.proposal_sequence
+                      << ',' << (use_ring ? "ring" : "window") << ',' << segment.scope
+                      << ',' << std::setprecision(9) << segment_ms[i] << '\n';
+        }
         std::cout << "P2_PROJECTION_TIMING_SUMMARY,proposal=" << projection_timing.proposal_sequence
                   << ",route=" << (use_ring ? "ring" : "window")
                   << ",ring_window=" << eff_window
@@ -4321,6 +5818,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         std::cout << "E5A3 propose_timing use_ring=" << (use_ring ? 1 : 0)
                   << " total_ms=" << tot_ms
                   << " fast_device_liveness=" << (m.fast_device_liveness ? 1 : 0)
+                  << " fused_topk_liveness_calls=" << m.fused_topk_liveness_calls
                   << " fused_selector_calls=" << m.fused_selector_calls
                   << " device_liveness_checks=" << m.device_liveness_checks << "\n";
         for (const auto& kv : ph_ms)

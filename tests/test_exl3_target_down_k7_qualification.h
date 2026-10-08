@@ -4,28 +4,6 @@
 // down candidate.  The production route reuses the accepted 16-output-tile
 // large-down MMA kernel, split policy, transforms and reduction unchanged.
 
-class TargetDownK7EnvironmentRestore {
-public:
-    TargetDownK7EnvironmentRestore()
-        : candidate_(env("NINFER_EXL3_TARGET_DOWN_K7_SMALL_M")),
-          async_a_(env("NINFER_EXL3_TARGET_DOWN_K7_ASYNC_A")),
-          gateup_(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M")),
-          topology_(env("NINFER_EXL3_LARGE_DOWN_TOPOLOGY")),
-          splits_(env("NINFER_EXL3_LARGE_DOWN_SPLITS")) {}
-    ~TargetDownK7EnvironmentRestore() {
-        _putenv_s("NINFER_EXL3_TARGET_DOWN_K7_SMALL_M", candidate_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_DOWN_K7_ASYNC_A", async_a_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", gateup_.c_str());
-        _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", topology_.c_str());
-        _putenv_s("NINFER_EXL3_LARGE_DOWN_SPLITS", splits_.c_str());
-    }
-private:
-    std::string candidate_;
-    std::string async_a_;
-    std::string gateup_;
-    std::string topology_;
-    std::string splits_;
-};
 
 void run_target_down_k7_qualification(Exl3TextModel& target,
                                       Exl3Dflash2DraftModel& draft,
@@ -38,7 +16,12 @@ void run_target_down_k7_qualification(Exl3TextModel& target,
                 env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0" &&
                 env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "0",
             "target down K7 capture requires both candidates explicit flag0");
-    TargetDownK7EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment{
+        "NINFER_EXL3_TARGET_DOWN_K7_SMALL_M",
+        "NINFER_EXL3_TARGET_DOWN_K7_ASYNC_A",
+        "NINFER_EXL3_TARGET_GATEUP_SMALL_M",
+        "NINFER_EXL3_LARGE_DOWN_TOPOLOGY",
+        "NINFER_EXL3_LARGE_DOWN_SPLITS"};
     _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", "16");
     _putenv_s("NINFER_EXL3_LARGE_DOWN_SPLITS", "");
     auto captured = run_target_down_k7_capture(

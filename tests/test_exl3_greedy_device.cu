@@ -15,13 +15,13 @@ static float value(std::uint16_t h) {
     const float magnitude=exp?std::ldexp(float(1024+mant),exp-25):std::ldexp(float(mant),-24);
     return h&32768?-magnitude:magnitude;
 }
-static void compare(const std::vector<std::uint16_t>& input,int rows,int vocab,int stride) {
+static void compare_route(const std::vector<std::uint16_t>& input,int rows,int vocab,int stride,bool warp) {
     std::uint16_t* device=nullptr;Exl3GreedyRow* output=nullptr;
     try {
         check(cudaMalloc(reinterpret_cast<void**>(&device),input.size()*2));
         check(cudaMalloc(reinterpret_cast<void**>(&output),rows*sizeof(Exl3GreedyRow)));
         check(cudaMemcpy(device,input.data(),input.size()*2,cudaMemcpyHostToDevice));
-        exl3_greedy_packet_kernel<<<rows,256>>>(device,vocab,stride,91,output);
+        exl3_launch_greedy_packet(warp,rows,nullptr,device,vocab,stride,91,output);
         check(cudaGetLastError());
         std::vector<Exl3GreedyRow> actual(rows);
         check(cudaMemcpy(actual.data(),output,rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost));
@@ -35,6 +35,10 @@ static void compare(const std::vector<std::uint16_t>& input,int rows,int vocab,i
         }
     } catch(...) {cudaFree(output);cudaFree(device);throw;}
     check(cudaFree(output));check(cudaFree(device));
+}
+static void compare(const std::vector<std::uint16_t>& input,int rows,int vocab,int stride) {
+    compare_route(input,rows,vocab,stride,false);
+    compare_route(input,rows,vocab,stride,true);
 }
 int main() {
     try {

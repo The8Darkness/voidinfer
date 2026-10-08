@@ -214,19 +214,19 @@ private:
         auto limits=resource_limits_;
         auto& device=limits[static_cast<unsigned>(Exl3ResourceInventory::Domain::device)];
         const auto retired_device=retired_device_bytes_.bytes();
-        if(retired_device>device)throw Exl3ResourceReservationExhausted{};
+        if(retired_device>device)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         device-=retired_device;
         auto& registration=limits[static_cast<unsigned>(Exl3ResourceInventory::Domain::cuda_registered_host)];
         const auto retired_registration=retired_registration_bytes_.bytes();
-        if(retired_registration>registration)throw Exl3ResourceReservationExhausted{};
+        if(retired_registration>registration)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         registration-=retired_registration;
         auto& metadata=limits[static_cast<unsigned>(Exl3ResourceInventory::Domain::host_metadata)];
         const auto direct=direct_descriptor_bytes();
-        if(direct>metadata)throw Exl3ResourceReservationExhausted{};
+        if(direct>metadata)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         metadata-=direct;
         const auto outstanding=assessment_descriptors_.bytes();
         if(excluded>outstanding)throw std::logic_error("resident assessment credit ownership mismatch");
-        if(outstanding-excluded>metadata)throw Exl3ResourceReservationExhausted{};
+        if(outstanding-excluded>metadata)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         metadata-=outstanding-excluded;return limits;
     }
     std::uint64_t direct_descriptor_bytes() const {
@@ -429,7 +429,7 @@ public:
             const auto domain=static_cast<unsigned>(Domain::host_metadata);
             auto& peak=plan.resource_peak_[domain];
             if(peak>resource_limits_[domain] || required.units[domain]>resource_limits_[domain]-peak)
-                throw Exl3ResourceReservationExhausted{};
+                throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
             peak+=required.units[domain];
             plan.scratch_bytes_+=required.units[domain];
         };
@@ -486,7 +486,7 @@ public:
         const auto available_limits=allocation_limits();
         for(unsigned i=0;i<old.size();++i)
             if(old[i]>available_limits[i] || requirement.units[i]>available_limits[i]-old[i])
-                throw Exl3ResourceReservationExhausted{};
+                throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         ++revision_;reserving_=true;
         struct Guard {bool& active;~Guard(){active=false;}} guard{reserving_};
         auto next=std::forward<Factory>(factory)(requirement.configuration);
@@ -518,7 +518,7 @@ public:
         for(const auto bytes:{direct_descriptor_bytes(),other_credit,plan.scratch_bytes_})
             if(bytes)live_peak.add(Exl3ResourceInventory::Domain::host_metadata,1,bytes);
         for(unsigned i=0;i<live_peak.units.size();++i)
-            if(live_peak.units[i]>resource_limits_[i])throw Exl3ResourceReservationExhausted{};
+            if(live_peak.units[i]>resource_limits_[i])throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         plan.consumed_=true;
         transitioning_=true;
         struct Guard {bool& active;~Guard(){active=false;}} guard{transitioning_};
@@ -566,7 +566,7 @@ public:
         for(unsigned i=0;i<rollback.units.size();++i) {
             auto& peak=stats.transition_peak_resource_units[i];
             if(peak>resource_limits_[i] || rollback.units[i]>resource_limits_[i]-peak)
-                throw Exl3ResourceReservationExhausted{};
+                throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
             peak+=rollback.units[i];
         }
         std::vector<Range> combined_pages;combined_pages.reserve(page_slots);
@@ -671,7 +671,7 @@ public:
         const auto available_limits=allocation_limits();
         for(unsigned i=0;i<old.size();++i)
             if(old[i]>available_limits[i] || requirement.units[i]>available_limits[i]-old[i])
-                throw Exl3ResourceReservationExhausted{};
+                throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         // Invalidate every previously assessed plan, including on rollback.
         // The in-flight promise is exclusive and cannot be replayed or nested.
         ++revision_;reserving_=true;
@@ -691,7 +691,7 @@ public:
                 if(next.units[i]<promised.units[i])
                     throw std::invalid_argument("resource reservation extension cannot shrink");
                 if(old[i]>available_limits[i] || next.units[i]>available_limits[i]-old[i])
-                    throw Exl3ResourceReservationExhausted{};
+                    throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
             }
             promised=next;
         };
@@ -808,7 +808,7 @@ public:
         if(!bytes)throw std::invalid_argument("resident metadata lifetime reservation extent");
         const auto domain=static_cast<unsigned>(Exl3ResourceInventory::Domain::host_metadata);
         const auto limits=allocation_limits(),held=held_.resources.totals();
-        if(held[domain]>limits[domain] || bytes>limits[domain]-held[domain])throw Exl3ResourceReservationExhausted{};
+        if(held[domain]>limits[domain] || bytes>limits[domain]-held[domain])throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         if(revision_==std::numeric_limits<std::uint64_t>::max())throw std::overflow_error("resident revision exhausted");
         ++revision_;
         return retired_host_descriptors_.acquire(bytes);

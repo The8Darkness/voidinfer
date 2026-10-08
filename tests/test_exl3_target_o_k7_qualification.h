@@ -4,25 +4,6 @@
 // candidate. The production route reuses the accepted 32-output-tile generic
 // MMA kernel, split policy, transforms and reduction unchanged.
 
-class TargetOK7EnvironmentRestore {
-public:
-    TargetOK7EnvironmentRestore()
-        : candidate_(env("NINFER_EXL3_TARGET_O_K7_SMALL_M")),
-          gateup_(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M")),
-          down_(env("NINFER_EXL3_TARGET_DOWN_SMALL_M")),
-          splits_(env("NINFER_EXL3_GENERIC_SPLITS")) {}
-    ~TargetOK7EnvironmentRestore() {
-        _putenv_s("NINFER_EXL3_TARGET_O_K7_SMALL_M", candidate_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", gateup_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_DOWN_SMALL_M", down_.c_str());
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", splits_.c_str());
-    }
-private:
-    std::string candidate_;
-    std::string gateup_;
-    std::string down_;
-    std::string splits_;
-};
 
 void run_target_o_k7_qualification(Exl3TextModel& target,
                                       Exl3Dflash2DraftModel& draft,
@@ -35,7 +16,11 @@ void run_target_o_k7_qualification(Exl3TextModel& target,
                 env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
                 env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
             "target O K7 capture requires O flag0 and accepted K6 flags1");
-    TargetOK7EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment{
+        "NINFER_EXL3_TARGET_O_K7_SMALL_M",
+        "NINFER_EXL3_TARGET_GATEUP_SMALL_M",
+        "NINFER_EXL3_TARGET_DOWN_SMALL_M",
+        "NINFER_EXL3_GENERIC_SPLITS"};
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
     auto captured = run_target_o_k7_capture(
         target, draft, prompt, std::filesystem::path{}, oscar);

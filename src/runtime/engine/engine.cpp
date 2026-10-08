@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <string_view>
 #include "ninfer/engine.h"
 
 #include "core/device.h"
@@ -42,7 +44,16 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             options.artifact_read_mode!=ArtifactReadMode::Single ||
             options.exl3_package->target_directory.empty() || options.exl3_package->draft_directory.empty())
             throw std::invalid_argument("explicit EXL3 package cannot mix .ninfer artifact selection");
-        options.kv_cache=KvCacheStorage::Float16Host;
+        switch(options.exl3_package->round_implementation) {
+        case Exl3RoundImplementation::Established:
+            options.kv_cache=KvCacheStorage::Float16Host;
+            break;
+        case Exl3RoundImplementation::CoherentDevice:
+            options.kv_cache=KvCacheStorage::Float16Device;
+            break;
+        default:
+            throw std::invalid_argument("unknown EXL3 Engine round implementation");
+        }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
@@ -69,6 +80,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     if (!cache.enabled) {
+        if(options.exl3_package &&
+           options.exl3_package->round_implementation==Exl3RoundImplementation::CoherentDevice)
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires a host-root context cache for terminal publication");
         if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
             (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
             (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
@@ -107,6 +122,30 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         static_cast<std::uint64_t>(*cache.max_private_continuations) + *cache.max_shared_prefixes;
     if (address_spaces > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("context cache address-space capacity exceeds uint32");
+    }
+    if(options.exl3_package &&
+       options.exl3_package->round_implementation==Exl3RoundImplementation::CoherentDevice) {
+        constexpr std::uint64_t exact_kv_bytes_per_token=65536;
+        if(options.max_concurrency!=1 || options.enable_vision || options.use_cuda_graph ||
+           options.hierarchical_vericache.enabled ||
+           options.speculative.backend!=SpeculativeBackend::DFlash2 ||
+           options.speculative.draft_tokens!=7 ||
+           options.speculative.proposal_head!=ProposalHead::Full)
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires C1 greedy text/eager/DFlash2-K7 full proposals");
+        // L0 OSCAR (INT2 history in VRAM, FP16 K/V in mapped host memory) admits 256K.
+        const char* l0_oscar=std::getenv("NINFER_EXL3_L0_OSCAR");
+        const int coherent_context_limit=l0_oscar && std::string_view(l0_oscar)=="1"?262144:32768;
+        if(options.max_context<2048 || options.max_context>coherent_context_limit ||
+           options.kv_capacity.mode!=KvCapacityMode::Explicit ||
+           options.kv_capacity.explicit_tokens<options.max_context)
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires ordinary 2048..32768 context (262144 with L0 OSCAR) and explicit full KV capacity");
+        if(cache.host_state_slots==0 || *cache.max_shared_prefixes==0 ||
+           cache.host_kv_capacity_bytes<
+               static_cast<std::uint64_t>(options.max_context)*exact_kv_bytes_per_token)
+            throw std::invalid_argument(
+                "coherent-device EXL3 requires a host root and capacity for one terminal exact KV snapshot");
     }
     if (*cache.max_long_anchors_per_continuation != 0 &&
         *cache.max_private_continuations >

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <array>
 #include <atomic>
 #include <optional>
 #include <limits>
@@ -175,19 +176,45 @@ struct Exl3ReconstructGemmPhaseTiming {
 
 struct Exl3ReconstructGemmStats {
     std::uint64_t calls = 0;
+    std::uint64_t k5_calls = 0;
+    std::uint64_t k5_lt_calls = 0;
+    std::uint64_t large_lt_calls = 0;
+    std::uint64_t mxfp8_calls = 0;
+    std::uint64_t mxfp8_rows = 0;
+    std::uint64_t nvfp4_calls = 0;
+    std::uint64_t nvfp4_rows = 0;
+    std::uint64_t fused_mlp_calls = 0;
     std::uint64_t k6_calls = 0;
     std::uint64_t k7_calls = 0;
     std::uint64_t rows = 0;
     std::uint64_t fused_original_calls = 0;
     std::uint64_t fused_original_rows = 0;
+    std::uint64_t fused_gate_up_down_calls = 0;
+    std::uint64_t fused_gate_up_down_rows = 0;
+    std::uint64_t fused_down_residual_calls = 0;
+    std::uint64_t fused_down_residual_rows = 0;
     // Exploratory, separately gated backend telemetry.  This is distinct
     // from the existing FP32-compute numeric route and remains default-off.
     std::uint64_t fp16_compute_calls = 0;
     std::uint64_t fp16_compute_rows = 0;
+    // Actual FP16 slab writes from reconstruct-then-GEMM calls. Packed-direct
+    // and persistent leaves do not contribute to this count.
+    std::uint64_t reconstructed_weight_bytes = 0;
+    std::uint64_t reconstructed_weight_calls = 0;
+    std::uint64_t reused_weight_calls = 0;
+    std::uint64_t reused_weight_bytes = 0;
+    std::uint64_t prefetched_weight_submissions = 0;
+    std::uint64_t prefetched_weight_hits = 0;
+    std::size_t cached_weight_capacity_bytes = 0;
     // Separately labeled same-weight FP16-KV packed K6 backend. This is direct
     // packed-weight execution, not reconstruction or re-quantizing.
     std::uint64_t packed_direct_k6_calls = 0;
     std::uint64_t packed_direct_k6_rows = 0;
+    // Target GDN bulk MLP packed K5 gate/up/down. The FP16 GEMM destination
+    // boundary is preserved before the output transform.
+    std::uint64_t packed_direct_k5_gate_up_calls = 0;
+    std::uint64_t packed_direct_k5_down_calls = 0;
+    std::uint64_t packed_direct_k5_rows = 0;
     // Separately labeled native cooperative prefill leaf. It consumes the
     // packed EXL3 weights directly and is never folded into packed_direct_k6.
     std::uint64_t persistent_prefill_calls = 0;
@@ -219,7 +246,51 @@ public:
         std::uint16_t* output,
         int rows,
         cudaStream_t stream = nullptr,
-        Exl3ReconstructGemmPhaseTiming* timing = nullptr);
+        Exl3ReconstructGemmPhaseTiming* timing = nullptr,
+        const std::uint16_t* up = nullptr,
+        std::uint16_t* activation = nullptr,
+        const std::uint16_t* residual = nullptr,
+        std::uint16_t* down_trace = nullptr,
+        int trace_row_base = 0);
+
+    // Produce the represented SiLU(gate)*up activation and the down input
+    // transform in one tile-owned launch. The remaining projection path is
+    // identical to forward_numeric_candidate.
+    void forward_numeric_gate_up_down(
+        const Exl3CudaLinearWeights& weights,
+        const Exl3CudaLinearMetadata& metadata,
+        const std::uint16_t* gate,
+        const std::uint16_t* up,
+        std::uint16_t* activation,
+        std::uint16_t* output,
+        int rows,
+        cudaStream_t stream = nullptr);
+    bool supports_fused_gate_up_down() const noexcept;
+    // Prefill MLP on the block-quantized route: gate/up keep their raw GEMM
+    // outputs and the down projection's quantized input is produced in one
+    // pass (gate/up output transforms, SiLU*up, down input transform and
+    // block quantization). Returns false without work when not admitted.
+    // Gate/up buffers then hold untransformed values; activation is unused.
+    bool forward_numeric_mlp(
+        const Exl3CudaLinearWeights& gate, const Exl3CudaLinearMetadata& gate_metadata,
+        const Exl3CudaLinearWeights& up, const Exl3CudaLinearMetadata& up_metadata,
+        const Exl3CudaLinearWeights& down, const Exl3CudaLinearMetadata& down_metadata,
+        const std::uint16_t* input, std::uint16_t* gate_output, std::uint16_t* up_output,
+        std::uint16_t* activation, std::uint16_t* output, int rows,
+        cudaStream_t stream = nullptr);
+
+    // Reuse only the current layer's reconstructed projections while a
+    // layer-major prompt suffix is processed in causal row chunks. The caller
+    // owns the stream ordering and closes the scope before the next layer.
+    void begin_layer_reuse(std::size_t max_cached_bytes, bool allow_k5 = false);
+    void end_layer_reuse() noexcept;
+    // Model layer of the active layer-major reuse scope (-1 outside one); the
+    // NVFP4 mode 3 policy keeps layers >= 56 on MXFP8.
+    void set_prefill_layer(int layer) noexcept;
+    // Schedule one immutable K5 slab in the current layer's bounded reuse
+    // slot. The next numeric forward joins the preparation before GEMM.
+    bool prefetch_numeric_weight(const Exl3CudaLinearWeights& weights,
+        const Exl3CudaLinearMetadata& metadata,int rows,cudaStream_t stream);
 
     // Isolated V6 bring-up: donor-style GEMM destination precision BEFORE the
     // output Hadamard. Exactly one destination is required. No text dispatch
@@ -271,6 +342,25 @@ void exl3_transform_input_pair(
 
 // Persistent temporary storage for the isolated EXL3 leaf. It is allocated once and
 // reused across calls; no CUDA allocation occurs in forward().
+// GDN control projection operands for a merged single-row qkv/z launch.
+struct Exl3GdnControlSide {
+    const std::uint16_t* a_weight = nullptr;
+    const std::uint16_t* b_weight = nullptr;
+    const float* a_log = nullptr;
+    const float* dt_bias = nullptr;
+    float* a_output = nullptr;
+    float* b_output = nullptr;
+    float* beta_trace = nullptr;
+    float* g_trace = nullptr;
+    int heads = 0;
+};
+
+// Side-stream L2 prefetch of a weight range after the work queued on
+// `stream` (NINFER_EXL3_L2_PREFETCH, default 1); join before capture ends.
+bool exl3_l2_prefetch_enabled();
+void exl3_l2_prefetch_fork(cudaStream_t stream,const void* data,std::size_t bytes);
+void exl3_l2_prefetch_join(cudaStream_t stream);
+
 class Exl3CudaLinearWorkspace {
 public:
     explicit Exl3CudaLinearWorkspace(int max_rows = 16);
@@ -371,6 +461,64 @@ public:
     }
     static std::uint64_t process_fast_same_weights_fp16_m1_calls_for_test() noexcept {
         return process_fast_same_weights_fp16_m1_calls_.load(std::memory_order_relaxed);
+    }
+    static std::uint64_t process_fast_fp16_m2_8_down_calls_for_test() noexcept {
+        return process_fast_fp16_m2_8_down_calls_.load(std::memory_order_relaxed);
+    }
+    static std::uint64_t process_fast_fp16_m2_8_fused_down_calls_for_test() noexcept {
+        return process_fast_fp16_m2_8_fused_down_calls_.load(std::memory_order_relaxed);
+    }
+    // Operation indices: Q, QKV, Z, O, gate/up. Gate and up share the
+    // registered shape/admission; each invocation is counted separately.
+    static std::uint64_t coherent_wide_k6_calls_for_test(int operation) noexcept {
+        return operation >= 0 && operation < 5
+            ? coherent_wide_k6_calls_[operation].load(std::memory_order_relaxed) : 0;
+    }
+    static std::uint64_t coherent_wide_k6_rows_for_test(int operation) noexcept {
+        return operation >= 0 && operation < 5
+            ? coherent_wide_k6_rows_[operation].load(std::memory_order_relaxed) : 0;
+    }
+    static std::uint64_t coherent_wide_k6_split10_calls_for_test(int operation) noexcept {
+        return operation >= 0 && operation < 5
+            ? coherent_wide_k6_split10_calls_[operation].load(std::memory_order_relaxed) : 0;
+    }
+    static std::size_t coherent_wide_k6_shared_bytes_for_test() noexcept;
+    int coherent_wide_k6_resident_capacity_for_test() const noexcept {
+        return coherent_wide_k6_resident_capacity_;
+    }
+    int coherent_wide_k6_registers_per_thread_for_test() const noexcept {
+        return coherent_wide_k6_registers_per_thread_;
+    }
+    int coherent_wide_k6_operation_for_test() const noexcept {
+        return coherent_wide_k6_operation_;
+    }
+    static std::uint64_t process_coherent_down_k6_calls_for_test() noexcept {
+        return process_coherent_down_k6_calls_.load(std::memory_order_relaxed);
+    }
+    static std::uint64_t process_coherent_down_k6_rows_for_test() noexcept {
+        return process_coherent_down_k6_rows_.load(std::memory_order_relaxed);
+    }
+    int coherent_down_k6_resident_capacity_for_test() const noexcept {
+        return coherent_down_k6_resident_capacity_;
+    }
+    static std::uint64_t process_coherent_down_k7_calls_for_test() noexcept {
+        return process_coherent_down_k7_calls_.load(std::memory_order_relaxed);
+    }
+    static std::uint64_t process_coherent_down_k7_rows_for_test() noexcept {
+        return process_coherent_down_k7_rows_.load(std::memory_order_relaxed);
+    }
+    int coherent_down_k7_resident_capacity_for_test() const noexcept {
+        return coherent_down_k7_resident_capacity_;
+    }
+    static std::size_t coherent_down_k7_shared_bytes_for_test() noexcept;
+    static std::uint64_t process_coherent_o_k7_calls_for_test() noexcept {
+        return process_coherent_o_k7_calls_.load(std::memory_order_relaxed);
+    }
+    static std::uint64_t process_coherent_o_k7_rows_for_test() noexcept {
+        return process_coherent_o_k7_rows_.load(std::memory_order_relaxed);
+    }
+    int coherent_o_k7_resident_capacity_for_test() const noexcept {
+        return coherent_o_k7_resident_capacity_;
     }
     static std::uint64_t process_fast_same_weights_fp16_m1_wide_n32_calls_for_test() noexcept {
         return process_fast_same_weights_fp16_m1_wide_n32_calls_.load(std::memory_order_relaxed);
@@ -535,6 +683,10 @@ public:
         std::uint16_t* output,int rows,cudaStream_t stream=nullptr);
 
     // Admission by an ordinary exact-host context prepared for native M16.
+    // Draft head pruning: the H6 single-split head computes only output
+    // columns [0, features) (a multiple of 128; 0 = all). Columns beyond keep
+    // their previous contents; the row stride stays out_features.
+    void set_active_output_features(int features) noexcept { active_output_features_ = features; }
     void set_native_continuation16(bool enabled) noexcept {
         native_continuation_rows_ = enabled ? 16 : 8;
     }
@@ -567,7 +719,65 @@ public:
                                   int rows,
                                   cudaStream_t stream = nullptr,
                                   Exl3CudaLinearAdmission admission =
-                                      Exl3CudaLinearAdmission::ordinary);
+                                      Exl3CudaLinearAdmission::ordinary,
+                                  const std::uint16_t* raw_input = nullptr);
+
+    // The next coherent down/O projection (1..8 rows) also writes
+    // residual_out = half(left + projection) in its reduction kernel. The
+    // caller checks take_residual_applied() and skips its residual launch.
+    void arm_residual(const std::uint16_t* left,std::uint16_t* residual_out) noexcept {
+        pending_residual_left_=left; pending_residual_out_=residual_out; residual_applied_=false;
+    }
+    bool take_residual_applied() noexcept {
+        const bool applied=residual_applied_;
+        residual_applied_=false; pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        return applied;
+    }
+    // As arm_residual, and the same reduction also writes
+    // norm_out = rms_norm_f16(residual_out) (5120 features); the caller
+    // checks take_norm_applied() (before take_residual_applied()).
+    void arm_residual_norm(const std::uint16_t* left,std::uint16_t* residual_out,
+        const std::uint16_t* norm_weight,std::uint16_t* norm_out,float eps) noexcept {
+        arm_residual(left,residual_out);
+        pending_norm_weight_=norm_weight; pending_norm_out_=norm_out;
+        pending_norm_eps_=eps; norm_applied_=false;
+    }
+    bool take_norm_applied() noexcept {
+        const bool applied=norm_applied_;
+        norm_applied_=false; pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
+        return applied;
+    }
+
+    // Two same-input projections of 1..8 rows (e.g. GDN qkv and z) in one
+    // fused-input coherent producer launch and one reduction launch; false
+    // (nothing submitted) when ineligible. Optional GDN control projections
+    // (rows*heads extra CTAs, the control_fused_staged_kernel arithmetic) and
+    // a BF16 copy of the first output in the GDN convolution-input layout
+    // ([feature*rows+row]) ride on the same launches.
+    bool forward_merged_pair(Exl3CudaLinearWorkspace& second_workspace,
+                             const Exl3CudaLinearWeights& first_weights,
+                             const Exl3CudaLinearMetadata& first_metadata,
+                             std::uint16_t* first_output,
+                             const Exl3CudaLinearWeights& second_weights,
+                             const Exl3CudaLinearMetadata& second_metadata,
+                             std::uint16_t* second_output,const std::uint16_t* input,
+                             int rows,cudaStream_t stream,
+                             const Exl3GdnControlSide* control = nullptr,
+                             std::uint16_t* first_bf16 = nullptr);
+    // MLP gate/up/SiLU of 1..8 rows in one fused-input coherent producer
+    // launch plus one reduction/activation launch, which can also emit the
+    // down projection's transformed input. Returns false (nothing submitted)
+    // when the pair is not on the fused-input coherent wide route.
+    bool forward_merged_gate_up_silu(Exl3CudaLinearWorkspace& up_workspace,
+                                     const Exl3CudaLinearWeights& gate_weights,
+                                     const Exl3CudaLinearMetadata& gate_metadata,
+                                     const Exl3CudaLinearWeights& up_weights,
+                                     const Exl3CudaLinearMetadata& up_metadata,
+                                     const std::uint16_t* input,std::uint16_t* gate_output,
+                                     std::uint16_t* up_output,std::uint16_t* activation,
+                                     int rows,cudaStream_t stream,
+                                     const Exl3CudaLinearWeights* down_weights = nullptr,
+                                     Exl3CudaLinearWorkspace* down_workspace = nullptr);
 
     // Exact target-prefill fast path for a gate/up pair. Matrix-specific SUH
     // transforms share one launch and remain separate through the paired MMA.
@@ -713,6 +923,22 @@ public:
     bool target_fast_same_weights_fp16_m1_candidate(
         const Exl3CudaLinearMetadata& metadata, int rows,
         Exl3CudaLinearAdmission admission) const noexcept;
+    bool fast_fp16_m2_8_down_candidate(const Exl3CudaLinearMetadata& metadata,
+        int rows,Exl3CudaLinearAdmission admission) const noexcept;
+    bool fast_fp16_m2_8_fused_down_candidate(const Exl3CudaLinearMetadata& metadata,
+        int rows,Exl3CudaLinearAdmission admission) const noexcept;
+    bool coherent_wide_k6_candidate(const Exl3CudaLinearMetadata& metadata,
+        int rows,Exl3CudaLinearAdmission admission) const noexcept;
+    int coherent_wide_k6_split_count(int rows) const noexcept;
+    int coherent_split_override(const char* name, int rows) const;
+    bool coherent_down_k6_candidate(const Exl3CudaLinearMetadata& metadata,
+        int rows,Exl3CudaLinearAdmission admission) const noexcept;
+    bool coherent_down_k7_candidate(const Exl3CudaLinearMetadata& metadata,
+        int rows,Exl3CudaLinearAdmission admission) const noexcept;
+    bool coherent_o_k7_candidate(const Exl3CudaLinearMetadata& metadata,
+        int rows,Exl3CudaLinearAdmission admission) const noexcept;
+    bool fast_fp16_m2_8_all_candidate(const Exl3CudaLinearMetadata& metadata,
+        int rows,Exl3CudaLinearAdmission admission) const noexcept;
     bool fast_native_persistent_prefill_candidate(
         const Exl3CudaLinearMetadata& metadata,int rows,
         Exl3CudaLinearAdmission admission) const noexcept;
@@ -968,6 +1194,17 @@ private:
     inline static std::atomic<std::uint64_t> process_target_m1_k7_three_word_calls_{0};
     inline static std::atomic<std::uint64_t> process_fast_same_weights_fp16_accum_calls_{0};
     inline static std::atomic<std::uint64_t> process_fast_same_weights_fp16_m1_calls_{0};
+    inline static std::atomic<std::uint64_t> process_fast_fp16_m2_8_down_calls_{0};
+    inline static std::atomic<std::uint64_t> process_fast_fp16_m2_8_fused_down_calls_{0};
+    inline static std::array<std::atomic<std::uint64_t>,5> coherent_wide_k6_calls_{};
+    inline static std::array<std::atomic<std::uint64_t>,5> coherent_wide_k6_rows_{};
+    inline static std::array<std::atomic<std::uint64_t>,5> coherent_wide_k6_split10_calls_{};
+    inline static std::atomic<std::uint64_t> process_coherent_down_k6_calls_{0};
+    inline static std::atomic<std::uint64_t> process_coherent_down_k6_rows_{0};
+    inline static std::atomic<std::uint64_t> process_coherent_down_k7_calls_{0};
+    inline static std::atomic<std::uint64_t> process_coherent_down_k7_rows_{0};
+    inline static std::atomic<std::uint64_t> process_coherent_o_k7_calls_{0};
+    inline static std::atomic<std::uint64_t> process_coherent_o_k7_rows_{0};
     inline static std::atomic<std::uint64_t> process_fast_same_weights_fp16_m1_wide_n32_calls_{0};
     inline static std::atomic<std::uint64_t> process_fast_same_weights_fp16_m1_n16_calls_{0};
     inline static std::atomic<std::uint64_t> process_fast_native_persistent_m1_calls_{0};
@@ -1046,6 +1283,12 @@ private:
     int large_down_candidate_capacity_[2] = {};
     int large_down_candidate8_capacity_[2] = {};
     int fast_same_weights_fp16_m1_capacity_[3] = {};
+    int coherent_wide_k6_operation_ = -1;
+    int coherent_wide_k6_resident_capacity_ = 0;
+    int coherent_wide_k6_registers_per_thread_ = 0;
+    int coherent_down_k6_resident_capacity_ = 0;
+    int coherent_down_k7_resident_capacity_ = 0;
+    int coherent_o_k7_resident_capacity_ = 0;
     int fast_same_weights_fp16_m1_n16_capacity_[3] = {};
     int fast_same_weights_fp16_m1_n64_capacity_[3] = {};
     int fast_native_persistent_m1_grid_[2] = {};
@@ -1055,6 +1298,7 @@ private:
     bool specialized_shape_ = false;
     bool allow_generic_variants_ = true;
     bool h6_small_m_enabled_ = true;
+    int active_output_features_ = 0;
     bool draft_small_m_enabled_ = false;
     bool target_gateup_small_m_enabled_ = false;
     bool target_gateup_k6_async_a_enabled_ = false;
@@ -1066,6 +1310,15 @@ private:
     bool target_k6_m1_simt_enabled_ = false;
     bool fast_same_weights_fp16_accum_enabled_ = false;
     bool fast_same_weights_fp16_m1_enabled_ = false;
+    bool fast_fp16_m2_8_down_enabled_ = false;
+    bool fast_fp16_m2_8_fused_down_enabled_ = false;
+    bool coherent_wide_k6_enabled_ = false;
+    bool coherent_wide_k6_split10_enabled_ = false;
+    bool coherent_down_k6_enabled_ = false;
+    bool coherent_down_k7_enabled_ = false;
+    bool coherent_o_k7_enabled_ = false;
+    bool fast_fp16_m2_8_all_enabled_ = false;
+    bool fast_fp16_m2_8_async_a_enabled_ = false;
     bool fast_same_weights_fp16_m1_n16_enabled_ = false;
     bool fast_native_persistent_m1_enabled_ = false;
     bool fast_native_mia_m1_fp16_enabled_ = false;
@@ -1207,6 +1460,15 @@ private:
     bool draft_prefill_fc_enabled_ = false;
     std::uint16_t* transformed_ = nullptr;
     float* accum_ = nullptr;
+    const std::uint16_t* pending_residual_left_ = nullptr;
+    std::uint16_t* pending_residual_out_ = nullptr;
+    const std::uint16_t* pending_norm_weight_ = nullptr;
+    std::uint16_t* pending_norm_out_ = nullptr;
+    float pending_norm_eps_ = 0.0f;
+    bool norm_applied_ = false;
+    bool launch_armed_residual_reduce(cudaStream_t stream,const std::uint16_t* svh,
+        std::uint16_t* output,int rows,int split_count);
+    bool residual_applied_ = false;
     bool accum_owned_ = true;
     bool transformed_owned_ = true;
     std::size_t workspace_bytes_ = 0;

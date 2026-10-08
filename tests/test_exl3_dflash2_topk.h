@@ -101,6 +101,27 @@ void check_topk_case(const std::vector<std::uint16_t>& input, int rows, int voca
         else require(first_ids == got_ids && first_values == got_values,
                      "top-K exact original-GPU differential failed");
     }
+    DeviceBuffer nonfinite_flag(sizeof(unsigned int));
+    cuda_check(cudaMemset(nonfinite_flag.get(), 0, sizeof(unsigned int)),
+               "fused top-K liveness flag zero");
+    ninfer::exl3::dflash2_topk16_for_test(ip, rows, vocab, idp, vp,
+        true, true, nullptr, static_cast<unsigned int*>(nonfinite_flag.get()));
+    unsigned int observed_nonfinite = 0;
+    cuda_check(cudaMemcpy(&observed_nonfinite, nonfinite_flag.get(),
+                          sizeof(observed_nonfinite), cudaMemcpyDeviceToHost),
+               "fused top-K liveness flag read");
+    const bool expected_nonfinite = std::any_of(input.begin(), input.end(),
+        [](auto bits) { return !std::isfinite(half_to_float(bits)); });
+    require(observed_nonfinite == static_cast<unsigned int>(expected_nonfinite),
+            "fused top-K liveness differs from independent FP16 scan");
+    std::vector<std::int64_t> fused_ids(count + 2 * guard);
+    std::vector<std::uint32_t> fused_values(count + 2 * guard);
+    cuda_check(cudaMemcpy(fused_ids.data(), id_base, ids.bytes(), cudaMemcpyDeviceToHost),
+               "fused top-K IDs download");
+    cuda_check(cudaMemcpy(fused_values.data(), value_base, values.bytes(), cudaMemcpyDeviceToHost),
+               "fused top-K values download");
+    require(fused_ids == first_ids && fused_values == first_values,
+            "fused top-K changed selector candidates");
     std::vector<std::uint16_t> unchanged(input.size());
     cuda_check(cudaMemcpy(unchanged.data(), ip, in.bytes(), cudaMemcpyDeviceToHost), "top-K input integrity");
     require(unchanged == input, "top-K mutated input");

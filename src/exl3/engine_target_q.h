@@ -423,33 +423,33 @@ public:
         (gateup_workspace_?gateup_workspace_->workspace_bytes():0)+
         (down_workspace_?down_workspace_->workspace_bytes():0)+
         (head_workspace_?head_workspace_->workspace_bytes():0)+16ULL*(input_columns_+output_columns_)*2;}
-    std::uint64_t shared_batches() {std::lock_guard lock(mutex_);return shared_batches_;}
+    std::uint64_t shared_batches() {std::lock_guard<std::mutex> lock(mutex_);return shared_batches_;}
     void invalidate_next_offer_for_test() {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(busy_ || waiting_ || failed_ || invalidate_next_offer_for_test_)
             throw std::logic_error("invalid offer seam requires idle unarmed owner");
         invalidate_next_offer_for_test_=true;
     }
     void split_contracts_for_test(bool enabled) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(busy_ || waiting_ || failed_)throw std::logic_error("contract split requires idle owner");
         gather_signature_.clear();split_contracts_for_test_=enabled;
     }
     void set_preclaim_fault_for_test(unsigned fault) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(busy_ || waiting_ || failed_)throw std::logic_error("preclaim fault requires idle owner");
         if(fault>3)throw std::invalid_argument("preclaim fault menu0..3");
         gather_signature_.clear();preclaim_fault_for_test_=fault;
     }
-    std::uint64_t shared_rows() {std::lock_guard lock(mutex_);return shared_rows_;}
+    std::uint64_t shared_rows() {std::lock_guard<std::mutex> lock(mutex_);return shared_rows_;}
     void expire_next_pair_for_test() {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(busy_ || waiting_ || failed_ || expire_next_pair_for_test_ || claim_age_for_test_)
             throw std::logic_error("expired pair seam requires idle unarmed owner");
         expire_next_pair_for_test_=true;
     }
     void claim_next_pair_at_age_for_test(std::chrono::microseconds age) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(busy_ || waiting_ || failed_ || expire_next_pair_for_test_ || claim_age_for_test_)
             throw std::logic_error("claim-age seam requires idle unarmed owner");
         if(age.count()<0 || age>std::chrono::microseconds(50))
@@ -457,23 +457,23 @@ public:
         claim_age_for_test_=age;
     }
     std::uint64_t expired_pair_refusals_for_test() {
-        std::lock_guard lock(mutex_);return expired_pair_refusals_for_test_;
+        std::lock_guard<std::mutex> lock(mutex_);return expired_pair_refusals_for_test_;
     }
-    std::uint64_t failures() {std::lock_guard lock(mutex_);return failures_;}
-    std::uint64_t fallbacks() {std::lock_guard lock(mutex_);return fallbacks_;}
+    std::uint64_t failures() {std::lock_guard<std::mutex> lock(mutex_);return failures_;}
+    std::uint64_t fallbacks() {std::lock_guard<std::mutex> lock(mutex_);return fallbacks_;}
     struct Stats {std::uint64_t batches,rows,failures,fallbacks;std::array<std::uint64_t,15> families,family_fallbacks;std::array<std::uint64_t,64> layers;std::uint64_t reused_gather_bytes,completed_dispatches,completed_dispatch_rows;bool retains_claim_owners;std::uint64_t underfilled_cost_accepts,underfilled_cost_refusals,policy_capped_waits,policy_capped_wait_budget_us,contract_refusals,geometry_refusals,authority_refusals,conditional_draft_batches,conditional_draft_lanes;std::array<std::uint64_t,15> conditional_families;std::array<std::uint64_t,2> conditional_peers;std::uint64_t stage_refusals;};
-    Stats stats() {std::lock_guard lock(mutex_);return {shared_batches_,shared_rows_,failures_,fallbacks_,family_batches_,family_fallbacks_,layer_batches_,reused_gather_bytes_,completed_dispatches_,completed_dispatch_rows_,bool(claimed_owners_[0]),underfilled_cost_accepts_,underfilled_cost_refusals_,policy_capped_waits_,policy_capped_wait_budget_us_,contract_refusals_,geometry_refusals_,authority_refusals_,conditional_draft_batches_,conditional_draft_lanes_,conditional_draft_families_,conditional_peer_counts_,stage_refusals_};}
+    Stats stats() {std::lock_guard<std::mutex> lock(mutex_);return {shared_batches_,shared_rows_,failures_,fallbacks_,family_batches_,family_fallbacks_,layer_batches_,reused_gather_bytes_,completed_dispatches_,completed_dispatch_rows_,bool(claimed_owners_[0]),underfilled_cost_accepts_,underfilled_cost_refusals_,policy_capped_waits_,policy_capped_wait_budget_us_,contract_refusals_,geometry_refusals_,authority_refusals_,conditional_draft_batches_,conditional_draft_lanes_,conditional_draft_families_,conditional_peer_counts_,stage_refusals_};}
     void enable_gather_reuse(bool enabled) {
         Exl3PackedGatherSignature retired_gather;
         {
-            std::lock_guard lock(mutex_);
+            std::lock_guard<std::mutex> lock(mutex_);
             if(busy_ || waiting_ || failed_)throw std::logic_error("gather policy requires idle owner");
             retired_gather=std::exchange(gather_signature_,{});
             gather_reuse_enabled_=enabled;
         }
     }
     std::array<std::weak_ptr<const void>,8> claimed_owners_for_test() {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(busy_ || waiting_)throw std::logic_error("owner observation requires joined shared consumers");
         std::array<std::weak_ptr<const void>,8> result;
         for(std::size_t i=0;i<result.size();++i)result[i]=claimed_owners_[i];
@@ -486,7 +486,7 @@ public:
         std::optional<Exl3PackedProjectionPlan> retired_plan;
         std::array<std::shared_ptr<const void>,8> retired_owners{};
         {
-            std::lock_guard lock(mutex_);
+            std::lock_guard<std::mutex> lock(mutex_);
             if(busy_ || waiting_)throw std::logic_error("shared retirement requires joined producers");
             // Detach every externally owned reference before running its final
             // deleter. A deleter may observe the now-empty rendezvous again.
@@ -500,7 +500,7 @@ public:
     }
     void fail_next_completion_for_test(bool before_producer_drain=false,std::function<void()> observer={},
         bool after_first_scatter=false,unsigned family=Exl3PackedCostPolicy::family_count) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(family>Exl3PackedCostPolicy::family_count)
             throw std::invalid_argument("shared Q fault family out of range");
         if(before_producer_drain && after_first_scatter)
@@ -514,7 +514,7 @@ public:
         completion_observer_for_test_=std::move(observer);
     }
     void set_cost_policy(Exl3PackedCostPolicy policy) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(busy_ || waiting_ || failed_)throw std::logic_error("packed cost update requires idle owner");
         cost_policy_=std::move(policy);
     }
@@ -522,19 +522,19 @@ public:
         // Synchronize with predicate evaluation and wait registration: notifying
         // without this mutex can lose the wake between those two operations.
         // Never alter a claimed offer or release its physical owners here.
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(waiting_ && waiting_->cancelled && waiting_->cancelled->load())
             changed_.notify_all();
     }
     void observe_next_wait_for_test(std::function<void()> observer) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!observer)throw std::invalid_argument("shared wait observer is empty");
         if(busy_ || waiting_ || failed_ || next_wait_observer_for_test_)
             throw std::logic_error("shared wait observer requires idle unarmed owner");
         next_wait_observer_for_test_=std::move(observer);
     }
     void set_rendezvous_timeout_for_test(std::chrono::microseconds timeout) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(busy_ || waiting_ || failed_)throw std::logic_error("rendezvous update requires idle owner");
         if(timeout<std::chrono::microseconds(50) || timeout>std::chrono::milliseconds(5))
             throw std::invalid_argument("test rendezvous timeout outside 50us..5ms");
@@ -547,7 +547,7 @@ public:
         std::span<const std::int64_t> control_contract={},
         const std::atomic<bool>* cancelled=nullptr,
         std::shared_ptr<const Exl3VeriCacheRequest> conditioning_root={}) {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if(failed_)std::rethrow_exception(first_failure_);
         // A control publication or recycled acquisition replaces the bound root.
         // Reject stale callbacks before offering them to a peer or touching any

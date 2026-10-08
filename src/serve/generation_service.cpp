@@ -481,6 +481,32 @@ void GenerationService::warmup() {
     request.messages.push_back(std::move(turn));
     request.max_tokens       = 4;
     request.max_tokens_set   = true;
+    if (options_.exl3_package &&
+        options_.exl3_package->round_implementation ==
+            Exl3RoundImplementation::CoherentDevice) {
+        auto& warmup_text = request.messages.back().content.front().text;
+        const auto count_repeated = [&](int repetitions) {
+            warmup_text.clear();
+            warmup_text.reserve(static_cast<std::size_t>(repetitions) * 3);
+            for (int i = 0; i < repetitions; ++i) warmup_text += "hi ";
+            return count_prompt_tokens(request);
+        };
+        int lower = 0;
+        int upper = 2048;
+        while (count_repeated(upper) < 2048) {
+            lower = upper;
+            upper *= 2;
+        }
+        while (lower + 1 < upper) {
+            const int middle = lower + (upper - lower) / 2;
+            if (count_repeated(middle) < 2048) lower = middle;
+            else upper = middle;
+        }
+        if (count_repeated(upper) + request.max_tokens > options_.max_context) {
+            throw std::invalid_argument(
+                "coherent-device startup warmup needs context headroom above 2048 tokens");
+        }
+    }
     PreparedRequest prepared = prepare_impl(request, {}, {}, CacheParticipation::Disabled,
                                             DeadlinePolicy::UnboundedStartup);
     run(prepared, nullptr);

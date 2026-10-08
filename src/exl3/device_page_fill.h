@@ -75,12 +75,12 @@ public:
     // Own fill/view/counter metadata only; storage has its own retirement owner.
     // Attach while all components still exist, before sealed physical retirement.
     std::shared_ptr<const void> storage_owner_for_retirement() const {
-        std::lock_guard lock(state_->access);return state_->storage;
+        std::lock_guard<std::mutex> lock(state_->access);return state_->storage;
     }
     static bool can_attach_own_metadata_credit(const std::shared_ptr<const void>& owner) noexcept {
         const auto* fill=static_cast<const Exl3DevicePageFill*>(owner.get());
         if(!fill)return false;
-        std::lock_guard lock(fill->state_->access);
+        std::lock_guard<std::mutex> lock(fill->state_->access);
         const auto& state=*fill->state_;
         return !state.metadata_credit && state.view && state.view->readers_ &&
             can_attach_bounded_retirement_credit<Exl3DevicePageFill>(owner) &&
@@ -91,7 +91,7 @@ public:
         RetainedDescriptorLedger::Ticket credit) noexcept {
         auto* fill=const_cast<Exl3DevicePageFill*>(static_cast<const Exl3DevicePageFill*>(owner.get()));
         if(!fill || credit.bytes()!=metadata_bytes())return false;
-        std::lock_guard lock(fill->state_->access);
+        std::lock_guard<std::mutex> lock(fill->state_->access);
         auto& state=*fill->state_;
         if(state.metadata_credit || !state.view || !state.view->readers_ ||
             !can_attach_bounded_retirement_credit<Exl3DevicePageFill>(owner) ||
@@ -107,16 +107,16 @@ public:
         state.metadata_credit.emplace(std::move(credit));return true;
     }
     std::uint64_t retained_readers() const {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         return state_->view?state_->view->readers_->load(std::memory_order_acquire):0;
     }
     bool fill_in_flight() const {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         return state_->submitted && !state_->published.load(std::memory_order_acquire) &&
             !state_->failure.load(std::memory_order_acquire);
     }
     bool abandoned_before_submission() const {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         return state_->failure.load(std::memory_order_acquire)!=0 && !state_->submitted;
     }
     Exl3DevicePageFill(Exl3DevicePageKey key,std::shared_ptr<const void> storage,
@@ -144,7 +144,7 @@ public:
     std::uint64_t begin(std::uint64_t acquisition,std::uint64_t execution,std::uintptr_t event,
         std::shared_ptr<const void> event_owner,
         std::optional<Exl3KVRegistrationCache::ExternalRead> registration_read={}) {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         if(state_->submitted || failed() || !state_->key.current() || !event_owner || !event_owner.use_count())
             throw std::logic_error("device page fill already submitted/stale/missing event owner");
         if(registration_read && !registration_read->valid())
@@ -155,7 +155,7 @@ public:
         state_->acquisition=acquisition;state_->execution=execution;state_->submitted=true;return generation;
     }
     void plane_submitted(std::uint64_t generation,int bank,bool key) {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         if(!state_->submitted || generation!=state_->ready.generation() || bank<0 || bank>=16 ||
             state_->ready.first_error() || ready())throw std::logic_error("device page plane submission scope");
         const auto bit=std::uint32_t{1}<<(bank*2+(key?0:1));
@@ -165,7 +165,7 @@ public:
     bool finish(std::uint64_t generation,int error) noexcept {
         std::shared_ptr<const void> retired_event;
         std::optional<Exl3KVRegistrationCache::ExternalRead> retired_registration;
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         if(!state_->submitted || failed() || (!error && state_->planes!=UINT32_MAX))return false;
         const bool accepted=state_->ready.finish(generation,error);
         if(accepted) {
@@ -202,13 +202,13 @@ public:
     // Only the unique producer calls this when dropping an unfinished claim.
     // Pending storage remains retained; waiters cannot turn it into a ready hit.
     void abandon_producer() noexcept {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         if(state_->published.load(std::memory_order_acquire))return;
         if(state_->submitted)state_->ready.finish(state_->ready.generation(),-1);
         int none=0;state_->failure.compare_exchange_strong(none,-1,std::memory_order_release);
     }
     View view() const {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         if(!ready())throw std::logic_error("device page unavailable before complete readiness");
         // The published view already owns the reserved reader counter. A value
         // copy retains that counter and storage without allocating another one.
@@ -216,12 +216,12 @@ public:
         return *state_->view;
     }
     std::shared_ptr<const View> ready_handle() const {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         if(!ready())return {};
         return state_->view;
     }
     bool seal_for_retirement() {
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         const bool abandoned_unsubmitted=failed() && !state_->submitted;
         if(state_->sealed.load() ||
             (!state_->published.load(std::memory_order_acquire) && !abandoned_unsubmitted))return false;
@@ -234,7 +234,7 @@ public:
     bool retire_sealed_storage() noexcept {
         std::shared_ptr<View> retired_view;
         std::shared_ptr<const void> retired_storage;
-        std::lock_guard lock(state_->access);
+        std::lock_guard<std::mutex> lock(state_->access);
         if(!state_->sealed.load() || state_->reclaimed || !state_->retire ||
             state_->view.use_count()!=1 || state_->storage.use_count()!=2)return false;
         if(!state_->retire(state_->storage))return false;

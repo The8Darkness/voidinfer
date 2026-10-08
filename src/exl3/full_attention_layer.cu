@@ -1,6 +1,12 @@
+#include "exl3/pdl_small.cuh"
+#include "exl3/sibling_rows.cuh"
+#include "exl3/kv_fakequant.cuh"
+#include "exl3/l0_oscar.cuh"
 #include "exl3/full_attention_layer.h"
+#include "exl3/environment_options.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/linear_workspace_requirements.h"
+#include "exl3/block_tree_sum.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -8,6 +14,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <type_traits>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -44,12 +51,14 @@ std::atomic<std::uint64_t> prefill_shared_score_parallel_softmax_counter{0};
 std::atomic<std::uint64_t> prefill_shared_score_head_split256_counter{0};
 std::atomic<std::uint64_t> prefill_shared_score_dimension_split256_counter{0};
 std::atomic<std::uint64_t> fast_fused_flash_attention_counter{0};
+std::atomic<std::uint64_t> fast_fused_flash_multirow_attention_counter{0};
 std::atomic<std::uint64_t> fast_whole_context_fused_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_tiled_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_rows4_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_rows8_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_wmma_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_wmma32_attention_counter{0};
+std::atomic<std::uint64_t> fast_prefill_wmma64_attention_counter{0};
 std::atomic<std::uint64_t> fast_prefill_rows2_attention_counter{0};
 std::atomic<std::uint64_t> fast_online_decode_attention_counter{0};
 std::atomic<std::uint64_t> fast_cublas_attention_counter{0};
@@ -64,6 +73,7 @@ __global__ void split_qg_kernel(const std::uint16_t* qg,
                                 std::uint16_t* q,
                                 std::uint16_t* gate,
                                 int rows) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kQHeads * kHeadDim;
     if (index >= total) return;
@@ -80,10 +90,46 @@ __global__ void rms_norm_kernel(const std::uint16_t* input,
                                 std::uint16_t* output,
                                 int rows,
                                 int features) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int row = static_cast<int>(blockIdx.x);
     const int lane = static_cast<int>(threadIdx.x);
     if (row >= rows || lane >= features) return;
     extern __shared__ float shared[];
+    // Decode-shaped rows (5120 over 512 threads, 256-wide heads over 256):
+    // loads issued together and kept in registers; the per-thread x*x order
+    // and the pairwise tree are unchanged (block_tree_sum_exact).
+    const auto cached = [&](auto width, auto count) {
+        constexpr int B = decltype(width)::value, C = decltype(count)::value;
+        std::uint16_t x_bits[C], w_bits[C];
+        #pragma unroll
+        for (int j = 0; j < C; ++j) {
+            x_bits[j] = input[row * features + lane + j * B];
+            w_bits[j] = weight[lane + j * B];
+        }
+        float partial = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < C; ++j) {
+            const float value = __half2float(__ushort_as_half(x_bits[j]));
+            partial += value * value;
+        }
+        const float inv = rsqrtf(block_tree_sum_exact<B>(partial, shared, lane) /
+                                 static_cast<float>(features) + kRmsEps);
+        #pragma unroll
+        for (int j = 0; j < C; ++j) {
+            const float x = __half2float(__ushort_as_half(x_bits[j])) * inv;
+            const float w = __half2float(__ushort_as_half(w_bits[j]));
+            output[row * features + lane + j * B] =
+                __half_as_ushort(__float2half_rn(x * (w + 1.0f)));
+        }
+    };
+    if (blockDim.x == 512 && features == 5120) {
+        cached(std::integral_constant<int, 512>{}, std::integral_constant<int, 10>{});
+        return;
+    }
+    if (blockDim.x == 256 && features == 256) {
+        cached(std::integral_constant<int, 256>{}, std::integral_constant<int, 1>{});
+        return;
+    }
     float sum = 0.0f;
     for (int i = lane; i < features; i += blockDim.x) {
         const float value = __half2float(__ushort_as_half(input[row * features + i]));
@@ -110,7 +156,9 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
                             std::uint16_t* k_out,
                             int rows,
                             int position,
-                            const int* position_device,const int* positions_xyz,int offset) {
+                            const int* position_device,const int* positions_xyz,int offset,
+                            const int* chain_rows=nullptr) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kQHeads * kHeadDim;
     if (index >= total) return;
@@ -119,7 +167,7 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
     const int kv_index = row * kKVHeads * kHeadDim +
                          ((index / kHeadDim) % kKVHeads) * kHeadDim + channel;
     const int base_position = position_device ? *position_device : position;
-    int pos = base_position + row;
+    int pos = base_position + sibling_row_offset(row, chain_rows);
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
     float q = __half2float(__ushort_as_half(q_in[index]));
     float k = __half2float(__ushort_as_half(k_in[kv_index]));
@@ -151,14 +199,16 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
                               std::uint16_t* k_out,
                               int rows,
                               int position,
-                              const int* position_device,const int* positions_xyz,int offset) {
+                              const int* position_device,const int* positions_xyz,int offset,
+                              const int* chain_rows=nullptr) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kKVHeads * kHeadDim;
     if (index >= total) return;
     const int channel = index % kHeadDim;
     const int row = index / (kKVHeads * kHeadDim);
     const int base_position = position_device ? *position_device : position;
-    int pos = base_position + row;
+    int pos = base_position + sibling_row_offset(row, chain_rows);
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
     float value = __half2float(__ushort_as_half(k_in[index]));
     if (channel < kRopeDim) {
@@ -173,6 +223,67 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
         value = value * cosine + (channel < kRopeDim / 2 ? -mate_value : mate_value) * sine;
     }
     k_out[index] = __half_as_ushort(__float2half_rn(value));
+}
+
+// Decode Q/K preparation in one launch: split_qg_kernel, the per-head
+// rms_norm_kernel (256 threads, block_tree_sum_exact<256>) for Q and K, and
+// rope_kernel/rope_k_kernel (plain positions), with the same expressions and
+// the same half roundings. One block per (row, head); Q heads first.
+__global__ void __launch_bounds__(256) decode_qk_prepare_kernel(const std::uint16_t* qg,
+    const std::uint16_t* kp,const std::uint16_t* q_norm_weight,const std::uint16_t* k_norm_weight,
+    std::uint16_t* qn,std::uint16_t* gate,std::uint16_t* kn,std::uint16_t* qr,std::uint16_t* kr,
+    int rows,int position,const int* position_device,const int* chain_rows) {
+    EXL3_PDL_SMALL_PROLOGUE();
+    __shared__ float shared[256];
+    __shared__ float normalized[kHeadDim];
+    constexpr int kHeadsPerRow=kQHeads+kKVHeads;
+    const int row=static_cast<int>(blockIdx.x)/kHeadsPerRow;
+    const int head=static_cast<int>(blockIdx.x)%kHeadsPerRow;
+    const int channel=static_cast<int>(threadIdx.x);
+    if(row>=rows) return;
+    const bool is_q=head<kQHeads;
+    std::uint16_t bits;
+    std::size_t index;
+    if(is_q) {
+        index=(static_cast<std::size_t>(row)*kQHeads+head)*kHeadDim+channel;
+        const int source=head*(2*kHeadDim)+channel;
+        bits=qg[static_cast<std::size_t>(row)*kQProjection+source];
+        gate[index]=qg[static_cast<std::size_t>(row)*kQProjection+source+kHeadDim];
+    } else {
+        index=(static_cast<std::size_t>(row)*kKVHeads+(head-kQHeads))*kHeadDim+channel;
+        bits=kp[index];
+    }
+    const std::uint16_t w_bits=(is_q?q_norm_weight:k_norm_weight)[channel];
+    const float value=__half2float(__ushort_as_half(bits));
+    float partial=0.0f;
+    partial+=value*value;
+    const float inv=rsqrtf(block_tree_sum_exact<256>(partial,shared,channel)/
+                           static_cast<float>(kHeadDim)+kRmsEps);
+    const float x=__half2float(__ushort_as_half(bits))*inv;
+    const float w=__half2float(__ushort_as_half(w_bits));
+    const std::uint16_t norm_bits=__half_as_ushort(__float2half_rn(x*(w+1.0f)));
+    (is_q?qn:kn)[index]=norm_bits;
+    normalized[channel]=__half2float(__ushort_as_half(norm_bits));
+    __syncthreads();
+    const int base_position=position_device?*position_device:position;
+    const int pos=base_position+sibling_row_offset(row,chain_rows);
+    float out=normalized[channel];
+    if(channel<kRopeDim) {
+        const int pair=channel<kRopeDim/2?channel:channel-kRopeDim/2;
+        const int mate=channel<kRopeDim/2?channel+kRopeDim/2:channel-kRopeDim/2;
+        const float mate_value=normalized[mate];
+        if(is_q) {
+            const float inv_frequency=powf(kRopeTheta,-2.0f*static_cast<float>(pair)/
+                                                       static_cast<float>(kRopeDim));
+            const float angle=static_cast<float>(pos)*inv_frequency;
+            out=out*cosf(angle)+(channel<kRopeDim/2?-mate_value:mate_value)*sinf(angle);
+        } else {
+            const float angle=static_cast<float>(pos)*
+                powf(kRopeTheta,-2.0f*static_cast<float>(pair)/static_cast<float>(kRopeDim));
+            out=out*cosf(angle)+(channel<kRopeDim/2?-mate_value:mate_value)*sinf(angle);
+        }
+    }
+    (is_q?qr:kr)[index]=__half_as_ushort(__float2half_rn(out));
 }
 
 __global__ void attention_kernel(const std::uint16_t* q,
@@ -222,6 +333,7 @@ __global__ void append_kv_cache_kernel(const std::uint16_t* k,
                                        int position,
                                        int capacity,
                                        const int* position_device) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kKVHeads * kHeadDim;
     if (index >= total) return;
@@ -2755,7 +2867,12 @@ constexpr int kFastFusedFlashHeads=kQHeads/kKVHeads;
 constexpr int kFastFusedFlashValues=kFastFusedFlashHeads*kHeadDim;
 constexpr int kFastFusedFlashStride=kFastFusedFlashValues+2*kFastFusedFlashHeads;
 
-template<int kKeys>
+// Staged-K dimension chunk. Each key lane keeps its sequential FMA chain over
+// d; only the K source moves from strided global loads to a coalesced shared
+// tile, so the scores are bitwise identical to the unstaged kernel.
+constexpr int kFastFusedFlashStageDims=16;
+
+template<int kKeys,bool kStagedK=false>
 __global__ void attention_cached_gqa_six_fused_flash_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,float* workspace,std::uint16_t* output,
@@ -2775,8 +2892,8 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
     const int extent=min(kKeys,count-first);
     if(extent<=0 || count<1 || count>capacity) return;
 
-    __shared__ float query_values[kFastFusedFlashHeads][kHeadDim];
-    __shared__ float score_tile[kFastFusedFlashHeads][kKeys];
+    __shared__ __align__(16) float query_values[kFastFusedFlashHeads][kHeadDim];
+    __shared__ __align__(16) float score_tile[kFastFusedFlashHeads][kKeys];
     __shared__ float maximum[kFastFusedFlashHeads];
     __shared__ float denominator[kFastFusedFlashHeads];
     if(tid<kHeadDim) {
@@ -2789,7 +2906,49 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
 
     // The first 128 lanes own K rows. All six score chains use the same
     // represented FP16 K load, while the d lanes below own the V output.
-    if(tid<extent) {
+    if constexpr(kStagedK) {
+        constexpr int kWords=kFastFusedFlashStageDims/2;
+        constexpr int kParts=kFastFusedFlashStageDims/8;
+        __shared__ __half2 key_tile[kKeys][kWords+1];
+        float dot[kFastFusedFlashHeads]={};
+        for(int c=0;c<kHeadDim;c+=kFastFusedFlashStageDims) {
+            for(int w=tid;w<extent*kParts;w+=static_cast<int>(blockDim.x)) {
+                const int key=w/kParts;
+                const int part=w%kParts;
+                const uint4 packed=*reinterpret_cast<const uint4*>(k_cache+
+                    (static_cast<std::size_t>(first+key)*kKVHeads+kv_head)*kHeadDim+
+                        c+part*8);
+                key_tile[key][part*4+0]=*reinterpret_cast<const __half2*>(&packed.x);
+                key_tile[key][part*4+1]=*reinterpret_cast<const __half2*>(&packed.y);
+                key_tile[key][part*4+2]=*reinterpret_cast<const __half2*>(&packed.z);
+                key_tile[key][part*4+3]=*reinterpret_cast<const __half2*>(&packed.w);
+            }
+            __syncthreads();
+            if(tid<extent) {
+                #pragma unroll
+                for(int word=0;word<kWords;word+=2) {
+                    const int d=c+2*word;
+                    const float2 low=__half22float2(key_tile[tid][word]);
+                    const float2 high=__half22float2(key_tile[tid][word+1]);
+                    #pragma unroll
+                    for(int head=0;head<kFastFusedFlashHeads;++head) {
+                        const float4 query4=
+                            *reinterpret_cast<const float4*>(&query_values[head][d]);
+                        dot[head]+=query4.x*low.x;
+                        dot[head]+=query4.y*low.y;
+                        dot[head]+=query4.z*high.x;
+                        dot[head]+=query4.w*high.y;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if(tid<extent) {
+            #pragma unroll
+            for(int head=0;head<kFastFusedFlashHeads;++head)
+                score_tile[head][tid]=dot[head]*0.0625f;
+        }
+    } else if(tid<extent) {
         const int key=first+tid;
         const auto* key_values=k_cache+
             (static_cast<std::size_t>(key)*kKVHeads+kv_head)*kHeadDim;
@@ -2830,7 +2989,40 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
     __syncthreads();
 
     float accumulated[kFastFusedFlashHeads]={};
-    if(tid<kHeadDim) {
+    if(kStagedK && tid<kHeadDim) {
+        // Batch eight independent V loads, then apply them in chronological
+        // order: each head keeps the same FP32 chain as the scalar loop.
+        int offset=0;
+        for(;offset+8<=extent;offset+=8) {
+            float values[8];
+            #pragma unroll
+            for(int j=0;j<8;++j)
+                values[j]=__half2float(__ushort_as_half(
+                    v_cache[(static_cast<std::size_t>(first+offset+j)*kKVHeads+kv_head)*
+                        kHeadDim+tid]));
+            #pragma unroll
+            for(int head=0;head<kFastFusedFlashHeads;++head) {
+                const float4 a=*reinterpret_cast<const float4*>(&score_tile[head][offset]);
+                const float4 b=*reinterpret_cast<const float4*>(&score_tile[head][offset+4]);
+                accumulated[head]+=a.x*values[0];
+                accumulated[head]+=a.y*values[1];
+                accumulated[head]+=a.z*values[2];
+                accumulated[head]+=a.w*values[3];
+                accumulated[head]+=b.x*values[4];
+                accumulated[head]+=b.y*values[5];
+                accumulated[head]+=b.z*values[6];
+                accumulated[head]+=b.w*values[7];
+            }
+        }
+        for(;offset<extent;++offset) {
+            const auto represented=__half2float(__ushort_as_half(
+                v_cache[(static_cast<std::size_t>(first+offset)*kKVHeads+kv_head)*
+                    kHeadDim+tid]));
+            #pragma unroll
+            for(int head=0;head<kFastFusedFlashHeads;++head)
+                accumulated[head]+=score_tile[head][offset]*represented;
+        }
+    } else if(tid<kHeadDim) {
         for(int offset=0;offset<extent;++offset) {
             const auto represented=__half2float(__ushort_as_half(
                 v_cache[(static_cast<std::size_t>(first+offset)*kKVHeads+kv_head)*
@@ -2854,17 +3046,46 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
     }
 }
 
+bool wmma32_vector_loads_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_WMMA32_VECTOR_LOADS");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+bool fused_flash_staged_k_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_FLASH_STAGED_K");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
 __global__ void attention_cached_gqa_six_fused_flash_merge_kernel(
-    const float* workspace,std::uint16_t* output,int rows,int segments) {
+    const float* workspace,std::uint16_t* output,int rows,int segments,
+    int position,int capacity,int keys,const int* position_device,
+    int query_offset) {
     const int block=static_cast<int>(blockIdx.x);
     const int query=block/kKVHeads;
     const int kv_head=block%kKVHeads;
     const int tid=threadIdx.x;
     if(query>=rows || tid>=kHeadDim) return;
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int count=base+query+1;
+    if(count<1 || count>capacity) {
+        for(int head=0;head<kFastFusedFlashHeads;++head)
+            output[(query*kQHeads+kv_head*kFastFusedFlashHeads+head)*kHeadDim+tid]=0;
+        return;
+    }
+    // A graph may launch the capacity-sized grid before the live frontier
+    // reaches its final tile. Producers for those tiles return without writing
+    // scratch; the merge must never consume their old contents.
+    const int live_segments=min(segments,(count+keys-1)/keys);
     __shared__ float global_max[kFastFusedFlashHeads];
     if(tid<kFastFusedFlashHeads) {
         float value=-3.402823466e+38F;
-        for(int segment=0;segment<segments;++segment) {
+        for(int segment=0;segment<live_segments;++segment) {
             const float* slot=workspace+
                 ((static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments+segment)*
                     kFastFusedFlashStride;
@@ -2875,7 +3096,7 @@ __global__ void attention_cached_gqa_six_fused_flash_merge_kernel(
     __syncthreads();
     for(int head=0;head<kFastFusedFlashHeads;++head) {
         float denominator=0.0f,numerator=0.0f;
-        for(int segment=0;segment<segments;++segment) {
+        for(int segment=0;segment<live_segments;++segment) {
             const float* slot=workspace+
                 ((static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments+segment)*
                     kFastFusedFlashStride;
@@ -3480,7 +3701,7 @@ __global__ void attention_cached_gqa_six_wmma_prefill_kernel(
                     #pragma unroll
                     for(int group=0;group<kValueGroups;++group) {
                         nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,
-                            nvcuda::wmma::col_major> b;
+                            nvcuda::wmma::row_major> b;
                         nvcuda::wmma::load_matrix_sync(
                             b,&v_tile[n_base][k_base+group*16],kHeadDim);
                         nvcuda::wmma::mma_sync(c[group],a,b,c[group]);
@@ -3514,17 +3735,24 @@ __global__ void attention_cached_gqa_six_wmma_prefill_kernel(
 // within the physical-C1 limit while reusing each K/V tile across 32 rows. It is
 // construction-latched and default-off: the exact score/value path remains
 // the fallback for every unsupported or disabled configuration.
+// VectorLoads moves the same represented Q/K/V halves into the same shared
+// tiles with independent 16-byte loads instead of a dependent 2-byte loop.
+template<int TileStride,int SplitCount=1,int BlockM=32,bool VectorLoads=false>
 __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
     const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,std::uint16_t* output,int rows,
-    int position,int capacity,const int* position_device,int query_offset) {
-    constexpr int BlockM=32;
+    int position,int capacity,const int* position_device,int query_offset,
+    float* split_output,float* split_stats) {
+    static_assert(BlockM==32 || BlockM==64);
     constexpr int BlockN=32;
     constexpr int HeadsPerBlock=1;
-    constexpr int kValueGroups=kHeadDim/64;
+    constexpr int ActiveWarps=BlockM==64?8:4;
+    constexpr int kValueGroups=kHeadDim/(ActiveWarps*16);
     const int query_base=static_cast<int>(blockIdx.x)*BlockM;
     const int kv_head=static_cast<int>(blockIdx.y);
-    const int head_group=static_cast<int>(blockIdx.z);
+    static_assert(SplitCount==1 || SplitCount==2 || SplitCount==4);
+    const int head_group=static_cast<int>(blockIdx.z)/SplitCount;
+    const int split=static_cast<int>(blockIdx.z)%SplitCount;
     const int tid=static_cast<int>(threadIdx.x);
     const int warp=tid/32;
     constexpr int kHeadsPerKV=kQHeads/kKVHeads;
@@ -3535,10 +3763,19 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
     const int base=(position_device?*position_device:position)+query_offset;
     const int maximum_count=base+query_base+active_rows;
     if(base+query_base+1<1 || maximum_count>capacity) return;
+    const int segment_tiles=(maximum_count+SplitCount*BlockN-1)/
+        (SplitCount*BlockN);
+    const int first_begin=SplitCount==1?0:
+        min(split*segment_tiles*BlockN,maximum_count);
+    const int first_end=SplitCount==1?maximum_count:
+        min((split+1)*segment_tiles*BlockN,maximum_count);
 
-    __shared__ half q_tile[HeadsPerBlock][BlockM][kHeadDim];
-    __shared__ half k_tile[BlockN][kHeadDim];
-    __shared__ half v_tile[BlockN][kHeadDim];
+    // M64 streams Q from its original row-major positions and overlays K/V.
+    // That keeps the FP32 online output accumulator within SM120 shared memory.
+    __shared__ __align__(16) half q_tile[HeadsPerBlock][BlockM==64?1:BlockM][TileStride];
+    __shared__ __align__(16) half k_tile[BlockN][TileStride];
+    __shared__ __align__(16) half v_tile[BlockM==64?1:BlockN][TileStride];
+    static_assert(!VectorLoads || (BlockM==32 && HeadsPerBlock==1 && TileStride%8==0));
     __shared__ float score_tile[HeadsPerBlock][BlockM][BlockN];
     __shared__ half probability_tile[HeadsPerBlock][BlockM][BlockN];
     __shared__ float accumulated[HeadsPerBlock][BlockM][kHeadDim];
@@ -3551,9 +3788,10 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
         const int rem=index%(BlockM*kHeadDim);
         const int row=rem/kHeadDim;
         const int dim=rem%kHeadDim;
-        q_tile[head][row][dim]=row<active_rows?
-            __ushort_as_half(q[((query_base+row)*kQHeads+q_head_base+head)*
-                kHeadDim+dim]):__float2half(0.0f);
+        if constexpr(BlockM==32)
+            q_tile[head][row][dim]=row<active_rows?
+                __ushort_as_half(q[((query_base+row)*kQHeads+q_head_base+head)*
+                    kHeadDim+dim]):__float2half(0.0f);
         accumulated[head][row][dim]=0.0f;
     }
     for(int index=tid;index<HeadsPerBlock*BlockM;index+=blockDim.x) {
@@ -3565,29 +3803,48 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
     }
     __syncthreads();
 
-    for(int first=0;first<maximum_count;first+=BlockN) {
+    for(int first=first_begin;first<first_end;first+=BlockN) {
+        if constexpr(VectorLoads) {
+            constexpr int kVectors=kHeadDim/8;
+            for(int index=tid;index<BlockN*kVectors;index+=blockDim.x) {
+                const int key_offset=index/kVectors;
+                const int dim=(index%kVectors)*8;
+                const int key=first+key_offset;
+                uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
+                if(key<first_end && key<capacity) {
+                    const std::size_t offset=(static_cast<std::size_t>(key)*kKVHeads+
+                        kv_head)*kHeadDim+dim;
+                    key_bits=*reinterpret_cast<const uint4*>(k_cache+offset);
+                    value_bits=*reinterpret_cast<const uint4*>(v_cache+offset);
+                }
+                *reinterpret_cast<uint4*>(&k_tile[key_offset][dim])=key_bits;
+                *reinterpret_cast<uint4*>(&v_tile[key_offset][dim])=value_bits;
+            }
+        } else
         for(int index=tid;index<BlockN*kHeadDim;index+=blockDim.x) {
             const int key_offset=index/kHeadDim;
             const int dim=index%kHeadDim;
             const int key=first+key_offset;
-            if(key<maximum_count && key<capacity) {
+            if(key<first_end && key<capacity) {
                 k_tile[key_offset][dim]=__ushort_as_half(
                     k_cache[(static_cast<std::size_t>(key)*kKVHeads+
                         kv_head)*kHeadDim+dim]);
-                v_tile[key_offset][dim]=__ushort_as_half(
-                    v_cache[(static_cast<std::size_t>(key)*kKVHeads+
-                        kv_head)*kHeadDim+dim]);
+                if constexpr(BlockM==32)
+                    v_tile[key_offset][dim]=__ushort_as_half(
+                        v_cache[(static_cast<std::size_t>(key)*kKVHeads+
+                            kv_head)*kHeadDim+dim]);
             } else {
                 k_tile[key_offset][dim]=__float2half(0.0f);
-                v_tile[key_offset][dim]=__float2half(0.0f);
+                if constexpr(BlockM==32)
+                    v_tile[key_offset][dim]=__float2half(0.0f);
             }
         }
         __syncthreads();
 
-        // Four warps cover one head x two M tiles x two N tiles.
-        if(warp<HeadsPerBlock*4) {
-            const int head=warp/4;
-            const int task=warp%4;
+        // M64 assigns all eight warps to four M tiles x two N tiles.
+        if(warp<HeadsPerBlock*(BlockM/16)*2) {
+            const int head=warp/((BlockM/16)*2);
+            const int task=warp%((BlockM/16)*2);
             const int m_base=(task/2)*16;
             const int n_base=(task%2)*16;
             nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,
@@ -3598,10 +3855,16 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
             nvcuda::wmma::fill_fragment(c,0.0f);
             #pragma unroll
             for(int k_tile_base=0;k_tile_base<kHeadDim;k_tile_base+=16) {
+                if constexpr(BlockM==64)
+                    nvcuda::wmma::load_matrix_sync(a,
+                        reinterpret_cast<const half*>(q)+
+                        ((query_base+m_base)*kQHeads+q_head_base+head)*
+                            kHeadDim+k_tile_base,kQHeads*kHeadDim);
+                else
+                    nvcuda::wmma::load_matrix_sync(
+                        a,&q_tile[head][m_base][k_tile_base],TileStride);
                 nvcuda::wmma::load_matrix_sync(
-                    a,&q_tile[head][m_base][k_tile_base],kHeadDim);
-                nvcuda::wmma::load_matrix_sync(
-                    b,&k_tile[n_base][k_tile_base],kHeadDim);
+                    b,&k_tile[n_base][k_tile_base],TileStride);
                 nvcuda::wmma::mma_sync(c,a,b,c);
             }
             nvcuda::wmma::store_matrix_sync(
@@ -3615,7 +3878,7 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
                 float tile_max=-3.402823466e+38F;
                 for(int offset=0;offset<BlockN;++offset) {
                     const int key=first+offset;
-                    if(tid<active_rows && offset<maximum_count-first &&
+                    if(tid<active_rows && offset<first_end-first &&
                        key<=base+query_base+tid)
                         tile_max=fmaxf(tile_max,
                             score_tile[head][tid][offset]*0.0625f);
@@ -3633,7 +3896,7 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
                 const int offset=index%BlockN;
                 const int key=first+offset;
                 const bool valid=row<active_rows &&
-                    offset<maximum_count-first &&
+                    offset<first_end-first &&
                     key<=base+query_base+row;
                 const float score=score_tile[head][row][offset]*0.0625f;
                 probability_tile[head][row][offset]=__float2half(
@@ -3644,7 +3907,7 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
 
             if(tid<BlockM) {
                 float tile_sum=0.0f;
-                const int extent=min(BlockN,maximum_count-first);
+                const int extent=min(BlockN,first_end-first);
                 for(int offset=0;offset<extent;++offset)
                     tile_sum+=__half2float(probability_tile[head][tid][offset]);
                 denominator[head][tid]=denominator[head][tid]*
@@ -3659,9 +3922,25 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
             }
             __syncthreads();
 
-            const int head_warp=warp-head*4;
-            if(head_warp>=0 && head_warp<4) {
-                const int k_base=head_warp*64;
+            if constexpr(BlockM==64) {
+                // QK is complete. Reuse the K tile as V storage before PV.
+                for(int index=tid;index<BlockN*kHeadDim;index+=blockDim.x) {
+                    const int key_offset=index/kHeadDim;
+                    const int dim=index%kHeadDim;
+                    const int key=first+key_offset;
+                    k_tile[key_offset][dim]=key<first_end && key<capacity?
+                        __ushort_as_half(v_cache[
+                            (static_cast<std::size_t>(key)*kKVHeads+
+                                kv_head)*kHeadDim+dim]):__float2half(0.0f);
+                }
+                __syncthreads();
+            }
+
+            const int head_warp=warp-head*ActiveWarps;
+            if(head_warp>=0 && head_warp<ActiveWarps) {
+                const int k_base=head_warp*(kHeadDim/ActiveWarps);
+                const half* value_tile=BlockM==64?
+                    &k_tile[0][0]:&v_tile[0][0];
                 for(int m_base=0;m_base<BlockM;m_base+=16) {
                     nvcuda::wmma::fragment<
                         nvcuda::wmma::accumulator,16,16,16,float> c[kValueGroups];
@@ -3681,9 +3960,10 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
                         for(int group=0;group<kValueGroups;++group) {
                             nvcuda::wmma::fragment<
                                 nvcuda::wmma::matrix_b,16,16,16,half,
-                                nvcuda::wmma::col_major> b;
+                                nvcuda::wmma::row_major> b;
                             nvcuda::wmma::load_matrix_sync(
-                                b,&v_tile[n_base][k_base+group*16],kHeadDim);
+                                b,value_tile+n_base*TileStride+
+                                    k_base+group*16,TileStride);
                             nvcuda::wmma::mma_sync(c[group],a,b,c[group]);
                         }
                     }
@@ -3703,11 +3983,308 @@ __global__ void attention_cached_gqa_six_wmma32_prefill_kernel(
         const int rem=index%(BlockM*kHeadDim);
         const int row=rem/kHeadDim;
         const int dim=rem%kHeadDim;
-        if(row<active_rows)
-            output[((query_base+row)*kQHeads+q_head_base+head)*kHeadDim+dim]=
-                __half_as_ushort(__float2half_rn(
-                    accumulated[head][row][dim]/denominator[head][row]));
+        if(row<active_rows) {
+            const int element=((query_base+row)*kQHeads+q_head_base+head)*
+                kHeadDim+dim;
+            const float normalized=denominator[head][row]>0.0f?
+                accumulated[head][row][dim]/denominator[head][row]:0.0f;
+            if constexpr(SplitCount>1)
+                split_output[static_cast<std::size_t>(split)*rows*kQHeads*
+                    kHeadDim+element]=normalized;
+            else
+                output[element]=__half_as_ushort(__float2half_rn(normalized));
+        }
     }
+    if constexpr(SplitCount>1) {
+        for(int index=tid;index<HeadsPerBlock*active_rows;index+=blockDim.x) {
+            const int head=index/active_rows;
+            const int row=index%active_rows;
+            const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+
+                (query_base+row)*kQHeads+q_head_base+head)*2;
+            split_stats[stat]=running_max[head][row];
+            split_stats[stat+1]=denominator[head][row];
+        }
+    }
+}
+
+// Separate numeric candidate: a warp owns 16 query rows x 128 value columns
+// across the entire key scan. Unlike the selected WMMA64 path, its FP32 output
+// fragments stay in registers until the final store. A CTA-wide maximum gives
+// every fragment one rescale factor without assuming a WMMA fragment lane map.
+// The changed FP16 probability range requires an independent quality gate.
+template<int TileStride,int SplitCount,int HeadsPerCTA=1,int BlockN=32>
+__global__ void attention_cached_gqa_six_wmma64_register_prefill_kernel(
+    const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,std::uint16_t* output,int rows,
+    int position,int capacity,const int* position_device,int query_offset,
+    float* split_output,float* split_stats) {
+    static_assert(SplitCount==1 || SplitCount==2);
+    static_assert(HeadsPerCTA==1 || HeadsPerCTA==2);
+    static_assert(BlockN==32 || BlockN==64);
+    constexpr int BlockM=64/HeadsPerCTA;
+    constexpr int ValueColumnsPerWarp=128,WarpsPerHead=8/HeadsPerCTA;
+    constexpr int KeyStage=32;
+    constexpr int FinalColumns=BlockN==64?64:ValueColumnsPerWarp;
+    const int query_base=static_cast<int>(blockIdx.x)*BlockM;
+    const int kv_head=static_cast<int>(blockIdx.y);
+    constexpr int heads_per_kv=kQHeads/kKVHeads;
+    const int head_group=static_cast<int>(blockIdx.z)/SplitCount;
+    const int split=static_cast<int>(blockIdx.z)%SplitCount;
+    const int q_head_base=kv_head*heads_per_kv+head_group*HeadsPerCTA;
+    const int tid=static_cast<int>(threadIdx.x);
+    const int warp=tid/32;
+    const int lane=tid%32;
+    if(query_base+BlockM>rows || kv_head>=kKVHeads ||
+       head_group*HeadsPerCTA>=heads_per_kv) return;
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int maximum_count=base+query_base+BlockM;
+    if(base+query_base+1<1 || maximum_count>capacity) return;
+    const int segment_tiles=(maximum_count+SplitCount*BlockN-1)/
+        (SplitCount*BlockN);
+    const int first_begin=SplitCount==1?0:
+        min(split*segment_tiles*BlockN,maximum_count);
+    const int first_end=SplitCount==1?maximum_count:
+        min((split+1)*segment_tiles*BlockN,maximum_count);
+
+    __shared__ __align__(16) half key_value_tile[KeyStage][TileStride];
+    __shared__ __align__(16) float scores[HeadsPerCTA][BlockM][BlockN];
+    __shared__ __align__(16) half probabilities[HeadsPerCTA][BlockM][BlockN];
+    __shared__ float denominator[HeadsPerCTA][BlockM];
+    __shared__ float tile_row_max[HeadsPerCTA][BlockM];
+    __shared__ float current_max[HeadsPerCTA],rescale[HeadsPerCTA];
+    __shared__ __align__(16) float final_tile[16][FinalColumns];
+    if(tid<HeadsPerCTA*BlockM)
+        denominator[tid/BlockM][tid%BlockM]=0.0f;
+    if(tid<HeadsPerCTA) current_max[tid]=-3.402823466e+38F;
+    using Accumulator=nvcuda::wmma::fragment<
+        nvcuda::wmma::accumulator,16,16,16,float>;
+    Accumulator value[ValueColumnsPerWarp/16];
+    #pragma unroll
+    for(int group=0;group<ValueColumnsPerWarp/16;++group)
+        nvcuda::wmma::fill_fragment(value[group],0.0f);
+    __syncthreads();
+
+    for(int first=first_begin;first<first_end;first+=BlockN) {
+        const int head=warp/WarpsPerHead;
+        const int task=warp%WarpsPerHead;
+        const int m_base=(task/2)*16;
+        // A 64-key statistics tile uses two bounded 32-key K/V stages. The
+        // larger score plane halves online-max and rescale iterations without
+        // doubling shared K/V storage or changing register-owned output.
+        for(int key_window=0;key_window<BlockN;key_window+=KeyStage) {
+            for(int index=tid;index<KeyStage*kHeadDim;index+=blockDim.x) {
+                const int key_offset=index/kHeadDim;
+                const int dimension=index%kHeadDim;
+                const int key=first+key_window+key_offset;
+                key_value_tile[key_offset][dimension]=
+                    key<first_end && key<capacity?
+                    __ushort_as_half(k_cache[
+                        (static_cast<std::size_t>(key)*kKVHeads+kv_head)*
+                            kHeadDim+dimension]):__float2half(0.0f);
+            }
+            __syncthreads();
+            const int n_base=key_window+(task%2)*16;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,
+                nvcuda::wmma::row_major> query_fragment;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,
+                nvcuda::wmma::col_major> key_fragment;
+            Accumulator score_fragment;
+            nvcuda::wmma::fill_fragment(score_fragment,0.0f);
+            #pragma unroll
+            for(int dimension=0;dimension<kHeadDim;dimension+=16) {
+                nvcuda::wmma::load_matrix_sync(query_fragment,
+                    reinterpret_cast<const half*>(q)+
+                    ((query_base+m_base)*kQHeads+q_head_base+head)*
+                        kHeadDim+dimension,
+                    kQHeads*kHeadDim);
+                nvcuda::wmma::load_matrix_sync(key_fragment,
+                    &key_value_tile[(task%2)*16][dimension],TileStride);
+                nvcuda::wmma::mma_sync(score_fragment,query_fragment,
+                    key_fragment,score_fragment);
+            }
+            nvcuda::wmma::store_matrix_sync(&scores[head][m_base][n_base],
+                score_fragment,BlockN,nvcuda::wmma::mem_row_major);
+            __syncthreads();
+        }
+
+        if(tid<HeadsPerCTA*BlockM) {
+            const int score_head=tid/BlockM;
+            const int row=tid%BlockM;
+            float maximum=-3.402823466e+38F;
+            #pragma unroll
+            for(int offset=0;offset<BlockN;++offset) {
+                const int key=first+offset;
+                if(key<first_end && key<=base+query_base+row)
+                    maximum=fmaxf(maximum,
+                        scores[score_head][row][offset]*0.0625f);
+            }
+            tile_row_max[score_head][row]=maximum;
+        }
+        __syncthreads();
+        if(tid<HeadsPerCTA) {
+            float next_max=current_max[tid];
+            #pragma unroll
+            for(int row=0;row<BlockM;++row)
+                next_max=fmaxf(next_max,tile_row_max[tid][row]);
+            rescale[tid]=next_max==current_max[tid]?1.0f:
+                (current_max[tid]< -1.0e30f?0.0f:
+                    exp2f((current_max[tid]-next_max)*
+                        1.4426950408889634f));
+            current_max[tid]=next_max;
+        }
+        __syncthreads();
+        for(int index=tid;index<HeadsPerCTA*BlockM*BlockN;
+            index+=blockDim.x) {
+            const int probability_head=index/(BlockM*BlockN);
+            const int row=(index/BlockN)%BlockM;
+            const int offset=index%BlockN;
+            const int key=first+offset;
+            const bool valid=key<first_end && key<=base+query_base+row;
+            probabilities[probability_head][row][offset]=__float2half_rn(
+                valid?exp2f((scores[probability_head][row][offset]*
+                    0.0625f-current_max[probability_head])*
+                    1.4426950408889634f):0.0f);
+        }
+        __syncthreads();
+        if(tid<HeadsPerCTA*BlockM) {
+            const int probability_head=tid/BlockM;
+            const int row=tid%BlockM;
+            float sum=0.0f;
+            const int extent=min(BlockN,first_end-first);
+            for(int offset=0;offset<extent;++offset)
+                sum+=__half2float(
+                    probabilities[probability_head][row][offset]);
+            denominator[probability_head][row]=
+                denominator[probability_head][row]*
+                    rescale[probability_head]+sum;
+        }
+        #pragma unroll
+        for(int group=0;group<ValueColumnsPerWarp/16;++group)
+            #pragma unroll
+            for(int element=0;element<value[group].num_elements;++element)
+                value[group].x[element]*=rescale[warp/WarpsPerHead];
+        __syncthreads();
+
+        const int value_head=warp/WarpsPerHead;
+        const int value_m_base=((warp%WarpsPerHead)/2)*16;
+        const int value_d_base=(warp%2)*ValueColumnsPerWarp;
+        // QK has consumed the key stage. Reuse it for the matching V half.
+        for(int key_window=0;key_window<BlockN;key_window+=KeyStage) {
+            for(int index=tid;index<KeyStage*kHeadDim;index+=blockDim.x) {
+                const int key_offset=index/kHeadDim;
+                const int dimension=index%kHeadDim;
+                const int key=first+key_window+key_offset;
+                key_value_tile[key_offset][dimension]=
+                    key<first_end && key<capacity?
+                    __ushort_as_half(v_cache[
+                        (static_cast<std::size_t>(key)*kKVHeads+kv_head)*
+                            kHeadDim+dimension]):__float2half(0.0f);
+            }
+            __syncthreads();
+            #pragma unroll
+            for(int probability_offset=0;probability_offset<KeyStage;
+                probability_offset+=16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,
+                    nvcuda::wmma::row_major> probability_fragment;
+                nvcuda::wmma::load_matrix_sync(probability_fragment,
+                    &probabilities[value_head][value_m_base]
+                        [key_window+probability_offset],BlockN);
+                #pragma unroll
+                for(int group=0;group<ValueColumnsPerWarp/16;++group) {
+                    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,
+                        nvcuda::wmma::row_major> v_fragment;
+                    nvcuda::wmma::load_matrix_sync(v_fragment,
+                        &key_value_tile[probability_offset]
+                            [value_d_base+group*16],TileStride);
+                    nvcuda::wmma::mma_sync(value[group],probability_fragment,
+                        v_fragment,value[group]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Reuse one 16 x 128 tile across warps only once, after the key scan.
+    // Every warp participates in the CTA barriers, even on an empty split.
+    for(int owner=0;owner<8;++owner) {
+        for(int part=0;part<ValueColumnsPerWarp/FinalColumns;++part) {
+            if(warp==owner) {
+                #pragma unroll
+                for(int group=0;group<FinalColumns/16;++group)
+                    nvcuda::wmma::store_matrix_sync(
+                        &final_tile[0][group*16],
+                        value[part*(FinalColumns/16)+group],
+                        FinalColumns,nvcuda::wmma::mem_row_major);
+            }
+            __syncthreads();
+            if(warp==owner) {
+                const int output_head=warp/WarpsPerHead;
+                const int m_base=((warp%WarpsPerHead)/2)*16;
+                const int d_base=(warp%2)*ValueColumnsPerWarp+part*FinalColumns;
+                for(int index=lane;index<16*FinalColumns;index+=32) {
+                    const int row=m_base+index/FinalColumns;
+                    const int dimension=d_base+index%FinalColumns;
+                    const int element=((query_base+row)*kQHeads+
+                        q_head_base+output_head)*kHeadDim+dimension;
+                    const float result=denominator[output_head][row]>0.0f?
+                        final_tile[index/FinalColumns]
+                            [index%FinalColumns]/
+                                denominator[output_head][row]:0.0f;
+                    if constexpr(SplitCount==2)
+                        split_output[static_cast<std::size_t>(split)*rows*
+                            kQHeads*kHeadDim+element]=result;
+                    else
+                        output[element]=__half_as_ushort(__float2half_rn(result));
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if constexpr(SplitCount==2) {
+        if(tid<HeadsPerCTA*BlockM) {
+            const int output_head=tid/BlockM;
+            const int row=tid%BlockM;
+            const std::size_t stat=(static_cast<std::size_t>(split)*rows*
+                kQHeads+(query_base+row)*kQHeads+q_head_base+
+                output_head)*2;
+            split_stats[stat]=current_max[output_head];
+            split_stats[stat+1]=denominator[output_head][row];
+        }
+    }
+}
+
+template<int SplitCount>
+__global__ void attention_wmma32_split_merge_kernel(
+    const float* split_output,const float* split_stats,
+    std::uint16_t* output,int rows) {
+    const int element=static_cast<int>(blockIdx.x)*blockDim.x+threadIdx.x;
+    const int elements=rows*kQHeads*kHeadDim;
+    if(element>=elements) return;
+    const int head_row=element/kHeadDim;
+    float maximum=-3.402823466e+38F;
+    #pragma unroll
+    for(int split=0;split<SplitCount;++split) {
+        const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+
+            head_row)*2;
+        if(split_stats[stat+1]>0.0f)
+            maximum=fmaxf(maximum,split_stats[stat]);
+    }
+    float numerator=0.0f,denominator=0.0f;
+    #pragma unroll
+    for(int split=0;split<SplitCount;++split) {
+        const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+
+            head_row)*2;
+        const float sum=split_stats[stat+1];
+        if(sum>0.0f) {
+            const float scale=sum*exp2f((split_stats[stat]-maximum)*
+                1.4426950408889634f);
+            numerator+=split_output[static_cast<std::size_t>(split)*elements+
+                element]*scale;
+            denominator+=scale;
+        }
+    }
+    const float value=numerator/denominator;
+    output[element]=__half_as_ushort(__float2half_rn(value));
 }
 
 // T72 diagnostic candidate. One CTA owns a query/KV-head pair and scans the
@@ -3971,6 +4548,7 @@ __global__ void attention_cached_gqa_six_splitk_merge_kernel(
 __global__ void sigmoid_mul_kernel(const std::uint16_t* gate,
                                    std::uint16_t* values,
                                    int count) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float g = __half2float(__ushort_as_half(gate[i]));
@@ -3982,6 +4560,7 @@ __global__ void silu_mul_kernel(const std::uint16_t* gate,
                                 const std::uint16_t* up,
                                 std::uint16_t* output,
                                 int count) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float g = __half2float(__ushort_as_half(gate[i]));
@@ -3993,6 +4572,7 @@ __global__ void residual_kernel(const std::uint16_t* left,
                                 const std::uint16_t* right,
                                 std::uint16_t* output,
                                 int count) {
+    EXL3_PDL_SMALL_PROLOGUE();
     const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float a = __half2float(__ushort_as_half(left[i]));
@@ -4476,7 +5056,7 @@ exl3_attention_gate_fusion_discriminator_for_test() {
                 attention_cached_gqa_triple_normalized_values_kernel<false><<<
                     value_blocks,value_threads>>>(values,selected_output,scores,1,
                         capacity-1,capacity,nullptr,0);
-                sigmoid_mul_kernel<<<static_cast<int>((output_count+255)/256),256>>>(
+                exl3_launch_small(sigmoid_mul_kernel,dim3(static_cast<int>((output_count+255)/256)),dim3(256),0,nullptr,
                     gate,selected_output,static_cast<int>(output_count));
             }
         };
@@ -4919,6 +5499,1488 @@ exl3_prefill_attention_shared_score_global_snapshot() noexcept {
 std::uint64_t exl3_fast_fused_flash_attention_calls_for_test() noexcept {
     return fast_fused_flash_attention_counter.load(std::memory_order_relaxed);
 }
+std::uint64_t exl3_fast_fused_flash_multirow_attention_calls_for_test() noexcept {
+    return fast_fused_flash_multirow_attention_counter.load(std::memory_order_relaxed);
+}
+
+void fast_wmma_attention_fixture(bool rows32,const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    int rows,int position,int capacity,const int* position_device,
+    int query_offset,cudaStream_t stream,bool padded) {
+    if(rows32 && padded)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16><<<
+            dim3((rows+31)/32,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                nullptr,nullptr);
+    else if(rows32)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim><<<
+            dim3((rows+31)/32,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                nullptr,nullptr);
+    else
+        attention_cached_gqa_six_wmma_prefill_kernel<<<
+            dim3((rows+15)/16,kKVHeads,kQHeads/(kKVHeads*2)),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset);
+    cuda_check(cudaGetLastError(),"WMMA attention fixture launch");
+}
+
+// Register-resident twin of attention_cached_gqa_six_wmma32_prefill_kernel
+// <*,SplitCount,32>. Each warp owns 16 query rows of one query head across the
+// whole key scan; Heads query heads of one KV head share every K/V tile. The
+// arithmetic is the reference's: 32-key tiles in the same order, the same
+// m16n8k16 HMMA k-sequence for S and for P x V, exact quad max, the same
+// exp2f/half rounding of P, an in-order FP32 tile sum and the same running
+// max/denominator/rescale updates. Only operand residency changes: the FP32
+// output accumulators stay in registers instead of shared memory round trips.
+constexpr int kRegAttnStride=kHeadDim+8;
+constexpr int kRegAttnPStride=32+8;
+
+template<int Heads,bool QGlobal=false>
+constexpr std::size_t reg_attn_shared_bytes() {
+    return ((QGlobal?0:static_cast<std::size_t>(Heads)*32*kRegAttnStride)+
+            2*32*kRegAttnStride+2*Heads*16*kRegAttnPStride)*sizeof(half);
+}
+
+bool wmma32_register_q_global() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_WMMA32_REGISTER_Q_GLOBAL");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+__device__ __forceinline__ void reg_attn_ldmatrix_x4(unsigned (&r)[4],const half* p) {
+    const unsigned address=static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 :"=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]):"r"(address));
+}
+
+__device__ __forceinline__ void reg_attn_ldmatrix_x4_trans(unsigned (&r)[4],const half* p) {
+    const unsigned address=static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 :"=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]):"r"(address));
+}
+
+__device__ __forceinline__ void reg_attn_mma(float (&c)[4],const unsigned (&a)[4],
+                                             unsigned b0,unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3])
+                 :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
+}
+
+// FP16-accumulating m16n8k16 (twice the FP32-accumulate tensor rate on
+// GeForce Blackwell); callers add each k-block partial into FP32.
+__device__ __forceinline__ void mma_h(unsigned (&c)[2],const unsigned (&a)[4],
+                                      unsigned b0,unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+                 :"+r"(c[0]),"+r"(c[1])
+                 :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
+}
+
+constexpr int kQkHalfGroup=4;
+__device__ __forceinline__ unsigned reg_attn_pack(half low,half high) {
+    return static_cast<unsigned>(__half_as_ushort(low))|
+        (static_cast<unsigned>(__half_as_ushort(high))<<16);
+}
+
+// SplitBlockM names the reference row block whose frontier defines the split
+// boundaries and capacity check (32 for WMMA32, 64 for the M64 twin). Extra
+// fully masked tiles are exact no-ops for rows of the smaller block.
+// QGlobal reads the identical m16n8k16 A fragments of Q straight from global
+// memory (zero for rows beyond the live block) instead of staging Q in shared
+// memory, halving the CTA footprint so two CTAs fit per SM.
+template<int SplitCount,int Heads,int SplitBlockM=32,bool QGlobal=false>
+__global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_prefill_kernel(
+    const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,std::uint16_t* output,int rows,
+    int position,int capacity,const int* position_device,int query_offset,
+    float* split_output,float* split_stats) {
+    constexpr int BlockM=32;
+    constexpr int BlockN=32;
+    constexpr int kHeadsPerKV=kQHeads/kKVHeads;
+    constexpr int kVectors=kHeadDim/8;
+    static_assert(kHeadsPerKV%Heads==0);
+    static_assert(SplitCount==1 || SplitCount==2 || SplitCount==4);
+    extern __shared__ __align__(16) unsigned char reg_attn_shared[];
+    half* q_s=reinterpret_cast<half*>(reg_attn_shared);
+    half* k_s=q_s+(QGlobal?0:Heads*BlockM*kRegAttnStride);
+    half* v_s=k_s+BlockN*kRegAttnStride;
+    half* p_s=v_s+BlockN*kRegAttnStride;
+
+    const int query_base=static_cast<int>(blockIdx.x)*BlockM;
+    const int kv_head=static_cast<int>(blockIdx.y);
+    const int head_group=static_cast<int>(blockIdx.z)/SplitCount;
+    const int split=static_cast<int>(blockIdx.z)%SplitCount;
+    const int tid=static_cast<int>(threadIdx.x);
+    const int warp=tid>>5;
+    const int lane=tid&31;
+    const int q_head_base=kv_head*kHeadsPerKV+head_group*Heads;
+    if(query_base>=rows || kv_head>=kKVHeads) return;
+    static_assert(SplitBlockM==32 || SplitBlockM==64);
+    const int active_rows=min(BlockM,rows-query_base);
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int maximum_count=base+query_base+active_rows;
+    const int split_base=(query_base/SplitBlockM)*SplitBlockM;
+    const int split_count=base+split_base+min(SplitBlockM,rows-split_base);
+    if(base+split_base+1<1 || split_count>capacity) return;
+    const int segment_tiles=(split_count+SplitCount*BlockN-1)/(SplitCount*BlockN);
+    const int first_begin=SplitCount==1?0:
+        min(split*segment_tiles*BlockN,split_count);
+    const int first_end=SplitCount==1?maximum_count:
+        min((split+1)*segment_tiles*BlockN,split_count);
+
+    if constexpr(!QGlobal)
+    for(int index=tid;index<Heads*BlockM*kVectors;index+=blockDim.x) {
+        const int head=index/(BlockM*kVectors);
+        const int rem=index%(BlockM*kVectors);
+        const int row=rem/kVectors;
+        const int dim=(rem%kVectors)*8;
+        uint4 bits=make_uint4(0,0,0,0);
+        if(row<active_rows)
+            bits=*reinterpret_cast<const uint4*>(q+
+                (static_cast<std::size_t>(query_base+row)*kQHeads+q_head_base+head)*
+                    kHeadDim+dim);
+        *reinterpret_cast<uint4*>(q_s+(head*BlockM+row)*kRegAttnStride+dim)=bits;
+    }
+
+    const int head_local=warp>>1;
+    const int m_base=(warp&1)*16;
+    const int g=lane>>2;
+    const int t=lane&3;
+    const int row0=m_base+g;
+    const int row1=row0+8;
+    const half* q_warp=q_s+(QGlobal?0:(head_local*BlockM+m_base)*kRegAttnStride);
+    const bool q_row0_live=row0<active_rows;
+    const bool q_row1_live=row1<active_rows;
+    const auto* q_global0=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(query_base+(q_row0_live?row0:0))*kQHeads+
+            q_head_base+head_local)*kHeadDim+2*t);
+    const auto* q_global1=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(query_base+(q_row1_live?row1:0))*kQHeads+
+            q_head_base+head_local)*kHeadDim+2*t);
+    half* p_warp=p_s+warp*16*kRegAttnPStride;
+    float acc[kHeadDim/8][4];
+    #pragma unroll
+    for(int n=0;n<kHeadDim/8;++n)
+        acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+    float running_max[2]={-3.402823466e+38F,-3.402823466e+38F};
+    float denominator[2]={0.0f,0.0f};
+
+    for(int first=first_begin;first<first_end;first+=BlockN) {
+        __syncthreads();
+        for(int index=tid;index<BlockN*kVectors;index+=blockDim.x) {
+            const int key_offset=index/kVectors;
+            const int dim=(index%kVectors)*8;
+            const int key=first+key_offset;
+            uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
+            if(key<first_end && key<capacity) {
+                const std::size_t offset=(static_cast<std::size_t>(key)*kKVHeads+
+                    kv_head)*kHeadDim+dim;
+                key_bits=*reinterpret_cast<const uint4*>(k_cache+offset);
+                value_bits=*reinterpret_cast<const uint4*>(v_cache+offset);
+            }
+            *reinterpret_cast<uint4*>(k_s+key_offset*kRegAttnStride+dim)=key_bits;
+            *reinterpret_cast<uint4*>(v_s+key_offset*kRegAttnStride+dim)=value_bits;
+        }
+        __syncthreads();
+
+        float s[4][4];
+        #pragma unroll
+        for(int j=0;j<4;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.0f;
+        #pragma unroll
+        for(int kk=0;kk<kHeadDim;kk+=16) {
+            unsigned a[4];
+            if constexpr(QGlobal) {
+                a[0]=q_row0_live?q_global0[kk/2]:0u;
+                a[1]=q_row1_live?q_global1[kk/2]:0u;
+                a[2]=q_row0_live?q_global0[kk/2+4]:0u;
+                a[3]=q_row1_live?q_global1[kk/2+4]:0u;
+            } else
+            reg_attn_ldmatrix_x4(a,q_warp+(lane&15)*kRegAttnStride+kk+(lane>>4)*8);
+            #pragma unroll
+            for(int pair=0;pair<2;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4(b,k_s+(pair*16+(lane&7)+((lane>>4)<<3))*
+                    kRegAttnStride+kk+((lane>>3)&1)*8);
+                reg_attn_mma(s[2*pair],a,b[0],b[1]);
+                reg_attn_mma(s[2*pair+1],a,b[2],b[3]);
+            }
+        }
+
+        const int in_range=first_end-first;
+        const int causal=base+query_base-first;
+        float tile_max[2]={-3.402823466e+38F,-3.402823466e+38F};
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const int row=e<2?row0:row1;
+                const int offset=8*j+2*t+(e&1);
+                if(row<active_rows && offset<in_range && offset<=causal+row)
+                    tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]*0.0625f);
+            }
+        }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],1));
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],2));
+        }
+        float old_scale[2];
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            const float next_max=fmaxf(running_max[i],tile_max[i]);
+            old_scale[i]=denominator[i]==0.0f?0.0f:
+                exp2f((running_max[i]-next_max)*1.4426950408889634f);
+            running_max[i]=next_max;
+        }
+        half p[4][4];
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const int row=e<2?row0:row1;
+                const int offset=8*j+2*t+(e&1);
+                const bool valid=row<active_rows && offset<in_range &&
+                    offset<=causal+row;
+                const float score=s[j][e]*0.0625f;
+                p[j][e]=__float2half(valid?exp2f((score-running_max[e>>1])*
+                    1.4426950408889634f):0.0f);
+            }
+            *reinterpret_cast<unsigned*>(p_warp+g*kRegAttnPStride+8*j+2*t)=
+                reg_attn_pack(p[j][0],p[j][1]);
+            *reinterpret_cast<unsigned*>(p_warp+(g+8)*kRegAttnPStride+8*j+2*t)=
+                reg_attn_pack(p[j][2],p[j][3]);
+        }
+        __syncwarp();
+        float tile_sum=0.0f;
+        if(lane<16) {
+            const int extent=min(BlockN,in_range);
+            for(int offset=0;offset<extent;++offset)
+                tile_sum+=__half2float(p_warp[lane*kRegAttnPStride+offset]);
+        }
+        const float sums[2]={__shfl_sync(0xffffffffU,tile_sum,g),
+                             __shfl_sync(0xffffffffU,tile_sum,g+8)};
+        #pragma unroll
+        for(int i=0;i<2;++i)
+            denominator[i]=denominator[i]*old_scale[i]+sums[i];
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n) {
+            acc[n][0]*=old_scale[0];
+            acc[n][1]*=old_scale[0];
+            acc[n][2]*=old_scale[1];
+            acc[n][3]*=old_scale[1];
+        }
+        #pragma unroll
+        for(int kk=0;kk<2;++kk) {
+            const unsigned a[4]={reg_attn_pack(p[2*kk][0],p[2*kk][1]),
+                                 reg_attn_pack(p[2*kk][2],p[2*kk][3]),
+                                 reg_attn_pack(p[2*kk+1][0],p[2*kk+1][1]),
+                                 reg_attn_pack(p[2*kk+1][2],p[2*kk+1][3])};
+            #pragma unroll
+            for(int pair=0;pair<kHeadDim/16;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4_trans(b,v_s+(16*kk+(lane&7)+((lane>>3)&1)*8)*
+                    kRegAttnStride+pair*16+(lane>>4)*8);
+                reg_attn_mma(acc[2*pair],a,b[0],b[1]);
+                reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+            }
+        }
+        __syncwarp();
+    }
+
+    const int q_head=q_head_base+head_local;
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+        const int row=i==0?row0:row1;
+        if(row>=active_rows) continue;
+        const std::size_t row_base=(static_cast<std::size_t>(query_base+row)*kQHeads+
+            q_head)*kHeadDim;
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n) {
+            const int dim=8*n+2*t;
+            const float first_value=denominator[i]>0.0f?
+                acc[n][2*i]/denominator[i]:0.0f;
+            const float second_value=denominator[i]>0.0f?
+                acc[n][2*i+1]/denominator[i]:0.0f;
+            if constexpr(SplitCount>1) {
+                float* destination=split_output+static_cast<std::size_t>(split)*rows*
+                    kQHeads*kHeadDim+row_base+dim;
+                destination[0]=first_value;
+                destination[1]=second_value;
+            } else {
+                output[row_base+dim]=__half_as_ushort(__float2half_rn(first_value));
+                output[row_base+dim+1]=__half_as_ushort(__float2half_rn(second_value));
+            }
+        }
+        if constexpr(SplitCount>1) {
+            if(t==0) {
+                const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+
+                    (query_base+row)*kQHeads+q_head)*2;
+                split_stats[stat]=running_max[i];
+                split_stats[stat+1]=denominator[i];
+            }
+        }
+    }
+}
+
+
+// FA2-style GQA-6 prefill attention (NINFER_EXL3_FA2_PREFILL, default 1; 0 =
+// the register WMMA32 route). Eight warps cover two query heads x 64 rows and
+// share every 32-key K/V tile; Q A-fragments stay in registers; K/V tiles are
+// double buffered with cp.async; causal masking only on diagonal tiles; row
+// sums come from the register P values. Chunks whose causal extent reaches
+// 2048 keys split the key range four ways (longest row blocks first) and merge
+// through attention_wmma32_split_merge_kernel. Numerical profile: FP16 Q/K/V
+// and P, FP32 scores/accumulators; differs from the WMMA32 route only in FP32
+// summation order.
+namespace fa2_prefill {
+constexpr int kStride=kHeadDim+8;
+constexpr int BM=64, BN=32;
+constexpr int kStage=2*BN*kStride; // halfs (K then V)
+constexpr std::size_t smem_bytes(){ return 2u*kStage*sizeof(half); }
+__device__ __forceinline__ void cp16(void* dst,const void* src,bool valid){
+  const unsigned d=static_cast<unsigned>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"::"r"(d),"l"(src),"r"(valid?16:0));
+}
+__device__ __forceinline__ void commit(){ asm volatile("cp.async.commit_group;\n"); }
+template<int N> __device__ __forceinline__ void wait(){ asm volatile("cp.async.wait_group %0;\n"::"n"(N)); }
+template<int S>
+__global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,std::uint16_t* output,int rows,int base,int capacity,
+    float* split_output,float* split_stats,int history_end=0,
+    const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,int ring_mask=-1){
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  half* sm=reinterpret_cast<half*>(smem_raw);
+  const int query_base=(static_cast<int>(gridDim.x)-1-static_cast<int>(blockIdx.x))*BM;
+  const int kv_head=blockIdx.y;
+  const int head_group=blockIdx.z/S, split=blockIdx.z%S;
+  const int tid=threadIdx.x, warp=tid>>5, lane=tid&31;
+  const int head_local=warp>>2, m_base=(warp&3)*16;
+  const int g=lane>>2, t=lane&3;
+  const int row0=m_base+g, row1=row0+8;
+  const int q_head=kv_head*(kQHeads/kKVHeads)+head_group*2+head_local;
+  const int active_rows=min(BM,rows-query_base);
+  if(active_rows<=0) return;
+  const int maximum_count=min(base+query_base+active_rows,capacity);
+  // L0 OSCAR: key tiles of [kSink, history_end) are served by the INT2
+  // history kernel; virtual tile v maps to the sink tiles, then the tiles past
+  // the history. Identity when history_end <= kSink.
+  const int sink_tiles=ninfer::exl3::l0_oscar::kSink/BN;
+  const int skip=history_end>ninfer::exl3::l0_oscar::kSink?
+      (history_end-ninfer::exl3::l0_oscar::kSink)/BN:0;
+  const int tiles=(maximum_count+BN-1)/BN-skip;
+  const auto real_tile=[&](int tile){ return tile<sink_tiles?tile:tile+skip; };
+  const int per=(tiles+S-1)/S;
+  const int t_begin=split*per, t_end=min(tiles,t_begin+per);
+  unsigned qa[kHeadDim/16][4];
+  {
+    const bool l0=row0<active_rows, l1=row1<active_rows;
+    const unsigned* q0=reinterpret_cast<const unsigned*>(q+(static_cast<std::size_t>(query_base+(l0?row0:0))*kQHeads+q_head)*kHeadDim+2*t);
+    const unsigned* q1=reinterpret_cast<const unsigned*>(q+(static_cast<std::size_t>(query_base+(l1?row1:0))*kQHeads+q_head)*kHeadDim+2*t);
+    #pragma unroll
+    for(int kk=0;kk<kHeadDim/16;++kk){
+      qa[kk][0]=l0?q0[kk*8]:0u; qa[kk][1]=l1?q1[kk*8]:0u;
+      qa[kk][2]=l0?q0[kk*8+4]:0u; qa[kk][3]=l1?q1[kk*8+4]:0u;
+    }
+  }
+  float acc[kHeadDim/8][4];
+  #pragma unroll
+  for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
+  float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
+  auto load=[&](int tile,int stage){
+    half* ks=sm+stage*kStage; half* vs=ks+BN*kStride;
+    const int first=real_tile(tile)*BN;
+    #pragma unroll
+    for(int i=0;i<(BN*kHeadDim/8)/256;++i){
+      const int idx=tid+i*256; const int key_off=idx/(kHeadDim/8); const int dim=(idx%(kHeadDim/8))*8;
+      const int key=first+key_off; const bool valid=key<maximum_count;
+      const int k_index=valid?key:0;
+      const bool in_sink=sink_k && k_index<ninfer::exl3::l0_oscar::kSink;
+      const std::size_t off=(ninfer::exl3::l0_oscar::window_row(k_index,sink_k!=nullptr,ring_mask)*
+          kKVHeads+kv_head)*kHeadDim+dim;
+      cp16(ks+key_off*kStride+dim,(in_sink?sink_k:k_cache)+off,valid);
+      cp16(vs+key_off*kStride+dim,(in_sink?sink_v:v_cache)+off,valid);
+    }
+    commit();
+  };
+  if(t_begin<t_end) load(t_begin,0);
+  const int warp_min_limit=base+query_base+m_base;
+  const int warp_max_limit=base+query_base+m_base+15;
+  for(int tile=t_begin;tile<t_end;++tile){
+    const int stage=(tile-t_begin)&1;
+    if(tile+1<t_end){ load(tile+1,stage^1); wait<1>(); } else wait<0>();
+    __syncthreads();
+    const int first=real_tile(tile)*BN;
+    const half* ks=sm+stage*kStage; const half* vs=ks+BN*kStride;
+    const bool warp_live=(m_base<active_rows) && first<=warp_max_limit;
+    if(warp_live){
+      float s[BN/8][4];
+      #pragma unroll
+      for(int j=0;j<BN/8;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.f;
+      // Scores: kQkHalfGroup consecutive 16-dimension k-steps accumulate in
+      // FP16 (the double-rate tensor path), each partial is added in FP32.
+      #pragma unroll
+      for(int kk0=0;kk0<kHeadDim/16;kk0+=kQkHalfGroup){
+        unsigned hs[BN/8][2];
+        #pragma unroll
+        for(int j=0;j<BN/8;++j) hs[j][0]=hs[j][1]=0u;
+        #pragma unroll
+        for(int kk=kk0;kk<kk0+kQkHalfGroup;++kk){
+          #pragma unroll
+          for(int pair=0;pair<BN/16;++pair){
+            unsigned b[4];
+            reg_attn_ldmatrix_x4(b,ks+(pair*16+(lane&7)+((lane>>4)<<3))*kStride+kk*16+((lane>>3)&1)*8);
+            mma_h(hs[2*pair],qa[kk],b[0],b[1]);
+            mma_h(hs[2*pair+1],qa[kk],b[2],b[3]);
+          }
+        }
+        #pragma unroll
+        for(int j=0;j<BN/8;++j){
+          const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hs[j][0]));
+          const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hs[j][1]));
+          s[j][0]+=lo.x; s[j][1]+=lo.y; s[j][2]+=hi.x; s[j][3]+=hi.y;
+        }
+      }
+      const bool need_mask=first+BN-1>warp_min_limit;
+      float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
+      #pragma unroll
+      for(int j=0;j<BN/8;++j)
+        #pragma unroll
+        for(int e=0;e<4;++e){
+          const int row=e<2?row0:row1; const int key=first+8*j+2*t+(e&1);
+          float sc=s[j][e]*0.0625f;
+          if(need_mask && (key>base+query_base+row || row>=active_rows)) sc=-3.402823466e+38F;
+          s[j][e]=sc; tmax[e>>1]=fmaxf(tmax[e>>1],sc);
+        }
+      #pragma unroll
+      for(int i=0;i<2;++i){ tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],1)); tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],2)); }
+      float scale[2];
+      #pragma unroll
+      for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:exp2f((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+      unsigned pp[BN/8][2]; float rs[2]={0.f,0.f};
+      #pragma unroll
+      for(int j=0;j<BN/8;++j){
+        half p[4];
+        #pragma unroll
+        for(int e=0;e<4;++e){
+          const float x=s[j][e];
+          p[e]=__float2half(x==-3.402823466e+38F?0.f:exp2f((x-run_max[e>>1])*1.4426950408889634f));
+          rs[e>>1]+=__half2float(p[e]);
+        }
+        pp[j][0]=reg_attn_pack(p[0],p[1]); pp[j][1]=reg_attn_pack(p[2],p[3]);
+      }
+      #pragma unroll
+      for(int i=0;i<2;++i){ rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],1); rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],2); den[i]=den[i]*scale[i]+rs[i]; }
+      if(!__all_sync(0xffffffffu,scale[0]==1.f && scale[1]==1.f)){
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n){ acc[n][0]*=scale[0]; acc[n][1]*=scale[0]; acc[n][2]*=scale[1]; acc[n][3]*=scale[1]; }
+      }
+      // PV: each key tile accumulates in FP16 (double-rate tensor path) and
+      // is added into the FP32 accumulator.
+      unsigned hacc[kHeadDim/8][2];
+      #pragma unroll
+      for(int n=0;n<kHeadDim/8;++n) hacc[n][0]=hacc[n][1]=0u;
+      #pragma unroll
+      for(int kk=0;kk<BN/16;++kk){
+        const unsigned a[4]={pp[2*kk][0],pp[2*kk][1],pp[2*kk+1][0],pp[2*kk+1][1]};
+        #pragma unroll
+        for(int pair=0;pair<kHeadDim/16;++pair){
+          unsigned b[4];
+          reg_attn_ldmatrix_x4_trans(b,vs+(16*kk+(lane&7)+((lane>>3)&1)*8)*kStride+pair*16+(lane>>4)*8);
+          mma_h(hacc[2*pair],a,b[0],b[1]); mma_h(hacc[2*pair+1],a,b[2],b[3]);
+        }
+      }
+      #pragma unroll
+      for(int n=0;n<kHeadDim/8;++n){
+        const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hacc[n][0]));
+        const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hacc[n][1]));
+        acc[n][0]+=lo.x; acc[n][1]+=lo.y; acc[n][2]+=hi.x; acc[n][3]+=hi.y;
+      }
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for(int i=0;i<2;++i){
+    const int row=i==0?row0:row1;
+    if(row>=active_rows) continue;
+    const std::size_t row_base=(static_cast<std::size_t>(query_base+row)*kQHeads+q_head)*kHeadDim;
+    const float inv=den[i]>0.f?1.f/den[i]:0.f;
+    #pragma unroll
+    for(int n=0;n<kHeadDim/8;++n){
+      const int dim=8*n+2*t;
+      const float a0=acc[n][2*i]*inv, a1=acc[n][2*i+1]*inv;
+      if constexpr(S>1){
+        float2* d=reinterpret_cast<float2*>(split_output+static_cast<std::size_t>(split)*rows*kQHeads*kHeadDim+row_base+dim);
+        *d=make_float2(a0,a1);
+      } else {
+        *reinterpret_cast<unsigned*>(output+row_base+dim)=reg_attn_pack(__float2half_rn(a0),__float2half_rn(a1));
+      }
+    }
+    if constexpr(S>1) if(t==0){
+      const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+(query_base+row)*kQHeads+q_head)*2;
+      split_stats[stat]=run_max[i]; split_stats[stat+1]=den[i];
+    }
+  }
+}
+} // namespace fa2_prefill
+
+bool exl3_fa2_prefill_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_FA2_PREFILL");
+        if(!value || std::strcmp(value,"1")==0) return true;
+        if(std::strcmp(value,"0")==0) return false;
+        throw std::invalid_argument("NINFER_EXL3_FA2_PREFILL must be 0 or 1");
+    }();
+    return enabled;
+}
+
+template<int S>
+static void launch_fa2_prefill_variant(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    float* split_output,float* split_stats,cudaStream_t stream,int history_end=0,
+    bool merge=true,const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,
+    int ring_mask=-1) {
+    constexpr std::size_t bytes=fa2_prefill::smem_bytes();
+    static const bool configured=[] {
+        cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
+            "configure FA2 prefill shared memory");
+        return true;
+    }();
+    (void)configured;
+    fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S><<<
+        dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,kKVHeads,(kQHeads/kKVHeads/2)*S),256,
+        bytes,stream>>>(q,k,v,output,rows,position,capacity,split_output,split_stats,
+            history_end,sink_k,sink_v,ring_mask);
+    cuda_check(cudaGetLastError(),"launch FA2 prefill attention");
+    if(!merge) return;
+    if constexpr(S>1) {
+        attention_wmma32_split_merge_kernel<S><<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            split_output,split_stats,output,rows);
+        cuda_check(cudaGetLastError(),"launch FA2 prefill split merge");
+    }
+}
+
+static void launch_fa2_prefill(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    float* split_output,float* split_stats,cudaStream_t stream) {
+    if(position+rows>=2048)
+        launch_fa2_prefill_variant<4>(q,k,v,output,rows,position,capacity,split_output,split_stats,stream);
+    else
+        launch_fa2_prefill_variant<1>(q,k,v,output,rows,position,capacity,split_output,split_stats,stream);
+}
+
+template<int SplitCount,int Heads,int SplitBlockM=32,bool QGlobal=false>
+void launch_wmma32_register_prefill_variant(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    const int* position_device,int query_offset,float* split_output,float* split_stats,
+    cudaStream_t stream) {
+    constexpr std::size_t bytes=reg_attn_shared_bytes<Heads,QGlobal>();
+    static const bool configured=[] {
+        cuda_check(cudaFuncSetAttribute(
+            attention_gqa_six_wmma32_register_prefill_kernel<SplitCount,Heads,SplitBlockM,QGlobal>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
+            "configure register WMMA32 prefill shared memory");
+        return true;
+    }();
+    (void)configured;
+    attention_gqa_six_wmma32_register_prefill_kernel<SplitCount,Heads,SplitBlockM,QGlobal><<<
+        dim3((rows+31)/32,kKVHeads,(kQHeads/kKVHeads/Heads)*SplitCount),64*Heads,
+        bytes,stream>>>(q,k,v,output,rows,position,capacity,position_device,
+            query_offset,split_output,split_stats);
+}
+
+template<int SplitCount,int Heads,int SplitBlockM=32>
+void launch_wmma32_register_prefill(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    const int* position_device,int query_offset,float* split_output,float* split_stats,
+    cudaStream_t stream) {
+    if(wmma32_register_q_global())
+        launch_wmma32_register_prefill_variant<SplitCount,Heads,SplitBlockM,true>(q,k,v,
+            output,rows,position,capacity,position_device,query_offset,split_output,
+            split_stats,stream);
+    else
+        launch_wmma32_register_prefill_variant<SplitCount,Heads,SplitBlockM,false>(q,k,v,
+            output,rows,position,capacity,position_device,query_offset,split_output,
+            split_stats,stream);
+}
+
+int wmma32_register_heads() {
+    static const int heads=[] {
+        const char* value=std::getenv("NINFER_EXL3_WMMA32_REGISTER");
+        if(!value) return 2;
+        const int parsed=std::atoi(value);
+        if(parsed!=0 && parsed!=1 && parsed!=2 && parsed!=3)
+            throw std::invalid_argument("NINFER_EXL3_WMMA32_REGISTER must be 0, 1, 2 or 3");
+        return parsed;
+    }();
+    return heads;
+}
+
+// Returns false when disabled; otherwise launches the split partials (or the
+// final output for SplitCount 1).
+template<int SplitCount,int SplitBlockM=32>
+bool launch_wmma32_register_selected(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
+    const int* position_device,int query_offset,float* split_output,float* split_stats,
+    cudaStream_t stream) {
+    switch(wmma32_register_heads()) {
+    case 1: launch_wmma32_register_prefill<SplitCount,1,SplitBlockM>(q,k,v,output,rows,position,capacity,
+        position_device,query_offset,split_output,split_stats,stream); return true;
+    case 2: launch_wmma32_register_prefill<SplitCount,2,SplitBlockM>(q,k,v,output,rows,position,capacity,
+        position_device,query_offset,split_output,split_stats,stream); return true;
+    case 3: launch_wmma32_register_prefill<SplitCount,3,SplitBlockM>(q,k,v,output,rows,position,capacity,
+        position_device,query_offset,split_output,split_stats,stream); return true;
+    default: return false;
+    }
+}
+
+void fast_wmma32_register_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,int split_count,int heads,
+    cudaStream_t stream,int split_block_m) {
+    if(heads<1 || heads>3 || (split_count!=1 && split_count!=2 && split_count!=4) ||
+       (split_block_m!=32 && split_block_m!=64))
+        throw std::invalid_argument("register WMMA32 fixture geometry");
+    auto run=[&](auto split_tag) {
+        constexpr int S=decltype(split_tag)::value;
+        auto launch=[&](auto heads_tag,auto block_tag) {
+            launch_wmma32_register_prefill<S,decltype(heads_tag)::value,
+                decltype(block_tag)::value>(q,k,v,output,rows,position,capacity,
+                position_device,query_offset,split_output,split_stats,stream);
+        };
+        auto by_block=[&](auto heads_tag) {
+            if(split_block_m==64) launch(heads_tag,std::integral_constant<int,64>{});
+            else launch(heads_tag,std::integral_constant<int,32>{});
+        };
+        if(heads==1) by_block(std::integral_constant<int,1>{});
+        else if(heads==2) by_block(std::integral_constant<int,2>{});
+        else by_block(std::integral_constant<int,3>{});
+        cuda_check(cudaGetLastError(),"register WMMA32 fixture launch");
+        if constexpr(S>1) {
+            attention_wmma32_split_merge_kernel<S><<<
+                (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                    split_output,split_stats,output,rows);
+            cuda_check(cudaGetLastError(),"register WMMA32 fixture merge");
+        }
+    };
+    if(split_count==1) run(std::integral_constant<int,1>{});
+    else if(split_count==2) run(std::integral_constant<int,2>{});
+    else run(std::integral_constant<int,4>{});
+}
+
+void fast_wmma_split2_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,cudaStream_t stream,bool padded) {
+    if(padded)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,2><<<
+            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                split_output,split_stats);
+    else
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,2><<<
+            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                split_output,split_stats);
+    cuda_check(cudaGetLastError(),"WMMA split2 attention fixture launch");
+    attention_wmma32_split_merge_kernel<2><<<
+        (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            split_output,split_stats,output,rows);
+    cuda_check(cudaGetLastError(),"WMMA split2 attention fixture merge");
+}
+
+void fast_wmma_split4_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,cudaStream_t stream,bool padded) {
+    if(padded)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,4><<<
+            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                split_output,split_stats);
+    else
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,4><<<
+            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,query_offset,
+                split_output,split_stats);
+    cuda_check(cudaGetLastError(),"WMMA split4 attention fixture launch");
+    attention_wmma32_split_merge_kernel<4><<<
+        (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            split_output,split_stats,output,rows);
+    cuda_check(cudaGetLastError(),"WMMA split4 attention fixture merge");
+}
+
+void fast_wmma64_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,std::uint16_t* output,
+    float* split_output,float* split_stats,int rows,int position,int capacity,
+    const int* position_device,int query_offset,cudaStream_t stream,
+    bool padded,bool split2,bool register_owned,bool shared_heads,
+    bool keys64) {
+    if(keys64 && (!register_owned || shared_heads))
+        throw std::invalid_argument("WMMA64 keys64 fixture requires one-head register route");
+    // Partial blocks retain the repaired WMMA32 path; no Q fragment may read
+    // beyond the represented query span.
+    if(rows%64) {
+        if(split2)
+            fast_wmma_split2_attention_fixture(q,k,v,output,split_output,
+                split_stats,rows,position,capacity,position_device,
+                query_offset,stream,padded);
+        else
+            fast_wmma_attention_fixture(true,q,k,v,output,rows,position,
+                capacity,position_device,query_offset,stream,padded);
+        return;
+    }
+    if(split2) {
+        if(shared_heads && padded)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim+16,2,2><<<
+                dim3(rows/32,kKVHeads,2*kQHeads/(kKVHeads*2)),
+                256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(shared_heads)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim,2,2><<<
+                dim3(rows/32,kKVHeads,2*kQHeads/(kKVHeads*2)),
+                256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(keys64 && padded)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim+16,2,1,64><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(keys64)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim,2,1,64><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(register_owned && padded)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim+16,2><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(register_owned)
+            attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                kHeadDim,2><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else if(padded)
+            attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,2,64><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        else
+            attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,2,64><<<
+                dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),256,0,stream>>>(
+                q,k,v,output,rows,position,capacity,position_device,
+                query_offset,split_output,split_stats);
+        cuda_check(cudaGetLastError(),"WMMA64 split2 fixture partials");
+        attention_wmma32_split_merge_kernel<2><<<
+            (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            split_output,split_stats,output,rows);
+    } else if(shared_heads && padded)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim+16,1,2><<<
+            dim3(rows/32,kKVHeads,kQHeads/(kKVHeads*2)),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(shared_heads)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim,1,2><<<
+            dim3(rows/32,kKVHeads,kQHeads/(kKVHeads*2)),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(keys64 && padded)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim+16,1,1,64><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(keys64)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim,1,1,64><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(register_owned && padded)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim+16,1><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(register_owned)
+        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+            kHeadDim,1><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else if(padded)
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,1,64><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    else
+        attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,1,64><<<
+            dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+            q,k,v,output,rows,position,capacity,position_device,
+            query_offset,nullptr,nullptr);
+    cuda_check(cudaGetLastError(),"WMMA64 attention fixture launch");
+}
+
+// Tensor-core flash-decode for FP16-KV verifier/decode rows (numerics policy
+// candidate; quality-gated). One CTA owns one KV head and one 256-key segment
+// for up to eight query rows; the 6 sibling query heads of each row form 48
+// query vectors, handled as three m16 tiles by three warps. QK^T and P x V use
+// m16n8k16 HMMA with FP32 accumulation over 32-key chunks with an FP32 online
+// softmax (natural-exponent domain, P rounded to FP16 for P x V). Results are
+// written into the fused-flash scratch slot layout (unnormalized values plus
+// segment max and denominator), so the existing segment merge is reused.
+constexpr int kVerifyMmaChunk=32;
+constexpr int kVerifyMmaStride=kHeadDim+8;
+
+// Per-head twin of attention_cached_gqa_six_fused_flash_merge_kernel: one CTA
+// per (row, KV head, query head) instead of one per (row, KV head). Every
+// output performs the identical ordered max, scale, denominator and numerator
+// chain, so the result is bitwise equal; only the parallel extent changes.
+constexpr int kMergeGroups=4;  // segment groups per (row, query head)
+__global__ void __launch_bounds__(kMergeGroups*kHeadDim) attention_fused_flash_merge_heads_kernel(
+    const float* workspace,std::uint16_t* output,int rows,int segments,
+    int position,int capacity,int keys,const int* position_device,
+    int query_offset,const std::uint16_t* self_q=nullptr,
+    const std::uint16_t* self_k=nullptr,const std::uint16_t* self_v=nullptr,
+    const float* history_slot=nullptr,const std::uint16_t* sink_k=nullptr,
+    const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
+    EXL3_PDL_SMALL_PROLOGUE();
+    constexpr int H=kFastFusedFlashHeads;
+    __shared__ float group_max[kMergeGroups];
+    __shared__ float group_denominator[kMergeGroups];
+    __shared__ float group_numerator[kMergeGroups][kHeadDim];
+    __shared__ float self_partial[kMergeGroups][kHeadDim/32];
+    const int block=static_cast<int>(blockIdx.x);
+    const int head=block%H;
+    const int query=block/(H*kKVHeads);
+    const int kv_head=(block/H)%kKVHeads;
+    const int tid=static_cast<int>(threadIdx.x)%kHeadDim;
+    const int group=static_cast<int>(threadIdx.x)/kHeadDim;
+    if(query>=rows) return;
+    const int base=(position_device?*position_device:position)+query_offset;
+    const int count=base+query+1;
+    std::uint16_t* out=output+(query*kQHeads+kv_head*H+head)*kHeadDim+tid;
+    if(count<1 || count>capacity) { if(group==0) *out=0; return; }
+    const int l0_end=history_slot?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    const int live_segments=l0_end>ninfer::exl3::l0_oscar::kSink?
+        min(segments,1+(count-l0_end+keys-1)/keys):min(segments,(count+keys-1)/keys);
+    const float* slots=workspace+
+        (static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments*kFastFusedFlashStride;
+    // Group g owns segments g, g+G, ...; the maximum is exact in any order.
+    float local_max=-3.402823466e+38F;
+    for(int segment=group;segment<live_segments;segment+=kMergeGroups)
+        local_max=fmaxf(local_max,slots[segment*kFastFusedFlashStride+kFastFusedFlashValues+head]);
+    // Self term (verifier MMA route): the segments hold only the keys before
+    // the row's logical position; its own key, at physical slot count - 1, is
+    // the final term, so chain and sibling rows share one arithmetic.
+    // L0 OSCAR history: one already-merged, un-rotated slot (l0_oscar.cuh).
+    const float* history=history_slot?history_slot+
+        (static_cast<std::size_t>(query)*kKVHeads+kv_head)*kFastFusedFlashStride:nullptr;
+    const bool history_live=history && history[kFastFusedFlashValues+H+head]>0.0f;
+    float self_score=-INFINITY,self_value=0.0f;
+    if(self_q) {
+        const bool in_sink=sink_k && count-1<ninfer::exl3::l0_oscar::kSink;
+        const std::size_t kv=ninfer::exl3::l0_oscar::window_row(count-1,sink_k!=nullptr,ring_mask)*
+            kKVHeads*kHeadDim+kv_head*kHeadDim+tid;
+        const std::uint16_t* key_plane=in_sink?sink_k:self_k;
+        const std::uint16_t* value_plane=in_sink?sink_v:self_v;
+        float dot=__half2float(__ushort_as_half(
+            self_q[(query*kQHeads+kv_head*H+head)*kHeadDim+tid]))*
+            __half2float(__ushort_as_half(key_plane[kv]));
+        for(int offset=16;offset>0;offset>>=1)
+            dot+=__shfl_xor_sync(0xffffffffu,dot,offset);
+        if((tid&31)==0)self_partial[group][tid>>5]=dot;
+        self_value=__half2float(__ushort_as_half(value_plane[kv]));
+    }
+    if(tid==0) group_max[group]=local_max;
+    __syncthreads();
+    float global_max=group_max[0];
+    #pragma unroll
+    for(int g=1;g<kMergeGroups;++g) global_max=fmaxf(global_max,group_max[g]);
+    if(history_live) global_max=fmaxf(global_max,history[kFastFusedFlashValues+head]);
+    if(self_q) {
+        float dot=0.0f;
+        #pragma unroll
+        for(int w=0;w<kHeadDim/32;++w)dot+=self_partial[group][w];
+        self_score=dot*0.0625f;
+        global_max=fmaxf(global_max,self_score);
+    }
+    // An empty segment (no unmasked key) contributes nothing; its value plane
+    // may be unwritten (L0 OSCAR history segments), so it is selected away.
+    float denominator=0.0f,numerator=0.0f;
+    #pragma unroll 4
+    for(int segment=group;segment<live_segments;segment+=kMergeGroups) {
+        const float* slot=slots+segment*kFastFusedFlashStride;
+        const float weight=slot[kFastFusedFlashValues+H+head];
+        const float maximum=slot[kFastFusedFlashValues+head];
+        const float value=slot[head*kHeadDim+tid];
+        const bool live=weight!=0.0f;
+        const float scale=live?expf(maximum-global_max):0.0f;
+        denominator=live?fmaf(weight,scale,denominator):denominator;
+        numerator=live?fmaf(value,scale,numerator):numerator;
+    }
+    if(tid==0) group_denominator[group]=denominator;
+    group_numerator[group][tid]=numerator;
+    __syncthreads();
+    if(group!=0) return;
+    denominator=group_denominator[0];
+    numerator=group_numerator[0][tid];
+    #pragma unroll
+    for(int g=1;g<kMergeGroups;++g) {
+        denominator+=group_denominator[g];
+        numerator+=group_numerator[g][tid];
+    }
+    if(history_live) {
+        const float scale=expf(history[kFastFusedFlashValues+head]-global_max);
+        denominator+=history[kFastFusedFlashValues+H+head]*scale;
+        numerator+=history[head*kHeadDim+tid]*scale;
+    }
+    if(self_q) {
+        const float weight=expf(self_score-global_max);
+        denominator+=weight;
+        numerator+=weight*self_value;
+    }
+    *out=__half_as_ushort(__float2half_rn(numerator/denominator));
+}
+
+bool fused_flash_merge_heads_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_FLASH_MERGE_HEADS");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+void launch_fused_flash_merge(const float* workspace,std::uint16_t* output,int rows,
+    int segments,int position,int capacity,int keys,const int* position_device,
+    cudaStream_t stream,const std::uint16_t* self_q=nullptr,
+    const std::uint16_t* self_k=nullptr,const std::uint16_t* self_v=nullptr,
+    const float* history_slot=nullptr,const std::uint16_t* sink_k=nullptr,
+    const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
+    if((self_q || history_slot) && !fused_flash_merge_heads_enabled())
+        throw std::invalid_argument("verifier self-term merge requires the per-head merge");
+    if(fused_flash_merge_heads_enabled())
+        exl3_launch_small(attention_fused_flash_merge_heads_kernel,dim3(rows*kKVHeads*kFastFusedFlashHeads),dim3(kMergeGroups*kHeadDim),0,stream,workspace,output,rows,
+                segments,position,capacity,keys,position_device,0,self_q,self_k,self_v,
+                history_slot,sink_k,sink_v,ring_mask);
+    else
+        attention_cached_gqa_six_fused_flash_merge_kernel<<<
+            rows*kKVHeads,256,0,stream>>>(workspace,output,rows,segments,position,
+                capacity,keys,position_device,0);
+}
+
+template<int kVerifyMmaKeys>
+__global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
+    const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,float* workspace,int rows,int position,
+    int capacity,int segments,const int* position_device,int query_offset,int l0_history=0,
+    const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
+    EXL3_PDL_SMALL_PROLOGUE();
+    constexpr int H=kFastFusedFlashHeads;
+    constexpr int kVectors=kHeadDim/8;
+    // A sibling row (sibling_row_offset) sees the prefix before its logical
+    // position plus its own key at its physical slot.
+    const int* layout=position_device?position_device+1:nullptr;
+    __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
+    __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
+    const int segment=static_cast<int>(blockIdx.x);
+    const int kv_head=static_cast<int>(blockIdx.y);
+    const int tid=static_cast<int>(threadIdx.x);
+    const int warp=tid>>5;
+    const int lane=tid&31;
+    const int g=lane>>2;
+    const int t=lane&3;
+    const int base=(position_device?*position_device:position)+query_offset;
+    // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
+    // history end; the history itself is served by the INT2 kernel.
+    const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
+    const int first=l0_remap&&segment>0?l0_end+(segment-1)*kVerifyMmaKeys:segment*kVerifyMmaKeys;
+    const int last_count=base+rows;  // largest live key count of the block
+    if(first>=last_count || base+1<1 || last_count>capacity) return;
+    const int segment_end=min(first+kVerifyMmaKeys,last_count);
+    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT2
+    // history kernel; a segment wholly inside it only publishes an empty slot.
+    const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
+    const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    if(first>=history_begin && segment_end<=history_end) {
+        if(tid<rows*H) {
+            const int row=tid/H,head=tid%H;
+            float* slot=workspace+
+                ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*
+                    kFastFusedFlashStride;
+            slot[kFastFusedFlashValues+head]=-INFINITY;
+            slot[kFastFusedFlashValues+H+head]=0.0f;
+        }
+        return;
+    }
+
+    // Fragment rows: pair = row*6 + head for this warp's m16 tile.
+    const int pair0=warp*16+g;
+    const int pair1=pair0+8;
+    const int row0=pair0/H,head0=pair0%H;
+    const int row1=pair1/H,head1=pair1%H;
+    const bool live0=row0<rows,live1=row1<rows;
+    const int count0=base+row0+1,count1=base+row1+1;
+    // Keys before the logical position; the own key is the merge's self term.
+    const int prefix0=base+sibling_row_offset(row0,layout);
+    const int prefix1=base+sibling_row_offset(row1,layout);
+    const auto* q0=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(live0?row0:0)*kQHeads+kv_head*H+head0)*kHeadDim+2*t);
+    const auto* q1=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(live1?row1:0)*kQHeads+kv_head*H+head1)*kHeadDim+2*t);
+
+    float acc[kHeadDim/8][4];
+    #pragma unroll
+    for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+    float running_max[2]={-INFINITY,-INFINITY};
+    float denominator[2]={0.0f,0.0f};
+
+    for(int chunk_first=first;chunk_first<segment_end;chunk_first+=kVerifyMmaChunk) {
+        __syncthreads();
+        for(int index=tid;index<kVerifyMmaChunk*kVectors;index+=blockDim.x) {
+            const int key_offset=index/kVectors;
+            const int dim=(index%kVectors)*8;
+            const int key=chunk_first+key_offset;
+            uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
+            if(key<segment_end) {
+                const bool in_sink=sink_k && key<ninfer::exl3::l0_oscar::kSink;
+                const std::size_t offset=(ninfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
+                    ring_mask)*kKVHeads+kv_head)*kHeadDim+dim;
+                key_bits=*reinterpret_cast<const uint4*>((in_sink?sink_k:k_cache)+offset);
+                value_bits=*reinterpret_cast<const uint4*>((in_sink?sink_v:v_cache)+offset);
+            }
+            *reinterpret_cast<uint4*>(k_s+key_offset*kVerifyMmaStride+dim)=key_bits;
+            *reinterpret_cast<uint4*>(v_s+key_offset*kVerifyMmaStride+dim)=value_bits;
+        }
+        __syncthreads();
+
+        float s[4][4];
+        #pragma unroll
+        for(int j=0;j<4;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.0f;
+        #pragma unroll
+        for(int kk=0;kk<kHeadDim;kk+=16) {
+            const unsigned a[4]={live0?q0[kk/2]:0u,live1?q1[kk/2]:0u,
+                                 live0?q0[kk/2+4]:0u,live1?q1[kk/2+4]:0u};
+            #pragma unroll
+            for(int pair=0;pair<2;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4(b,k_s+(pair*16+(lane&7)+((lane>>4)<<3))*
+                    kVerifyMmaStride+kk+((lane>>3)&1)*8);
+                reg_attn_mma(s[2*pair],a,b[0],b[1]);
+                reg_attn_mma(s[2*pair+1],a,b[2],b[3]);
+            }
+        }
+        float tile_max[2]={-INFINITY,-INFINITY};
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const int key=chunk_first+8*j+2*t+(e&1);
+                const bool valid=(e<2?(live0&&key<prefix0):(live1&&key<prefix1))&&
+                    !(key>=history_begin&&key<history_end);
+                s[j][e]=valid?s[j][e]*0.0625f:-INFINITY;
+                tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]);
+            }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],1));
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],2));
+        }
+        float scale[2];
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            const float next=fmaxf(running_max[i],tile_max[i]);
+            scale[i]=next==-INFINITY?1.0f:expf(running_max[i]-next);
+            running_max[i]=next;
+        }
+        half p[4][4];
+        float sums[2]={0.0f,0.0f};
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const float m=running_max[e>>1];
+                p[j][e]=__float2half_rn(s[j][e]==-INFINITY?0.0f:expf(s[j][e]-m));
+                sums[e>>1]+=__half2float(p[j][e]);
+            }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],1);
+            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],2);
+            denominator[i]=denominator[i]*scale[i]+sums[i];
+        }
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n) {
+            acc[n][0]*=scale[0];acc[n][1]*=scale[0];
+            acc[n][2]*=scale[1];acc[n][3]*=scale[1];
+        }
+        #pragma unroll
+        for(int kk=0;kk<2;++kk) {
+            const unsigned a[4]={reg_attn_pack(p[2*kk][0],p[2*kk][1]),
+                                 reg_attn_pack(p[2*kk][2],p[2*kk][3]),
+                                 reg_attn_pack(p[2*kk+1][0],p[2*kk+1][1]),
+                                 reg_attn_pack(p[2*kk+1][2],p[2*kk+1][3])};
+            #pragma unroll
+            for(int pair=0;pair<kHeadDim/16;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4_trans(b,v_s+(16*kk+(lane&7)+((lane>>3)&1)*8)*
+                    kVerifyMmaStride+pair*16+(lane>>4)*8);
+                reg_attn_mma(acc[2*pair],a,b[0],b[1]);
+                reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+        const int row=i==0?row0:row1;
+        const int head=i==0?head0:head1;
+        const int count=i==0?count0:count1;
+        if(!(i==0?live0:live1) || first>=count) continue;
+        float* slot=workspace+
+            ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*
+                kFastFusedFlashStride;
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n) {
+            const int dim=8*n+2*t;
+            slot[head*kHeadDim+dim]=acc[n][2*i];
+            slot[head*kHeadDim+dim+1]=acc[n][2*i+1];
+        }
+        if(t==0) {
+            slot[kFastFusedFlashValues+head]=running_max[i];
+            slot[kFastFusedFlashValues+H+head]=denominator[i];
+        }
+    }
+}
+
+// Decode-shaped variant (rows*6 query heads fit one m16 tile, i.e. rows <= 2):
+// four warps each compute the identical scores and softmax for the single
+// tile but own a quarter of the PV head dimensions, so the per-thread
+// accumulator is 8x4 instead of 32x4 and many more CTAs stay resident.
+// Every stored value is produced by the same operations as the verify kernel.
+template<int kVerifyMmaKeys>
+__global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
+    const std::uint16_t* q,const std::uint16_t* k_cache,
+    const std::uint16_t* v_cache,float* workspace,int rows,int position,
+    int capacity,int segments,const int* position_device,int query_offset,int l0_history=0,
+    const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
+    EXL3_PDL_SMALL_PROLOGUE();
+    constexpr int H=kFastFusedFlashHeads;
+    constexpr int kVectors=kHeadDim/8;
+    // A sibling row (sibling_row_offset) sees the prefix before its logical
+    // position plus its own key at its physical slot.
+    const int* layout=position_device?position_device+1:nullptr;
+    __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
+    __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
+    const int segment=static_cast<int>(blockIdx.x);
+    const int kv_head=static_cast<int>(blockIdx.y);
+    const int tid=static_cast<int>(threadIdx.x);
+    const int warp=tid>>5;
+    const int lane=tid&31;
+    const int g=lane>>2;
+    const int t=lane&3;
+    const int base=(position_device?*position_device:position)+query_offset;
+    // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
+    // history end; the history itself is served by the INT2 kernel.
+    const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
+    const int first=l0_remap&&segment>0?l0_end+(segment-1)*kVerifyMmaKeys:segment*kVerifyMmaKeys;
+    const int last_count=base+rows;  // largest live key count of the block
+    if(first>=last_count || base+1<1 || last_count>capacity) return;
+    const int segment_end=min(first+kVerifyMmaKeys,last_count);
+    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT2
+    // history kernel; a segment wholly inside it only publishes an empty slot.
+    const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
+    const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+        position_device?*position_device:position),capacity):0;
+    if(first>=history_begin && segment_end<=history_end) {
+        if(tid<rows*H) {
+            const int row=tid/H,head=tid%H;
+            float* slot=workspace+
+                ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*
+                    kFastFusedFlashStride;
+            slot[kFastFusedFlashValues+head]=-INFINITY;
+            slot[kFastFusedFlashValues+H+head]=0.0f;
+        }
+        return;
+    }
+
+    // Fragment rows: pair = row*6 + head for this warp's m16 tile.
+    const int pair0=g;
+    const int pair1=pair0+8;
+    const int row0=pair0/H,head0=pair0%H;
+    const int row1=pair1/H,head1=pair1%H;
+    const bool live0=row0<rows,live1=row1<rows;
+    const int count0=base+row0+1,count1=base+row1+1;
+    // Keys before the logical position; the own key is the merge's self term.
+    const int prefix0=base+sibling_row_offset(row0,layout);
+    const int prefix1=base+sibling_row_offset(row1,layout);
+    const auto* q0=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(live0?row0:0)*kQHeads+kv_head*H+head0)*kHeadDim+2*t);
+    const auto* q1=reinterpret_cast<const unsigned*>(q+
+        (static_cast<std::size_t>(live1?row1:0)*kQHeads+kv_head*H+head1)*kHeadDim+2*t);
+
+    constexpr int kDimSplit=4,kLocalN=kHeadDim/8/kDimSplit;
+    float acc[kLocalN][4];
+    #pragma unroll
+    for(int n=0;n<kLocalN;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
+    float running_max[2]={-INFINITY,-INFINITY};
+    float denominator[2]={0.0f,0.0f};
+
+    for(int chunk_first=first;chunk_first<segment_end;chunk_first+=kVerifyMmaChunk) {
+        __syncthreads();
+        for(int index=tid;index<kVerifyMmaChunk*kVectors;index+=blockDim.x) {
+            const int key_offset=index/kVectors;
+            const int dim=(index%kVectors)*8;
+            const int key=chunk_first+key_offset;
+            uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
+            if(key<segment_end) {
+                const bool in_sink=sink_k && key<ninfer::exl3::l0_oscar::kSink;
+                const std::size_t offset=(ninfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
+                    ring_mask)*kKVHeads+kv_head)*kHeadDim+dim;
+                key_bits=*reinterpret_cast<const uint4*>((in_sink?sink_k:k_cache)+offset);
+                value_bits=*reinterpret_cast<const uint4*>((in_sink?sink_v:v_cache)+offset);
+            }
+            *reinterpret_cast<uint4*>(k_s+key_offset*kVerifyMmaStride+dim)=key_bits;
+            *reinterpret_cast<uint4*>(v_s+key_offset*kVerifyMmaStride+dim)=value_bits;
+        }
+        __syncthreads();
+
+        float s[4][4];
+        #pragma unroll
+        for(int j=0;j<4;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.0f;
+        #pragma unroll
+        for(int kk=0;kk<kHeadDim;kk+=16) {
+            const unsigned a[4]={live0?q0[kk/2]:0u,live1?q1[kk/2]:0u,
+                                 live0?q0[kk/2+4]:0u,live1?q1[kk/2+4]:0u};
+            #pragma unroll
+            for(int pair=0;pair<2;++pair) {
+                unsigned b[4];
+                reg_attn_ldmatrix_x4(b,k_s+(pair*16+(lane&7)+((lane>>4)<<3))*
+                    kVerifyMmaStride+kk+((lane>>3)&1)*8);
+                reg_attn_mma(s[2*pair],a,b[0],b[1]);
+                reg_attn_mma(s[2*pair+1],a,b[2],b[3]);
+            }
+        }
+        float tile_max[2]={-INFINITY,-INFINITY};
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const int key=chunk_first+8*j+2*t+(e&1);
+                const bool valid=(e<2?(live0&&key<prefix0):(live1&&key<prefix1))&&
+                    !(key>=history_begin&&key<history_end);
+                s[j][e]=valid?s[j][e]*0.0625f:-INFINITY;
+                tile_max[e>>1]=fmaxf(tile_max[e>>1],s[j][e]);
+            }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],1));
+            tile_max[i]=fmaxf(tile_max[i],__shfl_xor_sync(0xffffffffU,tile_max[i],2));
+        }
+        float scale[2];
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            const float next=fmaxf(running_max[i],tile_max[i]);
+            scale[i]=next==-INFINITY?1.0f:expf(running_max[i]-next);
+            running_max[i]=next;
+        }
+        half p[4][4];
+        float sums[2]={0.0f,0.0f};
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int e=0;e<4;++e) {
+                const float m=running_max[e>>1];
+                p[j][e]=__float2half_rn(s[j][e]==-INFINITY?0.0f:expf(s[j][e]-m));
+                sums[e>>1]+=__half2float(p[j][e]);
+            }
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],1);
+            sums[i]+=__shfl_xor_sync(0xffffffffU,sums[i],2);
+            denominator[i]=denominator[i]*scale[i]+sums[i];
+        }
+        #pragma unroll
+        for(int n=0;n<kLocalN;++n) {
+            acc[n][0]*=scale[0];acc[n][1]*=scale[0];
+            acc[n][2]*=scale[1];acc[n][3]*=scale[1];
+        }
+        #pragma unroll
+        for(int kk=0;kk<2;++kk) {
+            const unsigned a[4]={reg_attn_pack(p[2*kk][0],p[2*kk][1]),
+                                 reg_attn_pack(p[2*kk][2],p[2*kk][3]),
+                                 reg_attn_pack(p[2*kk+1][0],p[2*kk+1][1]),
+                                 reg_attn_pack(p[2*kk+1][2],p[2*kk+1][3])};
+            #pragma unroll
+            for(int local=0;local<kLocalN/2;++local) {
+                const int pair=warp*(kLocalN/2)+local;
+                unsigned b[4];
+                reg_attn_ldmatrix_x4_trans(b,v_s+(16*kk+(lane&7)+((lane>>3)&1)*8)*
+                    kVerifyMmaStride+pair*16+(lane>>4)*8);
+                reg_attn_mma(acc[2*local],a,b[0],b[1]);
+                reg_attn_mma(acc[2*local+1],a,b[2],b[3]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for(int i=0;i<2;++i) {
+        const int row=i==0?row0:row1;
+        const int head=i==0?head0:head1;
+        const int count=i==0?count0:count1;
+        if(!(i==0?live0:live1) || first>=count) continue;
+        float* slot=workspace+
+            ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*segments+segment)*
+                kFastFusedFlashStride;
+        #pragma unroll
+        for(int n=0;n<kLocalN;++n) {
+            const int dim=8*(warp*kLocalN+n)+2*t;
+            slot[head*kHeadDim+dim]=acc[n][2*i];
+            slot[head*kHeadDim+dim+1]=acc[n][2*i+1];
+        }
+        if(t==0 && warp==0) {
+            slot[kFastFusedFlashValues+head]=running_max[i];
+            slot[kFastFusedFlashValues+H+head]=denominator[i];
+        }
+    }
+}
+
+
+#include "exl3/l0_oscar_attention.cuh"
+
+bool verify_flash_mma_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+// Key-segment length of the tensor-core flash path (64 default, 128 or 256;
+// quality-gated: 2-row verify NLL within +0.0003 nats/token). Shorter
+// segments raise the CTA count for decode-sized row counts; a length whose
+// scratch would exceed the owned plane falls back to the next longer one.
+int verify_flash_mma_keys() {
+    static const int keys=[] {
+        const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS");
+        if(!value) return 64;
+        const int parsed=std::atoi(value);
+        if(parsed!=64 && parsed!=128 && parsed!=256)
+            throw std::invalid_argument("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS must be 64, 128 or 256");
+        return parsed;
+    }();
+    return keys;
+}
+
+// Tensor-core flash attention plus segment merge. Returns the key-segment
+// length used.
+int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,float* workspace,std::size_t workspace_bytes,
+    std::uint16_t* output,int rows,int position,int capacity,
+    const int* position_device,cudaStream_t stream,int requested_keys=0,
+    const float* history_slot=nullptr,const std::uint16_t* sink_k=nullptr,
+    const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
+    const int count=position+rows;
+    const int l0_history=history_slot?1:0;
+    int keys=requested_keys?requested_keys:verify_flash_mma_keys();
+    const auto segment_count=[&](int length) {
+        return l0_history?std::min((count+length-1)/length,1+kExl3L0ExactWindowKeys/length):
+            (count+length-1)/length;
+    };
+    const auto required=[&](int length) {
+        return static_cast<std::size_t>(rows)*kKVHeads*segment_count(length)*
+            kFastFusedFlashStride*sizeof(float);
+    };
+    while(keys<256 && required(keys)>workspace_bytes) keys*=2;
+    if(required(keys)>workspace_bytes)
+        throw std::invalid_argument("verify flash MMA scratch extent");
+    const int segments=segment_count(keys);
+    const dim3 grid(segments,kKVHeads);
+    static const bool decode_kernel=[] {
+        const char* value=std::getenv("NINFER_EXL3_DECODE_FLASH_MMA");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(decode_kernel && rows*kFastFusedFlashHeads<=16) {
+        if(keys==64)
+            exl3_launch_small(attention_decode_flash_mma_kernel<64>,dim3(grid),dim3(128),0,stream,
+                q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+                sink_k,sink_v,ring_mask);
+        else if(keys==128)
+            exl3_launch_small(attention_decode_flash_mma_kernel<128>,dim3(grid),dim3(128),0,stream,
+                q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+                sink_k,sink_v,ring_mask);
+        else
+            exl3_launch_small(attention_decode_flash_mma_kernel<256>,dim3(grid),dim3(128),0,stream,
+                q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+                sink_k,sink_v,ring_mask);
+    } else
+    if(keys==64)
+        exl3_launch_small(attention_verify_flash_mma_kernel<64>,dim3(grid),dim3(96),0,stream,
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+            sink_k,sink_v,ring_mask);
+    else if(keys==128)
+        exl3_launch_small(attention_verify_flash_mma_kernel<128>,dim3(grid),dim3(96),0,stream,
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+            sink_k,sink_v,ring_mask);
+    else
+        exl3_launch_small(attention_verify_flash_mma_kernel<256>,dim3(grid),dim3(96),0,stream,
+            q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
+            sink_k,sink_v,ring_mask);
+    launch_fused_flash_merge(workspace,output,rows,segments,position,capacity,keys,
+        position_device,stream,q,k,v,history_slot,sink_k,sink_v,ring_mask);
+    return keys;
+}
+
+void fast_verify_flash_mma_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,float* workspace,
+    std::uint16_t* output,int position,int capacity,int segments,int rows,
+    cudaStream_t stream,int keys) {
+    if(rows<1 || rows>8 || position<0 || position+rows>capacity)
+        throw std::invalid_argument("verify flash MMA fixture rows/frontier");
+    const std::size_t bytes=static_cast<std::size_t>(rows)*kKVHeads*
+        ((position+rows+keys-1)/keys)*kFastFusedFlashStride*sizeof(float);
+    (void)segments;
+    if(launch_verify_flash_mma(q,k,v,workspace,bytes,output,rows,position,capacity,
+           nullptr,stream,keys)!=keys)
+        throw std::invalid_argument("verify flash MMA fixture segment length");
+    cuda_check(cudaGetLastError(),"verify flash MMA fixture launch");
+}
+
+void fast_fused_attention_fixture(const std::uint16_t* q,
+    const std::uint16_t* k,const std::uint16_t* v,float* workspace,
+    std::uint16_t* output,int position,int capacity,int segments,
+    const int* position_device,cudaStream_t stream,int rows) {
+    if(rows<1 || rows>8 || position<0 || position+rows>capacity)
+        throw std::invalid_argument("fused attention fixture rows/frontier");
+    attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256><<<
+        rows*kKVHeads*segments,256,0,stream>>>(q,k,v,workspace,output,rows,position,
+            capacity,segments,position_device,0);
+    attention_cached_gqa_six_fused_flash_merge_kernel<<<
+        rows*kKVHeads,256,0,stream>>>(workspace,output,rows,segments,position,
+            capacity,kFastFusedFlashKeys256,position_device,0);
+    cuda_check(cudaGetLastError(),"fused attention fixture launch");
+}
 
 std::uint64_t exl3_fast_whole_context_fused_attention_calls_for_test() noexcept {
     return fast_whole_context_fused_attention_counter.load(std::memory_order_relaxed);
@@ -5055,128 +7117,83 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
     Exl3CudaTransformView paired_up_transformed)
     : weights_(weights), max_rows_(max_rows),
       reconstruct_gemm_(reconstruct_gemm) {
+    {
+        static int constructed = 0;
+        fakequant_bank_ = constructed++ % 16;
+    }
     coalesce_input_mlp_=coalesce_input_mlp;
-    const auto* small_m_fused_gate_up=std::getenv(
-        "NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM");
-    if(small_m_fused_gate_up && std::strcmp(small_m_fused_gate_up,"0")!=0 &&
-       std::strcmp(small_m_fused_gate_up,"1")!=0)
-        throw std::invalid_argument(
-            "small-M fused gate/up transform must be 0 or 1");
-    small_m_fused_gate_up_transform_=small_m_fused_gate_up &&
-        std::strcmp(small_m_fused_gate_up,"1")==0;
-    const auto* fused_flash=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH");
-    if(fused_flash && std::strcmp(fused_flash,"0")!=0 &&
-       std::strcmp(fused_flash,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV fused flash must be 0 or 1");
-    fast_fused_flash_attention_=fused_flash &&
-        std::strcmp(fused_flash,"1")==0;
-    const auto* fused_flash_keys256=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_KEYS256");
-    if(fused_flash_keys256 && std::strcmp(fused_flash_keys256,"0")!=0 &&
-       std::strcmp(fused_flash_keys256,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV fused flash keys256 must be 0 or 1");
-    fast_fused_flash_attention_keys256_=fused_flash_keys256 &&
-        std::strcmp(fused_flash_keys256,"1")==0;
-    const auto* cublas_attention=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_CUBLAS_ATTENTION");
-    if(cublas_attention && std::strcmp(cublas_attention,"0")!=0 &&
-       std::strcmp(cublas_attention,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV cuBLAS attention must be 0 or 1");
-    fast_cublas_attention_=cublas_attention &&
-        std::strcmp(cublas_attention,"1")==0;
-    const auto* online_decode_attention=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE");
-    if(online_decode_attention && std::strcmp(online_decode_attention,"0")!=0 &&
-       std::strcmp(online_decode_attention,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV online decode attention must be 0 or 1");
-    fast_online_decode_attention_=online_decode_attention &&
-        std::strcmp(online_decode_attention,"1")==0;
-    const auto* online_decode_warp_heads=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE_WARP_HEADS");
-    if(online_decode_warp_heads &&
-       std::strcmp(online_decode_warp_heads,"0")!=0 &&
-       std::strcmp(online_decode_warp_heads,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV online decode warp-heads must be 0 or 1");
-    fast_online_decode_attention_warp_heads_=online_decode_warp_heads &&
-        std::strcmp(online_decode_warp_heads,"1")==0;
-    const auto* whole_context_fused=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_WHOLE_CONTEXT");
-    if(whole_context_fused && std::strcmp(whole_context_fused,"0")!=0 &&
-       std::strcmp(whole_context_fused,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV whole-context fused attention must be 0 or 1");
-    fast_whole_context_fused_attention_=whole_context_fused &&
-        std::strcmp(whole_context_fused,"1")==0;
-    const auto* prefill_tiled=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED");
-    if(prefill_tiled && std::strcmp(prefill_tiled,"0")!=0 &&
-       std::strcmp(prefill_tiled,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV tiled prefill attention must be 0 or 1");
-    fast_prefill_tiled_attention_=prefill_tiled &&
-        std::strcmp(prefill_tiled,"1")==0;
-    const auto* prefill_rows4=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS4");
-    if(prefill_rows4 && std::strcmp(prefill_rows4,"0")!=0 &&
-       std::strcmp(prefill_rows4,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV four-row prefill attention must be 0 or 1");
-    fast_prefill_rows4_attention_=prefill_rows4 &&
-        std::strcmp(prefill_rows4,"1")==0;
-    const auto* prefill_rows8=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8");
-    if(prefill_rows8 && std::strcmp(prefill_rows8,"0")!=0 &&
-       std::strcmp(prefill_rows8,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV eight-row prefill attention must be 0 or 1");
-    fast_prefill_rows8_attention_=prefill_rows8 &&
-        std::strcmp(prefill_rows8,"1")==0;
-    const auto* prefill_rows8_threads128=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8_THREADS128");
-    if(prefill_rows8_threads128 && std::strcmp(prefill_rows8_threads128,"0")!=0 &&
-       std::strcmp(prefill_rows8_threads128,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV eight-row prefill 128-thread launch must be 0 or 1");
-    fast_prefill_rows8_threads128_=prefill_rows8_threads128 &&
-        std::strcmp(prefill_rows8_threads128,"1")==0;
-    const auto* prefill_wmma=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA");
-    if(prefill_wmma && std::strcmp(prefill_wmma,"0")!=0 &&
-       std::strcmp(prefill_wmma,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV WMMA prefill must be 0 or 1");
-    fast_prefill_wmma_attention_=prefill_wmma &&
-        std::strcmp(prefill_wmma,"1")==0;
-    const auto* prefill_wmma32=std::getenv(
+    small_m_fused_gate_up_transform_ = read_binary_option("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",
+        "small-M fused gate/up transform must be 0 or 1");
+    fast_fused_flash_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH",
+        "FAST same-weight FP16-KV fused flash must be 0 or 1");
+    fast_fused_flash_attention_keys256_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_KEYS256",
+        "FAST same-weight FP16-KV fused flash keys256 must be 0 or 1");
+    fast_fused_flash_multirow_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW",
+        "FAST same-weight FP16-KV fused flash multirow must be 0 or 1");
+    fast_cublas_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_CUBLAS_ATTENTION",
+        "FAST same-weight FP16-KV cuBLAS attention must be 0 or 1");
+    fast_online_decode_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE",
+        "FAST same-weight FP16-KV online decode attention must be 0 or 1");
+    fast_online_decode_attention_warp_heads_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE_WARP_HEADS",
+        "FAST same-weight FP16-KV online decode warp-heads must be 0 or 1");
+    fast_whole_context_fused_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_WHOLE_CONTEXT",
+        "FAST same-weight FP16-KV whole-context fused attention must be 0 or 1");
+    fast_prefill_tiled_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED",
+        "FAST same-weight FP16-KV tiled prefill attention must be 0 or 1");
+    fast_prefill_rows4_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS4",
+        "FAST same-weight FP16-KV four-row prefill attention must be 0 or 1");
+    fast_prefill_rows8_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8",
+        "FAST same-weight FP16-KV eight-row prefill attention must be 0 or 1");
+    fast_prefill_rows8_threads128_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8_THREADS128",
+        "FAST same-weight FP16-KV eight-row prefill 128-thread launch must be 0 or 1");
+    fast_prefill_wmma_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA",
+        "FAST same-weight FP16-KV WMMA prefill must be 0 or 1");
+    const char* explicit_wmma32 = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32");
-    if(prefill_wmma32 && std::strcmp(prefill_wmma32,"0")!=0 &&
-       std::strcmp(prefill_wmma32,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV WMMA32 prefill must be 0 or 1");
-    fast_prefill_wmma32_attention_=prefill_wmma32 &&
-        std::strcmp(prefill_wmma32,"1")==0;
-    const auto* prefill_rows2=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS2");
-    if(prefill_rows2 && std::strcmp(prefill_rows2,"0")!=0 &&
-       std::strcmp(prefill_rows2,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV two-row prefill attention must be 0 or 1");
-    fast_prefill_rows2_attention_=prefill_rows2 &&
-        std::strcmp(prefill_rows2,"1")==0;
-    const auto* m1_gate_up_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR");
-    if(m1_gate_up_pair && std::strcmp(m1_gate_up_pair,"0")!=0 &&
-       std::strcmp(m1_gate_up_pair,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV M1 gate/up pair must be 0 or 1");
-    fast_same_weights_fp16kv_m1_gate_up_pair_=m1_gate_up_pair &&
-        std::strcmp(m1_gate_up_pair,"1")==0;
+    const char* fast_prefill_scope = std::getenv(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+    fast_prefill_wmma32_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32",
+        "FAST same-weight FP16-KV WMMA32 prefill must be 0 or 1") ||
+        (!explicit_wmma32 && fast_prefill_scope &&
+         std::strcmp(fast_prefill_scope, "1") == 0);
+    fast_prefill_wmma64_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64",
+        "FAST same-weight FP16-KV WMMA64 prefill must be 0 or 1");
+    if (fast_prefill_wmma64_attention_ && !fast_prefill_wmma32_attention_)
+        throw std::invalid_argument("WMMA64 requires WMMA32 prefill policy");
+    fast_prefill_wmma64_register_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER",
+        "FAST same-weight FP16-KV WMMA64 register prefill must be 0 or 1");
+    if (fast_prefill_wmma64_register_attention_ &&
+        !fast_prefill_wmma64_attention_)
+        throw std::invalid_argument("WMMA64 register candidate requires WMMA64");
+    fast_prefill_wmma64_register_keys64_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER_KEYS64",
+        "FAST same-weight FP16-KV WMMA64 register keys64 must be 0 or 1");
+    if (fast_prefill_wmma64_register_keys64_attention_ &&
+        !fast_prefill_wmma64_register_attention_)
+        throw std::invalid_argument("WMMA64 keys64 requires register candidate");
+    fast_prefill_wmma64_shared_heads_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_HEADS2",
+        "FAST same-weight FP16-KV WMMA64 shared heads must be 0 or 1");
+    if (fast_prefill_wmma64_shared_heads_attention_ &&
+        !fast_prefill_wmma64_register_attention_)
+        throw std::invalid_argument("WMMA64 shared heads requires register candidate");
+    if (fast_prefill_wmma64_register_keys64_attention_ &&
+        fast_prefill_wmma64_shared_heads_attention_)
+        throw std::invalid_argument("WMMA64 keys64 excludes shared heads");
+    fast_prefill_wmma32_padded_attention_ = read_binary_option(
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32_PADDED",
+        "FAST same-weight FP16-KV WMMA32 padded tile must be 0 or 1");
+    if (fast_prefill_wmma32_padded_attention_ &&
+        !fast_prefill_wmma32_attention_)
+        throw std::invalid_argument("padded WMMA32 requires WMMA32 prefill");
+    fast_prefill_rows2_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS2",
+        "FAST same-weight FP16-KV two-row prefill attention must be 0 or 1");
+    fast_same_weights_fp16kv_m1_gate_up_pair_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR",
+        "FAST same-weight FP16-KV M1 gate/up pair must be 0 or 1");
     const auto* m1_kv_pair=std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
     if(m1_kv_pair && std::strcmp(m1_kv_pair,"0")!=0 &&
@@ -5185,23 +7202,11 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
             "FAST same-weight FP16-KV M1 K/V pair must be 0 or 1");
     fast_same_weights_fp16kv_m1_kv_pair_=m1_kv_pair &&
         std::strcmp(m1_kv_pair,"1")==0;
-    const auto* m1_kv_wide_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR");
-    if(m1_kv_wide_pair && std::strcmp(m1_kv_wide_pair,"0")!=0 &&
-       std::strcmp(m1_kv_wide_pair,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV M1 wide K/V pair must be 0 or 1");
-    fast_same_weights_fp16kv_m1_kv_wide_pair_=m1_kv_wide_pair &&
-        std::strcmp(m1_kv_wide_pair,"1")==0;
-    const auto* m1_kv_pair_graph=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR_GRAPH");
-    if(m1_kv_pair_graph && std::strcmp(m1_kv_pair_graph,"0")!=0 &&
-       std::strcmp(m1_kv_pair_graph,"1")!=0)
-        throw std::invalid_argument(
-            "FAST same-weight FP16-KV M1 K/V graph pair must be 0 or 1");
-    fast_same_weights_fp16kv_m1_kv_pair_graph_ =
-        fast_same_weights_fp16kv_m1_kv_pair_ && m1_kv_pair_graph &&
-        std::strcmp(m1_kv_pair_graph,"1")==0;
+    fast_same_weights_fp16kv_m1_kv_wide_pair_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR",
+        "FAST same-weight FP16-KV M1 wide K/V pair must be 0 or 1");
+    const bool m1_kv_pair_graph = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR_GRAPH",
+        "FAST same-weight FP16-KV M1 K/V graph pair must be 0 or 1");
+    fast_same_weights_fp16kv_m1_kv_pair_graph_ = fast_same_weights_fp16kv_m1_kv_pair_ && m1_kv_pair_graph;
     if(fast_fused_flash_attention_ && fast_whole_context_fused_attention_)
         throw std::invalid_argument(
             "FAST segmented and whole-context fused attention are mutually exclusive");
@@ -5225,126 +7230,34 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
        exact_attention_gqa_six_query_pair_scores_)
         throw std::invalid_argument(
             "exact attention K-tile64 and query-pair scores are mutually exclusive");
-    const auto* triple_values_v_tile=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE");
-    if(triple_values_v_tile && std::strcmp(triple_values_v_tile,"0")!=0 &&
-       std::strcmp(triple_values_v_tile,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values V tile must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_v_tile_=
-        triple_values_v_tile && std::strcmp(triple_values_v_tile,"1")==0;
-    const auto* triple_values_v_tile64=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64");
-    if(triple_values_v_tile64 && std::strcmp(triple_values_v_tile64,"0")!=0 &&
-       std::strcmp(triple_values_v_tile64,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values V tile64 must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_v_tile64_=
-        triple_values_v_tile64 && std::strcmp(triple_values_v_tile64,"1")==0;
-    const auto* triple_values_full_cta=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA");
-    if(triple_values_full_cta && std::strcmp(triple_values_full_cta,"0")!=0 &&
-       std::strcmp(triple_values_full_cta,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values full CTA must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_full_cta_=
-        triple_values_full_cta && std::strcmp(triple_values_full_cta,"1")==0;
-    const auto* triple_values_threads128=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128");
-    if(triple_values_threads128 && std::strcmp(triple_values_threads128,"0")!=0 &&
-       std::strcmp(triple_values_threads128,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values threads128 must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_threads128_=
-        triple_values_threads128 && std::strcmp(triple_values_threads128,"1")==0;
-    const auto* triple_values_score_tile=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE");
-    if(triple_values_score_tile && std::strcmp(triple_values_score_tile,"0")!=0 &&
-       std::strcmp(triple_values_score_tile,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values score tile must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_score_tile_=
-        triple_values_score_tile && std::strcmp(triple_values_score_tile,"1")==0;
-    const auto* triple_values_key_pair_pipeline=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE");
-    if(triple_values_key_pair_pipeline &&
-       std::strcmp(triple_values_key_pair_pipeline,"0")!=0 &&
-       std::strcmp(triple_values_key_pair_pipeline,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA triple-values key-pair pipeline must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_key_pair_pipeline_=
-        triple_values_key_pair_pipeline &&
-        std::strcmp(triple_values_key_pair_pipeline,"1")==0;
-    const auto* triple_values_warp_score_broadcast=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST");
-    if(triple_values_warp_score_broadcast &&
-       std::strcmp(triple_values_warp_score_broadcast,"0")!=0 &&
-       std::strcmp(triple_values_warp_score_broadcast,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA triple-values warp score broadcast must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_warp_score_broadcast_=
-        triple_values_warp_score_broadcast &&
-        std::strcmp(triple_values_warp_score_broadcast,"1")==0;
-    const auto* triple_values_pair_dimensions=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS");
-    if(triple_values_pair_dimensions &&
-       std::strcmp(triple_values_pair_dimensions,"0")!=0 &&
-       std::strcmp(triple_values_pair_dimensions,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values pair-dimensions must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_pair_dimensions_=
-        triple_values_pair_dimensions &&
-        std::strcmp(triple_values_pair_dimensions,"1")==0;
-    const auto* six_values_single_load=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD");
-    if(six_values_single_load && std::strcmp(six_values_single_load,"0")!=0 &&
-       std::strcmp(six_values_single_load,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax six-values single-load must be 0 or 1");
-    exact_attention_gqa_six_softmax_six_values_single_load_=
-        six_values_single_load && std::strcmp(six_values_single_load,"1")==0;
-    const auto* six_values_scalar_single_load=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD");
-    if(six_values_scalar_single_load &&
-       std::strcmp(six_values_scalar_single_load,"0")!=0 &&
-       std::strcmp(six_values_scalar_single_load,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax six-values scalar single-load must be 0 or 1");
-    exact_attention_gqa_six_softmax_six_values_scalar_single_load_=
-        six_values_scalar_single_load &&
-        std::strcmp(six_values_scalar_single_load,"1")==0;
-    const auto* triple_values_scalar_dim=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM");
-    if(triple_values_scalar_dim && std::strcmp(triple_values_scalar_dim,"0")!=0 &&
-       std::strcmp(triple_values_scalar_dim,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values scalar-dim must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_scalar_dim_=
-        triple_values_scalar_dim && std::strcmp(triple_values_scalar_dim,"1")==0;
-    const auto* triple_values_two_query=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY");
-    if(triple_values_two_query && std::strcmp(triple_values_two_query,"0")!=0 &&
-       std::strcmp(triple_values_two_query,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values two-query must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_two_query_=
-        triple_values_two_query && std::strcmp(triple_values_two_query,"1")==0;
-    const auto* triple_values_fused=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED");
-    if(triple_values_fused && std::strcmp(triple_values_fused,"0")!=0 &&
-       std::strcmp(triple_values_fused,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax triple-values fused must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_fused_=
-        triple_values_fused && std::strcmp(triple_values_fused,"1")==0;
-    const auto* fused_scalar_values=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_FUSED_SCALAR_VALUES");
-    if(fused_scalar_values && std::strcmp(fused_scalar_values,"0")!=0 &&
-       std::strcmp(fused_scalar_values,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six-softmax fused scalar values must be 0 or 1");
-    exact_attention_gqa_six_softmax_fused_scalar_values_=
-        fused_scalar_values && std::strcmp(fused_scalar_values,"1")==0;
+    exact_attention_gqa_six_softmax_triple_values_v_tile_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
+        "exact attention GQA six-softmax triple-values V tile must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_v_tile64_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
+        "exact attention GQA six-softmax triple-values V tile64 must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_full_cta_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
+        "exact attention GQA six-softmax triple-values full CTA must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_threads128_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
+        "exact attention GQA six-softmax triple-values threads128 must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_score_tile_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
+        "exact attention GQA six-softmax triple-values score tile must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_key_pair_pipeline_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE",
+        "exact attention GQA triple-values key-pair pipeline must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_warp_score_broadcast_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
+        "exact attention GQA triple-values warp score broadcast must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_pair_dimensions_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
+        "exact attention GQA six-softmax triple-values pair-dimensions must be 0 or 1");
+    exact_attention_gqa_six_softmax_six_values_single_load_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
+        "exact attention GQA six-softmax six-values single-load must be 0 or 1");
+    exact_attention_gqa_six_softmax_six_values_scalar_single_load_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
+        "exact attention GQA six-softmax six-values scalar single-load must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_scalar_dim_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
+        "exact attention GQA six-softmax triple-values scalar-dim must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_two_query_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
+        "exact attention GQA six-softmax triple-values two-query must be 0 or 1");
+    exact_attention_gqa_six_softmax_triple_values_fused_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
+        "exact attention GQA six-softmax triple-values fused must be 0 or 1");
+    exact_attention_gqa_six_softmax_fused_scalar_values_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_FUSED_SCALAR_VALUES",
+        "exact attention GQA six-softmax fused scalar values must be 0 or 1");
     const auto* decode_fused=std::getenv(
         "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_DECODE_FUSED");
     if(decode_fused && std::strcmp(decode_fused,"0")!=0 &&
@@ -5353,14 +7266,8 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
             "exact attention GQA six decode-fused route must be 0 or 1");
     exact_attention_gqa_six_decode_fused_=decode_fused &&
         std::strcmp(decode_fused,"1")==0;
-    const auto* softmax_tile512=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TILE512");
-    if(softmax_tile512 && std::strcmp(softmax_tile512,"0")!=0 &&
-       std::strcmp(softmax_tile512,"1")!=0)
-        throw std::invalid_argument(
-            "exact attention GQA six softmax tile512 must be 0 or 1");
-    exact_attention_gqa_six_softmax_tile512_=softmax_tile512 &&
-        std::strcmp(softmax_tile512,"1")==0;
+    exact_attention_gqa_six_softmax_tile512_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TILE512",
+        "exact attention GQA six softmax tile512 must be 0 or 1");
     if(exact_attention_gqa_six_softmax_tile512_ &&
        (exact_attention_gqa_six_softmax_triple_values_fused_ ||
         exact_attention_gqa_six_softmax_fused_scalar_values_))
@@ -5551,11 +7458,153 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
     k_cache_ = k_cache;
     v_cache_ = v_cache;
     cache_capacity_ = capacity;
+    if (l0_oscar::enabled() && !l0_.k_codes) {
+        if (kv_fakequant::config().mode)
+            throw std::invalid_argument("L0 OSCAR and KV fake-quant are exclusive");
+        (void)l0_oscar::assets();
+        auto& l=l0_;
+        l.capacity=capacity; l.rows=8; l.bank=fakequant_bank_;
+        // Verifier history: a fixed number of device-sized spans (l0_oscar::history_span).
+        l.segment_keys=0;
+        l.segments=l0_oscar::kHistorySegments;
+        const std::size_t cells=static_cast<std::size_t>(capacity)*kKVHeads;
+        const auto alloc=[](auto*& p,std::size_t bytes) {
+            if(cudaMalloc(reinterpret_cast<void**>(&p),bytes)!=cudaSuccess)
+                throw std::runtime_error("L0 OSCAR storage allocation");
+        };
+        alloc(l.k_codes,cells*l0_oscar::kCodeBytes);
+        alloc(l.v_codes,cells*l0_oscar::kCodeBytes);
+        alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+        alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+        alloc(l.state,2*sizeof(int));
+        cudaMemset(l.state,0,2*sizeof(int));
+        const std::size_t ring_bytes=static_cast<std::size_t>(l0_oscar::kRingRows)*kKVHeads*kHeadDim*2;
+        const std::size_t sink_bytes=static_cast<std::size_t>(l0_oscar::kSink)*kKVHeads*kHeadDim*2;
+        alloc(l.k_ring,ring_bytes); alloc(l.v_ring,ring_bytes);
+        alloc(l.k_sink,sink_bytes); alloc(l.v_sink,sink_bytes);
+        // Query and history scratch is consumed within one layer's attention on
+        // the layer stream, so all full-attention layers of the process share it
+        // (one target context executes layers sequentially).
+        static l0_oscar::LayerStorage shared{};
+        if(shared.segments<l.segments) {
+            // Earlier layers keep their (smaller) scratch; it is never released.
+            shared.segments=l.segments;
+            alloc(shared.q_rot,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(std::uint16_t));
+            alloc(shared.q_mu,static_cast<std::size_t>(l.rows)*kQHeads*sizeof(float));
+            alloc(shared.hist_work,static_cast<std::size_t>(l.rows)*kKVHeads*l.segments*
+                kL0HistoryStreams*kFastFusedFlashStride*sizeof(float));
+            alloc(shared.hist_slot,static_cast<std::size_t>(l.rows)*kKVHeads*kFastFusedFlashStride*sizeof(float));
+            alloc(shared.hist_rotated,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
+        }
+        static l0_oscar::LayerStorage prefill{};
+        l.prefill_rows=std::max(max_rows_,8);
+        if(prefill.prefill_rows<l.prefill_rows) {
+            prefill.prefill_rows=l.prefill_rows;
+            const std::size_t r=static_cast<std::size_t>(l.prefill_rows);
+            alloc(prefill.q_rot,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
+            alloc(prefill.q_mu,r*kQHeads*sizeof(float));
+            alloc(prefill.prefill_hist,4*r*kQHeads*kHeadDim*sizeof(float));
+            alloc(prefill.prefill_hist_stats,4*r*kQHeads*2*sizeof(float));
+            alloc(prefill.prefill_numer,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
+            alloc(prefill.prefill_split,5*r*kQHeads*kHeadDim*sizeof(float));
+            alloc(prefill.prefill_split_stats,5*r*kQHeads*2*sizeof(float));
+        }
+        l.prefill_hist=prefill.prefill_hist; l.prefill_hist_stats=prefill.prefill_hist_stats;
+        l.prefill_numer=prefill.prefill_numer;
+        l.prefill_split=prefill.prefill_split; l.prefill_split_stats=prefill.prefill_split_stats;
+        shared.q_rot=prefill.q_rot; shared.q_mu=prefill.q_mu;
+        l.q_rot=shared.q_rot; l.q_mu=shared.q_mu; l.hist_work=shared.hist_work; l.hist_slot=shared.hist_slot; l.hist_rotated=shared.hist_rotated;
+    }
+    if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
+        cudaMalloc(&fakequant_watermark_, 4 * sizeof(int)) == cudaSuccess)
+        cudaMemset(fakequant_watermark_, 0, 4 * sizeof(int));
 }
 
 void Exl3FullAttentionLayer::set_oscar(Exl3OscarContext* oscar, int model_layer) noexcept {
     oscar_ = oscar;
     oscar_layer_ = model_layer;
+}
+
+void Exl3FullAttentionLayer::append_sibling_row_copies(Exl3SiblingRowCopies& out,
+    int source,int destination) const {
+    if(!k_cache_ || !v_cache_)
+        throw std::invalid_argument("sibling promotion requires the ordinary K/V cache");
+    constexpr int row=kKVHeads*kHeadDim;
+    for(auto* cache:{k_cache_,v_cache_})
+        out.push_back({cache+static_cast<std::size_t>(source)*row,
+            cache+static_cast<std::size_t>(destination)*row,row,1,row});
+    if(l0_.k_ring)
+        for(auto* ring:{l0_.k_ring,l0_.v_ring})
+            out.push_back({ring,ring,row,1,row,l0_oscar::kRingRows-1,source,destination});
+}
+
+void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream) {
+    if(!l0_.k_ring || position<=0) return;
+    constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim*sizeof(std::uint16_t);
+    const auto copy=[&](std::uint16_t* dst,const std::uint16_t* src,int rows) {
+        if(rows>0) cuda_check(cudaMemcpyAsync(dst,src,rows*row,cudaMemcpyDefault,stream),
+                          "L0 OSCAR window refresh");
+    };
+    const int sink=std::min(position,l0_oscar::kSink);
+    copy(l0_.k_sink,k_cache_,sink);
+    copy(l0_.v_sink,v_cache_,sink);
+    // Ring rows cover [max(kSink, history_end(position)), position), split at the wrap.
+    for(int first=std::max(l0_oscar::kSink,l0_oscar::history_end(position));first<position;) {
+        const int slot=first&(l0_oscar::kRingRows-1);
+        const int rows=std::min(position-first,l0_oscar::kRingRows-slot);
+        const std::size_t at=static_cast<std::size_t>(first)*kKVHeads*kHeadDim;
+        const std::size_t to=static_cast<std::size_t>(slot)*kKVHeads*kHeadDim;
+        copy(l0_.k_ring+to,k_cache_+at,rows);
+        copy(l0_.v_ring+to,v_cache_+at,rows);
+        first+=rows;
+    }
+    cuda_check(cudaMemsetAsync(l0_.state,0,2*sizeof(int),stream),"L0 OSCAR history reset");
+}
+
+int Exl3FullAttentionLayer::l0_history_watermark(cudaStream_t stream) const {
+    if(!l0_.k_codes) return 0;
+    int state[2]={0,0};
+    cuda_check(cudaMemcpyAsync(state,l0_.state,sizeof(state),cudaMemcpyDeviceToHost,stream),
+               "L0 OSCAR park watermark");
+    cuda_check(cudaStreamSynchronize(stream),"L0 OSCAR park watermark");
+    return std::clamp(state[0],0,l0_.capacity);
+}
+
+void Exl3FullAttentionLayer::l0_download_history(int first,int rows,std::uint8_t* codes,
+    std::uint16_t* meta,cudaStream_t stream) const {
+    if(!l0_.k_codes || rows<=0) return;
+    if(first<0 || first+rows>l0_.capacity) throw std::invalid_argument("L0 OSCAR park extent");
+    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kCodeBytes;
+    const std::size_t meta_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kMetaFloats;
+    const std::size_t code_bytes=rows*code_row,meta_elements=rows*meta_row;
+    cuda_check(cudaMemcpyAsync(codes,l0_.k_codes+first*code_row,code_bytes,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park codes");
+    cuda_check(cudaMemcpyAsync(codes+code_bytes,l0_.v_codes+first*code_row,code_bytes,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park codes");
+    cuda_check(cudaMemcpyAsync(meta,l0_.k_meta+first*meta_row,meta_elements*2,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park meta");
+    cuda_check(cudaMemcpyAsync(meta+meta_elements,l0_.v_meta+first*meta_row,meta_elements*2,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park meta");
+    cuda_check(cudaStreamSynchronize(stream),"L0 OSCAR park history");
+}
+
+void Exl3FullAttentionLayer::l0_upload_history(int first,int rows,const std::uint8_t* codes,
+    const std::uint16_t* meta,cudaStream_t stream) {
+    if(!l0_.k_codes || rows<=0) return;
+    if(first<0 || first+rows>l0_.capacity) throw std::invalid_argument("L0 OSCAR resume extent");
+    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kCodeBytes;
+    const std::size_t meta_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kMetaFloats;
+    const std::size_t code_bytes=rows*code_row,meta_elements=rows*meta_row;
+    cuda_check(cudaMemcpyAsync(l0_.k_codes+first*code_row,codes,code_bytes,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume codes");
+    cuda_check(cudaMemcpyAsync(l0_.v_codes+first*code_row,codes+code_bytes,code_bytes,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume codes");
+    cuda_check(cudaMemcpyAsync(l0_.k_meta+first*meta_row,meta,meta_elements*2,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume meta");
+    cuda_check(cudaMemcpyAsync(l0_.v_meta+first*meta_row,meta+meta_elements,meta_elements*2,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume meta");
+    // Pinned sources owned by the restored state; the watermark update syncs.
+}
+
+void Exl3FullAttentionLayer::l0_set_history_watermark(int rows,int position,cudaStream_t stream) {
+    if(!l0_.k_codes) return;
+    if(rows<0 || rows>l0_.capacity || rows>std::max(l0_oscar::history_end(position),l0_oscar::kSink))
+        throw std::invalid_argument("L0 OSCAR parked history extent");
+    const int state[2]={rows,position};
+    cuda_check(cudaMemcpyAsync(l0_.state,state,sizeof(state),cudaMemcpyHostToDevice,stream),"L0 OSCAR resume watermark");
+    cuda_check(cudaStreamSynchronize(stream),"L0 OSCAR resume watermark");
 }
 
 void Exl3FullAttentionLayer::set_position_device(const int* position_device) noexcept {
@@ -5655,7 +7704,7 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
     auto* up=buffers_[13];
     auto* act=buffers_[14];
     auto* down=buffers_[15];
-    rms_norm_kernel<<<rows,512,512*sizeof(float),stream>>>(post_resid,
+    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512*sizeof(float),stream,post_resid,
         weights_.post_attention_norm,mlp_in,rows,kHidden);
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail norm");
     const auto project=[&](Exl3CudaLinearWorkspace* workspace,
@@ -5728,7 +7777,7 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
             Exl3CudaLinearAdmission::target_continuation_gate_up);
         cuda_check(cudaGetLastError(),"capture HostKV MLP-tail up");
     }
-    silu_mul_kernel<<<(rows*kIntermediate+255)/256,256,0,stream>>>(
+    exl3_launch_small(silu_mul_kernel,dim3((rows*kIntermediate+255)/256),dim3(256),0,stream,
         gp,up,act,rows*kIntermediate);
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail SiLU");
     const bool down_small_m=rows>1 &&
@@ -5739,7 +7788,7 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
         act,down,down_small_m,
         Exl3CudaLinearAdmission::target_continuation_down);
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail down");
-    residual_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(
+    exl3_launch_small(residual_kernel,dim3((rows*kHidden+255)/256),dim3(256),0,stream,
         post_resid,down,output,rows*kHidden);
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail residual");
 }
@@ -5758,6 +7807,21 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     if (!input || !output || rows <= 0 || rows > max_rows_) {
         throw std::invalid_argument("invalid EXL3 full-attention layer input/output/rows");
     }
+    // Side-branch L2 prefetch of upcoming GEMV weights (see the GDN layer).
+    static const std::size_t prefetch_bytes=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
+        return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
+    }();
+    static const int prefetch_sites=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_FULL_SITES");
+        return value?std::atoi(value):31;
+    }();
+    const bool prefetch=exl3_l2_prefetch_enabled() && rows==1 && !wide_prefill && !profile &&
+        !mlp_tail_graph;
+    const auto prefetch_weights=[&](int site,const std::uint16_t* trellis) {
+        if(prefetch && trellis && (prefetch_sites&site))
+            exl3_l2_prefetch_fork(stream,trellis,prefetch_bytes);
+    };
     if(exact_prefix_rows_ || exact_page_ranges_.count) {
         exact_position_contract_.require_current(mrope_positions_,rope_offset_);
         if(!supports_segmented_exact_prefix())
@@ -5889,7 +7953,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
              target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
              metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
              ((reconstruct_gemm_->accepts_all_model_shapes() &&
-               (metadata.K == 6 || metadata.K == 7) && rows >= 256) ||
+               metadata.K >= 5 && metadata.K <= 8 && rows >= 256) ||
               ((operation == Exl3TargetProjectionOperator::gate ||
                 operation == Exl3TargetProjectionOperator::up) &&
                metadata.K == 6 && metadata.in_features == kHidden &&
@@ -6043,7 +8107,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     };
 
     begin(0);
-    rms_norm_kernel<<<rows, 512, 512 * sizeof(float), stream>>>(input, weights_.input_norm,
+    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,input, weights_.input_norm,
         input_norm, rows, kHidden);
     launch(cudaGetLastError(), "launch EXL3 input RMSNorm"); end(0);
 
@@ -6166,6 +8230,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             throw;
         }
     } else {
+        prefetch_weights(1,weights_.k.trellis);
         begin(1);
         // Suspension is explicit at the layer boundary, outside ordinary linear
         // dispatch. Private attention/KV/MLP state resumes only after Q is complete.
@@ -6176,6 +8241,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         if(!shared_q)project(linear_workspaces_[0],weights_.q,weights_.q_metadata,
             input_norm,qg,Exl3TargetProjectionOperator::q);
         launch(cudaGetLastError(),"launch EXL3 Q projection");end(1);
+        prefetch_weights(2,weights_.o.trellis);
         const bool m1_kv_pair=(fast_same_weights_fp16kv_m1_kv_pair_ ||
             fast_same_weights_fp16kv_m1_kv_wide_pair_) &&
             !preserve_m1_topology && !can_share_target && rows==1 &&
@@ -6196,7 +8262,15 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             weights_.k_metadata.out_features==kKVProjection &&
             weights_.v_metadata.out_features==kKVProjection;
         begin(2);
-        if(m1_kv_pair) {
+        const bool merged_kv=!m1_kv_pair && rows>=1 && rows<=8 && !can_share_target &&
+            !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
+            !wide_prefill && linear_workspaces_[1] && linear_workspaces_[2] &&
+            linear_workspaces_[1]->forward_merged_pair(*linear_workspaces_[2],
+                weights_.k,weights_.k_metadata,kp,weights_.v,weights_.v_metadata,vp,
+                input_norm,rows,stream);
+        if(merged_kv) {
+            launch(cudaGetLastError(),"launch merged EXL3 K/V projection");
+        } else if(m1_kv_pair) {
             if(fast_same_weights_fp16kv_m1_kv_wide_pair_)
                 linear_workspaces_[1]->forward_target_m1_kv_wide_pair_for_test(
                     *linear_workspaces_[2],weights_.k,weights_.k_metadata,
@@ -6217,7 +8291,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         }
         end(2);
         begin(3);
-        if(!m1_kv_pair) {
+        if(!m1_kv_pair && !merged_kv) {
             const bool shared_v=can_share_target && target_kv_executor_enabled_ &&
                 target_shared_admission(Exl3TargetSharedFamily::v,weights_.v_metadata).has_value() &&
                 target_q_executor_(Exl3TargetQContinuation{weights_.v,weights_.v_metadata,
@@ -6229,25 +8303,73 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         end(3);
     }
 
-    split_qg_kernel<<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(qg, qn, gp, rows);
+    // Decode rows: split, Q/K norms and RoPE in one launch (bit-identical).
+    static const bool fused_qk_prepare=[] {
+        const char* value=std::getenv("NINFER_EXL3_DECODE_QK_PREPARE");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    const bool qk_prepared=fused_qk_prepare && rows>=1 && rows<=8 && !wide_prefill &&
+        !profile && !mrope_positions_ && !rope_offset_;
+    if(qk_prepared) {
+        exl3_launch_small(decode_qk_prepare_kernel,dim3(rows*(kQHeads+kKVHeads)),dim3(256),0,stream,
+            qg,kp,weights_.q_norm,weights_.k_norm,qn,gp,kn,qr,kr,rows,position,position_device_,
+            position_device_?position_device_+1:nullptr);
+        launch(cudaGetLastError(), "launch EXL3 fused decode Q/K preparation");
+        begin(4); end(4); begin(5); end(5);
+    } else {
+    exl3_launch_small(split_qg_kernel,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qg, qn, gp, rows);
     launch(cudaGetLastError(), "launch EXL3 Q/gate split");
     begin(4);
-    rms_norm_kernel<<<rows * kQHeads, 256, 256 * sizeof(float), stream>>>(qn, weights_.q_norm,
+    exl3_launch_small(rms_norm_kernel,dim3(rows * kQHeads),dim3(256),256 * sizeof(float),stream,qn, weights_.q_norm,
         qn, rows * kQHeads, kHeadDim);
-    rms_norm_kernel<<<rows * kKVHeads, 256, 256 * sizeof(float), stream>>>(kp, weights_.k_norm,
+    exl3_launch_small(rms_norm_kernel,dim3(rows * kKVHeads),dim3(256),256 * sizeof(float),stream,kp, weights_.k_norm,
         kn, rows * kKVHeads, kHeadDim);
     launch(cudaGetLastError(), "launch EXL3 Q/K RMSNorm"); end(4);
 
     begin(5);
     if(mrope_positions_||rope_offset_){
-        rope_kernel<true><<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(qn,kn,qr,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
-        rope_k_kernel<true><<<(rows * kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(kn,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
+        exl3_launch_small(rope_kernel<true>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
+        exl3_launch_small(rope_k_kernel<true>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
     }else{
-        rope_kernel<false><<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(qn,kn,qr,kr,rows,position,position_device_,nullptr,0);
-        rope_k_kernel<false><<<(rows * kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(kn,kr,rows,position,position_device_,nullptr,0);
+        const int* chain_rows=position_device_?position_device_+1:nullptr;
+        exl3_launch_small(rope_kernel<false>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,nullptr,0,chain_rows);
+        exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0,chain_rows);
     }
     launch(cudaGetLastError(), "launch EXL3 RoPE"); end(5);
+    }
 
+    const char* attention_core_sample_option=std::getenv(
+        "NINFER_EXL3_TEST_ATTENTION_CORE_SAMPLE");
+    static std::atomic<int> attention_core_samples{0};
+    const int attention_core_sample_index=rows>=256 && wide_prefill &&
+        !capture_active_ && attention_core_sample_option &&
+        std::strcmp(attention_core_sample_option,"1")==0 ?
+        attention_core_samples.fetch_add(1,std::memory_order_relaxed):-1;
+    const bool attention_core_sample=rows>=256 && wide_prefill &&
+        !capture_active_ && attention_core_sample_index>=0 &&
+        attention_core_sample_index<16;
+    if(attention_core_sample && attention_core_sample_index==0) {
+        int max_shared=0;
+        cuda_check(cudaDeviceGetAttribute(&max_shared,
+            cudaDevAttrMaxSharedMemoryPerBlockOptin,0),
+            "query SM120 shared-memory ceiling");
+        cudaFuncAttributes attributes{};
+        cuda_check(cudaFuncGetAttributes(&attributes,
+            attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16>),
+            "query WMMA32 kernel resources");
+        std::fprintf(stderr,
+            "ATTENTION_RESOURCE_SAMPLE optin_shared_bytes=%d wmma32_static_shared_bytes=%zu wmma32_registers_per_thread=%d\n",
+            max_shared,attributes.sharedSizeBytes,attributes.numRegs);
+    }
+    cudaEvent_t attention_core_start{},attention_core_end{};
+    if(attention_core_sample) {
+        cuda_check(cudaEventCreate(&attention_core_start),
+            "create attention core sample start");
+        cuda_check(cudaEventCreate(&attention_core_end),
+            "create attention core sample end");
+        cuda_check(cudaEventRecord(attention_core_start,stream),
+            "record attention core sample start");
+    }
     begin(6);
     if (oscar_ != nullptr && capture_active_ && preserve_m1_topology && rows > 1) {
         if (rows <= 8 && oscar_->continuation_cohort_b8_enabled()) {
@@ -6322,11 +8444,25 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             position < 0 || position + rows > cache_capacity_) {
             throw std::invalid_argument("invalid EXL3 attention cache configuration");
         }
-        append_kv_cache_kernel<<<(rows * kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(
+        exl3_launch_small(append_kv_cache_kernel,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,
             kr, vp, k_cache_, v_cache_, rows, position, cache_capacity_, position_device_);
         launch(cudaGetLastError(), "append EXL3 attention KV cache");
+        if (l0_.k_codes) {
+            l0_oscar::window_append_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+                kr,vp,l0_.k_ring,l0_.v_ring,l0_.k_sink,l0_.v_sink,rows,position,position_device_);
+            const auto& a=l0_oscar::assets();
+            l0_oscar::encode_kernel<<<256,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
+                position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
+                reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta));
+            l0_oscar::advance_kernel<<<1,1,0,stream>>>(position_device_,position,l0_.state,
+                cache_capacity_);
+            launch(cudaGetLastError(),"L0 OSCAR history encode");
+        }
+        if (fakequant_watermark_)
+            kv_fakequant::age(k_cache_, v_cache_, cache_capacity_, position_device_, position,
+                              fakequant_watermark_, fakequant_bank_, stream);
         if(direct_staged_rows_) {
-            append_kv_cache_kernel<<<(rows * kKVHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(
+            exl3_launch_small(append_kv_cache_kernel,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,
                 kr, vp, direct_staged_k_, direct_staged_v_, rows, position,
                 cache_capacity_, position_device_);
             launch(cudaGetLastError(), "append direct staged EXL3 attention KV");
@@ -6359,19 +8495,341 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 exact_attention_gqa_six_softmax_fused_scalar_values_ ? 1 : 0,
                 profile ? 1 : 0, position);
         }
-        if ((fast_prefill_wmma32_attention_ || fast_prefill_wmma_attention_) &&
+        // The guarded verifier route uses the same fused attention reduction
+        // for scalar seeds and B2..B8 proposals.  The older tiled prefill
+        // branch otherwise intercepts those small batches first.
+        const bool fused_flash_eligible=fast_fused_flash_attention_ &&
+            (rows==1 || (fast_fused_flash_multirow_ && rows>=2 && rows<=8)) &&
+            position>0 && (!capture_active_ || ordinary_full_layer_graph_capture_) &&
+            !direct_staged_rows_ && !exact_prefix_rows_ &&
+            !exact_page_ranges_.count &&
+            exact_scores_ && exact_score_rows_>=rows &&
+            exact_attention_gqa_six_scores_ &&
+            exact_attention_gqa_six_softmax_triple_values_ &&
+            !exact_attention_gqa_six_softmax_fused_scalar_values_;
+        const int l0_prefill_history=(l0_.k_codes && rows>8 && !fused_flash_eligible)?
+            std::min(l0_oscar::history_end(position),cache_capacity_):0;
+        if (l0_prefill_history>l0_oscar::kSink) {
+            if(capture_active_ || rows>l0_.prefill_rows || direct_staged_rows_ ||
+               exact_prefix_rows_ || exact_page_ranges_.count ||
+               position+rows-l0_prefill_history>l0_oscar::kRingRows)
+                throw std::invalid_argument("L0 OSCAR prefill route preconditions");
+            const auto& a=l0_oscar::assets();
+            constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
+            l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
+                rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
+            l0_history_prefill_kernel<<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
+                kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,0,stream>>>(l0_.q_rot,l0_.q_mu,
+                l0_.k_codes,l0_.v_codes,reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.prefill_hist,
+                l0_.prefill_hist_stats,rows,l0_prefill_history);
+            l0_history_split_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
+                l0_.prefill_hist_stats,reinterpret_cast<__half*>(l0_.prefill_numer),
+                l0_.prefill_split_stats,rows,4);
+            l0_launch_rotate(l0_.prefill_numer,a.rvt16+l0_.bank*bank_elements,
+                l0_.prefill_split+static_cast<std::size_t>(4)*rows*kQHeads*kHeadDim,rows,
+                nullptr,nullptr,stream);
+            launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
+                cache_capacity_,l0_.prefill_split,l0_.prefill_split_stats,stream,
+                l0_prefill_history,false,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+            attention_wmma32_split_merge_kernel<5><<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                l0_.prefill_split,l0_.prefill_split_stats,attn,rows);
+            launch(cudaGetLastError(),"L0 OSCAR prefill attention");
+        } else if ((fast_prefill_wmma32_attention_ || fast_prefill_wmma_attention_) &&
             fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
-            !exact_page_ranges_.count && !numeric_attention_splitk_) {
+            !exact_page_ranges_.count && !numeric_attention_splitk_ &&
+            !fused_flash_eligible) {
             // T77 is selected explicitly when requested; T75 remains the
             // fallback WMMA candidate under its original gate.
-            if (fast_prefill_wmma32_attention_) {
-                attention_cached_gqa_six_wmma32_prefill_kernel<<<
+            if (fast_wmma32_split2_output_ && fast_wmma32_split2_capacity_splits_>=4 &&
+                fast_wmma32_split2_capacity_rows_>=rows && exl3_fa2_prefill_enabled()) {
+                // L0 OSCAR while every key still fits the device sink and window
+                // ring: read them there, not from the host-mapped cache.
+                const bool l0_window=l0_.k_ring && position+rows<=l0_oscar::kRingRows;
+                if(l0_window && position+rows>=2048)
+                    launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
+                        cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream,
+                        0,true,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                else if(l0_window)
+                    launch_fa2_prefill_variant<1>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
+                        cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream,
+                        0,true,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                else
+                    launch_fa2_prefill(qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream);
+                static std::atomic<int> fa2_prefill_dispatches{0};
+                if(fa2_prefill_dispatches.fetch_add(1,std::memory_order_relaxed)==0)
+                    std::fprintf(stderr,"FA2_PREFILL_DISPATCH rows=%d position=%d\n",rows,position);
+            } else if (fast_wmma32_split2_output_ && fast_prefill_wmma32_attention_ &&
+                position+rows>=8192) {
+                if(!fast_wmma32_split2_stats_ ||
+                   fast_wmma32_split2_capacity_rows_<rows)
+                    throw std::logic_error("WMMA32 split2 workspace extent");
+                if(fast_prefill_wmma64_attention_ && rows%64==0 &&
+                   fast_wmma32_split_count_==2) {
+                    if(fast_prefill_wmma64_shared_heads_attention_ &&
+                       fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim+16,2,2><<<
+                            dim3(rows/32,kKVHeads,2*kQHeads/(kKVHeads*2)),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_shared_heads_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim,2,2><<<
+                            dim3(rows/32,kKVHeads,2*kQHeads/(kKVHeads*2)),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_register_keys64_attention_ &&
+                            fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim+16,2,1,64><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_register_keys64_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim,2,1,64><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_register_attention_ &&
+                       fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim+16,2><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(fast_prefill_wmma64_register_attention_)
+                        attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                            kHeadDim,2><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else if(launch_wmma32_register_selected<2,64>(qr,attention_k,
+                                attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                                fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(fast_prefill_wmma32_padded_attention_)
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,2,64><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,2,64><<<
+                            dim3(rows/64,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    if(fast_prefill_wmma64_attention_counter.fetch_add(
+                           1,std::memory_order_relaxed)==0)
+                        std::fprintf(stderr,
+                            "WMMA64_PREFILL_DISPATCH split=2 rows=%d register=%d heads=%d keys=%d\n",
+                            rows,fast_prefill_wmma64_register_attention_?1:0,
+                            fast_prefill_wmma64_shared_heads_attention_?2:1,
+                            fast_prefill_wmma64_register_keys64_attention_?64:32);
+                } else if(fast_wmma32_split_count_==4) {
+                    if(fast_prefill_wmma32_padded_attention_)
+                    {
+                    if(launch_wmma32_register_selected<4>(qr,attention_k,
+                           attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                           fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(wmma32_vector_loads_enabled())
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,4,32,true><<<
+                            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,4><<<
+                            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    }
+                    else
+                    {
+                    if(launch_wmma32_register_selected<4>(qr,attention_k,
+                           attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                           fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(wmma32_vector_loads_enabled())
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,4,32,true><<<
+                            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,4><<<
+                            dim3((rows+31)/32,kKVHeads,4*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    }
+                } else {
+                    if(fast_wmma32_split_count_!=2)
+                        throw std::logic_error("WMMA32 split count");
+                    if(fast_prefill_wmma32_padded_attention_)
+                    {
+                    if(launch_wmma32_register_selected<2>(qr,attention_k,
+                           attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                           fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(wmma32_vector_loads_enabled())
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,2,32,true><<<
+                            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim+16,2><<<
+                            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    }
+                    else
+                    {
+                    if(launch_wmma32_register_selected<2>(qr,attention_k,
+                           attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                           fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream)) {
+                    } else if(wmma32_vector_loads_enabled())
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,2,32,true><<<
+                            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    else
+                        attention_cached_gqa_six_wmma32_prefill_kernel<
+                            kHeadDim,2><<<
+                            dim3((rows+31)/32,kKVHeads,2*kQHeads/kKVHeads),
+                            256,0,stream>>>(qr,attention_k,attention_v,attn,
+                            rows,position,cache_capacity_,nullptr,0,
+                            fast_wmma32_split2_output_,fast_wmma32_split2_stats_);
+                    }
+                }
+                launch(cudaGetLastError(),"launch WMMA32 split2 partials");
+                if(fast_wmma32_split_count_==4)
+                    attention_wmma32_split_merge_kernel<4><<<
+                        (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                        fast_wmma32_split2_output_,fast_wmma32_split2_stats_,
+                        attn,rows);
+                else
+                    attention_wmma32_split_merge_kernel<2><<<
+                        (rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                        fast_wmma32_split2_output_,fast_wmma32_split2_stats_,
+                        attn,rows);
+            } else if (fast_prefill_wmma64_attention_ && rows%64==0) {
+                if(fast_prefill_wmma64_shared_heads_attention_ &&
+                   fast_prefill_wmma32_padded_attention_ &&
+                   position+rows>=8192)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim+16,1,2><<<
+                        dim3(rows/32,kKVHeads,kQHeads/(kKVHeads*2)),
+                        256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_shared_heads_attention_)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim,1,2><<<
+                        dim3(rows/32,kKVHeads,kQHeads/(kKVHeads*2)),
+                        256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_register_keys64_attention_ &&
+                   fast_prefill_wmma32_padded_attention_ &&
+                   position+rows>=8192)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim+16,1,1,64><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_register_keys64_attention_)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim,1,1,64><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_register_attention_ &&
+                   fast_prefill_wmma32_padded_attention_ &&
+                   position+rows>=8192)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim+16,1><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(fast_prefill_wmma64_register_attention_)
+                    attention_cached_gqa_six_wmma64_register_prefill_kernel<
+                        kHeadDim,1><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else if(launch_wmma32_register_selected<1,64>(qr,attention_k,
+                            attention_v,attn,rows,position,cache_capacity_,nullptr,0,
+                            nullptr,nullptr,stream)) {
+                } else if(fast_prefill_wmma32_padded_attention_ && position+rows>=8192)
+                    attention_cached_gqa_six_wmma32_prefill_kernel<
+                        kHeadDim+16,1,64><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                else
+                    attention_cached_gqa_six_wmma32_prefill_kernel<
+                        kHeadDim,1,64><<<
+                        dim3(rows/64,kKVHeads,kQHeads/kKVHeads),256,0,stream>>>(
+                        qr,attention_k,attention_v,attn,rows,position,
+                        cache_capacity_,nullptr,0,nullptr,nullptr);
+                if(fast_prefill_wmma64_attention_counter.fetch_add(
+                       1,std::memory_order_relaxed)==0)
+                    std::fprintf(stderr,
+                        "WMMA64_PREFILL_DISPATCH split=1 rows=%d register=%d heads=%d keys=%d\n",
+                        rows,fast_prefill_wmma64_register_attention_?1:0,
+                        fast_prefill_wmma64_shared_heads_attention_?2:1,
+                        fast_prefill_wmma64_register_keys64_attention_?64:32);
+            } else if (fast_prefill_wmma32_padded_attention_ &&
+                position+rows>=8192 && wmma32_vector_loads_enabled()) {
+                if(!launch_wmma32_register_selected<1>(qr,attention_k,attention_v,
+                       attn,rows,position,cache_capacity_,nullptr,0,nullptr,nullptr,stream))
+                attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16,1,32,true><<<
                     dim3((rows + 31) / 32, kKVHeads,
                          kQHeads / kKVHeads), 256, 0, stream>>>(
                     qr, attention_k, attention_v, attn, rows, position,
-                    cache_capacity_, nullptr, 0);
+                    cache_capacity_, nullptr, 0,nullptr,nullptr);
+            } else if (fast_prefill_wmma32_padded_attention_ &&
+                position+rows>=8192) {
+                attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim+16><<<
+                    dim3((rows + 31) / 32, kKVHeads,
+                         kQHeads / kKVHeads), 256, 0, stream>>>(
+                    qr, attention_k, attention_v, attn, rows, position,
+                    cache_capacity_, nullptr, 0,nullptr,nullptr);
+            } else if (fast_prefill_wmma32_attention_ && wmma32_vector_loads_enabled()) {
+                if(!launch_wmma32_register_selected<1>(qr,attention_k,attention_v,
+                       attn,rows,position,cache_capacity_,nullptr,0,nullptr,nullptr,stream))
+                attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim,1,32,true><<<
+                    dim3((rows + 31) / 32, kKVHeads,
+                         kQHeads / kKVHeads), 256, 0, stream>>>(
+                    qr, attention_k, attention_v, attn, rows, position,
+                    cache_capacity_, nullptr, 0,nullptr,nullptr);
+            } else if (fast_prefill_wmma32_attention_) {
+                attention_cached_gqa_six_wmma32_prefill_kernel<kHeadDim><<<
+                    dim3((rows + 31) / 32, kKVHeads,
+                         kQHeads / kKVHeads), 256, 0, stream>>>(
+                    qr, attention_k, attention_v, attn, rows, position,
+                    cache_capacity_, nullptr, 0,nullptr,nullptr);
             } else {
                 attention_cached_gqa_six_wmma_prefill_kernel<<<
                     dim3((rows + 15) / 16, kKVHeads,
@@ -6393,7 +8851,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if (fast_prefill_rows8_attention_ && fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
-            !exact_page_ranges_.count && !numeric_attention_splitk_) {
+            !exact_page_ranges_.count && !numeric_attention_splitk_ &&
+            !fused_flash_eligible) {
             // T74 numerical candidate: eight adjacent causal rows share the
             // represented K/V load.  Its smaller key tile keeps the larger
             // query block below the physical-C1 shared-memory limit; the
@@ -6417,7 +8876,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if (fast_prefill_rows2_attention_ && fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
-            !exact_page_ranges_.count && !numeric_attention_splitk_) {
+            !exact_page_ranges_.count && !numeric_attention_splitk_ &&
+            !fused_flash_eligible) {
             attention_cached_gqa_six_online_rows_kernel<2><<<
                 ((rows + 1) / 2) * kKVHeads, 256, 0, stream>>>(
                     qr, attention_k, attention_v, attn, rows, position,
@@ -6431,7 +8891,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if (fast_prefill_rows4_attention_ && fast_prefill_tiled_attention_ &&
             rows > 1 && rows <= 1024 && !capture_active_ &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
-            !exact_page_ranges_.count && !numeric_attention_splitk_) {
+            !exact_page_ranges_.count && !numeric_attention_splitk_ &&
+            !fused_flash_eligible) {
             // T73 numerical candidate: four adjacent causal rows share each
             // represented K/V load within one CTA. Keep the established T71
             // counter as the umbrella Fast-prefill dispatch and expose the
@@ -6449,7 +8910,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if (fast_prefill_tiled_attention_ && rows > 1 && rows <= 1024 &&
                    !capture_active_ && !direct_staged_rows_ &&
                    !exact_prefix_rows_ && !exact_page_ranges_.count &&
-                   !numeric_attention_splitk_) {
+                   !numeric_attention_splitk_ && !fused_flash_eligible) {
             // Numerical Fast prefill candidate. T71 qualified this online
             // softmax/value organization against the exact represented-input
             // route; it is explicitly excluded from the exact/reference lane.
@@ -6576,14 +9037,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                    "launch FAST whole-context same-weight FP16-KV attention");
             fast_whole_context_fused_attention_counter.fetch_add(
                 1,std::memory_order_relaxed);
-        } else if(fast_fused_flash_attention_ && rows==1 && position>0 &&
-                  (!capture_active_ || ordinary_full_layer_graph_capture_) &&
-                  !direct_staged_rows_ &&
-                  !exact_prefix_rows_ && !exact_page_ranges_.count &&
-                  exact_scores_ && exact_score_rows_>=rows &&
-                  exact_attention_gqa_six_scores_ &&
-                  exact_attention_gqa_six_softmax_triple_values_ &&
-                  !exact_attention_gqa_six_softmax_fused_scalar_values_) {
+        } else if(fused_flash_eligible) {
             if (ordinary_full_layer_graph_capture_ &&
                 std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                 std::fprintf(stderr,
@@ -6597,11 +9051,58 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             const int segments=(count+fused_keys-1)/fused_keys;
             const std::size_t required=static_cast<std::size_t>(rows)*kKVHeads*
                 segments*kFastFusedFlashStride*sizeof(float);
-            if(required>exl3_exact_attention_score_bytes(exact_score_rows_,
+            // L0 OSCAR sizes its verifier segments to the exact window.
+            if(!l0_.k_codes && required>exl3_exact_attention_score_bytes(exact_score_rows_,
                                                          cache_capacity_))
                 throw std::invalid_argument(
                     "FAST fused flash attention scratch extent");
-            if(fast_fused_flash_attention_keys256_)
+            const bool mma=fast_fused_flash_attention_keys256_&&verify_flash_mma_enabled();
+            if(l0_.k_codes && !mma)
+                throw std::invalid_argument("L0 OSCAR history requires the verifier MMA route");
+            const float* history_slot=nullptr;
+            if(l0_.k_codes) {
+                if(rows>l0_.rows) throw std::invalid_argument("L0 OSCAR history rows");
+                const auto& a=l0_oscar::assets();
+                constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
+                l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
+                    rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
+                const dim3 grid(l0_.segments,kKVHeads);
+                const auto history=[&](auto kernel) {
+                    static const bool configured=[&] {
+                        cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            static_cast<int>(l0_history_smem_bytes())),"configure L0 history shared memory");
+                        return true;
+                    }();
+                    (void)configured;
+                    kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes(),stream>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
+                        reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.hist_work,rows,position,cache_capacity_,
+                        l0_.segments,position_device_);
+                };
+                history(l0_history_mma_kernel<64>);
+                l0_history_merge_kernel<<<rows*kQHeads,256,0,stream>>>(l0_.hist_work,
+                    l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,l0_.segments,
+                    l0_.segment_keys,position,cache_capacity_,position_device_);
+                l0_launch_rotate<float,true>(l0_.hist_rotated,a.rvt16+l0_.bank*bank_elements,
+                    l0_.hist_slot,rows,nullptr,nullptr,stream);
+                launch(cudaGetLastError(),"L0 OSCAR history attention");
+                history_slot=l0_.hist_slot;
+            }
+            if(mma && l0_.k_ring)
+                launch_verify_flash_mma(qr,l0_.k_ring,l0_.v_ring,exact_scores_,
+                    exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
+                    attn,rows,position,cache_capacity_,position_device_,stream,0,
+                    history_slot,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+            else if(mma)
+                launch_verify_flash_mma(qr,attention_k,attention_v,exact_scores_,
+                    exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
+                    attn,rows,position,cache_capacity_,position_device_,stream,0,
+                    history_slot);
+            else if(fast_fused_flash_attention_keys256_&&fused_flash_staged_k_enabled())
+                attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256,true><<<
+                    rows*kKVHeads*segments,256,0,stream>>>(
+                        qr,attention_k,attention_v,exact_scores_,attn,rows,position,
+                        cache_capacity_,segments,position_device_,0);
+            else if(fast_fused_flash_attention_keys256_)
                 attention_cached_gqa_six_fused_flash_kernel<kFastFusedFlashKeys256><<<
                     rows*kKVHeads*segments,256,0,stream>>>(
                         qr,attention_k,attention_v,exact_scores_,attn,rows,position,
@@ -6611,12 +9112,14 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     rows*kKVHeads*segments,256,0,stream>>>(
                         qr,attention_k,attention_v,exact_scores_,attn,rows,position,
                         cache_capacity_,segments,position_device_,0);
-            attention_cached_gqa_six_fused_flash_merge_kernel<<<
-                rows*kKVHeads,256,0,stream>>>(
-                    exact_scores_,attn,rows,segments);
+            if(!mma)
+                launch_fused_flash_merge(exact_scores_,attn,rows,segments,position,
+                    cache_capacity_,fused_keys,position_device_,stream);
             launch(cudaGetLastError(),
                    "launch FAST same-weight FP16-KV fused flash attention");
             fast_fused_flash_attention_counter.fetch_add(
+                1,std::memory_order_relaxed);
+            if(rows>1)fast_fused_flash_multirow_attention_counter.fetch_add(
                 1,std::memory_order_relaxed);
         } else if(numeric_attention_splitk_) {
             const std::size_t required=exl3_numeric_attention_splitk_workspace_bytes(
@@ -7208,21 +9711,41 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         attention_kernel<<<rows * kQHeads, 256, 0, stream>>>(qr, kr, vp, attn, rows);
     }
     launch(cudaGetLastError(), "launch EXL3 causal GQA");
-    sigmoid_mul_kernel<<<(rows * kQHeads * kHeadDim + 255) / 256, 256, 0, stream>>>(gp, attn,
+    exl3_launch_small(sigmoid_mul_kernel,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,gp, attn,
         rows * kQHeads * kHeadDim);
     launch(cudaGetLastError(), "launch EXL3 attention output gate"); end(6);
+    if(attention_core_sample) {
+        cuda_check(cudaEventRecord(attention_core_end,stream),
+            "record attention core sample end");
+        cuda_check(cudaEventSynchronize(attention_core_end),
+            "resolve attention core sample");
+        float attention_core_ms=0.0f;
+        cuda_check(cudaEventElapsedTime(&attention_core_ms,
+            attention_core_start,attention_core_end),
+            "read attention core sample");
+        std::fprintf(stderr,
+            "ATTENTION_CORE_SAMPLE layer=%d rows=%d position=%d ms=%.6f\n",
+            model_layer_,rows,position,attention_core_ms);
+        cudaEventDestroy(attention_core_start);
+        cudaEventDestroy(attention_core_end);
+    }
 
+    prefetch_weights(4,weights_.gate.trellis);
     begin(7);
     const bool shared_o=can_share_target && target_o_executor_enabled_ &&
         target_shared_admission(Exl3TargetSharedFamily::o,weights_.o_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.o,weights_.o_metadata,
             attn,op,rows,position,model_layer_,stream,Exl3TargetSharedFamily::o});
+    if(!shared_o && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+       !projection_observer_)
+        linear_workspaces_[3]->arm_residual(input,post_resid);
     if(!shared_o)project(linear_workspaces_[3], weights_.o, weights_.o_metadata, attn, op,
             Exl3TargetProjectionOperator::o);
     launch(cudaGetLastError(), "launch EXL3 output projection"); end(7);
 
     begin(8);
-    residual_kernel<<<(rows * kHidden + 255) / 256, 256, 0, stream>>>(input, op, post_resid,
+    if(!linear_workspaces_[3]->take_residual_applied())
+    exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,input, op, post_resid,
         rows * kHidden);
     launch(cudaGetLastError(), "launch EXL3 attention residual");
     if(mlp_tail_graph) {
@@ -7236,16 +9759,32 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         end(8);
         mlp_tail_graph->launch(stream);
     } else {
-    rms_norm_kernel<<<rows, 512, 512 * sizeof(float), stream>>>(post_resid, weights_.post_attention_norm,
+    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,post_resid, weights_.post_attention_norm,
         mlp_in, rows, kHidden);
     launch(cudaGetLastError(), "launch EXL3 attention residual and norm"); end(8);
+    prefetch_weights(8,weights_.down.trellis);
 
+    // Fused prefill MLP (quantized route): gate/up stay untransformed and the
+    // quantized down input is produced in one pass.
+    const bool fused_prefill_mlp = wide_prefill && reconstruct_gemm_ &&
+        !capture_active_ && !oscar_ && !profile && !projection_timing_ &&
+        !projection_observer_ && !can_share_target && rows >= 256 &&
+        reconstruct_gemm_->forward_numeric_mlp(weights_.gate, weights_.gate_metadata,
+            weights_.up, weights_.up_metadata, weights_.down, weights_.down_metadata,
+            mlp_in, gp, up, act, down, rows, stream);
+    if (fused_prefill_mlp) {
+        launch(cudaGetLastError(), "launch fused EXL3 prefill MLP");
+        exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,
+            post_resid, down, output, rows * kHidden);
+        launch(cudaGetLastError(), "launch EXL3 final residual");
+    } else {
     const bool concurrent_mlp_gateup =
         eager_mlp_gateup_concurrency_.complete() && !capture_active_ && !oscar_ &&
         !profile && !projection_timing_ && !projection_observer_ &&
         (preserve_m1_topology || rows == 1) && !wide_prefill &&
         rows >= 1 && rows <= 8 &&
         !(can_share_target && target_gateup_executor_enabled_);
+    bool merged_gate_up = false;
     if (concurrent_mlp_gateup) {
         launch(cudaEventRecord(eager_mlp_gateup_concurrency_.fork, stream),
                "record eager full-attention MLP gate/up fork");
@@ -7298,12 +9837,20 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,stream);
             ++fast_same_weights_fp16kv_m1_gate_up_pair_submissions_;
         }
-        const bool paired_gate_up=!paired_m1_gate_up && !can_share_target &&
+        merged_gate_up=!paired_m1_gate_up && rows>=1 && rows<=8 && !can_share_target &&
+            !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
+            !wide_prefill && !small_m_fused_gate_up_transform_ &&
+            linear_workspaces_[4]->forward_merged_gate_up_silu(*linear_workspaces_[5],
+                weights_.gate,weights_.gate_metadata,weights_.up,weights_.up_metadata,
+                mlp_in,gp,up,act,rows,stream,
+                target_down_executor_enabled_?nullptr:&weights_.down,
+                target_down_executor_enabled_?nullptr:linear_workspaces_[6]);
+        const bool paired_gate_up=!paired_m1_gate_up && !merged_gate_up && !can_share_target &&
             !profile && !projection_timing_ &&
             !projection_observer_ && linear_workspaces_[4]->forward_target_prefill_gate_up_pair(
                 *linear_workspaces_[5],weights_.gate,weights_.gate_metadata,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,rows,stream);
-        const bool shared_gate=paired_m1_gate_up || paired_gate_up ||
+        const bool shared_gate=paired_m1_gate_up || merged_gate_up || paired_gate_up ||
             (can_share_target && target_gateup_executor_enabled_ &&
             target_shared_admission(Exl3TargetSharedFamily::gate,weights_.gate_metadata).has_value() &&
             target_q_executor_(Exl3TargetQContinuation{weights_.gate,weights_.gate_metadata,
@@ -7312,7 +9859,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 Exl3TargetProjectionOperator::gate);
         launch(cudaGetLastError(), "launch EXL3 gate projection"); end(9);
         begin(10);
-        const bool shared_up=paired_m1_gate_up || paired_gate_up ||
+        const bool shared_up=paired_m1_gate_up || merged_gate_up || paired_gate_up ||
             (can_share_target && target_gateup_executor_enabled_ &&
             target_shared_admission(Exl3TargetSharedFamily::up,weights_.up_metadata).has_value() &&
             target_q_executor_(Exl3TargetQContinuation{weights_.up,weights_.up_metadata,
@@ -7329,31 +9876,39 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         !weights_.down_metadata.mcg && weights_.down_metadata.mul1 &&
         !weights_.down_metadata.has_bias;
     begin(11);
-    if(fused_gate_up) {
+    if(merged_gate_up) {
+    } else if(fused_gate_up) {
         linear_workspaces_[6]->transform_gate_up(
             weights_.down,weights_.down_metadata,gp,up,act,rows,stream,
             rows==1 ? Exl3CudaLinearAdmission::ordinary :
                 Exl3CudaLinearAdmission::target_continuation_down);
         ++fused_gate_up_submissions_;
     } else {
-        silu_mul_kernel<<<(rows * kIntermediate + 255) / 256, 256, 0, stream>>>(
+        exl3_launch_small(silu_mul_kernel,dim3((rows * kIntermediate + 255) / 256),dim3(256),0,stream,
             gp,up,act,rows*kIntermediate);
         launch(cudaGetLastError(), "launch EXL3 SiLU gate");
     }
     end(11);
     begin(12);
+    prefetch_weights(16,next_layer_prefetch_);
     const bool shared_down=can_share_target && target_down_executor_enabled_ &&
         target_shared_admission(Exl3TargetSharedFamily::down,weights_.down_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
             act,down,rows,position,model_layer_,stream,Exl3TargetSharedFamily::down});
+    if(!shared_down && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+       !projection_observer_)
+        linear_workspaces_[6]->arm_residual(post_resid,output);
     if(!shared_down)project(linear_workspaces_[6], weights_.down, weights_.down_metadata, act, down,
             Exl3TargetProjectionOperator::down,
-            fused_gate_up?linear_workspaces_[6]->transformed_device():nullptr);
+            (fused_gate_up||merged_gate_up)?linear_workspaces_[6]->transformed_device():nullptr);
     launch(cudaGetLastError(), "launch EXL3 down projection");
-    residual_kernel<<<(rows * kHidden + 255) / 256, 256, 0, stream>>>(post_resid, down, output,
+    if(!linear_workspaces_[6]->take_residual_applied())
+    exl3_launch_small(residual_kernel,dim3((rows * kHidden + 255) / 256),dim3(256),0,stream,post_resid, down, output,
         rows * kHidden);
     launch(cudaGetLastError(), "launch EXL3 final residual"); end(12);
     }
+    }
+    if(prefetch) exl3_l2_prefetch_join(stream);
 
     if (profile) {
         cudaEvent_t total_end{};

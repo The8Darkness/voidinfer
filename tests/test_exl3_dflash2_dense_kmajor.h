@@ -6,7 +6,7 @@ void run_dflash2_dense_kmajor_qualification() {
     struct Shape {int rows,k,n;};
     std::size_t values=0;
     int cases=0;
-    for(const auto shape:std::array<Shape,2>{{{1,32,33},{7,5120,1280}}}) {
+    for(const auto shape:std::array<Shape,5>{{{1,32,33},{7,5120,1280},{8,5120,1280},{1,5120,1280},{7,5120,256}}}) {
         const auto input_count=static_cast<std::size_t>(shape.rows)*shape.k;
         const auto weight_count=static_cast<std::size_t>(shape.n)*shape.k;
         const auto output_count=static_cast<std::size_t>(shape.rows)*shape.n;

@@ -101,7 +101,7 @@ public:
 
     ~EngineCore() noexcept {
         {
-            std::lock_guard lock(queue_mutex_);
+            std::lock_guard<std::mutex> lock(queue_mutex_);
             stopping_ = true;
         }
         queue_cv_.notify_all();
@@ -188,7 +188,7 @@ public:
         std::uint64_t request_id        = 0;
         std::uint64_t publication_order = 0;
         {
-            std::lock_guard lock(queue_mutex_);
+            std::lock_guard<std::mutex> lock(queue_mutex_);
             if (stopping_ || failed_) {
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
@@ -226,7 +226,7 @@ public:
         }
 
         {
-            std::lock_guard lock(queue_mutex_);
+            std::lock_guard<std::mutex> lock(queue_mutex_);
             if (stopping_ || failed_) {
                 --outstanding_;
                 throw RequestError(RequestErrorKind::Unavailable,
@@ -240,7 +240,7 @@ public:
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
+        std::scoped_lock<std::mutex> lock(execution_mutex_);
         MemorySummary out                      = instance_.program->memory_summary();
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
@@ -257,13 +257,13 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
+        std::lock_guard<std::mutex> lock(stats_mutex_);
         return published_stats_;
     }
 
     void reset_memory_peaks() noexcept {
         try {
-            std::scoped_lock lock(execution_mutex_);
+            std::scoped_lock<std::mutex> lock(execution_mutex_);
             instance_.program->reset_memory_peaks();
         } catch (...) {}
     }
@@ -526,7 +526,7 @@ private:
         RuntimeStats snapshot = cumulative_stats_;
         resources_.populate_runtime_stats(*instance_.program, snapshot);
         {
-            std::lock_guard lock(queue_mutex_);
+            std::lock_guard<std::mutex> lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = 0;
@@ -548,7 +548,7 @@ private:
         phase_range.reset();
         finish_engine_phase(measurement, EngineHostPhase::Maintenance);
         snapshot.host_work = cumulative_stats_.host_work;
-        std::lock_guard lock(stats_mutex_);
+        std::lock_guard<std::mutex> lock(stats_mutex_);
         published_stats_ = snapshot;
     }
 
@@ -594,7 +594,7 @@ private:
         bool done=false;std::exception_ptr worker_error;
         bool delivery_reopened=false;
         {
-            std::lock_guard lock(request->mutex);
+            std::lock_guard<std::mutex> lock(request->mutex);
             events.swap(request->events);
             if(!events.empty()) {
                 request->pending_delivery_events.store(0,std::memory_order_release);
@@ -620,7 +620,7 @@ private:
         if(worker_error)return {GenerationPollState::Error,{},worker_error};
         GenerationPollResult result;result.state=GenerationPollState::Completed;
         {
-            std::lock_guard lock(request->mutex);
+            std::lock_guard<std::mutex> lock(request->mutex);
             result.result.emplace(std::move(request->result));
         }
         return result;
@@ -637,7 +637,7 @@ private:
 
         for (;;) {
             {
-                std::unique_lock lock(request->mutex);
+                std::unique_lock<std::mutex> lock(request->mutex);
                 request->cv.wait_for(lock,std::chrono::milliseconds(10),[&] {
                     return request->response_done || !request->events.empty();
                 });
@@ -679,7 +679,7 @@ private:
         if (output.empty()) { return; }
         const bool streaming = request->consumer_mode == OutputConsumerMode::Streaming;
         {
-            std::lock_guard lock(request->mutex);
+            std::lock_guard<std::mutex> lock(request->mutex);
             if(streaming && (request->events.size()>Request::maximum_pending_delivery_events ||
                     output.size()>Request::maximum_pending_delivery_events-request->events.size()))
                 throw std::logic_error("bounded streaming delivery queue overflow");
@@ -696,14 +696,14 @@ private:
     }
 
     void release_reserved_capacity() noexcept {
-        std::lock_guard lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(queue_mutex_);
         if (outstanding_ != 0) { --outstanding_; }
     }
 
     void release_consumer(const std::shared_ptr<Request>& request) noexcept {
         bool release = false;
         {
-            std::lock_guard lock(request->mutex);
+            std::lock_guard<std::mutex> lock(request->mutex);
             request->consumer_released = true;
             if (request->response_done && !request->capacity_released) {
                 request->capacity_released = true;
@@ -723,7 +723,7 @@ private:
     bool mark_completed(const std::shared_ptr<Request>& request) noexcept {
         bool release = false;
         {
-            std::lock_guard lock(request->mutex);
+            std::lock_guard<std::mutex> lock(request->mutex);
             if (request->consumer_released && !request->capacity_released) {
                 request->capacity_released = true;
                 release                    = true;
@@ -745,7 +745,7 @@ private:
         request->budget.reset();
         request->terminal_reason.reset();
         {
-            std::lock_guard lock(request->mutex);
+            std::lock_guard<std::mutex> lock(request->mutex);
             if (request->response_done) { return; }
             request->error         = std::move(error);
             request->response_done = true;
@@ -795,7 +795,7 @@ private:
         finish_engine_phase(completion, EngineHostPhase::CommitOutput);
         result.engine_timing = request->host_timing.public_snapshot();
         {
-            std::lock_guard lock(request->mutex);
+            std::lock_guard<std::mutex> lock(request->mutex);
             if (request->response_done) { return; }
             request->result        = std::move(result);
             request->response_done = true;
@@ -915,7 +915,7 @@ private:
         std::vector<std::shared_ptr<Request>> expired;
         bool have_pending = false;
         {
-            std::lock_guard lock(queue_mutex_);
+            std::lock_guard<std::mutex> lock(queue_mutex_);
             const auto now = Clock::now();
             for (auto it = pending_.begin(); it != pending_.end();) {
                 if ((*it)->cancelled.load(std::memory_order_acquire)) {
@@ -1279,17 +1279,17 @@ private:
     }
 
     [[nodiscard]] FifoSnapshot pending_snapshot() const {
-        std::lock_guard lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(queue_mutex_);
         return Scheduling::fifo_snapshot(pending_);
     }
 
     [[nodiscard]] bool has_pending_requests() const {
-        std::lock_guard lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(queue_mutex_);
         return !pending_.empty();
     }
 
     [[nodiscard]] bool erase_pending(const std::shared_ptr<Request>& request) {
-        std::lock_guard lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(queue_mutex_);
         const auto it = std::find(pending_.begin(), pending_.end(), request);
         if (it == pending_.end()) { return false; }
         pending_.erase(it);
@@ -1764,7 +1764,7 @@ private:
     void fail_all_locked(std::exception_ptr error) noexcept {
         std::deque<std::shared_ptr<Request>> pending;
         {
-            std::lock_guard lock(queue_mutex_);
+            std::lock_guard<std::mutex> lock(queue_mutex_);
             failed_ = true;
             pending.swap(pending_);
         }
@@ -1789,7 +1789,7 @@ private:
         bool previous_unit_was_decode = false;
         for (;;) {
             {
-                std::unique_lock lock(queue_mutex_);
+                std::unique_lock<std::mutex> lock(queue_mutex_);
                 if (!stopping_ && pending_.empty()) {
                     bool active = materializing_.has_value();
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -1803,13 +1803,13 @@ private:
                     lock.unlock();
                     const auto error = std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down"));
-                    std::scoped_lock execution_lock(execution_mutex_);
+                    std::scoped_lock<std::mutex> execution_lock(execution_mutex_);
                     fail_all_locked(error);
                     return;
                 }
             }
 
-            std::unique_lock execution_lock(execution_mutex_);
+            std::unique_lock<std::mutex> execution_lock(execution_mutex_);
             try {
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
@@ -1882,7 +1882,7 @@ private:
                 return;
             }
             execution_lock.unlock();
-            std::unique_lock wait_lock(queue_mutex_);
+            std::unique_lock<std::mutex> wait_lock(queue_mutex_);
             queue_cv_.wait_for(wait_lock, std::chrono::milliseconds(1));
         }
     }

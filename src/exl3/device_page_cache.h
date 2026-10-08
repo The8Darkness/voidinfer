@@ -34,7 +34,7 @@ class Exl3DevicePageCache : public std::enable_shared_from_this<Exl3DevicePageCa
     struct ConstructionKey {};
 public:
     Exl3DevicePageWeakComponents weak_components_for_test() {
-        std::lock_guard lock(mutex_);Exl3DevicePageWeakComponents result;
+        std::lock_guard<std::mutex> lock(mutex_);Exl3DevicePageWeakComponents result;
         const auto add=[&](const std::shared_ptr<const void>& owner,std::uint64_t bytes) {
             result.owners[result.count]=owner;result.bytes[result.count++]=bytes;
         };
@@ -48,10 +48,10 @@ public:
         return result;
     }
     bool constructor_fault_armed_for_test() {
-        std::lock_guard lock(mutex_);return constructor_fault_for_test_!=0;
+        std::lock_guard<std::mutex> lock(mutex_);return constructor_fault_for_test_!=0;
     }
     void fail_next_constructor_for_test(unsigned stage,bool fail_cleanup) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(stage<1 || stage>4 || constructor_fault_for_test_)
             throw std::invalid_argument("page constructor fixture requires unarmed stage1..4");
         constructor_fault_for_test_=stage;constructor_cleanup_failure_for_test_=fail_cleanup;
@@ -77,7 +77,7 @@ public:
     // A failed allocation remains charged until certified retirement. Weak lookup
     // records describe retired fills; detached component tickets can outlive them.
     Accounting accounting() {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         Accounting result;
         std::array<std::shared_ptr<const Exl3ExactKVPage>,64> source_pages{};
         const auto add_source=[&](std::shared_ptr<const Exl3ExactKVPage> source,std::uint64_t bytes) {
@@ -115,7 +115,7 @@ public:
         return result;
     }
     bool uncertain_after_join() {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         for(const auto& entry:entries_)if(entry.fill && entry.fill->uncertain_after_join())return true;
         return false;
     }
@@ -127,7 +127,7 @@ public:
         const Exl3DevicePageKey& key) {
         if(authority_!=&authority || !authority.compute_leases_current(std::span(&lease,1)) || !key.current())
             throw std::invalid_argument("page retirement authority/lease/key");
-        std::unique_lock lock(mutex_,std::try_to_lock);
+        std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);
         if(!lock.owns_lock())return false;
         if(!authority.compute_leases_current(std::span(&lease,1)) || !key.current())
             throw std::invalid_argument("page retirement lease/key changed before mutation");
@@ -157,7 +157,7 @@ public:
         const typename Coordinator::Lease& lease,const Exl3DevicePageKey& key) {
         if(authority_!=&authority || !authority.compute_leases_current(std::span(&lease,1)) || !key.current())
             throw std::invalid_argument("page seal authority/lease/key");
-        std::unique_lock lock(mutex_,std::try_to_lock);
+        std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);
         if(!lock.owns_lock())return {};
         if(!authority.compute_leases_current(std::span(&lease,1)) || !key.current())
             throw std::invalid_argument("page seal lease/key changed before mutation");
@@ -189,7 +189,7 @@ public:
         const Exl3DevicePageKey& key) {
         if(authority_!=&authority || !authority.compute_leases_current(std::span(&lease,1)) || !key.current())
             throw std::invalid_argument("page reclamation authority/lease/key");
-        std::unique_lock lock(mutex_,std::try_to_lock);
+        std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);
         if(!lock.owns_lock())return false;
         if(!authority.compute_leases_current(std::span(&lease,1)) || !key.current())
             throw std::invalid_argument("page reclamation lease/key changed before mutation");
@@ -223,7 +223,7 @@ public:
         std::optional<Exl3DevicePageKey> key;
         std::shared_ptr<Exl3DevicePageFill> selected;
         {
-            std::unique_lock lock(mutex_,std::try_to_lock);
+            std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);
             if(!lock.owns_lock())return false;
             if(!authority.compute_leases_current(std::span(&lease,1)))
                 throw std::invalid_argument("page victim lease changed before selection");
@@ -248,7 +248,7 @@ public:
         const Exl3DevicePageKey& key,Exl3DevicePageStorageProvider provider={}) {
         if(authority_!=&authority || !authority.compute_leases_current(std::span(&lease,1)) || !key.current())
             throw std::invalid_argument("device page cache authority/lease/key");
-        std::unique_lock lock(mutex_,std::try_to_lock);
+        std::unique_lock<std::mutex> lock(mutex_,std::try_to_lock);
         if(!lock.owns_lock())return {}; // bounded host fallback while allocator owns lookup
         Entry* empty=nullptr;
         for(auto& entry:entries_) {

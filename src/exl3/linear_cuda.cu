@@ -1,4 +1,5 @@
 #include "exl3/linear_cuda.h"
+#include "exl3/environment_options.h"
 #include "exl3/projection_lifetime.h"
 #include "exl3/paired_transform_extent.h"
 #include "exl3/reconstruction_stream.h"
@@ -7,8 +8,12 @@
 #include "core/nvtx_range.h"
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cooperative_groups.h>
 #include "exl3/mia_exllamav3/quant/exl3_gemv_int8_kernel.cuh"
 #include "exl3/mia_exllamav3/quant/native_persistent_gemm_inner.cuh"
@@ -39,12 +44,90 @@ constexpr int kTilesN = 1088;
 constexpr int kHadamard = 128;
 constexpr int kThreads = 256;
 constexpr float kHadamardScale = 0.088388347648f;
+
+// Programmatic dependent launch. Kernels carrying this prologue wait for full
+// completion (and memory visibility) of their stream predecessor before any
+// global access, so the attribute only overlaps launch/scheduling latency.
+// Without the attribute both instructions are no-ops.
+#define EXL3_PDL_PROLOGUE()                                              \
+    do {                                                                 \
+        asm volatile("griddepcontrol.wait;" ::: "memory");               \
+        asm volatile("griddepcontrol.launch_dependents;");               \
+    } while (0)
+
+bool exl3_pdl_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_PDL");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+template<class... KernelArgs,class... CallArgs>
+void exl3_launch_pdl(void (*kernel)(KernelArgs...),dim3 grid,dim3 block,
+                     std::size_t shared,cudaStream_t stream,CallArgs&&... args) {
+    if(!exl3_pdl_enabled()) {
+        kernel<<<grid,block,shared,stream>>>(std::forward<CallArgs>(args)...);
+        return;
+    }
+    cudaLaunchAttribute attribute{};
+    attribute.id=cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute.val.programmaticStreamSerializationAllowed=1;
+    cudaLaunchConfig_t config{};
+    config.gridDim=grid;
+    config.blockDim=block;
+    config.dynamicSmemBytes=shared;
+    config.stream=stream;
+    config.attrs=&attribute;
+    config.numAttrs=1;
+    const cudaError_t error=cudaLaunchKernelEx(&config,kernel,std::forward<CallArgs>(args)...);
+    if(error!=cudaSuccess)
+        throw std::runtime_error(std::string("PDL launch: ")+cudaGetErrorString(error));
+}
 constexpr std::uint16_t kMul1AccumulatorHalf = 0x6400u;
 constexpr std::uint16_t kMul1InverseHalf = 0x1eeeu;
 constexpr std::uint16_t kMul1BiasHalf = 0xc931u;
 constexpr int kShape4OutputBlocks = kTilesN / 32;
 constexpr int kShape4Splits = Exl3LinearWorkspaceRequirements::accumulation_splits;
 constexpr int kShape4CooperativeGrid = kShape4OutputBlocks * kShape4Splits;
+// N8 x M16 scratch for the shared K6 down arithmetic. M1 and M2..8 use the
+// same packed decode, FP32 row accumulators, K partitions, and output epilogue.
+// The same packed N8/M16 producer serves each reached wide K6 target shape.
+constexpr std::size_t kCoherentWideK6SharedBytes =
+    2u * 256u * sizeof(half) + 2u * 8u * 16u * 6u * sizeof(std::uint16_t) +
+    16u * 128u * sizeof(float);
+constexpr std::size_t kCoherentDownK6SharedBytes =
+    2u * 256u * sizeof(half) + 2u * 8u * 16u * 6u * sizeof(std::uint16_t) +
+    16u * 128u * sizeof(float);
+constexpr std::size_t kCoherentDownK7SharedBytes =
+    2u * 256u * sizeof(half) + 2u * 8u * 16u * 7u * sizeof(std::uint16_t) +
+    16u * 128u * sizeof(float);
+constexpr std::size_t kCoherentOK7SharedBytes =
+    2u * 256u * sizeof(half) + 2u * 8u * 16u * 7u * sizeof(std::uint16_t) +
+    16u * 128u * sizeof(float);
+// Coherent 128-column packed producers with a DeepStages cp.async ring.
+constexpr std::size_t coherent_deep_shared_bytes(int bits, int stages) {
+    return static_cast<std::size_t>(stages) * 256u * sizeof(half) +
+           static_cast<std::size_t>(stages) * 8u * 16u *
+               static_cast<std::size_t>(bits) * sizeof(std::uint16_t) +
+           16u * 128u * sizeof(float);
+}
+// The coherent K6/K7 packed producers run 128-column CTAs whose grid is too
+// small to cover DRAM latency with a two-stage ring. Four stages (default) is
+// the measured selection; NINFER_EXL3_COHERENT_DEEP_PIPELINE=0 restores the
+// two-stage ring and 8 is retained for comparison. Numerically identical.
+int coherent_deep_pipeline_stages() {
+    static const int stages = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_DEEP_PIPELINE");
+        if (!value) return 4;
+        if (std::strcmp(value, "0") == 0) return 0;
+        if (std::strcmp(value, "4") == 0) return 4;
+        if (std::strcmp(value, "8") == 0) return 8;
+        throw std::invalid_argument(
+            "NINFER_EXL3_COHERENT_DEEP_PIPELINE must be 0, 4 or 8");
+    }();
+    return stages;
+}
 constexpr std::size_t kShape4SharedBytes =
     256u * sizeof(half) + 2u * 32u * 80u * sizeof(std::uint16_t) +
     16u * 512u * sizeof(float);
@@ -124,6 +207,13 @@ __device__ __forceinline__ void exl3_cp_async_commit() {
 
 __device__ __forceinline__ void exl3_cp_async_wait() {
     asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+// Wait until at most Pending committed cp.async groups remain in flight.
+template <int Pending>
+__device__ __forceinline__ void exl3_cp_async_wait_pending() {
+    static_assert(Pending >= 0 && Pending <= 8, "bounded cp.async pipeline depth");
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(Pending));
 }
 
 template <int Groups>
@@ -882,6 +972,282 @@ __global__ void output_hadamard_fp16_inplace_kernel(
         __half_as_ushort(__hmul(normalized, scale));
 }
 
+
+// Warp-per-block twins of the 128-point transforms: each warp owns one
+// (row, 128-column) block with four elements per lane. Widths 1 and 2 pair
+// elements inside a lane, wider widths pair lanes through shfl_xor. Every
+// butterfly output is the same single FP32 add (lower+upper) or subtract
+// (lower-upper) of the same operands as the shared-memory kernels, so the
+// transformed bits are identical; only the CTA/barrier structure changes.
+bool exl3_hadamard_warp_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_HADAMARD_WARP");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+__device__ __forceinline__ void exl3_warp_butterflies(float (&v)[4],int lane) {
+    {
+        const float a=v[0],b=v[1],c=v[2],d=v[3];
+        v[0]=a+b; v[1]=a-b; v[2]=c+d; v[3]=c-d;
+    }
+    {
+        const float a=v[0],b=v[1],c=v[2],d=v[3];
+        v[0]=a+c; v[2]=a-c; v[1]=b+d; v[3]=b-d;
+    }
+    #pragma unroll
+    for(int mask=1;mask<32;mask<<=1) {
+        const bool lower=(lane&mask)==0;
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const float partner=__shfl_xor_sync(0xffffffffU,v[j],mask);
+            v[j]=lower?v[j]+partner:partner-v[j];
+        }
+    }
+}
+
+__device__ __forceinline__ void exl3_load_half4(const std::uint16_t* p,std::uint16_t (&h)[4]) {
+    const uint2 bits=*reinterpret_cast<const uint2*>(p);
+    h[0]=static_cast<std::uint16_t>(bits.x&0xffffu);
+    h[1]=static_cast<std::uint16_t>(bits.x>>16);
+    h[2]=static_cast<std::uint16_t>(bits.y&0xffffu);
+    h[3]=static_cast<std::uint16_t>(bits.y>>16);
+}
+
+__device__ __forceinline__ void exl3_store_half4(std::uint16_t* p,const std::uint16_t (&h)[4]) {
+    uint2 bits;
+    bits.x=static_cast<unsigned>(h[0])|(static_cast<unsigned>(h[1])<<16);
+    bits.y=static_cast<unsigned>(h[2])|(static_cast<unsigned>(h[3])<<16);
+    *reinterpret_cast<uint2*>(p)=bits;
+}
+
+constexpr int kHadamardWarpsPerBlock=8;
+
+template<bool RoundProductToHalf,bool GateUp>
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) input_hadamard_warp_kernel(
+    const std::uint16_t* input,const std::uint16_t* suh,std::uint16_t* transformed,
+    int rows,int input_features,const std::uint16_t* up,std::uint16_t* activation) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=input_features/kHadamard;
+    const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=static_cast<long long>(rows)*blocks) return;
+    const int row=static_cast<int>(task/blocks);
+    const int block=static_cast<int>(task%blocks);
+    const int offset=block*kHadamard+lane*4;
+    const std::size_t element=static_cast<std::size_t>(row)*input_features+offset;
+    std::uint16_t represented[4],scale[4];
+    exl3_load_half4(input+element,represented);
+    exl3_load_half4(suh+offset,scale);
+    if constexpr(GateUp) {
+        std::uint16_t up_bits[4];
+        exl3_load_half4(up+element,up_bits);
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const float g=__half2float(__ushort_as_half(represented[j]));
+            const float u=__half2float(__ushort_as_half(up_bits[j]));
+            represented[j]=__half_as_ushort(__float2half_rn((g/(1.0f+expf(-g)))*u));
+        }
+        exl3_store_half4(activation+element,represented);
+    }
+    float v[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        float product=half_product(represented[j],scale[j]);
+        if constexpr(RoundProductToHalf) product=__half2float(__float2half_rn(product));
+        v[j]=product;
+    }
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) result[j]=__half_as_ushort(__float2half_rn(v[j]*kHadamardScale));
+    exl3_store_half4(transformed+element,result);
+}
+
+// Input transforms of one activation for two projections (input_hadamard_warp
+// _kernel arithmetic for each SUH); one warp per (row, 128-block).
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) input_hadamard_pair_warp_kernel(
+    const std::uint16_t* input,const std::uint16_t* suh_a,const std::uint16_t* suh_b,
+    std::uint16_t* transformed_a,std::uint16_t* transformed_b,int rows,int input_features) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=input_features/kHadamard;
+    const int task=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=rows*blocks) return;
+    const int offset=(task%blocks)*kHadamard+lane*4;
+    const std::size_t element=static_cast<std::size_t>(task/blocks)*input_features+offset;
+    std::uint16_t represented[4],scale_a[4],scale_b[4];
+    exl3_load_half4(input+element,represented);
+    exl3_load_half4(suh_a+offset,scale_a);
+    exl3_load_half4(suh_b+offset,scale_b);
+    float a[4],b[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        a[j]=half_product(represented[j],scale_a[j]);
+        b[j]=half_product(represented[j],scale_b[j]);
+    }
+    exl3_warp_butterflies(a,lane);
+    exl3_warp_butterflies(b,lane);
+    std::uint16_t result_a[4],result_b[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        result_a[j]=__half_as_ushort(__float2half_rn(a[j]*kHadamardScale));
+        result_b[j]=__half_as_ushort(__float2half_rn(b[j]*kHadamardScale));
+    }
+    exl3_store_half4(transformed_a+element,result_a);
+    exl3_store_half4(transformed_b+element,result_b);
+}
+
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_warp_kernel(
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
+    int output_features,int active_features) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=active_features/kHadamard;
+    const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=static_cast<long long>(rows)*blocks) return;
+    const int row=static_cast<int>(task/blocks);
+    const int block=static_cast<int>(task%blocks);
+    const int offset=block*kHadamard+lane*4;
+    const std::size_t element=static_cast<std::size_t>(row)*output_features+offset;
+    const float4 loaded=*reinterpret_cast<const float4*>(accum+element);
+    float v[4]={loaded.x,loaded.y,loaded.z,loaded.w};
+    std::uint16_t scale[4];
+    exl3_load_half4(svh+offset,scale);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+    }
+    exl3_store_half4(output+element,result);
+}
+
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) output_hadamard_fp16_inplace_warp_kernel(
+    std::uint16_t* output,const std::uint16_t* svh,int rows,int output_features) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=output_features/kHadamard;
+    const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=static_cast<long long>(rows)*blocks) return;
+    const int row=static_cast<int>(task/blocks);
+    const int block=static_cast<int>(task%blocks);
+    const int offset=block*kHadamard+lane*4;
+    const std::size_t element=static_cast<std::size_t>(row)*output_features+offset;
+    std::uint16_t loaded[4],scale[4];
+    exl3_load_half4(output+element,loaded);
+    exl3_load_half4(svh+offset,scale);
+    float v[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) v[j]=__half2float(__ushort_as_half(loaded[j]));
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+    }
+    exl3_store_half4(output+element,result);
+}
+
+inline unsigned exl3_hadamard_warp_grid(int rows,int features) {
+    const long long tasks=static_cast<long long>(rows)*(features/kHadamard);
+    return static_cast<unsigned>((tasks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock);
+}
+
+inline bool exl3_hadamard_warp_aligned(const void* a,const void* b,const void* c=nullptr,
+                                       const void* d=nullptr,const void* e=nullptr) {
+    const auto bits=reinterpret_cast<std::uintptr_t>(a)|reinterpret_cast<std::uintptr_t>(b)|
+        reinterpret_cast<std::uintptr_t>(c)|reinterpret_cast<std::uintptr_t>(d)|
+        reinterpret_cast<std::uintptr_t>(e);
+    return (bits&15u)==0;
+}
+
+template<int Block,bool RoundProductToHalf=false,bool GateUp=false>
+void launch_input_hadamard(cudaStream_t stream,const std::uint16_t* input,
+    const std::uint16_t* suh,std::uint16_t* transformed,int rows,int input_features,
+    const std::uint16_t* up=nullptr,std::uint16_t* activation=nullptr) {
+    static_assert(Block==kHadamard);
+    if(rows>0 && exl3_hadamard_warp_enabled() && input_features%kHadamard==0 &&
+       exl3_hadamard_warp_aligned(input,suh,transformed,up,activation))
+        exl3_launch_pdl(input_hadamard_warp_kernel<RoundProductToHalf,GateUp>,
+            dim3(exl3_hadamard_warp_grid(rows,input_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,input,suh,transformed,rows,input_features,up,activation);
+    else
+        input_hadamard_kernel<Block,RoundProductToHalf,GateUp><<<
+            dim3(rows,input_features/kHadamard),dim3(kHadamard),0,stream>>>(
+                input,suh,transformed,rows,input_features,up,activation);
+}
+
+inline void launch_output_hadamard(cudaStream_t stream,const float* accum,
+    const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features,
+    int active_features=0) {
+    if(active_features<=0) active_features=output_features;
+    if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
+       exl3_hadamard_warp_aligned(accum,svh,output))
+        exl3_launch_pdl(output_hadamard_warp_kernel,
+            dim3(exl3_hadamard_warp_grid(rows,active_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,accum,svh,output,rows,output_features,active_features);
+    else
+        output_hadamard_kernel<<<dim3(rows,active_features/kHadamard),dim3(kHadamard),0,
+            stream>>>(accum,svh,output,rows,output_features);
+}
+
+inline void launch_output_hadamard_fp16_inplace(cudaStream_t stream,std::uint16_t* output,
+    const std::uint16_t* svh,int rows,int output_features) {
+    if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
+       exl3_hadamard_warp_aligned(output,svh))
+        exl3_launch_pdl(output_hadamard_fp16_inplace_warp_kernel,
+            dim3(exl3_hadamard_warp_grid(rows,output_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,output,svh,rows,output_features);
+    else
+        output_hadamard_fp16_inplace_kernel<<<dim3(rows,output_features/kHadamard),
+            dim3(kHadamard),0,stream>>>(output,svh,rows,output_features);
+}
+
+// Bulk down projections already write the GEMM destination as FP16.
+// Preserve its represented down value before performing the same FP32-add,
+// FP16-store boundary as GDN's separate residual kernel. The final diagnostic
+// rows have a separate owner because the normal output aliases down.
+__global__ void output_hadamard_fp16_residual_kernel(
+    std::uint16_t* output, const std::uint16_t* svh,
+    const std::uint16_t* residual, std::uint16_t* down_trace,
+    int trace_row_base, int rows, int output_features) {
+    __shared__ float values[kHadamard];
+    const int row = static_cast<int>(blockIdx.x);
+    const int block = static_cast<int>(blockIdx.y);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (row >= rows || lane >= kHadamard) return;
+    const int offset = block * kHadamard + lane;
+    const auto index = static_cast<std::size_t>(row) * output_features + offset;
+    values[lane] = __half2float(__ushort_as_half(output[index]));
+    __syncthreads();
+    for (int width = 1; width < kHadamard; width *= 2) {
+        if ((lane % (2 * width)) < width) {
+            const float left = values[lane];
+            const float right = values[lane + width];
+            values[lane] = left + right;
+            values[lane + width] = left - right;
+        }
+        __syncthreads();
+    }
+    const auto normalized = __float2half_rn(values[lane] * kHadamardScale);
+    const auto scale = __ushort_as_half(svh[offset]);
+    const auto down_half = __hmul(normalized, scale);
+    if (down_trace && row >= trace_row_base)
+        down_trace[static_cast<std::size_t>(row - trace_row_base) *
+                   output_features + offset] = __half_as_ushort(down_half);
+    output[index] = __half_as_ushort(__float2half_rn(
+        __half2float(__ushort_as_half(residual[index])) +
+        __half2float(down_half)));
+}
+
 // Ascending split reduction followed by the unchanged output Hadamard.
 // V6 donor reconstruction uses the destination dtype for the GEMM result as
 // well as the Hadamard. Keep this separate from the historical T69 candidate.
@@ -913,7 +1279,7 @@ __global__ void v6_output_hadamard_kernel(const float* accum,
 }
 
 template<bool ShuffleLocal=false,bool MinimalBarriers=false,
-         bool PrefetchSplitPlanes=false>
+         bool PrefetchSplitPlanes=false,bool Fp16GemmDestination=false>
 __global__ void prefill_reduce_output_kernel(const float* accum,
                                        const std::uint16_t* svh,
                                        std::uint16_t* output,
@@ -944,6 +1310,11 @@ __global__ void prefill_reduce_output_kernel(const float* accum,
         for (int split = 1; split < split_count; ++split)
             value += accum[split * stride + index];
     }
+    // The reached K5 bulk-MLP comparator writes its FP32-compute GEMM result
+    // to FP16 before SVH/Hadamard. Retain that represented boundary when the
+    // packed MMA leaf writes its partial into this FP32 scratch plane.
+    if constexpr(Fp16GemmDestination)
+        value=__half2float(__float2half_rn(value));
     float transformed_value;
     if constexpr(ShuffleLocal) {
         // Widths 1..16 are warp-local. Every lane computes the same output
@@ -980,6 +1351,214 @@ __global__ void prefill_reduce_output_kernel(const float* accum,
     const auto normalized = __float2half_rn(transformed_value * kHadamardScale);
     const auto scale = __ushort_as_half(svh[offset]);
     output[row * output_features + offset] = __half_as_ushort(__hmul(normalized, scale));
+}
+
+// Warp-per-block twin of prefill_reduce_output_kernel: the split planes are
+// summed in the same chronological order, the optional FP16 destination
+// boundary is kept, and the transform is the exact butterfly network of the
+// shared-memory kernel (see exl3_warp_butterflies).
+template<bool Fp16GemmDestination>
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) prefill_reduce_output_warp_kernel(
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
+    int output_features,int split_count) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int blocks=output_features/kHadamard;
+    const long long task=static_cast<long long>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    if(task>=static_cast<long long>(rows)*blocks) return;
+    const int row=static_cast<int>(task/blocks);
+    const int block=static_cast<int>(task%blocks);
+    const int offset=block*kHadamard+lane*4;
+    const std::size_t index=static_cast<std::size_t>(row)*output_features+offset;
+    const std::size_t stride=static_cast<std::size_t>(rows)*output_features;
+    const float4 first=*reinterpret_cast<const float4*>(accum+index);
+    float v[4]={first.x,first.y,first.z,first.w};
+    if(split_count<=10) {
+        // All planes are loaded before the (unchanged, ascending) adds.
+        float4 planes[9];
+        #pragma unroll
+        for(int split=1;split<10;++split)
+            if(split<split_count)
+                planes[split-1]=*reinterpret_cast<const float4*>(accum+split*stride+index);
+        #pragma unroll
+        for(int split=1;split<10;++split)
+            if(split<split_count) {
+                v[0]+=planes[split-1].x; v[1]+=planes[split-1].y;
+                v[2]+=planes[split-1].z; v[3]+=planes[split-1].w;
+            }
+    } else
+    for(int split=1;split<split_count;++split) {
+        const float4 plane=*reinterpret_cast<const float4*>(accum+split*stride+index);
+        v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
+    }
+    if constexpr(Fp16GemmDestination) {
+        #pragma unroll
+        for(int j=0;j<4;++j) v[j]=__half2float(__float2half_rn(v[j]));
+    }
+    std::uint16_t scale[4];
+    exl3_load_half4(svh+offset,scale);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+    }
+    exl3_store_half4(output+row*output_features+offset,result);
+}
+
+// Ascending split-plane sum (prefill_reduce_output_warp_kernel order): up to
+// ten planes are loaded before the adds so their latencies overlap.
+__device__ __forceinline__ void exl3_sum_split_planes(const float* accum,std::size_t stride,
+    int offset,int split_count,float (&v)[4]) {
+    const float4 first=*reinterpret_cast<const float4*>(accum+offset);
+    v[0]=first.x; v[1]=first.y; v[2]=first.z; v[3]=first.w;
+    if(split_count<=10) {
+        float4 planes[9];
+        #pragma unroll
+        for(int split=1;split<10;++split)
+            if(split<split_count)
+                planes[split-1]=*reinterpret_cast<const float4*>(accum+split*stride+offset);
+        #pragma unroll
+        for(int split=1;split<10;++split)
+            if(split<split_count) {
+                v[0]+=planes[split-1].x; v[1]+=planes[split-1].y;
+                v[2]+=planes[split-1].z; v[3]+=planes[split-1].w;
+            }
+        return;
+    }
+    for(int split=1;split<split_count;++split) {
+        const float4 plane=*reinterpret_cast<const float4*>(accum+split*stride+offset);
+        v[0]+=plane.x; v[1]+=plane.y; v[2]+=plane.z; v[3]+=plane.w;
+    }
+}
+
+// prefill_reduce_output_warp_kernel<false> followed by residual_kernel:
+// output = reduced projection, residual_out = half(left + output).
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) reduce_output_residual_warp_kernel(
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features,
+    int split_count,const std::uint16_t* left,std::uint16_t* residual_out) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int task=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    const int blocks=output_features/kHadamard;
+    if(task>=rows*blocks) return;
+    const std::size_t row_base=static_cast<std::size_t>(task/blocks)*output_features;
+    const int column=(task%blocks)*kHadamard+lane*4;
+    const std::size_t offset=row_base+column;
+    float v[4];
+    exl3_sum_split_planes(accum+row_base,static_cast<std::size_t>(rows)*output_features,
+                          column,split_count,v);
+    std::uint16_t scale[4],base[4];
+    exl3_load_half4(svh+column,scale);
+    exl3_load_half4(left+offset,base);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4],sum[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+        sum[j]=__half_as_ushort(__float2half_rn(__half2float(__ushort_as_half(base[j]))+
+                                                __half2float(__ushort_as_half(result[j]))));
+    }
+    exl3_store_half4(output+offset,result);
+    exl3_store_half4(residual_out+offset,sum);
+}
+
+
+// reduce_output_residual_warp_kernel followed by the RMS norm of the residual
+// (5120 features, rms_norm_f16_kernel formula): one 5-CTA cluster per row,
+// each CTA owning 1024 columns. The sum of squares is reduced per warp, per
+// CTA, then over the five CTA sums in rank order through DSMEM, so every CTA
+// derives the same inverse norm and normalizes its own slice.
+constexpr int kResidualNormFeatures=5120;
+constexpr int kResidualNormCluster=kResidualNormFeatures/(kHadamardWarpsPerBlock*kHadamard);
+static_assert(kResidualNormCluster==5,"residual-norm cluster geometry");
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) reduce_output_residual_norm_kernel(
+    const float* accum,const std::uint16_t* svh,std::uint16_t* output,int rows,
+    int split_count,const std::uint16_t* left,std::uint16_t* residual_out,
+    const std::uint16_t* norm_weight,std::uint16_t* norm_out,float eps) {
+    constexpr int kFeatures=kResidualNormFeatures,kSlice=kHadamardWarpsPerBlock*kHadamard;
+    __shared__ float warp_sums[kHadamardWarpsPerBlock];
+    __shared__ float cta_sum;
+    __shared__ float total_sum;
+    cg::cluster_group cluster=cg::this_cluster();
+    const int tid=static_cast<int>(threadIdx.x),lane=tid&31,warp=tid>>5;
+    const int rank=static_cast<int>(cluster.block_rank());
+    const int row=static_cast<int>(blockIdx.x)/kResidualNormCluster;
+    const int column=rank*kSlice+warp*kHadamard+lane*4;
+    // Norm weights do not depend on the preceding grid.
+    std::uint16_t weight_bits[4];
+    exl3_load_half4(norm_weight+column,weight_bits);
+    EXL3_PDL_PROLOGUE();
+    const std::size_t row_base=static_cast<std::size_t>(row)*kFeatures;
+    const std::size_t offset=row_base+column;
+    float v[4];
+    exl3_sum_split_planes(accum+row_base,static_cast<std::size_t>(rows)*kFeatures,
+                          column,split_count,v);
+    std::uint16_t scale[4],base[4];
+    exl3_load_half4(svh+column,scale);
+    exl3_load_half4(left+offset,base);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4],sum[4];
+    float x[4],squares=0.0f;
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+        sum[j]=__half_as_ushort(__float2half_rn(__half2float(__ushort_as_half(base[j]))+
+                                                __half2float(__ushort_as_half(result[j]))));
+        x[j]=__half2float(__ushort_as_half(sum[j]));
+        squares+=x[j]*x[j];
+    }
+    exl3_store_half4(output+offset,result);
+    exl3_store_half4(residual_out+offset,sum);
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) squares+=__shfl_xor_sync(0xffffffffu,squares,o);
+    if(lane==0) warp_sums[warp]=squares;
+    __syncthreads();
+    if(tid==0) {
+        float t=0.0f;
+        #pragma unroll
+        for(int w=0;w<kHadamardWarpsPerBlock;++w) t+=warp_sums[w];
+        cta_sum=t;
+    }
+    cluster.sync();
+    if(tid==0) {
+        float t=0.0f;
+        #pragma unroll
+        for(int r=0;r<kResidualNormCluster;++r) t+=*cluster.map_shared_rank(&cta_sum,r);
+        total_sum=t;
+    }
+    __syncthreads();
+    const float inv=rsqrtf(total_sum/static_cast<float>(kFeatures)+eps);
+    std::uint16_t normed[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const float w=__half2float(__ushort_as_half(weight_bits[j]));
+        normed[j]=__half_as_ushort(__float2half_rn((x[j]*inv)*(w+1.0f)));
+    }
+    exl3_store_half4(norm_out+offset,normed);
+    cluster.sync();  // peers read cta_sum through DSMEM before this CTA exits
+}
+
+
+template<bool ShuffleLocal=false,bool MinimalBarriers=false,
+         bool PrefetchSplitPlanes=false,bool Fp16GemmDestination=false>
+void launch_prefill_reduce_output(cudaStream_t stream,const float* accum,
+    const std::uint16_t* svh,std::uint16_t* output,int rows,int output_features,
+    int split_count) {
+    if(rows>0 && exl3_hadamard_warp_enabled() && output_features%kHadamard==0 &&
+       exl3_hadamard_warp_aligned(accum,svh,output))
+        exl3_launch_pdl(prefill_reduce_output_warp_kernel<Fp16GemmDestination>,
+            dim3(exl3_hadamard_warp_grid(rows,output_features)),dim3(kHadamardWarpsPerBlock*32),
+            0,stream,accum,svh,output,rows,output_features,split_count);
+    else
+        prefill_reduce_output_kernel<ShuffleLocal,MinimalBarriers,PrefetchSplitPlanes,
+            Fp16GemmDestination><<<dim3(rows,output_features/kHadamard),kHadamard,0,stream>>>(
+                accum,svh,output,rows,output_features,split_count);
 }
 
 // Generic native EXL3 path used by E3A's K=6 and K=8 projection families.
@@ -1094,11 +1673,46 @@ __device__ __forceinline__ void decode4_three_word_k7(
     w3 = decode_state_from_three_words_k7(a, b, c, relative_bit + 21);
 }
 
+// Branch-free K7 four-state window for any t_offset in [0,256). States 0..2
+// always lie inside the first two represented words; only state 3 can reach
+// the third word (relative bit > 27), and it is selected rather than taken
+// through a divergent per-lane path. Extracted states, and hence decoded
+// halves, are bitwise identical to decode4_generic/decode4_three_word_k7.
+__device__ __forceinline__ void exl3_dq4_k7_window(
+    const std::uint32_t* packed, int t_offset, Exl3FragB& fragment,
+    std::uint32_t mul1_multiplier) {
+    const int b0 = t_offset * 7 + 1783;
+    int i0 = b0 >> 5;
+    if (i0 >= 56) i0 -= 56;
+    const int i1 = i0 == 55 ? 0 : i0 + 1;
+    const int i2 = i1 == 55 ? 0 : i1 + 1;
+    const int rel = b0 & 31;
+    const std::uint32_t a = packed[i0], b = packed[i1], c = packed[i2];
+    const std::uint64_t ab = (static_cast<std::uint64_t>(a) << 32) | b;
+    const std::uint64_t bc = (static_cast<std::uint64_t>(b) << 32) | c;
+    const std::uint32_t w0 = static_cast<std::uint32_t>(ab >> (48 - rel)) & 0xffffu;
+    const std::uint32_t w1 = static_cast<std::uint32_t>(ab >> (41 - rel)) & 0xffffu;
+    const std::uint32_t w2 = static_cast<std::uint32_t>(ab >> (34 - rel)) & 0xffffu;
+    const std::uint32_t w3 = (rel <= 27
+        ? static_cast<std::uint32_t>(ab >> (27 - rel))
+        : static_cast<std::uint32_t>(bc >> (59 - rel))) & 0xffffu;
+    fragment.values[0] = decode_mul1_product_2_k7(w0 * mul1_multiplier,
+                                                   w1 * mul1_multiplier);
+    fragment.values[1] = decode_mul1_product_2_k7(w2 * mul1_multiplier,
+                                                   w3 * mul1_multiplier);
+}
+
 template <int Bits, bool K7ThreeWord = false>
 __device__ __forceinline__ void exl3_dq4_generic(const std::uint32_t* packed,
                                                   int t_offset,
                                                   Exl3FragB& fragment,
                                                   std::uint32_t mul1_multiplier) {
+#ifndef NINFER_EXL3_K7_DIVERGENT_DECODE
+    if constexpr (Bits == 7 && K7ThreeWord) {
+        exl3_dq4_k7_window(packed, t_offset, fragment, mul1_multiplier);
+        return;
+    }
+#endif
     const int b0 = (t_offset + 257) * Bits - 16;
     if ((b0 & 31) + 3 * Bits + 16 > 64) {
         // A four-state window can cross three 32-bit words for some K7/K8
@@ -1184,6 +1798,215 @@ __device__ __forceinline__ int inverse_tensor_core_index(int row, int column) {
     return (c_group * 4 + t_mod) * 8 + slot;
 }
 
+// MXFP8 (OCP MX: E4M3 elements, one E8M0 power-of-two scale per 32 elements
+// along K) operands for the cuBLASLt VEC32_UE8M0 prefill route. Scale factors
+// use the cuBLASLt 128x4 tile layout; `inner_blocks` is K/32 rounded up to 4.
+__device__ __forceinline__ std::size_t mxfp8_scale_offset(int outer,int inner,
+                                                          int inner_blocks) {
+    return (static_cast<std::size_t>(outer/128)*inner_blocks+(inner/4)*4)*128+
+        (outer%32)*16+((outer%128)/32)*4+(inner%4);
+}
+
+// Power-of-two scale so the block maximum maps at or below the E4M3 finite
+// maximum (448); a zero block keeps the minimum scale and encodes zeros.
+__device__ __forceinline__ int mxfp8_block_exponent(float amax) {
+    if (!(amax>0.0f)) return -127;
+    int power=0;
+    const float mantissa=frexpf(amax*(1.0f/448.0f),&power);
+    const int exponent=mantissa==0.5f?power-1:power;
+    return exponent<-127?-127:(exponent>127?127:exponent);
+}
+
+__device__ __forceinline__ void mxfp8_encode32(const float (&values)[32],float scale,
+                                               std::uint8_t* destination) {
+    alignas(16) std::uint8_t bytes[32];
+#pragma unroll
+    for (int i=0;i<32;i+=2) {
+        const __nv_fp8x2_storage_t pair=__nv_cvt_float2_to_fp8x2(
+            make_float2(values[i]*scale,values[i+1]*scale),__NV_SATFINITE,__NV_E4M3);
+        bytes[i]=static_cast<std::uint8_t>(pair&0xff);
+        bytes[i+1]=static_cast<std::uint8_t>(pair>>8);
+    }
+    reinterpret_cast<uint4*>(destination)[0]=reinterpret_cast<const uint4*>(bytes)[0];
+    reinterpret_cast<uint4*>(destination)[1]=reinterpret_cast<const uint4*>(bytes)[1];
+}
+
+// K-contiguous FP16 activations [rows][k] -> E4M3 [rows][k] plus scales for
+// rows padded to 128 (padding scales are zero-filled as cuBLASLt requires).
+__global__ void mxfp8_quantize_rows_kernel(const half* __restrict__ source,
+    std::uint8_t* __restrict__ values,std::uint8_t* __restrict__ scales,
+    int rows,int k,int padded_rows) {
+    const int blocks=k/32;
+    const int inner_blocks=(blocks+3)/4*4;
+    const int index=blockIdx.x*blockDim.x+threadIdx.x;
+    if (index>=padded_rows*blocks) return;
+    const int row=index/blocks,block=index%blocks;
+    if (row>=rows) {
+        scales[mxfp8_scale_offset(row,block,inner_blocks)]=0;
+        return;
+    }
+    const auto* input=reinterpret_cast<const uint4*>(
+        source+static_cast<std::size_t>(row)*k+block*32);
+    float x[32];
+    float amax=0.0f;
+#pragma unroll
+    for (int part=0;part<4;++part) {
+        const uint4 packed=input[part];
+        const half2* pairs=reinterpret_cast<const half2*>(&packed);
+#pragma unroll
+        for (int i=0;i<4;++i) {
+            const float2 value=__half22float2(pairs[i]);
+            x[part*8+i*2]=value.x;x[part*8+i*2+1]=value.y;
+            amax=fmaxf(amax,fmaxf(fabsf(value.x),fabsf(value.y)));
+        }
+    }
+    const int exponent=mxfp8_block_exponent(amax);
+    mxfp8_encode32(x,exp2f(static_cast<float>(-exponent)),
+        values+static_cast<std::size_t>(row)*k+block*32);
+    scales[mxfp8_scale_offset(row,block,inner_blocks)]=
+        static_cast<std::uint8_t>(exponent+127);
+}
+
+// Reconstructed FP16 weight [k][n] (N contiguous) -> K-major E4M3 [n][k] plus
+// scales (outer n, inner k/32). One thread owns one output column's 32-row
+// K block; grid (ceil(n/256), k/32). n and k are multiples of 128.
+__global__ void mxfp8_quantize_weight_transposed_kernel(const half* __restrict__ source,
+    std::uint8_t* __restrict__ values,std::uint8_t* __restrict__ scales,int k,int n) {
+    const int column=blockIdx.x*blockDim.x+threadIdx.x;
+    const int block=blockIdx.y;
+    if (column>=n) return;
+    float x[32];
+    float amax=0.0f;
+#pragma unroll
+    for (int i=0;i<32;++i) {
+        x[i]=__half2float(source[static_cast<std::size_t>(block*32+i)*n+column]);
+        amax=fmaxf(amax,fabsf(x[i]));
+    }
+    const int exponent=mxfp8_block_exponent(amax);
+    mxfp8_encode32(x,exp2f(static_cast<float>(-exponent)),
+        values+static_cast<std::size_t>(column)*k+block*32);
+    scales[mxfp8_scale_offset(column,block,(k/32+3)/4*4)]=
+        static_cast<std::uint8_t>(exponent+127);
+}
+
+// NVFP4 operands for the cuBLASLt VEC16_UE4M3 prefill route: E2M1 elements
+// (two per byte, lower K index in the low nibble), one unsigned E4M3 scale per
+// 16 elements along K in the 128x4 tile layout (inner = K/16 rounded up to 4),
+// and one FP32 global scale per tensor so block scales stay in E4M3 range.
+// Dequantized value = e2m1 * e4m3_scale * global.
+__device__ __forceinline__ float nvfp4_global_from_amax(float amax) {
+    return amax > 0.0f ? amax / (6.0f * 448.0f) : 1.0f;
+}
+
+__device__ __forceinline__ float nvfp4_decode_e4m3(__nv_fp8_storage_t code) {
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw(code, __NV_E4M3)));
+}
+
+// Smallest positive E4M3 code whose value is >= target, saturating at 448.
+__device__ __forceinline__ std::uint8_t nvfp4_scale_code(float target, float& value) {
+    __nv_fp8_storage_t code = __nv_cvt_float_to_fp8(target, __NV_SATFINITE, __NV_E4M3);
+    float decoded = nvfp4_decode_e4m3(code);
+    if (decoded < target && code < 0x7e) decoded = nvfp4_decode_e4m3(++code);
+    if (!(decoded > 0.0f)) decoded = nvfp4_decode_e4m3(code = 0x01);
+    value = decoded;
+    return static_cast<std::uint8_t>(code);
+}
+
+__device__ __forceinline__ void nvfp4_encode16(const float (&x)[16], float amax,
+    float global, std::uint8_t* destination, std::uint8_t& scale_code) {
+    float scale = 1.0f;
+    scale_code = nvfp4_scale_code(fmaxf(amax / (6.0f * global), 1e-30f), scale);
+    const float inverse = 1.0f / (scale * global);
+    alignas(8) std::uint8_t bytes[8];
+#pragma unroll
+    for (int i = 0; i < 16; i += 2)
+        bytes[i / 2] = static_cast<std::uint8_t>(__nv_cvt_float2_to_fp4x2(
+            make_float2(x[i] * inverse, x[i + 1] * inverse), __NV_E2M1, cudaRoundNearest));
+    *reinterpret_cast<uint2*>(destination) = *reinterpret_cast<const uint2*>(bytes);
+}
+
+// Tensor absolute maximum; non-negative floats order as unsigned bit patterns.
+__global__ void nvfp4_amax_kernel(const half* __restrict__ source, std::size_t count,
+                                  unsigned* __restrict__ amax_bits) {
+    float local = 0.0f;
+    for (std::size_t i = (blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x) * 8;
+         i < count; i += static_cast<std::size_t>(gridDim.x) * blockDim.x * 8) {
+        const uint4 packed = *reinterpret_cast<const uint4*>(source + i);
+        const half2* pairs = reinterpret_cast<const half2*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 value = __half22float2(pairs[j]);
+            local = fmaxf(local, fmaxf(fabsf(value.x), fabsf(value.y)));
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local = fmaxf(local, __shfl_xor_sync(0xffffffffu, local, offset));
+    if ((threadIdx.x & 31) == 0) atomicMax(amax_bits, __float_as_uint(local));
+}
+
+// K-contiguous FP16 activations [rows][k] -> packed E2M1 [rows][k/2] plus block
+// scales (rows padded to 128, padding zero-filled). Publishes the GEMM
+// alpha = activation global * weight global.
+__global__ void nvfp4_quantize_rows_kernel(const half* __restrict__ source,
+    std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
+    int rows, int k, int padded_rows, const unsigned* __restrict__ amax_bits,
+    const float* __restrict__ weight_global, float* __restrict__ alpha) {
+    const float global = nvfp4_global_from_amax(__uint_as_float(*amax_bits));
+    const int blocks = k / 16;
+    const int inner_blocks = (blocks + 3) / 4 * 4;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index == 0) *alpha = global * *weight_global;
+    if (index >= padded_rows * blocks) return;
+    const int row = index / blocks, block = index % blocks;
+    if (row >= rows) {
+        scales[mxfp8_scale_offset(row, block, inner_blocks)] = 0;
+        return;
+    }
+    const auto* input = reinterpret_cast<const uint4*>(
+        source + static_cast<std::size_t>(row) * k + block * 16);
+    float x[16];
+    float amax = 0.0f;
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+        const uint4 packed = input[part];
+        const half2* pairs = reinterpret_cast<const half2*>(&packed);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 value = __half22float2(pairs[i]);
+            x[part * 8 + i * 2] = value.x;
+            x[part * 8 + i * 2 + 1] = value.y;
+            amax = fmaxf(amax, fmaxf(fabsf(value.x), fabsf(value.y)));
+        }
+    }
+    std::uint8_t code = 0;
+    nvfp4_encode16(x, amax, global,
+        values + (static_cast<std::size_t>(row) * k + block * 16) / 2, code);
+    scales[mxfp8_scale_offset(row, block, inner_blocks)] = code;
+}
+
+// Reconstructed FP16 weight [k][n] -> K-major packed E2M1 [n][k/2] plus block
+// scales (outer n, inner k/16) and the weight global scale. Grid (ceil(n/256), k/16).
+__global__ void nvfp4_quantize_weight_transposed_kernel(const half* __restrict__ source,
+    std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
+    int k, int n, const unsigned* __restrict__ amax_bits, float* __restrict__ weight_global) {
+    const float global = nvfp4_global_from_amax(__uint_as_float(*amax_bits));
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    const int block = blockIdx.y;
+    if (column == 0 && block == 0) *weight_global = global;
+    if (column >= n) return;
+    float x[16];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        x[i] = __half2float(source[static_cast<std::size_t>(block * 16 + i) * n + column]);
+        amax = fmaxf(amax, fabsf(x[i]));
+    }
+    std::uint8_t code = 0;
+    nvfp4_encode16(x, amax, global,
+        values + (static_cast<std::size_t>(column) * k + block * 16) / 2, code);
+    scales[mxfp8_scale_offset(column, block, (k / 16 + 3) / 4 * 4)] = code;
+}
+
 template <int Bits, bool FragmentOrder = false>
 __global__ void exl3_reconstruct_transformed_weight_kernel(
     const std::uint16_t* trellis,
@@ -1231,6 +2054,272 @@ __global__ void exl3_reconstruct_transformed_weight_kernel(
     else
         reconstructed[(static_cast<std::size_t>(tile_k) * 16 + row) *
                           output_features + tile_n * 16 + column] = value;
+}
+
+// EXL3 MUL1 codebook values lie in [-3.454, 3.447] for every state, so the
+// NVFP4 weight global scale is a constant bound instead of a measured amax.
+constexpr float kNvfp4WeightGlobal = 3.5f / (6.0f * 448.0f);
+
+// Fused EXL3 decode + block quantization of one transformed weight into the
+// K-major MXFP8 (Quant=32) or NVFP4 (Quant=16) prefill operand, bypassing the
+// FP16 reconstruction plane. Each thread decodes one output column over
+// Blocks consecutive quantization blocks along K from the packed trellis tiles
+// staged in shared memory, so its value bytes form whole 32-byte segments
+// (NVFP4: 4 x 16 values = 32 bytes, scales one 32-bit store; MXFP8: 32 bytes
+// per block). Grid (ceil(n/256), k/(Quant*Blocks)).
+template <int Bits, int Quant, int Blocks>
+__global__ void __launch_bounds__(256, 4) exl3_decode_quantize_weight_kernel(
+    const std::uint16_t* __restrict__ trellis, const std::int32_t* __restrict__ mul1,
+    std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
+    float* __restrict__ weight_global, int k, int n) {
+    constexpr int kTilesPerBlock = Quant / 16;
+    constexpr int kTilesK = kTilesPerBlock * Blocks;
+    constexpr int kWords = 16 * Bits;          // packed u16 words per 16x16 tile
+    __shared__ std::uint16_t packed[kTilesK][16][kWords];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tiles_n = n / 16;
+    const int tile_n0 = static_cast<int>(blockIdx.x) * 16;
+    const int live_tiles = min(16, tiles_n - tile_n0);
+    const int k_tile0 = static_cast<int>(blockIdx.y) * kTilesK;
+    for (int kt = 0; kt < kTilesK; ++kt) {
+        const std::uint16_t* source = trellis +
+            (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords;
+        for (int i = tid; i < live_tiles * kWords; i += 256)
+            packed[kt][i / kWords][i % kWords] = source[i];
+    }
+    if (Quant == 16 && tid == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+        *weight_global = kNvfp4WeightGlobal;
+    __syncthreads();
+    const int local_tile = tid / 16, column_in_tile = tid % 16;
+    if (local_tile >= live_tiles) return;
+    const int column = (tile_n0 + local_tile) * 16 + column_in_tile;
+    const std::uint32_t multiplier = static_cast<std::uint32_t>(*mul1);
+    const int k0 = static_cast<int>(blockIdx.y) * Quant * Blocks;
+    const int inner_blocks = (k / Quant + 3) / 4 * 4;
+    std::uint32_t codes = 0;
+#pragma unroll
+    for (int b = 0; b < Blocks; ++b) {
+        float x[Quant];
+        float amax = 0.0f;
+#pragma unroll
+        for (int kt = 0; kt < kTilesPerBlock; ++kt) {
+#pragma unroll
+            for (int row = 0; row < 16; ++row) {
+                const int encoded = inverse_tensor_core_index(row, column_in_tile);
+                const float value = __half2float(__ushort_as_half(decode_mul1_generic(
+                    decode_state_generic(packed[b * kTilesPerBlock + kt][local_tile],
+                                         Bits, encoded), multiplier)));
+                x[kt * 16 + row] = value;
+                amax = fmaxf(amax, fabsf(value));
+            }
+        }
+        const int kb = k0 + b * Quant;
+        if constexpr (Quant == 32) {
+            const int exponent = mxfp8_block_exponent(amax);
+            mxfp8_encode32(x, exp2f(static_cast<float>(-exponent)),
+                values + static_cast<std::size_t>(column) * k + kb);
+            scales[mxfp8_scale_offset(column, kb / 32, inner_blocks)] =
+                static_cast<std::uint8_t>(exponent + 127);
+        } else {
+            std::uint8_t code = 0;
+            nvfp4_encode16(x, amax, kNvfp4WeightGlobal,
+                values + (static_cast<std::size_t>(column) * k + kb) / 2, code);
+            codes |= static_cast<std::uint32_t>(code) << (8 * b);
+        }
+    }
+    if constexpr (Quant == 16) {
+        static_assert(Blocks == 4, "NVFP4 scale store covers four inner blocks");
+        *reinterpret_cast<std::uint32_t*>(scales +
+            mxfp8_scale_offset(column, k0 / 16, inner_blocks)) = codes;
+    }
+}
+
+template <int Quant>
+void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
+    const std::int32_t* mul1, std::uint8_t* values, std::uint8_t* scales,
+    float* weight_global, int k, int n, cudaStream_t stream) {
+    constexpr int kBlocks = Quant == 16 ? 4 : 1;
+    const dim3 grid((n / 16 + 15) / 16, k / (Quant * kBlocks));
+    switch (bits) {
+    case 5: exl3_decode_quantize_weight_kernel<5, Quant, kBlocks><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
+    case 6: exl3_decode_quantize_weight_kernel<6, Quant, kBlocks><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
+    case 7: exl3_decode_quantize_weight_kernel<7, Quant, kBlocks><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
+    case 8: exl3_decode_quantize_weight_kernel<8, Quant, kBlocks><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
+    default: throw std::invalid_argument("fused EXL3 decode/quantize supports K5..K8");
+    }
+}
+
+// Transformed activations are bounded well below 4 on this model (observed
+// per-site maxima <= 0.49 over 4K/16K code and prose prefills), so the NVFP4
+// activation global scale is a static bound, as with calibrated input scales.
+constexpr float kNvfp4ActivationGlobal = 4.0f / (6.0f * 448.0f);
+
+// Input Hadamard fused with block quantization of its FP16-rounded result
+// (identical values to transform-then-quantize). One warp owns a 128-element
+// Hadamard block; Quant=16 (NVFP4, constant activation global) spans 4 lanes,
+// Quant=32 (MXFP8) spans 8. Tasks cover rows padded to 128 so padding scales
+// are zero. Thread 0 publishes the NVFP4 GEMM alpha.
+template <int Quant>
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock * 32) input_hadamard_quantize_warp_kernel(
+    const std::uint16_t* __restrict__ input, const std::uint16_t* __restrict__ suh,
+    std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
+    int rows, int padded_rows, int input_features,
+    const float* __restrict__ weight_global, float* __restrict__ alpha) {
+    constexpr int kGroup = Quant / 4;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int blocks = input_features / kHadamard;
+    const long long task = static_cast<long long>(blockIdx.x) * kHadamardWarpsPerBlock +
+        (static_cast<int>(threadIdx.x) >> 5);
+    if (Quant == 16 && task == 0 && lane == 0) *alpha = kNvfp4ActivationGlobal * *weight_global;
+    if (task >= static_cast<long long>(padded_rows) * blocks) return;
+    const int row = static_cast<int>(task / blocks);
+    const int block = static_cast<int>(task % blocks);
+    const int offset = block * kHadamard + lane * 4;
+    const int inner_blocks = (input_features / Quant + 3) / 4 * 4;
+    if (row >= rows) {
+        if (lane % kGroup == 0) scales[mxfp8_scale_offset(row, offset / Quant, inner_blocks)] = 0;
+        return;
+    }
+    const std::size_t element = static_cast<std::size_t>(row) * input_features + offset;
+    std::uint16_t represented[4], scale[4];
+    exl3_load_half4(input + element, represented);
+    exl3_load_half4(suh + offset, scale);
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = half_product(represented[j], scale[j]);
+    exl3_warp_butterflies(v, lane);
+    float x[4];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        x[j] = __half2float(__float2half_rn(v[j] * kHadamardScale));
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+#pragma unroll
+    for (int o = 1; o < kGroup; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if constexpr (Quant == 32) {
+        const int exponent = mxfp8_block_exponent(amax);
+        const float s = exp2f(static_cast<float>(-exponent));
+        const __nv_fp8x2_storage_t low = __nv_cvt_float2_to_fp8x2(
+            make_float2(x[0] * s, x[1] * s), __NV_SATFINITE, __NV_E4M3);
+        const __nv_fp8x2_storage_t high = __nv_cvt_float2_to_fp8x2(
+            make_float2(x[2] * s, x[3] * s), __NV_SATFINITE, __NV_E4M3);
+        *reinterpret_cast<std::uint32_t*>(values + element) =
+            static_cast<std::uint32_t>(low) | (static_cast<std::uint32_t>(high) << 16);
+        if (lane % kGroup == 0)
+            scales[mxfp8_scale_offset(row, offset / 32, inner_blocks)] =
+                static_cast<std::uint8_t>(exponent + 127);
+    } else {
+        float block_scale = 1.0f;
+        const std::uint8_t code = nvfp4_scale_code(
+            fmaxf(amax / (6.0f * kNvfp4ActivationGlobal), 1e-30f), block_scale);
+        const float inverse = 1.0f / (block_scale * kNvfp4ActivationGlobal);
+        const auto low = static_cast<std::uint16_t>(__nv_cvt_float2_to_fp4x2(
+            make_float2(x[0] * inverse, x[1] * inverse), __NV_E2M1, cudaRoundNearest));
+        const auto high = static_cast<std::uint16_t>(__nv_cvt_float2_to_fp4x2(
+            make_float2(x[2] * inverse, x[3] * inverse), __NV_E2M1, cudaRoundNearest));
+        *reinterpret_cast<std::uint16_t*>(values + element / 2) =
+            static_cast<std::uint16_t>((low & 0xffu) | ((high & 0xffu) << 8));
+        if (lane % kGroup == 0)
+            scales[mxfp8_scale_offset(row, offset / 16, inner_blocks)] = code;
+    }
+}
+
+// Prefill MLP activation fused with the down projection's quantized input.
+// Per warp (row, 128-block): gate and up output Hadamards with their svh,
+// SiLU(gate)*up rounded to FP16, the down input Hadamard with suh rounded to
+// FP16, then MXFP8 (Quant=32) or NVFP4 (Quant=16) block quantization. Every
+// FP16 rounding matches the unfused output-transform, SiLU and input-transform
+// kernels, so the quantized values are identical.
+template <int Quant>
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock * 32) mlp_activation_quantize_warp_kernel(
+    const std::uint16_t* __restrict__ gate, const std::uint16_t* __restrict__ up,
+    const std::uint16_t* __restrict__ gate_svh, const std::uint16_t* __restrict__ up_svh,
+    const std::uint16_t* __restrict__ suh, std::uint8_t* __restrict__ values,
+    std::uint8_t* __restrict__ scales, int rows, int padded_rows, int features,
+    const float* __restrict__ weight_global, float* __restrict__ alpha) {
+    constexpr int kGroup = Quant / 4;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int blocks = features / kHadamard;
+    const long long task = static_cast<long long>(blockIdx.x) * kHadamardWarpsPerBlock +
+        (static_cast<int>(threadIdx.x) >> 5);
+    if (Quant == 16 && task == 0 && lane == 0) *alpha = kNvfp4ActivationGlobal * *weight_global;
+    if (task >= static_cast<long long>(padded_rows) * blocks) return;
+    const int row = static_cast<int>(task / blocks);
+    const int block = static_cast<int>(task % blocks);
+    const int offset = block * kHadamard + lane * 4;
+    const int inner_blocks = (features / Quant + 3) / 4 * 4;
+    if (row >= rows) {
+        if (lane % kGroup == 0) scales[mxfp8_scale_offset(row, offset / Quant, inner_blocks)] = 0;
+        return;
+    }
+    const std::size_t element = static_cast<std::size_t>(row) * features + offset;
+    std::uint16_t g_bits[4], u_bits[4], g_scale[4], u_scale[4], in_scale[4];
+    exl3_load_half4(gate + element, g_bits);
+    exl3_load_half4(up + element, u_bits);
+    exl3_load_half4(gate_svh + offset, g_scale);
+    exl3_load_half4(up_svh + offset, u_scale);
+    exl3_load_half4(suh + offset, in_scale);
+    float g[4], u[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        g[j] = __half2float(__ushort_as_half(g_bits[j]));
+        u[j] = __half2float(__ushort_as_half(u_bits[j]));
+    }
+    exl3_warp_butterflies(g, lane);
+    exl3_warp_butterflies(u, lane);
+    std::uint16_t act[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float gv = __half2float(__hmul(__float2half_rn(g[j] * kHadamardScale),
+                                             __ushort_as_half(g_scale[j])));
+        const float uv = __half2float(__hmul(__float2half_rn(u[j] * kHadamardScale),
+                                             __ushort_as_half(u_scale[j])));
+        act[j] = __half_as_ushort(__float2half_rn((gv / (1.0f + expf(-gv))) * uv));
+    }
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = half_product(act[j], in_scale[j]);
+    exl3_warp_butterflies(v, lane);
+    float x[4];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        x[j] = __half2float(__float2half_rn(v[j] * kHadamardScale));
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+#pragma unroll
+    for (int o = 1; o < kGroup; o <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    if constexpr (Quant == 32) {
+        const int exponent = mxfp8_block_exponent(amax);
+        const float s = exp2f(static_cast<float>(-exponent));
+        const __nv_fp8x2_storage_t low = __nv_cvt_float2_to_fp8x2(
+            make_float2(x[0] * s, x[1] * s), __NV_SATFINITE, __NV_E4M3);
+        const __nv_fp8x2_storage_t high = __nv_cvt_float2_to_fp8x2(
+            make_float2(x[2] * s, x[3] * s), __NV_SATFINITE, __NV_E4M3);
+        *reinterpret_cast<std::uint32_t*>(values + element) =
+            static_cast<std::uint32_t>(low) | (static_cast<std::uint32_t>(high) << 16);
+        if (lane % kGroup == 0)
+            scales[mxfp8_scale_offset(row, offset / 32, inner_blocks)] =
+                static_cast<std::uint8_t>(exponent + 127);
+    } else {
+        float block_scale = 1.0f;
+        const std::uint8_t code = nvfp4_scale_code(
+            fmaxf(amax / (6.0f * kNvfp4ActivationGlobal), 1e-30f), block_scale);
+        const float inverse = 1.0f / (block_scale * kNvfp4ActivationGlobal);
+        const auto low = static_cast<std::uint16_t>(__nv_cvt_float2_to_fp4x2(
+            make_float2(x[0] * inverse, x[1] * inverse), __NV_E2M1, cudaRoundNearest));
+        const auto high = static_cast<std::uint16_t>(__nv_cvt_float2_to_fp4x2(
+            make_float2(x[2] * inverse, x[3] * inverse), __NV_E2M1, cudaRoundNearest));
+        *reinterpret_cast<std::uint16_t*>(values + element / 2) =
+            static_cast<std::uint16_t>((low & 0xffu) | ((high & 0xffu) << 8));
+        if (lane % kGroup == 0)
+            scales[mxfp8_scale_offset(row, offset / 16, inner_blocks)] = code;
+    }
 }
 
 // Fold both EXL3 128-point transforms into a row-major reconstructed weight.
@@ -1773,6 +2862,44 @@ constexpr std::size_t exl3_native_persistent_smem_bytes() {
            static_cast<std::size_t>(sh_c_elements) * sizeof(float);
 }
 
+// Per-row shared stride (halves) of the fused-input Hadamard staging: the
+// split's 128-blocks plus one block covering an unaligned split start, padded
+// by 8 halves so the eight A-fragment rows (lane / 4) read distinct banks.
+__host__ __device__ __forceinline__ int exl3_fused_input_span(int input_features,
+                                                              int split_count) {
+    const int tiles_per_split = (input_features / 16 + split_count - 1) / split_count;
+    return ((tiles_per_split * 16 + kHadamard - 1) / kHadamard + 1) * kHadamard + 8;
+}
+
+// True when a drained deep cp.async ring (ring_halves packed halves) can hold
+// the CTA's 16-row FP32 output tile.
+__host__ __device__ constexpr bool exl3_deep_ring_holds_output(int ring_halves,
+                                                               int output_tiles) {
+    return ring_halves * 2 >= 16 * output_tiles * 16 * 4;
+}
+
+// Dynamic shared bytes of a deep async-A producer that stages A tiles. The
+// output-tile bytes stay allocated even when sh_c reuses the ring: the
+// tighter footprint admits more CTAs per SM and measured slower.
+inline std::size_t exl3_deep_shared_bytes(int bits, int stages, int warps, int per) {
+    return static_cast<std::size_t>(stages * per) * 256u * sizeof(half) +
+        static_cast<std::size_t>(stages * per * warps * 16 * bits) * sizeof(std::uint16_t) +
+        16u * warps * 16u * sizeof(float);
+}
+
+// Dynamic shared bytes of a fused-input deep producer (no A staging, sh_c in
+// the drained ring when it fits, rows * span halves of transformed input).
+inline std::size_t exl3_fused_input_shared_bytes(int bits, int stages, int warps, int per,
+                                                 int rows, int input_features,
+                                                 int split_count) {
+    const int ring_halves = stages * per * warps * 16 * bits;
+    const std::size_t output_bytes = 16u * warps * 16u * sizeof(float);
+    return static_cast<std::size_t>(ring_halves) * sizeof(std::uint16_t) +
+        (exl3_deep_ring_holds_output(ring_halves, warps) ? 0u : output_bytes) +
+        static_cast<std::size_t>(rows) * exl3_fused_input_span(input_features, split_count) *
+            sizeof(half);
+}
+
 // Generalized version of the E2B cooperative leaf.  The model's real EXL3
 // projection dimensions are all multiples of a 512-column output block, so a
 // block owns 32 packed 16-column tiles and a split owns a contiguous range of
@@ -1782,18 +2909,47 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool AsyncA = false, bool PartialOnly = false,
            bool K7ThreeWord = false, bool PredecodedB = false,
            bool FastK6Decode = false, bool Fp16Accumulate = false,
-           bool RegisterPipeline = false, bool GlobalSlices = false>
-__global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
+           bool RegisterPipeline = false, bool GlobalSlices = false,
+           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1,
+           bool FusedInput = false>
+__device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
+                                                 const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
                                                  float* accum,
                                                  int rows,
                                                  int input_features,
                                                  int output_features,
-                                                 int split_count) {
+                                                 int split_count,
+                                                 const std::uint16_t* raw_input,
+                                                 const std::uint16_t* suh) {
+    // FusedInput (rows 1..8, deep async-A FP32 path only): the CTA computes
+    // the input Hadamard of its split's 128-blocks from the raw rows and SUH
+    // (the input_hadamard_warp_kernel arithmetic) into shared memory, one
+    // exl3_fused_input_span row stride per row, and builds the A fragments
+    // from it; rows >= `rows` (and 8..15) stay zero as in the staged tile.
+    static_assert(!FusedInput || (DeepStages > 0 && AsyncA && !RegisterPipeline &&
+                                  !Fp16Accumulate && !PredecodedB),
+                  "fused input requires the deep async-A FP32 producer");
+    // Deep async-A stages may stream the constant packed weights of their
+    // preload groups before the dependency wait; everything else waits first.
+    constexpr bool kEarlyWeights = DeepStages > 0 && AsyncA && !RegisterPipeline;
+    if constexpr (!kEarlyWeights) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    asm volatile("griddepcontrol.launch_dependents;");
     constexpr int output_tiles_per_block = OutputTilesPerBlock;
-    constexpr int fragments_per_warp = output_tiles_per_block / 4;
-    static_assert(output_tiles_per_block == 8 || output_tiles_per_block == 16 ||
+    // Each warp owns fragments_per_warp N8 fragments over the CTA's complete
+    // K range. Narrower CTAs (fewer warps, fewer tiles) keep that per-warp
+    // work and MMA sequence unchanged while multiplying the grid.
+    constexpr int threads = Warps * 32;
+    constexpr int fragments_per_warp = output_tiles_per_block * 2 / Warps;
+    static_assert(Warps == 8 || Warps == 4 || Warps == 2,
+                  "EXL3 packed producer uses 2, 4 or 8 warps");
+    static_assert(output_tiles_per_block * 2 % Warps == 0,
+                  "EXL3 output tiles must divide across warps");
+    static_assert(output_tiles_per_block == 2 || output_tiles_per_block == 4 ||
+                      output_tiles_per_block == 8 || output_tiles_per_block == 16 ||
                       output_tiles_per_block == 32 || output_tiles_per_block == 64,
                   "EXL3 output topology must use a proven tile width");
     static_assert(fragments_per_warp == 2 || fragments_per_warp == 4 ||
@@ -1806,22 +2962,40 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     static_assert(!GlobalSlices ||
                       (!SingleSplit && AsyncA && PartialOnly),
                   "global slices require async-A partial-only accumulation");
+    // DeepStages keeps DeepStages-1 packed tiles in flight per CTA. It changes
+    // only copy scheduling; every output sees the same MMA sequence.
+    static_assert(DeepStages == 0 ||
+                      (DeepStages >= 3 && DeepStages <= 8 && AsyncA &&
+                       !RegisterPipeline && !Fp16Accumulate),
+                  "deep cp.async staging requires the async-A FP32 path");
     constexpr int tile_half = PredecodedB ? 256 : 16 * Bits;
     constexpr int raw_stage_half = output_tiles_per_block * tile_half;
-    constexpr int raw_stage_count = RegisterPipeline ? 4 : 2;
+    static_assert(TilesPerStage == 1 ||
+                      (DeepStages && (TilesPerStage == 2 || TilesPerStage == 4)),
+                  "multi-tile stages require the deep cp.async ring");
+    constexpr int raw_stage_count =
+        RegisterPipeline ? 4 : (DeepStages ? DeepStages * TilesPerStage : 2);
+    // The deep ring is drained before the output tile is written, so sh_c
+    // reuses it whenever it fits (exl3_deep_ring_holds_output); fused input
+    // builds A fragments from sh_in and stages no A tiles. Launchers size
+    // fused-input shared memory with exl3_fused_input_shared_bytes.
+    constexpr bool alias_c = DeepStages > 0 &&
+        exl3_deep_ring_holds_output(raw_stage_count * raw_stage_half, output_tiles_per_block);
     extern __shared__ half shared[];
     half* sh_a = shared;
     auto* sh_raw = reinterpret_cast<std::uint16_t*>(
-        sh_a + (AsyncA ? raw_stage_count * 256 : 256));
-    float* sh_c = reinterpret_cast<float*>(
+        sh_a + (FusedInput ? 0 : (AsyncA ? raw_stage_count * 256 : 256)));
+    float* sh_c = alias_c ? reinterpret_cast<float*>(sh_raw) : reinterpret_cast<float*>(
         sh_raw + raw_stage_count * raw_stage_half);
+    half* sh_in = alias_c ? reinterpret_cast<half*>(sh_raw + raw_stage_count * raw_stage_half)
+                          : reinterpret_cast<half*>(sh_c + 16 * output_tiles_per_block * 16);
     const int thread = static_cast<int>(threadIdx.x);
     const int warp = thread / 32;
     const int lane = thread & 31;
     const int tiles_k = input_features / 16;
     const int tiles_n = output_features / 16;
     const int output_blocks = (tiles_n + output_tiles_per_block - 1) / output_tiles_per_block;
-    const int block = static_cast<int>(blockIdx.x);
+    const int block = block_index;
     const int tile_base = (SingleSplit ? block : block % output_blocks) * output_tiles_per_block;
     const int split = SingleSplit ? 0 : block / output_blocks;
     const int tiles_per_split = (tiles_k + split_count - 1) / split_count;
@@ -1829,18 +3003,20 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     const int tile_k_end = min(tile_k_begin + tiles_per_split, tiles_k);
     const std::uint32_t mul1_multiplier = static_cast<std::uint32_t>(*mul1);
 
-    auto prefetch = [&](int tile_k, int stage) {
+    // part: 0 = packed weights and A, 1 = packed weights only, 2 = A only.
+    auto prefetch = [&](int tile_k, int stage, bool commit = true, int part = 0) {
         if (tile_k >= tile_k_end) return;
         const std::size_t offset =
             (static_cast<std::size_t>(tile_k) * tiles_n + tile_base) *
             static_cast<std::size_t>(tile_half);
         auto* destination = sh_raw + stage * raw_stage_half;
         const auto* source = trellis + offset;
-        for (int chunk = thread; chunk < raw_stage_half / 8; chunk += kThreads) {
+        if (part != 2)
+        for (int chunk = thread; chunk < raw_stage_half / 8; chunk += threads) {
             exl3_cp_async_16(destination + chunk * 8, source + chunk * 8);
         }
-        if constexpr (AsyncA) {
-            if (thread < 32) {
+        if constexpr (AsyncA && !FusedInput) {
+            if (part != 1 && thread < 32) {
                 const int row = thread / 2;
                 const int column = (thread % 2) * 8;
                 const int source_column =
@@ -1860,10 +3036,10 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
                 }
             }
         }
-        exl3_cp_async_commit();
+        if (commit) exl3_cp_async_commit();
     };
 
-    if constexpr (!RegisterPipeline) {
+    if constexpr (!RegisterPipeline && DeepStages == 0) {
         prefetch(tile_k_begin, 0);
         exl3_cp_async_wait();
         __syncthreads();
@@ -1978,10 +3154,124 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
         }
         exl3_cp_async_wait_group<0>();
         __syncthreads();
+    } else if constexpr (DeepStages > 0) {
+        constexpr int stages = DeepStages;
+        constexpr int per = TilesPerStage;
+        // One committed group per stage of `per` consecutive k-tiles,
+        // including empty tail groups, so wait_pending<stages-2> always
+        // completes the current stage. Tiles are consumed in ascending k.
+        auto issue = [&](int group, int stage, int part = 0) {
+            #pragma unroll
+            for (int t = 0; t < per; ++t)
+                prefetch(tile_k_begin + group * per + t, stage * per + t, false, part);
+            exl3_cp_async_commit();
+        };
+        if constexpr (kEarlyWeights) {
+            // Weights for every preload stage, then (after the dependency
+            // wait) the producer-written A slices. Commit order B0..B(s-2),
+            // A0..A(s-2), then combined groups: each wait_pending<stages-2>
+            // below still covers the stage it consumes.
+            #pragma unroll
+            for (int preload = 0; preload < stages - 1; ++preload)
+                issue(preload, preload, 1);
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            #pragma unroll
+            for (int preload = 0; preload < stages - 1; ++preload)
+                issue(preload, preload, 2);
+        } else {
+        #pragma unroll
+        for (int preload = 0; preload < stages - 1; ++preload)
+            issue(preload, preload);
+        }
+        const int fused_block0 = tile_k_begin * 16 / kHadamard;
+        const int fused_span = exl3_fused_input_span(input_features, split_count);
+        if constexpr (FusedInput) {
+            const int fused_block1 = (tile_k_end * 16 + kHadamard - 1) / kHadamard;
+            const int fused_blocks = fused_block1 - fused_block0;
+            for (int task = warp; task < rows * fused_blocks; task += Warps) {
+                const int row = task / fused_blocks;
+                const int b = fused_block0 + task % fused_blocks;
+                const int offset = b * kHadamard + lane * 4;
+                std::uint16_t represented[4], scale[4];
+                exl3_load_half4(raw_input + static_cast<std::size_t>(row) * input_features +
+                                offset, represented);
+                exl3_load_half4(suh + offset, scale);
+                float v[4];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) v[j] = half_product(represented[j], scale[j]);
+                exl3_warp_butterflies(v, lane);
+                std::uint16_t result[4];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    result[j] = __half_as_ushort(__float2half_rn(v[j] * kHadamardScale));
+                exl3_store_half4(reinterpret_cast<std::uint16_t*>(sh_in) + row * fused_span +
+                                 (b - fused_block0) * kHadamard + lane * 4, result);
+            }
+            __syncthreads();
+        }
+        const int groups = (tile_k_end - tile_k_begin + per - 1) / per;
+        for (int group = 0; group < groups; ++group) {
+            exl3_cp_async_wait_pending<stages - 2>();
+            // Also orders the previous iteration's shared reads before the
+            // refill of its stage below.
+            __syncthreads();
+            issue(group + stages - 1, (group + stages - 1) % stages);
+          #pragma unroll
+          for (int t = 0; t < per; ++t) {
+            if (tile_k_begin + group * per + t >= tile_k_end) break;
+            const int stage = (group % stages) * per + t;
+            Exl3FragA a;
+            if constexpr (FusedInput) {
+                // m16n8k16 A: words 0/2 hold row lane/4 at columns
+                // 2*(lane%4) and 8+2*(lane%4); words 1/3 (rows 8..15) are zero.
+                const int tile_k = tile_k_begin + group * per + t;
+                const int a_row = lane >> 2;
+                const auto* row_words = reinterpret_cast<const std::uint32_t*>(
+                    sh_in + a_row * fused_span + (tile_k * 16 - fused_block0 * kHadamard));
+                auto* words = reinterpret_cast<std::uint32_t*>(&a);
+                const bool live = a_row < rows;
+                words[0] = live ? row_words[lane & 3] : 0u;
+                words[1] = 0u;
+                words[2] = live ? row_words[4 + (lane & 3)] : 0u;
+                words[3] = 0u;
+            } else {
+            const int r = (lane % 8) + 8 * ((lane / 8) % 2);
+            const int base_c = lane / 16;
+            const int c_swizzled = base_c ^ ((r >> 2) & 1);
+            exl3_ldsm4(a, sh_a + stage * 256 + r * 16 + c_swizzled * 8);
+            }
+            #pragma unroll
+            for (int n2 = 0; n2 < fragments_per_warp; n2 += 2) {
+                const int sub_n2 = warp * (fragments_per_warp / 2) + n2 / 2;
+                const auto* packed = reinterpret_cast<const std::uint32_t*>(
+                    sh_raw + stage * raw_stage_half + sub_n2 * tile_half);
+                Exl3FragB b0, b1;
+                if constexpr (PredecodedB) {
+                    const auto* values = reinterpret_cast<const half2*>(packed) +
+                        lane * 4;
+                    b0.values[0] = values[0]; b0.values[1] = values[1];
+                    b1.values[0] = values[2]; b1.values[1] = values[3];
+                } else if constexpr (FastK6Decode) {
+                    static_assert(Bits==6,"fast M1 lane-window decoder is K6-only");
+                    exl3_dq4_k6_lane_window(packed,lane<<3,b0,mul1_multiplier);
+                    exl3_dq4_k6_lane_window(packed,(lane<<3)+4,b1,mul1_multiplier);
+                } else {
+                    exl3_dq4_generic<Bits, K7ThreeWord>(
+                        packed, lane << 3, b0, mul1_multiplier);
+                    exl3_dq4_generic<Bits, K7ThreeWord>(
+                        packed, (lane << 3) + 4, b1, mul1_multiplier);
+                }
+                exl3_mma_m16n8k16(a, b0, c[n2]);
+                exl3_mma_m16n8k16(a, b1, c[n2 + 1]);
+            }
+          }
+        }
+        exl3_cp_async_wait();
+        __syncthreads();
     } else {
         for (int tile_k = tile_k_begin; tile_k < tile_k_end; ++tile_k) {
             if constexpr (!AsyncA) {
-                for (int i = thread; i < 256; i += kThreads) {
+                for (int i = thread; i < 256; i += threads) {
                     const int row = i / 16;
                     const int column = i % 16;
                     const int source_column =
@@ -2078,7 +3368,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
         const bool first = split == split_count - 1;
         const bool last = split == 0;
         exl3_global_slice_acquire(locks + block % output_blocks, lock_stage);
-        for (int i = thread; i < rows * output_tile_elements; i += kThreads) {
+        for (int i = thread; i < rows * output_tile_elements; i += threads) {
             const int row = i / output_tile_elements;
             const int column = i % output_tile_elements;
             float* destination = accum + row * output_features +
@@ -2091,7 +3381,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
         exl3_global_slice_release(locks + block % output_blocks,
                                   lock_stage + 1, last);
     } else {
-        for (int i = thread; i < rows * output_tile_elements; i += kThreads) {
+        for (int i = thread; i < rows * output_tile_elements; i += threads) {
             const int row = i / output_tile_elements;
             const int column = i % output_tile_elements;
             if constexpr (SingleSplit) {
@@ -2108,7 +3398,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
     }
     if constexpr (!SingleSplit && !PartialOnly) {
       if (split == 0) {
-        for (int i = thread; i < rows * output_tile_elements; i += kThreads) {
+        for (int i = thread; i < rows * output_tile_elements; i += threads) {
             const int row = i / output_tile_elements;
             const int column = i % output_tile_elements;
             float value = sh_c[i];
@@ -2119,6 +3409,353 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
             accum[row * output_features + tile_base * 16 + column] = value;
         }
       }
+    }
+}
+
+template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
+           bool AsyncA = false, bool PartialOnly = false,
+           bool K7ThreeWord = false, bool PredecodedB = false,
+           bool FastK6Decode = false, bool Fp16Accumulate = false,
+           bool RegisterPipeline = false, bool GlobalSlices = false,
+           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1>
+__global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
+                                                 const std::uint16_t* trellis,
+                                                 const std::int32_t* mul1,
+                                                 float* accum,
+                                                 int rows,
+                                                 int input_features,
+                                                 int output_features,
+                                                 int split_count) {
+    exl3_gemm_m1_generic_mma_body<Bits, SingleSplit, OutputTilesPerBlock, AsyncA,
+        PartialOnly, K7ThreeWord, PredecodedB, FastK6Decode, Fp16Accumulate,
+        RegisterPipeline, GlobalSlices, DeepStages, Warps, TilesPerStage, false>(
+            static_cast<int>(blockIdx.x), transformed, trellis, mul1, accum, rows, input_features, output_features,
+            split_count, nullptr, nullptr);
+}
+
+template <int Bits, bool K7ThreeWord, bool FastK6Decode, int DeepStages, int Warps,
+          int TilesPerStage>
+__global__ void exl3_gemm_m1_fused_input_kernel(const std::uint16_t* raw_input,
+                                                 const std::uint16_t* suh,
+                                                 const std::uint16_t* trellis,
+                                                 const std::int32_t* mul1,
+                                                 float* accum,
+                                                 int rows,
+                                                 int input_features,
+                                                 int output_features,
+                                                 int split_count) {
+    exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+        FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
+            static_cast<int>(blockIdx.x), raw_input, trellis, mul1, accum, rows,
+            input_features, output_features, split_count, raw_input, suh);
+}
+
+// Two same-input projections (MLP gate and up, GDN qkv and z, K and V) of
+// 1..8 rows in one launch: blocks [0, grid_a) run the first producer, the next
+// grid_b the second, and any further rows*heads blocks the GDN control
+// projections. Fused producers transform the raw rows in their prologue
+// (exl3_gemm_m1_fused_input_kernel arithmetic); otherwise they read the two
+// pre-transformed inputs (launch_coherent_packed_partials arithmetic).
+template <int Bits, bool K7ThreeWord, bool FastK6Decode, int DeepStages, int Warps,
+          int TilesPerStage, bool Fused = true>
+__global__ void exl3_gemm_m1_fused_input_dual_kernel(const std::uint16_t* raw_input,
+    const std::uint16_t* transformed_a, const std::uint16_t* transformed_b,
+    const std::uint16_t* suh_a, const std::uint16_t* trellis_a, const std::int32_t* mul1_a,
+    float* accum_a, const std::uint16_t* suh_b, const std::uint16_t* trellis_b,
+    const std::int32_t* mul1_b, float* accum_b, int rows, int input_features,
+    int output_features_a, int output_features_b, int split_count, int grid_a, int grid_b,
+    Exl3GdnControlSide control) {
+    const int block = static_cast<int>(blockIdx.x);
+    if (block >= grid_a + grid_b) {
+        // GDN a/b control projections (control_fused_staged_kernel arithmetic:
+        // same fmaf order over d = t + 128 s, shuffle and four-warp sums).
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        asm volatile("griddepcontrol.launch_dependents;");
+        __shared__ float partial_a[4], partial_b[4];
+        const int index = block - grid_a - grid_b;
+        const int head = index % control.heads;
+        const std::uint16_t* x_row = raw_input +
+            static_cast<std::size_t>(index / control.heads) * input_features;
+        const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+        const std::uint16_t* a_row = control.a_weight + static_cast<std::size_t>(head) * input_features;
+        const std::uint16_t* b_row = control.b_weight + static_cast<std::size_t>(head) * input_features;
+        float asum = 0.0f, bsum = 0.0f;
+        #pragma unroll 8
+        for (int step = 0; step < input_features / 128; ++step) {
+            const int d = tid + step * 128;
+            const float x = __half2float(__ushort_as_half(x_row[d]));
+            asum = fmaf(x, __half2float(__ushort_as_half(a_row[d])), asum);
+            bsum = fmaf(x, __half2float(__ushort_as_half(b_row[d])), bsum);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            asum += __shfl_down_sync(0xffffffffu, asum, offset);
+            bsum += __shfl_down_sync(0xffffffffu, bsum, offset);
+        }
+        if (lane == 0) { partial_a[warp] = asum; partial_b[warp] = bsum; }
+        __syncthreads();
+        if (tid == 0) {
+            asum = 0.0f; bsum = 0.0f;
+            for (int w = 0; w < 4; ++w) { asum += partial_a[w]; bsum += partial_b[w]; }
+            control.a_output[index] = asum;
+            control.b_output[index] = bsum;
+            const float beta_f = 1.0f / (1.0f + expf(-bsum));
+            const float av = asum + control.dt_bias[head];
+            const float softplus = av > 20.0f ? av : log1pf(expf(av));
+            control.beta_trace[index] = __bfloat162float(__float2bfloat16_rn(beta_f));
+            control.g_trace[index] = -expf(control.a_log[head]) * softplus;
+        }
+        return;
+    }
+    if constexpr (Fused) {
+        if (block < grid_a)
+            exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+                FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
+                    block, raw_input, trellis_a, mul1_a, accum_a, rows, input_features,
+                    output_features_a, split_count, raw_input, suh_a);
+        else
+            exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+                FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, true>(
+                    block - grid_a, raw_input, trellis_b, mul1_b, accum_b, rows, input_features,
+                    output_features_b, split_count, raw_input, suh_b);
+    } else {
+        if (block < grid_a)
+            exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+                FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, false>(
+                    block, transformed_a, trellis_a, mul1_a, accum_a, rows, input_features,
+                    output_features_a, split_count, nullptr, nullptr);
+        else
+            exl3_gemm_m1_generic_mma_body<Bits, false, Warps, true, true, K7ThreeWord, false,
+                FastK6Decode, false, false, false, DeepStages, Warps, TilesPerStage, false>(
+                    block - grid_a, transformed_b, trellis_b, mul1_b, accum_b, rows,
+                    input_features, output_features_b, split_count, nullptr, nullptr);
+    }
+}
+
+// Reduction of two independent split-plane sets of 1..8 rows (per row the
+// blocks of the first matrix, then of the second); per block exactly
+// prefill_reduce_output_warp_kernel<false>.
+__global__ void __launch_bounds__(kHadamardWarpsPerBlock*32) exl3_pair_reduce_output_kernel(
+    const float* accum_a,const std::uint16_t* svh_a,std::uint16_t* output_a,int features_a,
+    const float* accum_b,const std::uint16_t* svh_b,std::uint16_t* output_b,int features_b,
+    int rows,int split_count,std::uint16_t* first_bf16) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int task=static_cast<int>(blockIdx.x)*kHadamardWarpsPerBlock+
+        (static_cast<int>(threadIdx.x)>>5);
+    const int blocks_a=features_a/kHadamard;
+    const int row_blocks=blocks_a+features_b/kHadamard;
+    if(task>=rows*row_blocks) return;
+    const int row=task/row_blocks;
+    int block=task%row_blocks;
+    const float* accum=accum_a; const std::uint16_t* svh=svh_a; std::uint16_t* output=output_a;
+    int features=features_a;
+    std::uint16_t* bf16_copy=first_bf16;
+    if(block>=blocks_a) {
+        block-=blocks_a; accum=accum_b; svh=svh_b; output=output_b; features=features_b;
+        bf16_copy=nullptr;
+    }
+    const int offset=block*kHadamard+lane*4;
+    accum+=static_cast<std::size_t>(row)*features;
+    output+=static_cast<std::size_t>(row)*features;
+    float v[4];
+    exl3_sum_split_planes(accum,static_cast<std::size_t>(rows)*features,offset,split_count,v);
+    std::uint16_t scale[4];
+    exl3_load_half4(svh+offset,scale);
+    exl3_warp_butterflies(v,lane);
+    std::uint16_t result[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+        result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+    }
+    exl3_store_half4(output+offset,result);
+    if(bf16_copy) {
+        // transpose_f16_to_bf16_kernel: bf16_rn(float(fp16)) at [feature*rows+row].
+        std::uint16_t converted[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const __nv_bfloat16 value=__float2bfloat16_rn(__half2float(__ushort_as_half(result[j])));
+            converted[j]=*reinterpret_cast<const std::uint16_t*>(&value);
+        }
+        if(rows==1) exl3_store_half4(bf16_copy+offset,converted);
+        else {
+            #pragma unroll
+            for(int j=0;j<4;++j)
+                bf16_copy[static_cast<std::size_t>(offset+j)*rows+row]=converted[j];
+        }
+    }
+}
+
+// Reduces both split-plane sets exactly as prefill_reduce_output_warp_kernel
+// (ascending planes, output Hadamard, SVH) and applies the silu_mul_kernel
+// activation; one warp per 128-column block.
+template<int Warps=kHadamardWarpsPerBlock>
+__global__ void __launch_bounds__(Warps*32) exl3_gate_up_reduce_silu_kernel(
+    const float* accum_gate,const float* accum_up,const std::uint16_t* svh_gate,
+    const std::uint16_t* svh_up,std::uint16_t* gate,std::uint16_t* up,
+    std::uint16_t* activation,int rows,int output_features,int split_count,
+    const std::uint16_t* down_suh,std::uint16_t* down_transformed) {
+    EXL3_PDL_PROLOGUE();
+    const int lane=static_cast<int>(threadIdx.x)&31;
+    const int task=static_cast<int>(blockIdx.x)*Warps+
+        (static_cast<int>(threadIdx.x)>>5);
+    const int blocks=output_features/kHadamard;
+    if(task>=rows*blocks) return;
+    const std::size_t row_base=static_cast<std::size_t>(task/blocks)*output_features;
+    const int column=(task%blocks)*kHadamard+lane*4;
+    const std::size_t offset=row_base+column;
+    float g[4],u[4];
+    const auto reduce=[&](const float* accum,const std::uint16_t* svh,std::uint16_t* out,
+                          float (&value)[4]) {
+        float v[4];
+        exl3_sum_split_planes(accum+row_base,static_cast<std::size_t>(rows)*output_features,
+                              column,split_count,v);
+        std::uint16_t scale[4];
+        exl3_load_half4(svh+column,scale);
+        exl3_warp_butterflies(v,lane);
+        std::uint16_t result[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const auto normalized=__float2half_rn(v[j]*kHadamardScale);
+            result[j]=__half_as_ushort(__hmul(normalized,__ushort_as_half(scale[j])));
+            value[j]=__half2float(__ushort_as_half(result[j]));
+        }
+        exl3_store_half4(out+offset,result);
+    };
+    reduce(accum_gate,svh_gate,gate,g);
+    reduce(accum_up,svh_up,up,u);
+    std::uint16_t act[4];
+    #pragma unroll
+    for(int j=0;j<4;++j)
+        act[j]=__half_as_ushort(__float2half_rn((g[j]/(1.0f+expf(-g[j])))*u[j]));
+    exl3_store_half4(activation+offset,act);
+    if(down_transformed) {
+        // The down projection's input Hadamard (input_hadamard_warp_kernel
+        // arithmetic) on the block this warp already holds.
+        std::uint16_t scale[4];
+        exl3_load_half4(down_suh+column,scale);
+        float v[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) v[j]=half_product(act[j],scale[j]);
+        exl3_warp_butterflies(v,lane);
+        std::uint16_t result[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) result[j]=__half_as_ushort(__float2half_rn(v[j]*kHadamardScale));
+        exl3_store_half4(down_transformed+offset,result);
+    }
+}
+
+// One CTA owns a complete 128-column Hadamard group for up to eight rows.
+// Unlike the split small-M path, its packed MMA result stays in shared memory
+// through the output transform: no global FP32 partials or reduction launch.
+// The bounded K6 down shape is the first admitted owner of this dataflow.
+__global__ void exl3_small_m_down_fused_output_kernel(
+    const std::uint16_t* transformed, const std::uint16_t* trellis,
+    const std::int32_t* mul1, const std::uint16_t* svh,
+    std::uint16_t* output, int rows, int input_features,
+    int output_features) {
+    constexpr int output_tiles = 8;
+    constexpr int raw_stage_half = output_tiles * 16 * 6;
+    __shared__ half sh_a[256];
+    __shared__ std::uint16_t sh_raw[2 * raw_stage_half];
+    __shared__ float sh_c[16 * kHadamard];
+    const int thread = static_cast<int>(threadIdx.x);
+    const int warp = thread / 32;
+    const int lane = thread & 31;
+    const int tile_base = static_cast<int>(blockIdx.x) * output_tiles;
+    const int tiles_n = output_features / 16;
+    const int tiles_k = input_features / 16;
+    const std::uint32_t multiplier = static_cast<std::uint32_t>(*mul1);
+    auto prefetch = [&](int tile_k, int stage) {
+        if (tile_k >= tiles_k) return;
+        const std::size_t offset =
+            (static_cast<std::size_t>(tile_k) * tiles_n + tile_base) * 16u * 6u;
+        auto* destination = sh_raw + stage * raw_stage_half;
+        const auto* source = trellis + offset;
+        for (int chunk = thread; chunk < raw_stage_half / 8; chunk += kThreads)
+            exl3_cp_async_16(destination + chunk * 8, source + chunk * 8);
+        exl3_cp_async_commit();
+    };
+    prefetch(0, 0);
+    exl3_cp_async_wait();
+    __syncthreads();
+    Exl3FragC c[2];
+    #pragma unroll
+    for (auto& fragment : c)
+        for (float& value : fragment.values) value = 0.0f;
+    int raw_stage = 0;
+    for (int tile_k = 0; tile_k < tiles_k; ++tile_k) {
+        for (int i = thread; i < 256; i += kThreads) {
+            const int row = i / 16;
+            const int column = i % 16;
+            const int source_column =
+                (column / 8 ^ ((row >> 2) & 1)) * 8 + column % 8;
+            sh_a[i] = row < rows
+                ? __ushort_as_half(transformed[row * input_features +
+                                               tile_k * 16 + source_column])
+                : __float2half_rn(0.0f);
+        }
+        __syncthreads();
+        prefetch(tile_k + 1, 1 - raw_stage);
+        Exl3FragA a;
+        const int r = (lane % 8) + 8 * ((lane / 8) % 2);
+        const int base_c = lane / 16;
+        const int c_swizzled = base_c ^ ((r >> 2) & 1);
+        exl3_ldsm4(a, sh_a + r * 16 + c_swizzled * 8);
+        const auto* packed = reinterpret_cast<const std::uint32_t*>(
+            sh_raw + raw_stage * raw_stage_half + warp * 16 * 6);
+        Exl3FragB b0, b1;
+        exl3_dq4_generic<6>(packed, lane << 3, b0, multiplier);
+        exl3_dq4_generic<6>(packed, (lane << 3) + 4, b1, multiplier);
+        exl3_mma_m16n8k16(a, b0, c[0]);
+        exl3_mma_m16n8k16(a, b1, c[1]);
+        if (tile_k + 1 < tiles_k) {
+            exl3_cp_async_wait();
+            __syncthreads();
+        }
+        raw_stage = 1 - raw_stage;
+    }
+    const int r0 = lane / 4;
+    const int r1 = r0 + 8;
+    const int column = (lane % 4) * 2;
+    #pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        if (r0 < rows) {
+            float* destination = sh_c + r0 * kHadamard + warp * 16 + n * 8 + column;
+            destination[0] = c[n].values[0];
+            destination[1] = c[n].values[1];
+        }
+        if (r1 < rows) {
+            float* destination = sh_c + r1 * kHadamard + warp * 16 + n * 8 + column;
+            destination[0] = c[n].values[2];
+            destination[1] = c[n].values[3];
+        }
+    }
+    __syncthreads();
+    // Two 128-thread groups transform one row each, four passes for M=8.
+    const int row_lane = thread & (kHadamard - 1);
+    const int row_group = thread / kHadamard;
+    for (int row_base = 0; row_base < rows; row_base += 2) {
+        const int row = row_base + row_group;
+        for (int width = 1; width < kHadamard; width *= 2) {
+            if (row < rows && row_lane % (2 * width) < width) {
+                const int index = row * kHadamard + row_lane;
+                const float left = sh_c[index];
+                const float right = sh_c[index + width];
+                sh_c[index] = left + right;
+                sh_c[index + width] = left - right;
+            }
+            __syncthreads();
+        }
+        if (row < rows) {
+            const int offset = static_cast<int>(blockIdx.x) * kHadamard + row_lane;
+            const float value = sh_c[row * kHadamard + row_lane];
+            const auto normalized = __float2half_rn(value * kHadamardScale);
+            const auto scale = __ushort_as_half(svh[offset]);
+            output[row * output_features + offset] =
+                __half_as_ushort(__hmul(normalized, scale));
+        }
+        __syncthreads();
     }
 }
 
@@ -3225,10 +4862,10 @@ exl3_split_plane_prefetch_discriminator_for_test() {
         const dim3 grid(rows,output_features/kHadamard);
         const auto launch=[&](bool candidate) {
             if(candidate)
-                prefill_reduce_output_kernel<true,false,true><<<grid,kHadamard>>>(
+                launch_prefill_reduce_output<true,false,true>(0,
                     accum,scale,prefetched,rows,output_features,split_count);
             else
-                prefill_reduce_output_kernel<true,false,false><<<grid,kHadamard>>>(
+                launch_prefill_reduce_output<true,false,false>(0,
                     accum,scale,selected,rows,output_features,split_count);
         };
         for(int warmup=0;warmup<4;++warmup){launch(false);launch(true);}
@@ -3457,10 +5094,9 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
        (transformed.data!=nullptr && transformed.bytes<requirement.transformed_bytes))
         throw std::invalid_argument("EXL3 borrowed transform capacity");
     requirement.require_disjoint_borrowed_views(transformed.data,accumulation.data);
-    const char* stream_reduce=std::getenv("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION");
-    if(stream_reduce && std::strcmp(stream_reduce,"0")!=0 && std::strcmp(stream_reduce,"1")!=0)
-        throw std::invalid_argument("K6 small-M stream reduction must be0 or1");
-    k6_stream_reduction_enabled_=target_wide_prefill_owner && stream_reduce && std::strcmp(stream_reduce,"1")==0;
+    const bool stream_reduce = read_binary_option("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",
+        "K6 small-M stream reduction must be0 or1");
+    k6_stream_reduction_enabled_ = target_wide_prefill_owner && stream_reduce;
     const char* extended=std::getenv("NINFER_EXL3_EXTENDED_STREAM_REDUCTION");
     if(extended&&std::strcmp(extended,"0")!=0&&std::strcmp(extended,"1")!=0)
         throw std::invalid_argument("extended target stream reduction must be0 or1");
@@ -3474,10 +5110,9 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
          std::strcmp(host_kv_gdn_segment_graphs,"1")==0) ||
         (host_kv_mlp_tail_graphs &&
          std::strcmp(host_kv_mlp_tail_graphs,"1")==0);
-    const char* kv_stream=std::getenv("NINFER_EXL3_KV_K7_STREAM_REDUCTION");
-    if(kv_stream && std::strcmp(kv_stream,"0")!=0 && std::strcmp(kv_stream,"1")!=0)
-        throw std::invalid_argument("K7 KV stream reduction must be 0 or 1");
-    kv_k7_stream_reduction_enabled_=target_kv_owner && kv_stream && std::strcmp(kv_stream,"1")==0;
+    const bool kv_stream = read_binary_option("NINFER_EXL3_KV_K7_STREAM_REDUCTION",
+        "K7 KV stream reduction must be 0 or 1");
+    kv_k7_stream_reduction_enabled_ = target_kv_owner && kv_stream;
     // Widen only explicit staged target prefill, with construction-latched opt-in.
     const char* wide64 = std::getenv("NINFER_EXL3_PREFILL_WIDE64");
     target_wide64_enabled_ = wide64 && std::strcmp(wide64, "1") == 0;
@@ -3500,14 +5135,10 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     // kernels; it never selects an alternate arithmetic route.
     prefill_projection_graph_enabled_ = target_wide_prefill_owner &&
         projection_graphs && std::strcmp(projection_graphs,"1") == 0;
-    const char* persisting_l2=
-        std::getenv("NINFER_EXL3_PREFILL_PERSISTING_L2");
-    if(persisting_l2 && std::strcmp(persisting_l2,"0")!=0 &&
-       std::strcmp(persisting_l2,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_PERSISTING_L2 must be 0 or 1");
-    prefill_persisting_l2_enabled_=target_wide_prefill_owner &&
-        persisting_l2 && std::strcmp(persisting_l2,"1")==0;
+    const bool persisting_l2 = read_binary_option("NINFER_EXL3_PREFILL_PERSISTING_L2",
+        "NINFER_EXL3_PREFILL_PERSISTING_L2 must be 0 or 1");
+    prefill_persisting_l2_enabled_ = target_wide_prefill_owner &&
+        persisting_l2;
     if(prefill_persisting_l2_enabled_) {
         int device=0,maximum=0;
         if(cudaGetDevice(&device)==cudaSuccess &&
@@ -3665,28 +5296,52 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     fast_same_weights_fp16_accum_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_accum &&
         std::strcmp(fast_same_weights_fp16_accum, "1") == 0;
-    const char* fast_same_weights_fp16_m1 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1");
-    if (fast_same_weights_fp16_m1 &&
-        std::strcmp(fast_same_weights_fp16_m1, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16_m1, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1 must be 0 or 1");
-    }
+    const bool fast_same_weights_fp16_m1 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1 must be 0 or 1");
     fast_same_weights_fp16_m1_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16_m1 &&
-        std::strcmp(fast_same_weights_fp16_m1, "1") == 0;
-    const char* fast_same_weights_fp16_m1_n16 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16");
-    if (fast_same_weights_fp16_m1_n16 &&
-        std::strcmp(fast_same_weights_fp16_m1_n16, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16_m1_n16, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16 must be 0 or 1");
-    }
+        fast_same_weights_fp16_m1;
+    fast_fp16_m2_8_down_enabled_ = target_down_owner &&
+        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_DOWN_K6",
+            "fast FP16 M2-8 down K6 must be 0 or 1");
+    fast_fp16_m2_8_fused_down_enabled_ = target_down_owner &&
+        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6",
+            "fast FP16 M2-8 fused down K6 must be 0 or 1");
+    const bool coherent_wide_k6_requested =
+        read_binary_option("NINFER_EXL3_TARGET_COHERENT_WIDE_K6",
+            "coherent wide K6 must be 0 or 1");
+    coherent_wide_k6_operation_ =
+        target_q_k6_owner && in_features_ == 5120 && out_features_ == 12288 ? 0 :
+        target_qkv_k6_owner && in_features_ == 5120 && out_features_ == 10240 ? 1 :
+        target_z_k6_owner && in_features_ == 5120 && out_features_ == 6144 ? 2 :
+        target_o_k7_owner && in_features_ == 6144 && out_features_ == 5120 ? 3 :
+        target_gateup_owner && in_features_ == 5120 && out_features_ == 17408 ? 4 : -1;
+    coherent_wide_k6_enabled_ = coherent_wide_k6_requested &&
+        coherent_wide_k6_operation_ >= 0;
+    // Split10 is the quality-gated default (teacher-forced verify NLL within
+    // +/-0.00012 nats/token); 0 restores the 5-split reduction order.
+    coherent_wide_k6_split10_enabled_ = coherent_wide_k6_enabled_ &&
+        (!std::getenv("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10") ||
+         read_binary_option("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",
+            "coherent wide K6 split10 must be 0 or 1"));
+    coherent_down_k6_enabled_ = target_down_owner &&
+        read_binary_option("NINFER_EXL3_COHERENT_DOWN_K6",
+            "coherent K6 down must be 0 or 1");
+    coherent_down_k7_enabled_ = target_down_owner &&
+        read_binary_option("NINFER_EXL3_COHERENT_DOWN_K7",
+            "coherent K7 down must be 0 or 1");
+    coherent_o_k7_enabled_ = target_o_k7_owner &&
+        read_binary_option("NINFER_EXL3_COHERENT_O_K7",
+            "coherent K7 O must be 0 or 1");
+    fast_fp16_m2_8_all_enabled_ = target_m1_owner &&
+        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8",
+            "fast FP16 M2-8 must be 0 or 1");
+    fast_fp16_m2_8_async_a_enabled_ = target_m1_owner &&
+        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_ASYNC_A",
+            "fast FP16 M2-8 async A must be 0 or 1");
+    const bool fast_same_weights_fp16_m1_n16 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16 must be 0 or 1");
     fast_same_weights_fp16_m1_n16_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_n16 &&
-        std::strcmp(fast_same_weights_fp16_m1_n16, "1") == 0;
+        fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_n16;
     const char* fast_same_weights_fp16_m1_k6_register_pipeline =
         std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_K6_REGISTER_PIPELINE");
     if (fast_same_weights_fp16_m1_k6_register_pipeline &&
@@ -3783,28 +5438,13 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         std::strcmp(fast_native_persistent_m1_only, "6") == 0 ? 6 :
         fast_native_persistent_m1_only &&
         std::strcmp(fast_native_persistent_m1_only, "7") == 0 ? 7 : 0;
-    const char* fast_same_weights_fp16_m1_wide =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE");
-    if (fast_same_weights_fp16_m1_wide &&
-        std::strcmp(fast_same_weights_fp16_m1_wide, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16_m1_wide, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE must be 0 or 1");
-    }
+    const bool fast_same_weights_fp16_m1_wide = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE must be 0 or 1");
     fast_same_weights_fp16_m1_wide_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_wide &&
-        std::strcmp(fast_same_weights_fp16_m1_wide, "1") == 0;
-    const char* fast_same_weights_fp16_m1_wide_n32 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32");
-    if (fast_same_weights_fp16_m1_wide_n32 &&
-        std::strcmp(fast_same_weights_fp16_m1_wide_n32, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16_m1_wide_n32, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32 must be 0 or 1");
-    }
-    fast_same_weights_fp16_m1_wide_n32_enabled_ =
-        fast_same_weights_fp16_m1_wide_enabled_ && fast_same_weights_fp16_m1_wide_n32 &&
-        std::strcmp(fast_same_weights_fp16_m1_wide_n32, "1") == 0;
+        fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_wide;
+    const bool fast_same_weights_fp16_m1_wide_n32 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32 must be 0 or 1");
+    fast_same_weights_fp16_m1_wide_n32_enabled_ = fast_same_weights_fp16_m1_wide_enabled_ && fast_same_weights_fp16_m1_wide_n32;
     const char* fast_same_weights_fp16_m1_wide_k5 =
         std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_K5");
     if (fast_same_weights_fp16_m1_wide_k5 &&
@@ -3846,17 +5486,10 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     fast_same_weights_fp16_m1_n64_k5_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_m1_n64_k5 &&
         std::strcmp(fast_same_weights_fp16_m1_n64_k5, "1") == 0;
-    const char* fast_same_weights_int8_gemv =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV");
-    if (fast_same_weights_int8_gemv &&
-        std::strcmp(fast_same_weights_int8_gemv, "0") != 0 &&
-        std::strcmp(fast_same_weights_int8_gemv, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV must be 0 or 1");
-    }
+    const bool fast_same_weights_int8_gemv = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV must be 0 or 1");
     fast_same_weights_int8_gemv_enabled_ = target_m1_owner &&
-        fast_same_weights_int8_gemv &&
-        std::strcmp(fast_same_weights_int8_gemv, "1") == 0;
+        fast_same_weights_int8_gemv;
     const char* fast_same_weights_int8_gemv_k7 =
         std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_K7");
     if (fast_same_weights_int8_gemv_k7 &&
@@ -3890,50 +5523,22 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     fast_same_weights_int8_gemv_down_k7_enabled_ = target_m1_owner &&
         fast_same_weights_int8_gemv_down_k7 &&
         std::strcmp(fast_same_weights_int8_gemv_down_k7, "1") == 0;
-    const char* fast_same_weights_int8_mia_policy =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY");
-    if (fast_same_weights_int8_mia_policy &&
-        std::strcmp(fast_same_weights_int8_mia_policy, "0") != 0 &&
-        std::strcmp(fast_same_weights_int8_mia_policy, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY must be 0 or 1");
-    }
+    const bool fast_same_weights_int8_mia_policy = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY must be 0 or 1");
     fast_same_weights_int8_mia_policy_enabled_ = target_m1_owner &&
-        fast_same_weights_int8_mia_policy &&
-        std::strcmp(fast_same_weights_int8_mia_policy, "1") == 0;
-    const char* fast_same_weights_int8_gemv_occupancy_grid =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID");
-    if (fast_same_weights_int8_gemv_occupancy_grid &&
-        std::strcmp(fast_same_weights_int8_gemv_occupancy_grid, "0") != 0 &&
-        std::strcmp(fast_same_weights_int8_gemv_occupancy_grid, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID must be 0 or 1");
-    }
+        fast_same_weights_int8_mia_policy;
+    const bool fast_same_weights_int8_gemv_occupancy_grid = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID must be 0 or 1");
     fast_same_weights_int8_gemv_occupancy_grid_enabled_ = target_m1_owner &&
-        fast_same_weights_int8_gemv_occupancy_grid &&
-        std::strcmp(fast_same_weights_int8_gemv_occupancy_grid, "1") == 0;
-    const char* fast_same_weights_fp16kv_m1_mgemm_pair = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR");
-    if (fast_same_weights_fp16kv_m1_mgemm_pair &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_pair, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_pair, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR must be 0 or 1");
-    }
+        fast_same_weights_int8_gemv_occupancy_grid;
+    const bool fast_same_weights_fp16kv_m1_mgemm_pair = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR must be 0 or 1");
     fast_same_weights_fp16kv_m1_mgemm_pair_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16kv_m1_mgemm_pair &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_pair, "1") == 0;
-    const char* fast_same_weights_fp16kv_m1_mgemm_policy = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY");
-    if (fast_same_weights_fp16kv_m1_mgemm_policy &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_policy, "0") != 0 &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_policy, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY must be 0 or 1");
-    }
+        fast_same_weights_fp16kv_m1_mgemm_pair;
+    const bool fast_same_weights_fp16kv_m1_mgemm_policy = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY",
+        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY must be 0 or 1");
     fast_same_weights_fp16kv_m1_mgemm_policy_enabled_ = target_m1_owner &&
-        fast_same_weights_fp16kv_m1_mgemm_policy &&
-        std::strcmp(fast_same_weights_fp16kv_m1_mgemm_policy, "1") == 0;
+        fast_same_weights_fp16kv_m1_mgemm_policy;
     target_k5_small_m_batch_enabled_ = target_m1_owner &&
         target_k5_small_m_batch &&
         std::strcmp(target_k5_small_m_batch, "1") == 0;
@@ -3980,28 +5585,14 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     native_k6_critical_path_enabled_ = target_m1_owner &&
         native_k6_critical_path &&
         std::strcmp(native_k6_critical_path, "1") == 0;
-    const char* native_k6_global_slices =
-        std::getenv("NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES");
-    if (native_k6_global_slices &&
-        std::strcmp(native_k6_global_slices, "0") != 0 &&
-        std::strcmp(native_k6_global_slices, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES must be 0 or 1");
-    }
+    const bool native_k6_global_slices = read_binary_option("NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES",
+        "NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES must be 0 or 1");
     native_k6_global_slices_enabled_ = target_m1_owner &&
-        native_k6_critical_path_enabled_ && native_k6_global_slices &&
-        std::strcmp(native_k6_global_slices, "1") == 0;
-    const char* native_k6_register_pipeline =
-        std::getenv("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE");
-    if (native_k6_register_pipeline &&
-        std::strcmp(native_k6_register_pipeline, "0") != 0 &&
-        std::strcmp(native_k6_register_pipeline, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE must be 0 or 1");
-    }
+        native_k6_critical_path_enabled_ && native_k6_global_slices;
+    const bool native_k6_register_pipeline = read_binary_option("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE",
+        "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE must be 0 or 1");
     native_k6_register_pipeline_enabled_ = target_m1_owner &&
-        native_k6_critical_path_enabled_ && native_k6_register_pipeline &&
-        std::strcmp(native_k6_register_pipeline, "1") == 0;
+        native_k6_critical_path_enabled_ && native_k6_register_pipeline;
     const char* native_k6_shape4_register_pipeline =
         std::getenv("NINFER_EXL3_NATIVE_K6_SHAPE4_REGISTER_PIPELINE");
     if (native_k6_shape4_register_pipeline &&
@@ -4019,17 +5610,10 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         in_features_ == 5120 && out_features_ == 17408 &&
         native_k6_shape4_register_pipeline &&
         std::strcmp(native_k6_shape4_register_pipeline, "1") == 0;
-    const char* native_k6_register_pipeline_n16 =
-        std::getenv("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16");
-    if (native_k6_register_pipeline_n16 &&
-        std::strcmp(native_k6_register_pipeline_n16, "0") != 0 &&
-        std::strcmp(native_k6_register_pipeline_n16, "1") != 0) {
-        throw std::invalid_argument(
-            "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16 must be 0 or 1");
-    }
+    const bool native_k6_register_pipeline_n16 = read_binary_option("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16",
+        "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16 must be 0 or 1");
     native_k6_register_pipeline_n16_enabled_ = target_m1_owner &&
-        native_k6_register_pipeline_enabled_ && native_k6_register_pipeline_n16 &&
-        std::strcmp(native_k6_register_pipeline_n16, "1") == 0;
+        native_k6_register_pipeline_enabled_ && native_k6_register_pipeline_n16;
     const char* target_m1_k7_n32_async_a =
         std::getenv("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A");
     if (target_m1_k7_n32_async_a &&
@@ -4098,64 +5682,34 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     target_direct_tiles64_=target_direct_async_a_ &&
         (direct_tiles64 ? std::strcmp(direct_tiles64,"1")==0
                         : qualified_default_group);
-    const char* k6_fast_decode=
-        std::getenv("NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE");
-    if(k6_fast_decode && std::strcmp(k6_fast_decode,"0")!=0 &&
-       std::strcmp(k6_fast_decode,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE must be 0 or 1");
-    target_k6_fast_decode_=target_wide_prefill_owner && k6_fast_decode &&
-        std::strcmp(k6_fast_decode,"1")==0;
-    const char* k6_rowpair_n64=
-        std::getenv("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64");
-    if(k6_rowpair_n64 && std::strcmp(k6_rowpair_n64,"0")!=0 &&
-       std::strcmp(k6_rowpair_n64,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_ROWPAIR_N64 must be 0 or 1");
-    target_k6_rowpair_n64_=target_wide_prefill_owner && k6_rowpair_n64 &&
-        std::strcmp(k6_rowpair_n64,"1")==0;
-    const char* k6_down_rowpair=
-        std::getenv("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR");
-    if(k6_down_rowpair && std::strcmp(k6_down_rowpair,"0")!=0 &&
-       std::strcmp(k6_down_rowpair,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR must be 0 or 1");
-    target_k6_down_rowpair_=target_down_owner && target_wide_prefill_owner &&
-        k6_down_rowpair && std::strcmp(k6_down_rowpair,"1")==0;
-    const char* shape4_n64=std::getenv("NINFER_EXL3_PREFILL_SHAPE4_N64");
-    if(shape4_n64 && std::strcmp(shape4_n64,"0")!=0 &&
-       std::strcmp(shape4_n64,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_SHAPE4_N64 must be 0 or 1");
-    target_shape4_n64_=specialized_shape_ && target_wide_prefill_owner &&
-        shape4_n64 && std::strcmp(shape4_n64,"1")==0;
-    const char* gateup_warpgroup =
-        std::getenv("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC");
-    if (gateup_warpgroup && std::strcmp(gateup_warpgroup,"0")!=0 &&
-        std::strcmp(gateup_warpgroup,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC must be 0 or 1");
+    const bool k6_fast_decode = read_binary_option("NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE",
+        "NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE must be 0 or 1");
+    target_k6_fast_decode_ = target_wide_prefill_owner && k6_fast_decode;
+    const bool k6_rowpair_n64 = read_binary_option("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64",
+        "NINFER_EXL3_PREFILL_K6_ROWPAIR_N64 must be 0 or 1");
+    target_k6_rowpair_n64_ = target_wide_prefill_owner && k6_rowpair_n64;
+    const bool k6_down_rowpair = read_binary_option("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR",
+        "NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR must be 0 or 1");
+    target_k6_down_rowpair_ = target_down_owner && target_wide_prefill_owner &&
+        k6_down_rowpair;
+    const bool shape4_n64 = read_binary_option("NINFER_EXL3_PREFILL_SHAPE4_N64",
+        "NINFER_EXL3_PREFILL_SHAPE4_N64 must be 0 or 1");
+    target_shape4_n64_ = specialized_shape_ && target_wide_prefill_owner &&
+        shape4_n64;
+    const bool gateup_warpgroup = read_binary_option("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC",
+        "NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC must be 0 or 1");
     target_k6_gateup_warpgroup_async_ = target_gateup_owner &&
-        gateup_warpgroup && std::strcmp(gateup_warpgroup,"1")==0;
-    const char* gateup_n32_pair_cta =
-        std::getenv("NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA");
-    if (gateup_n32_pair_cta && std::strcmp(gateup_n32_pair_cta,"0")!=0 &&
-        std::strcmp(gateup_n32_pair_cta,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA must be 0 or 1");
+        gateup_warpgroup;
+    const bool gateup_n32_pair_cta = read_binary_option("NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA",
+        "NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA must be 0 or 1");
     target_k6_gateup_n32_pair_cta_ = target_gateup_owner &&
-        gateup_n32_pair_cta && std::strcmp(gateup_n32_pair_cta,"1")==0;
+        gateup_n32_pair_cta;
     if(target_k6_gateup_n32_pair_cta_ && target_k6_gateup_warpgroup_async_)
         throw std::invalid_argument(
             "K6 gate/up N32-pair CTA and warp-group candidates are mutually exclusive");
-    const char* gate_up_pair=std::getenv(
-        "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR");
-    if(gate_up_pair && std::strcmp(gate_up_pair,"0")!=0 &&
-       std::strcmp(gate_up_pair,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR must be 0 or 1");
-    target_prefill_gate_up_pair_=target_gateup_owner && gate_up_pair &&
-        std::strcmp(gate_up_pair,"1")==0;
+    const bool gate_up_pair = read_binary_option("NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR",
+        "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR must be 0 or 1");
+    target_prefill_gate_up_pair_ = target_gateup_owner && gate_up_pair;
     const char* k7_tiles64_exact_splits =
         std::getenv("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS");
     if (k7_tiles64_exact_splits &&
@@ -4166,14 +5720,9 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     target_k7_tiles64_exact_splits_ = target_wide_prefill_owner &&
         k7_tiles64_exact_splits &&
         std::strcmp(k7_tiles64_exact_splits,"1")==0;
-    const char* k8_kv_async_a =
-        std::getenv("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A");
-    if (k8_kv_async_a && std::strcmp(k8_kv_async_a,"0")!=0 &&
-        std::strcmp(k8_kv_async_a,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K8_KV_ASYNC_A must be 0 or 1");
-    target_k8_kv_prefill_async_a_ = target_kv_owner && k8_kv_async_a &&
-        std::strcmp(k8_kv_async_a,"1")==0;
+    const bool k8_kv_async_a = read_binary_option("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A",
+        "NINFER_EXL3_PREFILL_K8_KV_ASYNC_A must be 0 or 1");
+    target_k8_kv_prefill_async_a_ = target_kv_owner && k8_kv_async_a;
     const char* reduce_shfl=std::getenv("NINFER_EXL3_PREFILL_REDUCE_SHFL");
     if(reduce_shfl && std::strcmp(reduce_shfl,"0")!=0 &&
        std::strcmp(reduce_shfl,"1")!=0)
@@ -4181,22 +5730,15 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     target_reduce_shfl_=target_wide_prefill_owner &&
         (reduce_shfl ? std::strcmp(reduce_shfl,"1")==0
                      : qualified_default_group);
-    const char* reduce_min_barriers=
-        std::getenv("NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS");
-    if(reduce_min_barriers && std::strcmp(reduce_min_barriers,"0")!=0 &&
-       std::strcmp(reduce_min_barriers,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS must be 0 or 1");
-    target_reduce_shfl_min_barriers_=target_reduce_shfl_ &&
-        reduce_min_barriers && std::strcmp(reduce_min_barriers,"1")==0;
+    const bool reduce_min_barriers = read_binary_option("NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS",
+        "NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS must be 0 or 1");
+    target_reduce_shfl_min_barriers_ = target_reduce_shfl_ &&
+        reduce_min_barriers;
     const char* rowpair=std::getenv("NINFER_EXL3_PREFILL_ROWPAIR_K6");
     target_rowpair_k6_=target_wide_prefill_owner && rowpair && std::strcmp(rowpair,"1")==0;
-    const char* rowpair_k7=std::getenv("NINFER_EXL3_PREFILL_ROWPAIR_K7");
-    if(rowpair_k7 && std::strcmp(rowpair_k7,"0")!=0 &&
-       std::strcmp(rowpair_k7,"1")!=0)
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_ROWPAIR_K7 must be 0 or 1");
-    target_rowpair_k7_=target_wide_prefill_owner && rowpair_k7 &&
-        std::strcmp(rowpair_k7,"1")==0;
+    const bool rowpair_k7 = read_binary_option("NINFER_EXL3_PREFILL_ROWPAIR_K7",
+        "NINFER_EXL3_PREFILL_ROWPAIR_K7 must be 0 or 1");
+    target_rowpair_k7_ = target_wide_prefill_owner && rowpair_k7;
     const char* direct_partials=std::getenv("NINFER_EXL3_PREFILL_DIRECT_PARTIALS");
     target_direct_partials_=direct_partials
         ? std::strcmp(direct_partials,"1")==0 : qualified_default_group;
@@ -4234,6 +5776,54 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         cudaDeviceProp properties{};
         cuda_check(cudaGetDeviceProperties(&properties, device),
                    "query EXL3 generic device properties");
+        if (coherent_wide_k6_enabled_) {
+            int active = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active,
+                exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true>,
+                kThreads, kCoherentWideK6SharedBytes),
+                "query coherent wide K6 occupancy");
+            cudaFuncAttributes attributes{};
+            cuda_check(cudaFuncGetAttributes(&attributes,
+                exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true>),
+                "query coherent wide K6 kernel resources");
+            coherent_wide_k6_resident_capacity_ =
+                active * properties.multiProcessorCount;
+            coherent_wide_k6_registers_per_thread_ = attributes.numRegs;
+        }
+        if (coherent_down_k6_enabled_ && in_features_ == 17408 &&
+            out_features_ == 5120) {
+            int active = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active,
+                exl3_gemm_m1_generic_mma_kernel<6, false, 8, true, true>,
+                kThreads, kCoherentDownK6SharedBytes),
+                "query coherent K6 down shared-row occupancy");
+            coherent_down_k6_resident_capacity_ =
+                active * properties.multiProcessorCount;
+        }
+        if (coherent_down_k7_enabled_ && in_features_ == 17408 &&
+            out_features_ == 5120) {
+            int active = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active,
+                exl3_gemm_m1_generic_mma_kernel<7, false, 8, true, true>,
+                kThreads, kCoherentDownK7SharedBytes),
+                "query coherent K7 down shared-row occupancy");
+            coherent_down_k7_resident_capacity_ =
+                active * properties.multiProcessorCount;
+        }
+        if (coherent_o_k7_enabled_ && in_features_ == 6144 &&
+            out_features_ == 5120) {
+            int active = 0;
+            cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active,
+                exl3_gemm_m1_generic_mma_kernel<7, false, 8, true, true>,
+                kThreads, kCoherentOK7SharedBytes),
+                "query coherent K7 O shared-row occupancy");
+            coherent_o_k7_resident_capacity_ =
+                active * properties.multiProcessorCount;
+        }
         const std::size_t static_bytes = 256u * sizeof(half) +
             16u * 512u * sizeof(float);
         const std::size_t shared_bytes[3] = {
@@ -4796,7 +6386,8 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         };
         query_large_down_candidate(6, large_down_candidate_capacity_[0]);
         query_large_down_candidate(7, large_down_candidate_capacity_[1]);
-        if (fast_same_weights_fp16_m1_enabled_) {
+        if (fast_same_weights_fp16_m1_enabled_ || fast_fp16_m2_8_down_enabled_ ||
+            fast_fp16_m2_8_all_enabled_) {
             const std::size_t k6_wide_bytes =
                 512u * sizeof(half) +
                 2u * 32u * 16u * 6u * sizeof(std::uint16_t) +
@@ -5183,6 +6774,23 @@ void Exl3CudaLinearWorkspace::retire_owned(std::unique_ptr<Exl3CudaLinearWorkspa
 }
 
 struct Exl3CudaReconstructGemmWorkspace::Impl {
+    struct ReuseSlot {
+        std::uint16_t* data = nullptr;
+        std::size_t capacity = 0;
+        const std::uint16_t* trellis = nullptr;
+        const std::int32_t* mul1 = nullptr;
+        const std::uint16_t* suh = nullptr;
+        const std::uint16_t* svh = nullptr;
+        int in_features = 0;
+        int out_features = 0;
+        int K = 0;
+        bool original_basis = false;
+        bool assigned = false;
+        bool valid = false;
+        bool prefetch_pending = false;
+        cudaEvent_t prefetch_fork = nullptr;
+        cudaEvent_t prefetch_ready = nullptr;
+    };
     int in_features = 0;
     int out_features = 0;
     int max_rows = 0;
@@ -5193,14 +6801,51 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     float* accum = nullptr;
     void* cublas_workspace = nullptr;
     cublasHandle_t handle = nullptr;
+    cublasLtHandle_t lt_handle = nullptr;
+    struct LtPlan {
+        cublasLtMatmulDesc_t operation = nullptr;
+        cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+        cublasLtMatmulAlgo_t algorithm{};
+        std::size_t workspace_bytes = 0;
+    };
+    std::unordered_map<std::uint64_t,LtPlan> lt_plans;
+    bool k5_lt_enabled = false;
+    bool large_lt_enabled = false;
+    bool mxfp8_enabled = false;
+    int nvfp4_mode = 0;
+    bool fused_decode_enabled = true;
+    bool fused_act_enabled = true;
+    bool fused_mlp_enabled = true;
+    // forward_numeric_mlp state: raw_output skips the output transform of the
+    // gate/up calls; mlp_* supplies the down call's raw gate/up inputs.
+    bool raw_output = false;
+    std::uint16_t* mlp_gate = nullptr;
+    std::uint16_t* mlp_up = nullptr;
+    std::uint16_t* mlp_activation = nullptr;
+    const std::uint16_t* mlp_gate_svh = nullptr;
+    const std::uint16_t* mlp_up_svh = nullptr;
+    int prefill_layer = -1;
+    float* nvfp4_scalars = nullptr;
     bool fused_original_enabled = false;
+    bool original_gdn_mlp_cache_enabled = false;
     bool fp16_compute_enabled = false;
+    bool k5_layer_prefill_enabled = false;
+    bool k5_scope_enabled = false;
     bool packed_direct_k6_enabled = false;
+    bool packed_direct_k5_enabled = false;
     bool persistent_prefill_enabled = false;
     bool mia_prefill_fp16_enabled = false;
     int persistent_prefill_capacity[6] = {};
     std::size_t bytes = 0;
     Exl3ReconstructGemmStats stats{};
+    std::vector<ReuseSlot> reuse_slots;
+    cudaStream_t weight_prefetch_stream = nullptr;
+    std::size_t reuse_budget = 0;
+    std::size_t reuse_capacity = 0;
+    std::size_t reuse_used = 0;
+    bool reuse_active = false;
+    std::size_t reuse_scope_count = 0;
+    int diagnostic_remaining = 0;
 };
 
 std::size_t Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
@@ -5248,6 +6893,15 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->fused_original_enabled = accept_all_model_shapes && fused_original &&
         std::strcmp(fused_original, "1") == 0;
+    const char* original_gdn_mlp=std::getenv(
+        "NINFER_EXL3_FAST_ORIGINAL_GDN_MLP_CACHE");
+    if(original_gdn_mlp && std::strcmp(original_gdn_mlp,"0")!=0 &&
+       std::strcmp(original_gdn_mlp,"1")!=0) {
+        delete impl_;impl_=nullptr;
+        throw std::invalid_argument("original-basis GDN MLP cache must be 0 or 1");
+    }
+    impl_->original_gdn_mlp_cache_enabled=accept_all_model_shapes &&
+        original_gdn_mlp && std::strcmp(original_gdn_mlp,"1")==0;
     const char* fp16_compute = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GEMM_FP16_COMPUTE");
     if (fp16_compute && std::strcmp(fp16_compute, "0") != 0 &&
@@ -5258,6 +6912,69 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->fp16_compute_enabled = accept_all_model_shapes && fp16_compute &&
         std::strcmp(fp16_compute, "1") == 0;
+    const char* k5_layer_prefill=std::getenv(
+        "NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
+    if(k5_layer_prefill && std::strcmp(k5_layer_prefill,"0")!=0 &&
+       std::strcmp(k5_layer_prefill,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("layer-major K5 reconstruction must be 0 or 1");
+    }
+    impl_->k5_layer_prefill_enabled=accept_all_model_shapes &&
+        k5_layer_prefill && std::strcmp(k5_layer_prefill,"1")==0;
+    const char* k5_lt=std::getenv("NINFER_EXL3_FAST_PREFILL_K5_CUBLAS_LT");
+    if(k5_lt && std::strcmp(k5_lt,"0")!=0 && std::strcmp(k5_lt,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("K5 prefill cuBLASLt must be 0 or 1");
+    }
+    impl_->k5_lt_enabled=accept_all_model_shapes && k5_lt &&
+        std::strcmp(k5_lt,"1")==0;
+    const char* large_lt=std::getenv("NINFER_EXL3_FAST_PREFILL_LARGE_CUBLAS_LT");
+    if(large_lt && std::strcmp(large_lt,"0")!=0 &&
+        std::strcmp(large_lt,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("large prefill cuBLASLt must be 0 or 1");
+    }
+    impl_->large_lt_enabled=accept_all_model_shapes && large_lt &&
+        std::strcmp(large_lt,"1")==0;
+    // Prefill numerical policy (default 1, quality-gated; 0 = FP16 control):
+    // large-M projections run as MXFP8 (E4M3 with block-32 E8M0 scales on
+    // weights and activations, FP32 accumulation).
+    const char* mxfp8=std::getenv("NINFER_EXL3_PREFILL_MXFP8");
+    if(mxfp8 && std::strcmp(mxfp8,"0")!=0 && std::strcmp(mxfp8,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_MXFP8 must be 0 or 1");
+    }
+    impl_->mxfp8_enabled=accept_all_model_shapes &&
+        (!mxfp8 || std::strcmp(mxfp8,"1")==0);
+    // NVFP4 prefill numerical policy (default 2 = MLP gate/up/down only,
+    // quality-gated; 0 = MXFP8 control; 1 = all admitted prefill projections,
+    // rejected on held-out quality: +0.039 overall, prose +0.068).
+    // Requires the MXFP8 route.
+    const char* nvfp4=std::getenv("NINFER_EXL3_PREFILL_NVFP4");
+    if(nvfp4 && std::strcmp(nvfp4,"0")!=0 && std::strcmp(nvfp4,"1")!=0 &&
+       std::strcmp(nvfp4,"2")!=0 && std::strcmp(nvfp4,"3")!=0 && std::strcmp(nvfp4,"4")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0..4");
+    }
+    impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 2) : 0;
+    const char* fused_decode=std::getenv("NINFER_EXL3_PREFILL_FUSED_DECODE");
+    if(fused_decode && std::strcmp(fused_decode,"0")!=0 && std::strcmp(fused_decode,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_DECODE must be 0 or 1");
+    }
+    impl_->fused_decode_enabled=!fused_decode || std::strcmp(fused_decode,"1")==0;
+    const char* fused_act=std::getenv("NINFER_EXL3_PREFILL_FUSED_ACT");
+    if(fused_act && std::strcmp(fused_act,"0")!=0 && std::strcmp(fused_act,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_ACT must be 0 or 1");
+    }
+    impl_->fused_act_enabled=!fused_act || std::strcmp(fused_act,"1")==0;
+    const char* fused_mlp=std::getenv("NINFER_EXL3_PREFILL_FUSED_MLP");
+    if(fused_mlp && std::strcmp(fused_mlp,"0")!=0 && std::strcmp(fused_mlp,"1")!=0) {
+        delete impl_; impl_=nullptr;
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_MLP must be 0 or 1");
+    }
+    impl_->fused_mlp_enabled=!fused_mlp || std::strcmp(fused_mlp,"1")==0;
     const char* packed_direct_k6 = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_PACKED_DIRECT_K6");
     if (packed_direct_k6 && std::strcmp(packed_direct_k6, "0") != 0 &&
@@ -5268,6 +6985,15 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->packed_direct_k6_enabled = accept_all_model_shapes &&
         packed_direct_k6 && std::strcmp(packed_direct_k6, "1") == 0;
+    const char* packed_direct_k5 = std::getenv(
+        "NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5");
+    if (packed_direct_k5 && std::strcmp(packed_direct_k5, "0") != 0 &&
+        std::strcmp(packed_direct_k5, "1") != 0) {
+        delete impl_; impl_ = nullptr;
+        throw std::invalid_argument("GDN bulk packed K5 must be 0 or 1");
+    }
+    impl_->packed_direct_k5_enabled = accept_all_model_shapes &&
+        packed_direct_k5 && std::strcmp(packed_direct_k5, "1") == 0;
     const char* persistent_prefill = std::getenv(
         "NINFER_EXL3_FAST_NATIVE_PERSISTENT_PREFILL");
     if (persistent_prefill && std::strcmp(persistent_prefill, "0") != 0 &&
@@ -5364,13 +7090,23 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
                    "T69 allocate GEMM output");
         cuda_check(cudaMalloc(&impl_->cublas_workspace, cublas_bytes),
                    "T69 allocate cuBLAS workspace");
+        if (impl_->nvfp4_mode) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&impl_->nvfp4_scalars),
+                                  4 * sizeof(float)), "allocate NVFP4 scalars");
+            cuda_check(cudaMemset(impl_->nvfp4_scalars, 0, 4 * sizeof(float)),
+                       "clear NVFP4 scalars");
+        }
         cublas_check(cublasCreate(&impl_->handle), "T69 create cuBLAS handle");
+        if (impl_->k5_lt_enabled || impl_->large_lt_enabled || impl_->mxfp8_enabled)
+            cublas_check(cublasLtCreate(&impl_->lt_handle),
+                         "create K5 prefill cuBLASLt handle");
         cublas_check(cublasSetPointerMode(impl_->handle, CUBLAS_POINTER_MODE_HOST),
                      "T69 set cuBLAS host pointer mode");
         cublas_check(cublasSetWorkspace(impl_->handle, impl_->cublas_workspace,
                                         cublas_bytes),
                      "T69 bind cuBLAS workspace");
     } catch (...) {
+        if (impl_->lt_handle) cublasLtDestroy(impl_->lt_handle);
         if (impl_->handle) cublasDestroy(impl_->handle);
         if (impl_->cublas_workspace) cudaFree(impl_->cublas_workspace);
         if (impl_->accum) cudaFree(impl_->accum);
@@ -5385,8 +7121,25 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
 
 Exl3CudaReconstructGemmWorkspace::~Exl3CudaReconstructGemmWorkspace() {
     if (!impl_) return;
+    if (impl_->weight_prefetch_stream)
+        (void)cudaStreamSynchronize(impl_->weight_prefetch_stream);
+    for (auto& [key, plan] : impl_->lt_plans) {
+        if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+        if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+        if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+        if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+    }
+    if (impl_->lt_handle) cublasLtDestroy(impl_->lt_handle);
+    for (auto& slot : impl_->reuse_slots) {
+        if (slot.prefetch_fork) (void)cudaEventDestroy(slot.prefetch_fork);
+        if (slot.prefetch_ready) (void)cudaEventDestroy(slot.prefetch_ready);
+        if (slot.data) cudaFree(slot.data);
+    }
+    if (impl_->weight_prefetch_stream)
+        (void)cudaStreamDestroy(impl_->weight_prefetch_stream);
     if (impl_->handle) cublasDestroy(impl_->handle);
     if (impl_->cublas_workspace) cudaFree(impl_->cublas_workspace);
+    if (impl_->nvfp4_scalars) cudaFree(impl_->nvfp4_scalars);
     if (impl_->accum) cudaFree(impl_->accum);
     if (impl_->reconstructed) cudaFree(impl_->reconstructed);
     if (impl_->transformed) cudaFree(impl_->transformed);
@@ -5401,6 +7154,134 @@ Exl3ReconstructGemmStats Exl3CudaReconstructGemmWorkspace::stats() const noexcep
     return impl_ ? impl_->stats : Exl3ReconstructGemmStats{};
 }
 
+void Exl3CudaReconstructGemmWorkspace::begin_layer_reuse(
+    std::size_t max_cached_bytes, bool allow_k5) {
+    if (!impl_ || impl_->reuse_active || !impl_->accept_all_model_shapes || !max_cached_bytes)
+        throw std::invalid_argument("layer-major weight reuse admission");
+    impl_->reuse_active = true;
+    impl_->k5_scope_enabled = allow_k5 && impl_->k5_layer_prefill_enabled;
+    impl_->reuse_budget = max_cached_bytes;
+    impl_->reuse_used = 0;
+    const char* profile=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
+    impl_->diagnostic_remaining = impl_->reuse_scope_count==0 && profile &&
+        std::strcmp(profile,"1")==0 ? 16 : 0;
+    ++impl_->reuse_scope_count;
+    for (auto& slot : impl_->reuse_slots) {
+        slot.assigned = false;
+        slot.valid = false;
+        slot.prefetch_pending = false;
+    }
+}
+
+void Exl3CudaReconstructGemmWorkspace::set_prefill_layer(int layer) noexcept {
+    if (impl_) impl_->prefill_layer = layer;
+}
+
+void Exl3CudaReconstructGemmWorkspace::end_layer_reuse() noexcept {
+    if (!impl_) return;
+    impl_->prefill_layer = -1;
+    if (impl_->weight_prefetch_stream) {
+        for (const auto& slot : impl_->reuse_slots) {
+            if (slot.prefetch_pending) {
+                (void)cudaStreamSynchronize(impl_->weight_prefetch_stream);
+                break;
+            }
+        }
+    }
+    impl_->reuse_active = false;
+    impl_->k5_scope_enabled = false;
+    impl_->reuse_used = 0;
+    impl_->diagnostic_remaining = 0;
+    for (auto& slot : impl_->reuse_slots) {
+        slot.assigned = false;
+        slot.valid = false;
+        slot.prefetch_pending = false;
+    }
+}
+
+bool Exl3CudaReconstructGemmWorkspace::prefetch_numeric_weight(
+    const Exl3CudaLinearWeights& weights,
+    const Exl3CudaLinearMetadata& metadata,int rows,cudaStream_t stream) {
+    // The FP16 prefetch slot format is not the MXFP8 slot format.
+    if (!impl_ || !impl_->reuse_active || !impl_->k5_scope_enabled ||
+        impl_->mxfp8_enabled ||
+        metadata.K!=5 || rows<1024 || !supports(metadata,rows) ||
+        !weights.trellis || !weights.mul1 || !weights.suh || !weights.svh)
+        return false;
+    const std::size_t weight_bytes=static_cast<std::size_t>(metadata.in_features)*
+        static_cast<std::size_t>(metadata.out_features)*sizeof(std::uint16_t);
+    Impl::ReuseSlot* slot=nullptr;
+    for (std::size_t index=0;index<impl_->reuse_used;++index) {
+        auto& candidate=impl_->reuse_slots[index];
+        if (candidate.assigned && candidate.trellis==weights.trellis &&
+            candidate.mul1==weights.mul1 && candidate.suh==weights.suh &&
+            candidate.svh==weights.svh &&
+            candidate.in_features==metadata.in_features &&
+            candidate.out_features==metadata.out_features &&
+            candidate.K==metadata.K && !candidate.original_basis) {
+            slot=&candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        if (impl_->reuse_used==impl_->reuse_slots.size())
+            impl_->reuse_slots.emplace_back();
+        slot=&impl_->reuse_slots[impl_->reuse_used++];
+        slot->assigned=true;
+        slot->valid=false;
+        slot->trellis=weights.trellis;
+        slot->mul1=weights.mul1;
+        slot->suh=weights.suh;
+        slot->svh=weights.svh;
+        slot->in_features=metadata.in_features;
+        slot->out_features=metadata.out_features;
+        slot->K=metadata.K;
+        slot->original_basis=false;
+        if (slot->capacity<weight_bytes &&
+            impl_->reuse_capacity-slot->capacity+weight_bytes<=impl_->reuse_budget) {
+            if (slot->data) {
+                cuda_check(cudaFree(slot->data),"retire smaller prefetched weight slot");
+                impl_->reuse_capacity-=slot->capacity;
+                slot->data=nullptr;
+                slot->capacity=0;
+            }
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&slot->data),weight_bytes),
+                "allocate bounded prefetched weight slot");
+            slot->capacity=weight_bytes;
+            impl_->reuse_capacity+=weight_bytes;
+            impl_->stats.cached_weight_capacity_bytes=impl_->reuse_capacity;
+        }
+    }
+    if (!slot->data || slot->capacity<weight_bytes || slot->valid ||
+        slot->prefetch_pending)
+        return false;
+    if (!impl_->weight_prefetch_stream)
+        cuda_check(cudaStreamCreateWithFlags(&impl_->weight_prefetch_stream,
+            cudaStreamNonBlocking),"create K5 weight prefetch stream");
+    if (!slot->prefetch_fork)
+        cuda_check(cudaEventCreateWithFlags(&slot->prefetch_fork,
+            cudaEventDisableTiming),"create K5 prefetch fork event");
+    if (!slot->prefetch_ready)
+        cuda_check(cudaEventCreateWithFlags(&slot->prefetch_ready,
+            cudaEventDisableTiming),"create K5 prefetch ready event");
+    cuda_check(cudaEventRecord(slot->prefetch_fork,stream),
+        "record K5 weight prefetch fork");
+    cuda_check(cudaStreamWaitEvent(impl_->weight_prefetch_stream,
+        slot->prefetch_fork,0),"join K5 weight prefetch fork");
+    slot->prefetch_pending=true;
+    exl3_reconstruct_transformed_weight_kernel<5><<<
+        dim3(metadata.out_features/16,metadata.in_features/16),256,0,
+        impl_->weight_prefetch_stream>>>(weights.trellis,weights.mul1,
+            slot->data,metadata.in_features,metadata.out_features);
+    cuda_check(cudaGetLastError(),"launch K5 weight prefetch");
+    cuda_check(cudaEventRecord(slot->prefetch_ready,
+        impl_->weight_prefetch_stream),"record K5 weight prefetch ready");
+    ++impl_->stats.prefetched_weight_submissions;
+    ++impl_->stats.reconstructed_weight_calls;
+    impl_->stats.reconstructed_weight_bytes+=weight_bytes;
+    return true;
+}
+
 bool Exl3CudaReconstructGemmWorkspace::supports(
     const Exl3CudaLinearMetadata& metadata, int rows) const noexcept {
     if (!impl_ || rows <= 0 || rows > impl_->max_rows) return false;
@@ -5411,7 +7292,13 @@ bool Exl3CudaReconstructGemmWorkspace::supports(
             metadata.out_features <= impl_->out_features &&
             metadata.in_features % kHadamard == 0 &&
             metadata.out_features % kHadamard == 0;
-        return bounded_shape && (metadata.K == 6 || metadata.K == 7) &&
+        const bool k5_layer=metadata.K==5 &&
+            (impl_->k5_scope_enabled || impl_->mxfp8_enabled) &&
+            impl_->reuse_active && rows>=256;
+        // K8 (attention K/V) is admitted only to the fused decode route.
+        const bool k8_layer=metadata.K==8 && impl_->mxfp8_enabled &&
+            impl_->fused_decode_enabled && impl_->reuse_active && rows>=256;
+        return bounded_shape && (metadata.K == 6 || metadata.K == 7 || k5_layer || k8_layer) &&
             metadata.mul1 && !metadata.mcg && !metadata.has_bias;
     }
     const bool primary_shape =
@@ -5429,6 +7316,69 @@ bool Exl3CudaReconstructGemmWorkspace::accepts_all_model_shapes() const noexcept
     return impl_ && impl_->accept_all_model_shapes;
 }
 
+bool Exl3CudaReconstructGemmWorkspace::supports_fused_gate_up_down() const noexcept {
+    return accepts_all_model_shapes() && !impl_->fused_original_enabled &&
+        !impl_->original_gdn_mlp_cache_enabled;
+}
+
+void Exl3CudaReconstructGemmWorkspace::forward_numeric_gate_up_down(
+    const Exl3CudaLinearWeights& weights,
+    const Exl3CudaLinearMetadata& metadata,
+    const std::uint16_t* gate,
+    const std::uint16_t* up,
+    std::uint16_t* activation,
+    std::uint16_t* output,
+    int rows,
+    cudaStream_t stream) {
+    if (!supports_fused_gate_up_down() || !up || !activation ||
+        metadata.in_features != 17408 || metadata.out_features != 5120)
+        throw std::invalid_argument("GDN fused gate/up down admission");
+    forward_numeric_candidate(weights,metadata,gate,output,rows,stream,
+                              nullptr,up,activation);
+}
+
+bool Exl3CudaReconstructGemmWorkspace::forward_numeric_mlp(
+    const Exl3CudaLinearWeights& gate, const Exl3CudaLinearMetadata& gate_metadata,
+    const Exl3CudaLinearWeights& up, const Exl3CudaLinearMetadata& up_metadata,
+    const Exl3CudaLinearWeights& down, const Exl3CudaLinearMetadata& down_metadata,
+    const std::uint16_t* input, std::uint16_t* gate_output, std::uint16_t* up_output,
+    std::uint16_t* activation, std::uint16_t* output, int rows, cudaStream_t stream) {
+    if (!impl_ || !impl_->fused_mlp_enabled || !impl_->fused_act_enabled ||
+        !impl_->mxfp8_enabled || !impl_->reuse_active || rows < 256 ||
+        impl_->persistent_prefill_enabled || impl_->mia_prefill_fp16_enabled ||
+        impl_->packed_direct_k6_enabled || impl_->packed_direct_k5_enabled ||
+        impl_->fused_original_enabled || impl_->original_gdn_mlp_cache_enabled ||
+        !input || !gate_output || !up_output || !activation || !output ||
+        gate_metadata.in_features != 5120 || gate_metadata.out_features != 17408 ||
+        up_metadata.in_features != 5120 || up_metadata.out_features != 17408 ||
+        down_metadata.in_features != 17408 || down_metadata.out_features != 5120 ||
+        !supports(gate_metadata, rows) || !supports(up_metadata, rows) ||
+        !supports(down_metadata, rows) || !gate.svh || !up.svh)
+        return false;
+    const char* fast = std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+    if (!fast || std::strcmp(fast, "1") != 0) return false;
+    struct Reset {
+        Impl* impl;
+        ~Reset() {
+            impl->raw_output = false;
+            impl->mlp_gate = impl->mlp_up = impl->mlp_activation = nullptr;
+            impl->mlp_gate_svh = impl->mlp_up_svh = nullptr;
+        }
+    } reset{impl_};
+    impl_->raw_output = true;
+    forward_numeric_candidate(gate, gate_metadata, input, gate_output, rows, stream);
+    forward_numeric_candidate(up, up_metadata, input, up_output, rows, stream);
+    impl_->raw_output = false;
+    impl_->mlp_gate = gate_output;
+    impl_->mlp_up = up_output;
+    impl_->mlp_activation = activation;
+    impl_->mlp_gate_svh = gate.svh;
+    impl_->mlp_up_svh = up.svh;
+    forward_numeric_candidate(down, down_metadata, activation, output, rows, stream);
+    ++impl_->stats.fused_mlp_calls;
+    return true;
+}
+
 void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const Exl3CudaLinearWeights& weights,
     const Exl3CudaLinearMetadata& metadata,
@@ -5436,32 +7386,109 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     std::uint16_t* output,
     int rows,
     cudaStream_t stream,
-    Exl3ReconstructGemmPhaseTiming* timing) {
+    Exl3ReconstructGemmPhaseTiming* timing,
+    const std::uint16_t* up,
+    std::uint16_t* activation,
+    const std::uint16_t* residual,
+    std::uint16_t* down_trace,
+    int trace_row_base) {
     if (!supports(metadata, rows) || !weights.trellis ||
-        !weights.suh || !weights.svh || !weights.mul1 || !input || !output) {
+        !weights.suh || !weights.svh || !weights.mul1 || !input || !output ||
+        ((up == nullptr) != (activation == nullptr)) ||
+        (down_trace && (!residual || trace_row_base < 0 ||
+                        trace_row_base >= rows))) {
         throw std::invalid_argument("T69 reconstruct GEMM contract");
     }
+    Exl3ReconstructGemmPhaseTiming diagnostic_timing{};
+    const bool diagnostic=timing==nullptr && impl_->reuse_active &&
+        impl_->diagnostic_remaining>0;
+    if (diagnostic) {
+        --impl_->diagnostic_remaining;
+        timing=&diagnostic_timing;
+    }
+    struct DiagnosticPrint {
+        bool active;
+        const Exl3CudaLinearMetadata& metadata;
+        int rows;
+        const Exl3ReconstructGemmPhaseTiming& value;
+        ~DiagnosticPrint() {
+            if (!active) return;
+            std::fprintf(stderr,
+                "LAYER_MAJOR_PROJECTION_SAMPLE K=%d in=%d out=%d rows=%d "
+                "input_us=%.2f reconstruct_us=%.2f gemm_us=%.2f output_us=%.2f total_us=%.2f\n",
+                metadata.K,metadata.in_features,metadata.out_features,rows,
+                value.input_transform_us,value.reconstruct_us,value.gemm_us,
+                value.output_transform_us,value.total_us);
+        }
+    } diagnostic_print{diagnostic,metadata,rows,diagnostic_timing};
     cudaEvent_t events[5]{};
     if (timing) {
         for (auto& event : events)
             cuda_check(cudaEventCreate(&event), "T69 create phase event");
         cuda_check(cudaEventRecord(events[0], stream), "T69 begin phase timing");
     }
-    const bool fused_original = impl_->fused_original_enabled && rows >= 1024 &&
+    const bool original_gdn_mlp=impl_->original_gdn_mlp_cache_enabled &&
+        impl_->reuse_active && rows>=1024 &&
+        ((metadata.in_features==5120 && metadata.out_features==17408) ||
+         (metadata.in_features==17408 && metadata.out_features==5120));
+    const bool fused_original = (impl_->fused_original_enabled || original_gdn_mlp) &&
+        metadata.K!=5 && rows >= 1024 &&
         metadata.in_features % kHadamard == 0 &&
         metadata.out_features % kHadamard == 0;
+    if (up && fused_original)
+        throw std::invalid_argument("original-basis GEMM cannot consume transformed gate/up input");
     const char* fast_same_weights_fp16kv = std::getenv(
         "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
     const bool fast_fp16_destination = impl_->accept_all_model_shapes &&
         rows > 1 && fast_same_weights_fp16kv &&
         std::strcmp(fast_same_weights_fp16kv, "1") == 0;
+    if (residual && (metadata.in_features != 17408 ||
+                     metadata.out_features != 5120 || !fast_fp16_destination ||
+                     fused_original || up || activation || residual == output ||
+                     impl_->persistent_prefill_enabled ||
+                     impl_->mia_prefill_fp16_enabled ||
+                     impl_->packed_direct_k6_enabled))
+        throw std::invalid_argument("bulk down residual epilogue admission");
     const bool fp16_compute = impl_->fp16_compute_enabled &&
-        fast_fp16_destination && !fused_original;
-    if (!fused_original) {
-        input_hadamard_kernel<kHadamard><<<
-            dim3(rows, metadata.in_features / kHadamard), dim3(kHadamard), 0, stream>>>(
-                input, weights.suh, impl_->transformed, rows, metadata.in_features);
+        fast_fp16_destination && !fused_original && metadata.K!=5;
+    // Under the block-quantized route the FP16 transformed input is only
+    // materialized if a non-quantized branch consumes it; otherwise the
+    // transform is fused into activation quantization.
+    bool transformed_ready = false;
+    const bool raw_mlp_input = impl_->mlp_gate != nullptr;
+    const bool defer_input = raw_mlp_input ||
+        (impl_->mxfp8_enabled && impl_->fused_act_enabled &&
+         fast_fp16_destination && !fused_original && !up &&
+         metadata.in_features % kHadamard == 0);
+    const auto ensure_transformed = [&]() {
+        if (transformed_ready || fused_original) return;
+        if (raw_mlp_input) {
+            launch_output_hadamard_fp16_inplace(stream, impl_->mlp_gate,
+                impl_->mlp_gate_svh, rows, metadata.in_features);
+            launch_output_hadamard_fp16_inplace(stream, impl_->mlp_up,
+                impl_->mlp_up_svh, rows, metadata.in_features);
+            launch_input_hadamard<kHadamard,false,true>(stream, impl_->mlp_gate,
+                weights.suh, impl_->transformed, rows, metadata.in_features,
+                impl_->mlp_up, impl_->mlp_activation);
+        } else {
+            launch_input_hadamard<kHadamard>(stream,
+                    input, weights.suh, impl_->transformed, rows, metadata.in_features);
+        }
         cuda_check(cudaGetLastError(), "T69 input Hadamard");
+        transformed_ready = true;
+    };
+    if (!fused_original) {
+        if (up) {
+            launch_input_hadamard<kHadamard,false,true>(stream,
+                    input,weights.suh,impl_->transformed,rows,
+                    metadata.in_features,up,activation);
+            ++impl_->stats.fused_gate_up_down_calls;
+            impl_->stats.fused_gate_up_down_rows += static_cast<std::uint64_t>(rows);
+            cuda_check(cudaGetLastError(), "T69 input Hadamard");
+            transformed_ready = true;
+        } else if (!defer_input) {
+            ensure_transformed();
+        }
     }
     if (timing) cuda_check(cudaEventRecord(events[1], stream), "T69 input event");
 
@@ -5491,6 +7518,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         impl_->persistent_prefill_capacity[persistent_prefill_capacity_index] >=
             persistent_prefill_chunks;
     if (persistent_prefill_candidate) {
+        ensure_transformed();
         const bool k7 = metadata.K == 7;
         const int tile_k = persistent_prefill_down ? 32 : 16;
         const int tile_n = persistent_prefill_down ? (k7 ? 128 : 256) : 512;
@@ -5551,9 +7579,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         if (timing)
             cuda_check(cudaEventRecord(events[3], stream),
                        "T69 persistent prefill GEMM event");
-        output_hadamard_kernel<<<
-            dim3(rows, metadata.out_features / kHadamard), dim3(kHadamard), 0,
-            stream>>>(impl_->accum, weights.svh, output, rows,
+        launch_output_hadamard(stream,impl_->accum, weights.svh, output, rows,
                       metadata.out_features);
         cuda_check(cudaGetLastError(), "T69 persistent prefill output Hadamard");
         if (timing) {
@@ -5593,6 +7619,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         impl_->persistent_prefill_capacity[persistent_prefill_capacity_index] >=
             persistent_prefill_chunks;
     if (mia_prefill_candidate) {
+        ensure_transformed();
         const bool k7 = metadata.K == 7;
         const int tile_k = persistent_prefill_down ? 32 : 16;
         const int tile_n = persistent_prefill_down ? (k7 ? 128 : 256) : 512;
@@ -5676,6 +7703,73 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         return;
     }
 
+    // Only the reached target GDN bulk gate/up/down shapes may use this K5
+    // leaf. The packed tile is decoded in the same represented transformed
+    // basis as reconstruction, then each 16-row MMA group accumulates in FP32.
+    // The reduction/output kernel casts that GEMM destination to FP16 before
+    // the existing SVH/Hadamard boundary. No full FP16 weight slab is written.
+    const bool packed_direct_k5_gate_up =
+        metadata.in_features == 5120 && metadata.out_features == 17408;
+    const bool packed_direct_k5_down =
+        metadata.in_features == 17408 && metadata.out_features == 5120;
+    const bool packed_direct_k5_candidate =
+        impl_->packed_direct_k5_enabled && fast_fp16_destination &&
+        !fused_original && !residual && !up && !activation &&
+        rows >= 1024 && rows <= impl_->max_rows && metadata.K == 5 &&
+        !metadata.mcg && !metadata.has_bias && weights.trellis &&
+        weights.mul1 && weights.suh && weights.svh &&
+        (packed_direct_k5_gate_up || packed_direct_k5_down);
+    if (packed_direct_k5_candidate) {
+        ensure_transformed();
+        constexpr int output_tiles_per_block = 64;
+        constexpr int split_count = 1;
+        const int output_blocks = metadata.out_features /
+            (16 * output_tiles_per_block);
+        const std::size_t shared_bytes = 512u * sizeof(half) +
+            2u * output_tiles_per_block * 16u * 5u * sizeof(std::uint16_t);
+        if (timing)
+            cuda_check(cudaEventRecord(events[2], stream),
+                       "K5 packed direct begin event");
+        exl3_prefill_direct_async_a_kernel<5, 64, 2><<<
+            dim3(output_blocks, (rows + 15) / 16), kThreads,
+            shared_bytes, stream>>>(
+                impl_->transformed, weights.trellis, weights.mul1,
+                impl_->accum, rows, metadata.in_features,
+                metadata.out_features, split_count);
+        cuda_check(cudaGetLastError(), "launch GDN bulk packed K5 GEMM");
+        if (timing)
+            cuda_check(cudaEventRecord(events[3], stream),
+                       "K5 packed direct GEMM event");
+        launch_prefill_reduce_output<false, false, false, true>(stream,impl_->accum, weights.svh, output, rows,
+                         metadata.out_features, split_count);
+        cuda_check(cudaGetLastError(), "launch GDN bulk packed K5 output");
+        ++impl_->stats.calls;
+        ++impl_->stats.k5_calls;
+        impl_->stats.rows += static_cast<std::uint64_t>(rows);
+        impl_->stats.packed_direct_k5_rows += static_cast<std::uint64_t>(rows);
+        if (packed_direct_k5_gate_up)
+            ++impl_->stats.packed_direct_k5_gate_up_calls;
+        else
+            ++impl_->stats.packed_direct_k5_down_calls;
+        if (timing) {
+            cuda_check(cudaEventRecord(events[4], stream),
+                       "K5 packed direct output event");
+            cuda_check(cudaEventSynchronize(events[4]),
+                       "resolve K5 packed direct timing");
+            float ms[4]{};
+            for (int i = 0; i < 4; ++i)
+                cuda_check(cudaEventElapsedTime(&ms[i], events[i], events[i + 1]),
+                           "resolve K5 packed direct phase");
+            timing->input_transform_us = ms[0] * 1000.0;
+            timing->reconstruct_us = 0.0;
+            timing->gemm_us = ms[2] * 1000.0;
+            timing->output_transform_us = ms[3] * 1000.0;
+            timing->total_us = (ms[0] + ms[1] + ms[2] + ms[3]) * 1000.0;
+            for (auto event : events) cudaEventDestroy(event);
+        }
+        return;
+    }
+
     // Same-weight Fast differential: consume the original packed K6 trellis
     // directly with the established async-A/MMA decoder. This is deliberately
     // narrower than the general reconstruct+cuBLAS candidate: only the 6-bpw
@@ -5689,6 +7783,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         metadata.K == 6 && metadata.in_features % 16 == 0 &&
         metadata.out_features % 16 == 0 && weights.trellis && weights.mul1;
     if (packed_direct_k6_candidate) {
+        ensure_transformed();
         const int output_tiles_per_block =
             metadata.out_features % (16 * 64) == 0 ? 64 :
             metadata.out_features % (16 * 32) == 0 ? 32 : 16;
@@ -5719,9 +7814,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         }
         cuda_check(cudaGetLastError(),
                    "launch FAST packed direct K6 projection");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, metadata.out_features / kHadamard), kHadamard, 0,
-            stream>>>(impl_->accum, weights.svh, output, rows,
+        launch_prefill_reduce_output<false>(stream,impl_->accum, weights.svh, output, rows,
                       metadata.out_features, split_count);
         cuda_check(cudaGetLastError(),
                    "launch FAST packed direct K6 reduction/output");
@@ -5755,34 +7848,186 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
 
     const dim3 reconstruct_grid(metadata.out_features / 16,
                                 metadata.in_features / 16);
-    if (fused_original) {
+    const std::size_t weight_bytes =
+        static_cast<std::size_t>(metadata.in_features) *
+        static_cast<std::size_t>(metadata.out_features) * sizeof(std::uint16_t);
+    std::uint16_t* reconstructed = impl_->reconstructed;
+    bool reconstruct_needed = true;
+    if (impl_->reuse_active && (!fused_original || original_gdn_mlp)) {
+        Impl::ReuseSlot* slot = nullptr;
+        for (std::size_t index = 0; index < impl_->reuse_used; ++index) {
+            auto& candidate = impl_->reuse_slots[index];
+            if (candidate.assigned && candidate.trellis == weights.trellis &&
+                candidate.mul1 == weights.mul1 &&
+                candidate.suh == weights.suh && candidate.svh == weights.svh &&
+                candidate.in_features == metadata.in_features &&
+                candidate.out_features == metadata.out_features &&
+                candidate.K == metadata.K &&
+                candidate.original_basis == fused_original) {
+                slot = &candidate;
+                break;
+            }
+        }
+        if (!slot) {
+            if (impl_->reuse_used == impl_->reuse_slots.size())
+                impl_->reuse_slots.emplace_back();
+            slot = &impl_->reuse_slots[impl_->reuse_used++];
+            slot->assigned = true;
+            slot->valid = false;
+            slot->trellis = weights.trellis;
+            slot->mul1 = weights.mul1;
+            slot->suh = weights.suh;
+            slot->svh = weights.svh;
+            slot->in_features = metadata.in_features;
+            slot->out_features = metadata.out_features;
+            slot->K = metadata.K;
+            slot->original_basis = fused_original;
+            if (slot->capacity < weight_bytes &&
+                impl_->reuse_capacity - slot->capacity + weight_bytes <=
+                    impl_->reuse_budget) {
+                if (slot->data) {
+                    cuda_check(cudaFree(slot->data),
+                               "retire smaller layer-major weight slot");
+                    impl_->reuse_capacity -= slot->capacity;
+                    slot->data = nullptr;
+                    slot->capacity = 0;
+                }
+                cuda_check(cudaMalloc(reinterpret_cast<void**>(&slot->data),
+                                      weight_bytes),
+                           "allocate bounded layer-major weight slot");
+                slot->capacity = weight_bytes;
+                impl_->reuse_capacity += weight_bytes;
+                impl_->stats.cached_weight_capacity_bytes = impl_->reuse_capacity;
+            }
+        }
+        if (slot->data && slot->capacity >= weight_bytes) {
+            reconstructed = slot->data;
+            if (slot->prefetch_pending) {
+                cuda_check(cudaStreamWaitEvent(stream,slot->prefetch_ready,0),
+                    "join prefetched K5 weight before GEMM");
+                slot->prefetch_pending=false;
+                slot->valid=true;
+                reconstruct_needed=false;
+                ++impl_->stats.prefetched_weight_hits;
+            } else if (slot->valid) {
+                reconstruct_needed = false;
+                ++impl_->stats.reused_weight_calls;
+                impl_->stats.reused_weight_bytes += weight_bytes;
+            } else slot->valid = true;
+        }
+    }
+    // MXFP8 policy: the layer-reuse slot holds the K-major E4M3 weight and its
+    // block scales; FP16 reconstruction goes through the scratch plane first.
+    // Without a resident slot the call keeps the FP16 route.
+    const bool mxfp8 = impl_->mxfp8_enabled && fast_fp16_destination &&
+        !fused_original && rows >= 16 &&
+        metadata.in_features % 128 == 0 && metadata.out_features % 128 == 0 &&
+        reconstructed != impl_->reconstructed;
+    std::uint8_t* const mx_weight =
+        mxfp8 ? reinterpret_cast<std::uint8_t*>(reconstructed) : nullptr;
+    const bool mlp_shape =
+        (metadata.in_features == 5120 && metadata.out_features == 17408) ||
+        (metadata.in_features == 17408 && metadata.out_features == 5120);
+    // Mode 3 mirrors the NInfer Qwen3.8 NVFP4 artifact: MLP layers 0..55.
+    const bool gdn_qkvz_shape = metadata.in_features == 5120 &&
+        (metadata.out_features == 10240 || metadata.out_features == 6144);
+    const bool nvfp4 = mxfp8 && (impl_->nvfp4_mode == 1 ||
+        (impl_->nvfp4_mode == 2 && mlp_shape) ||
+        (impl_->nvfp4_mode == 4 && (mlp_shape || gdn_qkvz_shape)) ||
+        (impl_->nvfp4_mode == 3 && mlp_shape && impl_->prefill_layer >= 0 &&
+         impl_->prefill_layer < 56));
+    // NVFP4 slot: packed values (k*n/2), block scales (n x k/16), then the
+    // FP32 weight global scale, all inside the FP16-sized reuse slot.
+    const std::size_t nv_value_bytes =
+        static_cast<std::size_t>(metadata.in_features) * metadata.out_features / 2;
+    const std::size_t nv_scale_bytes =
+        static_cast<std::size_t>(metadata.in_features) * metadata.out_features / 16;
+    // Default 1: decode EXL3 trellis tiles straight into the quantized operand
+    // (NINFER_EXL3_PREFILL_FUSED_DECODE=0 keeps the FP16 reconstruct + quantize control).
+    const bool fused_decode = mxfp8 && impl_->fused_decode_enabled &&
+        metadata.K >= 5 && metadata.K <= 8;
+    float* const nv_weight_global = nvfp4 ? reinterpret_cast<float*>(
+        mx_weight + nv_value_bytes + nv_scale_bytes) : nullptr;
+    if (mxfp8) reconstructed = impl_->reconstructed;
+    if (reconstruct_needed && fused_original) {
         const dim3 fused_grid(metadata.out_features / kHadamard,
                               metadata.in_features / kHadamard);
         if (metadata.K == 6) {
             exl3_fused_original_weight_reconstruct_kernel<6><<<
                 fused_grid, kThreads, 0, stream>>>(
-                impl_->reconstructed, weights.trellis, weights.suh,
+                reconstructed, weights.trellis, weights.suh,
                 weights.svh, metadata.out_features / 16);
         } else {
             exl3_fused_original_weight_reconstruct_kernel<7><<<
                 fused_grid, kThreads, 0, stream>>>(
-                impl_->reconstructed, weights.trellis, weights.suh,
+                reconstructed, weights.trellis, weights.suh,
                 weights.svh, metadata.out_features / 16);
         }
-    } else {
-        if (metadata.K == 6) {
+    } else if (reconstruct_needed && fused_decode) {
+        if (nvfp4)
+            launch_decode_quantize_weight<16>(metadata.K, weights.trellis, weights.mul1,
+                mx_weight, mx_weight + nv_value_bytes, nv_weight_global,
+                metadata.in_features, metadata.out_features, stream);
+        else
+            launch_decode_quantize_weight<32>(metadata.K, weights.trellis, weights.mul1,
+                mx_weight, mx_weight + static_cast<std::size_t>(metadata.in_features) *
+                    metadata.out_features, nullptr,
+                metadata.in_features, metadata.out_features, stream);
+    } else if (reconstruct_needed) {
+        if (metadata.K == 5) {
+            exl3_reconstruct_transformed_weight_kernel<5><<<
+                reconstruct_grid, 256, 0, stream>>>(
+                    weights.trellis, weights.mul1, reconstructed,
+                    metadata.in_features, metadata.out_features);
+        } else if (metadata.K == 6) {
             exl3_reconstruct_transformed_weight_kernel<6><<<
                 reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, impl_->reconstructed,
+                    weights.trellis, weights.mul1, reconstructed,
+                    metadata.in_features, metadata.out_features);
+        } else if (metadata.K == 8) {
+            exl3_reconstruct_transformed_weight_kernel<8><<<
+                reconstruct_grid, 256, 0, stream>>>(
+                    weights.trellis, weights.mul1, reconstructed,
                     metadata.in_features, metadata.out_features);
         } else {
             exl3_reconstruct_transformed_weight_kernel<7><<<
                 reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, impl_->reconstructed,
+                    weights.trellis, weights.mul1, reconstructed,
                     metadata.in_features, metadata.out_features);
         }
     }
-    cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
+    if (reconstruct_needed) {
+        cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
+        impl_->stats.reconstructed_weight_bytes += weight_bytes;
+        ++impl_->stats.reconstructed_weight_calls;
+        if (fused_decode) {
+            cuda_check(cudaGetLastError(), "fused EXL3 decode/quantize");
+        } else if (nvfp4) {
+            auto* amax_bits = reinterpret_cast<unsigned*>(impl_->nvfp4_scalars + 3);
+            cuda_check(cudaMemsetAsync(amax_bits, 0, sizeof(unsigned), stream),
+                       "clear NVFP4 weight amax");
+            nvfp4_amax_kernel<<<1024, 256, 0, stream>>>(
+                reinterpret_cast<const half*>(reconstructed),
+                static_cast<std::size_t>(metadata.in_features) * metadata.out_features,
+                amax_bits);
+            nvfp4_quantize_weight_transposed_kernel<<<
+                dim3((metadata.out_features + 255) / 256, metadata.in_features / 16),
+                256, 0, stream>>>(
+                    reinterpret_cast<const half*>(reconstructed), mx_weight,
+                    mx_weight + nv_value_bytes, metadata.in_features,
+                    metadata.out_features, amax_bits, nv_weight_global);
+            cuda_check(cudaGetLastError(), "NVFP4 weight quantization");
+        } else if (mxfp8) {
+            mxfp8_quantize_weight_transposed_kernel<<<
+                dim3((metadata.out_features + 255) / 256, metadata.in_features / 32),
+                256, 0, stream>>>(
+                    reinterpret_cast<const half*>(reconstructed), mx_weight,
+                    mx_weight + static_cast<std::size_t>(metadata.in_features) *
+                        metadata.out_features,
+                    metadata.in_features, metadata.out_features);
+            cuda_check(cudaGetLastError(), "MXFP8 weight quantization");
+        }
+    }
     if (timing) cuda_check(cudaEventRecord(events[2], stream), "T69 reconstruct event");
 
     cublas_check(cublasSetStream(impl_->handle, stream), "T69 set cuBLAS stream");
@@ -5792,6 +8037,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const float alpha = 1.0f, beta = 0.0f;
     const half alpha_half = __float2half(1.0f);
     const half beta_half = __float2half(0.0f);
+    if (!mxfp8) ensure_transformed();
     const void* gemm_input = fused_original
         ? static_cast<const void*>(input)
         : static_cast<const void*>(impl_->transformed);
@@ -5801,38 +8047,379 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                                  : static_cast<void*>(impl_->accum));
     const cudaDataType output_type =
         (fused_original || fast_fp16_destination) ? CUDA_R_16F : CUDA_R_32F;
-    cublas_check(cublasGemmEx(
-        impl_->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-        metadata.out_features, rows, metadata.in_features,
-        fp16_compute ? static_cast<const void*>(&alpha_half)
-                     : static_cast<const void*>(&alpha),
-        impl_->reconstructed, CUDA_R_16F, metadata.out_features,
-        gemm_input, CUDA_R_16F, metadata.in_features,
-        fp16_compute ? static_cast<const void*>(&beta_half)
-                     : static_cast<const void*>(&beta),
-        gemm_output, output_type, metadata.out_features,
-        fp16_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-        fp16_compute ? "T69 same-weights FP16-compute GEMM"
-                     : (fused_original ? "T69 fused original-basis GEMM"
-                                        : "T69 FP32-compute GEMM"));
+    bool used_lt=false;
+    if (nvfp4) {
+        const int in_blocks = metadata.in_features / 16;
+        const int padded_rows = (rows + 127) / 128 * 128;
+        auto* act_values = reinterpret_cast<std::uint8_t*>(impl_->accum);
+        auto* act_scales = act_values +
+            static_cast<std::size_t>(rows) * metadata.in_features / 2;
+        act_scales += (16 - reinterpret_cast<std::uintptr_t>(act_scales) % 16) % 16;
+        auto* amax_bits = reinterpret_cast<unsigned*>(impl_->nvfp4_scalars);
+        float* alpha_device = impl_->nvfp4_scalars + 1;
+        float* beta_device = impl_->nvfp4_scalars + 2;
+        if (!transformed_ready && raw_mlp_input) {
+            mlp_activation_quantize_warp_kernel<16><<<
+                exl3_hadamard_warp_grid(padded_rows, metadata.in_features),
+                kHadamardWarpsPerBlock * 32, 0, stream>>>(
+                    impl_->mlp_gate, impl_->mlp_up, impl_->mlp_gate_svh, impl_->mlp_up_svh,
+                    weights.suh, act_values, act_scales, rows, padded_rows,
+                    metadata.in_features, nv_weight_global, alpha_device);
+        } else if (!transformed_ready) {
+            input_hadamard_quantize_warp_kernel<16><<<
+                exl3_hadamard_warp_grid(padded_rows, metadata.in_features),
+                kHadamardWarpsPerBlock * 32, 0, stream>>>(
+                    input, weights.suh, act_values, act_scales, rows, padded_rows,
+                    metadata.in_features, nv_weight_global, alpha_device);
+        } else {
+            cuda_check(cudaMemsetAsync(amax_bits, 0, sizeof(unsigned), stream),
+                       "clear NVFP4 activation amax");
+            nvfp4_amax_kernel<<<512, 256, 0, stream>>>(
+                reinterpret_cast<const half*>(impl_->transformed),
+                static_cast<std::size_t>(rows) * metadata.in_features, amax_bits);
+            const int act_threads = padded_rows * in_blocks;
+            nvfp4_quantize_rows_kernel<<<(act_threads + 255) / 256, 256, 0, stream>>>(
+                reinterpret_cast<const half*>(impl_->transformed), act_values, act_scales,
+                rows, metadata.in_features, padded_rows, amax_bits, nv_weight_global,
+                alpha_device);
+        }
+        cuda_check(cudaGetLastError(), "NVFP4 activation quantization");
+        const std::uint64_t key = (1ull << 61) |
+            (static_cast<std::uint64_t>(metadata.in_features) << 32) |
+            (static_cast<std::uint64_t>(metadata.out_features) << 16) |
+            static_cast<std::uint64_t>(rows);
+        auto found = impl_->lt_plans.find(key);
+        if (found == impl_->lt_plans.end()) {
+            Impl::LtPlan plan{};
+            cublasLtMatmulPreference_t preference = nullptr;
+            try {
+                cublas_check(cublasLtMatmulDescCreate(&plan.operation,
+                    CUBLAS_COMPUTE_32F, CUDA_R_32F), "create NVFP4 Lt operation");
+                const cublasOperation_t transpose = CUBLAS_OP_T, plain = CUBLAS_OP_N;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_TRANSA, &transpose, sizeof(transpose)),
+                    "NVFP4 transa");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_TRANSB, &plain, sizeof(plain)), "NVFP4 transb");
+                const cublasLtPointerMode_t device_mode = CUBLASLT_POINTER_MODE_DEVICE;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_POINTER_MODE, &device_mode, sizeof(device_mode)),
+                    "NVFP4 device alpha");
+                const cublasLtMatmulMatrixScale_t mode =
+                    CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)),
+                    "NVFP4 A scale mode");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode)),
+                    "NVFP4 B scale mode");
+                const void* placeholder = impl_->cublas_workspace;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &placeholder, sizeof(placeholder)),
+                    "NVFP4 placeholder A scales");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &placeholder, sizeof(placeholder)),
+                    "NVFP4 placeholder B scales");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_4F_E2M1,
+                    metadata.in_features, metadata.out_features, metadata.in_features),
+                    "create NVFP4 weight layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_4F_E2M1,
+                    metadata.in_features, rows, metadata.in_features),
+                    "create NVFP4 activation layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16F,
+                    metadata.out_features, rows, metadata.out_features),
+                    "create NVFP4 output layout");
+                cublas_check(cublasLtMatmulPreferenceCreate(&preference),
+                    "create NVFP4 Lt preference");
+                constexpr std::size_t limit = 16u * 1024u * 1024u;
+                cublas_check(cublasLtMatmulPreferenceSetAttribute(preference,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &limit, sizeof(limit)),
+                    "bound NVFP4 Lt workspace");
+                cublasLtMatmulHeuristicResult_t candidates[4]{};
+                int count = 0;
+                cublas_check(cublasLtMatmulAlgoGetHeuristic(impl_->lt_handle,
+                    plan.operation, plan.a, plan.b, plan.c, plan.c, preference,
+                    4, candidates, &count), "query NVFP4 Lt algorithms");
+                bool selected = false;
+                for (int i = 0; i < count && !selected; ++i) {
+                    if (candidates[i].state == CUBLAS_STATUS_SUCCESS &&
+                        candidates[i].workspaceSize <= limit) {
+                        plan.algorithm = candidates[i].algo;
+                        plan.workspace_bytes = candidates[i].workspaceSize;
+                        selected = true;
+                    }
+                }
+                if (!selected) throw std::runtime_error("no supported NVFP4 Lt plan");
+                cublasLtMatmulPreferenceDestroy(preference);
+                preference = nullptr;
+                found = impl_->lt_plans.emplace(key, plan).first;
+            } catch (...) {
+                if (preference) cublasLtMatmulPreferenceDestroy(preference);
+                if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+                if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+                if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+                if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+                throw;
+            }
+        }
+        const auto& plan = found->second;
+        const void* weight_scales = mx_weight + nv_value_bytes;
+        const void* input_scales = act_scales;
+        cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+            CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &weight_scales, sizeof(weight_scales)),
+            "bind NVFP4 weight scales");
+        cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+            CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &input_scales, sizeof(input_scales)),
+            "bind NVFP4 activation scales");
+        cublas_check(cublasLtMatmul(impl_->lt_handle, plan.operation, alpha_device,
+            mx_weight, plan.a, act_values, plan.b, beta_device,
+            output, plan.c, output, plan.c, &plan.algorithm,
+            impl_->cublas_workspace, plan.workspace_bytes, stream),
+            "NVFP4 prefill cuBLASLt GEMM");
+        ++impl_->stats.nvfp4_calls;
+        impl_->stats.nvfp4_rows += static_cast<std::uint64_t>(rows);
+        used_lt = true;
+    } else if (mxfp8) {
+        const int in_blocks = metadata.in_features / 32;
+        const int padded_rows = (rows + 127) / 128 * 128;
+        auto* act_values = reinterpret_cast<std::uint8_t*>(impl_->accum);
+        auto* act_scales = act_values +
+            static_cast<std::size_t>(rows) * metadata.in_features;
+        act_scales += (16 - reinterpret_cast<std::uintptr_t>(act_scales) % 16) % 16;
+        if (!transformed_ready && raw_mlp_input) {
+            mlp_activation_quantize_warp_kernel<32><<<
+                exl3_hadamard_warp_grid(padded_rows, metadata.in_features),
+                kHadamardWarpsPerBlock * 32, 0, stream>>>(
+                    impl_->mlp_gate, impl_->mlp_up, impl_->mlp_gate_svh, impl_->mlp_up_svh,
+                    weights.suh, act_values, act_scales, rows, padded_rows,
+                    metadata.in_features, nullptr, nullptr);
+        } else if (!transformed_ready) {
+            input_hadamard_quantize_warp_kernel<32><<<
+                exl3_hadamard_warp_grid(padded_rows, metadata.in_features),
+                kHadamardWarpsPerBlock * 32, 0, stream>>>(
+                    input, weights.suh, act_values, act_scales, rows, padded_rows,
+                    metadata.in_features, nullptr, nullptr);
+        } else {
+            const int act_threads = padded_rows * in_blocks;
+            mxfp8_quantize_rows_kernel<<<(act_threads + 255) / 256, 256, 0, stream>>>(
+                reinterpret_cast<const half*>(impl_->transformed), act_values, act_scales,
+                rows, metadata.in_features, padded_rows);
+        }
+        cuda_check(cudaGetLastError(), "MXFP8 activation quantization");
+        const std::uint64_t key = (1ull << 62) |
+            (static_cast<std::uint64_t>(metadata.in_features) << 32) |
+            (static_cast<std::uint64_t>(metadata.out_features) << 16) |
+            static_cast<std::uint64_t>(rows);
+        auto found = impl_->lt_plans.find(key);
+        if (found == impl_->lt_plans.end()) {
+            Impl::LtPlan plan{};
+            cublasLtMatmulPreference_t preference = nullptr;
+            try {
+                cublas_check(cublasLtMatmulDescCreate(&plan.operation,
+                    CUBLAS_COMPUTE_32F, CUDA_R_32F), "create MXFP8 Lt operation");
+                const cublasOperation_t transpose = CUBLAS_OP_T, plain = CUBLAS_OP_N;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_TRANSA, &transpose, sizeof(transpose)),
+                    "MXFP8 transa");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_TRANSB, &plain, sizeof(plain)), "MXFP8 transb");
+                const cublasLtMatmulMatrixScale_t mode =
+                    CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)),
+                    "MXFP8 A scale mode");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode)),
+                    "MXFP8 B scale mode");
+                // Block-scaled heuristics require bound scale pointers; each
+                // call rebinds its own weight and activation scales.
+                const void* placeholder = impl_->cublas_workspace;
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &placeholder, sizeof(placeholder)),
+                    "MXFP8 placeholder A scales");
+                cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+                    CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &placeholder, sizeof(placeholder)),
+                    "MXFP8 placeholder B scales");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_8F_E4M3,
+                    metadata.in_features, metadata.out_features, metadata.in_features),
+                    "create MXFP8 weight layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_8F_E4M3,
+                    metadata.in_features, rows, metadata.in_features),
+                    "create MXFP8 activation layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16F,
+                    metadata.out_features, rows, metadata.out_features),
+                    "create MXFP8 output layout");
+                cublas_check(cublasLtMatmulPreferenceCreate(&preference),
+                    "create MXFP8 Lt preference");
+                constexpr std::size_t limit = 16u * 1024u * 1024u;
+                cublas_check(cublasLtMatmulPreferenceSetAttribute(preference,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &limit, sizeof(limit)),
+                    "bound MXFP8 Lt workspace");
+                cublasLtMatmulHeuristicResult_t candidates[4]{};
+                int count = 0;
+                cublas_check(cublasLtMatmulAlgoGetHeuristic(impl_->lt_handle,
+                    plan.operation, plan.a, plan.b, plan.c, plan.c, preference,
+                    4, candidates, &count), "query MXFP8 Lt algorithms");
+                bool selected = false;
+                for (int i = 0; i < count && !selected; ++i) {
+                    if (candidates[i].state == CUBLAS_STATUS_SUCCESS &&
+                        candidates[i].workspaceSize <= limit) {
+                        plan.algorithm = candidates[i].algo;
+                        plan.workspace_bytes = candidates[i].workspaceSize;
+                        selected = true;
+                    }
+                }
+                if (!selected) throw std::runtime_error("no supported MXFP8 Lt plan");
+                cublasLtMatmulPreferenceDestroy(preference);
+                preference = nullptr;
+                found = impl_->lt_plans.emplace(key, plan).first;
+            } catch (...) {
+                if (preference) cublasLtMatmulPreferenceDestroy(preference);
+                if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+                if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+                if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+                if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+                throw;
+            }
+        }
+        const auto& plan = found->second;
+        const void* weight_scales = mx_weight +
+            static_cast<std::size_t>(metadata.in_features) * metadata.out_features;
+        const void* input_scales = act_scales;
+        cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+            CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &weight_scales, sizeof(weight_scales)),
+            "bind MXFP8 weight scales");
+        cublas_check(cublasLtMatmulDescSetAttribute(plan.operation,
+            CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &input_scales, sizeof(input_scales)),
+            "bind MXFP8 activation scales");
+        cublas_check(cublasLtMatmul(impl_->lt_handle, plan.operation, &alpha,
+            mx_weight, plan.a, act_values, plan.b, &beta,
+            output, plan.c, output, plan.c, &plan.algorithm,
+            impl_->cublas_workspace, plan.workspace_bytes, stream),
+            "MXFP8 prefill cuBLASLt GEMM");
+        ++impl_->stats.mxfp8_calls;
+        impl_->stats.mxfp8_rows += static_cast<std::uint64_t>(rows);
+        used_lt = true;
+    }
+    const bool large_lt_candidate=!mxfp8 && impl_->large_lt_enabled &&
+        (metadata.K==6 || metadata.K==7) && rows>=4096;
+    if (!mxfp8 && ((impl_->k5_lt_enabled && metadata.K==5 && !fp16_compute) ||
+         (large_lt_candidate && fp16_compute)) &&
+        fast_fp16_destination && !fused_original) {
+        const std::uint64_t key=(fp16_compute?1ull<<63:0ull) |
+            (static_cast<std::uint64_t>(metadata.in_features)<<32) |
+            (static_cast<std::uint64_t>(metadata.out_features)<<16) |
+            static_cast<std::uint64_t>(rows);
+        auto found=impl_->lt_plans.find(key);
+        if (found==impl_->lt_plans.end()) {
+            Impl::LtPlan plan{};
+            cublasLtMatmulPreference_t preference=nullptr;
+            try {
+                cublas_check(cublasLtMatmulDescCreate(&plan.operation,
+                    fp16_compute?CUBLAS_COMPUTE_16F:CUBLAS_COMPUTE_32F,
+                    fp16_compute?CUDA_R_16F:CUDA_R_32F),"create prefill Lt operation");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.a,CUDA_R_16F,
+                    metadata.out_features,metadata.in_features,metadata.out_features),
+                    "create K5 Lt A layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.b,CUDA_R_16F,
+                    metadata.in_features,rows,metadata.in_features),
+                    "create K5 Lt B layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.c,CUDA_R_16F,
+                    metadata.out_features,rows,metadata.out_features),
+                    "create K5 Lt C layout");
+                cublas_check(cublasLtMatmulPreferenceCreate(&preference),
+                    "create K5 Lt preference");
+                constexpr std::size_t limit=16u*1024u*1024u;
+                cublas_check(cublasLtMatmulPreferenceSetAttribute(preference,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&limit,sizeof(limit)),
+                    "bound K5 Lt workspace");
+                cublasLtMatmulHeuristicResult_t candidates[4]{};
+                int count=0;
+                cublas_check(cublasLtMatmulAlgoGetHeuristic(impl_->lt_handle,
+                    plan.operation,plan.a,plan.b,plan.c,plan.c,preference,
+                    4,candidates,&count),"query K5 Lt algorithms");
+                bool selected=false;
+                for (int i=0;i<count;++i) {
+                    if (candidates[i].state==CUBLAS_STATUS_SUCCESS &&
+                        candidates[i].workspaceSize<=limit) {
+                        plan.algorithm=candidates[i].algo;
+                        plan.workspace_bytes=candidates[i].workspaceSize;
+                        selected=true;
+                        break;
+                    }
+                }
+                if (!selected)
+                    throw std::runtime_error("no supported K5 Lt plan");
+                cublasLtMatmulPreferenceDestroy(preference);
+                preference=nullptr;
+                found=impl_->lt_plans.emplace(key,plan).first;
+            } catch (...) {
+                if (preference) cublasLtMatmulPreferenceDestroy(preference);
+                if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+                if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+                if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+                if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+                throw;
+            }
+        }
+        const auto& plan=found->second;
+        cublas_check(cublasLtMatmul(impl_->lt_handle,plan.operation,
+            fp16_compute?static_cast<const void*>(&alpha_half):
+                static_cast<const void*>(&alpha),
+            reconstructed,plan.a,gemm_input,plan.b,
+            fp16_compute?static_cast<const void*>(&beta_half):
+                static_cast<const void*>(&beta),
+            gemm_output,plan.c,gemm_output,plan.c,&plan.algorithm,
+            impl_->cublas_workspace,plan.workspace_bytes,stream),
+            "K5 prefill cuBLASLt GEMM");
+        if(metadata.K==5) ++impl_->stats.k5_lt_calls;
+        else ++impl_->stats.large_lt_calls;
+        used_lt=true;
+    }
+    if (!used_lt) {
+        cublas_check(cublasGemmEx(
+            impl_->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            metadata.out_features, rows, metadata.in_features,
+            fp16_compute ? static_cast<const void*>(&alpha_half)
+                         : static_cast<const void*>(&alpha),
+            reconstructed, CUDA_R_16F, metadata.out_features,
+            gemm_input, CUDA_R_16F, metadata.in_features,
+            fp16_compute ? static_cast<const void*>(&beta_half)
+                         : static_cast<const void*>(&beta),
+            gemm_output, output_type, metadata.out_features,
+            fp16_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            fp16_compute ? "T69 same-weights FP16-compute GEMM"
+                         : (fused_original ? "T69 fused original-basis GEMM"
+                                            : "T69 FP32-compute GEMM"));
+    }
     if (timing) cuda_check(cudaEventRecord(events[3], stream), "T69 GEMM event");
 
     if (!fused_original) {
         if (fast_fp16_destination) {
-            output_hadamard_fp16_inplace_kernel<<<
-                dim3(rows, metadata.out_features / kHadamard), dim3(kHadamard), 0,
-                stream>>>(output, weights.svh, rows, metadata.out_features);
+            if (residual) {
+                output_hadamard_fp16_residual_kernel<<<
+                    dim3(rows, metadata.out_features / kHadamard),
+                    dim3(kHadamard), 0, stream>>>(
+                        output, weights.svh, residual, down_trace,
+                        trace_row_base, rows, metadata.out_features);
+                ++impl_->stats.fused_down_residual_calls;
+                impl_->stats.fused_down_residual_rows +=
+                    static_cast<std::uint64_t>(rows);
+            } else if (!impl_->raw_output) {
+                launch_output_hadamard_fp16_inplace(stream,
+                        output, weights.svh, rows, metadata.out_features);
+            }
         } else {
-            output_hadamard_kernel<<<
-                dim3(rows, metadata.out_features / kHadamard), dim3(kHadamard), 0, stream>>>(
+            launch_output_hadamard(stream,
                     impl_->accum, weights.svh, output, rows, metadata.out_features);
         }
         cuda_check(cudaGetLastError(), "T69 output Hadamard");
     }
     ++impl_->stats.calls;
     impl_->stats.rows += static_cast<std::uint64_t>(rows);
-    if (metadata.K == 6) ++impl_->stats.k6_calls;
+    if (metadata.K == 5) ++impl_->stats.k5_calls;
+    else if (metadata.K == 6) ++impl_->stats.k6_calls;
     else ++impl_->stats.k7_calls;
     if (fused_original) {
         ++impl_->stats.fused_original_calls;
@@ -6449,8 +9036,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_v6_numeric(
     // V6's donor multiplies the FP16 activation and SUH in FP16 before
     // the FP32 butterfly. The established text route deliberately keeps its
     // original full product; this specialization is admitted only here.
-    input_hadamard_kernel<kHadamard,true><<<dim3(rows,metadata.in_features/kHadamard),
-        kHadamard,0,stream>>>(input,weights.suh,impl_->transformed,rows,metadata.in_features);
+    launch_input_hadamard<kHadamard,true>(stream,input,weights.suh,impl_->transformed,rows,metadata.in_features);
     exl3_reconstruct_transformed_weight_kernel<6><<<
         dim3(metadata.out_features/16,metadata.in_features/16),256,0,stream>>>(
         weights.trellis,weights.mul1,impl_->reconstructed,metadata.in_features,metadata.out_features);
@@ -6511,8 +9097,7 @@ void Exl3CudaLinearWorkspace::forward_predecoded_m1_k6_for_test(
             transformed_,decoded,weights.mul1,accum_,rows,in_features_,
             out_features_,split_count);
     cuda_check(cudaGetLastError(),"launch predecoded M1 K6 discriminator partials");
-    prefill_reduce_output_kernel<false><<<
-        dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+    launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,rows,out_features_,split_count);
     cuda_check(cudaGetLastError(),"launch predecoded M1 K6 discriminator output");
 }
@@ -6544,8 +9129,7 @@ void Exl3CudaLinearWorkspace::forward_fast_decode_m1_k6_for_test(
                 in_features_,out_features_,split_count);
     cuda_check(cudaGetLastError(),
         "launch fast-decode M1 K6 discriminator partials");
-    prefill_reduce_output_kernel<false><<<
-        dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+    launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,rows,out_features_,split_count);
     cuda_check(cudaGetLastError(),
         "launch fast-decode M1 K6 discriminator output");
@@ -6590,11 +9174,9 @@ void Exl3CudaLinearWorkspace::forward_k6_rowpair_shared_decode_for_test(
     cuda_check(cudaGetLastError(),
         "launch K6 rowpair shared-decode discriminator partials");
     if(target_reduce_shfl_)
-        prefill_reduce_output_kernel<true><<<
-            dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+        launch_prefill_reduce_output<true>(stream,
                 accum_,weights.svh,output,rows,out_features_,splits);
-    else prefill_reduce_output_kernel<false><<<
-        dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+    else launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,rows,out_features_,splits);
     cuda_check(cudaGetLastError(),
         "launch K6 rowpair shared-decode discriminator output");
@@ -6707,14 +9289,14 @@ void Exl3CudaLinearWorkspace::forward_reconstructed_exact_from_transformed(
     } // Next slice may overwrite decoded only after this slice's consumers.
     if(target_reduce_shfl_) {
         if(target_reduce_shfl_min_barriers_) {
-            prefill_reduce_output_kernel<true,true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+            launch_prefill_reduce_output<true,true>(stream,
                 accum_,weights.svh,output,rows,out_features_,splits);
             ++reduce_shfl_min_barrier_calls_;reduce_shfl_min_barrier_rows_+=rows;
-        } else prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+        } else launch_prefill_reduce_output<true>(stream,
             accum_,weights.svh,output,rows,out_features_,splits);
     }
     else
-        prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,rows,out_features_,splits);
     cuda_check(cudaGetLastError(), "exact reconstructed K7 reduction and output");
 }
@@ -6773,9 +9355,7 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
                          metadata.out_features, CUBLAS_COMPUTE_32F,
                          CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                      "fast Mia-parity wide-prefill FP32-compute GEMM");
-        output_hadamard_kernel<<<
-            dim3(rows, metadata.out_features / kHadamard), kHadamard, 0,
-            stream>>>(accum_, weights.svh, output, rows, metadata.out_features);
+        launch_output_hadamard(stream,accum_, weights.svh, output, rows, metadata.out_features);
         cuda_check(cudaGetLastError(),
                    "fast Mia-parity wide-prefill output Hadamard");
     } catch (...) {
@@ -6784,6 +9364,219 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
     }
     ++fast_wide_prefill_gemm_calls_;
     fast_wide_prefill_gemm_rows_ += static_cast<std::uint64_t>(rows);
+    return true;
+}
+
+static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission, int in_features, int out_features,
+    std::size_t capacity);
+
+static bool coherent_fused_input_for(int rows);
+static bool merged_gate_up_enabled();
+int coherent_packed_warps();
+int coherent_tiles_per_stage_setting();
+
+static void launch_input_transform_pair(cudaStream_t stream,const std::uint16_t* input,
+    const std::uint16_t* suh_a,const std::uint16_t* suh_b,std::uint16_t* transformed_a,
+    std::uint16_t* transformed_b,int rows,int input_features) {
+    const int tasks=rows*(input_features/kHadamard);
+    exl3_launch_pdl(input_hadamard_pair_warp_kernel,
+        dim3((tasks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+        dim3(kHadamardWarpsPerBlock*32),0,stream,input,suh_a,suh_b,transformed_a,
+        transformed_b,rows,input_features);
+    cuda_check(cudaGetLastError(),"launch merged-route input transform pair");
+}
+
+bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
+    Exl3CudaLinearWorkspace& up_workspace,
+    const Exl3CudaLinearWeights& gate_weights,const Exl3CudaLinearMetadata& gate_metadata,
+    const Exl3CudaLinearWeights& up_weights,const Exl3CudaLinearMetadata& up_metadata,
+    const std::uint16_t* input,std::uint16_t* gate_output,std::uint16_t* up_output,
+    std::uint16_t* activation,int rows,cudaStream_t stream,
+    const Exl3CudaLinearWeights* down_weights,Exl3CudaLinearWorkspace* down_workspace) {
+    if(rows<1 || rows>8 || rows>max_rows_ || rows>up_workspace.max_rows_ ||
+       !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
+       coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
+       (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
+       gate_metadata.K!=up_metadata.K || gate_metadata.K<5 || gate_metadata.K>7 ||
+       (!coherent_fused_input_for(rows) && out_features_<in_features_) ||
+       in_features_!=up_workspace.in_features_ || out_features_!=up_workspace.out_features_ ||
+       out_features_%kHadamard!=0 ||
+       !coherent_wide_k6_candidate(gate_metadata,rows,Exl3CudaLinearAdmission::ordinary) ||
+       !up_workspace.coherent_wide_k6_candidate(up_metadata,rows,Exl3CudaLinearAdmission::ordinary) ||
+       !gate_weights.suh || !gate_weights.svh || !up_weights.suh || !up_weights.svh ||
+       !input || !gate_output || !up_output || !activation)
+        return false;
+    const int split_count=coherent_wide_k6_split_count(rows);
+    if(split_count!=up_workspace.coherent_wide_k6_split_count(rows))return false;
+    if(down_workspace && (!down_weights || !down_weights->suh ||
+        down_workspace->in_features_!=out_features_ || !down_workspace->transformed_))
+        return false;
+    // Ordered layer projections may share one accumulation buffer; the up
+    // partials then follow the gate planes.
+    const std::size_t planes=static_cast<std::size_t>(split_count)*rows*out_features_;
+    float* up_accum=up_workspace.accum_;
+    if(up_accum==accum_) {
+        if(accumulation_capacity_bytes_<2*planes*sizeof(float))return false;
+        up_accum=accum_+planes;
+    }
+    constexpr int stages=4,warps=4,per=2;
+    const int grid=out_features_/(16*warps)*split_count;
+    // Wider rows stage both input transforms in the projection outputs: each
+    // producer finishes reading them before the reduction overwrites them.
+    const bool fused=coherent_fused_input_for(rows);
+    if(!fused) launch_input_transform_pair(stream,input,gate_weights.suh,up_weights.suh,
+        gate_output,up_output,rows,in_features_);
+    const std::size_t shared=fused ?
+        exl3_fused_input_shared_bytes(gate_metadata.K,stages,warps,per,rows,in_features_,split_count) :
+        exl3_deep_shared_bytes(gate_metadata.K,stages,warps,per);
+    const auto launch=[&](auto kernel) {
+        if(shared>48u*1024u)
+            cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shared)),"set merged gate/up shared memory");
+        exl3_launch_pdl(kernel,dim3(2*grid),dim3(warps*32),shared,stream,input,
+            static_cast<const std::uint16_t*>(gate_output),
+            static_cast<const std::uint16_t*>(up_output),
+            gate_weights.suh,gate_weights.trellis,gate_weights.mul1,accum_,
+            up_weights.suh,up_weights.trellis,up_weights.mul1,up_accum,
+            rows,in_features_,out_features_,out_features_,split_count,grid,grid,
+            Exl3GdnControlSide{});
+    };
+    const auto launch_k=[&](auto fused_kernel,auto staged_kernel) {
+        if(fused) launch(fused_kernel); else launch(staged_kernel);
+    };
+    if(gate_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per,false>);
+    else if(gate_metadata.K==6) launch_k(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per,false>);
+    else launch_k(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per,false>);
+    cuda_check(cudaGetLastError(),"launch merged M1 gate/up producers");
+    // NINFER_EXL3_GATE_UP_REDUCE_WARPS (1, 2, 4 or 8; default 2) warps per CTA:
+    // narrow CTAs spread the split-plane reads over more SMs.
+    static const int reduce_warps=[] {
+        const char* value=std::getenv("NINFER_EXL3_GATE_UP_REDUCE_WARPS");
+        const int parsed=value?std::atoi(value):2;
+        if(parsed!=1&&parsed!=2&&parsed!=4&&parsed!=8)
+            throw std::invalid_argument("NINFER_EXL3_GATE_UP_REDUCE_WARPS must be 1, 2, 4 or 8");
+        return parsed;
+    }();
+    const auto launch_reduce=[&](auto kernel,int warps) {
+        exl3_launch_pdl(kernel,
+            dim3((rows*(out_features_/kHadamard)+warps-1)/warps),
+            dim3(warps*32),0,stream,accum_,up_accum,
+            gate_weights.svh,up_weights.svh,gate_output,up_output,activation,rows,out_features_,
+            split_count,
+            down_workspace?down_weights->suh:nullptr,
+            down_workspace?down_workspace->transformed_:nullptr);
+    };
+    if(reduce_warps==1) launch_reduce(exl3_gate_up_reduce_silu_kernel<1>,1);
+    else if(reduce_warps==2) launch_reduce(exl3_gate_up_reduce_silu_kernel<2>,2);
+    else if(reduce_warps==4) launch_reduce(exl3_gate_up_reduce_silu_kernel<4>,4);
+    else launch_reduce(exl3_gate_up_reduce_silu_kernel<8>,8);
+    cuda_check(cudaGetLastError(),"launch merged M1 gate/up reduction and activation");
+    coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    coherent_wide_k6_rows_[coherent_wide_k6_operation_].fetch_add(rows,std::memory_order_relaxed);
+    up_workspace.coherent_wide_k6_calls_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    up_workspace.coherent_wide_k6_rows_[up_workspace.coherent_wide_k6_operation_].fetch_add(rows,std::memory_order_relaxed);
+    if(split_count==10) {
+        coherent_wide_k6_split10_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+        up_workspace.coherent_wide_k6_split10_calls_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool Exl3CudaLinearWorkspace::forward_merged_pair(
+    Exl3CudaLinearWorkspace& second_workspace,
+    const Exl3CudaLinearWeights& first_weights,const Exl3CudaLinearMetadata& first_metadata,
+    std::uint16_t* first_output,
+    const Exl3CudaLinearWeights& second_weights,const Exl3CudaLinearMetadata& second_metadata,
+    std::uint16_t* second_output,const std::uint16_t* input,int rows,cudaStream_t stream,
+    const Exl3GdnControlSide* control,std::uint16_t* first_bf16) {
+    if(control && (in_features_%128!=0 || control->heads<=0))return false;
+    if(rows<1 || rows>8 || rows>max_rows_ || rows>second_workspace.max_rows_ ||
+       !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
+       coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
+       (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
+       first_metadata.K!=second_metadata.K || first_metadata.K<5 || first_metadata.K>8 ||
+       (!coherent_fused_input_for(rows) &&
+        (out_features_<in_features_ || second_workspace.out_features_<in_features_)) ||
+       in_features_!=second_workspace.in_features_ ||
+       out_features_%kHadamard!=0 || second_workspace.out_features_%kHadamard!=0 ||
+       !first_weights.suh || !first_weights.svh || !second_weights.suh || !second_weights.svh ||
+       !input || !first_output || !second_output)
+        return false;
+    // Both projections must take the same coherent route and split: the wide
+    // producer (split 10) or the narrow K/V split-plane producer.
+    const auto route_split=[rows](Exl3CudaLinearWorkspace& workspace,
+                                  const Exl3CudaLinearMetadata& metadata) {
+        if(const int kv=coherent_kv_split_for(metadata,rows,Exl3CudaLinearAdmission::ordinary,
+               workspace.in_features_,workspace.out_features_,
+               workspace.accumulation_capacity_bytes_))
+            return -kv;
+        if(metadata.K<=7 &&
+           workspace.coherent_wide_k6_candidate(metadata,rows,Exl3CudaLinearAdmission::ordinary))
+            return workspace.coherent_wide_k6_split_count(rows);
+        return 0;
+    };
+    const int first_route=route_split(*this,first_metadata);
+    if(!first_route || first_route!=route_split(second_workspace,second_metadata))return false;
+    const bool kv_route=first_route<0;
+    const int split_count=kv_route?-first_route:first_route;
+    const int out_a=out_features_, out_b=second_workspace.out_features_;
+    float* second_accum=second_workspace.accum_;
+    if(second_accum==accum_) {
+        const std::size_t total=static_cast<std::size_t>(split_count)*rows*(out_a+out_b)*sizeof(float);
+        if(accumulation_capacity_bytes_<total)return false;
+        second_accum=accum_+static_cast<std::size_t>(split_count)*rows*out_a;
+    }
+    constexpr int stages=4,warps=4,per=2;
+    const int grid_a=out_a/(16*warps)*split_count, grid_b=out_b/(16*warps)*split_count;
+    // Wider rows stage both input transforms in the projection outputs (see
+    // forward_merged_gate_up_silu).
+    const bool fused=coherent_fused_input_for(rows);
+    if(!fused) launch_input_transform_pair(stream,input,first_weights.suh,second_weights.suh,
+        first_output,second_output,rows,in_features_);
+    const std::size_t shared=fused ?
+        exl3_fused_input_shared_bytes(first_metadata.K,stages,warps,per,rows,in_features_,split_count) :
+        exl3_deep_shared_bytes(first_metadata.K,stages,warps,per);
+    const auto launch=[&](auto kernel) {
+        if(shared>48u*1024u)
+            cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shared)),"set merged pair shared memory");
+        exl3_launch_pdl(kernel,dim3(grid_a+grid_b+(control?rows*control->heads:0)),
+            dim3(warps*32),shared,stream,input,
+            static_cast<const std::uint16_t*>(first_output),
+            static_cast<const std::uint16_t*>(second_output),
+            first_weights.suh,first_weights.trellis,first_weights.mul1,accum_,
+            second_weights.suh,second_weights.trellis,second_weights.mul1,second_accum,
+            rows,in_features_,out_a,out_b,split_count,grid_a,grid_b,
+            control?*control:Exl3GdnControlSide{});
+    };
+    const auto launch_k=[&](auto fused_kernel,auto staged_kernel) {
+        if(fused) launch(fused_kernel); else launch(staged_kernel);
+    };
+    if(first_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per,false>);
+    else if(first_metadata.K==6) launch_k(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per,false>);
+    else if(first_metadata.K==7) launch_k(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per,false>);
+    else launch_k(exl3_gemm_m1_fused_input_dual_kernel<8,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<8,false,false,stages,warps,per,false>);
+    cuda_check(cudaGetLastError(),"launch merged M1 pair producers");
+    const int blocks=rows*((out_a+out_b)/kHadamard);
+    exl3_launch_pdl(exl3_pair_reduce_output_kernel,
+        dim3((blocks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+        dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,first_weights.svh,first_output,out_a,
+        second_accum,second_weights.svh,second_output,out_b,rows,split_count,first_bf16);
+    cuda_check(cudaGetLastError(),"launch merged M1 pair reduction");
+    if(!kv_route) for(auto* workspace:{this,&second_workspace}) {
+        workspace->coherent_wide_k6_calls_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+        workspace->coherent_wide_k6_rows_[workspace->coherent_wide_k6_operation_].fetch_add(rows,std::memory_order_relaxed);
+        if(split_count==10)
+            workspace->coherent_wide_k6_split10_calls_[workspace->coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
+    }
     return true;
 }
 
@@ -6803,6 +9596,64 @@ void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
     if(admission==Exl3CudaLinearAdmission::target_continuation_head &&
        !target_head_small_m_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared head requires admitted H6 small-M workspace");
+    if (coherent_kv_split_for(metadata, rows, admission, in_features_, out_features_,
+            accumulation_capacity_bytes_)) {
+        if (coherent_fused_input_for(rows)) {
+            forward_from_transformed(weights, metadata, transformed_, output,
+                                     rows, stream, admission, input);
+            return;
+        }
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
+    if (coherent_down_k6_candidate(metadata, rows, admission)) {
+        // This explicit policy wins over older M1-only INT8/fused-input probes.
+        // Scalar and verifier must not silently select different down math.
+        if (coherent_fused_input_for(rows)) {
+            forward_from_transformed(weights, metadata, transformed_, output,
+                                     rows, stream, admission, input);
+            return;
+        }
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
+    if (coherent_down_k7_candidate(metadata, rows, admission)) {
+        if (coherent_fused_input_for(rows)) {
+            forward_from_transformed(weights, metadata, transformed_, output,
+                                     rows, stream, admission, input);
+            return;
+        }
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
+    if (coherent_o_k7_candidate(metadata, rows, admission)) {
+        if (coherent_fused_input_for(rows)) {
+            forward_from_transformed(weights, metadata, transformed_, output,
+                                     rows, stream, admission, input);
+            return;
+        }
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
+    if (coherent_wide_k6_candidate(metadata, rows, admission)) {
+        if (coherent_fused_input_for(rows)) {
+            forward_from_transformed(weights, metadata, transformed_, output,
+                                     rows, stream, admission, input);
+            return;
+        }
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output,
+                                 rows, stream, admission);
+        return;
+    }
     // Admission failure must precede the input-Hadamard scratch write. The
     // submission path reacquires and holds this guard through slab consumption.
     if(extended_stream_reduction_candidate(metadata,rows,admission)) {
@@ -7024,8 +9875,7 @@ void Exl3CudaLinearWorkspace::transform_input(const Exl3CudaLinearWeights& weigh
         throw std::invalid_argument("EXL3 CUDA received a null device buffer");
     }
 
-    input_hadamard_kernel<kHadamard><<<dim3(rows, in_features_ / kHadamard),
-                                       dim3(kHadamard), 0, stream>>>(
+    launch_input_hadamard<kHadamard>(stream,
         input, weights.suh, transformed_, rows, in_features_);
     cuda_check(cudaGetLastError(), "launch EXL3 input Hadamard");
 }
@@ -7058,8 +9908,7 @@ void Exl3CudaLinearWorkspace::forward_k4_prefill_for_test(
             accum_+output_offset,tail,in_features_,out_features_,4);
     }
     cuda_check(cudaGetLastError(),"launch K4 prefill discriminator projection");
-    output_hadamard_kernel<<<dim3(rows,out_features_/kHadamard),
-        dim3(kHadamard),0,stream>>>(accum_,weights.svh,output,rows,out_features_);
+    launch_output_hadamard(stream,accum_,weights.svh,output,rows,out_features_);
     cuda_check(cudaGetLastError(),"launch K4 prefill discriminator output");
 }
 
@@ -7083,8 +9932,7 @@ void Exl3CudaLinearWorkspace::forward_k4_prefill_mma_for_test(
             transformed_,weights.trellis,weights.mul1,accum_,rows,
             in_features_,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch K4 MMA prefill discriminator projection");
-    prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),
-        kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,splits);
+    launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch K4 MMA prefill discriminator output");
 }
 
@@ -7147,18 +9995,14 @@ bool Exl3CudaLinearWorkspace::forward_target_prefill_gate_up_pair(
             rows,in_features_,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch paired target K6 gate/up partials");
     if(target_reduce_shfl_)
-        prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),
-            kHadamard,0,stream>>>(accum_,gate_weights.svh,gate_output,rows,
+        launch_prefill_reduce_output<true>(stream,accum_,gate_weights.svh,gate_output,rows,
                 out_features_,splits);
-    else prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),
-            kHadamard,0,stream>>>(accum_,gate_weights.svh,gate_output,rows,
+    else launch_prefill_reduce_output<false>(stream,accum_,gate_weights.svh,gate_output,rows,
                 out_features_,splits);
     if(up_workspace.target_reduce_shfl_)
-        prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),
-            kHadamard,0,stream>>>(up_workspace.accum_,up_weights.svh,up_output,
+        launch_prefill_reduce_output<true>(stream,up_workspace.accum_,up_weights.svh,up_output,
                 rows,out_features_,splits);
-    else prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),
-            kHadamard,0,stream>>>(up_workspace.accum_,up_weights.svh,up_output,
+    else launch_prefill_reduce_output<false>(stream,up_workspace.accum_,up_weights.svh,up_output,
                 rows,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch paired target K6 gate/up reductions");
     ++target_prefill_gate_up_pair_calls_;
@@ -7305,11 +10149,9 @@ void Exl3CudaLinearWorkspace::forward_target_m1_gate_up_pair(
         }
         cuda_check(cudaGetLastError(),"launch target M1 packed gate/up pair discriminator");
     }
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(accum_,gate_weights.svh,gate_output,1,
+    launch_prefill_reduce_output<false>(stream,accum_,gate_weights.svh,gate_output,1,
             out_features_,splits);
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(up_workspace.accum_,up_weights.svh,up_output,1,
+    launch_prefill_reduce_output<false>(stream,up_workspace.accum_,up_weights.svh,up_output,1,
             out_features_,splits);
     cuda_check(cudaGetLastError(),"reduce target M1 K6 gate/up pair discriminator");
     process_fast_same_weights_fp16kv_m1_gate_up_pair_calls_.fetch_add(
@@ -7373,11 +10215,9 @@ void Exl3CudaLinearWorkspace::forward_target_m1_kv_pair_for_test(
                 second_weights.trellis,second_weights.mul1,accum_,
                 second_workspace.accum_,in_features_,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch target M1 K6 K/V pair discriminator");
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(accum_,first_weights.svh,first_output,1,
+    launch_prefill_reduce_output<false>(stream,accum_,first_weights.svh,first_output,1,
             out_features_,splits);
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(second_workspace.accum_,second_weights.svh,
+    launch_prefill_reduce_output<false>(stream,second_workspace.accum_,second_weights.svh,
             second_output,1,out_features_,splits);
     cuda_check(cudaGetLastError(),"reduce target M1 K6 K/V pair discriminator");
     process_fast_same_weights_fp16kv_m1_kv_pair_calls_.fetch_add(
@@ -7431,11 +10271,9 @@ void Exl3CudaLinearWorkspace::forward_target_m1_kv_wide_pair_for_test(
                 second_weights.trellis,second_weights.mul1,accum_,
                 second_workspace.accum_,in_features_,out_features_,splits);
     cuda_check(cudaGetLastError(),"launch target M1 wide K6/K7 K/V pair");
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(accum_,first_weights.svh,first_output,1,
+    launch_prefill_reduce_output<false>(stream,accum_,first_weights.svh,first_output,1,
             out_features_,splits);
-    prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-        kHadamard,0,stream>>>(second_workspace.accum_,second_weights.svh,
+    launch_prefill_reduce_output<false>(stream,second_workspace.accum_,second_weights.svh,
             second_output,1,out_features_,splits);
     cuda_check(cudaGetLastError(),"reduce target M1 wide K6/K7 K/V pair");
     process_fast_same_weights_fp16kv_m1_kv_pair_calls_.fetch_add(
@@ -7462,8 +10300,7 @@ void Exl3CudaLinearWorkspace::transform_gate_up(const Exl3CudaLinearWeights& wei
             {reinterpret_cast<std::uintptr_t>(input),reinterpret_cast<std::uintptr_t>(weights.suh),
              reinterpret_cast<std::uintptr_t>(weights.suh),reinterpret_cast<std::uintptr_t>(activation),
              reinterpret_cast<std::uintptr_t>(transformed_)});
-    input_hadamard_kernel<kHadamard,false,true><<<dim3(rows,in_features_/kHadamard),
-        dim3(kHadamard),0,stream>>>(gate,weights.suh,transformed_,rows,in_features_,up,activation);
+    launch_input_hadamard<kHadamard,false,true>(stream,gate,weights.suh,transformed_,rows,in_features_,up,activation);
     cuda_check(cudaGetLastError(),"launch EXL3 gate/up activation input Hadamard");
 }
 
@@ -7841,6 +10678,180 @@ bool Exl3CudaLinearWorkspace::target_fast_same_weights_fp16_m1_candidate(
         ? capacities[2]
         : capacities[k6_down ? 1 : 0];
     return output_blocks > 0 && output_blocks <= capacity;
+}
+
+bool Exl3CudaLinearWorkspace::fast_fp16_m2_8_down_candidate(
+    const Exl3CudaLinearMetadata& metadata,int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    // One M16 MMA consumes all proposal rows and decodes each packed B tile
+    // once. The K6 down projection owns this first bounded vertical slice.
+    return fast_fp16_m2_8_down_enabled_ && allow_generic_variants_ &&
+        rows>=2 && rows<=8 && rows<=max_rows_ &&
+        (admission==Exl3CudaLinearAdmission::target_continuation_down ||
+         admission==Exl3CudaLinearAdmission::ordinary) &&
+        in_features_==17408 && out_features_==5120 &&
+        metadata.in_features==in_features_ &&
+        metadata.out_features==out_features_ && metadata.K==6 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias &&
+        fast_same_weights_fp16_m1_capacity_[1]>=20;
+}
+
+bool Exl3CudaLinearWorkspace::fast_fp16_m2_8_fused_down_candidate(
+    const Exl3CudaLinearMetadata& metadata,int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    return fast_fp16_m2_8_fused_down_enabled_ && allow_generic_variants_ &&
+        rows>=2 && rows<=8 && rows<=max_rows_ &&
+        (admission==Exl3CudaLinearAdmission::target_continuation_down ||
+         admission==Exl3CudaLinearAdmission::ordinary) &&
+        in_features_==17408 && out_features_==5120 &&
+        metadata.in_features==in_features_ &&
+        metadata.out_features==out_features_ && metadata.K==6 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias;
+}
+
+std::size_t Exl3CudaLinearWorkspace::coherent_wide_k6_shared_bytes_for_test() noexcept {
+    return kCoherentWideK6SharedBytes;
+}
+
+// NINFER_EXL3_COHERENT_ANY_K (default 1; quality-gated) also admits K5 and K7 weights to the coherent
+// wide and down producers (numerics policy: split-plane FP32 accumulation).
+static bool coherent_any_k_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_ANY_K");
+        if (!value || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        throw std::invalid_argument("NINFER_EXL3_COHERENT_ANY_K must be 0 or 1");
+    }();
+    return enabled;
+}
+
+bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    if (!coherent_wide_k6_enabled_ || !allow_generic_variants_ ||
+        coherent_wide_k6_resident_capacity_ <= 0 ||
+        rows < 1 || rows > 8 || rows > max_rows_ ||
+        metadata.in_features != in_features_ ||
+        metadata.out_features != out_features_ ||
+        !(metadata.K == 6 ||
+          (coherent_any_k_enabled() && (metadata.K == 5 || metadata.K == 7))) ||
+        metadata.mcg || !metadata.mul1 || metadata.has_bias)
+        return false;
+    constexpr Exl3CudaLinearAdmission continuation[5] = {
+        Exl3CudaLinearAdmission::target_continuation_q,
+        Exl3CudaLinearAdmission::target_continuation_qkv,
+        Exl3CudaLinearAdmission::target_continuation_z,
+        Exl3CudaLinearAdmission::target_continuation_o,
+        Exl3CudaLinearAdmission::target_continuation_gate_up};
+    return coherent_wide_k6_operation_ >= 0 &&
+        coherent_wide_k6_operation_ < 5 &&
+        (admission == Exl3CudaLinearAdmission::ordinary ||
+         admission == continuation[coherent_wide_k6_operation_]);
+}
+
+// NINFER_EXL3_COHERENT_DOWN_SPLIT / NINFER_EXL3_COHERENT_O_SPLIT (10 default,
+// quality-gated within +/-0.00022 nats/token; 5 or 8): K partitions of the coherent down / O producers. A numerics-policy
+// choice (FP32 partial boundaries move); falls back to 5 when the owned
+// accumulation planes are too small.
+int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows) const {
+    const char* value = std::getenv(name);
+    const int base = static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
+    const int split = value ? std::atoi(value) : 10;
+    if (split != 5 && split != 8 && split != 10)
+        throw std::invalid_argument("coherent split override must be 5, 8 or 10");
+    const auto required = static_cast<std::size_t>(rows) *
+        static_cast<std::size_t>(out_features_) * split * sizeof(float);
+    return accumulation_capacity_bytes_ >= required ? split : base;
+}
+
+int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexcept {
+    constexpr int split10 = 10;
+    const auto required = static_cast<std::size_t>(rows) *
+        static_cast<std::size_t>(out_features_) * split10 * sizeof(float);
+    return coherent_wide_k6_split10_enabled_ &&
+        accumulation_capacity_bytes_ >= required ? split10 :
+        static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
+}
+
+bool Exl3CudaLinearWorkspace::coherent_down_k6_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    // One N8 CTA decodes each packed B tile once for all independent active
+    // rows of an M16 MMA tile. Scalar, verifier, and correction share this
+    // body and five disjoint K partitions.
+    return coherent_down_k6_enabled_ && allow_generic_variants_ &&
+        coherent_down_k6_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        rows <= max_rows_ &&
+        (admission == Exl3CudaLinearAdmission::ordinary ||
+         admission == Exl3CudaLinearAdmission::target_continuation_down) &&
+        in_features_ == 17408 && out_features_ == 5120 &&
+        metadata.in_features == in_features_ &&
+        metadata.out_features == out_features_ &&
+        (metadata.K == 6 || (coherent_any_k_enabled() && metadata.K == 5)) &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias;
+}
+
+std::size_t Exl3CudaLinearWorkspace::coherent_down_k7_shared_bytes_for_test() noexcept {
+    return kCoherentDownK7SharedBytes;
+}
+
+bool Exl3CudaLinearWorkspace::coherent_down_k7_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    return coherent_down_k7_enabled_ && allow_generic_variants_ &&
+        coherent_down_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        rows <= max_rows_ &&
+        (admission == Exl3CudaLinearAdmission::ordinary ||
+         admission == Exl3CudaLinearAdmission::target_continuation_down) &&
+        in_features_ == 17408 && out_features_ == 5120 &&
+        metadata.in_features == in_features_ &&
+        metadata.out_features == out_features_ && metadata.K == 7 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias;
+}
+
+bool Exl3CudaLinearWorkspace::coherent_o_k7_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    return coherent_o_k7_enabled_ && allow_generic_variants_ &&
+        coherent_o_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        rows <= max_rows_ &&
+        (admission == Exl3CudaLinearAdmission::ordinary ||
+         admission == Exl3CudaLinearAdmission::target_continuation_o) &&
+        in_features_ == 6144 && out_features_ == 5120 &&
+        metadata.in_features == in_features_ &&
+        metadata.out_features == out_features_ && metadata.K == 7 &&
+        !metadata.mcg && metadata.mul1 && !metadata.has_bias;
+}
+
+bool Exl3CudaLinearWorkspace::fast_fp16_m2_8_all_candidate(
+    const Exl3CudaLinearMetadata& metadata,int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    if(!fast_fp16_m2_8_all_enabled_ || !allow_generic_variants_ ||
+       rows<2 || rows>8 || rows>max_rows_ || metadata.mcg ||
+       !metadata.mul1 || metadata.has_bias ||
+       metadata.in_features!=in_features_ ||
+       metadata.out_features!=out_features_ ||
+       (in_features_!=5120 && in_features_!=17408) ||
+       out_features_==248320 || (metadata.K!=6 && metadata.K!=7))
+        return false;
+    switch(admission) {
+    case Exl3CudaLinearAdmission::ordinary:
+    case Exl3CudaLinearAdmission::target_continuation_gate_up:
+    case Exl3CudaLinearAdmission::target_continuation_down:
+    case Exl3CudaLinearAdmission::target_continuation_q:
+    case Exl3CudaLinearAdmission::target_continuation_qkv:
+    case Exl3CudaLinearAdmission::target_continuation_z:
+    case Exl3CudaLinearAdmission::target_continuation_kv:
+    case Exl3CudaLinearAdmission::target_continuation_o:
+        break;
+    default:return false;
+    }
+    const bool down=in_features_==17408 && out_features_==5120;
+    const int tiles=metadata.K==7?32:(down?16:32);
+    const int blocks=out_features_/(16*tiles);
+    const int capacity=fast_same_weights_fp16_m1_capacity_[
+        metadata.K==7?2:(down?1:0)];
+    return out_features_% (16*tiles)==0 && blocks>0 && blocks<=capacity;
 }
 
 bool Exl3CudaLinearWorkspace::fast_native_persistent_m1_candidate(
@@ -8463,6 +11474,29 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
     // Diagnostic mirror of the forward_from_transformed() branch order.
+    if (coherent_down_k6_candidate(metadata, rows, admission))
+        return "coherent_down_k6_shared_rows_n8_split5";
+    if (coherent_down_k7_candidate(metadata, rows, admission))
+        return "coherent_down_k7_shared_rows_n8_split5";
+    if (coherent_o_k7_candidate(metadata, rows, admission))
+        return "coherent_o_k7_shared_rows_n8_split5";
+    if (coherent_wide_k6_candidate(metadata, rows, admission)) {
+        constexpr const char* names[5] = {
+            "coherent_wide_k6_q_n8_m16_split5",
+            "coherent_wide_k6_qkv_n8_m16_split5",
+            "coherent_wide_k6_z_n8_m16_split5",
+            "coherent_wide_k6_o_n8_m16_split5",
+            "coherent_wide_k6_gate_up_n8_m16_split5"};
+        constexpr const char* split10_names[5] = {
+            "coherent_wide_k6_q_n8_m16_split10",
+            "coherent_wide_k6_qkv_n8_m16_split10",
+            "coherent_wide_k6_z_n8_m16_split10",
+            "coherent_wide_k6_o_n8_m16_split10",
+            "coherent_wide_k6_gate_up_n8_m16_split10"};
+        if (coherent_wide_k6_split_count(rows) == 10)
+            return split10_names[coherent_wide_k6_operation_];
+        return names[coherent_wide_k6_operation_];
+    }
     if (native_mtp_one_step_candidate(metadata, rows, admission))
         return "native_mtp_one_step_mma64";
     if (native_mtp_wide_prefill_candidate(metadata, rows, admission))
@@ -8501,6 +11535,12 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
             "fast_same_weights_int8_gemv_down_k7";
     if(target_m1_k7_int8_candidate(metadata,rows,admission))
         return "fast_same_weights_int8_gemv_k7";
+    if (fast_fp16_m2_8_fused_down_candidate(metadata,rows,admission))
+        return "fast_fp16_m2_8_fused_down_k6";
+    if (fast_fp16_m2_8_all_candidate(metadata,rows,admission))
+        return "fast_fp16_m2_8_k6k7";
+    if (fast_fp16_m2_8_down_candidate(metadata,rows,admission))
+        return "fast_fp16_m2_8_down_k6";
     if (target_fast_same_weights_fp16_m1_candidate(metadata, rows, admission)) {
         const bool k6_down = metadata.K == 6 && metadata.in_features == 17408 &&
             metadata.out_features == 5120;
@@ -8630,6 +11670,224 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
     return "unsupported";
 }
 
+// Coherent packed producer (K6 down, K7 down/O, wide K6) with the selected
+// cp.async depth and CTA width. Every warp keeps 16 output columns and the
+// full split K range, so narrower CTAs only enlarge the grid.
+template <int Bits, int Stages, int Warps, int Per = 1>
+static void launch_coherent_packed_variant(
+    cudaStream_t stream, const std::uint16_t* transformed,
+    const std::uint16_t* trellis, const std::int32_t* mul1, float* accum,
+    int rows, int input_features, int output_features, int split_count,
+    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
+    constexpr int tiles = Warps;
+    constexpr int stage_count = (Stages ? Stages : 2) * Per;
+    const std::size_t shared =
+        static_cast<std::size_t>(stage_count) * 256u * sizeof(half) +
+        static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t) +
+        16u * tiles * 16u * sizeof(float);
+    const int grid = output_features / (16 * tiles) * split_count;
+    if constexpr (Stages > 0) {
+        if (raw_input) {
+            const std::size_t fused_shared = exl3_fused_input_shared_bytes(
+                Bits, Stages, Warps, Per, rows, input_features, split_count);
+            constexpr bool fast_k6 = Bits == 6;
+            auto kernel = exl3_gemm_m1_fused_input_kernel<Bits, Bits == 7, fast_k6, Stages, Warps, Per>;
+            if (fused_shared > 48u * 1024u)
+                cuda_check(cudaFuncSetAttribute(kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(fused_shared)),
+                    "set fused-input coherent shared memory");
+            exl3_launch_pdl(kernel, dim3(grid), dim3(Warps * 32), fused_shared, stream,
+                raw_input, suh, trellis, mul1, accum, rows, input_features, output_features,
+                split_count);
+            return;
+        }
+    }
+    if (shared > 48u * 1024u) {
+        static const bool configured = [shared] {
+            cuda_check(cudaFuncSetAttribute(
+                exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
+                    false, Bits == 6, false, false, false, Stages, Warps, Per>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)),
+                "set deep coherent shared memory");
+            cuda_check(cudaFuncSetAttribute(
+                exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
+                    false, false, false, false, false, Stages, Warps, Per>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)),
+                "set deep coherent shared memory");
+            return true;
+        }();
+        (void)configured;
+    }
+    // The exact K6 lane-window and K7 three-word decoders (identical state
+    // words and MUL1 arithmetic) are the measured default;
+    // NINFER_EXL3_COHERENT_FAST_DECODE=0 restores the generic decoder.
+    static const bool fast_decode = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_FAST_DECODE");
+        if (!value) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        throw std::invalid_argument("NINFER_EXL3_COHERENT_FAST_DECODE must be 0 or 1");
+    }();
+    if (fast_decode) {
+        exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
+            false, Bits == 6, false, false, false, Stages, Warps, Per>,
+            dim3(grid), dim3(Warps * 32), shared, stream,
+                transformed, trellis, mul1, accum, rows, input_features,
+                output_features, split_count);
+        return;
+    }
+    exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, false,
+        false, false, false, false, false, Stages, Warps, Per>,
+        dim3(grid), dim3(Warps * 32), shared, stream,
+            transformed, trellis, mul1, accum, rows, input_features,
+            output_features, split_count);
+}
+
+// NINFER_EXL3_COHERENT_WARPS selects the CTA width: 4 warps (64 columns,
+// measured default), 8 (the former 128-column CTA) or 2.
+int coherent_packed_warps() {
+    static const int warps = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_WARPS");
+        if (!value || std::strcmp(value, "4") == 0) return 4;
+        if (std::strcmp(value, "8") == 0) return 8;
+        if (std::strcmp(value, "4") == 0) return 4;
+        if (std::strcmp(value, "2") == 0) return 2;
+        throw std::invalid_argument("NINFER_EXL3_COHERENT_WARPS must be 8, 4 or 2");
+    }();
+    return warps;
+}
+
+// NINFER_EXL3_MERGED_GATE_UP (default 1; 0 = separate gate, up and SiLU
+// launches): single-row MLP gate/up share one producer launch and one
+// reduction/activation kernel. Bit-identical outputs.
+static bool merged_gate_up_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_MERGED_GATE_UP");
+        if (!value || std::strcmp(value, "1") == 0) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        throw std::invalid_argument("NINFER_EXL3_MERGED_GATE_UP must be 0 or 1");
+    }();
+    return enabled;
+}
+
+// NINFER_EXL3_COHERENT_FUSED_INPUT=R (default 1; 0 = separate input-Hadamard
+// launches): coherent producers of 1..R rows compute the input Hadamard of
+// their split range in the CTA prologue. Every CTA of a split repeats that
+// transform, so wider verifier rows (measured) take one separate transform
+// launch instead. Bit-identical partials and outputs.
+static bool coherent_fused_input_for(int rows) {
+    static const int max_rows = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_FUSED_INPUT");
+        const int parsed = value ? std::atoi(value) : 1;
+        if (parsed < 0 || parsed > 8)
+            throw std::invalid_argument("NINFER_EXL3_COHERENT_FUSED_INPUT must be 0..8");
+        return parsed;
+    }();
+    return rows >= 1 && rows <= max_rows && coherent_deep_pipeline_stages() > 0;
+}
+
+// NINFER_EXL3_COHERENT_TILES_PER_STAGE: k-tiles per coherent cp.async stage.
+// Returns 0 when unset: two tiles per stage for every row count (eight tiles
+// in flight at four stages; measured fastest for M1 and M2..8 verifier rows
+// alike). The choice never changes numerics.
+int coherent_tiles_per_stage_setting() {
+    static const int per = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_TILES_PER_STAGE");
+        if (!value) return 0;
+        if (std::strcmp(value, "4") == 0) return 4;
+        if (std::strcmp(value, "1") == 0) return 1;
+        if (std::strcmp(value, "2") == 0) return 2;
+        throw std::invalid_argument(
+            "NINFER_EXL3_COHERENT_TILES_PER_STAGE must be 1, 2 or 4");
+    }();
+    return per;
+}
+
+// Small-grid M1 cooperative GEMVs use narrow CTAs by default (measured);
+// NINFER_EXL3_GENERIC_NARROW=0 restores the 512-column CTAs.
+bool generic_narrow_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_EXL3_GENERIC_NARROW");
+        if (!value) return true;
+        if (std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        throw std::invalid_argument("NINFER_EXL3_GENERIC_NARROW must be 0 or 1");
+    }();
+    return enabled;
+}
+
+template <int Bits>
+static void launch_coherent_packed_partials(
+    int grid, std::size_t two_stage_bytes, cudaStream_t stream,
+    const std::uint16_t* transformed, const std::uint16_t* trellis,
+    const std::int32_t* mul1, float* accum, int rows, int input_features,
+    int output_features, int split_count,
+    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
+    const int stages = coherent_deep_pipeline_stages();
+    const int warps = coherent_packed_warps();
+    if (raw_input && (rows < 1 || rows > 8 || stages == 0))
+        throw std::logic_error("fused-input coherent producer requires the deep route and 1..8 rows");
+    const int per_setting = coherent_tiles_per_stage_setting();
+    if (const int per = per_setting ? per_setting : 2; per != 1) {
+#define NINFER_COHERENT_MULTI(S, W, P)                                                 if (stages == S && warps == W && per == P) {                                       launch_coherent_packed_variant<Bits, S, W, P>(stream, transformed,                 trellis, mul1, accum, rows, input_features, output_features,                   split_count, raw_input, suh);                                              return;                                                                    }
+        NINFER_COHERENT_MULTI(4, 4, 2) NINFER_COHERENT_MULTI(4, 4, 4)
+        NINFER_COHERENT_MULTI(8, 4, 2) NINFER_COHERENT_MULTI(8, 4, 4)
+        NINFER_COHERENT_MULTI(4, 2, 2) NINFER_COHERENT_MULTI(4, 2, 4)
+        NINFER_COHERENT_MULTI(8, 2, 2) NINFER_COHERENT_MULTI(8, 2, 4)
+#undef NINFER_COHERENT_MULTI
+        throw std::invalid_argument("unsupported coherent multi-tile variant");
+    }
+    if (warps == 8 && stages == 0) {
+        exl3_gemm_m1_generic_mma_kernel<Bits, false, 8, true, true><<<
+            dim3(grid), dim3(kThreads), two_stage_bytes, stream>>>(
+                transformed, trellis, mul1, accum, rows, input_features,
+                output_features, split_count);
+        return;
+    }
+#define NINFER_COHERENT_VARIANT(S, W)                                          \
+    if (stages == S && warps == W) {                                           \
+        launch_coherent_packed_variant<Bits, S, W>(stream, transformed,        \
+            trellis, mul1, accum, rows, input_features, output_features,       \
+            split_count);                                                      \
+        return;                                                                \
+    }
+    NINFER_COHERENT_VARIANT(4, 8) NINFER_COHERENT_VARIANT(8, 8)
+    NINFER_COHERENT_VARIANT(0, 4) NINFER_COHERENT_VARIANT(4, 4)
+    NINFER_COHERENT_VARIANT(8, 4) NINFER_COHERENT_VARIANT(0, 2)
+    NINFER_COHERENT_VARIANT(4, 2) NINFER_COHERENT_VARIANT(8, 2)
+#undef NINFER_COHERENT_VARIANT
+    throw std::logic_error("unsupported coherent packed producer variant");
+}
+
+// NINFER_EXL3_COHERENT_KV_SPLIT=S (default 20, quality-gated; 0 = generic GEMV): the narrow 5120->1024
+// K/V projections (K6..K8) run as the coherent split-plane producer with S
+// K partitions instead of the 160-CTA generic GEMV. Numerics-policy candidate.
+static int coherent_kv_split_setting() {
+    static const int split = [] {
+        const char* value = std::getenv("NINFER_EXL3_COHERENT_KV_SPLIT");
+        const int parsed = value ? std::atoi(value) : 20;
+        if (parsed < 0 || parsed > 80)
+            throw std::invalid_argument("NINFER_EXL3_COHERENT_KV_SPLIT must be 0..80");
+        return parsed;
+    }();
+    return split;
+}
+
+static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission, int in_features, int out_features,
+    std::size_t capacity) {
+    const int split = coherent_kv_split_setting();
+    if (!split || rows < 1 || rows > 8 || in_features != 5120 || out_features != 1024 ||
+        metadata.in_features != in_features || metadata.out_features != out_features ||
+        metadata.K < 6 || metadata.K > 8 || metadata.mcg || !metadata.mul1 ||
+        metadata.has_bias ||
+        (admission != Exl3CudaLinearAdmission::ordinary &&
+         admission != Exl3CudaLinearAdmission::target_continuation_kv))
+        return 0;
+    const auto required = static_cast<std::size_t>(rows) * out_features * split * sizeof(float);
+    return capacity >= required ? split : 0;
+}
+
 void Exl3CudaLinearWorkspace::forward_from_transformed(
     const Exl3CudaLinearWeights& weights,
     const Exl3CudaLinearMetadata& metadata,
@@ -8637,7 +11895,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     std::uint16_t* output,
     int rows,
     cudaStream_t stream,
-    Exl3CudaLinearAdmission admission) {
+    Exl3CudaLinearAdmission admission,
+    const std::uint16_t* raw_input) {
+    const std::uint16_t* fused_suh = raw_input ? weights.suh : nullptr;
+    int head_active_features = out_features_;
     if((admission==Exl3CudaLinearAdmission::draft_shared_q_m16 || admission==Exl3CudaLinearAdmission::draft_shared_kv_m16 || admission==Exl3CudaLinearAdmission::draft_shared_o_m16 || admission==Exl3CudaLinearAdmission::draft_shared_down_m16 || admission==Exl3CudaLinearAdmission::draft_shared_gateup_m16) &&
        !draft_shared_m16_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared transformed draft Q requires admitted M16 workspace");
@@ -8667,6 +11928,191 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     // contract before any reconstructed or ordinary dispatch can run.
     Exl3LinearWorkspaceRequirements::derive(in_features_,out_features_,rows,true,true)
         .require_disjoint_borrowed_views(transformed_input,accum_);
+
+    if (const int kv_split = coherent_kv_split_for(metadata, rows, admission,
+            in_features_, out_features_, accumulation_capacity_bytes_)) {
+        if (metadata.K == 6)
+            launch_coherent_packed_partials<6>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
+                raw_input, fused_suh);
+        else if (metadata.K == 7)
+            launch_coherent_packed_partials<7>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
+                raw_input, fused_suh);
+        else
+            launch_coherent_packed_partials<8>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
+                raw_input, fused_suh);
+        cuda_check(cudaGetLastError(), "launch coherent K/V partials");
+        launch_prefill_reduce_output<false>(stream, accum_, weights.svh, output, rows,
+            out_features_, kv_split);
+        cuda_check(cudaGetLastError(), "launch coherent K/V reduction/output");
+        return;
+    }
+
+    if (coherent_down_k6_candidate(metadata, rows, admission)) {
+        constexpr int output_blocks = 5120 / 128;
+        const int split_count = coherent_split_override("NINFER_EXL3_COHERENT_DOWN_SPLIT", rows);
+        // One packed-MMA producer instantiation serves M1 and M2..8. Each
+        // K/N tile's B decode is reused across active independent row C
+        // fragments; inactive physical M16 rows are zero and never stored.
+        if (metadata.K == 5) launch_coherent_packed_partials<5>(
+            output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        else launch_coherent_packed_partials<6>(
+            output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K6 down shared-row partials");
+        if (!launch_armed_residual_reduce(stream, weights.svh, output, rows, split_count))
+        launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
+        pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K6 down row reduction/output");
+        process_coherent_down_k6_calls_.fetch_add(1, std::memory_order_relaxed);
+        process_coherent_down_k6_rows_.fetch_add(
+            static_cast<std::uint64_t>(rows), std::memory_order_relaxed);
+        return;
+    }
+
+    if (coherent_down_k7_candidate(metadata, rows, admission)) {
+        constexpr int output_blocks = 5120 / 128;
+        const int split_count = coherent_split_override("NINFER_EXL3_COHERENT_DOWN_SPLIT", rows);
+        launch_coherent_packed_partials<7>(
+            output_blocks * split_count, kCoherentDownK7SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K7 down shared-row partials");
+        if (!launch_armed_residual_reduce(stream, weights.svh, output, rows, split_count))
+        launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
+        pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K7 down row reduction/output");
+        process_coherent_down_k7_calls_.fetch_add(1, std::memory_order_relaxed);
+        process_coherent_down_k7_rows_.fetch_add(
+            static_cast<std::uint64_t>(rows), std::memory_order_relaxed);
+        return;
+    }
+
+    if (coherent_o_k7_candidate(metadata, rows, admission)) {
+        constexpr int output_blocks = 5120 / 128;
+        const int split_count = coherent_split_override("NINFER_EXL3_COHERENT_O_SPLIT", rows);
+        launch_coherent_packed_partials<7>(
+            output_blocks * split_count, kCoherentOK7SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K7 O shared-row partials");
+        if (!launch_armed_residual_reduce(stream, weights.svh, output, rows, split_count))
+        launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
+        pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
+        cuda_check(cudaGetLastError(),
+                   "launch coherent K7 O row reduction/output");
+        process_coherent_o_k7_calls_.fetch_add(1, std::memory_order_relaxed);
+        process_coherent_o_k7_rows_.fetch_add(
+            static_cast<std::uint64_t>(rows), std::memory_order_relaxed);
+        return;
+    }
+
+    if (coherent_wide_k6_candidate(metadata, rows, admission)) {
+        const int output_blocks = out_features_ / kHadamard;
+        const int split_count = coherent_wide_k6_split_count(rows);
+        if (metadata.K == 5) launch_coherent_packed_partials<5>(
+            output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        else if (metadata.K == 7) launch_coherent_packed_partials<7>(
+            output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        else launch_coherent_packed_partials<6>(
+            output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        cuda_check(cudaGetLastError(),
+                   "launch coherent wide K6 shared-row partials");
+        if (!launch_armed_residual_reduce(stream, weights.svh, output, rows, split_count))
+        launch_prefill_reduce_output<false>(stream,accum_, weights.svh, output, rows, out_features_, split_count);
+        pending_residual_left_=nullptr; pending_residual_out_=nullptr;
+        pending_norm_weight_=nullptr; pending_norm_out_=nullptr;
+        cuda_check(cudaGetLastError(),
+                   "launch coherent wide K6 row reduction/output");
+        coherent_wide_k6_calls_[coherent_wide_k6_operation_].fetch_add(
+            1, std::memory_order_relaxed);
+        coherent_wide_k6_rows_[coherent_wide_k6_operation_].fetch_add(
+            static_cast<std::uint64_t>(rows), std::memory_order_relaxed);
+        if (split_count == 10)
+            coherent_wide_k6_split10_calls_[coherent_wide_k6_operation_].fetch_add(
+                1, std::memory_order_relaxed);
+        return;
+    }
+
+    if (fast_fp16_m2_8_fused_down_candidate(metadata,rows,admission)) {
+        exl3_small_m_down_fused_output_kernel<<<
+            dim3(out_features_/kHadamard),dim3(kThreads),0,stream>>>(
+                transformed_input,weights.trellis,weights.mul1,weights.svh,
+                output,rows,in_features_,out_features_);
+        cuda_check(cudaGetLastError(),
+            "launch fused-output packed FP16 M2-8 down projection");
+        process_fast_fp16_m2_8_fused_down_calls_.fetch_add(
+            1,std::memory_order_relaxed);
+        return;
+    }
+    if(fast_fp16_m2_8_all_candidate(metadata,rows,admission) ||
+       fast_fp16_m2_8_down_candidate(metadata,rows,admission)) {
+        const bool down=in_features_==17408 && out_features_==5120;
+        const int output_tiles_per_block=metadata.K==7?32:(down?16:32);
+        const int output_blocks=out_features_/(16*output_tiles_per_block);
+        const int capacity=fast_same_weights_fp16_m1_capacity_[
+            metadata.K==7?2:(down?1:0)];
+        int split_count=std::min(5,capacity/output_blocks);
+        if(const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+           requested && *requested)
+            split_count=std::min(split_count,std::max(1,std::atoi(requested)));
+        if(split_count<1)throw std::runtime_error(
+            "fast FP16 M2-8 down lacks resident capacity");
+        // The prior small-M path loaded every A tile synchronously and
+        // introduced an extra CTA barrier per K step. Stage A alongside the
+        // already double-buffered packed B tile when explicitly requested.
+        const bool async_a=fast_fp16_m2_8_async_a_enabled_;
+        const std::size_t shared_bytes=(async_a?512u:256u)*sizeof(half)+
+            2u*output_tiles_per_block*16u*metadata.K*sizeof(std::uint16_t)+
+            16u*output_tiles_per_block*16u*sizeof(float);
+        const std::uint16_t* trellis=weights.trellis;
+        const std::int32_t* mul1=weights.mul1;
+        float* accum=accum_;
+        int input_features=in_features_,output_features=out_features_;
+        void* args[]={&transformed_input,&trellis,&mul1,&accum,&rows,
+            &input_features,&output_features,&split_count};
+        void* kernel=metadata.K==7?
+            (async_a?reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<7,false,32,true,true,true>):
+                reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<7,false,32,false,true,true>)):
+            down?(async_a?reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<6,false,16,true,true>):
+                reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<6,false,16,false,true>)):
+                (async_a?reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<6,false,32,true,true>):
+                reinterpret_cast<void*>(
+                exl3_gemm_m1_generic_mma_kernel<6,false,32,false,true>));
+        cuda_check(cudaLaunchKernel(
+            kernel,
+            dim3(output_blocks*split_count),dim3(kThreads),args,shared_bytes,
+            stream),"launch packed FP16 M2-8 target projection");
+        launch_prefill_reduce_output<false>(stream,
+                accum_,weights.svh,output,rows,out_features_,split_count);
+        cuda_check(cudaGetLastError(),"reduce packed FP16 M2-8 target projection");
+        process_fast_fp16_m2_8_down_calls_.fetch_add(1,std::memory_order_relaxed);
+        return;
+    }
 
     // The opt-in native MGEMM policy must be evaluated before the established
     // rows==1 target selectors below.  Those selectors are intentionally kept
@@ -8852,8 +12298,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(grid_x, chunks), dim3(block_threads),
                        kernel_args, shared_bytes, stream),
                    "launch native persistent prefill GEMM");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, rows, out_features_, 1);
         cuda_check(cudaGetLastError(),
                    "launch native persistent prefill output transform");
@@ -8919,8 +12364,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             rows, in_features_, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch native MTP one-step K4 N64 async-A");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch native MTP one-step K4 reduction/output");
@@ -8946,8 +12390,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                    "launch native MTP K4 N64 async-A prefill");
         // prefill_reduce_output_kernel's non-shuffle path visits split planes
         // 0,1,...,4, preserving the qualified ascending reduction order.
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
                 accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch native MTP K4 N64 reduction/output");
@@ -9043,8 +12486,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(grid), dim3(block_threads), kernel_args,
                        shared_bytes, stream),
                    "launch native persistent M1 GEMM");
-        prefill_reduce_output_kernel<false><<<
-            dim3(1, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
                 accum_, weights.svh, output, 1, out_features_, 1);
         cuda_check(cudaGetLastError(),
                    "launch native persistent M1 FP32 output transform");
@@ -9103,8 +12545,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                            kernel, dim3(output_blocks * global_split_count),
                            dim3(kThreads), kernel_args, shared_bytes, stream),
                        "launch native K6 global-slice cooperative GEMM");
-            prefill_reduce_output_kernel<false><<<
-                dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+            launch_prefill_reduce_output<false>(stream,
                 accum_, weights.svh, output, rows, out_features_, 1);
             cuda_check(cudaGetLastError(),
                        "launch native K6 global-slice reduction/output");
@@ -9185,8 +12626,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        dim3(output_blocks * split_count), dim3(kThreads),
                        kernel_args, shared_bytes, stream),
                    "launch native K6 critical-path partials");
-        prefill_reduce_output_kernel<false><<<
-            dim3(rows, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, rows, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch native K6 critical-path reduction/output");
@@ -9233,14 +12673,14 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             cuda_check(cudaGetLastError(),"launch staged shape4 partials");
             if(target_reduce_shfl_) {
                 if(target_reduce_shfl_min_barriers_) {
-                    prefill_reduce_output_kernel<true,true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+                    launch_prefill_reduce_output<true,true>(stream,
                         accum_,weights.svh,output,rows,out_features_,kShape4Splits);
                     ++reduce_shfl_min_barrier_calls_;reduce_shfl_min_barrier_rows_+=rows;
-                } else prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+                } else launch_prefill_reduce_output<true>(stream,
                     accum_,weights.svh,output,rows,out_features_,kShape4Splits);
             }
             else
-                prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+                launch_prefill_reduce_output<false>(stream,
                     accum_,weights.svh,output,rows,out_features_,kShape4Splits);
             cuda_check(cudaGetLastError(),"launch staged shape4 reduction");
             return;
@@ -9380,12 +12820,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         }
         if(target_reduce_shfl_) {
             if(target_reduce_shfl_min_barriers_) {
-                prefill_reduce_output_kernel<true,true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,splits);
+                launch_prefill_reduce_output<true,true>(stream,accum_,weights.svh,output,rows,out_features_,splits);
                 ++reduce_shfl_min_barrier_calls_;reduce_shfl_min_barrier_rows_+=rows;
-            } else prefill_reduce_output_kernel<true><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,splits);
+            } else launch_prefill_reduce_output<true>(stream,accum_,weights.svh,output,rows,out_features_,splits);
         }
         else
-            prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,splits);
+            launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,splits);
         cuda_check(cudaGetLastError(), "launch staged prefill reduction/output");
         return;
     }
@@ -9432,8 +12872,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(output_blocks * split_count),
                        dim3(kThreads), kernel_args, shared_bytes, stream),
                    "launch FAST_SAME_WEIGHTS FP16 M1 N16");
-        prefill_reduce_output_kernel<false><<<
-            dim3(1, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, 1, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch FAST_SAME_WEIGHTS FP16 M1 N16 reduction/output");
@@ -9487,8 +12926,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(output_blocks * split_count),
                        dim3(kThreads), kernel_args, shared_bytes, stream),
                    "launch FAST_SAME_WEIGHTS FP16 M1 N64 cooperative GEMV");
-        prefill_reduce_output_kernel<false><<<
-            dim3(1, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, 1, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch FAST_SAME_WEIGHTS FP16 M1 N64 reduction/output");
@@ -9572,8 +13010,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                     dim3(output_blocks*split_count,1,1),dim3(512),kernel_args,
                     shared_bytes,stream),"launch FAST wide native M1 K7");
         }
-        prefill_reduce_output_kernel<false><<<
-            dim3(1,out_features_/kHadamard),kHadamard,0,stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_,weights.svh,output,1,out_features_,split_count);
         cuda_check(cudaGetLastError(),"reduce FAST wide native M1");
         process_fast_same_weights_fp16_m1_calls_.fetch_add(
@@ -9641,8 +13078,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        kernel, dim3(output_blocks * split_count),
                        dim3(kThreads), kernel_args, shared_bytes, stream),
                    "launch FAST_SAME_WEIGHTS FP16 M1 cooperative GEMV");
-        prefill_reduce_output_kernel<false><<<
-            dim3(1, out_features_ / kHadamard), kHadamard, 0, stream>>>(
+        launch_prefill_reduce_output<false>(stream,
             accum_, weights.svh, output, 1, out_features_, split_count);
         cuda_check(cudaGetLastError(),
                    "launch FAST_SAME_WEIGHTS FP16 M1 reduction/output");
@@ -9662,8 +13098,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                 weights.trellis,weights.mul1,accum_,in_features_,out_features_,
                 split_count);
         cuda_check(cudaGetLastError(),"launch target K6 M1 SIMT partials");
-        prefill_reduce_output_kernel<false><<<dim3(1,out_features_/kHadamard),
-            kHadamard,0,stream>>>(accum_,weights.svh,output,1,out_features_,
+        launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,1,out_features_,
                 split_count);
         cuda_check(cudaGetLastError(),"launch target K6 M1 SIMT reduction/output");
         ++target_k6_m1_simt_calls_;
@@ -9691,6 +13126,35 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         float* accum = accum_;
         int row_count = rows;
         void* kernel_args[] = {&transformed, &trellis, &mul1, &accum, &row_count};
+        // Default: the same K5 five-split partition and fixed-order in-kernel
+        // reduction through the narrow async-deep generic producer (64-column
+        // CTAs; measured). NINFER_EXL3_SHAPE4_NARROW=0 keeps the shape-4 leaf.
+        static const bool shape4_narrow = [] {
+            const char* value = std::getenv("NINFER_EXL3_SHAPE4_NARROW");
+            if (!value) return true;
+            if (std::strcmp(value, "0") == 0) return false;
+            if (std::strcmp(value, "1") == 0) return true;
+            throw std::invalid_argument("NINFER_EXL3_SHAPE4_NARROW must be 0 or 1");
+        }();
+        if (shape4_narrow) {
+            constexpr int warps = 4, stages = 4;
+            int input_features = in_features_;
+            int output_features = out_features_;
+            int split_count = kShape4Splits;
+            void* narrow_args[] = {&transformed, &trellis, &mul1, &accum, &row_count,
+                                   &input_features, &output_features, &split_count};
+            const std::size_t narrow_shared =
+                static_cast<std::size_t>(stages) *
+                    (256u * sizeof(half) + warps * 16u * 5u * sizeof(std::uint16_t)) +
+                16u * warps * 16u * sizeof(float);
+            cuda_check(cudaLaunchCooperativeKernel(
+                           reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<
+                               5, false, warps, true, false, false, false, false, false,
+                               false, false, stages, warps>),
+                           dim3(out_features_ / (16 * warps) * split_count), dim3(warps * 32),
+                           narrow_args, narrow_shared, stream),
+                       "launch EXL3 narrow shape-4 split GEMV");
+        } else
         cuda_check(cudaLaunchCooperativeKernel(
                        reinterpret_cast<void*>(exl3_gemm_m1_shape4_kernel),
                        dim3(cooperative_grid_), dim3(kThreads), kernel_args,
@@ -9797,7 +13261,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                         ? reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<7,false,16,false,true,true>)
                         : reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<7,false,16,false,true>));
             cuda_check(cudaLaunchKernel(kernel,dim3(grid_blocks),dim3(kThreads),kernel_args,shared_bytes,stream),"launch exact N16 stream partials");
-            prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,split_count);
+            launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,split_count);
             cuda_check(cudaGetLastError(),"launch exact N16 stream reduction/output");
             ++extended_stream_reduction_calls_;
             if(target_down_k6_async_a)++target_down_k6_async_a_calls_;
@@ -9878,11 +13342,43 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         int split_count = 1;
         void* kernel_args[] = {&transformed_input, &trellis, &mul1, &accum,
                                &rows, &input_features, &output_features, &split_count};
+        // The head trellis is k-tile major with one K split: launching only the
+        // leading CTAs computes exactly the leading output columns.
+        if (active_output_features_ > 0 && active_output_features_ < out_features_ &&
+            active_output_features_ % 128 == 0)
+            head_active_features = active_output_features_;
+        // Default: 64-column 4-warp CTAs with async-A, the 4x4 cp.async ring
+        // and the exact K6 lane-window decoder (measured). Each warp still
+        // accumulates its 16 columns over the whole K in order.
+        // NINFER_EXL3_H6_NARROW=0 restores the 512-column launch.
+        static const bool h6_narrow = [] {
+            const char* value = std::getenv("NINFER_EXL3_H6_NARROW");
+            if (!value) return true;
+            if (std::strcmp(value, "0") == 0) return false;
+            if (std::strcmp(value, "1") == 0) return true;
+            throw std::invalid_argument("NINFER_EXL3_H6_NARROW must be 0 or 1");
+        }();
+        if (h6_narrow) {
+            constexpr int warps = 4, stages = 4, per = 4;
+            const std::size_t narrow_shared =
+                static_cast<std::size_t>(stages * per) *
+                    (256u * sizeof(half) + warps * 16u * 6u * sizeof(std::uint16_t)) +
+                16u * warps * 16u * sizeof(float);
+            cuda_check(cudaLaunchKernel(
+                           reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<
+                               6, true, warps, true, false, false, false, true, false,
+                               false, false, stages, warps, per>),
+                           dim3(head_active_features / (16 * warps)), dim3(warps * 32), kernel_args,
+                           narrow_shared, stream),
+                       "launch EXL3 H6 narrow single-split GEMV");
+        } else {
+        head_active_features = out_features_;
         cuda_check(cudaLaunchKernel(
                        reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<6, true>),
                        dim3(output_blocks), dim3(kThreads), kernel_args,
                        shared_bytes, stream),
                    "launch EXL3 H6 single-split GEMV");
+        }
     } else if (metadata.K >= 5 &&
                (rows == 1 || draft_small_m_candidate(metadata, rows) ||
                  draft_shared_m16_candidate(metadata,rows,admission) ||
@@ -9975,7 +13471,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                     ? reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<7,false,32,false,true,true>)
                     : reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<7,false,32,false,true>));
             cuda_check(cudaLaunchKernel(kernel,dim3(grid_blocks),dim3(kThreads),kernel_args,shared_bytes,stream),"launch exact K7 N32 stream partials");
-            prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(accum_,weights.svh,output,rows,out_features_,split_count);
+            launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,split_count);
             cuda_check(cudaGetLastError(),"launch exact K7 N32 stream reduction/output");
             ++extended_stream_reduction_calls_;
             if(target_k7_small_m_async_a)++target_k7_small_m_async_a_calls_;
@@ -9999,14 +13495,60 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                 : reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<6,false,32,false,true>);
             cuda_check(cudaLaunchKernel(kernel,dim3(grid_blocks),dim3(kThreads),kernel_args,shared_bytes,stream),
                 "launch exact K6 normal split partials");
-            prefill_reduce_output_kernel<false><<<dim3(rows,out_features_/kHadamard),kHadamard,0,stream>>>(
+            launch_prefill_reduce_output<false>(stream,
                 accum_,weights.svh,output,rows,out_features_,split_count);
             cuda_check(cudaGetLastError(),"launch exact K6 stream reduction/output");
             ++stream_reduction_calls_;
             if(target_k6_small_m_async_a)++target_k6_small_m_async_a_calls_;
             return;
         }
-        if (metadata.K == 6 && target_m1_k6_n32_async_a) {
+        // Narrow M1 CTAs for small grids: each warp keeps 16 output columns
+        // and the same split partition/in-kernel reduction, so results are
+        // unchanged while the grid covers the SMs.
+        const int narrow_warps = rows <= 16 && generic_narrow_enabled() &&
+            output_blocks * split_count < 340
+            ? (out_features_ <= 2048 ? 2 : 4) : 0;
+        void* narrow_kernel = nullptr;
+        if (narrow_warps) {
+            const bool k7_async = metadata.K == 7 && target_m1_k7_n32_async_a;
+            const bool k7_three = metadata.K == 7 && target_m1_k7_three_word;
+// Narrow variants also stage A with cp.async and keep three packed tiles in
+// flight; A values and the MMA sequence are unchanged.
+#define NINFER_NARROW(B, A, T, W)                                             \
+    reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<B, false, W, true,  \
+        false, T, false, false, false, false, false, 4, W>)
+            if (metadata.K == 5 && !draft_k5_async_a)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(5, false, false, 2)
+                                                  : NINFER_NARROW(5, false, false, 4);
+            else if (metadata.K == 8)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(8, false, false, 2)
+                                                  : NINFER_NARROW(8, false, false, 4);
+            else if (metadata.K == 7 && k7_async && k7_three)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, true, true, 2)
+                                                  : NINFER_NARROW(7, true, true, 4);
+            else if (metadata.K == 7 && !k7_async && k7_three)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, false, true, 2)
+                                                  : NINFER_NARROW(7, false, true, 4);
+            else if (metadata.K == 7 && !k7_async && !k7_three)
+                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, false, false, 2)
+                                                  : NINFER_NARROW(7, false, false, 4);
+#undef NINFER_NARROW
+        }
+        if (narrow_kernel) {
+            const std::size_t narrow_shared =
+                4u * 256u * sizeof(half) +
+                4u * static_cast<std::size_t>(narrow_warps) * 16u *
+                    static_cast<std::size_t>(metadata.K) * sizeof(std::uint16_t) +
+                16u * static_cast<std::size_t>(narrow_warps) * 16u * sizeof(float);
+            const int narrow_grid = out_features_ / (16 * narrow_warps) * split_count;
+            cuda_check(cudaLaunchCooperativeKernel(narrow_kernel, dim3(narrow_grid),
+                           dim3(narrow_warps * 32), kernel_args, narrow_shared, stream),
+                       "launch EXL3 narrow cooperative split GEMV");
+            static std::atomic<unsigned> reported{0};
+            if (reported.fetch_or(1u << metadata.K) & (1u << metadata.K)) {}
+            else std::fprintf(stderr, "EXL3_GENERIC_NARROW K=%d in=%d out=%d warps=%d grid=%d\n",
+                              metadata.K, in_features_, out_features_, narrow_warps, narrow_grid);
+        } else if (metadata.K == 6 && target_m1_k6_n32_async_a) {
             cuda_check(cudaLaunchCooperativeKernel(
                            reinterpret_cast<void*>(
                                exl3_gemm_m1_generic_mma_kernel<6, false, 32, true>),
@@ -10078,9 +13620,102 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     cuda_check(cudaGetLastError(), "launch EXL3 packed GEMV");
     if (target_k5_small_m_batch_candidate(metadata, rows, admission))
         ++target_k5_small_m_batch_calls_;
-    output_hadamard_kernel<<<dim3(rows, out_features_ / kHadamard), dim3(kHadamard), 0, stream>>>(
-        accum_, weights.svh, output, rows, out_features_);
+    launch_output_hadamard(stream,
+        accum_, weights.svh, output, rows, out_features_, head_active_features);
     cuda_check(cudaGetLastError(), "launch EXL3 output Hadamard");
+}
+
+// Launches the armed residual (and optional norm) reduction; returns false
+// when the shape is not covered (caller falls back).
+bool Exl3CudaLinearWorkspace::launch_armed_residual_reduce(cudaStream_t stream,
+    const std::uint16_t* svh,std::uint16_t* output,int rows,int split_count) {
+    if(!pending_residual_left_ || out_features_%kHadamard!=0) return false;
+    if(pending_norm_weight_ && out_features_==kResidualNormFeatures) {
+        cudaLaunchAttribute attributes[2]{};
+        attributes[0].id=cudaLaunchAttributeClusterDimension;
+        attributes[0].val.clusterDim.x=kResidualNormCluster;
+        attributes[0].val.clusterDim.y=1;
+        attributes[0].val.clusterDim.z=1;
+        attributes[1].id=cudaLaunchAttributeProgrammaticStreamSerialization;
+        attributes[1].val.programmaticStreamSerializationAllowed=1;
+        cudaLaunchConfig_t config{};
+        config.gridDim=dim3(rows*kResidualNormCluster);
+        config.blockDim=dim3(kHadamardWarpsPerBlock*32);
+        config.stream=stream;
+        config.attrs=attributes;
+        config.numAttrs=exl3_pdl_enabled()?2:1;
+        cuda_check(cudaLaunchKernelEx(&config,reduce_output_residual_norm_kernel,
+            static_cast<const float*>(accum_),svh,output,rows,split_count,
+            pending_residual_left_,pending_residual_out_,pending_norm_weight_,
+            pending_norm_out_,pending_norm_eps_),"launch fused residual RMS norm reduction");
+        norm_applied_=true;
+    } else
+        exl3_launch_pdl(reduce_output_residual_warp_kernel,
+            dim3((rows*(out_features_/kHadamard)+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+            dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,svh,output,rows,out_features_,
+            split_count,pending_residual_left_,pending_residual_out_);
+    residual_applied_=true;
+    return true;
+}
+
+
+// L2 prefetch of a weight range on a side stream that starts when the work
+// already queued on `stream` completes (CUDA graph: a parallel branch from
+// the current node). Bulk prefetches are fire-and-forget hints, so a GEMV
+// queued later streams part of its weights from L2 while the intervening
+// small kernels keep DRAM otherwise idle. exl3_l2_prefetch_join rejoins the
+// side stream (required before a capture ends).
+namespace {
+__global__ void exl3_l2_prefetch_kernel(const char* data,std::size_t bytes) {
+    constexpr std::size_t kChunk=32768;
+    for(std::size_t offset=(static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x)*kChunk;
+        offset<bytes;offset+=static_cast<std::size_t>(gridDim.x)*blockDim.x*kChunk) {
+        const unsigned size=static_cast<unsigned>(bytes-offset<kChunk?bytes-offset:kChunk)&~15u;
+        if(size) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                              ::"l"(data+offset),"r"(size):"memory");
+    }
+}
+struct Exl3PrefetchStreams {
+    cudaStream_t side=nullptr;
+    cudaEvent_t fork=nullptr,join=nullptr;
+    bool pending=false;
+};
+Exl3PrefetchStreams& exl3_prefetch_streams() {
+    static Exl3PrefetchStreams streams=[] {
+        Exl3PrefetchStreams value;
+        cuda_check(cudaStreamCreateWithFlags(&value.side,cudaStreamNonBlocking),"prefetch stream");
+        cuda_check(cudaEventCreateWithFlags(&value.fork,cudaEventDisableTiming),"prefetch fork");
+        cuda_check(cudaEventCreateWithFlags(&value.join,cudaEventDisableTiming),"prefetch join");
+        return value;
+    }();
+    return streams;
+}
+}  // namespace
+
+bool exl3_l2_prefetch_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    return enabled;
+}
+
+void exl3_l2_prefetch_fork(cudaStream_t stream,const void* data,std::size_t bytes) {
+    if(!data || !bytes) return;
+    auto& streams=exl3_prefetch_streams();
+    cuda_check(cudaEventRecord(streams.fork,stream),"prefetch fork record");
+    cuda_check(cudaStreamWaitEvent(streams.side,streams.fork,0),"prefetch fork wait");
+    exl3_l2_prefetch_kernel<<<8,128,0,streams.side>>>(static_cast<const char*>(data),bytes);
+    cuda_check(cudaGetLastError(),"launch L2 prefetch");
+    streams.pending=true;
+}
+
+void exl3_l2_prefetch_join(cudaStream_t stream) {
+    auto& streams=exl3_prefetch_streams();
+    if(!streams.pending) return;
+    cuda_check(cudaEventRecord(streams.join,streams.side),"prefetch join record");
+    cuda_check(cudaStreamWaitEvent(stream,streams.join,0),"prefetch join wait");
+    streams.pending=false;
 }
 
 } // namespace ninfer::exl3

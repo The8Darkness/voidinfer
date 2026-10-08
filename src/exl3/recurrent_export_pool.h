@@ -48,13 +48,13 @@ struct Exl3RecurrentPinBudget {
     inline static std::mutex mutex;
     inline static std::uint64_t live=0,peak=0,quarantined=0;
     static bool claim(std::size_t bytes){
-        std::lock_guard lock(mutex);MEMORYSTATUSEX m{};m.dwLength=sizeof(m);
+        std::lock_guard<std::mutex> lock(mutex);MEMORYSTATUSEX m{};m.dwLength=sizeof(m);
         if(bytes>cap-live || !GlobalMemoryStatusEx(&m) || m.ullAvailPhys<reserve+bytes)return false;
         live+=bytes;peak=std::max(peak,live);return true;
     }
-    static void release(std::size_t bytes){std::lock_guard lock(mutex);live-=bytes;}
-    static void quarantine(std::size_t bytes){std::lock_guard lock(mutex);quarantined+=bytes;}
-    static std::array<std::uint64_t,3> snapshot(){std::lock_guard lock(mutex);return {live,peak,quarantined};}
+    static void release(std::size_t bytes){std::lock_guard<std::mutex> lock(mutex);live-=bytes;}
+    static void quarantine(std::size_t bytes){std::lock_guard<std::mutex> lock(mutex);quarantined+=bytes;}
+    static std::array<std::uint64_t,3> snapshot(){std::lock_guard<std::mutex> lock(mutex);return {live,peak,quarantined};}
 };
 struct Exl3RecurrentSlab {
     Exl3RecurrentSlab()=default;

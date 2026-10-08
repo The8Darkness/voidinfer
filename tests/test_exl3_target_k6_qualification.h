@@ -4,25 +4,6 @@
 // oracle helpers.  This checks only the explicitly admitted target
 // continuation gate/up K6 candidate on the 94 real represented inputs.
 
-class TargetK6EnvironmentRestore {
-public:
-    TargetK6EnvironmentRestore()
-        : candidate_(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M")),
-          async_a_(env("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A")),
-          n16_(env("NINFER_EXL3_TARGET_GATEUP_K6_N16")),
-          splits_(env("NINFER_EXL3_GENERIC_SPLITS")) {}
-    ~TargetK6EnvironmentRestore() {
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", candidate_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", async_a_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_N16", n16_.c_str());
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", splits_.c_str());
-    }
-private:
-    std::string candidate_;
-    std::string async_a_;
-    std::string n16_;
-    std::string splits_;
-};
 
 void run_target_k6_qualification(Exl3TextModel& target,
                                  Exl3Dflash2DraftModel& draft,
@@ -33,7 +14,11 @@ void run_target_k6_qualification(Exl3TextModel& target,
     require(oscar, "target K6 qualification requires canonical OSCAR");
     require(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
             "target K6 real capture must start from explicit flag0 baseline");
-    TargetK6EnvironmentRestore restore_environment;
+    ninfer::test::ScopedEnvironmentRestore restore_environment{
+        "NINFER_EXL3_TARGET_GATEUP_SMALL_M",
+        "NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A",
+        "NINFER_EXL3_TARGET_GATEUP_K6_N16",
+        "NINFER_EXL3_GENERIC_SPLITS"};
     _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
 
     auto captured = run_target_k6_capture(

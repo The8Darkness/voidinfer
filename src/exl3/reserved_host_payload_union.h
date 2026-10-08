@@ -103,7 +103,7 @@ template<std::size_t Capacity> class ReservedHostPayloadTracker {
     mutable std::mutex mutex_;
 public:
     void track(const std::shared_ptr<const void>& owner,std::size_t plane,const void* data,std::size_t bytes) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         ReservedHostPayloadUnion<Capacity> checked;
         std::size_t slot=Capacity;
         for(std::size_t i=0;i<Capacity;++i) {
@@ -121,7 +121,7 @@ public:
         entries_[slot]={owner,plane,data,bytes};
     }
     ReservedHostPayloadUnion<Capacity> snapshot() const {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         ReservedHostPayloadUnion<Capacity> result;
         for(const auto& entry:entries_)if(auto live=entry.owner.lock())
             result.add(std::move(live),entry.plane,entry.data,entry.bytes);

@@ -72,16 +72,19 @@ cudaError_t DecodeGraphDefinition::try_reset() noexcept {
 void DecodeGraphDefinition::reset() noexcept { log_cuda_error("cudaGraphDestroy",try_reset()); }
 
 DecodeGraphExecutable::~DecodeGraphExecutable() { reset(); }
-DecodeGraphExecutable::DecodeGraphExecutable(Provider provider):provider_(provider) {
+DecodeGraphExecutable::DecodeGraphExecutable(Provider provider)
+    :provider_(provider),custom_provider_(true) {
     if(!provider_.instantiate || !provider_.destroy || !provider_.upload ||
        !provider_.launch)
         throw std::invalid_argument("incomplete graph executable provider");
 }
 
 DecodeGraphExecutable::DecodeGraphExecutable(DecodeGraphExecutable&& other) noexcept
-    : exec_(other.exec_),retirement_error_(other.retirement_error_),provider_(other.provider_) {
+    : exec_(other.exec_),retirement_error_(other.retirement_error_),
+      provider_(other.provider_),custom_provider_(other.custom_provider_) {
     other.exec_ = nullptr;
     other.retirement_error_=cudaSuccess;
+    other.custom_provider_=false;
 }
 
 DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& other) noexcept {
@@ -90,9 +93,11 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
     if(try_reset()!=cudaSuccess)return *this;
     exec_       = other.exec_;
     provider_=other.provider_;
+    custom_provider_=other.custom_provider_;
     retirement_error_=other.retirement_error_;
     other.exec_ = nullptr;
     other.retirement_error_=cudaSuccess;
+    other.custom_provider_=false;
     return *this;
 }
 
@@ -129,13 +134,18 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
     CUDA_CHECK(retirement_error_);
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
-    CUDA_CHECK(provider_.upload(exec_, stream));
+    // The default upload and launch callback pointers aliased in an
+    // Engine-linked Windows binary. Dispatch ordinary CUDA calls directly;
+    // explicit providers remain available for failure injection.
+    CUDA_CHECK(custom_provider_?provider_.upload(exec_,stream):
+        cudaGraphUpload(exec_,stream));
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {
     CUDA_CHECK(retirement_error_);
     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
-    CUDA_CHECK(provider_.launch(exec_, stream));
+    CUDA_CHECK(custom_provider_?provider_.launch(exec_,stream):
+        cudaGraphLaunch(exec_,stream));
 }
 
 bool DecodeGraphExecutable::ready() const noexcept { return exec_ != nullptr; }

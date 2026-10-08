@@ -1,5 +1,6 @@
 #pragma once
 #include "exl3/branch_reference.h"
+#include <chrono>
 #include <exception>
 
 namespace ninfer::exl3 {
@@ -94,6 +95,9 @@ struct Exl3OuterReferenceResult {
     std::size_t checkpoint_restores = 0;
     std::size_t checkpoint_reconstructed_rows = 0;
     std::size_t checkpoint_fallback_rows = 0;
+    std::size_t sibling_promotions = 0;
+    bool device_seed_reused = false;
+    bool device_seed_fallback = false;
     std::size_t committed_tap_d2d_bytes = 0;
     // Committed rows whose five captured tap planes stayed device-resident.
     // The D2D consumer still stages every row into the authoritative draft
@@ -253,6 +257,270 @@ inline Exl3OuterReferenceResult verify_exl3_outer_checkpointed_reference(
         try {
             if(exact.transaction_active()) exact.rollback_transaction(stream);
             else exact.restore_exact_host_state(root,stream);
+        } catch(...) {}
+        std::rethrow_exception(failure);
+    }
+    return result;
+}
+
+// Guarded ordinary-device-KV transaction. The caller owns the live context and
+// its frontier; this function does not restore or export a full host state.
+// Decisions are returned as a compact host packet and the committed target
+// state remains on the device. A caller needing an oracle may export after the
+// timed call. It must discard the context on a post-commit failure.
+struct Exl3OuterDeviceStageTimeline {
+    double begin_ms=0, seed_ms=0, submit_ms=0, decision_ms=0, settlement_ms=0;
+};
+// A host-ready target seed can be carried across draft proposal without a
+// second greedy read. The owner retains the context, while root_revision is
+// replaced after every committed frontier. The numerical policy tag is owned
+// by the request route, rather than inferred from the tentative token values.
+struct Exl3OuterDeviceSeedPacket {
+    Exl3CommittedTapBinding binding;
+    std::uint64_t request_generation=0, numerical_policy=0;
+    std::int64_t token=-1;
+    cudaStream_t completed_stream=nullptr;
+    bool device_greedy=false;
+};
+inline Exl3OuterDeviceSeedPacket bind_exl3_outer_device_seed(
+    const Exl3TextContext& exact,const Exl3CommittedTapBinding& binding,
+    std::int64_t token,std::uint64_t numerical_policy,
+    cudaStream_t completed_stream=nullptr) {
+    if(!binding || binding.context_owner.get()!=&exact ||
+       binding.root_position!=exact.position() ||
+       token<0 || token>=248320 || !numerical_policy)
+        throw std::invalid_argument("device seed packet root/policy extent");
+    return {binding,exact.request_generation(),numerical_policy,token,
+        completed_stream,
+        exl3_device_greedy_enabled()};
+}
+inline bool exl3_outer_device_seed_matches(
+    const Exl3TextContext& exact,const Exl3CommittedTapBinding* tap_binding,
+    const Exl3OuterDeviceSeedPacket* ready_seed,
+    std::uint64_t numerical_policy,std::int64_t proposed_root,
+    cudaStream_t stream=nullptr) {
+    return ready_seed && tap_binding && *tap_binding &&
+        tap_binding->context_owner.get()==&exact &&
+        ready_seed->binding.context_owner==tap_binding->context_owner &&
+        ready_seed->binding.root_revision==tap_binding->root_revision &&
+        ready_seed->binding.root_position==exact.position() &&
+        ready_seed->binding.acquisition==tap_binding->acquisition &&
+        ready_seed->binding.execution==tap_binding->execution &&
+        ready_seed->request_generation==exact.request_generation() &&
+        ready_seed->numerical_policy &&
+        ready_seed->numerical_policy==numerical_policy &&
+        ready_seed->completed_stream==stream &&
+        ready_seed->device_greedy==exl3_device_greedy_enabled() &&
+        ready_seed->token==proposed_root &&
+        ready_seed->token>=0 && ready_seed->token<248320;
+}
+// A rejected round's correction row is deferred to the next round's verifier
+// (row 0) instead of being decoded by a separate M1 pass. Measured default;
+// NINFER_EXL3_FOLD_CORRECTION=0 restores the separate correction pass.
+inline bool exl3_fold_correction_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_FOLD_CORRECTION");
+        if(!value)return true;
+        if(std::string_view(value)=="0")return false;
+        if(std::string_view(value)=="1")return true;
+        throw std::invalid_argument("NINFER_EXL3_FOLD_CORRECTION must be 0 or 1");
+    }();
+    return enabled;
+}
+
+enum class Exl3OuterDeviceSettlement : std::uint8_t {
+    Eager,
+    DeferTargetCommit,
+};
+
+inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
+    Exl3TextContext& exact,std::span<const std::int64_t> tentative,
+    std::span<const std::int64_t> terminal={},cudaStream_t stream=nullptr,
+    const Exl3CommittedTapBinding* tap_binding=nullptr,
+    const Exl3CommittedTapConsumer* tap_consumer=nullptr,
+    Exl3OuterDeviceStageTimeline* timeline=nullptr,
+    const Exl3OuterDeviceSeedPacket* ready_seed=nullptr,
+    std::uint64_t numerical_policy=0,
+    Exl3OuterDeviceSettlement settlement=Exl3OuterDeviceSettlement::Eager,
+    std::span<const int> sibling_offsets={}) {
+    if(tentative.size()<2 || tentative.size()>8 ||
+       exact.continuation_capacity()<tentative.size() ||
+       !exact.transaction_prepared())
+        throw std::invalid_argument(
+            "device-resident verifier requires prepared B2..B8 transaction");
+    // tentative = [seed, chain drafts, sibling leaves]: sibling j is an
+    // alternative to chain row sibling_offsets[j] (sibling_rows.cuh).
+    const int siblings=static_cast<int>(sibling_offsets.size());
+    const int chain_rows=static_cast<int>(tentative.size())-siblings;
+    if(siblings<0 || chain_rows<2 ||
+       (siblings && (!exl3_device_greedy_enabled() || !exl3_fold_correction_enabled())))
+        throw std::invalid_argument("device-resident verifier sibling layout");
+    for(auto token:tentative) if(token<0 || token>=248320)
+        throw std::invalid_argument("device-resident tentative token extent");
+    for(auto token:terminal) if(token<0 || token>=248320)
+        throw std::invalid_argument("device-resident terminal token extent");
+    if(tap_consumer && (!tap_binding || !*tap_binding))
+        throw std::invalid_argument("device-resident tap binding");
+    const auto* device_kv=std::getenv("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION");
+    if(!device_kv || std::string_view(device_kv)!="1")
+        throw std::invalid_argument("device-resident verifier requires its guarded device-KV policy");
+
+    Exl3OuterReferenceResult result;
+    result.committed_tap_segments.reserve(tentative.size());
+    const int root_position=exact.position();
+    const bool fast_w1=exl3_fast_mia_parity_w1_enabled();
+    const bool reuse_seed=exl3_outer_device_seed_matches(
+        exact,tap_binding,ready_seed,numerical_policy,tentative.front(),stream);
+    result.device_seed_reused=reuse_seed;
+    result.device_seed_fallback=ready_seed && !reuse_seed;
+    using StageClock=std::chrono::steady_clock;
+    auto stage_start=timeline?StageClock::now():StageClock::time_point{};
+    const auto stage_end=[&](double& ms) {
+        if(!timeline)return;
+        const auto now=StageClock::now();
+        ms=std::chrono::duration<double,std::milli>(now-stage_start).count();
+        stage_start=now;
+    };
+    try {
+        // A caller may begin the transaction before drafting so its
+        // checkpoint overlaps the draft.
+        if(!exact.transaction_active())exact.begin_transaction(stream);
+        result.checkpoint_captured_bytes=exact.transaction_bytes();
+        if(timeline)stage_end(timeline->begin_ms);
+        // An invalid or stale packet takes the ordinary checked reduction.
+        // The valid host token was already synchronized before draft proposal.
+        const auto seed=reuse_seed?ready_seed->token:exl3_branch_greedy(exact,stream);
+        if(timeline)stage_end(timeline->seed_ms);
+        if(siblings)exact.set_verifier_siblings(sibling_offsets);
+        exact.continue_rows(tentative,stream);
+        if(timeline)stage_end(timeline->submit_ms);
+        result.verification_rows=tentative.size();
+        result.native_invocations=1;
+        ++result.native_batch_hist[tentative.size()];
+        std::array<std::int64_t,8> path_storage{};
+        auto path=std::span<std::int64_t>(path_storage).first(tentative.size());
+        std::int64_t deferred_bonus=-1;
+        int promoted_sibling=-1;
+        Exl3OuterDecision decision;
+        if(siblings) {
+            const auto packet=exact.greedy_packet(true,stream);
+            auto chain_path=path.first(static_cast<std::size_t>(chain_rows));
+            chain_path[0]=seed;
+            for(int row=1;row<chain_rows;++row)
+                chain_path[static_cast<std::size_t>(row)]=packet.decisions[row-1].token;
+            decision=decide_exl3_outer_prefix(chain_path,
+                tentative.first(static_cast<std::size_t>(chain_rows)),terminal);
+            // A rejected chain row d whose target token equals a sibling at
+            // offset d continues through that sibling's row.
+            const int depth=static_cast<int>(decision.accepted);
+            for(int j=0;j<siblings && decision.rejected && !decision.stopped;++j)
+                if(sibling_offsets[static_cast<std::size_t>(j)]==depth &&
+                   tentative[static_cast<std::size_t>(chain_rows+j)]==
+                       decision.committed_tokens.back()) {
+                    promoted_sibling=chain_rows+j;
+                    break;
+                }
+            if(promoted_sibling>=0) {
+                const auto next=packet.decisions[promoted_sibling].token;
+                decision.committed_tokens.push_back(next);
+                decision.accepted=static_cast<std::size_t>(depth)+1;
+                decision.stopped=exl3_terminal_token(next,terminal);
+                ++result.sibling_promotions;
+            }
+        } else {
+        exl3_outer_greedy_path(exact,seed,path,stream,
+            fast_w1?&deferred_bonus:nullptr);
+        decision=decide_exl3_outer_prefix(path,tentative,terminal);
+        }
+        result.committed_tokens=std::move(decision.committed_tokens);
+        result.accepted=decision.accepted;
+        result.rejected=decision.rejected;
+        result.stopped=decision.stopped;
+        if(timeline)stage_end(timeline->decision_ms);
+        const bool truncated=result.committed_tokens.size()<tentative.size();
+        if(fast_w1 && !result.rejected && !result.stopped && !truncated) {
+            if(deferred_bonus<0 || deferred_bonus>=248320)
+                throw std::runtime_error("device-resident W+1 bonus extent");
+            result.fast_mia_parity_pending=deferred_bonus;
+            result.fast_mia_parity_w1_bonus_rows=1;
+        }
+        const auto stage_taps=[&](int source_first,int rows,
+                                  int destination_first,bool repair,
+                                  bool correction=false) {
+            if(!tap_consumer)return;
+            exl3_emit_committed_tap_segment(result,exact,tap_binding,
+                tap_consumer,source_first,rows,
+                root_position+destination_first,destination_first,
+                root_position,static_cast<int>(tentative.size()),
+                exact.position()-exact.captured_tap_rows(),
+                exact.captured_tap_rows(),repair,correction,stream);
+        };
+        if(result.rejected && result.accepted>0 && exl3_fold_correction_enabled()) {
+            // Folded correction: keep only the verified prefix. Retention
+            // restores the last retained row's logits, so the next round's
+            // seed is exactly this correction and its verifier consumes it as
+            // row 0. The correction is published only when consumed.
+            const int accepted=static_cast<int>(result.accepted);
+            if(promoted_sibling>=0)
+                exact.promote_sibling_row(promoted_sibling,accepted-1,stream);
+            exact.retain_transaction_prefix(accepted,stream);
+            ++result.checkpoint_restores;
+            result.checkpoint_reconstructed_rows=accepted;
+            stage_taps(0,accepted,0,true);
+            result.committed_tokens.pop_back();
+            result.stopped=exl3_terminal_token(result.committed_tokens.back(),terminal);
+            if(settlement==Exl3OuterDeviceSettlement::Eager)
+                exact.commit_transaction();
+        } else if(result.rejected) {
+            const int accepted=static_cast<int>(result.accepted);
+            const auto correction=result.committed_tokens.back();
+            if(accepted>0) {
+                exact.retain_transaction_prefix(accepted,stream);
+                ++result.checkpoint_restores;
+                result.checkpoint_reconstructed_rows=accepted;
+                stage_taps(0,accepted,0,true);
+            } else {
+                exact.rollback_transaction(stream);
+                ++result.checkpoint_fallback_rows;
+                // A pending Engine preview still needs a rollback boundary for
+                // the correction row. Capture the restored root before replay.
+                if(settlement==Exl3OuterDeviceSettlement::DeferTargetCommit)
+                    exact.begin_transaction(stream);
+            }
+            exact.set_target_projection_timing_phase(Exl3TargetProjectionPhase::replay);
+            exact.decode(correction,stream);
+            ++result.replay_rows;
+            ++result.native_invocations;
+            ++result.native_batch_hist[1];
+            stage_taps(0,1,accepted,true,true);
+            if(accepted>0 && settlement==Exl3OuterDeviceSettlement::Eager)
+                exact.commit_transaction();
+        } else {
+            const int retained=static_cast<int>(result.committed_tokens.size());
+            if(truncated) {
+                exact.retain_transaction_prefix(retained,stream);
+                ++result.checkpoint_restores;
+                result.checkpoint_reconstructed_rows=retained;
+            }
+            stage_taps(0,retained,0,truncated);
+            if(settlement==Exl3OuterDeviceSettlement::Eager) {
+                exact.commit_transaction();
+                if(exact.continuation_rows()>0)
+                    exact.finish_exact_continuation(stream);
+            }
+        }
+        result.executed_rows=result.verification_rows+result.replay_rows;
+        if(timeline)stage_end(timeline->settlement_ms);
+        if(settlement==Exl3OuterDeviceSettlement::DeferTargetCommit &&
+           !exact.transaction_active())
+            throw std::logic_error("device-resident pending verifier lost target rollback boundary");
+        // No full host-state export is performed here; the live context owns
+        // the committed device KV, GDN state and captured tap frontier.
+    } catch(...) {
+        const auto failure=std::current_exception();
+        try {
+            if(exact.transaction_active()) exact.rollback_transaction(stream);
+            else exact.reset(stream);
         } catch(...) {}
         std::rethrow_exception(failure);
     }

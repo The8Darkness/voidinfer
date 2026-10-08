@@ -1,4 +1,6 @@
 #pragma once
+#include "exl3/gaming_optimizations.h"
+#include "exl3/sibling_rows.h"
 
 #include "exl3/linear_cuda.h"
 #include "exl3/layer_buffer_retirement.h"
@@ -171,7 +173,15 @@ struct Exl3GdnStageFusionFixtureView {
 
 void exl3_gdn_stage_fusion_fixture(
     const Exl3GdnStageFusionFixtureView& view,
-    cudaStream_t stream=nullptr);
+    cudaStream_t stream=nullptr,bool pair_columns=false);
+// Verifier-sized (1..8 rows) recurrence route of the decode/verify forward:
+// q,k BF16 [rows][16][128] (unnormalized), v BF16 [rows][48][128], g (log
+// decay) and beta FP32 [rows][48], state FP32 [48][128][128] updated in place,
+// output BF16 [rows][48][128]. chain_rows (device int, may be null) selects
+// the sibling-leaf layout of sibling_rows.cuh.
+void exl3_gdn_verifier_recurrence_fixture(const std::uint16_t* q,const std::uint16_t* k,
+    const std::uint16_t* v,const float* g,const float* beta,float* state,
+    std::uint16_t* output,int rows,const int* chain_rows,cudaStream_t stream=nullptr);
 
 // Owning read-only slice of the most recent supported M1-topology recurrent
 // history. `storage_owner` must keep the context/layer allocations alive;
@@ -478,6 +488,7 @@ struct Exl3GdnWideScratchView {
 
 class Exl3GdnLayer {
 public:
+    GoptSubmissions gaming_submissions() const noexcept { return gaming_submissions_; }
     // Successful host submissions outside graph capture; not replay or GPU completion counts.
     std::uint64_t paired_transform_submissions() const noexcept { return paired_transform_submissions_; }
     std::uint64_t fused_gate_up_submissions() const noexcept { return fused_gate_up_submissions_; }
@@ -516,12 +527,38 @@ public:
     Exl3GdnLayer& operator=(const Exl3GdnLayer&) = delete;
 
     void reset(cudaStream_t stream = nullptr);
+    struct BulkPrefillBuffers {
+        std::uint16_t* h = nullptr;
+        std::uint16_t* qkv = nullptr;
+        std::uint16_t* z = nullptr;
+        int rows = 0;
+    };
+    struct DeferredMlpBuffers {
+        std::uint16_t* post = nullptr;
+        std::uint16_t* mlp_input = nullptr;
+        int rows = 0;
+    };
+    bool supports_bulk_prefill() const noexcept;
+    void prepare_bulk_prefill(const std::uint16_t* input,
+                             BulkPrefillBuffers buffers,
+                             cudaStream_t stream);
+    bool supports_bulk_mlp(int rows) const noexcept;
+    void forward_before_bulk_mlp(const std::uint16_t* input,
+                                 DeferredMlpBuffers buffers,
+                                 cudaStream_t stream);
+    void finish_bulk_mlp(DeferredMlpBuffers buffers,
+                         std::uint16_t* gate,std::uint16_t* up,
+                         std::uint16_t* act,std::uint16_t* down,
+                         std::uint16_t* output,
+                         cudaStream_t stream,bool preserve_trace=false);
     void forward(const std::uint16_t* input, std::uint16_t* output, int rows,
                  cudaStream_t stream = nullptr, bool profile = false,
                  // Explicit target-verifier mode; nonlinear staging remains
                  // batched while every packed projection retains its M1 path.
                  bool preserve_m1_topology = false,
-                 bool wide_prefill = false);
+                 bool wide_prefill = false,
+                 const BulkPrefillBuffers* prepared = nullptr,
+                 const DeferredMlpBuffers* deferred_mlp = nullptr);
     // Qualification-only T0a topology oracle. One host thread submits a fixed
     // projection-by-projection schedule for two independent real layer
     // instances. Each lane retains the authoritative fixed-B8 projection
@@ -544,6 +581,25 @@ public:
     void prepare_eager_mlp_gateup_concurrency(
         Exl3MlpGateUpConcurrencyView view);
     void set_capture_active(bool active) noexcept { capture_active_ = active; }
+    // Verifier row layout (sibling_rows.cuh); nullptr keeps every row a chain row.
+    void set_chain_rows_device(const int* chain_rows) noexcept { chain_rows_device_ = chain_rows; }
+    // Production contexts skip trace-only work: the per-forward recurrent
+    // state-before copy (3 MB per layer) and the packed conv-output/head copies;
+    // only diagnostics and tests read those trace() fields.
+    void set_skip_state_trace(bool skip) noexcept { skip_state_trace_ = skip; }
+    // The next GDN layer of the stack: this layer's decode down reduction also
+    // writes the successor's input RMS norm into the successor's input-norm
+    // buffer, and the successor skips its own norm for exactly that input.
+    void set_successor(Exl3GdnLayer* successor) noexcept { successor_ = successor; }
+    // Weights of the next layer's first projection, prefetched into L2 on a
+    // side branch before this layer's down projection (M1 decode).
+    void set_next_layer_prefetch(const std::uint16_t* trellis) noexcept { next_layer_prefetch_ = trellis; }
+    const std::uint16_t* first_projection_trellis() const noexcept { return weights_.qkv.trellis; }
+    // Per-row continuation traces (convolution input, q/k/v, gates) of the
+    // last `rows`-row forward that an accepted sibling must carry into
+    // `destination` before retained-prefix repair.
+    void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,int destination,
+                                   int rows) const;
     void set_shared_gateup_executor(Exl3TargetQExecutor executor,int layer,bool gateup=true,bool down=false) {
         shared_gateup_executor_=std::move(executor);model_layer_=layer;
         shared_gateup_enabled_=gateup;shared_down_enabled_=down;
@@ -584,6 +640,16 @@ public:
     void reconstruct_retained_prefix(const Exl3GdnLayerCheckpoint& checkpoint,
                                      int retained_rows,
                                      cudaStream_t stream = nullptr);
+    // Split form for a captured multi-layer repair graph: the host part runs
+    // every provenance check and state transition of reconstruct_retained_prefix
+    // without GPU work; the enqueue part submits exactly its device work and
+    // may be recorded into a graph (fixed buffers, no host state access).
+    // Returns the attempted row count the enqueue must use.
+    int reconstruct_retained_prefix_host(const Exl3GdnLayerCheckpoint& checkpoint,
+                                         int retained_rows, cudaStream_t stream);
+    void enqueue_retained_prefix_reconstruct(const Exl3GdnLayerCheckpoint& checkpoint,
+                                             int retained_rows, int attempted_rows,
+                                             cudaStream_t stream) const;
     // Host-side completion for a successfully replayed fixed-width graph.
     // Binds stable forward scratch to the eager checkpoint taken immediately
     // before replay; it performs no device work or state publication.
@@ -736,6 +802,8 @@ private:
         int first_row,int rows) const;
     Exl3GdnLayerWeights weights_{};
     int max_rows_ = 0;
+    Exl3GamingOptions gaming_ = Exl3GamingOptions::from_environment();
+    GoptSubmissions gaming_submissions_{};
     bool prefill_resident_ = false;
     bool prefill_resident_pair_columns_ = false;
     bool prefill_resident_pair_vector_io_ = false;
@@ -743,6 +811,9 @@ private:
     bool dual_input_transform_ = false;
     bool fused_gate_up_transform_ = false;
     bool small_m_fused_gate_up_transform_ = false;
+    bool bulk_mlp_fused_down_ = false;
+    bool bulk_mlp_fused_residual_ = false;
+    bool bulk_mlp_weight_prefetch_ = false;
     bool fused_residual_norm_ = false;
     bool fast_same_weights_fp16kv_gdn_decode_conv_ = false;
     bool fast_same_weights_fp16kv_gdn_m1_gate_up_pair_ = false;
@@ -769,6 +840,11 @@ private:
     Exl3GdnScratchReuseContract scratch_reuse_{};
     float* recurrent_state_ = nullptr;
     float* recurrent_state_before_ = nullptr;
+    bool skip_state_trace_ = false;
+    Exl3GdnLayer* successor_ = nullptr;
+    const std::uint16_t* next_layer_prefetch_ = nullptr;
+    const std::uint16_t* prenormalized_input_ = nullptr;
+    int prenormalized_rows_ = 0;
     std::uint16_t* conv_state_ = nullptr;
     std::uint16_t* conv_state_trace_ = nullptr;
     DeviceArena* op_workspace_ = nullptr;
@@ -785,6 +861,7 @@ private:
     Exl3TargetQExecutor shared_gateup_executor_;
     Exl3ActivationLifetime mlp_activation_lifetime_;
     bool shared_gateup_enabled_=false,shared_down_enabled_=false;
+    const int* chain_rows_device_ = nullptr;
     bool capture_active_ = false;
     Exl3GdnGraphQkvzConcurrencyView graph_qkvz_concurrency_{};
     std::shared_ptr<const void> prefill_projection_chain_context_owner_ =

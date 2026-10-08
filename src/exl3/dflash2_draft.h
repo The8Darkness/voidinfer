@@ -1,4 +1,5 @@
 #pragma once
+#include "exl3/gaming_optimizations.h"
 #include "exl3/target_q_continuation.h"
 #include "exl3/draft_distribution_contract.h"
 
@@ -145,7 +146,7 @@ public:
             const auto live=bounded_shared_live_blocks_for_test<Page>();
             unsigned calls=0;bool refused=false;
             const MetadataReservation reserve=[&](std::uint64_t bytes){
-                if(++calls==3)throw Exl3ResourceReservationExhausted{};
+                if(++calls==3)throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
                 return ledger.acquire(bytes);
             };
             try {
@@ -184,6 +185,8 @@ public:
     bool same_represented_payload_for_test(const Exl3DraftHostRing& other) const;
     // Diagnostic value copy; excludes model identity and shared page ownership.
     std::shared_ptr<const Exl3DraftHostRing> detached_payload_for_test() const;
+    // Exact chronological K/V bytes of every usable logical row. Diagnostic only.
+    std::size_t write_represented_payload_for_test(const std::filesystem::path& path) const;
     static std::uint64_t visit_allocations(std::span<const std::shared_ptr<const Exl3DraftHostRing>> states,
         const std::function<void(const void*,std::size_t)>& visitor={},bool include_unused_capacity=true);
 };
@@ -194,7 +197,8 @@ public:
 void dflash2_topk16_for_test(const std::uint16_t* logits, int rows, int vocab,
                            std::int64_t* ids, float* values, bool parallel,
                            bool local_merge = false,
-                           cudaStream_t stream = nullptr);
+                           cudaStream_t stream = nullptr,
+                           unsigned int* nonfinite_flag = nullptr);
 
 // Qualification entry: Q[queries,32,128], ring K/V[2048,8,128], block
 // K/V[block,8,128], output[queries,32,128]. Count0..2047, queries0..8,
@@ -203,6 +207,10 @@ void dflash2_ring_attention_for_test(const std::uint16_t* q,
     const std::uint16_t* ring_k, const std::uint16_t* ring_v, int start, int count,
     const std::uint16_t* k, const std::uint16_t* v, std::uint16_t* out,
     int queries, int block, float scale, bool parallel, cudaStream_t stream = nullptr);
+// True when the parallel ring attention at this context length takes the
+// split-K tensor-core route (FP16 probabilities; not bitwise to the serial
+// kernel, checked against the independent FP64 bound only).
+bool dflash2_ring_attention_split_for_test(int count);
 
 // Qualification entry for the draft F16 output-major dense projection and its
 // exact K-major storage adapter. The two routes retain chronological FP32
@@ -277,6 +285,7 @@ public:
     bool shares_weights_with(const Exl3Dflash2DraftModel& other) const noexcept;
     std::size_t execution_bytes() const noexcept; // scratch + workspaces + KV/ring
 
+    GoptSubmissions gaming_submissions() const noexcept;
     ~Exl3Dflash2DraftModel();
     Exl3Dflash2DraftModel(const Exl3Dflash2DraftModel&) = delete;
     Exl3Dflash2DraftModel& operator=(const Exl3Dflash2DraftModel&) = delete;
@@ -353,6 +362,7 @@ public:
     const std::int64_t* last_topk_ids_device_for_test() const noexcept;
     const float* last_topk_values_device_for_test() const noexcept;
     std::uint64_t local_topk_calls() const noexcept;
+    std::uint64_t fused_topk_liveness_calls() const noexcept;
     // Test-only host telemetry for the most recent proposal. Empty unless the
     // model was loaded with NINFER_DFLASH2_POSITION_CONFIDENCE=1. Each entry
     // corresponds to one proposed position and is copied at the selector's
@@ -442,6 +452,16 @@ public:
     //1..16 contiguous new rows; opt-in batches native projections at most8 rows.
     void commit_prefill_block(const std::uint16_t* const* taps, int rows,
                               long long abs_pos0, cudaStream_t stream = nullptr);
+    // Optional request-scoped undo for one saturated-ring prefill commit of 1..8
+    // rows. begin snapshots the affected physical slots on the same eager stream;
+    // exactly one matching commit_prefill_block may follow. accept keeps it;
+    // rollback restores every slot and the pre-commit ring/witness metadata.
+    // The caller serializes this execution resource and uses the same stream for
+    // all three calls. A failed rollback poisons the ring until reset.
+    void begin_prefill_ring_undo(int rows, long long abs_pos0,
+                                 cudaStream_t stream = nullptr);
+    void accept_prefill_ring_undo(cudaStream_t stream = nullptr);
+    void rollback_prefill_ring_undo(cudaStream_t stream = nullptr);
     // Explicit eager fresh initialization on an empty logical ring. Submit the
     // original ordered1..16-row calls on the declared stream through exact end.
     // Only whole calls ending<=end-2048 may be omitted; crossing calls preserve
@@ -453,6 +473,10 @@ public:
         long long submitted_rows = 0, encoded_rows = 0, skipped_rows = 0;
     };
     void begin_fresh_prefill(long long start, long long end, cudaStream_t stream = nullptr);
+    // Submit one original <=16-row partition that lies wholly before the
+    // fresh window. Advances logical coverage without requiring discarded taps.
+    void skip_fresh_prefill_block(int rows, long long abs_pos0,
+                                  cudaStream_t stream = nullptr);
     void finish_fresh_prefill(cudaStream_t stream = nullptr);
     FreshPrefillStatus fresh_prefill_status() const noexcept;
     // propose() reading committed ring K/V instead of recomputing the window.
@@ -466,6 +490,12 @@ public:
     long long ring_base_abs() const noexcept;
     // Borrowed host input: retain through successful call completion, or through
     // stream retirement if the call fails after enqueue. Engine uses lane storage.
+    // Proposals also report each position's top-16 candidate IDs and unary
+    // scores ([position][16], unary order of the selector) for verification
+    // tree construction.
+    void set_proposal_candidates(bool enabled);
+    const std::vector<std::int64_t>& last_candidate_ids() const noexcept;
+    const std::vector<float>& last_candidate_unary() const noexcept;
     std::vector<std::int64_t> propose_cached_view(
         std::span<const std::int64_t> block_ids,int block_pos0,
         const std::uint16_t* target_embedding_bf16,
@@ -507,6 +537,9 @@ public:
     RingRestoreStats ring_restore_stats() const noexcept;
     // FNV-1a digest of committed ring K/V per layer (test/equivalence use).
     std::array<std::uint64_t, 5> ring_digest(cudaStream_t stream = nullptr);
+    // Diagnostic digest of all 2048 physical slots, including the spare slot.
+    std::array<std::uint64_t, 5> physical_ring_digest_for_test(
+        cudaStream_t stream = nullptr);
     // Logical rollback: rewinds the committed length (no copies).
     // require(count <= ring_count()).
     void rewind_to(int count, cudaStream_t stream = nullptr);

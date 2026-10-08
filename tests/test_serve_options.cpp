@@ -1,5 +1,9 @@
 #include "serve/serve_options.h"
+#include "serve/request_log.h"
 #include "serve/translate.h"
+#include "ninfer/engine.h"
+
+#include <nlohmann/json.hpp>
 
 #include <iostream>
 #include <string>
@@ -29,6 +33,115 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(!defaults.exl3_package.has_value(),
+                      "ordinary artifact unexpectedly selected an EXL3 package");
+    ninfer::PinnedExl3PackageOptions default_exl3_package;
+    failures += check(default_exl3_package.round_implementation ==
+                          ninfer::Exl3RoundImplementation::Established,
+                      "EXL3 round implementation is not established by default");
+    const ServeOptions exl3_established =
+        parse({"ninfer-serve", "--exl3-target", "target", "--exl3-draft", "draft"});
+    failures += check(exl3_established.exl3_package &&
+                          exl3_established.exl3_package->round_implementation ==
+                              ninfer::Exl3RoundImplementation::Established,
+                      "EXL3 package changed its default round implementation");
+    const ServeOptions exl3_coherent = parse({"ninfer-serve", "--exl3-target", "target",
+                                               "--exl3-draft", "draft", "--exl3-round",
+                                               "coherent-device", "--greedy"});
+    failures += check(exl3_coherent.exl3_package &&
+                          exl3_coherent.exl3_package->round_implementation ==
+                              ninfer::Exl3RoundImplementation::CoherentDevice &&
+                          exl3_coherent.kv_cache==ninfer::KvCacheStorage::Float16Device,
+                      "--exl3-round coherent-device did not select the typed round identity");
+    bool coherent_c2_rejected = false;
+    try {
+        ninfer::EngineOptions selected;
+        selected.exl3_package = exl3_coherent.exl3_package;
+        selected.max_concurrency=2;
+        ninfer::Engine engine(selected);
+    } catch (const std::invalid_argument& error) {
+        coherent_c2_rejected = std::string_view(error.what()).find(
+            "coherent-device EXL3 requires") != std::string_view::npos;
+    }
+    failures += check(coherent_c2_rejected,
+                      "Engine accepted unsupported coherent-device C2 admission");
+    for (const std::vector<std::string>& rejected : {
+             std::vector<std::string>{"--max-concurrency", "2"},
+             std::vector<std::string>{"--vision"},
+             std::vector<std::string>{"--temperature", "0.5"},
+             std::vector<std::string>{"--top-p", "0.8"},
+             std::vector<std::string>{"--max-context", "1024"},
+             std::vector<std::string>{"--kv-capacity", "auto"},
+             std::vector<std::string>{"--host-kv-mib", "0"},
+             std::vector<std::string>{"--no-prefix-reuse"},
+             std::vector<std::string>{"--lm-head-draft"}}) {
+        auto arguments=std::vector<std::string>{"ninfer-serve", "--exl3-target", "target",
+            "--exl3-draft", "draft", "--exl3-round", "coherent-device", "--greedy"};
+        arguments.insert(arguments.end(),rejected.begin(),rejected.end());
+        bool rejected_option=false;
+        try {(void)parse(std::move(arguments));}
+        catch(const std::invalid_argument&) {rejected_option=true;}
+        failures += check(rejected_option,
+                          "unsupported coherent-device serve combination was accepted");
+    }
+    const ServeOptions exl3_explicit_established =
+        parse({"ninfer-serve", "--exl3-target", "target", "--exl3-draft", "draft",
+               "--exl3-round", "established"});
+    failures += check(exl3_explicit_established.exl3_package &&
+                          exl3_explicit_established.exl3_package->round_implementation ==
+                              ninfer::Exl3RoundImplementation::Established,
+                      "--exl3-round established did not retain the baseline");
+    for (const std::vector<std::string>& rejected : {
+             std::vector<std::string>{"ninfer-serve", "model.ninfer", "--exl3-round",
+                                      "coherent-device"},
+             std::vector<std::string>{"ninfer-serve", "--exl3-target", "target",
+                                      "--exl3-draft", "draft", "--exl3-round", "unknown"},
+             std::vector<std::string>{"ninfer-serve", "--exl3-target", "target",
+                                      "--exl3-draft", "draft", "--exl3-round"}}) {
+        bool rejected_round = false;
+        try { (void)parse(rejected); }
+        catch (const std::invalid_argument&) { rejected_round = true; }
+        failures += check(rejected_round, "invalid EXL3 round selection was accepted");
+    }
+    ninfer::EngineOptions effective_exl3;
+    effective_exl3.exl3_package = exl3_coherent.exl3_package;
+    effective_exl3.kv_cache=exl3_coherent.kv_cache;
+    effective_exl3.context_cache.device_state_slots = 0;
+    effective_exl3.context_cache.max_private_continuations = 0;
+    effective_exl3.context_cache.max_shared_prefixes = 0;
+    effective_exl3.context_cache.max_long_anchors_per_continuation = 0;
+    effective_exl3.context_cache.max_cache_markers_per_request = 0;
+    const auto round_server_json = nlohmann::json::parse(format_server_start_json(
+        "serve-test", 0, exl3_coherent, effective_exl3, ninfer::ModelSamplingDefaults{},
+        "exl3-test", ninfer::LoadSummary{}, ninfer::MemorySummary{}, ServerLogEnvironment{},
+        std::nullopt));
+    failures += check(round_server_json.at("engine").at("selected_exl3_round") ==
+                          "coherent-device" &&
+                          round_server_json.at("engine").at("kv_cache")=="fp16-device",
+                      "server log omitted selected EXL3 round or device KV identity");
+    const GenerationRequest round_request;
+    const PreparedRequest round_prepared;
+    const RequestLogContext round_log_context =
+        make_request_log_context(1, "openai_chat_completions", round_request, round_prepared,
+                                 selected_exl3_round(effective_exl3));
+    const auto round_request_json = nlohmann::json::parse(
+        format_request_start_json("serve-test", 1, round_log_context));
+    failures += check(round_request_json.at("request").at("selected_exl3_round") ==
+                          "coherent-device" &&
+                          !selected_exl3_round(ninfer::EngineOptions{}),
+                      "request log omitted selected effective EXL3 round identity");
+    ApiError round_rejection_error;
+    const auto round_rejection_json = nlohmann::json::parse(format_request_rejected_json(
+        "serve-test", 2,
+        make_request_rejection_log_context(2, "openai_chat_completions", round_request,
+                                           round_rejection_error,
+                                           selected_exl3_round(effective_exl3))));
+    failures += check(round_rejection_json.at("request").at("selected_exl3_round") ==
+                          "coherent-device",
+                      "rejected request log omitted selected EXL3 round identity");
+    failures += check(serve_usage_text("ninfer-serve").find("--exl3-round") !=
+                          std::string::npos,
+                      "serve help omits EXL3 round selection");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

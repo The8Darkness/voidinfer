@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -37,7 +38,7 @@ public:
         RetainedDescriptorLedger::Ticket metadata;
     };
     RegistrationConstructorCredits reserve_registration_constructor_credits(std::uint64_t registration,std::uint64_t metadata) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!runtime_construction_state_ || !allocating_ || !runtime_allocating_ ||
             allocation_thread_!=std::this_thread::get_id() || !registration || !metadata)
             throw std::logic_error("registration constructor credits require active runtime factory");
@@ -46,21 +47,21 @@ public:
         const auto m=static_cast<unsigned>(Exl3ResourceInventory::Domain::host_metadata);
         if(state.issued[r]>state.ceiling[r] || state.issued[m]>state.ceiling[m] ||
             registration>state.ceiling[r]-state.issued[r] || metadata>state.ceiling[m]-state.issued[m])
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto registration_ticket=state.registration.acquire(registration);
         auto metadata_ticket=state.metadata.acquire(metadata);
         state.issued[r]+=registration;state.issued[m]+=metadata;
         return {std::move(registration_ticket),std::move(metadata_ticket)};
     }
     RegistrationConstructorCredits reserve_startup_registration_constructor_credits(std::uint64_t registration,std::uint64_t metadata) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!allocating_ || runtime_allocating_ || constructor_thread_!=std::this_thread::get_id() ||
             !registration || !metadata)throw std::logic_error("registration credits require active startup factory");
         const auto r=static_cast<unsigned>(Exl3ResourceInventory::Domain::cuda_registered_host);
         const auto m=static_cast<unsigned>(Exl3ResourceInventory::Domain::host_metadata);
         if(constructor_issued_[r]>constructor_ceiling_[r] || constructor_issued_[m]>constructor_ceiling_[m] ||
             registration>constructor_ceiling_[r]-constructor_issued_[r] || metadata>constructor_ceiling_[m]-constructor_issued_[m])
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto a=constructor_registration_.acquire(registration);auto b=constructor_metadata_.acquire(metadata);
         constructor_issued_[r]+=registration;constructor_issued_[m]+=metadata;return {std::move(a),std::move(b)};
     }
@@ -69,7 +70,7 @@ public:
         RetainedDescriptorLedger::Ticket metadata;
     };
     ConstructorCredits reserve_runtime_constructor_credits(std::uint64_t device,std::uint64_t metadata) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!runtime_construction_state_ || !allocating_ || !runtime_allocating_ ||
             allocation_thread_!=std::this_thread::get_id() || !device || !metadata)
             throw std::logic_error("device constructor credits require active runtime factory");
@@ -78,7 +79,7 @@ public:
         const auto m=static_cast<unsigned>(Exl3ResourceInventory::Domain::host_metadata);
         if(state.issued[d]>state.ceiling[d] || state.issued[m]>state.ceiling[m] ||
             device>state.ceiling[d]-state.issued[d] || metadata>state.ceiling[m]-state.issued[m])
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto device_ticket=state.device.acquire(device);
         auto metadata_ticket=state.metadata.acquire(metadata);
         state.issued[d]+=device;state.issued[m]+=metadata;
@@ -87,14 +88,14 @@ public:
     // Provisional charges cover construction only. Committed inventory assumes
     // ownership before callers release them; failed cleanup retains their states.
     ConstructorCredits reserve_constructor_credits(std::uint64_t device,std::uint64_t metadata) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         if(!allocating_ || runtime_allocating_ || constructor_thread_!=std::this_thread::get_id() ||
             !device || !metadata)throw std::logic_error("constructor credits require active startup factory");
         using Domain=Exl3ResourceInventory::Domain;
         const auto d=static_cast<unsigned>(Domain::device),m=static_cast<unsigned>(Domain::host_metadata);
         if(constructor_issued_[d]>constructor_ceiling_[d] || constructor_issued_[m]>constructor_ceiling_[m] ||
             device>constructor_ceiling_[d]-constructor_issued_[d] || metadata>constructor_ceiling_[m]-constructor_issued_[m])
-            throw Exl3ResourceReservationExhausted{};
+            throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto device_ticket=constructor_device_.acquire(device);
         auto metadata_ticket=constructor_metadata_.acquire(metadata);
         constructor_issued_[d]+=device;constructor_issued_[m]+=metadata;
@@ -116,6 +117,21 @@ public:
         // Acquisition identity is separate from the publication generation:
         // yielding does not invalidate a client's cancellation ticket.
         std::uint64_t acquisition = 0;
+    };
+    // Logical authority while a caller-owned physical lane keeps the exact
+    // target/draft state. The initial host root stays resident until one
+    // terminal child is supplied. This handle never owns numerical state.
+    struct DeviceLogicalLease {
+        Ticket ticket;
+        std::shared_ptr<const Exl3VeriCacheRequest> initial_root;
+        std::shared_ptr<const void> physical_owner;
+        std::uint64_t acquisition = 0;
+        int frontier = 0;
+    };
+    struct DeviceLogicalPublication {
+        DeviceLogicalLease lease;
+        std::size_t committed_tokens = 0;
+        std::uint64_t sequence = 0;
     };
     // Issued only by a physical DFlash lane after its final scoped event has
     // completed and retired. Logical cancellation or lease liveness cannot
@@ -202,7 +218,7 @@ public:
 
     Ticket admit(std::shared_ptr<const Exl3VeriCacheRequest> root) {
         validate_root(root);
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         if (entries().size() >= policy_.logical_capacity)
             throw std::runtime_error("serving coordinator logical capacity exhausted");
@@ -233,7 +249,7 @@ public:
     // Allocation-before-startup remains a separate, unfinished reservation seam.
     void bind_physical_resources(Exl3ResourceInventory resources,
         Exl3ResourceInventory::Totals limits) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(physical_bound_ || !entries().empty() || resident_updates_)
             throw std::logic_error("physical inventory must precede admission");
         resident_.set_resource_limits(limits);
@@ -263,7 +279,7 @@ public:
     // Both coordinator and inventory retain the same backing allocation owner.
     void reserve_metadata_startup(unsigned fault=0) {
         if(fault>4)throw std::invalid_argument("coordinator metadata fault extent");
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(!physical_bound_ || metadata_ || entries().capacity() || queue().capacity() || resident_updates_)
             throw std::logic_error("coordinator metadata reservation must precede admission");
         const auto required=metadata_requirement();
@@ -302,13 +318,13 @@ public:
         }
     }
     std::weak_ptr<const void> metadata_owner_for_test() const {
-        std::unique_lock lock(mutex_);return metadata_;
+        std::unique_lock<std::mutex> lock(mutex_);return metadata_;
     }
     static std::size_t metadata_owner_blocks_for_test() noexcept {
         return bounded_shared_live_blocks_for_test<MetadataStorage>();
     }
     bool publication_scratch_empty_for_test() const {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         const auto& storage=metadata_?*metadata_:fallback_metadata_;
         return storage.selected.empty() && storage.replacements.empty() && storage.roots.empty();
     }
@@ -319,7 +335,7 @@ public:
         bool publication_active=false,root_active=false;
     };
     PublicationScratchSnapshot publication_scratch_snapshot_for_test() const {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         const auto& storage=metadata_?*metadata_:fallback_metadata_;
         return {reinterpret_cast<std::uintptr_t>(storage.selected.data()),
             reinterpret_cast<std::uintptr_t>(storage.replacements.data()),
@@ -349,7 +365,7 @@ public:
         using Inventory=Exl3ResourceInventory;
         Inventory::Requirement required;required.configuration=0x4c4f47484f5354;
         required.add(Inventory::Domain::host_metadata,1,bytes);
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(!physical_bound_)throw std::logic_error("logical host reservation requires bound authority");
         auto next=physical_resources_;
         Inventory::Allocation allocation;
@@ -381,7 +397,7 @@ public:
         return retire_logical_host_impl<true>(lease,std::forward<Attach>(attach));
     }
     template<bool Deferred,class Retire> bool retire_logical_host_impl(LogicalHostLease& lease,Retire&& retire) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(lease.authority_!=this || !lease.allocation_.owner)
             throw std::invalid_argument("logical host retirement stale authority");
         auto next=physical_resources_.without_allocation(lease.allocation_);
@@ -436,7 +452,7 @@ public:
     template<class Factory,class Rollback,class Observe=std::nullptr_t> void allocate_startup_resources_growing(
         const Exl3ResourceInventory::Requirement& requirement,Factory&& factory,Rollback&& rollback,Observe&& observe=nullptr,
         Exl3HostResidentSet::ReservationExtent extent=Exl3HostResidentSet::ReservationExtent::exact) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(!physical_bound_ || !entries().empty() || resident_updates_)
             throw std::logic_error("startup reservation must precede admission");
         auto next=physical_resources_;
@@ -450,7 +466,7 @@ public:
             resident_.allocate_reserved_growing(requirement,[&](std::uint64_t configuration,auto&& extend) {
                 const auto grow=[&](const Exl3ResourceInventory::Requirement& next_requirement) {
                     extend(next_requirement);
-                    std::lock_guard state_lock(mutex_);constructor_ceiling_=next_requirement.units;
+                    std::lock_guard<std::mutex> state_lock(mutex_);constructor_ceiling_=next_requirement.units;
                 };
                 produced=std::forward<Factory>(factory)(configuration,grow);
                 next.append(produced); // prepare coordinator ownership before commit
@@ -510,7 +526,7 @@ public:
     template<class Factory,class Rollback,class Observe> void allocate_runtime_resources_impl(const Lease* lease,
         const std::shared_ptr<const void>& preparation_owner,const Exl3ResourceInventory::Requirement& requirement,
         Factory&& factory,Rollback&& rollback,Observe&& observe) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(!physical_bound_ || (!lease && (!preparation_owner || !preparation_owner.use_count())))throw std::logic_error("runtime resource authority unavailable");
         if(lease) {
             const auto& entry=find_locked(lease->ticket.request_id);
@@ -525,10 +541,10 @@ public:
         try {
             resident_.allocate_reserved(requirement,[&](std::uint64_t configuration) {
                 auto actual=[&] {
-                    {std::lock_guard scope_lock(mutex_);runtime_construction_state_=&constructor_state;}
+                    {std::lock_guard<std::mutex> scope_lock(mutex_);runtime_construction_state_=&constructor_state;}
                     struct Scope {
                         Exl3VeriCacheServingCoordinator& owner;
-                        ~Scope(){std::lock_guard scope_lock(owner.mutex_);owner.runtime_construction_state_=nullptr;}
+                        ~Scope(){std::lock_guard<std::mutex> scope_lock(owner.mutex_);owner.runtime_construction_state_=nullptr;}
                     } scope{*this};
                     return std::forward<Factory>(factory)(configuration);
                 }();
@@ -547,18 +563,18 @@ public:
         }
     }
     std::uint64_t owner_lifetime_metadata_bytes_for_test() const {
-        std::lock_guard lock(mutex_);return resident_.owner_lifetime_metadata_bytes_for_test();
+        std::lock_guard<std::mutex> lock(mutex_);return resident_.owner_lifetime_metadata_bytes_for_test();
     }
     static constexpr std::size_t runtime_host_source_metadata_bytes() noexcept {return bounded_shared_allocation_bytes<HostSourceTable>();}
     std::size_t runtime_host_source_storage_bytes() const {
-        std::lock_guard lock(mutex_);return host_sources_?runtime_host_source_metadata_bytes():0;
+        std::lock_guard<std::mutex> lock(mutex_);return host_sources_?runtime_host_source_metadata_bytes():0;
     }
     std::weak_ptr<const void> runtime_host_source_owner_for_test() const {
-        std::lock_guard lock(mutex_);return host_sources_;
+        std::lock_guard<std::mutex> lock(mutex_);return host_sources_;
     }
     void reserve_runtime_host_sources() {
         {
-            std::unique_lock lock(mutex_);require_open(lock);
+            std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
             if(host_sources_)return;
         }
         Exl3ResourceInventory::Requirement required;required.configuration=0x4853524345;
@@ -572,13 +588,13 @@ public:
                 &attach_bounded_retirement_credit<HostSourceTable,const void>});
             return actual;
         },[&]() noexcept {prepared.reset();});
-        std::lock_guard lock(mutex_);host_sources_=std::move(prepared);
+        std::lock_guard<std::mutex> lock(mutex_);host_sources_=std::move(prepared);
     }
     // Device fill cannot begin before these host ranges join the same old/new
     // residency union as request roots. Neither registry nor snapshots own fill.
     void bind_runtime_host_source(const Lease& lease,const std::shared_ptr<const void>& lifetime,
         const Exl3DevicePageKey& key) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         const auto& entry=find_locked(lease.ticket.request_id);
         if(!physical_bound_ || !host_sources_ || !entry.active || entry.generation!=lease.ticket.generation ||
            entry.acquisition!=lease.acquisition || entry.root!=lease.root ||
@@ -597,14 +613,14 @@ public:
                 throw std::logic_error("runtime host source already bound");
             if(slot==host_sources_->end() && it->lifetime.expired())slot=it;
         }
-        if(slot==host_sources_->end())throw Exl3ResourceReservationExhausted{};
+        if(slot==host_sources_->end())throw Exl3ResourceReservationExhausted(__FILE__,__LINE__);
         auto previous=*slot;*slot=std::move(prepared);
         try{replace_resident_locked({},0);}
         catch(...){*slot=std::move(previous);throw;}
     }
     template<class Retire> bool retire_runtime_resource(const Lease& lease,
         const Exl3ResourceInventory::Allocation& allocation,Retire&& retire) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         const auto& entry=find_locked(lease.ticket.request_id);
         if(!physical_bound_ || !entry.active || entry.generation!=lease.ticket.generation ||
             entry.acquisition!=lease.acquisition || entry.root!=lease.root)
@@ -634,7 +650,7 @@ public:
     }
     bool retire_runtime_metadata_to_lifetime_impl(const Lease* lease,const std::shared_ptr<const void>& preparation_owner,
         const Exl3ResourceInventory::Allocation& allocation) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(!physical_bound_ || (!lease && (!preparation_owner || !preparation_owner.use_count())))throw std::logic_error("metadata resource authority unavailable");
         if(lease) {
             const auto& entry=find_locked(lease->ticket.request_id);
@@ -653,7 +669,7 @@ public:
     RetainedDescriptorLedger::Ticket reserve_snapshot_metadata(const Lease* lease,
         const std::shared_ptr<const void>& preparation_owner,std::uint64_t bytes,
         bool exhaust_active_headroom_for_test=false) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(!physical_bound_ || (!lease && (!preparation_owner || !preparation_owner.use_count())))
             throw std::logic_error("snapshot metadata reservation authority unavailable");
         if(lease) {
@@ -671,7 +687,7 @@ public:
         return resident_.reserve_host_metadata_lifetime(bytes);
     }
     RetainedHostAllocationLedger::Ticket reserve_snapshot_payload(const Lease& lease,std::uint64_t bytes) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         const auto& entry=find_locked(lease.ticket.request_id);
         if(!physical_bound_ || !entry.active || entry.generation!=lease.ticket.generation ||
             entry.acquisition!=lease.acquisition || entry.root!=lease.root)
@@ -684,7 +700,7 @@ public:
     // backing directly just like a post-acquisition snapshot ticket.
     RetainedHostAllocationLedger::Ticket reserve_preparation_payload(
         const std::shared_ptr<const void>& preparation_owner,std::uint64_t bytes) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(!physical_bound_ || !preparation_owner || !preparation_owner.use_count())
             throw std::logic_error("media preparation payload authority unavailable");
         return resident_.reserve_host_payload_lifetime(bytes);
@@ -694,7 +710,7 @@ public:
     // must never be passed to the typed identity predicate.
     void track_snapshot_payload(const Lease& lease,const std::shared_ptr<const void>& owner,
         std::size_t plane,const void* data,std::size_t bytes) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         const auto& entry=find_locked(lease.ticket.request_id);
         if(!physical_bound_ || !entry.active || entry.generation!=lease.ticket.generation ||
             entry.acquisition!=lease.acquisition || entry.root!=lease.root)
@@ -707,7 +723,7 @@ public:
     }
     void transfer_retired_metadata(const Lease& lease,const Exl3ResourceInventory::Allocation& expected,
         const Exl3ResourceInventory::Allocation& tracking) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         const auto& entry=find_locked(lease.ticket.request_id);
         if(!physical_bound_ || !entry.active || entry.generation!=lease.ticket.generation ||
             entry.acquisition!=lease.acquisition || entry.root!=lease.root)
@@ -718,7 +734,7 @@ public:
     }
     bool collect_retired_metadata(const Lease& lease,const Exl3ResourceInventory::Allocation& tracking,
         const std::weak_ptr<const void>& retired) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         const auto& entry=find_locked(lease.ticket.request_id);
         if(!physical_bound_ || !entry.active || entry.generation!=lease.ticket.generation ||
             entry.acquisition!=lease.acquisition || entry.root!=lease.root)
@@ -730,7 +746,7 @@ public:
     // One-shot source-test seam; no callback can reenter the coordinator mutex.
     // Invalid requests do not consume it; the next real residency transition does.
     void fail_next_residency_for_test(ResidencyFault fault) {
-        std::unique_lock lock(mutex_);require_open(lock);residency_fault_=fault;
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);residency_fault_=fault;
     }
 
     std::vector<Ticket> admit_batch(
@@ -750,7 +766,7 @@ public:
         if(roots.size()!=tickets.size())
             throw std::invalid_argument("serving coordinator admission output extent");
         for (const auto& root : roots) validate_root(root);
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         if (roots.size() > policy_.logical_capacity - entries().size())
             throw std::runtime_error("serving coordinator logical capacity exhausted");
@@ -793,7 +809,7 @@ public:
     }
 
     std::optional<Lease> acquire() {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         if (active_ >= policy_.physical_capacity || queue().empty()) return {};
         const auto id = queue().front();
@@ -809,8 +825,124 @@ public:
         return Lease{Ticket{entry.id, entry.generation}, entry.root, entry.acquisition};
     }
 
+    // The caller must already own the physical lane. Reserve all logical
+    // suffix storage before invalidating its ordinary host Lease.
+    DeviceLogicalLease enter_device_logical(const Lease& lease,
+        std::shared_ptr<const void> physical_owner,int initial_frontier,
+        std::size_t output_token_capacity,int max_context) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        require_open(lock);
+        auto& entry=require_lease_locked(lease);
+        if(!physical_owner || max_context<=0 ||
+           !entry.root->state()->native_extent_valid(max_context) ||
+           initial_frontier!=entry.root->state()->position() ||
+           initial_frontier<0 || initial_frontier>max_context ||
+           output_token_capacity==0 ||
+           output_token_capacity>static_cast<std::size_t>(
+               max_context-initial_frontier))
+            throw std::invalid_argument("serving coordinator device logical entry extent/owner");
+        if(entry.generation==UINT64_MAX)
+            throw std::overflow_error("serving coordinator device logical generation exhausted");
+        std::vector<std::int64_t> suffix;
+        suffix.reserve(output_token_capacity);
+        DeviceLogicalLease result{
+            Ticket{entry.id,entry.generation+1},entry.root,
+            physical_owner,entry.acquisition,initial_frontier};
+        entry.device_suffix=std::move(suffix);
+        entry.device_owner=std::move(physical_owner);
+        entry.device_initial_frontier=initial_frontier;
+        entry.device_capacity=output_token_capacity;
+        entry.device_mode=true;
+        ++entry.generation;
+        return result;
+    }
+
+    // The verified numerical operation and any rollback are caller-owned.
+    // This critical section only commits its ordered token result. No host
+    // child or resident-set update is made for an intermediate window.
+    DeviceLogicalPublication publish_device_logical_window(
+        const DeviceLogicalLease& lease,std::span<const std::int64_t> tokens) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        require_open(lock);
+        auto& entry=require_device_logical_lease_locked(lease);
+        if(tokens.empty() || tokens.size()>128 ||
+           tokens.size()>entry.device_capacity-entry.device_suffix.size() ||
+           std::any_of(tokens.begin(),tokens.end(),
+               [](std::int64_t token){return token<0;}))
+            throw std::invalid_argument("serving coordinator device logical window tokens/extent");
+        if(entry.generation==UINT64_MAX || entry.publications==UINT64_MAX ||
+           publications_==UINT64_MAX || next_publication_sequence_==UINT64_MAX)
+            throw std::overflow_error("serving coordinator device logical publication exhausted");
+        DeviceLogicalPublication result{
+            DeviceLogicalLease{Ticket{entry.id,entry.generation+1},
+                entry.root,entry.device_owner,entry.acquisition,
+                lease.frontier+static_cast<int>(tokens.size())},
+            entry.device_suffix.size()+tokens.size(),next_publication_sequence_};
+        // Capacity was reserved on entry. Inserting trivial token values does
+        // not allocate; all validation and result construction precedes it.
+        entry.device_suffix.insert(entry.device_suffix.end(),tokens.begin(),tokens.end());
+        ++entry.generation;
+        ++entry.publications;
+        ++publications_;
+        ++next_publication_sequence_;
+        return result;
+    }
+
+    // The caller supplies a fully prepared immutable exact host child. Only
+    // after its lineage and entire accumulated suffix match do we replace the
+    // initial resident root once and restore an ordinary host Lease.
+    Lease materialize_device_logical(const DeviceLogicalLease& lease,
+        std::shared_ptr<const Exl3VeriCacheRequest> child) {
+        validate_root(child);
+        std::unique_lock<std::mutex> lock(mutex_);
+        require_open(lock);
+        auto& entry=require_device_logical_lease_locked(lease);
+        if(entry.generation==UINT64_MAX || entry.publications==UINT64_MAX ||
+           publications_==UINT64_MAX || next_publication_sequence_==UINT64_MAX)
+            throw std::overflow_error("serving coordinator device logical materialization exhausted");
+        if(entry.device_suffix.empty() || !child->is_child_of(*entry.root) ||
+           child->state()->model_identity()!=entry.root->state()->model_identity() ||
+           child->state()->position()!=lease.frontier ||
+           child->token_suffix(entry.device_initial_frontier)!=entry.device_suffix)
+            throw std::invalid_argument("serving coordinator device logical child lineage/tokens");
+        const std::array<std::pair<std::uint64_t,
+            std::shared_ptr<const Exl3VeriCacheRequest>>,1> replacement{{{entry.id,child}}};
+        (void)replace_resident_locked(replacement,0);
+        entry.root=std::move(child);
+        entry.device_owner.reset();
+        std::vector<std::int64_t>{}.swap(entry.device_suffix);
+        entry.device_initial_frontier=0;
+        entry.device_capacity=0;
+        entry.device_mode=false;
+        ++entry.generation;
+        ++entry.publications;
+        ++publications_;
+        ++next_publication_sequence_;
+        return Lease{Ticket{entry.id,entry.generation},entry.root,entry.acquisition};
+    }
+
+    // Active logical cancellation is allowed only after the physical worker
+    // has finished or rolled back its operation. The initial root is removed
+    // from residency by the same one-shot cancellation path as host leases.
+    void cancel_device_logical(const DeviceLogicalLease& lease,
+        bool worker_complete) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        require_open(lock);
+        auto& entry=require_device_logical_lease_locked(lease);
+        if(!worker_complete)
+            throw std::logic_error("serving coordinator device logical cancellation needs worker boundary");
+        const auto id=entry.id;
+        (void)replace_resident_locked(std::span<const std::pair<std::uint64_t,
+            std::shared_ptr<const Exl3VeriCacheRequest>>>{},id);
+        --active_;
+        entries().erase(std::find_if(entries().begin(),entries().end(),
+            [&](const Entry& candidate){return candidate.id==id;}));
+        ++cancellations_;
+        if(entries().empty())model_identity_.reset();
+    }
+
     void yield(const Lease& lease) {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         auto& entry = require_lease_locked(lease);
         if(queue().size()==queue().capacity())
@@ -840,7 +972,7 @@ public:
         if (leases.empty() || leases.size() != roots.size() ||
             leases.size() != tokens.size() || leases.size()!=output.size())
             throw std::invalid_argument("serving coordinator publication extent");
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         if (leases.size() > policy_.physical_capacity)
             throw std::invalid_argument("serving coordinator publication exceeds physical capacity");
@@ -899,13 +1031,13 @@ public:
     // Coherent read-only acquisition snapshot for bounded shared compute.
     // Caller still owns the physical lanes; this never authorizes publication.
     bool compute_leases_current(std::span<const Lease> leases) const {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if(closed_ || leases.empty() || leases.size()>policy_.physical_capacity) return false;
         for(std::size_t i=0;i<leases.size();++i) {
             const auto& lease=leases[i];
             for(std::size_t j=0;j<i;++j) if(leases[j].ticket.request_id==lease.ticket.request_id) return false;
             const auto found=std::find_if(entries().begin(),entries().end(),[&](const Entry& e){return e.id==lease.ticket.request_id;});
-            if(found==entries().end() || !found->active || found->generation!=lease.ticket.generation ||
+            if(found==entries().end() || found->device_mode || !found->active || found->generation!=lease.ticket.generation ||
                found->acquisition!=lease.acquisition || found->root!=lease.root) return false;
         }
         return true;
@@ -921,7 +1053,7 @@ public:
         // thinking-control sequences can span several native calls.
         if (tokens.empty() || tokens.size() > 128)
             throw std::invalid_argument("serving coordinator window extent");
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         auto& entry = require_lease_locked(lease);
         if (!root->is_child_of(*entry.root) ||
@@ -948,7 +1080,7 @@ public:
     // rolled back its numerical operation. The generation-stamped lease then
     // becomes stale and cannot publish a late result.
     void cancel(Ticket ticket, bool worker_complete = false) {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         auto it = std::find_if(entries().begin(), entries().end(),
             [&](const Entry& entry) { return entry.id == ticket.request_id; });
@@ -967,7 +1099,7 @@ public:
     }
 
     void complete(const Lease& lease) {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         auto& entry = require_lease_locked(lease);
         const auto id = entry.id;
@@ -1001,7 +1133,7 @@ public:
     Turnover complete_and_admit(const Lease& lease,
         std::shared_ptr<const Exl3VeriCacheRequest> root) {
         validate_root(root);
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         require_open(lock);
         auto& retired = require_lease_locked(lease);
         if (root->state()->model_identity() != model_identity_)
@@ -1040,7 +1172,7 @@ public:
     Exl3VeriCachePrefixIndex::PolicyTrim trim_prefix_retention(
         std::uint64_t available_physical_bytes,
         std::span<const Exl3VeriCachePrefixIndex::RetentionDecision> supplied) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(supplied.size()>64)
             throw std::invalid_argument("coordinator retention decision bound exceeded");
         std::array<Exl3VeriCachePrefixIndex::RetentionDecision,64> decisions{};
@@ -1061,7 +1193,7 @@ public:
         std::shared_ptr<const Exl3VeriCacheRequest> root,
         std::span<const std::int64_t> input,std::uint64_t available_physical_bytes,
         std::span<const Exl3VeriCachePrefixIndex::RetentionDecision> supplied) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(supplied.size()>64)
             throw std::invalid_argument("coordinator retention decision bound exceeded");
         std::array<Exl3VeriCachePrefixIndex::RetentionDecision,64> decisions{};
@@ -1075,13 +1207,13 @@ public:
     }
 
     std::uint64_t tighten_metadata_headroom_for_test(std::uint64_t headroom) {
-        std::unique_lock lock(mutex_);require_open(lock);
+        std::unique_lock<std::mutex> lock(mutex_);require_open(lock);
         if(!physical_bound_ || active_ || !entries().empty() || allocating_)
             throw std::logic_error("metadata ceiling requires idle bound coordinator");
         return resident_.tighten_metadata_headroom_for_test(headroom);
     }
     Stats stats() const {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         const bool unresolved=startup_retirement_failed_.load(std::memory_order_acquire);
         return Stats{queue().size(), active_, entries().size(),
             policy_.logical_capacity, policy_.physical_capacity,
@@ -1093,19 +1225,19 @@ public:
                 std::optional<Exl3ResourceInventory::Totals>{resident_.retained_resource_units()},closing_started_ && !closed_,unresolved};
     }
     std::vector<Exl3ResourceInventory::Attribution> resource_attribution_for_test() const {
-        std::lock_guard lock(mutex_);return physical_resources_.attribution_snapshot();
+        std::lock_guard<std::mutex> lock(mutex_);return physical_resources_.attribution_snapshot();
     }
     std::size_t high_queued() const {
-        std::unique_lock lock(mutex_); return high_queued_;
+        std::unique_lock<std::mutex> lock(mutex_); return high_queued_;
     }
     std::size_t queue_capacity_for_test() const {
-        std::unique_lock lock(mutex_);return queue().capacity();
+        std::unique_lock<std::mutex> lock(mutex_);return queue().capacity();
     }
     std::size_t high_active() const {
-        std::unique_lock lock(mutex_); return high_active_;
+        std::unique_lock<std::mutex> lock(mutex_); return high_active_;
     }
     std::size_t high_admitted() const {
-        std::unique_lock lock(mutex_); return high_admitted_;
+        std::unique_lock<std::mutex> lock(mutex_); return high_admitted_;
     }
 
     // A failed factory may retain allocations outside the rolled-back inventory.
@@ -1115,7 +1247,7 @@ public:
         resident_.seal_external_retirement_failure();
     }
     void close() {
-        std::unique_lock lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if (closed_) return;
         require_open(lock,true);
         if (active_ != 0)
@@ -1137,6 +1269,11 @@ private:
         std::uint64_t publications = 0;
         std::shared_ptr<const Exl3VeriCacheRequest> root;
         std::uint64_t acquisition = 0;
+        bool device_mode = false;
+        std::shared_ptr<const void> device_owner;
+        int device_initial_frontier = 0;
+        std::size_t device_capacity = 0;
+        std::vector<std::int64_t> device_suffix;
     };
 
     static void validate_root(
@@ -1182,9 +1319,24 @@ private:
     }
     Entry& require_lease_locked(const Lease& lease) {
         auto& entry = find_locked(lease.ticket.request_id);
-        if (!entry.active || entry.generation != lease.ticket.generation ||
+        if (entry.device_mode || !entry.active || entry.generation != lease.ticket.generation ||
             entry.root != lease.root || entry.acquisition != lease.acquisition)
             throw std::invalid_argument("serving coordinator stale lease");
+        return entry;
+    }
+    Entry& require_device_logical_lease_locked(const DeviceLogicalLease& lease) {
+        auto& entry=find_locked(lease.ticket.request_id);
+        const auto& owner=lease.physical_owner;
+        const auto& held=entry.device_owner;
+        if(!entry.device_mode || !entry.active ||
+           entry.generation!=lease.ticket.generation ||
+           entry.acquisition!=lease.acquisition ||
+           entry.root!=lease.initial_root || !owner || !held ||
+           owner.get()!=held.get() || owner.owner_before(held) ||
+           held.owner_before(owner) ||
+           lease.frontier!=entry.device_initial_frontier+
+               static_cast<int>(entry.device_suffix.size()))
+            throw std::invalid_argument("serving coordinator stale device logical lease");
         return entry;
     }
     static void require_retirement(const Lease& lease,

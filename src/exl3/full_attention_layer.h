@@ -1,6 +1,8 @@
 #pragma once
 
 #include "exl3/linear_cuda.h"
+#include "exl3/sibling_rows.h"
+#include "exl3/l0_oscar_storage.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/attention_page_ranges.h"
 #include "exl3/attention_position_contract.h"
@@ -21,6 +23,9 @@
 #include <stdexcept>
 
 namespace ninfer::exl3 {
+// NINFER_EXL3_FA2_PREFILL (default 1): FA2-style prefill attention route.
+bool exl3_fa2_prefill_enabled();
+
 struct Exl3PrefillQkvConcurrencyView {
     cudaStream_t k_stream = nullptr;
     cudaStream_t v_stream = nullptr;
@@ -168,6 +173,7 @@ exl3_prefill_attention_shared_score_global_snapshot() noexcept;
 // FP16-KV fused-flash candidate.  The counter records submitted launches and
 // does not by itself establish numerical or completion validity.
 std::uint64_t exl3_fast_fused_flash_attention_calls_for_test() noexcept;
+std::uint64_t exl3_fast_fused_flash_multirow_attention_calls_for_test() noexcept;
 
 // Process-wide real-caller dispatch seam for the separately gated native
 // whole-context FP16-KV fused attention candidate.  The counter records one
@@ -253,6 +259,10 @@ struct Exl3FullAttentionLayerTimings {
 
 class Exl3FullAttentionLayer {
 public:
+    // Weights of the next layer's first projection, prefetched into L2 on a
+    // side branch before this layer's down projection (M1 decode).
+    void set_next_layer_prefetch(const std::uint16_t* trellis) noexcept { next_layer_prefetch_ = trellis; }
+    const std::uint16_t* first_projection_trellis() const noexcept { return weights_.q.trellis; }
     static std::size_t shared_scratch_bytes(int rows,bool coalesce_input_mlp=false);
     Exl3FullAttentionLayer(const Exl3FullAttentionLayerWeights& weights,
                             int max_rows = 16, Exl3CudaAccumulationView accumulation = {}, Exl3CudaTransformView transformed = {},
@@ -633,10 +643,37 @@ public:
         numeric_attention_splitk_workspace_bytes_=workspace_bytes;
         numeric_attention_splitk_=enabled;
     }
+    // capacity_splits: FP32 partial planes allocated (the FA2 prefill route
+    // needs four); split_count: the WMMA32 route's split (0 when unselected).
+    void set_fast_wmma32_split2_workspace(float* output,float* stats,
+                                           int capacity_rows,int split_count,
+                                           int capacity_splits) noexcept {
+        fast_wmma32_split2_output_=output;
+        fast_wmma32_split2_stats_=stats;
+        fast_wmma32_split2_capacity_rows_=capacity_rows;
+        fast_wmma32_split_count_=split_count;
+        fast_wmma32_split2_capacity_splits_=capacity_splits;
+    }
 
     // Decode-only graph path: kernels read the current position through this
     // stable device pointer instead of a captured host scalar.
     void set_position_device(const int* position_device) noexcept;
+    // L0 OSCAR: after the host K/V planes were restored to `position`, reload
+    // the device window (sink and recent rows) and re-encode the history.
+    void l0_refresh_window(int position, cudaStream_t stream);
+    // Parks / reinstalls the encoded INT2 history (rows [0, watermark)).
+    // Export returns the watermark; import follows l0_refresh_window.
+    int l0_history_watermark(cudaStream_t stream) const;
+    // Rows [first, first + rows): codes K then V ([rows][4][64] each), FP16
+    // meta K then V ([rows][4][4] each).
+    void l0_download_history(int first, int rows, std::uint8_t* codes, std::uint16_t* meta,
+                             cudaStream_t stream) const;
+    void l0_upload_history(int first, int rows, const std::uint8_t* codes,
+                           const std::uint16_t* meta, cudaStream_t stream);
+    void l0_set_history_watermark(int rows, int position, cudaStream_t stream);
+    // K/V cache rows an accepted sibling carries into its chain slot.
+    void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,
+                                   int destination) const;
     // Research media phases only. Causal/cache positions keep their original
     // logical cursor; these coordinates affect the rotary phase exclusively.
     void set_mrope_positions(const int* rows_xyz,int offset) noexcept {
@@ -847,6 +884,7 @@ private:
         bool wide_prefill,cudaEvent_t* starts,cudaEvent_t* ends);
     void ensure_fast_cublas_attention_resources(int capacity);
     Exl3FullAttentionLayerWeights weights_{};
+    const std::uint16_t* next_layer_prefetch_ = nullptr;
     int max_rows_ = 0;
     std::size_t workspace_bytes_ = 0;
     std::array<std::uint16_t*, 18> buffers_{};
@@ -855,6 +893,11 @@ private:
     std::array<Exl3CudaLinearWorkspace*, 7> linear_workspaces_{};
     Exl3CudaReconstructGemmWorkspace* reconstruct_gemm_ = nullptr;
     std::uint16_t* k_cache_ = nullptr;
+    // KV-tier fidelity research (kv_fakequant.cuh): aged-row watermark and rotation bank.
+    int* fakequant_watermark_ = nullptr;
+    // L0 OSCAR INT2 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
+    l0_oscar::LayerStorage l0_{};
+    int fakequant_bank_ = 0;
     std::uint16_t* v_cache_ = nullptr;
     int cache_capacity_ = 0;
     std::uint16_t* direct_staged_k_=nullptr;
@@ -940,6 +983,7 @@ private:
     std::uint64_t gqa_six_score_k_tile64_row_attempts_=0;
     bool fast_fused_flash_attention_ = false;
     bool fast_fused_flash_attention_keys256_ = false;
+    bool fast_fused_flash_multirow_ = false;
     bool fast_whole_context_fused_attention_ = false;
     bool fast_prefill_tiled_attention_ = false;
     bool fast_prefill_rows4_attention_ = false;
@@ -947,6 +991,11 @@ private:
     bool fast_prefill_rows8_threads128_ = false;
     bool fast_prefill_wmma_attention_ = false;
     bool fast_prefill_wmma32_attention_ = false;
+    bool fast_prefill_wmma64_attention_ = false;
+    bool fast_prefill_wmma64_register_attention_ = false;
+    bool fast_prefill_wmma64_register_keys64_attention_ = false;
+    bool fast_prefill_wmma64_shared_heads_attention_ = false;
+    bool fast_prefill_wmma32_padded_attention_ = false;
     bool fast_prefill_rows2_attention_ = false;
     bool fast_online_decode_attention_ = false;
     bool fast_online_decode_attention_warp_heads_ = false;
@@ -964,6 +1013,11 @@ private:
     float* numeric_attention_splitk_workspace_ = nullptr;
     std::size_t numeric_attention_splitk_workspace_bytes_ = 0;
     bool numeric_attention_splitk_ = false;
+    float* fast_wmma32_split2_output_ = nullptr;
+    float* fast_wmma32_split2_stats_ = nullptr;
+    int fast_wmma32_split2_capacity_rows_ = 0;
+    int fast_wmma32_split_count_ = 0;
+    int fast_wmma32_split2_capacity_splits_ = 0;
     const int* position_device_ = nullptr;
     const int* mrope_positions_ = nullptr;
     int rope_offset_ = 0;

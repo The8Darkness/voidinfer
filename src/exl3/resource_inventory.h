@@ -17,6 +17,8 @@ namespace ninfer::exl3 {
 class Exl3ResourceReservationExhausted : public std::runtime_error {
 public:
     Exl3ResourceReservationExhausted():std::runtime_error("resource allocation reservation exhausted"){}
+    Exl3ResourceReservationExhausted(const char* file,int line):std::runtime_error(
+        std::string("resource allocation reservation exhausted at ")+file+":"+std::to_string(line)){}
 };
 // Payload declarations supplied by allocation owners, never sampled device
 // memory. Windows page locking is still exclusively owned by HostResidentSet.

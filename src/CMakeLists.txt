@@ -80,7 +80,7 @@ ninfer_cuda_archive(ninfer_exl3_cuda)
 target_include_directories(ninfer_exl3_cuda PUBLIC
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_exl3_cuda PUBLIC ninfer_exl3_oscar ${NINFER_CUDART_TARGET}
-  PRIVATE CUDA::cublas)
+  PRIVATE CUDA::cublas CUDA::cublasLt)
 
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas

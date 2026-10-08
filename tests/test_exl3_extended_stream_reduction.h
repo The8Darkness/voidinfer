@@ -72,27 +72,16 @@ void capture_target_k6_small_m_async_inputs(
         capture_target_k6_projection(item,user);
 }
 
-class TargetK6SmallMAsyncEnvironmentRestore {
-public:
-    TargetK6SmallMAsyncEnvironmentRestore()
-        : stream_(env("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION")),
-          async_(env("NINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A")),
-          k7_async_(env("NINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A")) {}
-    ~TargetK6SmallMAsyncEnvironmentRestore() {
-        _putenv_s("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",stream_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A",async_.c_str());
-        _putenv_s("NINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A",k7_async_.c_str());
-    }
-private:
-    std::string stream_,async_,k7_async_;
-};
 
 void run_target_k6_small_m_async_qualification(
     Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& prompt,std::ostream& out) {
     using namespace ninfer::exl3;
     require(prompt.size()==512,"target K6 small-M async-A requires ctx512");
-    TargetK6SmallMAsyncEnvironmentRestore restore;
+    ninfer::test::ScopedEnvironmentRestore restore{
+        "NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",
+        "NINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A",
+        "NINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A"};
     TapStage stage;
     for(int tap=0;tap<kTapCount;++tap) {
         stage.bulk.push_back(std::make_unique<DeviceBuffer>(

@@ -101,9 +101,11 @@ void check_ring_attention_case(const RingAttentionInput& x, const std::string& n
         std::vector<std::uint16_t> values(got.begin() + guard, got.end() - guard);
         require(std::all_of(values.begin(), values.end(), [](auto h) { return std::isfinite(half_to_float(h)); }),
                 "ring nonfinite output");
+        const bool split = parallel && ninfer::exl3::dflash2_ring_attention_split_for_test(x.count);
         if (!parallel) serial = values;
-        else require(values == serial, "ring original-GPU bitwise mismatch: " + name);
-        if (production) require(values == *production, "ring actual production output mismatch");
+        else if (!split) require(values == serial, "ring original-GPU bitwise mismatch: " + name);
+        if (production && parallel)
+            require(values == *production, "ring actual production output mismatch");
         const auto error = ring_attention_cpu_check(x, values);
         max_error = std::max(max_error, error.first); max_ratio = std::max(max_ratio, error.second);
     }
