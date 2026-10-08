@@ -23,7 +23,21 @@ struct Exl3NativeContextExtent {
     // history plus exact windows on the device (l0_oscar.cuh).
     static constexpr std::uint32_t l0_oscar_tokens = 262144;
     // L0 OSCAR per-row buffers (hidden states, taps) hold one layer-major prefill block.
-    static constexpr int l0_prefill_block_rows = 8192;
+    static constexpr int l0_prefill_block_rows_max = 8192;
+    // Rows of one layer-major L0 prompt block (NINFER_EXL3_L0_PREFILL_BLOCK_ROWS,
+    // 2048..8192 in steps of 1024, default 8192). Per-context row buffers (hidden,
+    // taps, embedding trace) are sized by it; concurrent lanes trade a little
+    // prefill speed for that memory.
+    static int l0_prefill_block_rows() {
+        static const int rows=[] {
+            const char* value=std::getenv("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS");
+            const int parsed=value?std::atoi(value):l0_prefill_block_rows_max;
+            if(parsed<2048 || parsed>l0_prefill_block_rows_max || parsed%1024)
+                throw std::invalid_argument("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS must be 2048..8192 in steps of 1024");
+            return parsed;
+        }();
+        return rows;
+    }
     static bool l0_oscar_enabled() { return exl3_l0_oscar_enabled(); }
     static constexpr std::uint64_t exact_kv_bytes_per_token = 65536;
     static constexpr std::uint32_t exact_kv_page_tokens = 64;

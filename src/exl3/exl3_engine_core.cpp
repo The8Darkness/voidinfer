@@ -473,6 +473,15 @@ struct Exl3EngineCore::Impl {
         coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
         if(coherent_device)require_coherent_device_profile(value);
         else require_exact_profile();
+        if(coherent_device && value.max_concurrency==2) {
+            // Two resident lanes: halve the per-context L0 prompt-block row
+            // buffers and let exclusive prompt ingestion use a smaller
+            // layer-major reserve, so both lanes keep the fast prefill.
+            if(!std::getenv("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS"))
+                _putenv_s("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS","4096");
+            if(!std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
+                _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","256");
+        }
         const auto flag=[](const char* name) {
             const auto* value=std::getenv(name);
             if(value && std::string_view(value)!="0" && std::string_view(value)!="1")
@@ -2104,8 +2113,9 @@ struct Exl3EngineCore::Impl {
                 ~BatchedLane() {
                     if(!coordinator)return;
                     coordinator->set_active(false);
-                    if(std::getenv("NINFER_EXL3_BATCHED_STATS"))std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu solo=%llu\n",
-                        static_cast<unsigned long long>(coordinator->batched_rounds()),static_cast<unsigned long long>(coordinator->solo_rounds()));
+                    if(std::getenv("NINFER_EXL3_BATCHED_STATS"))std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu eager=%llu solo=%llu timeouts=%llu wait_ms=%.1f\n",
+                        static_cast<unsigned long long>(coordinator->batched_rounds()),static_cast<unsigned long long>(coordinator->eager_rounds()),static_cast<unsigned long long>(coordinator->solo_rounds()),
+                        static_cast<unsigned long long>(coordinator->timeouts()),coordinator->wait_us()/1000.0);
                 }
             } batched_lane(batched_verify.get());
             round=std::make_unique<Exl3FastDeviceRound>(context,draft,
@@ -2184,6 +2194,11 @@ struct Exl3EngineCore::Impl {
                             static_cast<std::uint8_t>(settled.verification.accepted));
                         continue;
                     }
+                    // Verifier and fix passes use the process-wide prompt-scale
+                    // scratch: they run alone on the device like ingestion.
+                    round_lock.unlock();
+                    std::unique_lock verify_lock(coherent_prefill_mutex);
+                    if(options.max_concurrency>1)check(cudaDeviceSynchronize());
                     const auto verified=round->verify(unverified,vericache.delta);
                     unverified.clear();
                     terminal_seen=false;
@@ -2249,7 +2264,11 @@ struct Exl3EngineCore::Impl {
                     if(finished)break;
                 }
                 // Unverified drafted tokens (cancellation) are never published: rewind.
-                if(round->frontier()!=round->verified_frontier())round->commit_verification({});
+                if(round->frontier()!=round->verified_frontier()) {
+                    std::unique_lock rewind_lock(coherent_prefill_mutex);
+                    if(options.max_concurrency>1)check(cudaDeviceSynchronize());
+                    round->commit_verification({});
+                }
                 if(std::getenv("NINFER_EXL3_VERICACHE_STATS")) {
                     const auto& t=round->totals();
                     std::fprintf(stderr,"VERICACHE blocks=%llu corrected=%llu verify_ms=%.1f block=%d delta=%.3f "

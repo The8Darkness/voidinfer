@@ -1698,7 +1698,7 @@ struct Exl3TextContext::Impl {
         const auto row_storage=static_cast<std::size_t>(
             (host_kv.enabled || oscar_only) ? prefill_capacity :
                 (Exl3NativeContextExtent::l0_oscar_enabled() ?
-                    std::min<int>(max_context,Exl3NativeContextExtent::l0_prefill_block_rows) : max_context));
+                    std::min<int>(max_context,Exl3NativeContextExtent::l0_prefill_block_rows()) : max_context));
         const auto hidden_bytes=row_storage*static_cast<std::size_t>(kHidden)*
             sizeof(std::uint16_t);
         const auto add=[&](const void* address,std::size_t bytes) noexcept {
@@ -4763,7 +4763,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     // L0 OSCAR contexts prefill in bounded chunks: per-row buffers hold one chunk.
     const int row_storage=(impl->host_kv.enabled || impl->oscar_only) ? impl->prefill_capacity :
         (Exl3NativeContextExtent::l0_oscar_enabled() ?
-            std::min<int>(max_context_,Exl3NativeContextExtent::l0_prefill_block_rows) : max_context_);
+            std::min<int>(max_context_,Exl3NativeContextExtent::l0_prefill_block_rows()) : max_context_);
     require(row_storage>0,"target context storage rows must be positive");
     const auto checked_extent=[&](std::size_t bytes_per_row) {
         Exl3ResourceInventory::Requirement required;
@@ -8274,6 +8274,20 @@ void Exl3TextContext::continue_rows_for_verification(
     else continue_rows(token_ids,stream);
 }
 
+// Free-memory reserve kept beside the layer-major projection cache of L0 OSCAR
+// contexts (NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB, default 1024). Concurrent
+// Engine lanes ingest prompts exclusively, so a smaller reserve is safe there.
+static std::size_t l0_layer_major_reserve_bytes() {
+    static const std::size_t bytes=[] {
+        const char* value=std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB");
+        const long mib=value?std::atol(value):1024;
+        if(mib<64 || mib>8192)
+            throw std::invalid_argument("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB must be 64..8192");
+        return static_cast<std::size_t>(mib)*1024*1024;
+    }();
+    return bytes;
+}
+
 bool Exl3TextContext::l0_layer_major_headroom() const {
     // Mirrors the projection-cache admission of the layer-major schedule for
     // L0 OSCAR contexts (1 GiB reserve plus a 256 MiB minimum cache).
@@ -8286,7 +8300,8 @@ bool Exl3TextContext::l0_layer_major_headroom() const {
     cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes),"query layer-major headroom");
     const std::size_t existing=impl_->numeric_prefill_projection_workspace?
         impl_->numeric_prefill_projection_workspace->stats().cached_weight_capacity_bytes:0;
-    constexpr std::size_t reserve=1024ull*1024*1024,minimum_cache=256ull*1024*1024;
+    const std::size_t reserve=l0_layer_major_reserve_bytes();
+    constexpr std::size_t minimum_cache=256ull*1024*1024;
     return free_bytes>=reserve && existing+free_bytes-reserve>=minimum_cache;
 }
 
@@ -8318,7 +8333,7 @@ void Exl3TextContext::append_prefill_layer_major(
                 first += static_cast<std::size_t>(take);
             }
         };
-        constexpr std::size_t block=Exl3NativeContextExtent::l0_prefill_block_rows;
+        const std::size_t block=static_cast<std::size_t>(Exl3NativeContextExtent::l0_prefill_block_rows());
         // Equal blocks of at most `block` rows: every block of a multi-block
         // suffix exceeds block / 2 rows, so the last one holds the tap tail.
         const std::size_t total=token_ids.size();
@@ -8405,7 +8420,7 @@ void Exl3TextContext::append_prefill_layer_major(
     // L0 OSCAR contexts already hold their KV history in compact device codes
     // and the FP16 planes in host memory: a 1 GiB reserve covers the rest.
     const std::size_t reserve_bytes=Exl3NativeContextExtent::l0_oscar_enabled()?
-        1024ull*1024*1024:fast_device_kv_transaction_enabled()?
+        l0_layer_major_reserve_bytes():fast_device_kv_transaction_enabled()?
         1536ull*1024*1024:2ull*1024*1024*1024;
     constexpr std::size_t cache_limit=1536ull*1024*1024;
     constexpr std::size_t minimum_cache=256ull*1024*1024;
@@ -9476,6 +9491,7 @@ void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
         // Replay bypasses the host-side retained-prefix arming of the eager
         // forwards; reproduce it per agent exactly as the per-layer graphs do.
         graph->executable.launch(stream);
+        ++batched_graph_replays_;
         impl_->last_stack_output=graph->stack_output;
         for(int c=0;c<2;++c) {
             if(!arm_retained_prefix[c])continue;
@@ -9491,6 +9507,7 @@ void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
             }
         }
     } else {
+        ++batched_eager_forwards_;
         BatchBinding binding(*impl_,*peer.impl_,own_rows,peer_rows,base_positions[1],peer_stream);
         impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
             false,false,nullptr,0,kLayers,nullptr,nullptr,true);

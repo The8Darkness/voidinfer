@@ -38,8 +38,10 @@ struct Exl3VeriCacheConfig {
     static const Exl3VeriCacheConfig& get() {
         static const Exl3VeriCacheConfig value=[] {
             Exl3VeriCacheConfig c;
+            // Tolerance verification of L0 OSCAR output is the default whenever
+            // L0 is (NINFER_EXL3_VERICACHE=0 opts out).
             const char* mode=std::getenv("NINFER_EXL3_VERICACHE");
-            const std::string m=mode?mode:"0";
+            const std::string m=mode?mode:(exl3_l0_oscar_enabled()?"1":"0");
             if(m=="0"||m.empty()) return c;
             if(m!="1" && m!="tolerance" && m!="exact")
                 throw std::invalid_argument("NINFER_EXL3_VERICACHE must be 0, 1, tolerance or exact");

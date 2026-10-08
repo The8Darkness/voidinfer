@@ -55,9 +55,11 @@ public:
             std::exception_ptr error;
             try {
                 check(cudaStreamWaitEvent(stream, peer->ready, 0), "batched verify peer order");
+                const auto graphs_before = context.batched_graph_replays();
                 context.continue_rows_batched(*peer->context, tokens, peer->tokens, stream,
                                               peer->stream);
                 check(cudaEventRecord(peer->done, stream), "batched verify completion");
+                eager_ += context.batched_graph_replays() == graphs_before ? 1 : 0;
             } catch (...) {
                 error = std::current_exception();
             }
@@ -84,12 +86,16 @@ public:
         mine.done = events.done;
         check(cudaEventRecord(mine.ready, stream), "batched verify arrival");
         waiting_ = &mine;
+        const auto arrived = std::chrono::steady_clock::now();
         const auto deadline = std::chrono::steady_clock::now() + wait_;
         while (!mine.taken && active_ >= 2 &&
                changed_.wait_until(lock, deadline) != std::cv_status::timeout) {}
+        wait_us_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - arrived).count());
         if (!mine.taken) {
             if (waiting_ == &mine) waiting_ = nullptr;
             ++solo_;
+            ++timeouts_;
             lock.unlock();
             context.continue_rows(tokens, stream);
             return;
@@ -107,6 +113,18 @@ public:
     std::uint64_t solo_rounds() const {
         std::lock_guard lock(mutex_);
         return solo_;
+    }
+    std::uint64_t eager_rounds() const {
+        std::lock_guard lock(mutex_);
+        return eager_;
+    }
+    std::uint64_t timeouts() const {
+        std::lock_guard lock(mutex_);
+        return timeouts_;
+    }
+    std::uint64_t wait_us() const {
+        std::lock_guard lock(mutex_);
+        return wait_us_;
     }
 
 private:
@@ -143,7 +161,7 @@ private:
     std::map<const Exl3TextContext*, Events> events_;
     Pending* waiting_ = nullptr;
     int active_ = 0;
-    std::uint64_t batched_ = 0, solo_ = 0;
+    std::uint64_t batched_ = 0, solo_ = 0, timeouts_ = 0, wait_us_ = 0, eager_ = 0;
 };
 
 }  // namespace ninfer::exl3

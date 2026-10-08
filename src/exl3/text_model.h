@@ -1294,6 +1294,11 @@ private:
                                         cudaStream_t stream);
     std::unique_ptr<Impl> impl_;
     Exl3BatchedVerifyCoordinator* batched_verify_ = nullptr;
+public:
+    std::uint64_t batched_graph_replays() const noexcept { return batched_graph_replays_; }
+    std::uint64_t batched_eager_forwards() const noexcept { return batched_eager_forwards_; }
+private:
+    std::uint64_t batched_graph_replays_ = 0, batched_eager_forwards_ = 0;
     int position_ = 0;
     std::uint16_t* logits_ = nullptr;
     std::size_t persistent_bytes_ = 0;
