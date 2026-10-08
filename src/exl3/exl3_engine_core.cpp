@@ -489,6 +489,7 @@ struct Exl3EngineCore::Impl {
             // workspace serves every lane.
             if(!std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
                 _putenv_s("NINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
+
         }
         const auto flag=[](const char* name) {
             const auto* value=std::getenv(name);
@@ -1681,6 +1682,13 @@ struct Exl3EngineCore::Impl {
                 value.max_concurrency,mib(free_bytes));
             std::fputc(10,stderr);
         }
+        // The overlapped GDN retained-prefix repair (side stream) corrupts
+        // recurrent state under concurrent lanes (VeriCache corrections with
+        // 12-20 logit gaps at C3; clean when the repair replays in order on the
+        // target stream). Root cause open; C1 keeps the overlap.
+        if(coherent_device && value.max_concurrency>=2)
+            for(std::uint32_t i=0;i<value.max_concurrency;++i)
+                lanes[i]->context_owner_for_device_round()->set_gdn_repair_overlap(false);
         try{for(std::uint32_t i=0;i<value.max_concurrency;++i)workers[i]=std::thread([this,i]{loop(i);});}
         catch(...){
             {std::lock_guard lock(mutex);stopping=true;}

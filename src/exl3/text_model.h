@@ -1002,6 +1002,9 @@ public:
     bool l0_layer_major_headroom() const;
     // Batched multi-agent rounds: the DFlash2 verifier's target continuation
     // goes through this coordinator (shared by the Engine's lanes) when set.
+    // Overlapped (side-stream) GDN retained-prefix repair; concurrent Engine
+    // lanes disable it.
+    void set_gdn_repair_overlap(bool enabled) noexcept;
     void set_batched_verify(Exl3BatchedVerifyCoordinator* coordinator) noexcept {
         batched_verify_ = coordinator;
     }

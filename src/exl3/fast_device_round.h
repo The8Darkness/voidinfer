@@ -606,7 +606,13 @@ public:
             std::int64_t correction=-1;
             for(std::size_t i=0;i+1<tokens.size();++i) {
                 const bool bad=delta>0?scores[i].gap>delta:scores[i].greedy!=tokens[i+1];
-                if(bad) {reject=i+1;correction=scores[i].greedy;break;}
+                if(bad) {
+                    reject=i+1;correction=scores[i].greedy;
+                    if(timed)std::fprintf(stderr,"VERICACHE_CORRECTION block_rows=%zu reject_at=%zu gap=%.3f drafted=%lld exact=%lld\n",
+                        tokens.size(),reject,static_cast<double>(scores[i].gap),
+                        static_cast<long long>(tokens[i+1]),static_cast<long long>(correction));
+                    break;
+                }
                 // Accepted rows: how far each kept token trails the exact top.
                 result.max_gap=std::max(result.max_gap,scores[i].gap);
                 totals_.accepted_gap_sum+=scores[i].gap;

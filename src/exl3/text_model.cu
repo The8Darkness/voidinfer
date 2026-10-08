@@ -1252,6 +1252,10 @@ struct Exl3TextContext::Impl {
     // state joins it first (join_repair / drain_repair).
     cudaStream_t repair_stream=nullptr;
     cudaEvent_t repair_fork=nullptr;
+    // Concurrent Engine lanes replay the repair in order on the target stream
+    // (set_gdn_repair_overlap(false)): the overlapped side-stream repair
+    // corrupts recurrent state there (root cause open).
+    bool gdn_repair_overlap=true;
     cudaEvent_t repair_join=nullptr;
     bool repair_pending=false;
     // L0 OSCAR: re-entry of append_prefill_layer_major for one bounded block.
@@ -9797,6 +9801,10 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
     }
 }
 
+void Exl3TextContext::set_gdn_repair_overlap(bool enabled) noexcept {
+    impl_->gdn_repair_overlap=enabled;
+}
+
 void Exl3TextContext::bind_request_compatibility(std::string contract) {
     if(contract.empty()) throw std::invalid_argument("request compatibility contract missing");
     if(!impl_->request_compatibility_contract.empty()) {
@@ -10313,7 +10321,7 @@ void Exl3TextContext::retain_transaction_prefix_impl(
             const char* value=std::getenv("NINFER_EXL3_GDN_REPAIR_OVERLAP");
             return !value || std::strcmp(value,"0")!=0;
         }();
-        if(overlap) {
+        if(overlap && impl_->gdn_repair_overlap) {
             if(!impl_->repair_stream) {
                 cuda_check(cudaStreamCreateWithFlags(&impl_->repair_stream,
                     cudaStreamNonBlocking),"create overlapped GDN repair stream");
