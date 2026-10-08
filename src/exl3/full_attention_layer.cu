@@ -7836,515 +7836,23 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail residual");
 }
 
-void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
-                                     std::uint16_t* output,
-                                     int rows,
-                                     int position,
-                                     cudaStream_t stream,
-                                     bool profile,
-                                     bool preserve_m1_topology,
-                                     bool wide_prefill,
-                                     DecodeGraphExecutable* mlp_tail_graph) {
-    if(coalesce_input_mlp_ && (profile || capture_active_ || oscar_))
-        throw std::invalid_argument("coalesced attention scratch requires ordinary eager nondiagnostic execution");
-    if (!input || !output || rows <= 0 || rows > max_rows_) {
-        throw std::invalid_argument("invalid EXL3 full-attention layer input/output/rows");
-    }
-    // Side-branch L2 prefetch of upcoming GEMV weights (see the GDN layer).
-    static const std::size_t prefetch_bytes=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
-        return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
-    }();
-    static const int prefetch_sites=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_FULL_SITES");
-        return value?std::atoi(value):31;
-    }();
-    const bool prefetch=exl3_l2_prefetch_enabled() && rows==1 && !wide_prefill && !profile &&
-        !mlp_tail_graph;
-    const auto prefetch_weights=[&](int site,const std::uint16_t* trellis) {
-        if(prefetch && trellis && (prefetch_sites&site))
-            exl3_l2_prefetch_fork(stream,trellis,prefetch_bytes);
-    };
-    if(exact_prefix_rows_ || exact_page_ranges_.count) {
-        exact_position_contract_.require_current(mrope_positions_,rope_offset_);
-        if(!supports_segmented_exact_prefix())
-            throw std::invalid_argument("segmented attention precompute extent/profile");
-        Exl3AttentionInputView input_view{k_cache_,v_cache_,cache_capacity_,1024,exact_page_ranges_};
-        if(exact_prefix_rows_)input_view.shared.append(exact_prefix_k_,exact_prefix_v_,
-            exact_prefix_first_,exact_prefix_rows_,position);
-        input_view.require_geometry(position,rows);
-    }
-    if(direct_staged_rows_) {
-        if(!direct_staged_k_ || !direct_staged_v_ ||
-           direct_staged_rows_!=position || !supports_direct_staged_history(rows,position))
-            throw std::invalid_argument("direct staged history extent/profile");
-    }
-    retained_prefix_available_ = false;
-    bool eligible_retained_prefix = preserve_m1_topology && rows >= 2 && rows <= 8 &&
-        ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
-         (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&
-        !capture_active_;
-    if (eligible_retained_prefix) {
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        cuda_check(cudaStreamIsCapturing(stream, &capture_status),
-                   "query EXL3 full-attention retained-prefix source capture");
-        eligible_retained_prefix =
-            capture_status == cudaStreamCaptureStatusNone;
-    }
-    cudaEvent_t starts[13]{};
-    cudaEvent_t ends[13]{};
-    if (profile) {
-        for (int i = 0; i < 13; ++i) {
-            cuda_check(cudaEventCreate(&starts[i]), "create EXL3 layer start event");
-            cuda_check(cudaEventCreate(&ends[i]), "create EXL3 layer end event");
-        }
-    }
+// Stateful attention core of one forward: Q/gate split, Q/K norms and RoPE at
+// this layer's positions, K/V (and L0) cache append, causal attention over this
+// layer's cache and the output gate. Rows-independent projections stay in
+// forward(); batched multi-agent rounds call this once per agent segment on
+// that agent's layer object.
+void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
+    const std::uint16_t* input_norm=m.input_norm;
+    std::uint16_t* qg=m.qg; std::uint16_t* kp=m.kp; std::uint16_t* vp=m.vp;
+    std::uint16_t* qn=m.qn; std::uint16_t* kn=m.kn; std::uint16_t* qr=m.qr;
+    std::uint16_t* kr=m.kr; std::uint16_t* attn=m.attn; std::uint16_t* gp=m.gp;
+    const int rows=m.rows; const int position=m.position; cudaStream_t stream=m.stream;
+    const bool profile=m.profile; const bool preserve_m1_topology=m.preserve_m1_topology;
+    const bool wide_prefill=m.wide_prefill; bool eligible_retained_prefix=m.eligible_retained_prefix;
+    cudaEvent_t* starts=m.starts; cudaEvent_t* ends=m.ends;
     const auto begin = [&](int i) { if (profile) launch_profile_event(starts[i], stream); };
     const auto end = [&](int i) { if (profile) launch_profile_event(ends[i], stream); };
     const auto launch = [&](cudaError_t error, const char* op) { cuda_check(error, op); };
-    auto* input_norm = buffers_[0];
-    auto* qg = buffers_[1];
-    auto* kp = buffers_[2];
-    auto* vp = buffers_[3];
-    auto* qn = buffers_[4];
-    auto* kn = buffers_[5];
-    auto* qr = buffers_[6];
-    auto* kr = buffers_[7];
-    auto* attn = buffers_[8];
-    auto* op = buffers_[9];
-    auto* post_resid = buffers_[10];
-    auto* mlp_in = buffers_[11];
-    auto* gp = buffers_[12];
-    auto* up = buffers_[13];
-    auto* act = buffers_[14];
-    auto* down = buffers_[15];
-    const auto project_on = [&](Exl3CudaLinearWorkspace* workspace,
-                             const Exl3CudaLinearWeights& weights,
-                             const Exl3CudaLinearMetadata& metadata,
-                              const std::uint16_t* source,
-                              std::uint16_t* destination,
-                              Exl3TargetProjectionOperator operation,
-                              cudaStream_t projection_stream,
-                              const std::uint16_t* transformed_input=nullptr) {
-        const bool rowwise = preserve_m1_topology && rows > 1;
-        const bool target_initial16 = !rowwise && rows == 16 &&
-            workspace->target_initial16_candidate(metadata, rows, Exl3CudaLinearAdmission::target_initial16);
-        const bool target_wide_candidate = rowwise && wide_prefill &&
-            workspace->target_wide_prefill_candidate(metadata, rows, Exl3CudaLinearAdmission::target_wide_prefill);
-        const bool target_gateup_m16 = !rowwise && rows == 16 &&
-            (operation == Exl3TargetProjectionOperator::gate ||
-             operation == Exl3TargetProjectionOperator::up) &&
-            workspace->target_gateup_m16_candidate(metadata, rows,
-                Exl3CudaLinearAdmission::target_prefill_gate_up);
-        const bool target_gateup_candidate = rowwise &&
-            (operation == Exl3TargetProjectionOperator::gate ||
-             operation == Exl3TargetProjectionOperator::up) &&
-            (workspace->target_gateup_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_gate_up) ||
-             workspace->target_gateup_k5_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_gate_up));
-        const bool target_down_candidate = rowwise &&
-            operation == Exl3TargetProjectionOperator::down &&
-            workspace->target_down_small_m_candidate(
-                metadata, rows,
-                Exl3CudaLinearAdmission::target_continuation_down);
-        const bool target_o_k7_candidate = rowwise &&
-            operation == Exl3TargetProjectionOperator::o &&
-            (workspace->target_o_k7_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_o) ||
-             workspace->target_o_k6_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_o));
-        const bool target_kv_candidate = rowwise && !wide_prefill &&
-            (operation == Exl3TargetProjectionOperator::k ||
-             operation == Exl3TargetProjectionOperator::v) &&
-            workspace->target_kv_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_kv);
-        const bool target_q_k6_candidate = rowwise && !wide_prefill &&
-            operation == Exl3TargetProjectionOperator::q &&
-            workspace->target_q_k6_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_q);
-        const auto target_k5_admission =
-            operation == Exl3TargetProjectionOperator::q
-                ? Exl3CudaLinearAdmission::target_continuation_q
-            : (operation == Exl3TargetProjectionOperator::k ||
-               operation == Exl3TargetProjectionOperator::v)
-                ? Exl3CudaLinearAdmission::target_continuation_kv
-            : operation == Exl3TargetProjectionOperator::o
-                ? Exl3CudaLinearAdmission::target_continuation_o
-            : operation == Exl3TargetProjectionOperator::down
-                ? Exl3CudaLinearAdmission::target_continuation_down
-                : Exl3CudaLinearAdmission::ordinary;
-        const bool target_k5_candidate = rowwise && !wide_prefill &&
-            workspace->target_k5_small_m_batch_candidate(
-                metadata, rows, target_k5_admission);
-        const bool target_small_m_candidate =
-            target_gateup_candidate || target_down_candidate ||
-            target_o_k7_candidate || target_wide_candidate || target_kv_candidate ||
-            target_q_k6_candidate || target_k5_candidate;
-        const char* fast_same_weights_fp16kv_decode = std::getenv(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
-        const bool fast_same_weights_fp16kv_decode_candidate =
-            reconstruct_gemm_ && rows == 1 && !wide_prefill && !capture_active_ &&
-            fast_same_weights_fp16kv_decode &&
-            std::strcmp(fast_same_weights_fp16kv_decode, "1") == 0 &&
-            reconstruct_gemm_->accepts_all_model_shapes() &&
-            reconstruct_gemm_->supports(metadata, rows) && metadata.mul1 &&
-            !metadata.mcg && !metadata.has_bias;
-        const bool numeric_reconstruct_candidate =
-            fast_same_weights_fp16kv_decode_candidate ||
-            (reconstruct_gemm_ && rowwise && wide_prefill && !capture_active_ &&
-             target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
-             metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
-             ((reconstruct_gemm_->accepts_all_model_shapes() &&
-               metadata.K >= 5 && metadata.K <= 8 && rows >= 256) ||
-              ((operation == Exl3TargetProjectionOperator::gate ||
-                operation == Exl3TargetProjectionOperator::up) &&
-               metadata.K == 6 && metadata.in_features == kHidden &&
-               metadata.out_features == kIntermediate && rows >= 512) ||
-              (operation == Exl3TargetProjectionOperator::down &&
-               metadata.K == 7 && metadata.in_features == kIntermediate &&
-               metadata.out_features == kHidden && rows >= 256)));
-        bool observed_projection = false;
-        const bool observe_prefill = !rowwise && rows == 16 &&
-            projection_observer_selection_ ==
-                Exl3TargetProjectionObserverSelection::prefill_gate_up_k6;
-        const bool observe_initial16 = !rowwise && rows == 16 &&
-            projection_observer_selection_ == Exl3TargetProjectionObserverSelection::initial16_generic;
-        const bool observe_m1_k6_n32 = rowwise &&
-            projection_observer_selection_ ==
-                Exl3TargetProjectionObserverSelection::m1_k6_n32;
-        if (projection_observer_ != nullptr &&
-            (rowwise || observe_prefill || observe_initial16 || observe_m1_k6_n32)) {
-            const bool observed_gate_up =
-                (projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::gate_up_k6 || observe_prefill) &&
-                (operation == Exl3TargetProjectionOperator::gate ||
-                 operation == Exl3TargetProjectionOperator::up) &&
-                metadata.in_features == kHidden &&
-                metadata.out_features == kIntermediate;
-            const bool observed_gate_up_k7 =
-                projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::gate_up_k7 &&
-                (operation == Exl3TargetProjectionOperator::gate ||
-                 operation == Exl3TargetProjectionOperator::up) &&
-                metadata.in_features == kHidden &&
-                metadata.out_features == kIntermediate;
-            const bool observed_down =
-                projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::down_k6 &&
-                operation == Exl3TargetProjectionOperator::down &&
-                metadata.in_features == kIntermediate &&
-                metadata.out_features == kHidden;
-            const bool observed_down_k7 =
-                projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::down_k7 &&
-                operation == Exl3TargetProjectionOperator::down &&
-                metadata.in_features == kIntermediate &&
-                metadata.out_features == kHidden;
-            const bool observed_output =
-                projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::output_k7 &&
-                operation == Exl3TargetProjectionOperator::o &&
-                metadata.in_features == kQHeads * kHeadDim &&
-                metadata.out_features == kHidden;
-            observed_projection =
-                (((observed_gate_up || observed_down) && metadata.K == 6) ||
-                 ((observed_gate_up_k7 || observed_output || observed_down_k7) &&
-                  metadata.K == 7)) &&
-                metadata.mul1 && !metadata.mcg && !metadata.has_bias;
-            if (observe_initial16)
-                observed_projection = std::string(workspace->dispatch_name(metadata,16)) == "generic_tile" &&
-                    !(metadata.in_features == 5120 && metadata.out_features == 17408 && metadata.K == 6);
-            if (observe_m1_k6_n32)
-                observed_projection = metadata.K == 6 && metadata.mul1 &&
-                    !metadata.mcg && !metadata.has_bias &&
-                    std::string(workspace->dispatch_name(metadata, 1)) ==
-                        "generic_mma_split";
-            if (projection_observer_selection_ == Exl3TargetProjectionObserverSelection::wide_prefill_all)
-                observed_projection = rowwise;
-        }
-        if (observed_projection) {
-            const Exl3TargetProjectionObservation observation{
-                weights, metadata, source, rows, model_layer_,
-                (projection_observer_selection_ == Exl3TargetProjectionObserverSelection::wide_prefill_all ||
-                 observe_initial16 || observe_m1_k6_n32)
-                    ? target_projection_operator_name(operation) :
-                operation == Exl3TargetProjectionOperator::gate ? "gate" :
-                    (operation == Exl3TargetProjectionOperator::up ? "up" :
-                     (operation == Exl3TargetProjectionOperator::o ? "o" : "down")),
-                workspace->dispatch_name(metadata, 1), projection_stream};
-            projection_observer_(observation, projection_observer_user_);
-        }
-        const auto topology = numeric_reconstruct_candidate
-            ? Exl3TargetProjectionTopology::batched
-            : target_small_m_candidate
-            ? Exl3TargetProjectionTopology::small_m_mma_split
-            : (rowwise ? Exl3TargetProjectionTopology::m1_per_row
-            : (rows == 1 ? Exl3TargetProjectionTopology::m1
-                         : Exl3TargetProjectionTopology::batched));
-        const int timing_slot = projection_timing_
-            ? projection_timing_->begin(model_layer_, operation, rows, metadata.K,
-                                        metadata.in_features, metadata.out_features,
-                                        topology,
-                                        rowwise && !target_small_m_candidate ? rows : 1,
-                                        projection_stream)
-            : -1;
-        if (numeric_reconstruct_candidate) {
-            if(transformed_input)
-                throw std::logic_error(
-                    "numeric reconstruct cannot consume borrowed transformed input");
-            reconstruct_gemm_->forward_numeric_candidate(
-                weights, metadata, source, destination, rows, projection_stream);
-        } else if (rowwise && !target_small_m_candidate) {
-            for (int row = 0; row < rows; ++row) {
-                if(transformed_input)
-                    workspace->forward_from_transformed(weights,metadata,
-                        transformed_input+static_cast<std::size_t>(row)*metadata.in_features,
-                        destination+static_cast<std::size_t>(row)*metadata.out_features,
-                        1,projection_stream,Exl3CudaLinearAdmission::ordinary);
-                else workspace->forward(weights, metadata,
-                        source + static_cast<std::size_t>(row) * metadata.in_features,
-                        destination + static_cast<std::size_t>(row) * metadata.out_features,
-                        1, projection_stream);
-            }
-        } else {
-            const auto admission=target_kv_candidate
-                    ? Exl3CudaLinearAdmission::target_continuation_kv
-                    : target_q_k6_candidate
-                    ? Exl3CudaLinearAdmission::target_continuation_q
-                    : target_k5_candidate
-                    ? target_k5_admission
-                    : target_initial16
-                    ? Exl3CudaLinearAdmission::target_initial16
-                    : target_wide_candidate
-                    ? Exl3CudaLinearAdmission::target_wide_prefill
-                    : target_gateup_m16
-                    ? Exl3CudaLinearAdmission::target_prefill_gate_up
-                    : target_gateup_candidate
-                    ? Exl3CudaLinearAdmission::target_continuation_gate_up
-                    : (target_down_candidate
-                           ? Exl3CudaLinearAdmission::target_continuation_down
-                           : (target_o_k7_candidate
-                                   ? Exl3CudaLinearAdmission::target_continuation_o
-                                   : Exl3CudaLinearAdmission::ordinary));
-            if(transformed_input)
-                workspace->forward_from_transformed(
-                    weights,metadata,transformed_input,destination,rows,
-                    projection_stream,admission);
-            else workspace->forward(
-                weights,metadata,source,destination,rows,projection_stream,
-                admission);
-        }
-        if (projection_timing_)
-            projection_timing_->end(timing_slot, projection_stream);
-    };
-    const auto project = [&](Exl3CudaLinearWorkspace* workspace,
-                             const Exl3CudaLinearWeights& weights,
-                             const Exl3CudaLinearMetadata& metadata,
-                              const std::uint16_t* source,
-                              std::uint16_t* destination,
-                              Exl3TargetProjectionOperator operation,
-                              const std::uint16_t* transformed_input=nullptr) {
-        project_on(workspace, weights, metadata, source, destination, operation,
-                   stream,transformed_input);
-    };
-
-    begin(0);
-    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,input, weights_.input_norm,
-        input_norm, rows, kHidden);
-    launch(cudaGetLastError(), "launch EXL3 input RMSNorm"); end(0);
-
-    const bool can_share_target=target_q_executor_ && !capture_active_ && !oscar_ &&
-        !profile && !projection_timing_ && !projection_observer_ &&
-        preserve_m1_topology && !wide_prefill && rows>=1 && rows<=8;
-    const bool concurrent_qkv=prefill_qkv_concurrency_.complete() &&
-        !capture_active_ && !oscar_ && !profile && !projection_timing_ &&
-        !projection_observer_ && preserve_m1_topology && wide_prefill &&
-        rows>=17 && rows<=1024 && !can_share_target;
-    const auto* projection_chain_value=
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
-    const auto* projection_chain_full_value=
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL");
-    if(projection_chain_full_value &&
-       std::strcmp(projection_chain_full_value,"0")!=0 &&
-       std::strcmp(projection_chain_full_value,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL must be 0 or 1");
-    const bool projection_chain=projection_chain_value &&
-        std::strcmp(projection_chain_value,"1")==0 &&
-        (!projection_chain_full_value ||
-         std::strcmp(projection_chain_full_value,"1")==0) && !capture_active_ &&
-        !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
-        preserve_m1_topology && wide_prefill && rows==1024 && !can_share_target &&
-        !concurrent_qkv;
-    if(projection_chain) {
-        std::array<Exl3GraphBufferIdentity,16> buffers{};
-        std::array<Exl3GraphBoundResource,16> resources{};
-        std::size_t count=0;
-        const auto append=[&](const void* address,std::size_t bytes,
-                              const std::shared_ptr<const void>& owner) {
-            if(!address || !bytes || count==buffers.size())
-                throw std::logic_error("full-attention projection-chain resource");
-            buffers[count]={address,bytes};
-            resources[count]={owner,address,bytes,count+1};
-            ++count;
-        };
-        append(input_norm,static_cast<std::size_t>(rows)*kHidden*2,
-               prefill_projection_chain_scratch_owner_);
-        append(qg,static_cast<std::size_t>(rows)*weights_.q_metadata.out_features*2,
-               prefill_projection_chain_scratch_owner_);
-        append(kp,static_cast<std::size_t>(rows)*weights_.k_metadata.out_features*2,
-               prefill_projection_chain_scratch_owner_);
-        append(vp,static_cast<std::size_t>(rows)*weights_.v_metadata.out_features*2,
-               prefill_projection_chain_scratch_owner_);
-        const auto append_weights=[&](const Exl3CudaLinearWeights& value) {
-            if(value.trellis)append(value.trellis,2,prefill_projection_chain_model_owner_);
-            if(value.suh)append(value.suh,2,prefill_projection_chain_model_owner_);
-            if(value.svh)append(value.svh,2,prefill_projection_chain_model_owner_);
-            if(value.mul1)append(value.mul1,4,prefill_projection_chain_model_owner_);
-        };
-        append_weights(weights_.q);append_weights(weights_.k);append_weights(weights_.v);
-        Exl3GraphCompatibilityFingerprint fingerprint;
-        fingerprint.bind(prefill_projection_chain_context_owner_,
-            prefill_projection_chain_model_owner_,
-            prefill_projection_chain_scratch_owner_,
-            std::span<const Exl3GraphBufferIdentity>(buffers.data(),count),
-            rows,max_rows_,rows,kHidden,1,0x46514b56u,
-            Exl3GraphPrecision::oscar_int2_fp16,
-            Exl3GraphPositionPolicy::oscar_split_class,1,stream);
-        Exl3GraphCaptureExtent extent;extent.known=true;
-        extent.retained[static_cast<unsigned>(
-            Exl3ResourceInventory::Domain::graph_count)]=2;
-        Exl3PrefillProjectionChainGraph::Request request{
-            std::move(fingerprint),
-            std::span<const Exl3GraphBoundResource>(resources.data(),count),
-            extent,1,0x46514b560001ull,stream,true};
-        begin(1);
-        prefill_projection_chain_graph_.execute(request,[&](cudaStream_t graph_stream) {
-            project_on(linear_workspaces_[0],weights_.q,weights_.q_metadata,
-                input_norm,qg,Exl3TargetProjectionOperator::q,graph_stream);
-            project_on(linear_workspaces_[1],weights_.k,weights_.k_metadata,
-                input_norm,kp,Exl3TargetProjectionOperator::k,graph_stream);
-            project_on(linear_workspaces_[2],weights_.v,weights_.v_metadata,
-                input_norm,vp,Exl3TargetProjectionOperator::v,graph_stream);
-        });
-        launch(cudaGetLastError(),"launch prefill projection-chain QKV graph");
-        end(1);
-    } else if(concurrent_qkv) {
-        launch(cudaEventRecord(prefill_qkv_concurrency_.fork,stream),
-               "record wide-prefill QKV fork");
-        launch(cudaStreamWaitEvent(prefill_qkv_concurrency_.k_stream,
-                                   prefill_qkv_concurrency_.fork,0),
-               "fork wide-prefill K stream");
-        launch(cudaStreamWaitEvent(prefill_qkv_concurrency_.v_stream,
-                                   prefill_qkv_concurrency_.fork,0),
-               "fork wide-prefill V stream");
-        try {
-            project_on(prefill_qkv_concurrency_.k_workspace,weights_.k,
-                weights_.k_metadata,input_norm,kp,Exl3TargetProjectionOperator::k,
-                prefill_qkv_concurrency_.k_stream);
-            launch(cudaGetLastError(),"launch concurrent wide-prefill K projection");
-            launch(cudaEventRecord(prefill_qkv_concurrency_.k_done,
-                                   prefill_qkv_concurrency_.k_stream),
-                   "record wide-prefill K completion");
-            project_on(prefill_qkv_concurrency_.v_workspace,weights_.v,
-                weights_.v_metadata,input_norm,vp,Exl3TargetProjectionOperator::v,
-                prefill_qkv_concurrency_.v_stream);
-            launch(cudaGetLastError(),"launch concurrent wide-prefill V projection");
-            launch(cudaEventRecord(prefill_qkv_concurrency_.v_done,
-                                   prefill_qkv_concurrency_.v_stream),
-                   "record wide-prefill V completion");
-            project(linear_workspaces_[0],weights_.q,weights_.q_metadata,input_norm,qg,
-                    Exl3TargetProjectionOperator::q);
-            launch(cudaGetLastError(),"launch concurrent wide-prefill Q projection");
-            launch(cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.k_done,0),
-                   "join wide-prefill K stream");
-            launch(cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.v_done,0),
-                   "join wide-prefill V stream");
-            ++prefill_qkv_concurrent_calls_;
-            prefill_qkv_concurrent_rows_+=static_cast<std::uint64_t>(rows);
-        } catch(...) {
-            (void)cudaEventRecord(prefill_qkv_concurrency_.k_done,
-                                  prefill_qkv_concurrency_.k_stream);
-            (void)cudaEventRecord(prefill_qkv_concurrency_.v_done,
-                                  prefill_qkv_concurrency_.v_stream);
-            (void)cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.k_done,0);
-            (void)cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.v_done,0);
-            throw;
-        }
-    } else {
-        prefetch_weights(1,weights_.k.trellis);
-        begin(1);
-        // Suspension is explicit at the layer boundary, outside ordinary linear
-        // dispatch. Private attention/KV/MLP state resumes only after Q is complete.
-        const bool shared_q=can_share_target &&
-            target_shared_admission(Exl3TargetSharedFamily::q,weights_.q_metadata).has_value() &&
-            target_q_executor_(Exl3TargetQContinuation{weights_.q,weights_.q_metadata,
-                input_norm,qg,rows,position,model_layer_,stream});
-        if(!shared_q)project(linear_workspaces_[0],weights_.q,weights_.q_metadata,
-            input_norm,qg,Exl3TargetProjectionOperator::q);
-        launch(cudaGetLastError(),"launch EXL3 Q projection");end(1);
-        prefetch_weights(2,weights_.o.trellis);
-        const bool m1_kv_pair=(fast_same_weights_fp16kv_m1_kv_pair_ ||
-            fast_same_weights_fp16kv_m1_kv_wide_pair_) &&
-            !preserve_m1_topology && !can_share_target && rows==1 &&
-            !wide_prefill && (!capture_active_ ||
-                fast_same_weights_fp16kv_m1_kv_pair_graph_) &&
-            !oscar_ && !profile &&
-            !projection_timing_ &&
-            !projection_observer_ && linear_workspaces_[1] &&
-            linear_workspaces_[2] &&
-            (weights_.k_metadata.K==6 || weights_.k_metadata.K==7) &&
-            weights_.v_metadata.K==weights_.k_metadata.K &&
-            weights_.k_metadata.mul1 &&
-            weights_.v_metadata.mul1 && !weights_.k_metadata.mcg &&
-            !weights_.v_metadata.mcg && !weights_.k_metadata.has_bias &&
-            !weights_.v_metadata.has_bias &&
-            weights_.k_metadata.in_features==kHidden &&
-            weights_.v_metadata.in_features==kHidden &&
-            weights_.k_metadata.out_features==kKVProjection &&
-            weights_.v_metadata.out_features==kKVProjection;
-        begin(2);
-        const bool merged_kv=!m1_kv_pair && rows>=1 && rows<=8 && !can_share_target &&
-            !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
-            !wide_prefill && linear_workspaces_[1] && linear_workspaces_[2] &&
-            linear_workspaces_[1]->forward_merged_pair(*linear_workspaces_[2],
-                weights_.k,weights_.k_metadata,kp,weights_.v,weights_.v_metadata,vp,
-                input_norm,rows,stream);
-        if(merged_kv) {
-            launch(cudaGetLastError(),"launch merged EXL3 K/V projection");
-        } else if(m1_kv_pair) {
-            if(fast_same_weights_fp16kv_m1_kv_wide_pair_)
-                linear_workspaces_[1]->forward_target_m1_kv_wide_pair_for_test(
-                    *linear_workspaces_[2],weights_.k,weights_.k_metadata,
-                    weights_.v,weights_.v_metadata,input_norm,kp,vp,stream);
-            else linear_workspaces_[1]->forward_target_m1_kv_pair_for_test(
-                    *linear_workspaces_[2],weights_.k,weights_.k_metadata,
-                    weights_.v,weights_.v_metadata,input_norm,kp,vp,stream);
-            launch(cudaGetLastError(),"launch EXL3 paired K/V projection");
-            ++fast_same_weights_fp16kv_m1_kv_pair_submissions_;
-        } else {
-            const bool shared_k=can_share_target && target_kv_executor_enabled_ &&
-                target_shared_admission(Exl3TargetSharedFamily::k,weights_.k_metadata).has_value() &&
-                target_q_executor_(Exl3TargetQContinuation{weights_.k,weights_.k_metadata,
-                    input_norm,kp,rows,position,model_layer_,stream,Exl3TargetSharedFamily::k});
-            if(!shared_k)project(linear_workspaces_[1],weights_.k,weights_.k_metadata,input_norm,kp,
-                Exl3TargetProjectionOperator::k);
-            launch(cudaGetLastError(),"launch EXL3 K projection");
-        }
-        end(2);
-        begin(3);
-        if(!m1_kv_pair && !merged_kv) {
-            const bool shared_v=can_share_target && target_kv_executor_enabled_ &&
-                target_shared_admission(Exl3TargetSharedFamily::v,weights_.v_metadata).has_value() &&
-                target_q_executor_(Exl3TargetQContinuation{weights_.v,weights_.v_metadata,
-                    input_norm,vp,rows,position,model_layer_,stream,Exl3TargetSharedFamily::v});
-            if(!shared_v)project(linear_workspaces_[2],weights_.v,weights_.v_metadata,input_norm,vp,
-                Exl3TargetProjectionOperator::v);
-            launch(cudaGetLastError(),"launch EXL3 V projection");
-        }
-        end(3);
-    }
 
     // Decode rows: split, Q/K norms and RoPE in one launch (bit-identical).
     static const bool fused_qk_prepare=[] {
@@ -9822,6 +9330,520 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         cudaEventDestroy(attention_core_start);
         cudaEventDestroy(attention_core_end);
     }
+}
+
+void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
+                                     std::uint16_t* output,
+                                     int rows,
+                                     int position,
+                                     cudaStream_t stream,
+                                     bool profile,
+                                     bool preserve_m1_topology,
+                                     bool wide_prefill,
+                                     DecodeGraphExecutable* mlp_tail_graph) {
+    if(coalesce_input_mlp_ && (profile || capture_active_ || oscar_))
+        throw std::invalid_argument("coalesced attention scratch requires ordinary eager nondiagnostic execution");
+    if (!input || !output || rows <= 0 || rows > max_rows_) {
+        throw std::invalid_argument("invalid EXL3 full-attention layer input/output/rows");
+    }
+    // Side-branch L2 prefetch of upcoming GEMV weights (see the GDN layer).
+    static const std::size_t prefetch_bytes=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
+        return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
+    }();
+    static const int prefetch_sites=[] {
+        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_FULL_SITES");
+        return value?std::atoi(value):31;
+    }();
+    const bool prefetch=exl3_l2_prefetch_enabled() && rows==1 && !wide_prefill && !profile &&
+        !mlp_tail_graph;
+    const auto prefetch_weights=[&](int site,const std::uint16_t* trellis) {
+        if(prefetch && trellis && (prefetch_sites&site))
+            exl3_l2_prefetch_fork(stream,trellis,prefetch_bytes);
+    };
+    if(exact_prefix_rows_ || exact_page_ranges_.count) {
+        exact_position_contract_.require_current(mrope_positions_,rope_offset_);
+        if(!supports_segmented_exact_prefix())
+            throw std::invalid_argument("segmented attention precompute extent/profile");
+        Exl3AttentionInputView input_view{k_cache_,v_cache_,cache_capacity_,1024,exact_page_ranges_};
+        if(exact_prefix_rows_)input_view.shared.append(exact_prefix_k_,exact_prefix_v_,
+            exact_prefix_first_,exact_prefix_rows_,position);
+        input_view.require_geometry(position,rows);
+    }
+    if(direct_staged_rows_) {
+        if(!direct_staged_k_ || !direct_staged_v_ ||
+           direct_staged_rows_!=position || !supports_direct_staged_history(rows,position))
+            throw std::invalid_argument("direct staged history extent/profile");
+    }
+    retained_prefix_available_ = false;
+    bool eligible_retained_prefix = preserve_m1_topology && rows >= 2 && rows <= 8 &&
+        ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
+         (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&
+        !capture_active_;
+    if (eligible_retained_prefix) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream, &capture_status),
+                   "query EXL3 full-attention retained-prefix source capture");
+        eligible_retained_prefix =
+            capture_status == cudaStreamCaptureStatusNone;
+    }
+    cudaEvent_t starts[13]{};
+    cudaEvent_t ends[13]{};
+    if (profile) {
+        for (int i = 0; i < 13; ++i) {
+            cuda_check(cudaEventCreate(&starts[i]), "create EXL3 layer start event");
+            cuda_check(cudaEventCreate(&ends[i]), "create EXL3 layer end event");
+        }
+    }
+    const auto begin = [&](int i) { if (profile) launch_profile_event(starts[i], stream); };
+    const auto end = [&](int i) { if (profile) launch_profile_event(ends[i], stream); };
+    const auto launch = [&](cudaError_t error, const char* op) { cuda_check(error, op); };
+    auto* input_norm = buffers_[0];
+    auto* qg = buffers_[1];
+    auto* kp = buffers_[2];
+    auto* vp = buffers_[3];
+    auto* qn = buffers_[4];
+    auto* kn = buffers_[5];
+    auto* qr = buffers_[6];
+    auto* kr = buffers_[7];
+    auto* attn = buffers_[8];
+    auto* op = buffers_[9];
+    auto* post_resid = buffers_[10];
+    auto* mlp_in = buffers_[11];
+    auto* gp = buffers_[12];
+    auto* up = buffers_[13];
+    auto* act = buffers_[14];
+    auto* down = buffers_[15];
+    const auto project_on = [&](Exl3CudaLinearWorkspace* workspace,
+                             const Exl3CudaLinearWeights& weights,
+                             const Exl3CudaLinearMetadata& metadata,
+                              const std::uint16_t* source,
+                              std::uint16_t* destination,
+                              Exl3TargetProjectionOperator operation,
+                              cudaStream_t projection_stream,
+                              const std::uint16_t* transformed_input=nullptr) {
+        const bool rowwise = preserve_m1_topology && rows > 1;
+        const bool target_initial16 = !rowwise && rows == 16 &&
+            workspace->target_initial16_candidate(metadata, rows, Exl3CudaLinearAdmission::target_initial16);
+        const bool target_wide_candidate = rowwise && wide_prefill &&
+            workspace->target_wide_prefill_candidate(metadata, rows, Exl3CudaLinearAdmission::target_wide_prefill);
+        const bool target_gateup_m16 = !rowwise && rows == 16 &&
+            (operation == Exl3TargetProjectionOperator::gate ||
+             operation == Exl3TargetProjectionOperator::up) &&
+            workspace->target_gateup_m16_candidate(metadata, rows,
+                Exl3CudaLinearAdmission::target_prefill_gate_up);
+        const bool target_gateup_candidate = rowwise &&
+            (operation == Exl3TargetProjectionOperator::gate ||
+             operation == Exl3TargetProjectionOperator::up) &&
+            (workspace->target_gateup_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_gate_up) ||
+             workspace->target_gateup_k5_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_gate_up));
+        const bool target_down_candidate = rowwise &&
+            operation == Exl3TargetProjectionOperator::down &&
+            workspace->target_down_small_m_candidate(
+                metadata, rows,
+                Exl3CudaLinearAdmission::target_continuation_down);
+        const bool target_o_k7_candidate = rowwise &&
+            operation == Exl3TargetProjectionOperator::o &&
+            (workspace->target_o_k7_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_o) ||
+             workspace->target_o_k6_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_o));
+        const bool target_kv_candidate = rowwise && !wide_prefill &&
+            (operation == Exl3TargetProjectionOperator::k ||
+             operation == Exl3TargetProjectionOperator::v) &&
+            workspace->target_kv_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_kv);
+        const bool target_q_k6_candidate = rowwise && !wide_prefill &&
+            operation == Exl3TargetProjectionOperator::q &&
+            workspace->target_q_k6_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_q);
+        const auto target_k5_admission =
+            operation == Exl3TargetProjectionOperator::q
+                ? Exl3CudaLinearAdmission::target_continuation_q
+            : (operation == Exl3TargetProjectionOperator::k ||
+               operation == Exl3TargetProjectionOperator::v)
+                ? Exl3CudaLinearAdmission::target_continuation_kv
+            : operation == Exl3TargetProjectionOperator::o
+                ? Exl3CudaLinearAdmission::target_continuation_o
+            : operation == Exl3TargetProjectionOperator::down
+                ? Exl3CudaLinearAdmission::target_continuation_down
+                : Exl3CudaLinearAdmission::ordinary;
+        const bool target_k5_candidate = rowwise && !wide_prefill &&
+            workspace->target_k5_small_m_batch_candidate(
+                metadata, rows, target_k5_admission);
+        const bool target_small_m_candidate =
+            target_gateup_candidate || target_down_candidate ||
+            target_o_k7_candidate || target_wide_candidate || target_kv_candidate ||
+            target_q_k6_candidate || target_k5_candidate;
+        const char* fast_same_weights_fp16kv_decode = std::getenv(
+            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
+        const bool fast_same_weights_fp16kv_decode_candidate =
+            reconstruct_gemm_ && rows == 1 && !wide_prefill && !capture_active_ &&
+            fast_same_weights_fp16kv_decode &&
+            std::strcmp(fast_same_weights_fp16kv_decode, "1") == 0 &&
+            reconstruct_gemm_->accepts_all_model_shapes() &&
+            reconstruct_gemm_->supports(metadata, rows) && metadata.mul1 &&
+            !metadata.mcg && !metadata.has_bias;
+        const bool numeric_reconstruct_candidate =
+            fast_same_weights_fp16kv_decode_candidate ||
+            (reconstruct_gemm_ && rowwise && wide_prefill && !capture_active_ &&
+             target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
+             metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
+             ((reconstruct_gemm_->accepts_all_model_shapes() &&
+               metadata.K >= 5 && metadata.K <= 8 && rows >= 256) ||
+              ((operation == Exl3TargetProjectionOperator::gate ||
+                operation == Exl3TargetProjectionOperator::up) &&
+               metadata.K == 6 && metadata.in_features == kHidden &&
+               metadata.out_features == kIntermediate && rows >= 512) ||
+              (operation == Exl3TargetProjectionOperator::down &&
+               metadata.K == 7 && metadata.in_features == kIntermediate &&
+               metadata.out_features == kHidden && rows >= 256)));
+        bool observed_projection = false;
+        const bool observe_prefill = !rowwise && rows == 16 &&
+            projection_observer_selection_ ==
+                Exl3TargetProjectionObserverSelection::prefill_gate_up_k6;
+        const bool observe_initial16 = !rowwise && rows == 16 &&
+            projection_observer_selection_ == Exl3TargetProjectionObserverSelection::initial16_generic;
+        const bool observe_m1_k6_n32 = rowwise &&
+            projection_observer_selection_ ==
+                Exl3TargetProjectionObserverSelection::m1_k6_n32;
+        if (projection_observer_ != nullptr &&
+            (rowwise || observe_prefill || observe_initial16 || observe_m1_k6_n32)) {
+            const bool observed_gate_up =
+                (projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::gate_up_k6 || observe_prefill) &&
+                (operation == Exl3TargetProjectionOperator::gate ||
+                 operation == Exl3TargetProjectionOperator::up) &&
+                metadata.in_features == kHidden &&
+                metadata.out_features == kIntermediate;
+            const bool observed_gate_up_k7 =
+                projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::gate_up_k7 &&
+                (operation == Exl3TargetProjectionOperator::gate ||
+                 operation == Exl3TargetProjectionOperator::up) &&
+                metadata.in_features == kHidden &&
+                metadata.out_features == kIntermediate;
+            const bool observed_down =
+                projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::down_k6 &&
+                operation == Exl3TargetProjectionOperator::down &&
+                metadata.in_features == kIntermediate &&
+                metadata.out_features == kHidden;
+            const bool observed_down_k7 =
+                projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::down_k7 &&
+                operation == Exl3TargetProjectionOperator::down &&
+                metadata.in_features == kIntermediate &&
+                metadata.out_features == kHidden;
+            const bool observed_output =
+                projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::output_k7 &&
+                operation == Exl3TargetProjectionOperator::o &&
+                metadata.in_features == kQHeads * kHeadDim &&
+                metadata.out_features == kHidden;
+            observed_projection =
+                (((observed_gate_up || observed_down) && metadata.K == 6) ||
+                 ((observed_gate_up_k7 || observed_output || observed_down_k7) &&
+                  metadata.K == 7)) &&
+                metadata.mul1 && !metadata.mcg && !metadata.has_bias;
+            if (observe_initial16)
+                observed_projection = std::string(workspace->dispatch_name(metadata,16)) == "generic_tile" &&
+                    !(metadata.in_features == 5120 && metadata.out_features == 17408 && metadata.K == 6);
+            if (observe_m1_k6_n32)
+                observed_projection = metadata.K == 6 && metadata.mul1 &&
+                    !metadata.mcg && !metadata.has_bias &&
+                    std::string(workspace->dispatch_name(metadata, 1)) ==
+                        "generic_mma_split";
+            if (projection_observer_selection_ == Exl3TargetProjectionObserverSelection::wide_prefill_all)
+                observed_projection = rowwise;
+        }
+        if (observed_projection) {
+            const Exl3TargetProjectionObservation observation{
+                weights, metadata, source, rows, model_layer_,
+                (projection_observer_selection_ == Exl3TargetProjectionObserverSelection::wide_prefill_all ||
+                 observe_initial16 || observe_m1_k6_n32)
+                    ? target_projection_operator_name(operation) :
+                operation == Exl3TargetProjectionOperator::gate ? "gate" :
+                    (operation == Exl3TargetProjectionOperator::up ? "up" :
+                     (operation == Exl3TargetProjectionOperator::o ? "o" : "down")),
+                workspace->dispatch_name(metadata, 1), projection_stream};
+            projection_observer_(observation, projection_observer_user_);
+        }
+        const auto topology = numeric_reconstruct_candidate
+            ? Exl3TargetProjectionTopology::batched
+            : target_small_m_candidate
+            ? Exl3TargetProjectionTopology::small_m_mma_split
+            : (rowwise ? Exl3TargetProjectionTopology::m1_per_row
+            : (rows == 1 ? Exl3TargetProjectionTopology::m1
+                         : Exl3TargetProjectionTopology::batched));
+        const int timing_slot = projection_timing_
+            ? projection_timing_->begin(model_layer_, operation, rows, metadata.K,
+                                        metadata.in_features, metadata.out_features,
+                                        topology,
+                                        rowwise && !target_small_m_candidate ? rows : 1,
+                                        projection_stream)
+            : -1;
+        if (numeric_reconstruct_candidate) {
+            if(transformed_input)
+                throw std::logic_error(
+                    "numeric reconstruct cannot consume borrowed transformed input");
+            reconstruct_gemm_->forward_numeric_candidate(
+                weights, metadata, source, destination, rows, projection_stream);
+        } else if (rowwise && !target_small_m_candidate) {
+            for (int row = 0; row < rows; ++row) {
+                if(transformed_input)
+                    workspace->forward_from_transformed(weights,metadata,
+                        transformed_input+static_cast<std::size_t>(row)*metadata.in_features,
+                        destination+static_cast<std::size_t>(row)*metadata.out_features,
+                        1,projection_stream,Exl3CudaLinearAdmission::ordinary);
+                else workspace->forward(weights, metadata,
+                        source + static_cast<std::size_t>(row) * metadata.in_features,
+                        destination + static_cast<std::size_t>(row) * metadata.out_features,
+                        1, projection_stream);
+            }
+        } else {
+            const auto admission=target_kv_candidate
+                    ? Exl3CudaLinearAdmission::target_continuation_kv
+                    : target_q_k6_candidate
+                    ? Exl3CudaLinearAdmission::target_continuation_q
+                    : target_k5_candidate
+                    ? target_k5_admission
+                    : target_initial16
+                    ? Exl3CudaLinearAdmission::target_initial16
+                    : target_wide_candidate
+                    ? Exl3CudaLinearAdmission::target_wide_prefill
+                    : target_gateup_m16
+                    ? Exl3CudaLinearAdmission::target_prefill_gate_up
+                    : target_gateup_candidate
+                    ? Exl3CudaLinearAdmission::target_continuation_gate_up
+                    : (target_down_candidate
+                           ? Exl3CudaLinearAdmission::target_continuation_down
+                           : (target_o_k7_candidate
+                                   ? Exl3CudaLinearAdmission::target_continuation_o
+                                   : Exl3CudaLinearAdmission::ordinary));
+            if(transformed_input)
+                workspace->forward_from_transformed(
+                    weights,metadata,transformed_input,destination,rows,
+                    projection_stream,admission);
+            else workspace->forward(
+                weights,metadata,source,destination,rows,projection_stream,
+                admission);
+        }
+        if (projection_timing_)
+            projection_timing_->end(timing_slot, projection_stream);
+    };
+    const auto project = [&](Exl3CudaLinearWorkspace* workspace,
+                             const Exl3CudaLinearWeights& weights,
+                             const Exl3CudaLinearMetadata& metadata,
+                              const std::uint16_t* source,
+                              std::uint16_t* destination,
+                              Exl3TargetProjectionOperator operation,
+                              const std::uint16_t* transformed_input=nullptr) {
+        project_on(workspace, weights, metadata, source, destination, operation,
+                   stream,transformed_input);
+    };
+
+    begin(0);
+    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,input, weights_.input_norm,
+        input_norm, rows, kHidden);
+    launch(cudaGetLastError(), "launch EXL3 input RMSNorm"); end(0);
+
+    const bool can_share_target=target_q_executor_ && !capture_active_ && !oscar_ &&
+        !profile && !projection_timing_ && !projection_observer_ &&
+        preserve_m1_topology && !wide_prefill && rows>=1 && rows<=8;
+    const bool concurrent_qkv=prefill_qkv_concurrency_.complete() &&
+        !capture_active_ && !oscar_ && !profile && !projection_timing_ &&
+        !projection_observer_ && preserve_m1_topology && wide_prefill &&
+        rows>=17 && rows<=1024 && !can_share_target;
+    const auto* projection_chain_value=
+        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
+    const auto* projection_chain_full_value=
+        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL");
+    if(projection_chain_full_value &&
+       std::strcmp(projection_chain_full_value,"0")!=0 &&
+       std::strcmp(projection_chain_full_value,"1")!=0)
+        throw std::invalid_argument(
+            "NINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL must be 0 or 1");
+    const bool projection_chain=projection_chain_value &&
+        std::strcmp(projection_chain_value,"1")==0 &&
+        (!projection_chain_full_value ||
+         std::strcmp(projection_chain_full_value,"1")==0) && !capture_active_ &&
+        !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
+        preserve_m1_topology && wide_prefill && rows==1024 && !can_share_target &&
+        !concurrent_qkv;
+    if(projection_chain) {
+        std::array<Exl3GraphBufferIdentity,16> buffers{};
+        std::array<Exl3GraphBoundResource,16> resources{};
+        std::size_t count=0;
+        const auto append=[&](const void* address,std::size_t bytes,
+                              const std::shared_ptr<const void>& owner) {
+            if(!address || !bytes || count==buffers.size())
+                throw std::logic_error("full-attention projection-chain resource");
+            buffers[count]={address,bytes};
+            resources[count]={owner,address,bytes,count+1};
+            ++count;
+        };
+        append(input_norm,static_cast<std::size_t>(rows)*kHidden*2,
+               prefill_projection_chain_scratch_owner_);
+        append(qg,static_cast<std::size_t>(rows)*weights_.q_metadata.out_features*2,
+               prefill_projection_chain_scratch_owner_);
+        append(kp,static_cast<std::size_t>(rows)*weights_.k_metadata.out_features*2,
+               prefill_projection_chain_scratch_owner_);
+        append(vp,static_cast<std::size_t>(rows)*weights_.v_metadata.out_features*2,
+               prefill_projection_chain_scratch_owner_);
+        const auto append_weights=[&](const Exl3CudaLinearWeights& value) {
+            if(value.trellis)append(value.trellis,2,prefill_projection_chain_model_owner_);
+            if(value.suh)append(value.suh,2,prefill_projection_chain_model_owner_);
+            if(value.svh)append(value.svh,2,prefill_projection_chain_model_owner_);
+            if(value.mul1)append(value.mul1,4,prefill_projection_chain_model_owner_);
+        };
+        append_weights(weights_.q);append_weights(weights_.k);append_weights(weights_.v);
+        Exl3GraphCompatibilityFingerprint fingerprint;
+        fingerprint.bind(prefill_projection_chain_context_owner_,
+            prefill_projection_chain_model_owner_,
+            prefill_projection_chain_scratch_owner_,
+            std::span<const Exl3GraphBufferIdentity>(buffers.data(),count),
+            rows,max_rows_,rows,kHidden,1,0x46514b56u,
+            Exl3GraphPrecision::oscar_int2_fp16,
+            Exl3GraphPositionPolicy::oscar_split_class,1,stream);
+        Exl3GraphCaptureExtent extent;extent.known=true;
+        extent.retained[static_cast<unsigned>(
+            Exl3ResourceInventory::Domain::graph_count)]=2;
+        Exl3PrefillProjectionChainGraph::Request request{
+            std::move(fingerprint),
+            std::span<const Exl3GraphBoundResource>(resources.data(),count),
+            extent,1,0x46514b560001ull,stream,true};
+        begin(1);
+        prefill_projection_chain_graph_.execute(request,[&](cudaStream_t graph_stream) {
+            project_on(linear_workspaces_[0],weights_.q,weights_.q_metadata,
+                input_norm,qg,Exl3TargetProjectionOperator::q,graph_stream);
+            project_on(linear_workspaces_[1],weights_.k,weights_.k_metadata,
+                input_norm,kp,Exl3TargetProjectionOperator::k,graph_stream);
+            project_on(linear_workspaces_[2],weights_.v,weights_.v_metadata,
+                input_norm,vp,Exl3TargetProjectionOperator::v,graph_stream);
+        });
+        launch(cudaGetLastError(),"launch prefill projection-chain QKV graph");
+        end(1);
+    } else if(concurrent_qkv) {
+        launch(cudaEventRecord(prefill_qkv_concurrency_.fork,stream),
+               "record wide-prefill QKV fork");
+        launch(cudaStreamWaitEvent(prefill_qkv_concurrency_.k_stream,
+                                   prefill_qkv_concurrency_.fork,0),
+               "fork wide-prefill K stream");
+        launch(cudaStreamWaitEvent(prefill_qkv_concurrency_.v_stream,
+                                   prefill_qkv_concurrency_.fork,0),
+               "fork wide-prefill V stream");
+        try {
+            project_on(prefill_qkv_concurrency_.k_workspace,weights_.k,
+                weights_.k_metadata,input_norm,kp,Exl3TargetProjectionOperator::k,
+                prefill_qkv_concurrency_.k_stream);
+            launch(cudaGetLastError(),"launch concurrent wide-prefill K projection");
+            launch(cudaEventRecord(prefill_qkv_concurrency_.k_done,
+                                   prefill_qkv_concurrency_.k_stream),
+                   "record wide-prefill K completion");
+            project_on(prefill_qkv_concurrency_.v_workspace,weights_.v,
+                weights_.v_metadata,input_norm,vp,Exl3TargetProjectionOperator::v,
+                prefill_qkv_concurrency_.v_stream);
+            launch(cudaGetLastError(),"launch concurrent wide-prefill V projection");
+            launch(cudaEventRecord(prefill_qkv_concurrency_.v_done,
+                                   prefill_qkv_concurrency_.v_stream),
+                   "record wide-prefill V completion");
+            project(linear_workspaces_[0],weights_.q,weights_.q_metadata,input_norm,qg,
+                    Exl3TargetProjectionOperator::q);
+            launch(cudaGetLastError(),"launch concurrent wide-prefill Q projection");
+            launch(cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.k_done,0),
+                   "join wide-prefill K stream");
+            launch(cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.v_done,0),
+                   "join wide-prefill V stream");
+            ++prefill_qkv_concurrent_calls_;
+            prefill_qkv_concurrent_rows_+=static_cast<std::uint64_t>(rows);
+        } catch(...) {
+            (void)cudaEventRecord(prefill_qkv_concurrency_.k_done,
+                                  prefill_qkv_concurrency_.k_stream);
+            (void)cudaEventRecord(prefill_qkv_concurrency_.v_done,
+                                  prefill_qkv_concurrency_.v_stream);
+            (void)cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.k_done,0);
+            (void)cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.v_done,0);
+            throw;
+        }
+    } else {
+        prefetch_weights(1,weights_.k.trellis);
+        begin(1);
+        // Suspension is explicit at the layer boundary, outside ordinary linear
+        // dispatch. Private attention/KV/MLP state resumes only after Q is complete.
+        const bool shared_q=can_share_target &&
+            target_shared_admission(Exl3TargetSharedFamily::q,weights_.q_metadata).has_value() &&
+            target_q_executor_(Exl3TargetQContinuation{weights_.q,weights_.q_metadata,
+                input_norm,qg,rows,position,model_layer_,stream});
+        if(!shared_q)project(linear_workspaces_[0],weights_.q,weights_.q_metadata,
+            input_norm,qg,Exl3TargetProjectionOperator::q);
+        launch(cudaGetLastError(),"launch EXL3 Q projection");end(1);
+        prefetch_weights(2,weights_.o.trellis);
+        const bool m1_kv_pair=(fast_same_weights_fp16kv_m1_kv_pair_ ||
+            fast_same_weights_fp16kv_m1_kv_wide_pair_) &&
+            !preserve_m1_topology && !can_share_target && rows==1 &&
+            !wide_prefill && (!capture_active_ ||
+                fast_same_weights_fp16kv_m1_kv_pair_graph_) &&
+            !oscar_ && !profile &&
+            !projection_timing_ &&
+            !projection_observer_ && linear_workspaces_[1] &&
+            linear_workspaces_[2] &&
+            (weights_.k_metadata.K==6 || weights_.k_metadata.K==7) &&
+            weights_.v_metadata.K==weights_.k_metadata.K &&
+            weights_.k_metadata.mul1 &&
+            weights_.v_metadata.mul1 && !weights_.k_metadata.mcg &&
+            !weights_.v_metadata.mcg && !weights_.k_metadata.has_bias &&
+            !weights_.v_metadata.has_bias &&
+            weights_.k_metadata.in_features==kHidden &&
+            weights_.v_metadata.in_features==kHidden &&
+            weights_.k_metadata.out_features==kKVProjection &&
+            weights_.v_metadata.out_features==kKVProjection;
+        begin(2);
+        const bool merged_kv=!m1_kv_pair && rows>=1 && rows<=8 && !can_share_target &&
+            !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
+            !wide_prefill && linear_workspaces_[1] && linear_workspaces_[2] &&
+            linear_workspaces_[1]->forward_merged_pair(*linear_workspaces_[2],
+                weights_.k,weights_.k_metadata,kp,weights_.v,weights_.v_metadata,vp,
+                input_norm,rows,stream);
+        if(merged_kv) {
+            launch(cudaGetLastError(),"launch merged EXL3 K/V projection");
+        } else if(m1_kv_pair) {
+            if(fast_same_weights_fp16kv_m1_kv_wide_pair_)
+                linear_workspaces_[1]->forward_target_m1_kv_wide_pair_for_test(
+                    *linear_workspaces_[2],weights_.k,weights_.k_metadata,
+                    weights_.v,weights_.v_metadata,input_norm,kp,vp,stream);
+            else linear_workspaces_[1]->forward_target_m1_kv_pair_for_test(
+                    *linear_workspaces_[2],weights_.k,weights_.k_metadata,
+                    weights_.v,weights_.v_metadata,input_norm,kp,vp,stream);
+            launch(cudaGetLastError(),"launch EXL3 paired K/V projection");
+            ++fast_same_weights_fp16kv_m1_kv_pair_submissions_;
+        } else {
+            const bool shared_k=can_share_target && target_kv_executor_enabled_ &&
+                target_shared_admission(Exl3TargetSharedFamily::k,weights_.k_metadata).has_value() &&
+                target_q_executor_(Exl3TargetQContinuation{weights_.k,weights_.k_metadata,
+                    input_norm,kp,rows,position,model_layer_,stream,Exl3TargetSharedFamily::k});
+            if(!shared_k)project(linear_workspaces_[1],weights_.k,weights_.k_metadata,input_norm,kp,
+                Exl3TargetProjectionOperator::k);
+            launch(cudaGetLastError(),"launch EXL3 K projection");
+        }
+        end(2);
+        begin(3);
+        if(!m1_kv_pair && !merged_kv) {
+            const bool shared_v=can_share_target && target_kv_executor_enabled_ &&
+                target_shared_admission(Exl3TargetSharedFamily::v,weights_.v_metadata).has_value() &&
+                target_q_executor_(Exl3TargetQContinuation{weights_.v,weights_.v_metadata,
+                    input_norm,vp,rows,position,model_layer_,stream,Exl3TargetSharedFamily::v});
+            if(!shared_v)project(linear_workspaces_[2],weights_.v,weights_.v_metadata,input_norm,vp,
+                Exl3TargetProjectionOperator::v);
+            launch(cudaGetLastError(),"launch EXL3 V projection");
+        }
+        end(3);
+    }
+
+    attention_middle(AttentionMiddle{input_norm,qg,kp,vp,qn,kn,qr,kr,attn,gp,rows,position,stream,
+        profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix,starts,ends});
 
     prefetch_weights(4,weights_.gate.trellis);
     begin(7);

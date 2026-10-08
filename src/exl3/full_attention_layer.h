@@ -905,6 +905,18 @@ private:
     int* fakequant_watermark_ = nullptr;
     // L0 OSCAR INT2 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
     l0_oscar::LayerStorage l0_{};
+    // Arguments of attention_middle(): the stateful core between the Q/K/V
+    // projections and the output projection (see full_attention_layer.cu).
+    struct AttentionMiddle {
+        const std::uint16_t* input_norm;
+        std::uint16_t *qg,*kp,*vp,*qn,*kn,*qr,*kr,*attn,*gp;
+        int rows,position;
+        cudaStream_t stream;
+        bool profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix;
+        cudaEvent_t* starts;
+        cudaEvent_t* ends;
+    };
+    void attention_middle(const AttentionMiddle& m);
     bool l0_exact_ = false;          // verifier/decode rows (<= 8)
     bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)
 
