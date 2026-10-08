@@ -490,10 +490,12 @@ public:
     long long ring_base_abs() const noexcept;
     // Borrowed host input: retain through successful call completion, or through
     // stream retirement if the call fails after enqueue. Engine uses lane storage.
-    // Proposals also report `siblings` sibling-leaf candidates (positions
-    // 0..siblings-1: the highest-unary candidate other than the proposal).
-    void set_proposal_siblings(int siblings);
-    const std::vector<std::int64_t>& last_proposal_siblings() const noexcept;
+    // Proposals also report each position's top-16 candidate IDs and unary
+    // scores ([position][16], unary order of the selector) for verification
+    // tree construction.
+    void set_proposal_candidates(bool enabled);
+    const std::vector<std::int64_t>& last_candidate_ids() const noexcept;
+    const std::vector<float>& last_candidate_unary() const noexcept;
     std::vector<std::int64_t> propose_cached_view(
         std::span<const std::int64_t> block_ids,int block_pos0,
         const std::uint16_t* target_embedding_bf16,

@@ -167,7 +167,7 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
     const int kv_index = row * kKVHeads * kHeadDim +
                          ((index / kHeadDim) % kKVHeads) * kHeadDim + channel;
     const int base_position = position_device ? *position_device : position;
-    int pos = base_position + sibling_row_offset(row, sibling_chain_rows(chain_rows));
+    int pos = base_position + sibling_row_offset(row, chain_rows);
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
     float q = __half2float(__ushort_as_half(q_in[index]));
     float k = __half2float(__ushort_as_half(k_in[kv_index]));
@@ -208,7 +208,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
     const int channel = index % kHeadDim;
     const int row = index / (kKVHeads * kHeadDim);
     const int base_position = position_device ? *position_device : position;
-    int pos = base_position + sibling_row_offset(row, sibling_chain_rows(chain_rows));
+    int pos = base_position + sibling_row_offset(row, chain_rows);
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
     float value = __half2float(__ushort_as_half(k_in[index]));
     if (channel < kRopeDim) {
@@ -266,7 +266,7 @@ __global__ void __launch_bounds__(256) decode_qk_prepare_kernel(const std::uint1
     normalized[channel]=__half2float(__ushort_as_half(norm_bits));
     __syncthreads();
     const int base_position=position_device?*position_device:position;
-    const int pos=base_position+sibling_row_offset(row,sibling_chain_rows(chain_rows));
+    const int pos=base_position+sibling_row_offset(row,chain_rows);
     float out=normalized[channel];
     if(channel<kRopeDim) {
         const int pair=channel<kRopeDim/2?channel:channel-kRopeDim/2;
@@ -6496,7 +6496,7 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     constexpr int kVectors=kHeadDim/8;
     // A sibling row (sibling_row_offset) sees the prefix before its logical
     // position plus its own key at its physical slot.
-    const int chain=sibling_chain_rows(position_device?position_device+1:nullptr);
+    const int* layout=position_device?position_device+1:nullptr;
     __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
     __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
     const int segment=static_cast<int>(blockIdx.x);
@@ -6541,8 +6541,8 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const bool live0=row0<rows,live1=row1<rows;
     const int count0=base+row0+1,count1=base+row1+1;
     // Keys before the logical position; the own key is the merge's self term.
-    const int prefix0=base+sibling_row_offset(row0,chain);
-    const int prefix1=base+sibling_row_offset(row1,chain);
+    const int prefix0=base+sibling_row_offset(row0,layout);
+    const int prefix1=base+sibling_row_offset(row1,layout);
     const auto* q0=reinterpret_cast<const unsigned*>(q+
         (static_cast<std::size_t>(live0?row0:0)*kQHeads+kv_head*H+head0)*kHeadDim+2*t);
     const auto* q1=reinterpret_cast<const unsigned*>(q+
@@ -6688,7 +6688,7 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
     constexpr int kVectors=kHeadDim/8;
     // A sibling row (sibling_row_offset) sees the prefix before its logical
     // position plus its own key at its physical slot.
-    const int chain=sibling_chain_rows(position_device?position_device+1:nullptr);
+    const int* layout=position_device?position_device+1:nullptr;
     __shared__ __align__(16) half k_s[kVerifyMmaChunk*kVerifyMmaStride];
     __shared__ __align__(16) half v_s[kVerifyMmaChunk*kVerifyMmaStride];
     const int segment=static_cast<int>(blockIdx.x);
@@ -6733,8 +6733,8 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
     const bool live0=row0<rows,live1=row1<rows;
     const int count0=base+row0+1,count1=base+row1+1;
     // Keys before the logical position; the own key is the merge's self term.
-    const int prefix0=base+sibling_row_offset(row0,chain);
-    const int prefix1=base+sibling_row_offset(row1,chain);
+    const int prefix0=base+sibling_row_offset(row0,layout);
+    const int prefix1=base+sibling_row_offset(row1,layout);
     const auto* q0=reinterpret_cast<const unsigned*>(q+
         (static_cast<std::size_t>(live0?row0:0)*kQHeads+kv_head*H+head0)*kHeadDim+2*t);
     const auto* q1=reinterpret_cast<const unsigned*>(q+

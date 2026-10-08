@@ -4,6 +4,7 @@
 #include "exl3/native_context_extent.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/exact_outer_reference.h"
+#include "exl3/verification_tree.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -700,31 +701,35 @@ private:
         // overlap the draft (the verifier then reuses it).
         if(deferred && !context_->transaction_active())
             context_->begin_transaction(stream_);
-        // Sibling leaves (NINFER_DFLASH2_SIBLINGS, default 2): the last `siblings` verifier
-        // rows replace chain rows 1..siblings with the draft's runner-up.
-        // Each sibling replaces a drafted chain row: siblings <= chain drafts.
-        // Siblings pay off while few drafts are accepted; a deep-accepting
-        // stream keeps the full chain (committed tokens per round, EMA).
-        const bool sibling_regime=committed_ema_<sibling_switch();
-        const int siblings=deferred && sibling_regime?
-            std::min(sibling_count(),(value.width-1)/2):0;
-        const int chain_width=value.width-siblings;
-        draft_.set_proposal_siblings(siblings);
+        // Verification tree (verification_tree.h): the draft proposes the
+        // full chain, then the round keeps a chain prefix and fills the
+        // remaining verifier rows with up to NINFER_DFLASH2_SIBLINGS sibling
+        // leaves at the depths where they add the most expected acceptance.
+        const bool tree=deferred && sibling_count()>0;
+        draft_.set_proposal_candidates(tree);
         const auto draft_start=Clock::now();
         value.target_seed_ms=std::chrono::duration<double,std::milli>(
             draft_start-proposal_start).count();
         auto proposed=draft_.propose_cached_view(
-            std::span<const std::int64_t>(value.proposal).first(chain_width),
+            std::span<const std::int64_t>(value.proposal).first(value.width),
             value.root_position,context_->target_embedding(),
             context_->target_lm_head_weights(),
             context_->target_lm_head_metadata(),248070,stream_);
-        if(proposed.size()!=static_cast<std::size_t>(chain_width-1) ||
-           draft_.last_proposal_siblings().size()!=static_cast<std::size_t>(siblings))
+        if(proposed.size()!=static_cast<std::size_t>(value.width-1) ||
+           (tree && draft_.last_candidate_ids().size()!=proposed.size()*16))
             throw std::runtime_error("fast device round draft proposal extent");
         value.draft_api_ms=elapsed(draft_start);
         std::copy(proposed.begin(),proposed.end(),value.proposal.begin()+1);
-        std::copy(draft_.last_proposal_siblings().begin(),draft_.last_proposal_siblings().end(),
-                  value.proposal.begin()+chain_width);
+        std::vector<int> sibling_offsets;
+        if(tree) {
+            const auto shape=exl3_build_verification_tree(proposed,
+                draft_.last_candidate_ids(),draft_.last_candidate_unary(),
+                value.width-1,sibling_count());
+            std::copy(shape.sibling_tokens.begin(),shape.sibling_tokens.end(),
+                      value.proposal.begin()+1+shape.chain_drafts);
+            sibling_offsets=shape.sibling_offsets;
+            value.width=1+shape.chain_drafts+static_cast<int>(sibling_offsets.size());
+        }
         value.proposal_ms=elapsed(proposal_start);
         std::size_t staged=0;
         const Exl3CommittedTapConsumer consumer=[&](
@@ -750,14 +755,15 @@ private:
         value.verification=verify_exl3_outer_device_resident_reference(
             *context_,std::span<const std::int64_t>(value.proposal).first(value.width),
             terminal,stream_,&binding,&consumer,timeline,
-            seed?&*seed:nullptr,reuse_seed_?coherent_policy:0,settlement,siblings);
+            seed?&*seed:nullptr,reuse_seed_?coherent_policy:0,settlement,sibling_offsets);
         value.verifier_ms=elapsed(verifier_start);
         if(after_verify)after_verify(*context_);
         value.committed_tokens=value.verification.committed_tokens;
         if(const char* log_path=std::getenv("NINFER_DFLASH2_ROUND_LOG")) {
             // Diagnostic-only round record: root position, proposal chain,
-            // committed tokens and the draft's per-position top-16 candidates.
-            const int rows=value.width-1;
+            // committed tokens, the draft's per-position top-16 candidates and
+            // their unary scores (all drafted positions).
+            const int rows=static_cast<int>(proposed.size());
             std::vector<std::int64_t> candidates(static_cast<std::size_t>(rows)*16);
             if(rows>0 && draft_.last_topk_ids_device_for_test())
                 check(cudaMemcpy(candidates.data(),draft_.last_topk_ids_device_for_test(),
@@ -768,8 +774,15 @@ private:
             for(int i=0;i<value.width;++i)log<<value.proposal[static_cast<std::size_t>(i)]<<(i+1<value.width?' ':';');
             for(std::size_t i=0;i<value.committed_tokens.size();++i)
                 log<<value.committed_tokens[i]<<(i+1<value.committed_tokens.size()?' ':';');
+            std::vector<float> unary(candidates.size());
+            if(rows>0 && draft_.last_topk_values_device_for_test())
+                check(cudaMemcpy(unary.data(),draft_.last_topk_values_device_for_test(),
+                        unary.size()*sizeof(float),cudaMemcpyDeviceToHost),
+                    "round log top-16 unary scores");
             for(std::size_t i=0;i<candidates.size();++i)
-                log<<candidates[i]<<(i+1<candidates.size()?' ':'\n');
+                log<<candidates[i]<<(i+1<candidates.size()?' ':';');
+            for(std::size_t i=0;i<unary.size();++i)
+                log<<unary[i]<<(i+1<unary.size()?' ':'\n');
             if(candidates.empty())log<<'\n';
         }
         const auto useful=value.committed_tokens.size();
@@ -787,26 +800,16 @@ private:
         }
         value.staged_bytes=staged;
         value.terminal=value.verification.stopped;
-        committed_ema_=0.75*committed_ema_+0.25*static_cast<double>(useful);
     }
 
-    // NINFER_DFLASH2_SIBLING_SWITCH: committed tokens per round (EMA) at and
-    // above which rounds verify the full chain without siblings.
-    static double sibling_switch() {
-        static const double value=[] {
-            const char* text=std::getenv("NINFER_DFLASH2_SIBLING_SWITCH");
-            return text?std::atof(text):3.5;
-        }();
-        return value;
-    }
-    double committed_ema_=0.0;
-
+    // NINFER_DFLASH2_SIBLINGS: maximum sibling leaves per verification tree
+    // (0: plain chain verification).
     static int sibling_count() {
         static const int count=[] {
             const char* value=std::getenv("NINFER_DFLASH2_SIBLINGS");
-            const int parsed=value?std::atoi(value):2;
-            if(parsed<0 || parsed>4)
-                throw std::invalid_argument("NINFER_DFLASH2_SIBLINGS must be 0..4");
+            const int parsed=value?std::atoi(value):6;
+            if(parsed<0 || parsed>6)
+                throw std::invalid_argument("NINFER_DFLASH2_SIBLINGS must be 0..6");
             return parsed;
         }();
         return count;

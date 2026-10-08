@@ -435,6 +435,7 @@ __global__ void gdn_conv_kernel(const std::uint16_t* input, const std::uint16_t*
     auto* v_out = reinterpret_cast<__nv_bfloat16*>(v);
     const int chain = sibling_chain_rows(chain_rows);
     const int chain_end = chain > 0 && chain < rows ? chain : rows;
+    const int packed = chain_end < rows ? chain_rows[1] : 0;
     const auto convolve = [&](int row) {
         const float x0 = __bfloat162float(x[channel * rows + row]);
         const float acc = __bfloat162float(w[channel * 4 + 0]) * s1 +
@@ -448,8 +449,9 @@ __global__ void gdn_conv_kernel(const std::uint16_t* input, const std::uint16_t*
         return x0;
     };
     for (int row = 0; row < chain_end; ++row) {
-        // Sibling chain_end + row - 1 replaces chain row `row` (row >= 1).
-        if (row >= 1 && chain_end + row - 1 < rows) convolve(chain_end + row - 1);
+        // Siblings at logical offset `row` see the same history as chain row `row`.
+        for (int sibling = chain_end; sibling < rows; ++sibling)
+            if (sibling_offset(sibling - chain_end, packed) == row) convolve(sibling);
         const float x0 = convolve(row);
         s0 = s1; s1 = s2; s2 = s3; s3 = x0;
     }
@@ -982,10 +984,11 @@ __global__ void __launch_bounds__(kGdnChunkThreads) gdn_recurrence_chunk_kernel(
     }
     __syncthreads();
     const int chain_end=chain_value>0 && chain_value<rows?chain_value:rows;
+    const int packed=chain_end<rows?chain_rows[1]:0;
     // Row r has a = chain ancestors 0..a-1. Decay exponents are direct gate
     // sums over the spanned rows (never differences of cumulative sums), in
     // ascending row order: G_r - G_j = g_{j+1} + ... + g_{a-1} + g_r.
-    const auto ancestors=[&](int r) { return r<chain_end?r:r-chain_end+1; };
+    const auto ancestors=[&](int r) { return r<chain_end?r:sibling_offset(r-chain_end,packed); };
     const auto gate_sum=[&](int first,int end) {
         float x=0.0f;
         #pragma unroll 1
@@ -1038,13 +1041,13 @@ __global__ void __launch_bounds__(kGdnChunkThreads) gdn_recurrence_chunk_kernel(
         };
         #pragma unroll
         for(int t=0;t<kMax;++t) {
-            if(t>=1) {
-                const int sibling=chain_end+t-1;
-                solve(sibling<kMax?sibling:kMax-1,t,sibling<rows);
-            }
             u[t]=solve(t,t,t<chain_end);
             update[t][lane]=u[t];
         }
+        // Sibling leaves depend only on their chain ancestors' updates.
+        #pragma unroll
+        for(int r=1;r<kMax;++r)
+            if(r>=chain_end && r<rows) solve(r,sibling_offset(r-chain_end,packed),true);
     }
     __syncthreads();
     const float carry=final_decay[chain_end];

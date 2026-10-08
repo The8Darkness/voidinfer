@@ -342,14 +342,15 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
     const Exl3OuterDeviceSeedPacket* ready_seed=nullptr,
     std::uint64_t numerical_policy=0,
     Exl3OuterDeviceSettlement settlement=Exl3OuterDeviceSettlement::Eager,
-    int siblings=0) {
+    std::span<const int> sibling_offsets={}) {
     if(tentative.size()<2 || tentative.size()>8 ||
        exact.continuation_capacity()<tentative.size() ||
        !exact.transaction_prepared())
         throw std::invalid_argument(
             "device-resident verifier requires prepared B2..B8 transaction");
-    // tentative = [seed, chain drafts, sibling leaves]: sibling j replaces
-    // chain row j + 1 (sibling_rows.cuh).
+    // tentative = [seed, chain drafts, sibling leaves]: sibling j is an
+    // alternative to chain row sibling_offsets[j] (sibling_rows.cuh).
+    const int siblings=static_cast<int>(sibling_offsets.size());
     const int chain_rows=static_cast<int>(tentative.size())-siblings;
     if(siblings<0 || chain_rows<2 ||
        (siblings && (!exl3_device_greedy_enabled() || !exl3_fold_correction_enabled())))
@@ -390,7 +391,7 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
         // The valid host token was already synchronized before draft proposal.
         const auto seed=reuse_seed?ready_seed->token:exl3_branch_greedy(exact,stream);
         if(timeline)stage_end(timeline->seed_ms);
-        if(siblings)exact.set_verifier_siblings(siblings);
+        if(siblings)exact.set_verifier_siblings(sibling_offsets);
         exact.continue_rows(tentative,stream);
         if(timeline)stage_end(timeline->submit_ms);
         result.verification_rows=tentative.size();
@@ -409,13 +410,17 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
                 chain_path[static_cast<std::size_t>(row)]=packet.decisions[row-1].token;
             decision=decide_exl3_outer_prefix(chain_path,
                 tentative.first(static_cast<std::size_t>(chain_rows)),terminal);
-            // A rejected chain row d (1 <= d <= siblings) whose target token
-            // equals sibling d - 1 continues through that sibling's row.
+            // A rejected chain row d whose target token equals a sibling at
+            // offset d continues through that sibling's row.
             const int depth=static_cast<int>(decision.accepted);
-            if(decision.rejected && !decision.stopped && depth>=1 && depth<=siblings &&
-               tentative[static_cast<std::size_t>(chain_rows+depth-1)]==
-                   decision.committed_tokens.back()) {
-                promoted_sibling=chain_rows+depth-1;
+            for(int j=0;j<siblings && decision.rejected && !decision.stopped;++j)
+                if(sibling_offsets[static_cast<std::size_t>(j)]==depth &&
+                   tentative[static_cast<std::size_t>(chain_rows+j)]==
+                       decision.committed_tokens.back()) {
+                    promoted_sibling=chain_rows+j;
+                    break;
+                }
+            if(promoted_sibling>=0) {
                 const auto next=packet.decisions[promoted_sibling].token;
                 decision.committed_tokens.push_back(next);
                 decision.accepted=static_cast<std::size_t>(depth)+1;

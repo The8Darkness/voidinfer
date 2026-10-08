@@ -1196,7 +1196,7 @@ struct Exl3TextContext::Impl {
     bool repair_pending=false;
     // L0 OSCAR: re-entry of append_prefill_layer_major for one bounded block.
     bool l0_layer_major_block=false;
-    int verifier_siblings=0;
+    std::vector<int> verifier_sibling_offsets;
     // Sibling promotion descriptor tables, one per (source, destination, rows).
     struct SiblingCopyTable {
         int source=-1,destination=-1,rows=0,count=0;
@@ -1674,7 +1674,7 @@ struct Exl3TextContext::Impl {
         const auto add=[&](const void* address,std::size_t bytes) noexcept {
             result.buffers[result.count++]={address,bytes};
         };
-        add(position_device,2*sizeof(int));
+        add(position_device,3*sizeof(int));
         add(hidden_a,hidden_bytes);
         add(hidden_b,hidden_bytes);
         add(embedding_trace?embedding_trace->ptr:nullptr,hidden_bytes);
@@ -4735,9 +4735,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         allocate(kHidden*sizeof(std::uint16_t),reinterpret_cast<void**>(&impl->final_norm),"allocate E4A final norm");
         allocate(kVocab*sizeof(std::uint16_t),reinterpret_cast<void**>(&impl->logits),"allocate E4A logits");
         allocate(token_bytes,reinterpret_cast<void**>(&impl->token_ids),"allocate E4A token ids");
-        // [0] device position, [1] verifier chain rows (0: every row is a
-        // chain row; c > 0: rows >= c are sibling leaves, see sibling_row_offset).
-        allocate(2*sizeof(int),reinterpret_cast<void**>(&impl->position_device),"allocate E4B2 position parameter");
+        // [0] device position, [1..2] verifier layout {chain rows, packed
+        // sibling offsets} (chain rows 0: every row is a chain row; see
+        // sibling_rows.cuh).
+        allocate(3*sizeof(int),reinterpret_cast<void**>(&impl->position_device),"allocate E4B2 position parameter");
         allocate(sizeof(std::int64_t),reinterpret_cast<void**>(&impl->draft_token_id),"allocate E5A2 draft token id");
     };
     std::size_t base_bytes=0,base_owners=0;
@@ -7134,7 +7135,7 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
             cuda_check(cudaMemsetAsync(impl_->cache_v[layer]->ptr, 0, impl_->cache_v[layer]->bytes, stream), "reset E4A V cache");
         }
     }
-    cuda_check(cudaMemsetAsync(impl_->position_device, 0, 2*sizeof(int), stream),
+    cuda_check(cudaMemsetAsync(impl_->position_device, 0, 3*sizeof(int), stream),
                "reset E4B2 position parameter");
     if (impl_->oscar) impl_->oscar->reset();
     position_ = 0;
@@ -8069,7 +8070,7 @@ void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStrea
     if (impl_->continuation) impl_->continuation->rows = 0;
     cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
                                cudaMemcpyHostToDevice, stream), "upload E4A prefill token IDs");
-    cuda_check(cudaMemsetAsync(impl_->position_device, 0, 2*sizeof(int), stream),
+    cuda_check(cudaMemsetAsync(impl_->position_device, 0, 3*sizeof(int), stream),
                "set E4B2 prefill position parameter");
     if(impl_->host_kv_prefill_fault_for_test==1) {
         impl_->host_kv_prefill_fault_for_test=0;
@@ -9072,9 +9073,9 @@ __global__ void sibling_row_copy_kernel(const Exl3SiblingRowCopy* entries,
     }
 }
 
-void Exl3TextContext::set_verifier_siblings(int siblings) {
-    require(siblings>=0 && siblings<8,"verifier sibling count");
-    impl_->verifier_siblings=siblings;
+void Exl3TextContext::set_verifier_siblings(std::span<const int> offsets) {
+    require(offsets.size()<8,"verifier sibling count");
+    impl_->verifier_sibling_offsets.assign(offsets.begin(),offsets.end());
 }
 
 void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
@@ -9171,18 +9172,22 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
                                cudaMemcpyHostToDevice, stream),
                "upload P2 target continuation token IDs");
-    const int siblings=impl_->verifier_siblings;
-    impl_->verifier_siblings=0;
+    const auto offsets=std::move(impl_->verifier_sibling_offsets);
+    impl_->verifier_sibling_offsets.clear();
+    const int siblings=static_cast<int>(offsets.size());
     require(siblings==0 || rows-siblings>=2,"verifier sibling layout needs two chain rows");
-    // [0] base position, [1] chain rows (0 when every row is a chain row).
-    const std::array<int,2> layout{position_,siblings?rows-siblings:0};
+    // [0] base position, [1] chain rows (0 when every row is a chain row),
+    // [2] packed sibling offsets.
+    const int chain=siblings?rows-siblings:0;
+    const std::array<int,3> layout{position_,chain,
+        siblings?exl3_pack_sibling_offsets(offsets,chain):0};
     const int base_position = position_;
     cuda_check(cudaMemcpyAsync(impl_->position_device, layout.data(), sizeof(layout),
                                cudaMemcpyHostToDevice, stream),
                "set P2 target continuation base position");
     impl_->process_rows(impl_->token_ids, rows, base_position, stream,
                         nullptr, true, true, true);
-    const std::array<int,2> final_layout{base_position + rows - 1,0};
+    const std::array<int,3> final_layout{base_position + rows - 1,0,0};
     cuda_check(cudaMemcpyAsync(impl_->position_device, final_layout.data(),
                                sizeof(final_layout), cudaMemcpyHostToDevice, stream),
                "set P2 target continuation final device position");

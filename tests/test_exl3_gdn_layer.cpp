@@ -589,14 +589,19 @@ void run_gdn_verifier_recurrence_oracle() {
     auto beta_device=upload({reinterpret_cast<const std::byte*>(beta.data()),beta.size()*4},"allocate verifier beta");
     auto state_device=allocate_device(state_elements*4,"allocate verifier state");
     auto output_device=allocate_device(v.size()*2,"allocate verifier output");
-    auto chain_device=allocate_device(sizeof(int),"allocate verifier chain rows");
-    const std::array<std::array<int,2>,12> layouts{{{1,0},{2,0},{3,0},{4,0},{5,0},{7,0},{8,0},
-        {8,6},{8,5},{5,3},{3,2},{4,3}}};
-    for(const auto& [rows,chain]:layouts) {
+    auto chain_device=allocate_device(2*sizeof(int),"allocate verifier layout");
+    // {rows, chain rows, sibling offsets}: sibling leaves at arbitrary,
+    // repeated and unordered chain depths.
+    struct Layout { int rows,chain; std::vector<int> offsets; };
+    const std::vector<Layout> layouts{{1,0,{}},{2,0,{}},{3,0,{}},{4,0,{}},{5,0,{}},{7,0,{}},{8,0,{}},
+        {8,6,{1,2}},{8,5,{1,2,3}},{5,3,{1,2}},{3,2,{1}},{4,3,{1}},
+        {8,4,{3,1,1,2}},{8,2,{1,1,1,1,1,1}},{8,7,{6}},{6,3,{2,2,1}}};
+    for(const auto& [rows,chain,offsets]:layouts) {
         cuda_check(cudaMemcpy(state_device->ptr,state.data(),state_elements*4,cudaMemcpyHostToDevice),
                    "upload verifier state");
-        cuda_check(cudaMemcpy(chain_device->ptr,&chain,sizeof(int),cudaMemcpyHostToDevice),
-                   "upload verifier chain rows");
+        const std::array<int,2> layout{chain,chain?exl3_pack_sibling_offsets(offsets,chain):0};
+        cuda_check(cudaMemcpy(chain_device->ptr,layout.data(),sizeof(layout),cudaMemcpyHostToDevice),
+                   "upload verifier layout");
         exl3_gdn_verifier_recurrence_fixture(static_cast<const std::uint16_t*>(q_device->ptr),
             static_cast<const std::uint16_t*>(k_device->ptr),static_cast<const std::uint16_t*>(v_device->ptr),
             static_cast<const float*>(g_device->ptr),static_cast<const float*>(beta_device->ptr),
@@ -635,7 +640,8 @@ void run_gdn_verifier_recurrence_oracle() {
                 if(commit)s=next;
             };
             for(int t=0;t<chain_end;++t) {
-                if(t>=1 && chain_end+t-1<rows)step(chain_end+t-1,false);
+                for(int j=0;j<static_cast<int>(offsets.size());++j)
+                    if(offsets[static_cast<std::size_t>(j)]==t)step(chain_end+j,false);
                 step(t,true);
             }
             double head_output=0,head_state=0;

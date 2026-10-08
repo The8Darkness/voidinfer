@@ -2438,7 +2438,7 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
     const std::int64_t* device_anchor, const std::int64_t* cand_ids,
     const std::uint16_t* hidden, const std::uint16_t* pred_cb,
     const std::uint16_t* succ_cb, const float* cand_unary,
-    std::int64_t* proposal_out, int siblings) {
+    std::int64_t* proposal_out) {
     const int t = static_cast<int>(threadIdx.x);
     const int lane = t & 31;
     const int candidate_index = t >> 5;
@@ -2482,10 +2482,6 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
                 static_cast<std::size_t>(position) * kTopK + best];
             proposal_out[position] = selected;
             anchor = selected;
-            // Sibling leaf: the highest-unary other candidate at this position.
-            if (position < siblings)
-                proposal_out[kBlockCap + position] = cand_ids[
-                    static_cast<std::size_t>(position) * kTopK + (best == 0 ? 1 : 0)];
         }
         __syncthreads();
     }
@@ -2770,8 +2766,9 @@ struct Exl3Dflash2DraftModel::Impl {
     bool fused_topk_liveness = false;
     std::uint64_t fused_topk_liveness_calls = 0;
     bool fused_selector = false;
-    int proposal_siblings = 0;
-    std::vector<std::int64_t> last_siblings;
+    bool proposal_candidates = false;
+    std::vector<std::int64_t> last_candidate_ids;
+    std::vector<float> last_candidate_unary;
     std::uint64_t fused_selector_calls = 0;
     std::uint64_t device_liveness_checks = 0;
     std::vector<DraftPositionConfidence> last_position_confidence;
@@ -3143,8 +3140,8 @@ struct Exl3Dflash2DraftModel::Impl {
         alloc(rowsB(kBlockCap) * kTopK * sizeof(float), reinterpret_cast<void**>(&s.cand_unary), "dflash cand unary");
         alloc(dflash_topk_segment_bytes(), &s.topk_segments, "dflash segmented top-K scratch");
         alloc(kTopK * sizeof(float), reinterpret_cast<void**>(&s.edge_scores), "dflash edge scores");
-        // [0, kBlockCap) proposals (slot 7: device-seed status), [kBlockCap, 2 kBlockCap) siblings.
-        alloc(2 * rowsB(kBlockCap) * sizeof(std::int64_t), reinterpret_cast<void**>(&s.proposal_out), "dflash proposal out");
+        // [0, kBlockCap) proposals (slot 7: device-seed status).
+        alloc(rowsB(kBlockCap) * sizeof(std::int64_t), reinterpret_cast<void**>(&s.proposal_out), "dflash proposal out");
         if (position_confidence)
             alloc(rowsB(kBlockCap) * sizeof(DraftPositionConfidence),
                   reinterpret_cast<void**>(&s.confidence_out),
@@ -4502,14 +4499,17 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached(
                             target_head_metadata, mask_token_id, stream, true);
 }
 
-void Exl3Dflash2DraftModel::set_proposal_siblings(int siblings) {
-    require(siblings >= 0 && siblings < kBlockCap, "draft proposal sibling count");
-    require(!siblings || impl_->fused_selector, "draft siblings require the fused selector");
-    impl_->proposal_siblings = siblings;
+void Exl3Dflash2DraftModel::set_proposal_candidates(bool enabled) {
+    require(!enabled || impl_->fused_selector, "draft candidates require the fused selector");
+    impl_->proposal_candidates = enabled;
 }
 
-const std::vector<std::int64_t>& Exl3Dflash2DraftModel::last_proposal_siblings() const noexcept {
-    return impl_->last_siblings;
+const std::vector<std::int64_t>& Exl3Dflash2DraftModel::last_candidate_ids() const noexcept {
+    return impl_->last_candidate_ids;
+}
+
+const std::vector<float>& Exl3Dflash2DraftModel::last_candidate_unary() const noexcept {
+    return impl_->last_candidate_unary;
 }
 
 std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_view(
@@ -5571,11 +5571,10 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     std::int64_t anchor = block_ids[0];
     require(anchor >= 0 && anchor < kVocab, "E5A2 draft anchor outside vocabulary");
     if (fused_selector) {
-        const int siblings = std::min(m.proposal_siblings, proposal_rows);
         dflash_selector_fused_chain_kernel<<<1, kSelectorFusedThreads, 0, stream>>>(
             proposal_rows, anchor, device_seed ? m.s.ids : nullptr,
             m.s.cand_ids, m.s.hidden_proj_out, m.pred_cb, m.succ_cb,
-            m.s.cand_unary, m.s.proposal_out, siblings);
+            m.s.cand_unary, m.s.proposal_out);
         cuda_check(cudaGetLastError(), "E5A2 launch fused draft selector");
         ++m.fused_selector_calls;
         cuda_check(cudaMemcpyAsync(result.data(), m.s.proposal_out,
@@ -5583,12 +5582,20 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
                                        sizeof(std::int64_t),
                                    cudaMemcpyDeviceToHost, stream),
                    "E5A2 read fused draft proposals");
-        m.last_siblings.assign(static_cast<std::size_t>(siblings), 0);
-        if (siblings)
-            cuda_check(cudaMemcpyAsync(m.last_siblings.data(), m.s.proposal_out + kBlockCap,
-                                       static_cast<std::size_t>(siblings) * sizeof(std::int64_t),
+        const auto candidates =
+            m.proposal_candidates ? static_cast<std::size_t>(proposal_rows) * kTopK : 0;
+        m.last_candidate_ids.resize(candidates);
+        m.last_candidate_unary.resize(candidates);
+        if (candidates) {
+            cuda_check(cudaMemcpyAsync(m.last_candidate_ids.data(), m.s.cand_ids,
+                                       candidates * sizeof(std::int64_t),
                                        cudaMemcpyDeviceToHost, stream),
-                       "E5A2 read fused draft siblings");
+                       "E5A2 read fused draft candidate IDs");
+            cuda_check(cudaMemcpyAsync(m.last_candidate_unary.data(), m.s.cand_unary,
+                                       candidates * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream),
+                       "E5A2 read fused draft candidate scores");
+        }
         timing_close(Impl::TimingCategory::Selector,
                      "selector_fused_final_sync");
         cuda_check(cudaStreamSynchronize(stream),

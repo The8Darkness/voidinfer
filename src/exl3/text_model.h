@@ -1036,9 +1036,9 @@ public:
     // or rollback if that later publication fails.
     void retain_transaction_prefix(int retained_rows,
                                    cudaStream_t stream = nullptr);
-    // The next continue_rows() treats its last `siblings` rows as sibling
-    // leaves (sibling_rows.cuh); one-shot.
-    void set_verifier_siblings(int siblings);
+    // The next continue_rows() treats its last offsets.size() rows as sibling
+    // leaves at the given logical offsets (sibling_rows.cuh); one-shot.
+    void set_verifier_siblings(std::span<const int> offsets);
     // Copies an accepted sibling leaf row of the last continuation into its
     // chain slot (all per-row traces, K/V rows, taps, embedding and logits)
     // before retain_transaction_prefix(destination + 1).

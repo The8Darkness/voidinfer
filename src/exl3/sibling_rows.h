@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::exl3 {
@@ -22,5 +24,21 @@ struct Exl3SiblingRowCopy {
     int dst_row = 0;
 };
 using Exl3SiblingRowCopies = std::vector<Exl3SiblingRowCopy>;
+
+// Device verifier layout word 1: the logical offset of sibling j in bits
+// [3j, 3j + 3) (sibling_rows.cuh).
+inline constexpr int kExl3SiblingOffsetBits = 3;
+inline constexpr int kExl3SiblingOffsetMask = 7;
+inline int exl3_pack_sibling_offsets(std::span<const int> offsets, int chain_rows) {
+    if (offsets.size() > 7)
+        throw std::invalid_argument("verifier sibling count");
+    int packed = 0;
+    for (std::size_t j = 0; j < offsets.size(); ++j) {
+        if (offsets[j] < 1 || offsets[j] >= chain_rows)
+            throw std::invalid_argument("verifier sibling offset outside the chain");
+        packed |= offsets[j] << (kExl3SiblingOffsetBits * static_cast<int>(j));
+    }
+    return packed;
+}
 
 } // namespace ninfer::exl3
