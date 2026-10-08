@@ -29,6 +29,7 @@
 #include <string>
 
 namespace ninfer::exl3 {
+
 namespace {
 
 // Prefill numerical policy (default 1, quality-gated): wide-prefill GDN
@@ -2931,6 +2932,9 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     // Batched multi-agent rounds: this layer's own agent owns the leading
     // own_rows; peer agents' rows follow (run_peer_segment).
     const int own_rows=batch_?batch_->own_rows:rows;
+    // Fused multi-row paths admit the 16 rows of a batched multi-agent
+    // round; ordinary verifier rows stay at 8.
+    const int fused_rows=batch_?16:8;
     const SegmentState segment=begin_segment(own_rows,stream,preserve_m1_topology);
     const std::uint64_t base_checkpoint_generation = segment.base_generation;
     const void* base_checkpoint_recurrent = segment.base_recurrent;
@@ -3419,7 +3423,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             (void)cudaStreamWaitEvent(stream, graph_qkvz_concurrency_.z_done, 0);
             throw;
         }
-    } else if (rows >= 1 && rows <= 8 && !profile && !projection_timing_ &&
+    } else if (rows >= 1 && rows<=fused_rows && !profile && !projection_timing_ &&
                !projection_observer_ && !wide_prefill && !control_pair &&
                linear_workspaces_[0]->forward_merged_pair(*linear_workspaces_[1],
                    weights_.qkv,weights_.qkv_metadata,qkv,weights_.z,weights_.z_metadata,z,
@@ -3438,7 +3442,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     }
     gdn_middle(GdnMiddle{qkv,conv_input,q,k,v,conv_output,z,z_bf16,core,gdn_norm,head_trace,
         o_input,g_trace,beta_trace,own_rows,stream,wide_prefill,preserve_m1_topology,
-        merged_qkvz_side,eligible_retained_prefix,base_checkpoint_recurrent,
+        merged_qkvz_side && !batch_,eligible_retained_prefix,base_checkpoint_recurrent,
         collect_stage_events,starts,ends});
     if(batch_) {
         int first=own_rows;
@@ -3448,7 +3452,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             peer.layer->run_peer_segment(PeerSegmentSource{
                 h+row*kHidden,qkv+row*kQkv,conv_input+row*kQkv,z+row*kZ,
                 a+row*kHeads,b+row*kHeads,g_trace+row*kHeads,beta_trace+row*kHeads,
-                o_input+row*kZ,peer.rows,merged_qkvz_side},stream,preserve_m1_topology);
+                o_input+row*kZ,peer.rows,false},stream,preserve_m1_topology);
             first+=peer.rows;
         }
         if(first!=rows)throw std::logic_error("GDN batched segment rows");
@@ -3457,7 +3461,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         rows>=1 && rows<=8 && !wide_prefill && preserve_m1_topology;
     // The O reduction also writes post = half(input + o) and the
     // post-attention RMS norm (one fused cluster kernel) when its route allows.
-    if(!gopt_residual && rows>=1 && rows<=8 && !wide_prefill && !profile &&
+    if(!gopt_residual && rows>=1 && rows<=fused_rows && !wide_prefill && !profile &&
        !projection_timing_ && !projection_observer_ && residual_norm_fused_enabled() &&
        gdn_o_residual_norm_enabled())
         linear_workspaces_[2]->arm_residual_norm(input,post,weights_.post_attention_norm,
@@ -3511,7 +3515,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         weights_.gate_metadata.out_features == kIntermediate &&
         weights_.up_metadata.out_features == kIntermediate;
     prefetch_weights(4,weights_.down.trellis);
-    const bool merged_gate_up = !gdn_m1_gate_up_pair && rows >= 1 && rows <= 8 && !profile &&
+    const bool merged_gate_up = !gdn_m1_gate_up_pair && rows >= 1 && rows<=fused_rows && !profile &&
         !projection_timing_ && !projection_observer_ && !wide_prefill &&
         !shared_gateup_enabled_ && !small_m_fused_gate_up_transform_ &&
         linear_workspaces_[3]->forward_merged_gate_up_silu(*linear_workspaces_[4],
@@ -3630,7 +3634,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     // Production writes the layer output directly (final_output is trace-only),
     // so no device copy separates this reduction from the next layer.
     std::uint16_t* const residual_destination=skip_state_trace_?output:final_output;
-    if(!shared_down && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+    if(!shared_down && rows>=1 && rows<=fused_rows && !profile && !projection_timing_ &&
        !projection_observer_) {
         if(fuse_successor_norm)
             linear_workspaces_[5]->arm_residual_norm(post,residual_destination,

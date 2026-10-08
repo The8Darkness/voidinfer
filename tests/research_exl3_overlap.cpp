@@ -150,14 +150,14 @@ int main() {
             rewind();
             const auto compare = [&](const std::vector<float>& x, const std::vector<float>& y, const char* who) {
                 const std::size_t vocab = x.size() / static_cast<std::size_t>(n);
-                double max_abs = 0; int agree = 0;
+                double max_abs = 0, sum_abs = 0; int agree = 0;
                 for (int r = 0; r < n; ++r) {
                     const auto* xr = x.data() + r * vocab; const auto* yr = y.data() + r * vocab;
                     agree += std::max_element(xr, xr + vocab) - xr == std::max_element(yr, yr + vocab) - yr;
-                    for (std::size_t j = 0; j < vocab; ++j) max_abs = std::max(max_abs, std::abs(double(xr[j]) - yr[j]));
+                    for (std::size_t j = 0; j < vocab; ++j) { const double e = std::abs(double(xr[j]) - yr[j]); max_abs = std::max(max_abs, e); sum_abs += e; }
                 }
                 std::cout << "OVL batch " << who << " rows=" << n << " argmax_agree=" << agree << "/" << n
-                          << " max_abs_logit_diff=" << max_abs << " sizes=" << x.size() << "/" << y.size() << '\n';
+                          << " max_abs_logit_diff=" << max_abs << " mean_abs=" << sum_abs / double(x.size()) << " sizes=" << x.size() << "/" << y.size() << '\n';
             };
             compare(ra, ba, "own");
             compare(rb, bb, "peer");

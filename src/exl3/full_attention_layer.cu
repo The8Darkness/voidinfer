@@ -26,6 +26,7 @@
 #include <vector>
 
 namespace ninfer::exl3 {
+
 namespace {
 
 constexpr int kHidden = 5120;
@@ -9396,6 +9397,9 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     // Batched multi-agent rounds: this layer's own agent owns the leading
     // own_rows; peer agents' rows follow (run_peer_segment).
     const int own_rows=batch_?batch_->own_rows:rows;
+    // Fused multi-row paths admit the 16 rows of a batched multi-agent
+    // round; ordinary verifier rows stay at 8.
+    const int fused_rows=batch_?16:8;
     bool eligible_retained_prefix = preserve_m1_topology && own_rows >= 2 && own_rows <= 8 &&
         ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
          (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&
@@ -9823,7 +9827,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             weights_.k_metadata.out_features==kKVProjection &&
             weights_.v_metadata.out_features==kKVProjection;
         begin(2);
-        const bool merged_kv=!m1_kv_pair && rows>=1 && rows<=8 && !can_share_target &&
+        const bool merged_kv=!m1_kv_pair && rows>=1 && rows<=fused_rows && !can_share_target &&
             !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
             !wide_prefill && linear_workspaces_[1] && linear_workspaces_[2] &&
             linear_workspaces_[1]->forward_merged_pair(*linear_workspaces_[2],
@@ -9887,7 +9891,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         target_shared_admission(Exl3TargetSharedFamily::o,weights_.o_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.o,weights_.o_metadata,
             attn,op,rows,position,model_layer_,stream,Exl3TargetSharedFamily::o});
-    if(!shared_o && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+    if(!shared_o && rows>=1 && rows<=fused_rows && !profile && !projection_timing_ &&
        !projection_observer_)
         linear_workspaces_[3]->arm_residual(input,post_resid);
     if(!shared_o)project(linear_workspaces_[3], weights_.o, weights_.o_metadata, attn, op,
@@ -9988,7 +9992,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,stream);
             ++fast_same_weights_fp16kv_m1_gate_up_pair_submissions_;
         }
-        merged_gate_up=!paired_m1_gate_up && rows>=1 && rows<=8 && !can_share_target &&
+        merged_gate_up=!paired_m1_gate_up && rows>=1 && rows<=fused_rows && !can_share_target &&
             !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
             !wide_prefill && !small_m_fused_gate_up_transform_ &&
             linear_workspaces_[4]->forward_merged_gate_up_silu(*linear_workspaces_[5],
@@ -10046,7 +10050,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         target_shared_admission(Exl3TargetSharedFamily::down,weights_.down_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
             act,down,rows,position,model_layer_,stream,Exl3TargetSharedFamily::down});
-    if(!shared_down && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+    if(!shared_down && rows>=1 && rows<=fused_rows && !profile && !projection_timing_ &&
        !projection_observer_)
         linear_workspaces_[6]->arm_residual(post_resid,output);
     if(!shared_down)project(linear_workspaces_[6], weights_.down, weights_.down_metadata, act, down,
