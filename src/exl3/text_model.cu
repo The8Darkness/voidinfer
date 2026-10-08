@@ -793,6 +793,8 @@ struct Exl3TextModel::Impl {
     mutable std::mutex shared_numeric_mutex;
     mutable std::shared_ptr<Exl3CudaReconstructGemmWorkspace> shared_numeric_workspace;
     mutable std::shared_ptr<Exl3SharedPromptPool> shared_prompt_pool;
+    // Prompt-only FA2/WMMA32 attention partials shared by concurrent lanes.
+    mutable std::shared_ptr<Exl3SharedPromptPool> shared_wmma;
 
     TensorPayload load_tensor(const IndexedSafetensors& input, const std::string& name) {
         const auto start = std::chrono::steady_clock::now();
@@ -1462,6 +1464,7 @@ struct Exl3TextContext::Impl {
     // model's Exl3SharedPromptPool; this context's small tier serves rows
     // <= small_tier_rows. PromptTierScope selects the pool around larger passes.
     std::shared_ptr<Exl3SharedPromptPool> shared_prompt_pool;
+    std::shared_ptr<Exl3SharedPromptPool> shared_wmma;
     void* small_tier_storage = nullptr;
     int small_tier_rows = 0;
     int prompt_tier_depth = 0;
@@ -4844,6 +4847,12 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     };
     const std::size_t hidden_bytes=checked_extent(kHidden*sizeof(std::uint16_t));
     const auto token_bytes=checked_extent(sizeof(std::int64_t));
+    // Concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): the
+    // prompt-only WMMA32 partials come from one model-level allocation.
+    static const bool share_prompt_rows=[] {
+        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
     const auto visit_base_allocations=[&](auto&& allocate) {
         allocate(hidden_bytes,reinterpret_cast<void**>(&impl->hidden_a),"allocate E4A hidden A");
         allocate(hidden_bytes,reinterpret_cast<void**>(&impl->hidden_b),"allocate E4A hidden B");
@@ -4867,7 +4876,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             allocate(bulk_rows*17408*sizeof(std::uint16_t),
                 reinterpret_cast<void**>(&impl->gdn_mlp_up),"allocate GDN bulk up");
         }
-        if (impl->fast_wmma32_split_capacity) {
+        if (impl->fast_wmma32_split_capacity && !share_prompt_rows) {
             constexpr std::size_t rows=1024;
             allocate(static_cast<std::size_t>(impl->fast_wmma32_split_capacity)*
                 rows*kQHeads*kHeadDim*sizeof(float),
@@ -5578,6 +5587,27 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     materialize_kv();trace_stage("kv");
     materialize_taps();trace_stage("taps");
     materialize_shared();trace_stage("shared");
+    if(share_prompt_rows && impl->fast_wmma32_split_capacity) {
+        constexpr std::size_t rows=1024;
+        const std::array<std::size_t,2> extents{{
+            static_cast<std::size_t>(impl->fast_wmma32_split_capacity)*rows*kQHeads*kHeadDim*sizeof(float),
+            static_cast<std::size_t>(impl->fast_wmma32_split_capacity)*rows*kQHeads*2*sizeof(float)}};
+        std::lock_guard lock(impl->model->shared_numeric_mutex);
+        auto& pool=impl->model->shared_wmma;
+        if(!pool) {
+            auto created=std::make_shared<Exl3SharedPromptPool>();
+            for(std::size_t i=0;i<extents.size();++i) {
+                cuda_check(cudaMalloc(&created->data[i],extents[i]),"allocate shared WMMA32 partials");
+                created->bytes[i]=extents[i];
+            }
+            pool=std::move(created);
+        }
+        require(pool->bytes[0]==extents[0] && pool->bytes[1]==extents[1],
+            "shared WMMA32 partial geometry differs between contexts");
+        impl->fast_wmma32_split2_output=static_cast<float*>(pool->data[0]);
+        impl->fast_wmma32_split2_stats=static_cast<float*>(pool->data[1]);
+        impl->shared_wmma=pool;
+    }
     if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE shared accum=%.1f paired=%.1f transform=%.1f paired_t=%.1f scratch=%.1f wide=%.1f prefill_capacity=%d\n",
         accumulation.bytes/1048576.0,paired_up_accumulation.bytes/1048576.0,transformed.bytes/1048576.0,
         paired_up_transformed.bytes/1048576.0,scratch.bytes/1048576.0,gdn_wide_scratch.bytes/1048576.0,impl->prefill_capacity);
@@ -8597,7 +8627,16 @@ void Exl3TextContext::append_prefill_layer_major(
     const std::size_t reserve_bytes=Exl3NativeContextExtent::l0_oscar_enabled()?
         l0_layer_major_reserve_bytes():fast_device_kv_transaction_enabled()?
         1536ull*1024*1024:2ull*1024*1024*1024;
-    constexpr std::size_t cache_limit=1536ull*1024*1024;
+    // NINFER_EXL3_LAYER_MAJOR_CACHE_MIB (256..1536, default 1536): retained
+    // reconstructed-weight cache; concurrent Engine lanes keep it smaller so
+    // decode keeps device headroom (one layer's projections are ~0.75 GiB).
+    static const std::size_t cache_limit=[] {
+        const char* value=std::getenv("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB");
+        const long mib=value?std::atol(value):1536;
+        if(mib<256 || mib>1536)
+            throw std::invalid_argument("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB must be 256..1536");
+        return static_cast<std::size_t>(mib)*1024*1024;
+    }();
     constexpr std::size_t minimum_cache=256ull*1024*1024;
     auto& workspace=*impl_->numeric_prefill_projection_workspace;
     const auto existing_cache=workspace.stats().cached_weight_capacity_bytes;
@@ -10078,7 +10117,11 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
         Exl3CudaLinearWorkspace* head=nullptr; std::uint16_t* norm=nullptr; std::uint16_t* logits=nullptr;
         bool head_tried=false;
     };
-    static thread_local Buffers buffers;
+    // Process-wide: exact row scores run inside exclusive verifier passes
+    // (one lane at a time), so the 16-row head workspace (~90 MB) is shared.
+    static Buffers buffers;
+    static std::mutex buffers_mutex;
+    const std::lock_guard buffers_lock(buffers_mutex);
     constexpr int kScoreRows=16;
     if(!buffers.head_tried) {
         buffers.head_tried=true;

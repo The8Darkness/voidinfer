@@ -483,8 +483,13 @@ struct Exl3EngineCore::Impl {
             // layer-major reserve, so both lanes keep the fast prefill.
             if(!std::getenv("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS"))
                 _putenv_s("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS","4096");
+            // Decode keeps 1 GiB of device headroom; the retained layer-major
+            // projection cache is capped instead (one layer's projections at
+            // C3+). Oversubscribed WDDM memory corrupts batched graph replays.
             if(!std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
-                _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","256");
+                _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
+            if(!std::getenv("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
+                _putenv_s("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB","768");
             // Prompt-scale passes are exclusive across lanes: one reconstruct
             // workspace serves every lane.
             if(!std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
