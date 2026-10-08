@@ -7482,19 +7482,38 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         const std::size_t sink_bytes=static_cast<std::size_t>(l0_oscar::kSink)*kKVHeads*kHeadDim*2;
         alloc(l.k_ring,ring_bytes); alloc(l.v_ring,ring_bytes);
         alloc(l.k_sink,sink_bytes); alloc(l.v_sink,sink_bytes);
+        l.hot_slots=l0_oscar::hot_config().slots;
+        if(l.hot_slots) {
+            const std::size_t slots=static_cast<std::size_t>(kKVHeads)*l.hot_slots;
+            l.hot_words=(capacity+31)/32;
+            alloc(l.hot_k,slots*kHeadDim*2); alloc(l.hot_v,slots*kHeadDim*2);
+            cudaMemset(l.hot_k,0,slots*kHeadDim*2); cudaMemset(l.hot_v,0,slots*kHeadDim*2);
+            alloc(l.hot_row,slots*sizeof(int)); alloc(l.hot_prio,slots*sizeof(float));
+            alloc(l.hot_bits,static_cast<std::size_t>(kKVHeads)*l.hot_words*sizeof(unsigned));
+            alloc(l.hot_count,kKVHeads*sizeof(int));
+            alloc(l.hot_cand_row,static_cast<std::size_t>(kKVHeads)*l0_oscar::kHotCandidates*sizeof(int));
+            alloc(l.hot_cand_val,static_cast<std::size_t>(kKVHeads)*l0_oscar::kHotCandidates*sizeof(float));
+            alloc(l.hot_ref,kQHeads*sizeof(float));
+            alloc(l.hot_won,static_cast<std::size_t>(kKVHeads)*(1+2*l0_oscar::kHotMaxInsert)*sizeof(int));
+            l0_oscar::hot_clear_kernel<<<64,256>>>(l0_oscar::hot_view(l));
+            cuda_check(cudaDeviceSynchronize(),"L0 OSCAR hot rows initialization");
+        }
         // Query and history scratch is consumed within one layer's attention on
         // the layer stream, so all full-attention layers of the process share it
         // (one target context executes layers sequentially).
         static l0_oscar::LayerStorage shared{};
-        if(shared.segments<l.segments) {
+        // Partial slots per (row, KV head): the INT2 segments, then one per CTA with hot tiles.
+        const int slot_stride=l.segments*kL0HistoryStreams+std::min(l0_hot_tiles(l.hot_slots),l.segments);
+        if(shared.segments<slot_stride) {
             // Earlier layers keep their (smaller) scratch; it is never released.
-            shared.segments=l.segments;
+            shared.segments=slot_stride;
             alloc(shared.q_rot,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(std::uint16_t));
             alloc(shared.q_mu,static_cast<std::size_t>(l.rows)*kQHeads*sizeof(float));
-            alloc(shared.hist_work,static_cast<std::size_t>(l.rows)*kKVHeads*l.segments*
-                kL0HistoryStreams*kFastFusedFlashStride*sizeof(float));
+            alloc(shared.hist_work,static_cast<std::size_t>(l.rows)*kKVHeads*slot_stride*
+                kFastFusedFlashStride*sizeof(float));
             alloc(shared.hist_slot,static_cast<std::size_t>(l.rows)*kKVHeads*kFastFusedFlashStride*sizeof(float));
             alloc(shared.hist_rotated,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
+            alloc(shared.hist_hot,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
         }
         static l0_oscar::LayerStorage prefill{};
         l.prefill_rows=std::max(max_rows_,8);
@@ -7513,7 +7532,7 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         l.prefill_numer=prefill.prefill_numer;
         l.prefill_split=prefill.prefill_split; l.prefill_split_stats=prefill.prefill_split_stats;
         shared.q_rot=prefill.q_rot; shared.q_mu=prefill.q_mu;
-        l.q_rot=shared.q_rot; l.q_mu=shared.q_mu; l.hist_work=shared.hist_work; l.hist_slot=shared.hist_slot; l.hist_rotated=shared.hist_rotated;
+        l.q_rot=shared.q_rot; l.q_mu=shared.q_mu; l.hist_work=shared.hist_work; l.hist_slot=shared.hist_slot; l.hist_rotated=shared.hist_rotated; l.hist_hot=shared.hist_hot;
     }
     if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
         cudaMalloc(&fakequant_watermark_, 4 * sizeof(int)) == cudaSuccess)
@@ -7559,6 +7578,10 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
         first+=rows;
     }
     cuda_check(cudaMemsetAsync(l0_.state,0,2*sizeof(int),stream),"L0 OSCAR history reset");
+    if(l0_.hot_slots) {
+        l0_oscar::hot_clear_kernel<<<64,256,0,stream>>>(l0_oscar::hot_view(l0_));
+        cuda_check(cudaGetLastError(),"L0 OSCAR hot rows reset");
+    }
 }
 
 int Exl3FullAttentionLayer::l0_history_watermark(cudaStream_t stream) const {
@@ -7604,6 +7627,10 @@ void Exl3FullAttentionLayer::l0_set_history_watermark(int rows,int position,cuda
         throw std::invalid_argument("L0 OSCAR parked history extent");
     const int state[2]={rows,position};
     cuda_check(cudaMemcpyAsync(l0_.state,state,sizeof(state),cudaMemcpyHostToDevice,stream),"L0 OSCAR resume watermark");
+    if(l0_.hot_slots) {
+        l0_oscar::hot_clear_kernel<<<64,256,0,stream>>>(l0_oscar::hot_view(l0_));
+        cuda_check(cudaGetLastError(),"L0 OSCAR hot rows reset");
+    }
     cuda_check(cudaStreamSynchronize(stream),"L0 OSCAR resume watermark");
 }
 
@@ -8451,11 +8478,29 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             l0_oscar::window_append_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
                 kr,vp,l0_.k_ring,l0_.v_ring,l0_.k_sink,l0_.v_sink,rows,position,position_device_);
             const auto& a=l0_oscar::assets();
+            // Hot slots won last round are filled from L2 beside the encode.
+            struct HotBranch { cudaStream_t side=nullptr; cudaEvent_t fork=nullptr,join=nullptr; };
+            static const HotBranch hot_branch=[] {
+                HotBranch b;
+                cuda_check(cudaStreamCreateWithFlags(&b.side,cudaStreamNonBlocking),"L0 hot fill stream");
+                cuda_check(cudaEventCreateWithFlags(&b.fork,cudaEventDisableTiming),"L0 hot fill fork");
+                cuda_check(cudaEventCreateWithFlags(&b.join,cudaEventDisableTiming),"L0 hot fill join");
+                return b;
+            }();
+            if(l0_.hot_slots) {
+                launch(cudaEventRecord(hot_branch.fork,stream),"L0 hot fill fork");
+                launch(cudaStreamWaitEvent(hot_branch.side,hot_branch.fork,0),"L0 hot fill fork");
+                l0_oscar::hot_fill_kernel<<<4*l0_oscar::kHotMaxInsert*2*(kHeadDim/8)/256,256,0,hot_branch.side>>>(
+                    l0_oscar::hot_view(l0_),k_cache_,v_cache_);
+                launch(cudaEventRecord(hot_branch.join,hot_branch.side),"L0 hot fill join");
+            }
             l0_oscar::encode_kernel<<<256,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
                 position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
-                reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta));
+                reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta),
+                l0_oscar::hot_view(l0_));
             l0_oscar::advance_kernel<<<1,1,0,stream>>>(position_device_,position,l0_.state,
                 cache_capacity_);
+            if(l0_.hot_slots) launch(cudaStreamWaitEvent(stream,hot_branch.join,0),"L0 hot fill join");
             launch(cudaGetLastError(),"L0 OSCAR history encode");
         }
         if (fakequant_watermark_)
@@ -9066,6 +9111,12 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
                 l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
                     rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
+                const auto& hot_config=l0_oscar::hot_config();
+                const auto hot=l0_oscar::hot_view(l0_);
+                // Every history CTA runs its share of the exact hot tiles first;
+                // their partials follow the INT2 segment partials.
+                const int hot_ctas=std::min(l0_hot_tiles(l0_.hot_slots),l0_.segments);
+                const int slot_stride=l0_.segments*kL0HistoryStreams+hot_ctas;
                 const dim3 grid(l0_.segments,kKVHeads);
                 const auto history=[&](auto kernel) {
                     static const bool configured=[&] {
@@ -9076,14 +9127,18 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     (void)configured;
                     kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes(),stream>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
                         reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.hist_work,rows,position,cache_capacity_,
-                        l0_.segments,position_device_);
+                        l0_.segments,position_device_,slot_stride,hot,hot_config.log2_tau,qr,
+                        hot_config.lambda);
                 };
-                history(l0_history_mma_kernel<64>);
-                l0_history_merge_kernel<<<rows*kQHeads,256,0,stream>>>(l0_.hist_work,
+                if(hot_ctas) history(l0_history_mma_kernel<64,true>);
+                else history(l0_history_mma_kernel<64,false>);
+                l0_history_merge_kernel<<<rows*kQHeads+(hot_ctas?kKVHeads:0),256,0,stream>>>(l0_.hist_work,
                     l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,l0_.segments,
-                    l0_.segment_keys,position,cache_capacity_,position_device_);
+                    l0_.segment_keys,position,cache_capacity_,position_device_,slot_stride,hot_ctas,
+                    hot_ctas?l0_.hot_ref:nullptr,hot_ctas?l0_.hist_hot:nullptr,hot,hot_config.insert,
+                    hot_config.lambda);
                 l0_launch_rotate<float,true>(l0_.hist_rotated,a.rvt16+l0_.bank*bank_elements,
-                    l0_.hist_slot,rows,nullptr,nullptr,stream);
+                    l0_.hist_slot,rows,nullptr,nullptr,stream,hot_ctas?l0_.hist_hot:nullptr);
                 launch(cudaGetLastError(),"L0 OSCAR history attention");
                 history_slot=l0_.hist_slot;
             }

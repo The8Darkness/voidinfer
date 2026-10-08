@@ -6,7 +6,7 @@ param(
     [string]$Build='D:\AI\voidinfer-sol6-campaign-20260923\builds\B2',
     [string]$Tag='',
     [string]$Env='',        # extra NAME=VALUE;... applied after the receipt environment
-    [switch]$L0,             # force L0 OSCAR even at <=32K
+    [switch]$L0,             # L0 OSCAR (the engine default) even at <=32K; otherwise FP16 device KV up to 32K
     [string]$NsysOut=''      # optional: trace CUDA allocations into this report path prefix
 )
 # Our side of the 1:1 comparison. DFlash2: public Engine (device harness, warm-only: a same-length
@@ -30,7 +30,7 @@ foreach($case in $Prompts){
     if($Mode -eq 'dflash2'){
         $l0 = [bool]$L0 -or ($prefix -gt 32768)
         Reset-Env "$fast\fast-device-environment.csv" -KeepL0:$l0
-        if($l0){ $env:NINFER_EXL3_L0_OSCAR='1'; $env:NINFER_EXL3_L0_OSCAR_ROT='D:\AI\kvtier\rot_center384k' }
+        $env:NINFER_EXL3_L0_OSCAR=if($l0){'1'}else{'0'}
         foreach($kv in ($Env -split ';' | ? {$_})){ $k,$v=$kv -split '=',2; [Environment]::SetEnvironmentVariable($k,$v,'Process') }
         $env:NINFER_TEST_ENGINE_DEVICE_PREFIX=[string]$prefix
         $env:NINFER_TEST_ENGINE_DEVICE_SOURCE='D:\AI\kvtier\long_code_source.cpp'
@@ -59,6 +59,7 @@ foreach($case in $Prompts){
     } else {
         if(-not (Test-Path $ids)){ throw "run dflash2 first to export $ids" }
         Reset-Env "$target\target-environment.csv"
+        $env:NINFER_EXL3_L0_OSCAR=if($L0){'1'}else{'0'}
         $n=(Get-Content $ids | ? {$_}).Count
         $dir="$stem.run"; if(Test-Path $dir){ Remove-Item -Recurse -Force $dir }; New-Item -ItemType Directory $dir | Out-Null
         $env:NINFER_E5A4_PROMPT_FILE=$ids

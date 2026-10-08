@@ -166,7 +166,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     if(custom_prompt &&
        env("NINFER_EXL3_TEST_FAST_DEVICE_RESERVED_CONTEXT")=="1") {
         auto cold=target.create_context(true);
-        if(env("NINFER_EXL3_L0_OSCAR")=="1") {
+        if(env("NINFER_EXL3_L0_OSCAR")!="0") {
             // L0 OSCAR contexts prefill row-major in 1024-row chunks.
             const std::span<const std::int64_t> all(prefix);
             cold->prefill(all.first(16));
@@ -368,7 +368,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
             draft.ring_base_abs()+draft.ring_count()==prefix_rows &&
             // L0 OSCAR: the oracle ingests through the INT2-history route while
             // the live wide prefill attends exactly, so the roots differ by design.
-            (live_initial_hash==initial_hash || env("NINFER_EXL3_L0_OSCAR")=="1"),
+            (live_initial_hash==initial_hash || env("NINFER_EXL3_L0_OSCAR")!="0"),
         "real device DFlash root frontier differs from target-only oracle");
     std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> diagnostic_root;
     if(env("NINFER_EXL3_TEST_FAST_DEVICE_EXPORT_ROOT")=="1") {

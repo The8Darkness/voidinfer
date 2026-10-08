@@ -526,7 +526,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 "coherent-device EXL3 requires C1 text/eager/DFlash2-K7 full proposals");
         // L0 OSCAR (INT2 history in VRAM, FP16 K/V in mapped host memory) admits 256K.
         const char* l0_oscar=std::getenv("NINFER_EXL3_L0_OSCAR");
-        const int coherent_context_limit=l0_oscar && std::string_view(l0_oscar)=="1"?262144:32768;
+        const int coherent_context_limit=!l0_oscar || std::string_view(l0_oscar)!="0"?262144:32768;
         if(options.max_context<2048 || options.max_context>coherent_context_limit ||
            options.kv_capacity.mode!=KvCapacityMode::Explicit ||
            options.kv_capacity.explicit_tokens<options.max_context)

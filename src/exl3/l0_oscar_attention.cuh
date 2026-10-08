@@ -26,8 +26,10 @@ constexpr int kL0Stages=5;
 constexpr int kL0RawKeyBytes=2*l0::kCodeBytes+2*l0::kMetaFloats*2;   // K codes, V codes, K meta, V meta (FP16)
 constexpr std::size_t kL0StageBytes=static_cast<std::size_t>(kL0StageKeys)*kL0RawKeyBytes;
 constexpr std::size_t kL0MergeBytes=static_cast<std::size_t>(6)*32*70*sizeof(float);
+#include "exl3/l0_hot.cuh"
 constexpr std::size_t l0_history_smem_bytes() {
-    return kL0Stages*kL0StageBytes>kL0MergeBytes?kL0Stages*kL0StageBytes:kL0MergeBytes;
+    constexpr std::size_t a=kL0Stages*kL0StageBytes>kL0MergeBytes?kL0Stages*kL0StageBytes:kL0MergeBytes;
+    return a>l0_hot_smem_bytes()?a:l0_hot_smem_bytes();
 }
 
 __device__ __forceinline__ void l0_cp16(void* dst,const void* src,bool valid) {
@@ -66,12 +68,17 @@ constexpr int kL0IntMagic=0x4B400000;
 __device__ __forceinline__ float l0_int_value(int bits) {
     return __int_as_float(bits)-12582912.0f;
 }
-template<int kKeys>
+// kHot: each CTA first runs its exact hot tiles (l0_hot_cta) over the
+// original-basis queries `q_orig`; rows marked hot are then skipped and keys
+// whose probability relative to the previous round's history LSE exceeds tau
+// are emitted once per (key, KV head) as hot candidates.
+template<int kKeys,bool kHot>
 __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
     const std::uint8_t* v_codes,const __half* k_meta,const __half* v_meta,
     float* workspace,int rows,int position,int capacity,int segments,
-    const int* position_device) {
+    const int* position_device,int slot_stride,l0::HotView hot,float log2_tau,
+    const std::uint16_t* q_orig,float lambda) {
     constexpr int H=kFastFusedFlashHeads;
     constexpr float kLog2Scale=0.0625f*1.4426950408889634f;
     const auto* q_rot=reinterpret_cast<const __half*>(q_rot_bits);
@@ -79,12 +86,20 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     __shared__ __align__(16) signed char q8[kL0Queries][kHeadDim];
     __shared__ __align__(16) unsigned qfrag[3][4][32][8];
     __shared__ float qinfo[kL0Queries][5];   // qs0, qs1, qsum0, qsum1, mu (log2 units)
+    // Per stage key: bits of 1 + log2 p - log2 tau of its best vector (0 = none), double-buffered.
+    __shared__ unsigned hot_emit[2][kL0StageKeys];
+    __shared__ float hot_ref_s[kL0Queries];
     const int segment=static_cast<int>(blockIdx.x);
     const int kv_head=static_cast<int>(blockIdx.y);
     const int tid=static_cast<int>(threadIdx.x);
     const int warp=tid>>5,lane=tid&31,g=lane>>2,t=lane&3;
     const int stream=warp/6,vgroup=(warp/3)&1,mtile=warp%3;
     const int base=position_device?*position_device:position;
+    if constexpr(kHot) {
+        if(tid<kL0Queries) hot_ref_s[tid]=hot.ref[kv_head*H+tid%H]+log2_tau;
+        l0_hot_cta(l0_smem,q_orig,hot,workspace,rows,slot_stride,
+            segments*kL0HistoryStreams+segment,segment,segments,kv_head,base,log2_tau,lambda,hot_ref_s);
+    }
     const int end=min(l0::history_end(base),capacity);
     const int span=l0::history_span(end,segments);
     const int first=l0::kSink+segment*span;
@@ -160,6 +175,26 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     __syncthreads();
     // A fragments: k-step pair m uses code word W = 8 (m >> 1) + 2t + (m & 1)
     // of each key; byte i of (w >> 2j) & 0x03030303 is dim 16 W + 4 i + j.
+    if constexpr(kHot) {
+        if(tid<2*kL0StageKeys) hot_emit[tid/kL0StageKeys][tid%kL0StageKeys]=0u;
+        if(tid<kL0Queries) hot_ref_s[tid]=hot.ref[kv_head*H+tid%H]+log2_tau;
+    }
+    // Appends the flagged keys of stage `stage` (its buffer) and clears it.
+    const auto hot_flush=[&](int stage) {
+        if constexpr(kHot) {
+            if(stage>=0 && tid<kL0StageKeys) {
+                unsigned& cell=hot_emit[stage&1][tid];
+                if(cell) {
+                    const int slot=atomicAdd(hot.count+kv_head,1);
+                    if(slot<l0::kHotCandidates) {
+                        hot.cand_row[kv_head*l0::kHotCandidates+slot]=first+stage*kL0StageKeys+tid;
+                        hot.cand_val[kv_head*l0::kHotCandidates+slot]=__uint_as_float(cell)-1.0f+log2_tau;
+                    }
+                    cell=0u;
+                }
+            }
+        }
+    };
     for(int e=tid;e<3*4*32;e+=kL0HistoryThreads) {
         const int mt=e/128,m=(e/32)%4,ln=e%32,gg=ln>>2,tt=ln&3;
         const int W=8*(m>>1)+2*tt+(m&1);
@@ -194,6 +229,7 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
         asm volatile("cp.async.wait_group %0;\n"::"n"(kL0Stages-2));
         __syncthreads();
         fetch(stage+kL0Stages-1);
+        hot_flush(stage-1);
         const unsigned char* raw=l0_smem+(stage%kL0Stages)*kL0StageBytes;
         float qi[2][5];
         #pragma unroll
@@ -233,6 +269,8 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
         // This lane's keys: 4t + (i & 3) + 16 (i >> 2), i = 4 (j >> 1) + 2 (j & 1) + (e & 1).
         float sc[2][8];
         float tmax[2]={-INFINITY,-INFINITY};
+        // The 32-key block is one hot-bit word (blocks are 32-aligned).
+        const unsigned hot_word=kHot?__ldg(hot.bits+kv_head*hot.words+(kb>>5)):0u;
         #pragma unroll
         for(int j=0;j<4;++j)
             #pragma unroll
@@ -241,9 +279,23 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
                 const float4 k=l0_meta4(bk+key*kL0RawKeyBytes+2*l0::kCodeBytes);
                 const float v=qi[r][0]*k.x*static_cast<float>(s[0][j][e])+qi[r][1]*k.z*static_cast<float>(s[1][j][e])-
                     qi[r][2]*k.y*k.x-qi[r][3]*k.w*k.z+qi[r][4];
-                sc[r][i]=kb+key<segment_end?v:-INFINITY;
+                sc[r][i]=kb+key<segment_end && !((hot_word>>key)&1u)?v:-INFINITY;
                 tmax[r]=fmaxf(tmax[r],sc[r][i]);
             }
+        if constexpr(kHot) {
+            if(vgroup==0) {
+                #pragma unroll
+                for(int r=0;r<2;++r) {
+                    const float ref=hot_ref_s[r?v1:v0];
+                    #pragma unroll
+                    for(int i=0;i<8;++i) {
+                        const float rel=sc[r][i]-ref;
+                        if(rel>0.f)
+                            atomicMax(&hot_emit[stage&1][key_off+4*t+(i&3)+16*(i>>2)],__float_as_uint(rel+1.0f));
+                    }
+                }
+            }
+        }
         #pragma unroll
         for(int r=0;r<2;++r) {
             tmax[r]=fmaxf(tmax[r],__shfl_xor_sync(0xffffffffU,tmax[r],1));
@@ -336,6 +388,7 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
         }
     // Merge stream 1 into stream 0 through shared memory (the ring is idle).
     __syncthreads();
+    hot_flush(stages-1);
     float* xfer=reinterpret_cast<float*>(l0_smem)+static_cast<std::size_t>(warp%6)*32*70;
     if(stream==1) {
         #pragma unroll
@@ -368,13 +421,12 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
             for(int e=0;e<4;++e)
                 acc[n][e]=acc[n][e]*a_self[e>>1]+xfer[(4*n+e)*32+lane]*a_other[e>>1];
     }
-    const int slots=segments*kL0HistoryStreams;
     #pragma unroll
     for(int r=0;r<2;++r) {
         const int v=r?v1:v0,row=v/H,head=v%H;
         if(row>=rows) continue;
         float* slot=workspace+
-            ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*slots+segment)*kFastFusedFlashStride;
+            ((static_cast<std::size_t>(row)*kKVHeads+kv_head)*slot_stride+segment)*kFastFusedFlashStride;
         #pragma unroll
         for(int c=0;c<2;++c) {
             float* dst=slot+head*kHeadDim+128*vgroup+16*(2*t+c);
@@ -393,11 +445,21 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
 
 // Merges the live history segments of one (row, query head) in the rotated
 // value basis: normalized FP16 numerator into `rotated` (un-rotated and
-// re-scaled by l0_rotate_kernel), max and denominator into the slot.
+// re-scaled by l0_rotate_kernel), max and denominator into the slot. The
+// `hot_chunks` exact hot partials follow the segments; their normalized
+// original-basis numerator goes to `hot_out` (added by l0_rotate_kernel) and
+// row 0 publishes its history LSE (log2) as the next round's candidate reference.
 __global__ void __launch_bounds__(256) l0_history_merge_kernel(const float* workspace,
     float* history_slot,__half* rotated,int rows,int segments,int keys,int position,
-    int capacity,const int* position_device) {
+    int capacity,const int* position_device,int slot_stride,int hot_chunks,float* hot_ref,
+    float* hot_out,l0::HotView hot,int hot_insert,float hot_lambda) {
     constexpr int H=kFastFusedFlashHeads;
+    // CTAs past the (row, query head) merges select the next round's hot rows.
+    if(static_cast<int>(blockIdx.x)>=rows*kQHeads) {
+        l0_hot_select(hot,static_cast<int>(blockIdx.x)-rows*kQHeads,
+            position_device?*position_device:position,capacity,hot_insert,hot_lambda);
+        return;
+    }
     const int row=blockIdx.x/kQHeads,qh=blockIdx.x%kQHeads,kv=qh/H,head=qh%H,j=threadIdx.x;
     if(row>=rows) return;
     const int base=position_device?*position_device:position;
@@ -406,23 +468,28 @@ __global__ void __launch_bounds__(256) l0_history_merge_kernel(const float* work
     const int span=l0::history_span(end,segments);
     // Two partial slots (key streams) per history segment.
     const int live=(end>l0::kSink?min(segments,(end-l0::kSink+span-1)/span):0)*kL0HistoryStreams;
-    const float* slots=workspace+(static_cast<std::size_t>(row)*kKVHeads+kv)*segments*
-        kL0HistoryStreams*kFastFusedFlashStride;
+    const float* slots=workspace+(static_cast<std::size_t>(row)*kKVHeads+kv)*slot_stride*
+        kFastFusedFlashStride;
+    const int total=live+hot_chunks;
+    const auto slot_index=[&](int s) { return s<live?s:segments*kL0HistoryStreams+(s-live); };
     float gmax=-INFINITY;
-    for(int s=0;s<live;++s) gmax=fmaxf(gmax,slots[s*kFastFusedFlashStride+kFastFusedFlashValues+head]);
-    float den=0.0f,num=0.0f;
+    for(int s=0;s<total;++s) gmax=fmaxf(gmax,slots[slot_index(s)*kFastFusedFlashStride+kFastFusedFlashValues+head]);
+    float den=0.0f,num=0.0f,hot_num=0.0f;
     if(gmax>-INFINITY)
-        for(int s=0;s<live;++s) {
-            const float* slot=slots+s*kFastFusedFlashStride;
+        for(int s=0;s<total;++s) {
+            const float* slot=slots+slot_index(s)*kFastFusedFlashStride;
             const float sc=expf(slot[kFastFusedFlashValues+head]-gmax);
             den+=slot[kFastFusedFlashValues+H+head]*sc;
-            num+=slot[head*kHeadDim+j]*sc;
+            (s<live?num:hot_num)+=slot[head*kHeadDim+j]*sc;
         }
-    rotated[(static_cast<std::size_t>(row)*kQHeads+qh)*kHeadDim+j]=__float2half_rn(den>0.0f?num/den:0.0f);
+    const std::size_t at=(static_cast<std::size_t>(row)*kQHeads+qh)*kHeadDim+j;
+    rotated[at]=__float2half_rn(den>0.0f?num/den:0.0f);
+    if(hot_out) hot_out[at]=den>0.0f?hot_num/den:0.0f;
     if(j==0) {
         float* out=history_slot+(static_cast<std::size_t>(row)*kKVHeads+kv)*kFastFusedFlashStride;
         out[kFastFusedFlashValues+head]=gmax;
         out[kFastFusedFlashValues+H+head]=den;
+        if(hot_ref && row==0 && den>0.0f) hot_ref[qh]=(gmax+logf(den))*1.4426950408889634f;
     }
 }
 
@@ -748,7 +815,7 @@ __device__ __forceinline__ void l0_rot_store(float* y,float a,float b) {
 }
 template<typename Out,int Cols,bool Slot>
 __global__ void __launch_bounds__(kL0RotThreads) l0_rotate_kernel(const __half* x,
-    const __half* m_bank,Out* y,int rows,const float* mu,float* q_mu) {
+    const __half* m_bank,Out* y,int rows,const float* mu,float* q_mu,const float* add) {
     constexpr int H=kFastFusedFlashHeads;
     constexpr int BStride=Cols+8;
     extern __shared__ __align__(16) unsigned char l0_rot_smem_raw[];
@@ -804,8 +871,15 @@ __global__ void __launch_bounds__(kL0RotThreads) l0_rotate_kernel(const __half* 
             } else {
                 dst=y+vector_at(v)+cb*Cols+2*t;
             }
-            #pragma unroll
-            for(int n=0;n<Cols/8;++n) l0_rot_store(dst+8*n,acc[n][2*r]*scale,acc[n][2*r+1]*scale);
+            if(add) {
+                const float* extra=add+vector_at(v)+cb*Cols+2*t;
+                #pragma unroll
+                for(int n=0;n<Cols/8;++n)
+                    l0_rot_store(dst+8*n,(acc[n][2*r]+extra[8*n])*scale,(acc[n][2*r+1]+extra[8*n+1])*scale);
+            } else {
+                #pragma unroll
+                for(int n=0;n<Cols/8;++n) l0_rot_store(dst+8*n,acc[n][2*r]*scale,acc[n][2*r+1]*scale);
+            }
         }
     }
     if(mu && cb==0) {
@@ -823,7 +897,7 @@ __global__ void __launch_bounds__(kL0RotThreads) l0_rotate_kernel(const __half* 
 
 template<typename Out,int Cols,bool Slot>
 void l0_launch_rotate_cols(const void* x,const __half* m_bank,Out* y,int rows,const float* mu,
-    float* q_mu,cudaStream_t stream) {
+    float* q_mu,cudaStream_t stream,const float* add) {
     static const bool configured=[] {
         cuda_check(cudaFuncSetAttribute(l0_rotate_kernel<Out,Cols,Slot>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(l0_rot_smem<Cols>())),
@@ -833,14 +907,15 @@ void l0_launch_rotate_cols(const void* x,const __half* m_bank,Out* y,int rows,co
     (void)configured;
     l0_rotate_kernel<Out,Cols,Slot><<<dim3((rows*kFastFusedFlashHeads+kL0RotVectors-1)/kL0RotVectors,
         kHeadDim/Cols,kKVHeads),kL0RotThreads,l0_rot_smem<Cols>(),stream>>>(
-        reinterpret_cast<const __half*>(x),m_bank,y,rows,mu,q_mu);
+        reinterpret_cast<const __half*>(x),m_bank,y,rows,mu,q_mu,add);
 }
-// Few vectors (verifier rows): 16-column blocks spread R over 64 CTAs.
+// Few vectors (verifier rows): 16-column blocks spread R over 64 CTAs. `add`
+// (Slot only): original-basis normalized numerator added before re-scaling.
 template<typename Out,bool Slot=false>
 void l0_launch_rotate(const void* x,const __half* m_bank,Out* y,int rows,const float* mu,
-    float* q_mu,cudaStream_t stream) {
-    if(rows<=16) l0_launch_rotate_cols<Out,16,Slot>(x,m_bank,y,rows,mu,q_mu,stream);
-    else l0_launch_rotate_cols<Out,64,Slot>(x,m_bank,y,rows,mu,q_mu,stream);
+    float* q_mu,cudaStream_t stream,const float* add=nullptr) {
+    if(rows<=16) l0_launch_rotate_cols<Out,16,Slot>(x,m_bank,y,rows,mu,q_mu,stream,add);
+    else l0_launch_rotate_cols<Out,64,Slot>(x,m_bank,y,rows,mu,q_mu,stream,add);
 }
 
 // Merges the kL0PrefillSplits normalized history partials of one (row, query
