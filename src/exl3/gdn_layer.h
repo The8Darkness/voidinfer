@@ -775,6 +775,16 @@ public:
     std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
     static std::size_t fixed_owner_metadata_required() noexcept;
     std::size_t fixed_owner_metadata_bytes() const noexcept;
+    // Batched multi-agent rounds: while set, forward() runs its row-independent
+    // work over own_rows + every peer's rows, and each peer layer (another
+    // agent's context, same model layer) runs its own stateful core on its rows.
+    struct BatchPeer { Exl3GdnLayer* layer = nullptr; int rows = 0; };
+    struct Batch {
+        int own_rows = 0;
+        int peer_count = 0;
+        std::array<BatchPeer, 1> peers{};
+    };
+    void set_batch(const Batch* batch) noexcept { batch_ = batch; }
     // Borrowed child pointers for enclosing-context lifetime inventory only.
     std::array<Exl3CudaLinearWorkspace*,6> linear_workspace_owners() const noexcept {return linear_workspaces_;}
     std::array<Exl3LayerBufferRetirement*,34> buffer_retirement_owners() noexcept {
@@ -806,6 +816,26 @@ private:
         cudaEvent_t* ends;
     };
     void gdn_middle(const GdnMiddle& m);
+    struct SegmentState {
+        std::uint64_t base_generation = 0;
+        const void* base_recurrent = nullptr;
+        const void* base_conv = nullptr;
+        bool eligible = false;
+        Exl3GdnHistoryStorage storage{};
+    };
+    SegmentState begin_segment(int rows, cudaStream_t stream, bool preserve_m1_topology);
+    void end_segment(const SegmentState& segment, int rows, cudaStream_t stream,
+                     bool preserve_m1_topology);
+    struct PeerSegmentSource {
+        const std::uint16_t *h,*qkv,*conv_input,*z;
+        const float *a,*b,*g_trace,*beta_trace;
+        std::uint16_t* o_input;
+        int rows;
+        bool merged_qkvz_side;
+    };
+    void run_peer_segment(const PeerSegmentSource& source, cudaStream_t stream,
+                          bool preserve_m1_topology);
+    const Batch* batch_ = nullptr;
     friend class Exl3TextContext;
     // The TextContext passes the bounded shared owner for this layer. Every
     // exposed history buffer is layer-owned, while model_owner separately

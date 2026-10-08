@@ -7079,6 +7079,23 @@ std::size_t Exl3FullAttentionLayer::workspace_bytes_required(int rows,bool borro
     return bytes;
 }
 
+// Batched multi-agent rounds run the verifier rows of several agents (up to
+// 16) as one launch per projection on the 16-row continuation routes.
+static Exl3CudaLinearAdmission batched_continuation_admission(Exl3TargetProjectionOperator operation) {
+    switch(operation) {
+    case Exl3TargetProjectionOperator::q: return Exl3CudaLinearAdmission::target_continuation_q;
+    case Exl3TargetProjectionOperator::k:
+    case Exl3TargetProjectionOperator::v: return Exl3CudaLinearAdmission::target_continuation_kv;
+    case Exl3TargetProjectionOperator::o: return Exl3CudaLinearAdmission::target_continuation_o;
+    case Exl3TargetProjectionOperator::gate:
+    case Exl3TargetProjectionOperator::up: return Exl3CudaLinearAdmission::target_continuation_gate_up;
+    case Exl3TargetProjectionOperator::down: return Exl3CudaLinearAdmission::target_continuation_down;
+    case Exl3TargetProjectionOperator::qkv: return Exl3CudaLinearAdmission::target_continuation_qkv;
+    case Exl3TargetProjectionOperator::z: return Exl3CudaLinearAdmission::target_continuation_z;
+    default: return Exl3CudaLinearAdmission::ordinary;
+    }
+}
+
 void Exl3FullAttentionLayer::ensure_fast_cublas_attention_resources(int capacity) {
     if (!fast_cublas_attention_) return;
     if (capacity < 1) throw std::invalid_argument(
@@ -9376,7 +9393,10 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             throw std::invalid_argument("direct staged history extent/profile");
     }
     retained_prefix_available_ = false;
-    bool eligible_retained_prefix = preserve_m1_topology && rows >= 2 && rows <= 8 &&
+    // Batched multi-agent rounds: this layer's own agent owns the leading
+    // own_rows; peer agents' rows follow (run_peer_segment).
+    const int own_rows=batch_?batch_->own_rows:rows;
+    bool eligible_retained_prefix = preserve_m1_topology && own_rows >= 2 && own_rows <= 8 &&
         ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
          (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&
         !capture_active_;
@@ -9591,7 +9611,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     "numeric reconstruct cannot consume borrowed transformed input");
             reconstruct_gemm_->forward_numeric_candidate(
                 weights, metadata, source, destination, rows, projection_stream);
-        } else if (rowwise && !target_small_m_candidate) {
+        } else if (rowwise && !target_small_m_candidate && !(batch_ && rows > 8)) {
             for (int row = 0; row < rows; ++row) {
                 if(transformed_input)
                     workspace->forward_from_transformed(weights,metadata,
@@ -9623,13 +9643,15 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                            : (target_o_k7_candidate
                                    ? Exl3CudaLinearAdmission::target_continuation_o
                                    : Exl3CudaLinearAdmission::ordinary));
+            const auto launch_admission = batch_ && rows > 8 && !target_small_m_candidate
+                ? batched_continuation_admission(operation) : admission;
             if(transformed_input)
                 workspace->forward_from_transformed(
                     weights,metadata,transformed_input,destination,rows,
-                    projection_stream,admission);
+                    projection_stream,launch_admission);
             else workspace->forward(
                 weights,metadata,source,destination,rows,projection_stream,
-                admission);
+                launch_admission);
         }
         if (projection_timing_)
             projection_timing_->end(timing_slot, projection_stream);
@@ -9842,8 +9864,22 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         end(3);
     }
 
-    attention_middle(AttentionMiddle{input_norm,qg,kp,vp,qn,kn,qr,kr,attn,gp,rows,position,stream,
+    attention_middle(AttentionMiddle{input_norm,qg,kp,vp,qn,kn,qr,kr,attn,gp,own_rows,position,stream,
         profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix,starts,ends});
+    if(batch_) {
+        int first=own_rows;
+        for(int i=0;i<batch_->peer_count;++i) {
+            const auto& peer=batch_->peers[static_cast<std::size_t>(i)];
+            const auto row=static_cast<std::size_t>(first);
+            peer.layer->run_peer_segment(
+                qg+row*weights_.q_metadata.out_features,
+                kp+row*weights_.k_metadata.out_features,
+                vp+row*weights_.v_metadata.out_features,
+                attn+row*kQHeads*kHeadDim,peer.rows,peer.position,stream,preserve_m1_topology);
+            first+=peer.rows;
+        }
+        if(first!=rows)throw std::logic_error("full-attention batched segment rows");
+    }
 
     prefetch_weights(4,weights_.gate.trellis);
     begin(7);
@@ -10048,6 +10084,45 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     trace_ = {
         input, input_norm, qg, kp, vp, qn, kn, qr, kr, attn, op, post_resid,
         mlp_in, gp, up, act, down, output};
+    if (eligible_retained_prefix) {
+        retained_prefix_available_ = true;
+        retained_prefix_rows_ = own_rows;
+        retained_prefix_position_ = position;
+        retained_prefix_stream_ = stream;
+    }
+}
+
+// A peer agent's rows of a batched forward: the owner's Q/K/V projections are
+// copied into this layer's own buffers, this layer's cache and positions run
+// the stateful core exactly as its own forward would, and the gated attention
+// output returns to the owner's O-projection input.
+void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
+    const std::uint16_t* kp_source,const std::uint16_t* vp_source,std::uint16_t* attn_destination,
+    int rows,int position,cudaStream_t stream,bool preserve_m1_topology) {
+    if(rows<1 || rows>max_rows_ || position<0)
+        throw std::invalid_argument("full-attention peer segment rows/position");
+    retained_prefix_available_ = false;
+    bool eligible_retained_prefix = preserve_m1_topology && rows >= 2 && rows <= 8 &&
+        ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
+         (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&
+        !capture_active_;
+    if (eligible_retained_prefix) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream, &capture_status),
+                   "query EXL3 full-attention peer retained-prefix capture");
+        eligible_retained_prefix = capture_status == cudaStreamCaptureStatusNone;
+    }
+    const auto n=static_cast<std::size_t>(rows);
+    const auto copy=[&](void* destination,const void* from,std::size_t bytes,const char* what) {
+        cuda_check(cudaMemcpyAsync(destination,from,bytes,cudaMemcpyDeviceToDevice,stream),what);
+    };
+    copy(buffers_[1],qg_source,n*weights_.q_metadata.out_features*sizeof(std::uint16_t),"full-attention peer Q");
+    copy(buffers_[2],kp_source,n*weights_.k_metadata.out_features*sizeof(std::uint16_t),"full-attention peer K");
+    copy(buffers_[3],vp_source,n*weights_.v_metadata.out_features*sizeof(std::uint16_t),"full-attention peer V");
+    attention_middle(AttentionMiddle{buffers_[0],buffers_[1],buffers_[2],buffers_[3],buffers_[4],
+        buffers_[5],buffers_[6],buffers_[7],buffers_[8],buffers_[12],rows,position,stream,
+        false,preserve_m1_topology,false,eligible_retained_prefix,nullptr,nullptr});
+    copy(attn_destination,buffers_[8],n*kQHeads*kHeadDim*sizeof(std::uint16_t),"full-attention peer output");
     if (eligible_retained_prefix) {
         retained_prefix_available_ = true;
         retained_prefix_rows_ = rows;

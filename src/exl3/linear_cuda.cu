@@ -9367,6 +9367,8 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
     return true;
 }
 
+// Verifier rows of a batched multi-agent round (two agents x 8 rows).
+constexpr int kBatchedRows = 16;
 static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission, int in_features, int out_features,
     std::size_t capacity, int max_rows);
@@ -10759,11 +10761,11 @@ int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows)
     const int split = value ? std::atoi(value) : 10;
     if (split != 5 && split != 8 && split != 10)
         throw std::invalid_argument("coherent split override must be 5, 8 or 10");
-    // The split follows the workspace's row capacity, not this call's rows:
-    // a row's result must not depend on how many rows share the launch
-    // (batched multi-agent rounds).
+    // The split follows the workspace's verifier row capacity (at most
+    // kBatchedRows), not this call's rows: a row's result must not depend on
+    // how many rows share the launch (batched multi-agent rounds).
     (void)rows;
-    const auto required = static_cast<std::size_t>(max_rows_) *
+    const auto required = static_cast<std::size_t>(std::min(max_rows_, kBatchedRows)) *
         static_cast<std::size_t>(out_features_) * split * sizeof(float);
     return accumulation_capacity_bytes_ >= required ? split : base;
 }
@@ -10771,7 +10773,7 @@ int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows)
 int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexcept {
     constexpr int split10 = 10;
     (void)rows;   // row-independent, as in coherent_split_override
-    const auto required = static_cast<std::size_t>(max_rows_) *
+    const auto required = static_cast<std::size_t>(std::min(max_rows_, kBatchedRows)) *
         static_cast<std::size_t>(out_features_) * split10 * sizeof(float);
     return coherent_wide_k6_split10_enabled_ &&
         accumulation_capacity_bytes_ >= required ? split10 :
@@ -11891,7 +11893,7 @@ static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int row
         return 0;
     // Sized by the workspace's row capacity so the route and split never
     // depend on how many rows share a launch (batched multi-agent rounds).
-    const auto required = static_cast<std::size_t>(max_rows) * out_features * split * sizeof(float);
+    const auto required = static_cast<std::size_t>(std::min(max_rows, kBatchedRows)) * out_features * split * sizeof(float);
     return capacity >= required ? split : 0;
 }
 

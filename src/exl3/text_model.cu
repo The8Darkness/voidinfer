@@ -3137,6 +3137,48 @@ struct Exl3TextContext::Impl {
                 after.rows-before.rows;
         }
     };
+    // Batched multi-agent continuation: this context's all-row verification
+    // head over its rows of a shared layer stack (the all_head_rows path of
+    // process_rows).
+    void finish_batched_continuation(const std::uint16_t* hidden,int rows,int position,
+                                     cudaStream_t stream) {
+        require(continuation && continuation->capacity>=rows && rows>=2,
+            "batched continuation head capacity");
+        auto& scratch=*continuation;
+        auto* norm=static_cast<std::uint16_t*>(scratch.final_norm->ptr);
+        for(int row=0;row<rows;++row)
+            final_rms_norm_kernel<<<1,512,0,stream>>>(
+                hidden+static_cast<std::size_t>(row)*kHidden,model->final_norm,
+                norm+static_cast<std::size_t>(row)*kHidden);
+        cuda_check(cudaGetLastError(),"launch batched continuation final RMSNorm");
+        last_hidden_source=norm;
+        last_hidden_source_rows=rows;
+        last_hidden_source_first_row=0;
+        last_hidden_source_position=position;
+        if(++last_hidden_generation==0)
+            throw std::overflow_error("native MTP hidden generation exhausted");
+        auto* all_logits=static_cast<std::uint16_t*>(scratch.logits->ptr);
+        if(std::strcmp(scratch.head_workspace->dispatch_name(model->lm_head_metadata,rows),
+                       "h6_small_m_single_split")==0)
+            scratch.head_workspace->forward(model->lm_head,model->lm_head_metadata,
+                norm,all_logits,rows,stream);
+        else for(int row=0;row<rows;++row)
+            head_workspace->forward(model->lm_head,model->lm_head_metadata,
+                norm+static_cast<std::size_t>(row)*kHidden,
+                all_logits+static_cast<std::size_t>(row)*kVocab,1,stream);
+        cuda_check(cudaGetLastError(),"launch batched continuation LM head");
+        cuda_check(cudaMemcpyAsync(logits,all_logits+static_cast<std::size_t>(rows-1)*kVocab,
+            kVocab*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
+            "retain batched continuation final-row logits");
+        head_work.submitted_rows+=static_cast<std::uint64_t>(rows);
+        last_rows=rows;
+        if(capture_taps) {
+            const auto generation=tap_generation.fetch_add(1,std::memory_order_release)+1;
+            require(generation,"authoritative tap generation exhausted");
+        }
+        qkv_trace_valid=true;
+    }
+
     void process_rows(const std::int64_t* ids, int rows, int position, cudaStream_t stream,
                       ProfileEvents* events = nullptr, bool include_embedding = true,
                       bool continuation_reference = false,
@@ -3174,7 +3216,8 @@ struct Exl3TextContext::Impl {
             validate_native_mtp_hidden_capture_extent(position, rows);
         const auto head_plan=Exl3HeadConsumerPlan::make(rows,
             all_head_rows?Exl3HeadConsumer::verification:Exl3HeadConsumer::root_only,!all_head_rows);
-        require(!all_head_rows || (continuation && continuation->capacity>=head_plan.rows),
+        require(!all_head_rows || skip_head ||
+            (continuation && continuation->capacity>=head_plan.rows),
             "all-row head consumer lacks prepared output capacity");
         require(!oscar_only || oscar!=nullptr,"OSCAR-only context needs explicit OSCAR initialization");
         resident_exact_state_id=0;
@@ -9210,6 +9253,136 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
         transaction.prefix_available = true;
     }
     ++last_decode_h2d_;
+}
+
+void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
+    std::span<const std::int64_t> own_tokens,std::span<const std::int64_t> peer_tokens,
+    cudaStream_t stream) {
+    require(&peer!=this && peer.impl_->model==impl_->model,
+        "batched continuation needs a distinct context of the same model");
+    const int own_rows=static_cast<int>(own_tokens.size());
+    const int peer_rows=static_cast<int>(peer_tokens.size());
+    const int rows=own_rows+peer_rows;
+    Exl3TextContext* contexts[2]={this,&peer};
+    const std::span<const std::int64_t> tokens[2]={own_tokens,peer_tokens};
+    bool arm_retained_prefix[2]{};
+    for(int c=0;c<2;++c) {
+        auto& context=*contexts[c];
+        auto& impl=*context.impl_;
+        const int count=static_cast<int>(tokens[c].size());
+        impl.join_repair(stream);
+        require(!impl.host_kv.enabled && !impl.host_kv_failed && !impl.oscar &&
+                (!impl.transaction || !impl.transaction->rollback_required),
+            "batched continuation requires device-KV contexts outside failed transactions");
+        require(impl.continuation && count>=2 && count<=8 &&
+                count<=impl.continuation->capacity,
+            "batched continuation rows are outside each context's prepared capacity");
+        require(std::all_of(tokens[c].begin(),tokens[c].end(),[](std::int64_t token) {
+                return token>=0 && token<kVocab; }),
+            "batched continuation token ID is outside the vocabulary");
+        require(context.position_>0 && impl.last_rows>0 &&
+                context.position_<=impl.max_context-count,
+            "batched continuation requires a nonempty prefix and capacity");
+        require(impl.capture_taps && !impl.graph_active && !impl.graph_capture_active,
+            "batched continuation requires eager target execution");
+        arm_retained_prefix[c]=impl.transaction && impl.transaction->active &&
+            impl.transaction->fresh_snapshot && impl.transaction->stream==stream;
+    }
+    cudaStreamCaptureStatus capture_status=cudaStreamCaptureStatusNone;
+    cuda_check(cudaStreamIsCapturing(stream,&capture_status),
+        "query batched continuation stream capture state");
+    require(capture_status==cudaStreamCaptureStatusNone,
+        "batched continuation is unavailable during external stream capture");
+    require(impl_->prefill_capacity>=rows,"batched continuation exceeds the owner's row capacity");
+    // Owner: rows [0, own_rows); peer: rows [own_rows, rows).
+    std::array<std::int64_t,16> ids{};
+    std::copy(own_tokens.begin(),own_tokens.end(),ids.begin());
+    std::copy(peer_tokens.begin(),peer_tokens.end(),ids.begin()+own_rows);
+    cuda_check(cudaMemcpyAsync(impl_->token_ids,ids.data(),static_cast<std::size_t>(rows)*sizeof(std::int64_t),
+        cudaMemcpyHostToDevice,stream),"upload batched continuation token IDs");
+    int base_positions[2]{};
+    for(int c=0;c<2;++c) {
+        auto& context=*contexts[c];
+        auto& impl=*context.impl_;
+        impl.retain_host_kv_forward_stream(stream);
+        impl.continuation->rows=0;
+        const auto offsets=std::move(impl.verifier_sibling_offsets);
+        impl.verifier_sibling_offsets.clear();
+        const int count=static_cast<int>(tokens[c].size());
+        const int siblings=static_cast<int>(offsets.size());
+        require(siblings==0 || count-siblings>=2,"verifier sibling layout needs two chain rows");
+        const int chain=siblings?count-siblings:0;
+        const std::array<int,3> layout{context.position_,chain,
+            siblings?exl3_pack_sibling_offsets(offsets,chain):0};
+        base_positions[c]=context.position_;
+        cuda_check(cudaMemcpyAsync(impl.position_device,layout.data(),sizeof(layout),
+            cudaMemcpyHostToDevice,stream),"set batched continuation base position");
+        if(impl.transaction && impl.transaction->active) {
+            impl.transaction->fresh_snapshot=false;
+            impl.transaction->prefix_available=false;
+        }
+        for(auto& layer:impl.full_layers)if(layer)layer->invalidate_retained_prefix();
+    }
+    // Pair every layer of the owner with the peer's layer of the same index.
+    std::array<Exl3FullAttentionLayer::Batch,kLayers> full_batches{};
+    std::array<Exl3GdnLayer::Batch,kLayers> gdn_batches{};
+    const auto clear_batches=[&] {
+        for(auto& layer:impl_->full_layers)if(layer)layer->set_batch(nullptr);
+        for(auto& layer:impl_->gdn_layers)if(layer)layer->set_batch(nullptr);
+    };
+    for(int layer=0;layer<kLayers;++layer) {
+        if(impl_->full_layers[layer]) {
+            require(static_cast<bool>(peer.impl_->full_layers[layer]),"batched layer topology");
+            full_batches[layer].own_rows=own_rows;
+            full_batches[layer].peer_count=1;
+            full_batches[layer].peers[0]={peer.impl_->full_layers[layer].get(),peer_rows,base_positions[1]};
+            impl_->full_layers[layer]->set_batch(&full_batches[layer]);
+        } else if(impl_->gdn_layers[layer]) {
+            require(static_cast<bool>(peer.impl_->gdn_layers[layer]),"batched layer topology");
+            gdn_batches[layer].own_rows=own_rows;
+            gdn_batches[layer].peer_count=1;
+            gdn_batches[layer].peers[0]={peer.impl_->gdn_layers[layer].get(),peer_rows};
+            impl_->gdn_layers[layer]->set_batch(&gdn_batches[layer]);
+        }
+    }
+    try {
+        impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
+            false,false,nullptr,0,kLayers,nullptr,nullptr,true);
+    } catch(...) {clear_batches();throw;}
+    clear_batches();
+    // The owner's taps hold every row; the peer's rows move to its own taps.
+    for(std::size_t tap=0;tap<impl_->taps.size();++tap)
+        cuda_check(cudaMemcpyAsync(peer.impl_->taps[tap]->ptr,
+            static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr)+static_cast<std::size_t>(own_rows)*kHidden,
+            static_cast<std::size_t>(peer_rows)*kHidden*sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice,stream),"move batched peer taps");
+    cuda_check(cudaMemcpyAsync(peer.impl_->embedding_trace->ptr,
+        static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+static_cast<std::size_t>(own_rows)*kHidden,
+        static_cast<std::size_t>(peer_rows)*kHidden*sizeof(std::uint16_t),
+        cudaMemcpyDeviceToDevice,stream),"move batched peer embedding trace");
+    impl_->embedding_rows=impl_->tap_rows=own_rows;
+    peer.impl_->embedding_rows=peer.impl_->tap_rows=peer_rows;
+    const auto* hidden=impl_->last_stack_output;
+    peer.impl_->last_stack_output=impl_->last_stack_output+static_cast<std::size_t>(own_rows)*kHidden;
+    impl_->finish_batched_continuation(hidden,own_rows,base_positions[0],stream);
+    peer.impl_->finish_batched_continuation(peer.impl_->last_stack_output,peer_rows,base_positions[1],stream);
+    for(int c=0;c<2;++c) {
+        auto& context=*contexts[c];
+        auto& impl=*context.impl_;
+        const int count=static_cast<int>(tokens[c].size());
+        const std::array<int,3> final_layout{base_positions[c]+count-1,0,0};
+        cuda_check(cudaMemcpyAsync(impl.position_device,final_layout.data(),sizeof(final_layout),
+            cudaMemcpyHostToDevice,stream),"set batched continuation final device position");
+        context.position_+=count;
+        impl.continuation->rows=count;
+        if(arm_retained_prefix[c]) {
+            auto& transaction=*impl.transaction;
+            transaction.attempt_base_position=base_positions[c];
+            transaction.attempted_rows=count;
+            transaction.prefix_available=true;
+        }
+        ++context.last_decode_h2d_;
+    }
 }
 
 void Exl3TextContext::bind_request_compatibility(std::string contract) {

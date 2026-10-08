@@ -2174,6 +2174,23 @@ Exl3GdnLayer::~Exl3GdnLayer() {
     for (auto*& workspace : linear_workspaces_) Exl3CudaLinearWorkspace::retire_slot(workspace);
 }
 
+// Batched multi-agent rounds run the verifier rows of several agents (up to
+// 16) as one launch per projection on the 16-row continuation routes.
+static Exl3CudaLinearAdmission batched_continuation_admission(Exl3TargetProjectionOperator operation) {
+    switch(operation) {
+    case Exl3TargetProjectionOperator::q: return Exl3CudaLinearAdmission::target_continuation_q;
+    case Exl3TargetProjectionOperator::k:
+    case Exl3TargetProjectionOperator::v: return Exl3CudaLinearAdmission::target_continuation_kv;
+    case Exl3TargetProjectionOperator::o: return Exl3CudaLinearAdmission::target_continuation_o;
+    case Exl3TargetProjectionOperator::gate:
+    case Exl3TargetProjectionOperator::up: return Exl3CudaLinearAdmission::target_continuation_gate_up;
+    case Exl3TargetProjectionOperator::down: return Exl3CudaLinearAdmission::target_continuation_down;
+    case Exl3TargetProjectionOperator::qkv: return Exl3CudaLinearAdmission::target_continuation_qkv;
+    case Exl3TargetProjectionOperator::z: return Exl3CudaLinearAdmission::target_continuation_z;
+    default: return Exl3CudaLinearAdmission::ordinary;
+    }
+}
+
 void Exl3GdnLayer::prepare_continuation_graph_qkvz_concurrency(
     Exl3GdnGraphQkvzConcurrencyView view) {
     const bool any = view.z_stream || view.fork || view.z_done || view.z_workspace;
@@ -2911,36 +2928,20 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         projection_observer_ ||
         std::getenv("NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE")))
         throw std::invalid_argument("GDN deferred MLP contract");
-    invalidate_continuation_history();
-    const std::uint64_t base_checkpoint_generation = current_checkpoint_generation_;
-    const cudaStream_t base_checkpoint_stream = current_checkpoint_stream_;
-    const void* base_checkpoint_recurrent = current_checkpoint_recurrent_;
-    const void* base_checkpoint_conv = current_checkpoint_conv_;
-    bool eligible_retained_prefix = preserve_m1_topology &&
-        Exl3GdnScratchReuseContract::retained_rows_supported(
-            static_cast<std::size_t>(rows)) && base_checkpoint_generation != 0 &&
-        stream == base_checkpoint_stream;
-    if (eligible_retained_prefix) {
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        check(cudaStreamIsCapturing(stream, &capture_status),
-              "query EXL3 GDN retained-prefix source capture");
-        eligible_retained_prefix =
-            capture_status == cudaStreamCaptureStatusNone;
-    }
-    const auto history_storage=scratch_reuse_.history_storage(
-        static_cast<std::size_t>(rows),eligible_retained_prefix,capture_active_);
-    if(history_storage==Exl3GdnHistoryStorage::refused)
-        throw std::invalid_argument("GDN scratch row/lifetime contract");
+    // Batched multi-agent rounds: this layer's own agent owns the leading
+    // own_rows; peer agents' rows follow (run_peer_segment).
+    const int own_rows=batch_?batch_->own_rows:rows;
+    const SegmentState segment=begin_segment(own_rows,stream,preserve_m1_topology);
+    const std::uint64_t base_checkpoint_generation = segment.base_generation;
+    const void* base_checkpoint_recurrent = segment.base_recurrent;
+    const void* base_checkpoint_conv = segment.base_conv;
+    const bool eligible_retained_prefix = segment.eligible;
+    const auto history_storage=segment.storage;
     const bool use_wide_slab=
         history_storage==Exl3GdnHistoryStorage::shared_wide;
     if (use_wide_slab && !wide_prefill)
         throw std::invalid_argument(
             "GDN split storage requires wide prefill for rows above private capacity");
-    retained_prefix_available_ = false;
-    current_checkpoint_generation_ = 0;
-    current_checkpoint_stream_ = nullptr;
-    current_checkpoint_recurrent_ = nullptr;
-    current_checkpoint_conv_ = nullptr;
     static std::atomic<int> prefill_stage_samples{0};
     const char* stage_sample_option=std::getenv(
         "NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
@@ -3213,7 +3214,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                     "numeric reconstruct cannot consume borrowed transformed input");
             reconstruct_gemm_->forward_numeric_candidate(
                 weights, metadata, source, destination, rows, projection_stream);
-        } else if (rowwise && !target_small_m_candidate) {
+        } else if (rowwise && !target_small_m_candidate && !(batch_ && rows > 8)) {
             for (int row = 0; row < rows; ++row) {
                 if(transformed_input)
                     workspace->forward_from_transformed(weights,metadata,
@@ -3245,14 +3246,16 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                            : (target_o_k7_candidate
                                   ? Exl3CudaLinearAdmission::target_continuation_o
                                   : Exl3CudaLinearAdmission::ordinary));
+            const auto launch_admission = batch_ && rows > 8 && !target_small_m_candidate
+                ? batched_continuation_admission(operation) : admission;
             if (transformed_input)
                 workspace->forward_from_transformed(
                     weights, metadata, transformed_input, destination, rows,
-                    projection_stream, admission);
+                    projection_stream, launch_admission);
             else
                 workspace->forward(
                     weights, metadata, source, destination, rows,
-                    projection_stream, admission);
+                    projection_stream, launch_admission);
         }
         if (projection_timing_) projection_timing_->end(timing_slot, projection_stream);
     };
@@ -3434,9 +3437,22 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         launch_control(); end(3);
     }
     gdn_middle(GdnMiddle{qkv,conv_input,q,k,v,conv_output,z,z_bf16,core,gdn_norm,head_trace,
-        o_input,g_trace,beta_trace,rows,stream,wide_prefill,preserve_m1_topology,
+        o_input,g_trace,beta_trace,own_rows,stream,wide_prefill,preserve_m1_topology,
         merged_qkvz_side,eligible_retained_prefix,base_checkpoint_recurrent,
         collect_stage_events,starts,ends});
+    if(batch_) {
+        int first=own_rows;
+        for(int i=0;i<batch_->peer_count;++i) {
+            const auto& peer=batch_->peers[static_cast<std::size_t>(i)];
+            const auto row=static_cast<std::size_t>(first);
+            peer.layer->run_peer_segment(PeerSegmentSource{
+                h+row*kHidden,qkv+row*kQkv,conv_input+row*kQkv,z+row*kZ,
+                a+row*kHeads,b+row*kHeads,g_trace+row*kHeads,beta_trace+row*kHeads,
+                o_input+row*kZ,peer.rows,merged_qkvz_side},stream,preserve_m1_topology);
+            first+=peer.rows;
+        }
+        if(first!=rows)throw std::logic_error("GDN batched segment rows");
+    }
     const bool gopt_residual=gaming_[Gopt::GdnVerifierResidualNorm] &&
         rows>=1 && rows<=8 && !wide_prefill && preserve_m1_topology;
     // The O reduction also writes post = half(input + o) and the
@@ -3650,19 +3666,89 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         cudaEventDestroy(total_end);
     }
     trace_ = {input, h, qkv, z, b, a, conv_input, conv_output, beta_trace, g_trace, recurrent_state_before_, recurrent_state_, core, core, o_input, o_input, o, post, mlp_input, gate, up, act, down, final_output};
+    end_segment(segment,own_rows,stream,preserve_m1_topology);
+}
+
+Exl3GdnLayer::SegmentState Exl3GdnLayer::begin_segment(
+    int rows,cudaStream_t stream,bool preserve_m1_topology) {
+    invalidate_continuation_history();
+    SegmentState segment;
+    segment.base_generation = current_checkpoint_generation_;
+    const cudaStream_t base_checkpoint_stream = current_checkpoint_stream_;
+    segment.base_recurrent = current_checkpoint_recurrent_;
+    segment.base_conv = current_checkpoint_conv_;
+    segment.eligible = preserve_m1_topology &&
+        Exl3GdnScratchReuseContract::retained_rows_supported(
+            static_cast<std::size_t>(rows)) && segment.base_generation != 0 &&
+        stream == base_checkpoint_stream;
+    if (segment.eligible) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        check(cudaStreamIsCapturing(stream, &capture_status),
+              "query EXL3 GDN retained-prefix source capture");
+        segment.eligible = capture_status == cudaStreamCaptureStatusNone;
+    }
+    segment.storage=scratch_reuse_.history_storage(
+        static_cast<std::size_t>(rows),segment.eligible,capture_active_);
+    if(segment.storage==Exl3GdnHistoryStorage::refused)
+        throw std::invalid_argument("GDN scratch row/lifetime contract");
+    retained_prefix_available_ = false;
+    current_checkpoint_generation_ = 0;
+    current_checkpoint_stream_ = nullptr;
+    current_checkpoint_recurrent_ = nullptr;
+    current_checkpoint_conv_ = nullptr;
+    return segment;
+}
+
+void Exl3GdnLayer::end_segment(const SegmentState& segment,int rows,
+    cudaStream_t stream,bool preserve_m1_topology) {
     if(preserve_m1_topology &&
-       history_storage==Exl3GdnHistoryStorage::private_retained &&
+       segment.storage==Exl3GdnHistoryStorage::private_retained &&
        Exl3GdnScratchReuseContract::verifier_rows_supported(
            static_cast<std::size_t>(rows)))
         continuation_history_rows_=rows;
-    if (eligible_retained_prefix) {
+    if (segment.eligible) {
         retained_prefix_available_ = true;
         retained_prefix_rows_ = rows;
         retained_prefix_stream_ = stream;
-        retained_prefix_checkpoint_generation_ = base_checkpoint_generation;
-        retained_prefix_checkpoint_recurrent_ = base_checkpoint_recurrent;
-        retained_prefix_checkpoint_conv_ = base_checkpoint_conv;
+        retained_prefix_checkpoint_generation_ = segment.base_generation;
+        retained_prefix_checkpoint_recurrent_ = segment.base_recurrent;
+        retained_prefix_checkpoint_conv_ = segment.base_conv;
     }
+}
+
+// A peer agent's rows of a batched forward: the owner's row-independent
+// projection outputs are copied into this layer's own buffers, this layer's
+// state runs the stateful core exactly as its own forward would (traces stay
+// in this layer for its rollback repair), and the gated-norm output returns to
+// the owner's O-projection input.
+void Exl3GdnLayer::run_peer_segment(const PeerSegmentSource& source,cudaStream_t stream,
+    bool preserve_m1_topology) {
+    const int rows=source.rows;
+    if(rows<1 || rows>max_rows_)throw std::invalid_argument("GDN peer segment rows");
+    const SegmentState segment=begin_segment(rows,stream,preserve_m1_topology);
+    if(segment.storage==Exl3GdnHistoryStorage::shared_wide)
+        throw std::invalid_argument("GDN peer segment requires private history storage");
+    const auto copy=[&](void* destination,const void* from,std::size_t bytes,const char* what) {
+        check(cudaMemcpyAsync(destination,from,bytes,cudaMemcpyDeviceToDevice,stream),what);
+    };
+    const auto n=static_cast<std::size_t>(rows);
+    copy(half_buffers_[0],source.h,n*kHidden*sizeof(std::uint16_t),"GDN peer h");
+    copy(half_buffers_[1],source.qkv,n*kQkv*sizeof(std::uint16_t),"GDN peer qkv");
+    copy(half_buffers_[2],source.z,n*kZ*sizeof(std::uint16_t),"GDN peer z");
+    if(source.merged_qkvz_side)
+        copy(half_buffers_[3],source.conv_input,n*kQkv*sizeof(std::uint16_t),"GDN peer conv input");
+    copy(float_buffers_[1],source.a,n*kHeads*sizeof(float),"GDN peer a");
+    copy(float_buffers_[0],source.b,n*kHeads*sizeof(float),"GDN peer b");
+    copy(float_buffers_[5],source.g_trace,n*kHeads*sizeof(float),"GDN peer g");
+    copy(float_buffers_[4],source.beta_trace,n*kHeads*sizeof(float),"GDN peer beta");
+    cudaEvent_t* no_events=nullptr;
+    gdn_middle(GdnMiddle{half_buffers_[1],reinterpret_cast<std::uint16_t*>(half_buffers_[3]),
+        half_buffers_[4],half_buffers_[5],half_buffers_[6],half_buffers_[7],half_buffers_[2],
+        half_buffers_[8],half_buffers_[9],half_buffers_[11],half_buffers_[21],half_buffers_[12],
+        float_buffers_[5],float_buffers_[4],rows,stream,false,preserve_m1_topology,
+        source.merged_qkvz_side,segment.eligible,segment.base_recurrent,false,no_events,no_events});
+    copy(source.o_input,half_buffers_[12],n*kZ*sizeof(std::uint16_t),"GDN peer gated norm output");
+    end_segment(segment,rows,stream,preserve_m1_topology);
 }
 
 void Exl3GdnLayer::forward_pair_staged_serial_for_test(

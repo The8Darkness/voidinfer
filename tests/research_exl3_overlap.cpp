@@ -84,7 +84,8 @@ int main() {
             check(cudaStreamCreateWithPriority(&sv, cudaStreamNonBlocking, lo), "stream v");
         }
         const std::span<const std::int64_t> prompt(ids.data(), static_cast<std::size_t>(context));
-        const auto ingest = [&](Exl3TextContext& ctx, cudaStream_t s) {
+        const auto ingest = [&](Exl3TextContext& ctx, cudaStream_t s, std::size_t shift = 0) {
+            const std::span<const std::int64_t> prompt(ids.data() + shift, static_cast<std::size_t>(context));
             ctx.prefill(prompt.first(16), s);
             for (int at = 16; at < context;) {
                 const int n = std::min(1024, context - at);
@@ -98,7 +99,7 @@ int main() {
         std::unique_ptr<Exl3TextContext> d, v;
         if (mode != 1) { d = model->create_context(true); std::cerr << "OVL free after D create " << free_mib() << " MiB\n"; d->prepare_continuation(8); ingest(*d, sd); std::cerr << "OVL free after D ingest " << free_mib() << " MiB\n"; }
         if (mode != 0) {
-            v = model->create_context(true); std::cerr << "OVL free after V create " << free_mib() << " MiB\n"; v->prepare_continuation(8); ingest(*v, sd); std::cerr << "OVL free after V ingest " << free_mib() << " MiB\n";
+            v = model->create_context(true); std::cerr << "OVL free after V create " << free_mib() << " MiB\n"; v->prepare_continuation(8); ingest(*v, sd, mode == 5 ? 4096 : 0); std::cerr << "OVL free after V ingest " << free_mib() << " MiB\n";
             v->save_verified_root(sv);
             check(cudaStreamSynchronize(sv), "root");
         }
@@ -130,6 +131,55 @@ int main() {
             check(cudaStreamSynchronize(sd), "decode");
             d_ms = ms(start);
         };
+        if (mode == 5) {
+            // Batched multi-agent continuation vs. two separate continuations
+            // from the same verified roots (logits per row, then timing).
+            const int n = env_int("OVL_BATCH_ROWS", 8);
+            const std::span<const std::int64_t> ta(ids.data() + context, static_cast<std::size_t>(n));
+            const std::span<const std::int64_t> tb(ids.data() + context + 64, static_cast<std::size_t>(n));
+            d->save_verified_root(sd); v->save_verified_root(sd);
+            check(cudaStreamSynchronize(sd), "roots");
+            const auto separate = [&] { d->continue_rows(ta, sd); v->continue_rows(tb, sd); };
+            const auto batched = [&] { d->continue_rows_batched(*v, ta, tb, sd); };
+            const auto rewind = [&] { d->restore_verified_root(sd); v->restore_verified_root(sd); };
+            separate();
+            const auto ra = d->continuation_logits_host(sd), rb = v->continuation_logits_host(sd);
+            rewind();
+            batched();
+            const auto ba = d->continuation_logits_host(sd), bb = v->continuation_logits_host(sd);
+            rewind();
+            const auto compare = [&](const std::vector<float>& x, const std::vector<float>& y, const char* who) {
+                const std::size_t vocab = x.size() / static_cast<std::size_t>(n);
+                double max_abs = 0; int agree = 0;
+                for (int r = 0; r < n; ++r) {
+                    const auto* xr = x.data() + r * vocab; const auto* yr = y.data() + r * vocab;
+                    agree += std::max_element(xr, xr + vocab) - xr == std::max_element(yr, yr + vocab) - yr;
+                    for (std::size_t j = 0; j < vocab; ++j) max_abs = std::max(max_abs, std::abs(double(xr[j]) - yr[j]));
+                }
+                std::cout << "OVL batch " << who << " rows=" << n << " argmax_agree=" << agree << "/" << n
+                          << " max_abs_logit_diff=" << max_abs << " sizes=" << x.size() << "/" << y.size() << '\n';
+            };
+            compare(ra, ba, "own");
+            compare(rb, bb, "peer");
+            const auto time = [&](auto&& f, const char* what) {
+                for (int i = 0; i < 3; ++i) { f(); rewind(); }
+                check(cudaStreamSynchronize(sd), "warm");
+                const auto start = Clock::now();
+                for (int i = 0; i < 20; ++i) { f(); rewind(); }
+                check(cudaStreamSynchronize(sd), "timed");
+                std::cout << "OVL batch time " << what << " ms=" << ms(start) / 20 << " (incl. rewind)\n";
+            };
+            if (const char* only = std::getenv("OVL_ONLY")) {
+                const bool b = std::string(only) == "batched";
+                for (int i = 0; i < 10; ++i) { if (b) batched(); else separate(); rewind(); }
+                check(cudaStreamSynchronize(sd), "profile loop");
+                return 0;
+            }
+            time(separate, "separate");
+            time(batched, "batched");
+            time(rewind, "rewind-only");
+            return 0;
+        }
         if (mode == 4) {
             // Cost of one target continuation forward by row count (batched-round estimate).
             for (const int n : {1, 2, 4, 8, 9, 12, 16, 32}) {

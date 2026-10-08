@@ -970,6 +970,14 @@ public:
     // set, every full-attention layer attends to its history from the FP16 L2
     // planes instead of the INT2 codes and hot rows.
     void set_l0_exact_history(bool exact) noexcept;
+    // Batched multi-agent rounds: one target forward over this context's
+    // verifier rows followed by the peer's (each 2..8 rows), sharing every
+    // row-independent projection; each context keeps its own KV, recurrent
+    // state, taps, logits, positions and transaction exactly as continue_rows
+    // would leave them.
+    void continue_rows_batched(Exl3TextContext& peer, std::span<const std::int64_t> own_tokens,
+                               std::span<const std::int64_t> peer_tokens,
+                               cudaStream_t stream = nullptr);
 
     // Greedy token and logit gap of each row of the last completed forward:
     // row i yields its argmax and max_logit - logit(next[i]) (0 when next[i]

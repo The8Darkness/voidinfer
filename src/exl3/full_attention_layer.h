@@ -675,6 +675,17 @@ public:
     // the FP16 L2 planes instead of the INT2 codes and hot rows (VeriCache
     // verifier passes and lossless ingestion). No effect without L0 storage.
     void set_l0_exact_history(bool exact) noexcept { l0_exact_ = l0_exact_prefill_ = exact; }
+    // Batched multi-agent rounds: while set, forward() runs its row-independent
+    // work over own_rows + every peer's rows, and each peer layer (another
+    // agent's context, same model layer) runs its own stateful core on its rows
+    // at its own position.
+    struct BatchPeer { Exl3FullAttentionLayer* layer = nullptr; int rows = 0; int position = 0; };
+    struct Batch {
+        int own_rows = 0;
+        int peer_count = 0;
+        std::array<BatchPeer, 1> peers{};
+    };
+    void set_batch(const Batch* batch) noexcept { batch_ = batch; }
 
     // Rewind L0 aging and hot rows to a verified root at `position` (VeriCache):
     // rows from history_end(position) on will be rewritten and re-encoded.
@@ -917,6 +928,10 @@ private:
         cudaEvent_t* ends;
     };
     void attention_middle(const AttentionMiddle& m);
+    void run_peer_segment(const std::uint16_t* qg_source,const std::uint16_t* kp_source,
+        const std::uint16_t* vp_source,std::uint16_t* attn_destination,int rows,int position,
+        cudaStream_t stream,bool preserve_m1_topology);
+    const Batch* batch_ = nullptr;
     bool l0_exact_ = false;          // verifier/decode rows (<= 8)
     bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)
 
