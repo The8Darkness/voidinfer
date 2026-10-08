@@ -47,3 +47,18 @@ own rows with its own layer state:
    scratch is shared between lanes and prefill passes are serialized.
 5. **Measure and extend.** Aggregate and per-agent tok/s at 4K/16K/64K; then batch the
    draft model and consider more than two agents.
+
+## Status (2026-10-08)
+
+* Phase 1 done (59ff5a45): coherent projection routes admit 16 rows; FP64 per-row oracle
+  tests at 9/12/16 rows; 16 rows cost about the same as 8. Split choices are sized for
+  16 batched rows so a row's result never depends on the launch width.
+* Phases 2-3 done (1ad4ab73, 5c46156d, 2e641e35, cd015c8e, 3ff716a8):
+  `attention_middle()` / `gdn_middle()` hold each layer's stateful core;
+  `Exl3TextContext::continue_rows_batched` runs one 16-row stack in which every peer core
+  runs on its own layer object (copy-in/copy-out), and
+  `prepare_batched_continuation_graph` captures it. Batched logits are bit-identical to two
+  separate continuations; one batched forward takes 16.9 ms (8K) / 17.9 ms (32K) against
+  27.6 / 28.5 ms for two separate graph-replayed forwards.
+* Next: phase 4 (engine lockstep scheduler for two coherent-device lanes, shared prefill
+  scratch so two lanes fit in VRAM), then end-to-end aggregate tok/s.
