@@ -5508,6 +5508,17 @@ __device__ __forceinline__ void reg_attn_mma(float (&c)[4],const unsigned (&a)[4
                  :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
 }
 
+// FP16-accumulating m16n8k16 (twice the FP32-accumulate tensor rate on
+// GeForce Blackwell); callers add each k-block partial into FP32.
+__device__ __forceinline__ void mma_h(unsigned (&c)[2],const unsigned (&a)[4],
+                                      unsigned b0,unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+                 :"+r"(c[0]),"+r"(c[1])
+                 :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
+}
+
+constexpr int kQkHalfGroup=4;
 __device__ __forceinline__ unsigned reg_attn_pack(half low,half high) {
     return static_cast<unsigned>(__half_as_ushort(low))|
         (static_cast<unsigned>(__half_as_ushort(high))<<16);
@@ -5847,14 +5858,28 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       float s[BN/8][4];
       #pragma unroll
       for(int j=0;j<BN/8;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.f;
+      // Scores: kQkHalfGroup consecutive 16-dimension k-steps accumulate in
+      // FP16 (the double-rate tensor path), each partial is added in FP32.
       #pragma unroll
-      for(int kk=0;kk<kHeadDim/16;++kk){
+      for(int kk0=0;kk0<kHeadDim/16;kk0+=kQkHalfGroup){
+        unsigned hs[BN/8][2];
         #pragma unroll
-        for(int pair=0;pair<BN/16;++pair){
-          unsigned b[4];
-          reg_attn_ldmatrix_x4(b,ks+(pair*16+(lane&7)+((lane>>4)<<3))*kStride+kk*16+((lane>>3)&1)*8);
-          reg_attn_mma(s[2*pair],qa[kk],b[0],b[1]);
-          reg_attn_mma(s[2*pair+1],qa[kk],b[2],b[3]);
+        for(int j=0;j<BN/8;++j) hs[j][0]=hs[j][1]=0u;
+        #pragma unroll
+        for(int kk=kk0;kk<kk0+kQkHalfGroup;++kk){
+          #pragma unroll
+          for(int pair=0;pair<BN/16;++pair){
+            unsigned b[4];
+            reg_attn_ldmatrix_x4(b,ks+(pair*16+(lane&7)+((lane>>4)<<3))*kStride+kk*16+((lane>>3)&1)*8);
+            mma_h(hs[2*pair],qa[kk],b[0],b[1]);
+            mma_h(hs[2*pair+1],qa[kk],b[2],b[3]);
+          }
+        }
+        #pragma unroll
+        for(int j=0;j<BN/8;++j){
+          const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hs[j][0]));
+          const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hs[j][1]));
+          s[j][0]+=lo.x; s[j][1]+=lo.y; s[j][2]+=hi.x; s[j][3]+=hi.y;
         }
       }
       const bool need_mask=first+BN-1>warp_min_limit;
@@ -5891,11 +5916,11 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
         #pragma unroll
         for(int n=0;n<kHeadDim/8;++n){ acc[n][0]*=scale[0]; acc[n][1]*=scale[0]; acc[n][2]*=scale[1]; acc[n][3]*=scale[1]; }
       }
-#if 0
+      // PV: each key tile accumulates in FP16 (double-rate tensor path) and
+      // is added into the FP32 accumulator.
       unsigned hacc[kHeadDim/8][2];
       #pragma unroll
       for(int n=0;n<kHeadDim/8;++n) hacc[n][0]=hacc[n][1]=0u;
-#endif
       #pragma unroll
       for(int kk=0;kk<BN/16;++kk){
         const unsigned a[4]={pp[2*kk][0],pp[2*kk][1],pp[2*kk+1][0],pp[2*kk+1][1]};
@@ -5903,21 +5928,15 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
         for(int pair=0;pair<kHeadDim/16;++pair){
           unsigned b[4];
           reg_attn_ldmatrix_x4_trans(b,vs+(16*kk+(lane&7)+((lane>>3)&1)*8)*kStride+pair*16+(lane>>4)*8);
-#if 0
           mma_h(hacc[2*pair],a,b[0],b[1]); mma_h(hacc[2*pair+1],a,b[2],b[3]);
-#else
-          reg_attn_mma(acc[2*pair],a,b[0],b[1]); reg_attn_mma(acc[2*pair+1],a,b[2],b[3]);
-#endif
         }
       }
-#if 0
       #pragma unroll
       for(int n=0;n<kHeadDim/8;++n){
         const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hacc[n][0]));
         const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hacc[n][1]));
         acc[n][0]+=lo.x; acc[n][1]+=lo.y; acc[n][2]+=hi.x; acc[n][3]+=hi.y;
       }
-#endif
     }
     __syncthreads();
   }
