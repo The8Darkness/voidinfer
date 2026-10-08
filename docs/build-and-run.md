@@ -3,15 +3,15 @@
 ## Toolchain
 
 - Windows 11 x64 and an NVIDIA GPU supporting `sm_120a` (the current CMake contract).
-- Visual Studio 2022 Build Tools with MSVC C++.
-- CUDA Toolkit 13.1 or newer, CMake 3.28 or newer, Ninja, Git, Python 3.
+- Visual Studio 2026 Build Tools (MSVC 14.51) with the C++ workload.
+- CUDA Toolkit 13.3 (validated 2026-10-08; CUDA 13.1 with VS 2022 also builds), CMake 3.28 or newer, Ninja, Git, Python 3.
 - vcpkg dependencies selected by the repository's CMake configuration; FFmpeg and libcurl are
   runtime/build dependencies for media and HTTP support.
 
 From a Developer PowerShell or an ordinary PowerShell that initializes MSVC:
 
 ```powershell
-cmd /c "call C:\BuildTools\Common7\Tools\VsDevCmd.bat -arch=amd64 && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DBUILD_TESTING=ON"
+cmd /c "call C:\BuildTools2026\Common7\Tools\VsDevCmd.bat -arch=amd64 && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DCMAKE_CUDA_COMPILER=%CUDA_PATH_V13_3%\bin\nvcc.exe -DBUILD_TESTING=ON"
 cmake --build build --target ninfer-cli ninfer-serve
 ctest --test-dir build --output-on-failure
 ```

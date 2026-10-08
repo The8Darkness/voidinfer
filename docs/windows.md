@@ -9,16 +9,16 @@ serving API.
 ## Requirements
 
 - Windows 11 x64;
-- NVIDIA GeForce RTX 5090 with a driver supporting CUDA 13.1;
-- [CUDA Toolkit 13.1](https://developer.nvidia.com/cuda-downloads) or newer;
-- Visual Studio 2022 with the **Desktop development with C++** workload;
+- NVIDIA GeForce RTX 5090 with a driver supporting CUDA 13.3;
+- [CUDA Toolkit 13.3](https://developer.nvidia.com/cuda-downloads) (CUDA 13.1 also builds);
+- Visual Studio 2026 (MSVC 14.51) with the **Desktop development with C++** workload (VS 2022 also builds with CUDA 13.1);
 - CMake 3.28 or newer;
 - [vcpkg](https://github.com/microsoft/vcpkg); the repository pins the dependency baseline in
   `vcpkg.json`.
 
 The build rejects CUDA architectures other than `120a`, matching the upstream RTX 5090 target.
 On Windows, FFmpeg and libcurl come from vcpkg during configure; no system package installation
-is required. CUDA 13.1 uses MSVC's conforming preprocessor automatically.
+is required. CUDA 13.x uses MSVC's conforming preprocessor automatically.
 
 ## Installing vcpkg
 
@@ -33,14 +33,14 @@ With the vcpkg toolchain file passed to CMake (below), vcpkg installs `curl`, `f
 
 ## Building from source
 
-From the **x64 Native Tools Command Prompt for VS 2022** (or any shell with the MSVC toolchain
+From the **x64 Native Tools Command Prompt for VS 2026** (or any shell with the MSVC toolchain
 and the CUDA toolkit in `PATH`):
 
 ```powershell
 git clone https://github.com/natpate/ninfer-windows.git
 cd ninfer-windows
 
-cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 `
+cmake -S . -B build-windows -G "Visual Studio 18 2026" -A x64 `
   -DCMAKE_TOOLCHAIN_FILE=C:/src/vcpkg/scripts/buildsystems/vcpkg.cmake `
   -DVCPKG_TARGET_TRIPLET=x64-windows
 cmake --build build-windows --config Release --parallel
