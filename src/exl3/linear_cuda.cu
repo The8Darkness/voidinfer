@@ -2068,7 +2068,7 @@ constexpr float kNvfp4WeightGlobal = 3.5f / (6.0f * 448.0f);
 // (NVFP4: 4 x 16 values = 32 bytes, scales one 32-bit store; MXFP8: 32 bytes
 // per block). Grid (ceil(n/256), k/(Quant*Blocks)).
 template <int Bits, int Quant, int Blocks>
-__global__ void __launch_bounds__(256) exl3_decode_quantize_weight_kernel(
+__global__ void __launch_bounds__(256, 4) exl3_decode_quantize_weight_kernel(
     const std::uint16_t* __restrict__ trellis, const std::int32_t* __restrict__ mul1,
     std::uint8_t* __restrict__ values, std::uint8_t* __restrict__ scales,
     float* __restrict__ weight_global, int k, int n) {
