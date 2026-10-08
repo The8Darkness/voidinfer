@@ -85,6 +85,8 @@ becomes the next exact root (device GDN checkpoint plus L0 rewind).
 Measured with DFlash2 on the code workload, 1,024 output tokens:
 
 * Tolerance mode costs +8% per round at 16K (20.06 vs 18.56 ms) and +9% at 64K (21.21 vs 19.45 ms).
+* At 128K each verifier pass takes about 0.6 s. A run with one correction (a 0.53 s fix pass)
+  cost +19% (24.3 vs 20.3 ms). Exact prompt ingestion adds about 30% to prefill (33.3 vs 25.6 s).
 * A typical 1,024-token block needs no correction, and 13–23 accepted tokens are not the exact
   argmax (all within δ).
 * The verifier pass is compute-bound: weight reconstruction plus FP16 GEMMs, and history attention
