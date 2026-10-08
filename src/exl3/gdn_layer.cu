@@ -2169,6 +2169,43 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
     }
 }
 
+void Exl3GdnLayer::enable_small_tier(const Exl3SmallTierViews& views) {
+    if(small_rows_ || views.rows<1 || views.rows>private_row_capacity_ || !views.scratch.data ||
+       views.scratch.bytes<shared_scratch_bytes(views.rows))
+        throw std::invalid_argument("GDN small tier");
+    // Prompt-scale transients come from the context's small scratch; retained
+    // (private) buffers are already sized for the small tier.
+    auto* cursor=static_cast<std::byte*>(views.scratch.data);
+    small_half_buffers_=half_buffers_;
+    for(std::size_t i=0;i<half_buffers_.size();++i) {
+        if(half_buffer_owned_[i])continue;
+        small_half_buffers_[i]=reinterpret_cast<std::uint16_t*>(cursor);
+        cursor+=static_cast<std::size_t>(views.rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t);
+    }
+    small_float_buffers_=float_buffers_;
+    for(std::size_t i=0;i<float_buffers_.size();++i) {
+        if(float_buffer_owned_[i])continue;
+        small_float_buffers_[i]=reinterpret_cast<float*>(cursor);
+        cursor+=static_cast<std::size_t>(views.rows)*kHeads*sizeof(float);
+    }
+    for(auto* workspace:linear_workspaces_)if(workspace)workspace->attach_small_tier(views);
+    small_rows_=views.rows;
+    set_prompt_tier(false);
+}
+
+void Exl3GdnLayer::set_prompt_tier(bool prompt) noexcept {
+    if(!small_rows_ || prompt==!small_tier_active_)return;
+    std::swap(half_buffers_,small_half_buffers_);
+    std::swap(float_buffers_,small_float_buffers_);
+    for(auto* workspace:linear_workspaces_)if(workspace)workspace->swap_tier();
+    small_tier_active_=!prompt;
+}
+
+void Exl3GdnLayer::require_tier_rows(int rows) const {
+    if(small_tier_active_ && rows>small_rows_)
+        throw std::logic_error("GDN rows exceed the small tier (prompt tier not selected)");
+}
+
 Exl3GdnLayer::~Exl3GdnLayer() {
     for(auto& owner:buffer_retirements_)if(owner)owner->retire();
     delete op_workspace_;
@@ -2919,6 +2956,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                            bool wide_prefill,const BulkPrefillBuffers* prepared,
                            const DeferredMlpBuffers* deferred_mlp) {
     if (!input || !output || rows <= 0 || rows > max_rows_) throw std::invalid_argument("invalid EXL3 GDN input/output/rows");
+    require_tier_rows(rows);
     if (prepared && (!wide_prefill || prepared->rows!=rows ||
         !prepared->h || !prepared->qkv || !prepared->z ||
         !supports_bulk_prefill()))
@@ -3733,6 +3771,7 @@ void Exl3GdnLayer::run_peer_segment(const PeerSegmentSource& source,cudaStream_t
     cudaStream_t state_stream,bool preserve_m1_topology) {
     const int rows=source.rows;
     if(rows<1 || rows>max_rows_)throw std::invalid_argument("GDN peer segment rows");
+    require_tier_rows(rows);
     const SegmentState segment=begin_segment(rows,stream,preserve_m1_topology,state_stream);
     if(segment.storage==Exl3GdnHistoryStorage::shared_wide)
         throw std::invalid_argument("GDN peer segment requires private history storage");

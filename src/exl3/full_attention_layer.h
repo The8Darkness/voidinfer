@@ -691,6 +691,11 @@ public:
     // Context owning this layer: L0 decode scratch is shared by the layers of
     // one context only (set before set_kv_cache).
     void set_l0_scratch_owner(const void* owner) noexcept { l0_scratch_owner_ = owner; }
+    // Concurrent Engine lanes: binds the context's small (<= views.rows) tier
+    // and selects it. The prompt tier (the shared prompt-scale views given at
+    // construction) is selected only around exclusive prompt/verifier passes.
+    void enable_small_tier(const Exl3SmallTierViews& views);
+    void set_prompt_tier(bool prompt) noexcept;
 
     // Rewind L0 aging and hot rows to a verified root at `position` (VeriCache):
     // rows from history_end(position) on will be rewritten and re-encoded.
@@ -912,6 +917,14 @@ private:
     int max_rows_ = 0;
     std::size_t workspace_bytes_ = 0;
     std::array<std::uint16_t*, 18> buffers_{};
+    // Private small tier (concurrent lanes): verifier/decode rows use these
+    // buffers and the workspaces' small views; prompt-scale rows use the
+    // (possibly shared) buffers above. TierScope selects per call.
+    std::array<std::uint16_t*, 18> small_buffers_{};
+    void* small_storage_ = nullptr;
+    int small_rows_ = 0;
+    bool small_tier_active_ = false;
+    void require_tier_rows(int rows) const;
     std::array<bool, 18> buffer_owned_{};
     std::array<std::optional<Exl3LayerBufferRetirement>,18> buffer_retirements_{};
     std::array<Exl3CudaLinearWorkspace*, 7> linear_workspaces_{};

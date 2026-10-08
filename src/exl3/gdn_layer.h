@@ -591,6 +591,11 @@ public:
     // writes the successor's input RMS norm into the successor's input-norm
     // buffer, and the successor skips its own norm for exactly that input.
     void set_successor(Exl3GdnLayer* successor) noexcept { successor_ = successor; }
+    // Concurrent Engine lanes: binds the context's small tier and selects it;
+    // the prompt tier (shared prompt-scale views) is selected only around
+    // exclusive prompt/verifier passes.
+    void enable_small_tier(const Exl3SmallTierViews& views);
+    void set_prompt_tier(bool prompt) noexcept;
     // Weights of the next layer's first projection, prefetched into L2 on a
     // side branch before this layer's down projection (M1 decode).
     void set_next_layer_prefetch(const std::uint16_t* trellis) noexcept { next_layer_prefetch_ = trellis; }
@@ -874,6 +879,12 @@ private:
     std::array<std::uint16_t*, 22> half_buffers_{};
     std::array<std::uint16_t*, 5> wide_half_buffers_{};
     std::array<float*, 6> float_buffers_{};
+    // Small tier for concurrent Engine lanes (see enable_small_tier).
+    std::array<std::uint16_t*, 22> small_half_buffers_{};
+    std::array<float*, 6> small_float_buffers_{};
+    int small_rows_ = 0;
+    bool small_tier_active_ = false;
+    void require_tier_rows(int rows) const;
     std::array<std::size_t,22> half_buffer_bytes_{};
     std::array<std::size_t,5> wide_half_buffer_bytes_{};
     std::array<std::size_t,6> float_buffer_bytes_{};

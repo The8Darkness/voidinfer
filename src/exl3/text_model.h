@@ -1278,6 +1278,7 @@ private:
         std::shared_ptr<const Exl3ExactHostState> source, int rows);
     struct Impl;
     struct BatchBinding;
+    struct PromptTierScope;
     explicit Exl3TextContext(std::unique_ptr<Impl> impl);
     void reset_impl(cudaStream_t stream,bool preserve_exact_payload);
     Exl3RequestResetStats reset_for_request_impl(std::string_view contract,

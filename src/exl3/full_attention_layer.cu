@@ -43,7 +43,17 @@ constexpr float kRmsEps = 1.0e-6f;
 constexpr std::array<int,17> kBufferFeatures={{kHidden,kQProjection,kKVProjection,kKVProjection,
     kQHeads*kHeadDim,kKVHeads*kHeadDim,kQHeads*kHeadDim,kKVHeads*kHeadDim,
     kQHeads*kHeadDim,kHidden,kHidden,kHidden,kIntermediate,kIntermediate,kIntermediate,kHidden,kHidden}};
-constexpr bool transient_buffer(std::size_t i) {return i!=3 && i!=6 && i!=7;}
+// Concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1) keep every
+// prompt-scale buffer in the shared scratch: rows retained across forwards
+// live in each layer's private small tier instead (enable_small_tier).
+bool tiered_prompt_buffers() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    return enabled;
+}
+bool transient_buffer(std::size_t i) {return tiered_prompt_buffers() || (i!=3 && i!=6 && i!=7);}
 
 std::atomic<std::uint64_t> prefill_shared_score_launch_counter{0};
 std::atomic<std::uint64_t> prefill_shared_score_row_counter{0};
@@ -7416,7 +7426,42 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
     }
 }
 
+void Exl3FullAttentionLayer::enable_small_tier(const Exl3SmallTierViews& views) {
+    if(small_storage_ || views.rows<1 || views.rows>max_rows_ || !views.scratch.data || coalesce_input_mlp_ ||
+       views.scratch.bytes<shared_scratch_bytes(views.rows,false))
+        throw std::invalid_argument("full-attention small tier");
+    // Rows retained across forwards (retained-prefix Q/K rotations and V)
+    // stay private; the rest share the context's small scratch.
+    constexpr std::array<std::size_t,3> retained{{3,6,7}};
+    std::size_t private_bytes=0;
+    for(const auto i:retained)private_bytes+=static_cast<std::size_t>(views.rows)*kBufferFeatures[i]*sizeof(std::uint16_t);
+    cuda_check(cudaMalloc(&small_storage_,private_bytes),"allocate full-attention small tier");
+    auto* own=static_cast<std::byte*>(small_storage_);
+    auto* shared=static_cast<std::byte*>(views.scratch.data);
+    for(std::size_t i=0;i<kBufferFeatures.size();++i) {
+        const auto bytes=static_cast<std::size_t>(views.rows)*kBufferFeatures[i]*sizeof(std::uint16_t);
+        auto*& cursor=std::find(retained.begin(),retained.end(),i)!=retained.end()?own:shared;
+        small_buffers_[i]=reinterpret_cast<std::uint16_t*>(cursor);cursor+=bytes;
+    }
+    for(auto* workspace:linear_workspaces_)if(workspace)workspace->attach_small_tier(views);
+    small_rows_=views.rows;
+    set_prompt_tier(false);
+}
+
+void Exl3FullAttentionLayer::set_prompt_tier(bool prompt) noexcept {
+    if(!small_rows_ || prompt==!small_tier_active_)return;
+    std::swap(buffers_,small_buffers_);
+    for(auto* workspace:linear_workspaces_)if(workspace)workspace->swap_tier();
+    small_tier_active_=!prompt;
+}
+
+void Exl3FullAttentionLayer::require_tier_rows(int rows) const {
+    if(small_tier_active_ && rows>small_rows_)
+        throw std::logic_error("full-attention rows exceed the small tier (prompt tier not selected)");
+}
+
 Exl3FullAttentionLayer::~Exl3FullAttentionLayer() {
+    if(small_storage_)(void)cudaFree(small_storage_);
     if (fast_cublas_handle_) {
         (void)cublasDestroy(reinterpret_cast<cublasHandle_t>(fast_cublas_handle_));
         fast_cublas_handle_ = nullptr;
@@ -9373,6 +9418,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     if (!input || !output || rows <= 0 || rows > max_rows_) {
         throw std::invalid_argument("invalid EXL3 full-attention layer input/output/rows");
     }
+    require_tier_rows(rows);
     // Side-branch L2 prefetch of upcoming GEMV weights (see the GDN layer).
     static const std::size_t prefetch_bytes=[] {
         const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
@@ -10115,6 +10161,7 @@ void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
     int rows,int position,cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology) {
     if(rows<1 || rows>max_rows_ || position<0)
         throw std::invalid_argument("full-attention peer segment rows/position");
+    require_tier_rows(rows);
     retained_prefix_available_ = false;
     bool eligible_retained_prefix = preserve_m1_topology && rows >= 2 && rows <= 8 &&
         ((oscar_ != nullptr && oscar_->graph_class() == 0) ||

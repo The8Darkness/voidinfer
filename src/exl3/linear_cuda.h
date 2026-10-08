@@ -135,6 +135,18 @@ struct Exl3CudaAccumulationView {
     std::size_t bytes = 0;
 };
 
+// Small (verifier/decode-row) tier of a context whose prompt-scale views are
+// shared by every concurrent Engine lane. Each borrowed large view maps to the
+// small view of the same role; `scratch` replaces the shared layer scratch.
+struct Exl3SmallTierViews {
+    int rows = 0;
+    Exl3CudaAccumulationView accumulation, paired_up_accumulation;
+    Exl3CudaTransformView transformed, paired_up_transformed;
+    const float* large_paired_up_accumulation = nullptr;
+    const std::uint16_t* large_paired_up_transformed = nullptr;
+    Exl3CudaLayerScratchView scratch;
+};
+
 struct Exl3ReconstructedExactStats {
     bool reservation_fallback = false;
     std::uint64_t calls = 0;
@@ -1060,6 +1072,37 @@ public:
         Exl3CudaLinearAdmission admission) const noexcept;
 
     const std::uint16_t* transformed_device() const noexcept { return transformed_; }
+    // Two-tier storage for concurrent Engine lanes: the accumulation/transform
+    // views given at construction serve prompt-scale rows (and may be shared by
+    // every lane's context); this small private tier serves verifier and decode
+    // rows. The owning layer selects the tier around each forward.
+    // Maps each borrowed (large) view to its small counterpart; owned views
+    // stay as they are. Call while the large tier is active.
+    void attach_small_tier(const Exl3SmallTierViews& views) noexcept {
+        if (!accum_owned_ && accum_) {
+            const auto& view = views.large_paired_up_accumulation &&
+                accum_ == views.large_paired_up_accumulation ?
+                views.paired_up_accumulation : views.accumulation;
+            small_accum_ = view.data; small_accum_bytes_ = view.bytes;
+        }
+        if (!transformed_owned_ && transformed_) {
+            const auto& view = views.large_paired_up_transformed &&
+                transformed_ == views.large_paired_up_transformed ?
+                views.paired_up_transformed : views.transformed;
+            small_transformed_ = view.data; small_transformed_bytes_ = view.bytes;
+        }
+    }
+    // Exchanges the active views with the other tier (calls come in pairs).
+    void swap_tier() noexcept {
+        if (small_accum_) {
+            std::swap(accum_, small_accum_);
+            std::swap(accumulation_capacity_bytes_, small_accum_bytes_);
+        }
+        if (small_transformed_) {
+            std::swap(transformed_, small_transformed_);
+            std::swap(transformed_capacity_bytes_, small_transformed_bytes_);
+        }
+    }
 
     bool draft_small_m_candidate_for_test(
         const Exl3CudaLinearMetadata& metadata,int rows) const noexcept {
@@ -1460,6 +1503,9 @@ private:
     bool draft_prefill_fc_enabled_ = false;
     std::uint16_t* transformed_ = nullptr;
     float* accum_ = nullptr;
+    float* small_accum_ = nullptr;
+    std::uint16_t* small_transformed_ = nullptr;
+    std::size_t small_accum_bytes_ = 0, small_transformed_bytes_ = 0;
     const std::uint16_t* pending_residual_left_ = nullptr;
     std::uint16_t* pending_residual_out_ = nullptr;
     const std::uint16_t* pending_norm_weight_ = nullptr;

@@ -736,6 +736,19 @@ struct Exl3GreedyPacketTransfer {
     }
 };
 
+// Prompt-scale layer views (accumulation, transform, layer scratch, GDN wide
+// slab) shared by the contexts of concurrent Engine lanes. Only exclusive
+// prompt/verifier passes use them; every context keeps a private small tier
+// for verifier and decode rows (Exl3SmallTierViews).
+struct Exl3SharedPromptPool {
+    std::array<void*,6> data{};
+    std::array<std::size_t,6> bytes{};
+    Exl3SharedPromptPool() = default;
+    Exl3SharedPromptPool(const Exl3SharedPromptPool&) = delete;
+    Exl3SharedPromptPool& operator=(const Exl3SharedPromptPool&) = delete;
+    ~Exl3SharedPromptPool() { for(auto* pointer:data)if(pointer)(void)cudaFree(pointer); }
+};
+
 struct Exl3TextModel::Impl {
     // Lifetime-stable process identity for exact host images; prevents address
     // reuse from making an old model's checkpoint compatible with a new model.
@@ -768,6 +781,7 @@ struct Exl3TextModel::Impl {
     // runs those one lane at a time.
     mutable std::mutex shared_numeric_mutex;
     mutable std::shared_ptr<Exl3CudaReconstructGemmWorkspace> shared_numeric_workspace;
+    mutable std::shared_ptr<Exl3SharedPromptPool> shared_prompt_pool;
 
     TensorPayload load_tensor(const IndexedSafetensors& input, const std::string& name) {
         const auto start = std::chrono::steady_clock::now();
@@ -1408,6 +1422,17 @@ struct Exl3TextContext::Impl {
         numeric_prefill_projection_workspace;
     // Borrowed from the model's shared prompt workspace (counted by its owner).
     bool numeric_prefill_workspace_borrowed = false;
+    // Concurrent Engine lanes: the layers' prompt-scale views live in the
+    // model's Exl3SharedPromptPool; this context's small tier serves rows
+    // <= small_tier_rows. PromptTierScope selects the pool around larger passes.
+    std::shared_ptr<Exl3SharedPromptPool> shared_prompt_pool;
+    void* small_tier_storage = nullptr;
+    int small_tier_rows = 0;
+    int prompt_tier_depth = 0;
+    void select_prompt_tier(bool prompt) {
+        for(auto& layer:full_layers)if(layer)layer->set_prompt_tier(prompt);
+        for(auto& layer:gdn_layers)if(layer)layer->set_prompt_tier(prompt);
+    }
     bool fast_same_weights_fp16kv_prefill_enabled = false;
     Exl3TextContext::FastSameWeightsFp16KvPrefillStats
         fast_same_weights_fp16kv_prefill_stats;
@@ -2099,6 +2124,7 @@ struct Exl3TextContext::Impl {
         return true;
     }
     ~Impl() {
+        if(small_tier_storage)(void)cudaFree(small_tier_storage);
         if(repair_stream) {
             (void)cudaStreamSynchronize(repair_stream);
             (void)cudaEventDestroy(repair_fork);
@@ -5235,12 +5261,38 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         if(scratch.bytes)allocate(scratch.bytes,&scratch.data,"allocate shared target layer scratch");
         if(gdn_wide_scratch.bytes)allocate(gdn_wide_scratch.bytes,&gdn_wide_scratch.data,"allocate shared GDN wide slab");
     };
+    static const bool share_prompt_pool=[] {
+        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    const bool tiered=share_prompt_pool && scratch.bytes!=0;
+    require(!tiered || (accumulation.bytes && transformed.bytes),
+        "shared prompt pool requires shared accumulation and transform views");
     std::size_t shared_bytes=0,shared_owners=0;
-    visit_shared_allocations([&](std::size_t bytes,void**,const char*) {
+    if(!tiered)visit_shared_allocations([&](std::size_t bytes,void**,const char*) {
         shared_bytes=Exl3LinearWorkspaceRequirements::append_owned_bytes(shared_bytes,bytes);++shared_owners;
     });
     const auto materialize_shared=[&] {
-    if(shared_owners) {
+    if(tiered) {
+        std::lock_guard lock(impl->model->shared_numeric_mutex);
+        auto& pool=impl->model->shared_prompt_pool;
+        std::array<void**,6> views{{reinterpret_cast<void**>(&accumulation.data),
+            reinterpret_cast<void**>(&paired_up_accumulation.data),reinterpret_cast<void**>(&transformed.data),
+            reinterpret_cast<void**>(&paired_up_transformed.data),&scratch.data,&gdn_wide_scratch.data}};
+        const std::array<std::size_t,6> extents{{accumulation.bytes,paired_up_accumulation.bytes,transformed.bytes,
+            paired_up_transformed.bytes,scratch.bytes,gdn_wide_scratch.bytes}};
+        if(!pool) {
+            auto created=std::make_shared<Exl3SharedPromptPool>();
+            for(std::size_t i=0;i<views.size();++i)if(extents[i]) {
+                cuda_check(cudaMalloc(&created->data[i],extents[i]),"allocate shared prompt pool");
+                created->bytes[i]=extents[i];
+            }
+            pool=std::move(created);
+        }
+        require(pool->bytes==extents,"shared prompt pool geometry differs between contexts");
+        for(std::size_t i=0;i<views.size();++i)*views[i]=pool->data[i];
+        impl->shared_prompt_pool=pool;
+    } else if(shared_owners) {
         const auto expected_bytes=Exl3LinearWorkspaceRequirements::append_owned_bytes(impl->persistent_bytes,shared_bytes);
         require(shared_owners<=impl->allocations.max_size()-impl->allocations.size(),"target shared owner capacity overflow");
         const auto expected_owners=impl->allocations.size()+shared_owners;
@@ -5341,7 +5393,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             Exl3GdnLayer::workspace_bytes_required(impl->prefill_capacity,
                 accumulation.bytes!=0,transformed.bytes!=0,scratch.bytes!=0,
                 gdn_wide_scratch.bytes!=0,resident_required);
-        required_layer_group=Exl3LinearWorkspaceRequirements::append_owned_bytes(
+        // Concurrent lanes' full-attention layers may borrow every buffer.
+        if(layer_requirements[layer])required_layer_group=Exl3LinearWorkspaceRequirements::append_owned_bytes(
             required_layer_group,layer_requirements[layer]);
     }
     const char* media=std::getenv("NINFER_EXL3_MEDIA_EXECUTION_RESEARCH");
@@ -5480,13 +5533,21 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     // buffers; the closure retains all partial construction in Impl on failure.
     const auto construct=[&]() -> std::unique_ptr<Exl3TextContext> {
     impl->constructor_authority=authority;
-    materialize_base();
-    materialize_kv();
-    materialize_taps();
-    materialize_shared();
-    materialize_numeric();
-    materialize_reconstruction();
-    materialize_attention();
+    static const bool memory_trace=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    const auto trace_stage=[&](const char* stage) {
+        if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE %s persistent=%.1f MiB\n",stage,
+            impl->persistent_bytes/1048576.0);
+    };
+    materialize_base();trace_stage("base");
+    materialize_kv();trace_stage("kv");
+    materialize_taps();trace_stage("taps");
+    materialize_shared();trace_stage("shared");
+    if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE shared accum=%.1f paired=%.1f transform=%.1f paired_t=%.1f scratch=%.1f wide=%.1f prefill_capacity=%d\n",
+        accumulation.bytes/1048576.0,paired_up_accumulation.bytes/1048576.0,transformed.bytes/1048576.0,
+        paired_up_transformed.bytes/1048576.0,scratch.bytes/1048576.0,gdn_wide_scratch.bytes/1048576.0,impl->prefill_capacity);
+    materialize_numeric();trace_stage("numeric");
+    materialize_reconstruction();trace_stage("reconstruction");
+    materialize_attention();trace_stage("attention");
     require(impl->allocations.size()==expected_generic_owners &&
         impl->allocations.capacity()==reserved_generic_capacity,
         "target generic owner plan changed during device construction");
@@ -5502,8 +5563,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl->model->layers[layer].full_attention) {
             const auto layer_requirement=layer_requirements[layer];
-            const auto expected_layer_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
-                impl->persistent_bytes,layer_requirement);
+            const auto expected_layer_persistent=layer_requirement?Exl3LinearWorkspaceRequirements::append_owned_bytes(
+                impl->persistent_bytes,layer_requirement):impl->persistent_bytes;
             if(startup_fault==18) {
                 require(!transformed.data,"attention constructor failure fixture requires owned transform");
                 Exl3CudaLinearWorkspace::fail_constructor_cleanup_for_test(true);
@@ -5618,6 +5679,38 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         else if (impl->full_layers[layer]) impl->full_layers[layer]->set_next_layer_prefetch(next);
     }
     require(impl->persistent_bytes==expected_layer_group,"target complete layer group requirement mismatch");
+    trace_stage("layers");
+    if(tiered) {
+        constexpr int small_rows=16;
+        const auto small=Exl3LinearWorkspaceRequirements::derive(17408,17408,small_rows);
+        // Coherent continuation routes use up to 10 K partitions, and paired
+        // gate/up projections stack two planes in one accumulation view.
+        const std::size_t accumulation_bytes=small.accumulation_bytes*4;
+        const std::size_t transform_bytes=small.transformed_bytes*2;
+        const std::size_t scratch_bytes=std::max(Exl3GdnLayer::shared_scratch_bytes(small_rows),
+            Exl3FullAttentionLayer::shared_scratch_bytes(small_rows,false));
+        const std::size_t paired_accumulation_bytes=paired_up_accumulation.data?accumulation_bytes:0;
+        const std::size_t paired_transform_bytes=paired_up_transformed.data?transform_bytes:0;
+        const auto align=[](std::size_t bytes){return (bytes+255)&~std::size_t{255};};
+        const std::size_t total=align(accumulation_bytes)+align(paired_accumulation_bytes)+
+            align(transform_bytes)+align(paired_transform_bytes)+align(scratch_bytes);
+        cuda_check(cudaMalloc(&impl->small_tier_storage,total),"allocate context small tier");
+        auto* cursor=static_cast<std::byte*>(impl->small_tier_storage);
+        const auto carve=[&](std::size_t bytes) {auto* p=bytes?cursor:nullptr;cursor+=align(bytes);return p;};
+        Exl3SmallTierViews views;
+        views.rows=small_rows;
+        views.accumulation={reinterpret_cast<float*>(carve(accumulation_bytes)),accumulation_bytes};
+        views.paired_up_accumulation={reinterpret_cast<float*>(carve(paired_accumulation_bytes)),paired_accumulation_bytes};
+        views.transformed={reinterpret_cast<std::uint16_t*>(carve(transform_bytes)),transform_bytes};
+        views.paired_up_transformed={reinterpret_cast<std::uint16_t*>(carve(paired_transform_bytes)),paired_transform_bytes};
+        views.scratch={carve(scratch_bytes),scratch_bytes};
+        views.large_paired_up_accumulation=paired_up_accumulation.data;
+        views.large_paired_up_transformed=paired_up_transformed.data;
+        for(auto& layer:impl->full_layers)if(layer)layer->enable_small_tier(views);
+        for(auto& layer:impl->gdn_layers)if(layer)layer->enable_small_tier(views);
+        impl->small_tier_rows=small_rows;
+        if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE small_tier=%.1f MiB\n",total/1048576.0);
+    }
     require(impl->persistent_bytes==expected_delayed_persistent,"target delayed construction requirement mismatch");
     if (impl->continuation_graph_gdn_qkvz_concurrent) {
         const auto expected_graph_z_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
@@ -8156,7 +8249,24 @@ void Exl3TextContext::set_layer_observer_for_test(
     impl_->layer_observer_user = observer ? user : nullptr;
 }
 
+// Selects the shared prompt pool for passes wider than the context's small
+// tier (concurrent Engine lanes run those exclusively); nests.
+struct Exl3TextContext::PromptTierScope {
+    PromptTierScope(Exl3TextContext::Impl& impl,std::size_t rows)
+        : impl_(impl),active_(impl.small_tier_rows && rows>static_cast<std::size_t>(impl.small_tier_rows)) {
+        if(active_ && impl_.prompt_tier_depth++==0)impl_.select_prompt_tier(true);
+    }
+    ~PromptTierScope() {
+        if(active_ && --impl_.prompt_tier_depth==0)impl_.select_prompt_tier(false);
+    }
+    PromptTierScope(const PromptTierScope&)=delete;
+    PromptTierScope& operator=(const PromptTierScope&)=delete;
+    Exl3TextContext::Impl& impl_;
+    bool active_;
+};
+
 void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStream_t stream) {
+    const PromptTierScope prompt_tier(*impl_,token_ids.size());
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
@@ -8225,6 +8335,7 @@ void Exl3TextContext::append_prefill_wide(std::span<const std::int64_t> token_id
 
 void Exl3TextContext::append_prefill_impl(std::span<const std::int64_t> token_ids,
                                         cudaStream_t stream, bool wide, bool exact) {
+    const PromptTierScope prompt_tier(*impl_,token_ids.size());
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
@@ -8335,6 +8446,7 @@ bool Exl3TextContext::l0_layer_major_headroom() const {
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
+    const PromptTierScope prompt_tier(*impl_,token_ids.size());
     if (Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->l0_layer_major_block) {
         // L0 OSCAR contexts hold per-row buffers for one block of
         // kL0PrefillBlockRows: the suffix is ingested layer-major block by
@@ -8775,6 +8887,7 @@ void Exl3TextContext::append_prefill_layer_major(
 
 void Exl3TextContext::append_media_embeddings_numeric(std::span<const float> embeddings,
     std::span<const std::int32_t> positions_xyz,cudaStream_t stream){
+    const PromptTierScope prompt_tier(*impl_,embeddings.size());
     Impl::require_host_kv_retirement_admission();
     require(impl_->media_features&&impl_->media_positions&&impl_->host_kv.enabled&&impl_->capture_taps&&
         !impl_->oscar&&!impl_->graph_active&&!impl_->graph_capture_active&&!impl_->host_kv_failed&&
@@ -9274,6 +9387,7 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
 
 void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
                                     cudaStream_t stream) {
+    const PromptTierScope prompt_tier(*impl_,token_ids.size());
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->host_kv_failed,"HostKV continuation requires intact transfer lineage");
