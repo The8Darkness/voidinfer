@@ -926,6 +926,11 @@ public:
     bool target_k5_small_m_batch_candidate(
         const Exl3CudaLinearMetadata& metadata, int rows,
         Exl3CudaLinearAdmission admission) const noexcept;
+    // Any coherent packed producer (wide, down, O, K/V split) admits these
+    // 2..32 continuation rows as one launch, for every admitted bit width.
+    bool coherent_continuation_candidate(
+        const Exl3CudaLinearMetadata& metadata, int rows,
+        Exl3CudaLinearAdmission admission) const noexcept;
     bool target_k6_m1_simt_candidate(
         const Exl3CudaLinearMetadata& metadata, int rows,
         Exl3CudaLinearAdmission admission) const noexcept;

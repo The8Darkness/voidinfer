@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -2141,6 +2142,8 @@ void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
     constexpr int kBlocks = Quant == 16 ? 4 : 1;
     const dim3 grid((n / 16 + 15) / 16, k / (Quant * kBlocks));
     switch (bits) {
+    case 4: exl3_decode_quantize_weight_kernel<4, Quant, kBlocks><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
     case 5: exl3_decode_quantize_weight_kernel<5, Quant, kBlocks><<<grid, 256, 0, stream>>>(
         trellis, mul1, values, scales, weight_global, k, n); break;
     case 6: exl3_decode_quantize_weight_kernel<6, Quant, kBlocks><<<grid, 256, 0, stream>>>(
@@ -2149,7 +2152,7 @@ void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
         trellis, mul1, values, scales, weight_global, k, n); break;
     case 8: exl3_decode_quantize_weight_kernel<8, Quant, kBlocks><<<grid, 256, 0, stream>>>(
         trellis, mul1, values, scales, weight_global, k, n); break;
-    default: throw std::invalid_argument("fused EXL3 decode/quantize supports K5..K8");
+    default: throw std::invalid_argument("fused EXL3 decode/quantize supports K4..K8");
     }
 }
 
@@ -7355,7 +7358,7 @@ bool Exl3CudaReconstructGemmWorkspace::supports(
             metadata.out_features <= impl_->out_features &&
             metadata.in_features % kHadamard == 0 &&
             metadata.out_features % kHadamard == 0;
-        const bool k5_layer=metadata.K==5 &&
+        const bool k5_layer=(metadata.K==5 || metadata.K==4) &&
             (impl_->k5_scope_enabled || impl_->mxfp8_enabled) &&
             impl_->reuse_active && rows>=256;
         // K8 (attention K/V) is admitted only to the fused decode route.
@@ -8008,7 +8011,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     // Default 1: decode EXL3 trellis tiles straight into the quantized operand
     // (NINFER_EXL3_PREFILL_FUSED_DECODE=0 keeps the FP16 reconstruct + quantize control).
     const bool fused_decode = mxfp8 && impl_->fused_decode_enabled &&
-        metadata.K >= 5 && metadata.K <= 8;
+        metadata.K >= 4 && metadata.K <= 8;
     float* const nv_weight_global = nvfp4 ? reinterpret_cast<float*>(
         mx_weight + nv_value_bytes + nv_scale_bytes) : nullptr;
     if (mxfp8) reconstructed = impl_->reconstructed;
@@ -8037,7 +8040,12 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                     metadata.out_features, nullptr,
                 metadata.in_features, metadata.out_features, stream);
     } else if (reconstruct_needed) {
-        if (metadata.K == 5) {
+        if (metadata.K == 4) {
+            exl3_reconstruct_transformed_weight_kernel<4><<<
+                reconstruct_grid, 256, 0, stream>>>(
+                    weights.trellis, weights.mul1, reconstructed,
+                    metadata.in_features, metadata.out_features);
+        } else if (metadata.K == 5) {
             exl3_reconstruct_transformed_weight_kernel<5><<<
                 reconstruct_grid, 256, 0, stream>>>(
                     weights.trellis, weights.mul1, reconstructed,
@@ -9463,7 +9471,7 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
        !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
-       gate_metadata.K!=up_metadata.K || gate_metadata.K<5 || gate_metadata.K>7 ||
+       gate_metadata.K!=up_metadata.K || gate_metadata.K<4 || gate_metadata.K>7 ||
        (!coherent_fused_input_for(rows) && out_features_<in_features_) ||
        in_features_!=up_workspace.in_features_ || out_features_!=up_workspace.out_features_ ||
        out_features_%kHadamard!=0 ||
@@ -9510,7 +9518,9 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
     const auto launch_k=[&](auto fused_kernel,auto staged_kernel) {
         if(fused) launch(fused_kernel); else launch(staged_kernel);
     };
-    if(gate_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
+    if(gate_metadata.K==4) launch_k(exl3_gemm_m1_fused_input_dual_kernel<4,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<4,false,false,stages,warps,per,false>);
+    else if(gate_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per,false>);
     else if(gate_metadata.K==6) launch_k(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per,false>);
@@ -9563,7 +9573,7 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair(
        !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
-       first_metadata.K!=second_metadata.K || first_metadata.K<5 || first_metadata.K>8 ||
+       first_metadata.K!=second_metadata.K || first_metadata.K<4 || first_metadata.K>8 ||
        (!coherent_fused_input_for(rows) &&
         (out_features_<in_features_ || second_workspace.out_features_<in_features_)) ||
        in_features_!=second_workspace.in_features_ ||
@@ -9621,7 +9631,9 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair(
     const auto launch_k=[&](auto fused_kernel,auto staged_kernel) {
         if(fused) launch(fused_kernel); else launch(staged_kernel);
     };
-    if(first_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
+    if(first_metadata.K==4) launch_k(exl3_gemm_m1_fused_input_dual_kernel<4,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<4,false,false,stages,warps,per,false>);
+    else if(first_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per,false>);
     else if(first_metadata.K==6) launch_k(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per,false>);
@@ -10800,7 +10812,8 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
         metadata.in_features != in_features_ ||
         metadata.out_features != out_features_ ||
         !(metadata.K == 6 ||
-          (coherent_any_k_enabled() && (metadata.K == 5 || metadata.K == 7))) ||
+          (coherent_any_k_enabled() &&
+           (metadata.K == 4 || metadata.K == 5 || metadata.K == 7))) ||
         metadata.mcg || !metadata.mul1 || metadata.has_bias)
         return false;
     constexpr Exl3CudaLinearAdmission continuation[5] = {
@@ -10871,7 +10884,8 @@ bool Exl3CudaLinearWorkspace::coherent_down_k6_candidate(
         in_features_ == 17408 && out_features_ == 5120 &&
         metadata.in_features == in_features_ &&
         metadata.out_features == out_features_ &&
-        (metadata.K == 6 || (coherent_any_k_enabled() && metadata.K == 5)) &&
+        (metadata.K == 6 || (coherent_any_k_enabled() &&
+            (metadata.K == 4 || metadata.K == 5))) &&
         !metadata.mcg && metadata.mul1 && !metadata.has_bias;
 }
 
@@ -11364,7 +11378,7 @@ bool Exl3CudaLinearWorkspace::target_wide_prefill_candidate(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
     if (!target_wide_prefill_enabled_ || admission != Exl3CudaLinearAdmission::target_wide_prefill ||
-        rows < 2 || rows > (target_staged_prefill_enabled_ ? (target_wide1024_enabled_ ? 1024 : target_wide512_enabled_ ? 512 : target_wide256_enabled_ ? 256 : target_wide128_enabled_ ? 128 : target_wide64_enabled_ ? 64 : 32) : 16) || rows > max_rows_ || metadata.K < 5 || metadata.K > 8 ||
+        rows < 2 || rows > (target_staged_prefill_enabled_ ? (target_wide1024_enabled_ ? 1024 : target_wide512_enabled_ ? 512 : target_wide256_enabled_ ? 256 : target_wide128_enabled_ ? 128 : target_wide64_enabled_ ? 64 : 32) : 16) || rows > max_rows_ || metadata.K < 4 || metadata.K > 8 ||
         metadata.mcg || !metadata.mul1 || metadata.has_bias ||
         metadata.in_features != in_features_ || metadata.out_features != out_features_) return false;
     const bool target_shape =
@@ -11384,7 +11398,7 @@ bool Exl3CudaLinearWorkspace::target_wide_prefill_candidate(
         return out_features_ / (16 * 16) <= large_down_candidate_capacity_[metadata.K == 6 ? 0 : 1];
     }
     return out_features_ % (32 * 16) == 0 && out_features_ / (32 * 16) <=
-        generic_capacity_[metadata.K == 5 ? 0 : (metadata.K == 6 ? 1 : 2)];
+        generic_capacity_[metadata.K <= 5 ? 0 : (metadata.K == 6 ? 1 : 2)];
 }
 
 bool Exl3CudaLinearWorkspace::fast_wide_prefill_gemm_candidate(
@@ -12045,7 +12059,7 @@ static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int row
         (rows > kBatchedRows && admission != Exl3CudaLinearAdmission::target_continuation_kv) ||
         in_features != 5120 || out_features != 1024 ||
         metadata.in_features != in_features || metadata.out_features != out_features ||
-        metadata.K < 6 || metadata.K > 8 || metadata.mcg || !metadata.mul1 ||
+        metadata.K < 4 || metadata.K > 8 || metadata.mcg || !metadata.mul1 ||
         metadata.has_bias ||
         (admission != Exl3CudaLinearAdmission::ordinary &&
          admission != Exl3CudaLinearAdmission::target_continuation_kv))
@@ -12055,6 +12069,18 @@ static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int row
     const auto required = static_cast<std::size_t>(rows > kBatchedRows ? rows :
         std::min(max_rows, kBatchedRows)) * out_features * split * sizeof(float);
     return capacity >= required ? split : 0;
+}
+
+bool Exl3CudaLinearWorkspace::coherent_continuation_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    if (rows < 2 || admission == Exl3CudaLinearAdmission::ordinary) return false;
+    return coherent_kv_split_for(metadata, rows, admission, in_features_, out_features_,
+               accumulation_capacity_bytes_, max_rows_) != 0 ||
+        coherent_down_k6_candidate(metadata, rows, admission) ||
+        coherent_down_k7_candidate(metadata, rows, admission) ||
+        coherent_o_k7_candidate(metadata, rows, admission) ||
+        coherent_wide_k6_candidate(metadata, rows, admission);
 }
 
 void Exl3CudaLinearWorkspace::forward_from_transformed(
@@ -12100,7 +12126,15 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
 
     if (const int kv_split = coherent_kv_split_for(metadata, rows, admission,
             in_features_, out_features_, accumulation_capacity_bytes_, max_rows_)) {
-        if (metadata.K == 6)
+        if (metadata.K == 4)
+            launch_coherent_packed_partials<4>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
+                raw_input, fused_suh);
+        else if (metadata.K == 5)
+            launch_coherent_packed_partials<5>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
+                raw_input, fused_suh);
+        else if (metadata.K == 6)
             launch_coherent_packed_partials<6>(0, 0, stream, transformed_input,
                 weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
                 raw_input, fused_suh);
@@ -12125,7 +12159,11 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         // One packed-MMA producer instantiation serves M1 and M2..8. Each
         // K/N tile's B decode is reused across active independent row C
         // fragments; inactive physical M16 rows are zero and never stored.
-        if (metadata.K == 5) launch_coherent_packed_partials<5>(
+        if (metadata.K == 4) launch_coherent_packed_partials<4>(
+            output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        else if (metadata.K == 5) launch_coherent_packed_partials<5>(
             output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
@@ -12192,7 +12230,11 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (coherent_wide_k6_candidate(metadata, rows, admission)) {
         const int output_blocks = out_features_ / kHadamard;
         const int split_count = coherent_wide_k6_split_count(rows);
-        if (metadata.K == 5) launch_coherent_packed_partials<5>(
+        if (metadata.K == 4) launch_coherent_packed_partials<4>(
+            output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        else if (metadata.K == 5) launch_coherent_packed_partials<5>(
             output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
@@ -12867,7 +12909,9 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         const int tiles = down ? 16 : (direct_tiles64 ? 64 : 32);
         const int blocks = out_features_ / (16 * tiles);
         const int capacity = down ? large_down_candidate_capacity_[metadata.K == 6 ? 0 : 1]
-            : generic_capacity_[metadata.K == 5 ? 0 : (metadata.K == 6 ? 1 : 2)];
+            : generic_capacity_[metadata.K <= 5 ? 0 : (metadata.K == 6 ? 1 : 2)];
+        if (metadata.K < 4 || metadata.K > 8)
+            throw std::invalid_argument("staged prefill bit width");
         // Pairing adjacent output blocks changes only CTA ownership. Select
         // splits from the established N32 control so every group retains the
         // identical K ranges and ordered partial reduction.
@@ -12902,6 +12946,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         else if (down && metadata.K == 6) exl3_prefill_direct_partials_kernel<6,16><<<grid,kThreads,shared_bytes-16u*tiles*16u*sizeof(float),stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (down && target_direct_async_all_) exl3_prefill_direct_async_a_kernel<7,16><<<grid,kThreads,async_shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (down) exl3_prefill_direct_partials_kernel<7,16><<<grid,kThreads,shared_bytes-16u*tiles*16u*sizeof(float),stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
+        else if (metadata.K == 4) exl3_prefill_direct_partials_kernel<4><<<grid,kThreads,shared_bytes-16u*tiles*16u*sizeof(float),stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (metadata.K == 5) exl3_prefill_direct_partials_kernel<5><<<grid,kThreads,shared_bytes-16u*tiles*16u*sizeof(float),stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (k6_gateup_n32_pair_cta) {
             exl3_prefill_k6_gateup_n32_pair_cta_kernel<<<
@@ -12959,6 +13004,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         } else {
         if (down && metadata.K == 6) exl3_prefill_partials_kernel<6,16><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (down) exl3_prefill_partials_kernel<7,16><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
+        else if (metadata.K == 4) exl3_prefill_partials_kernel<4><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (metadata.K == 5) exl3_prefill_partials_kernel<5><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (metadata.K == 6) exl3_prefill_partials_kernel<6><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (metadata.K == 7) exl3_prefill_partials_kernel<7><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
@@ -13548,7 +13594,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        shared_bytes, stream),
                    "launch EXL3 H6 single-split GEMV");
         }
-    } else if (metadata.K >= 5 &&
+    } else if (metadata.K >= 4 &&
                (rows == 1 || draft_small_m_candidate(metadata, rows) ||
                  draft_shared_m16_candidate(metadata,rows,admission) ||
                  draft_prefill_fc_candidate(metadata, rows, admission) ||
@@ -13563,10 +13609,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                 target_wide_prefill_candidate(metadata, rows, admission)) &&
                out_features_ % (32 * 16) == 0 &&
                (out_features_ / (32 * 16)) <=
-                   generic_capacity_[metadata.K == 5 ? 0 : (metadata.K == 6 ? 1 : 2)]) {
+                   generic_capacity_[metadata.K <= 5 ? 0 : (metadata.K == 6 ? 1 : 2)]) {
         const int tiles_n = out_features_ / 16;
         const int output_blocks = tiles_n / 32;
-        const int capacity_index = metadata.K == 5 ? 0 : (metadata.K == 6 ? 1 : 2);
+        const int capacity_index = metadata.K <= 5 ? 0 : (metadata.K == 6 ? 1 : 2);
         const bool target_gateup_k6_async_a =
             metadata.K == 6 && target_gateup_k6_async_a_enabled_ &&
             target_gateup_small_m_candidate(metadata, rows, admission);
@@ -13741,6 +13787,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                            dim3(grid_blocks), dim3(kThreads), kernel_args,
                            shared_bytes, stream),
                        "launch EXL3 draft K5 async-A cooperative split GEMV");
+        } else if (metadata.K == 4) {
+            cuda_check(cudaLaunchCooperativeKernel(
+                           reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<4>),
+                           dim3(grid_blocks), dim3(kThreads), kernel_args,
+                           shared_bytes, stream),
+                       "launch EXL3 K4 cooperative split GEMV");
         } else if (metadata.K == 5) {
             cuda_check(cudaLaunchCooperativeKernel(
                            reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<5>),
@@ -13771,6 +13823,8 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                            shared_bytes, stream),
                        "launch EXL3 K7 cooperative split GEMV");
         } else {
+            if (metadata.K != 8)
+                throw std::invalid_argument("EXL3 cooperative split GEMV bit width");
             cuda_check(cudaLaunchCooperativeKernel(
                            reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<8>),
                            dim3(grid_blocks), dim3(kThreads), kernel_args,
@@ -13779,6 +13833,18 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         }
     } else if (rows <= 16) {
         const int tiles_n = out_features_ / 16;
+        {
+            // Scalar fallback: reported once per shape (route coverage gaps).
+            static std::mutex reported_mutex;
+            static std::set<std::uint64_t> reported;
+            const std::uint64_t key = (static_cast<std::uint64_t>(metadata.K) << 56) ^
+                (static_cast<std::uint64_t>(in_features_) << 32) ^
+                (static_cast<std::uint64_t>(out_features_) << 8) ^ static_cast<std::uint64_t>(rows);
+            const std::lock_guard lock(reported_mutex);
+            if (reported.insert(key).second)
+                std::fprintf(stderr, "EXL3_SCALAR_FALLBACK K=%d in=%d out=%d rows=%d admission=%d\n",
+                             metadata.K, in_features_, out_features_, rows, static_cast<int>(admission));
+        }
         exl3_generic_tile_kernel<<<dim3(tiles_n, rows), dim3(kThreads), 0, stream>>>(
             transformed_input, weights.trellis, weights.mul1, accum_, rows,
             in_features_, out_features_, metadata.K);

@@ -3167,10 +3167,16 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         const bool target_k5_candidate = rowwise && !wide_prefill &&
             workspace->target_k5_small_m_batch_candidate(
                 metadata, rows, target_k5_admission);
+        const bool target_coherent_candidate = rowwise && !wide_prefill &&
+            workspace->coherent_continuation_candidate(metadata, rows,
+                operation == Exl3TargetProjectionOperator::gate ||
+                operation == Exl3TargetProjectionOperator::up
+                    ? Exl3CudaLinearAdmission::target_continuation_gate_up
+                    : target_k5_admission);
         const bool target_small_m_candidate =
             target_gateup_candidate || target_down_candidate ||
             target_o_k7_candidate || target_z_k6_candidate || target_wide_candidate ||
-            target_qkv_k6_candidate || target_k5_candidate;
+            target_qkv_k6_candidate || target_k5_candidate || target_coherent_candidate;
         const char* fast_same_weights_fp16kv_decode = std::getenv(
             "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
         const bool fast_same_weights_fp16kv_decode_candidate =
@@ -3186,7 +3192,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
              target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
              metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
              ((reconstruct_gemm_->accepts_all_model_shapes() &&
-               (metadata.K == 5 || metadata.K == 6 || metadata.K == 7) && rows >= 256) ||
+               metadata.K >= 4 && metadata.K <= 7 && rows >= 256) ||
               ((operation == Exl3TargetProjectionOperator::gate ||
                 operation == Exl3TargetProjectionOperator::up) &&
                metadata.K == 6 && metadata.in_features == kHidden &&
@@ -3590,8 +3596,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         gdn_mgemm_pair && std::strcmp(gdn_mgemm_pair,"1")==0 &&
         rows == 1 && !profile && !projection_timing_ &&
         !projection_observer_ &&
-        (weights_.gate_metadata.K == 5 || weights_.gate_metadata.K == 6 ||
-         weights_.gate_metadata.K == 7) &&
+        weights_.gate_metadata.K >= 4 && weights_.gate_metadata.K <= 7 &&
         weights_.up_metadata.K == weights_.gate_metadata.K &&
         weights_.gate_metadata.mul1 && weights_.up_metadata.mul1 &&
         !weights_.gate_metadata.mcg && !weights_.up_metadata.mcg &&

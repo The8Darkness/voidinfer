@@ -7905,8 +7905,7 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
     // The frozen/reference and default eager routes never enter this capture.
     const bool graph_gate_up_pair = rows == 1 &&
         fast_same_weights_fp16kv_m1_gate_up_pair_ &&
-        (weights_.gate_metadata.K == 5 || weights_.gate_metadata.K == 6 ||
-         weights_.gate_metadata.K == 7) &&
+        weights_.gate_metadata.K >= 4 && weights_.gate_metadata.K <= 7 &&
         weights_.up_metadata.K == weights_.gate_metadata.K &&
         !weights_.gate_metadata.mcg && !weights_.up_metadata.mcg &&
         weights_.gate_metadata.mul1 && weights_.up_metadata.mul1 &&
@@ -9599,10 +9598,16 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         const bool target_k5_candidate = rowwise && !wide_prefill &&
             workspace->target_k5_small_m_batch_candidate(
                 metadata, rows, target_k5_admission);
+        const bool target_coherent_candidate = rowwise && !wide_prefill &&
+            workspace->coherent_continuation_candidate(metadata, rows,
+                operation == Exl3TargetProjectionOperator::gate ||
+                operation == Exl3TargetProjectionOperator::up
+                    ? Exl3CudaLinearAdmission::target_continuation_gate_up
+                    : target_k5_admission);
         const bool target_small_m_candidate =
             target_gateup_candidate || target_down_candidate ||
             target_o_k7_candidate || target_wide_candidate || target_kv_candidate ||
-            target_q_k6_candidate || target_k5_candidate;
+            target_q_k6_candidate || target_k5_candidate || target_coherent_candidate;
         const char* fast_same_weights_fp16kv_decode = std::getenv(
             "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
         const bool fast_same_weights_fp16kv_decode_candidate =
@@ -9618,7 +9623,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
              target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
              metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
              ((reconstruct_gemm_->accepts_all_model_shapes() &&
-               metadata.K >= 5 && metadata.K <= 8 && rows >= 256) ||
+               metadata.K >= 4 && metadata.K <= 8 && rows >= 256) ||
               ((operation == Exl3TargetProjectionOperator::gate ||
                 operation == Exl3TargetProjectionOperator::up) &&
                metadata.K == 6 && metadata.in_features == kHidden &&
@@ -10088,8 +10093,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             !projection_timing_ && !projection_observer_ && !wide_prefill &&
             !preserve_m1_topology && rows==1 && linear_workspaces_[4] &&
             linear_workspaces_[5] &&
-            (weights_.gate_metadata.K==5 || weights_.gate_metadata.K==6 ||
-             weights_.gate_metadata.K==7) &&
+            weights_.gate_metadata.K>=4 && weights_.gate_metadata.K<=7 &&
             weights_.up_metadata.K==weights_.gate_metadata.K;
         if(paired_m1_gate_up) {
             linear_workspaces_[4]->forward_target_m1_gate_up_pair_for_test(

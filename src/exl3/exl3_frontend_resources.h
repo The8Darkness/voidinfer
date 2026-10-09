@@ -11,4 +11,8 @@ namespace ninfer::exl3 {
 [[nodiscard]] targets::qwen3_6::FrontendResources
 load_pinned_frontend_resources(const std::filesystem::path& target_directory);
 
+// Pinned weights revision of the target ("SC_6.00bpw_H6_V6" or "SC_5.00bpw_H6_V6").
+[[nodiscard]] const char*
+pinned_weights_id(const std::filesystem::path& target_directory);
+
 } // namespace ninfer::exl3

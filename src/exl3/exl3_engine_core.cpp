@@ -517,7 +517,7 @@ struct Exl3EngineCore::Impl {
         frontend(targets::qwen3_6::make_frontend(resources,targets::qwen3_6::FrontendOptions{
             .vision_enabled=public_media_enabled,.max_context=value.max_context,
             .max_cache_markers_per_request=value.context_cache.max_cache_markers_per_request.value_or(4)})),
-        identity{"exl3-engine-epoch-1","SC_6.00bpw_H6_V6","0997f410-c3cf9e34",
+        identity{"exl3-engine-epoch-1",pinned_weights_id(value.exl3_package->target_directory),"0997f410-c3cf9e34",
             coherent_device?"coherent-device-P1-K6-B8-greedy":"ordinary-FP16-B8-greedy",
             public_media_enabled?"text+qualified-v6-media":"text"},
         cache(Exl3VeriCacheServingPrefixCache::Policy{std::max(1U,value.context_cache.max_shared_prefixes.value_or(1)),64,std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30},identity),
@@ -872,7 +872,7 @@ struct Exl3EngineCore::Impl {
         for(std::uint32_t i=0;i<value.max_concurrency;++i){
             if(i)drafts[i]=drafts[0]->create_execution_impl(true);
         }
-        load.target="qwen3.8-27b/exl3";load.model_id="SC_6.00bpw_H6_V6";load.weights_id="SC_6.00bpw_H6_V6";
+        load.target="qwen3.8-27b/exl3";load.model_id=identity.artifact_identity;load.weights_id=identity.artifact_identity;
         load.load_seconds=seconds(begin);const auto& transfer=target->load_stats();
         load.artifact_bytes_read=transfer.source_bytes[0]+transfer.source_bytes[1];load.peak_staging_bytes=transfer.staging_host_bytes;
         memory.device=value.device;memory.max_context=value.max_context;
