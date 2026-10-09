@@ -864,7 +864,8 @@ bool gdn_decode_tiled_enabled() {
 template<int kMax>
 __global__ void __launch_bounds__(kGdnChunkThreads) gdn_recurrence_chunk_kernel(
     const std::uint16_t* q,const std::uint16_t* k,const std::uint16_t* v,const float* g,
-    const float* beta,float* state,std::uint16_t* output,int rows,const int* chain_rows=nullptr) {
+    const float* beta,float* state,std::uint16_t* output,int rows,const int* chain_rows=nullptr,
+    const int* state_write=nullptr) {
     constexpr int kColumns=kGdnChunkColumns,kKeysPerWarp=kHeadDim/8,kRawStride=kHeadDim+8;
     __shared__ __align__(16) float q_rows[kGdnChunkMaxRows][kHeadDim];
     __shared__ __align__(16) float k_rows[kGdnChunkMaxRows][kHeadDim];
@@ -1067,23 +1068,25 @@ __global__ void __launch_bounds__(kGdnChunkThreads) gdn_recurrence_chunk_kernel(
             st[i+2]=fmaf(kk.z,uj,st[i+2]);st[i+3]=fmaf(kk.w,uj,st[i+3]);
         }
     }
+    if(state_write && *state_write==0) return;
     #pragma unroll
     for(int i=0;i<kKeysPerWarp;++i) s[(key_base+i)*kHeadDim]=st[i];
 }
 
 void launch_gdn_recurrence_sm120(const std::uint16_t* q,const std::uint16_t* k,
     const std::uint16_t* v,const float* g,const float* beta,float* state,
-    std::uint16_t* output,int rows,cudaStream_t stream,const int* chain_rows=nullptr) {
+    std::uint16_t* output,int rows,cudaStream_t stream,const int* chain_rows=nullptr,
+    const int* state_write=nullptr) {
     const dim3 grid(kHeads*(kHeadDim/kGdnChunkColumns)),block(kGdnChunkThreads);
     if(rows>=1 && rows<=kGdnChunkMaxRows && gdn_decode_tiled_enabled()) {
         if(rows==1)
-            exl3_launch_small(gdn_recurrence_chunk_kernel<1>,grid,block,0,stream,q,k,v,g,beta,state,output,rows,chain_rows);
+            exl3_launch_small(gdn_recurrence_chunk_kernel<1>,grid,block,0,stream,q,k,v,g,beta,state,output,rows,chain_rows,state_write);
         else if(rows==2)
-            exl3_launch_small(gdn_recurrence_chunk_kernel<2>,grid,block,0,stream,q,k,v,g,beta,state,output,rows,chain_rows);
+            exl3_launch_small(gdn_recurrence_chunk_kernel<2>,grid,block,0,stream,q,k,v,g,beta,state,output,rows,chain_rows,state_write);
         else if(rows<=4)
-            exl3_launch_small(gdn_recurrence_chunk_kernel<4>,grid,block,0,stream,q,k,v,g,beta,state,output,rows,chain_rows);
+            exl3_launch_small(gdn_recurrence_chunk_kernel<4>,grid,block,0,stream,q,k,v,g,beta,state,output,rows,chain_rows,state_write);
         else
-            exl3_launch_small(gdn_recurrence_chunk_kernel<8>,grid,block,0,stream,q,k,v,g,beta,state,output,rows,chain_rows);
+            exl3_launch_small(gdn_recurrence_chunk_kernel<8>,grid,block,0,stream,q,k,v,g,beta,state,output,rows,chain_rows,state_write);
     } else {
         gdn_recurrence_sm120_kernel<<<kHeads*(kHeadDim/4),4*32,0,stream>>>(
             q,k,v,g,beta,state,output,rows);
@@ -2375,6 +2378,9 @@ void Exl3GdnLayer::validate_checkpoint_storage(
     if (checkpoint.recurrent_trace_alias &&
         checkpoint.recurrent_state_device != recurrent_state_before_)
         throw std::invalid_argument("EXL3 GDN recurrent trace checkpoint alias");
+    if (checkpoint.recurrent_live_alias &&
+        (checkpoint.recurrent_state_device != recurrent_state_ || !state_write_flag_))
+        throw std::invalid_argument("EXL3 GDN recurrent live checkpoint alias");
     const auto disjoint=[&](const void* pointer,std::size_t bytes) {
         return Exl3GdnLayerCheckpoint::ranges_disjoint(
                    checkpoint.recurrent_state_device,
@@ -2404,6 +2410,7 @@ void Exl3GdnLayer::validate_checkpoint_storage(
         {conv_state_trace_,kConvStateBytes}};
     for(std::size_t i=0;i<live_state.size();++i)
         if(!(checkpoint.recurrent_trace_alias && i==1) &&
+           !(checkpoint.recurrent_live_alias && i==0) &&
            !disjoint(live_state[i].first,live_state[i].second))
             throw std::invalid_argument("EXL3 GDN checkpoint aliases live state");
 }
@@ -2435,9 +2442,10 @@ void Exl3GdnLayer::record_checkpoint_copy_nodes(
     const Exl3GdnLayerCheckpoint& checkpoint,cudaStream_t stream) const {
     validate_checkpoint_storage(checkpoint);
     // cudaMemcpyDefault: checkpoints may live in mapped host memory.
-    check(cudaMemcpyAsync(checkpoint.recurrent_state_device, recurrent_state_, kStateBytes,
-                          cudaMemcpyDefault, stream),
-          "save EXL3 GDN recurrent checkpoint");
+    if (!checkpoint.recurrent_live_alias)
+        check(cudaMemcpyAsync(checkpoint.recurrent_state_device, recurrent_state_, kStateBytes,
+                              cudaMemcpyDefault, stream),
+              "save EXL3 GDN recurrent checkpoint");
     check(cudaMemcpyAsync(checkpoint.conv_state_device, conv_state_, kConvStateStorageBytes,
                           cudaMemcpyDefault, stream),
           "save EXL3 GDN convolution checkpoint");
@@ -2496,10 +2504,12 @@ void Exl3GdnLayer::restore_checkpoint(const Exl3GdnLayerCheckpoint& checkpoint, 
     current_checkpoint_stream_ = nullptr;
     current_checkpoint_recurrent_ = nullptr;
     current_checkpoint_conv_ = nullptr;
-    check(cudaMemcpyAsync(recurrent_state_, checkpoint.recurrent_state_device, kStateBytes,
-                          cudaMemcpyDefault, stream),
-          "restore EXL3 GDN recurrent checkpoint");
-    if (checkpoint.recurrent_state_device != recurrent_state_before_)
+    if (!checkpoint.recurrent_live_alias)
+        check(cudaMemcpyAsync(recurrent_state_, checkpoint.recurrent_state_device, kStateBytes,
+                              cudaMemcpyDefault, stream),
+              "restore EXL3 GDN recurrent checkpoint");
+    if (checkpoint.recurrent_state_device != recurrent_state_before_ &&
+        !checkpoint.recurrent_live_alias)
         check(cudaMemcpyAsync(recurrent_state_before_, recurrent_state_,
                               kStateBytes,cudaMemcpyDeviceToDevice,stream),
               "restore EXL3 GDN recurrent state trace");
@@ -2602,9 +2612,10 @@ int Exl3GdnLayer::reconstruct_retained_prefix_host(
 void Exl3GdnLayer::enqueue_retained_prefix_reconstruct(
     const Exl3GdnLayerCheckpoint& checkpoint, int retained_rows, int attempted_rows,
     cudaStream_t stream) const {
-    check(cudaMemcpyAsync(recurrent_state_, checkpoint.recurrent_state_device,
-                          kStateBytes, cudaMemcpyDefault, stream),
-          "restore EXL3 GDN retained prefix recurrent base");
+    if (!checkpoint.recurrent_live_alias)
+        check(cudaMemcpyAsync(recurrent_state_, checkpoint.recurrent_state_device,
+                              kStateBytes, cudaMemcpyDefault, stream),
+              "restore EXL3 GDN retained prefix recurrent base");
     // The state-before buffer is a trace: the next forward rewrites it before
     // any consumer reads it, so the repair may skip restoring it.
     static const bool skip_trace_restore=[] {
@@ -2897,6 +2908,12 @@ void Exl3GdnLayer::gdn_middle(const GdnMiddle& m) {
         preserve_m1_topology};
     const bool small_resident=gaming_[Gopt::GdnSmallResident] &&
         gopt_small_gdn(rows,preserve_m1_topology,wide_prefill,prefill_normalized_!=nullptr);
+    // A live-alias transaction keeps the root state: only the tiled chunk
+    // recurrence honors state_write_flag_.
+    if (live_transaction_ && !wide_prefill &&
+        (small_resident || stage_fusion.exact_route_supported() ||
+         rows > kGdnChunkMaxRows || !gdn_decode_tiled_enabled()))
+        throw std::logic_error("GDN live-state transaction forward requires the tiled chunk recurrence");
     if (small_resident || stage_fusion.exact_route_supported()) {
         float* normalized_q = prefill_normalized_;
         float* normalized_k = normalized_q + max_rows_ * kKeyHeads * kHeadDim;
@@ -2954,7 +2971,7 @@ void Exl3GdnLayer::gdn_middle(const GdnMiddle& m) {
                   "record GDN recurrence sample start");
         launch_gdn_recurrence_sm120(
             q, k, v, g_trace, beta_trace, recurrent_state_, core, rows, stream,
-            chain_rows_device_);
+            chain_rows_device_, wide_prefill ? nullptr : state_write_flag_);
     }
     check(cudaGetLastError(), "launch GDN recurrence"); end(5);
     if(recurrence_sample) {

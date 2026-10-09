@@ -413,6 +413,10 @@ struct Exl3GdnLayerCheckpoint {
     // preserve_m1_topology forward must keep that trace immutable instead of
     // redundantly copying the same root into it again.
     bool recurrent_trace_alias = false;
+    // The recurrent "checkpoint" is the layer's live state itself: transaction
+    // forwards leave it at the root (state_write_flag == 0) and the
+    // retained-prefix repair advances it in place. No copy is stored.
+    bool recurrent_live_alias = false;
 
     static bool ranges_disjoint(const void* left,std::size_t left_bytes,
                                 const void* right,std::size_t right_bytes) noexcept {
@@ -589,6 +593,8 @@ public:
     // Skipping the state-before trace also releases its 3 MiB per layer (the
     // remaining restore copies write a process-wide sink nobody reads).
     void set_skip_state_trace(bool skip);
+    void set_state_write_flag(const int* flag) noexcept { state_write_flag_ = flag; }
+    void set_live_transaction(bool active) noexcept { live_transaction_ = active; }
     // The next GDN layer of the stack: this layer's decode down reduction also
     // writes the successor's input RMS norm into the successor's input-norm
     // buffer, and the successor skips its own norm for exactly that input.
@@ -930,6 +936,10 @@ private:
     Exl3ActivationLifetime mlp_activation_lifetime_;
     bool shared_gateup_enabled_=false,shared_down_enabled_=false;
     const int* chain_rows_device_ = nullptr;
+    // Device int read by continuation-forward recurrence kernels: 0 keeps the
+    // live recurrent state (live-alias transaction), nonzero writes it back.
+    const int* state_write_flag_ = nullptr;
+    bool live_transaction_ = false;
     bool capture_active_ = false;
     Exl3GdnGraphQkvzConcurrencyView graph_qkvz_concurrency_{};
     std::shared_ptr<const void> prefill_projection_chain_context_owner_ =

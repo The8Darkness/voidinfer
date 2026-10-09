@@ -383,9 +383,14 @@ struct DeviceAllocation {
             if(value)return std::strcmp(value,"0")!=0;
             return shared && std::strcmp(shared,"1")==0;
         }();
+        // The round transaction's tap/embedding checkpoint (rows of the
+        // previous forward, at most a prefill chunk) follows it: one small
+        // PCIe copy per round instead of ~62 MiB of device memory per lane.
         return host_root && label &&
             (std::strcmp(label,"allocate verified root recurrent state")==0 ||
-             std::strcmp(label,"allocate verified root convolution state")==0);
+             std::strcmp(label,"allocate verified root convolution state")==0 ||
+             std::strcmp(label,"allocate P2 target taps checkpoint")==0 ||
+             std::strcmp(label,"allocate P2 target embedding checkpoint")==0);
     }
     ~DeviceAllocation() {release();}
     DeviceAllocation(const DeviceAllocation&) = delete;
@@ -1125,6 +1130,12 @@ struct Exl3TextContext::Impl {
         int attempted_rows = 0;
         int continuation_graph_rows = 0;
         bool continuation_graph_attempt = false;
+        // GDN live checkpoint (gdn_live): an attempt forward left the live
+        // recurrent state at the root and its retained-prefix repair is owed;
+        // or a state-writing forward first saved the root to host memory.
+        bool live_pending = false;
+        bool live_host_saved = false;
+        void* live_host_root = nullptr;
         DecodeGraphDefinition checkpoint_graph_definition;
         DecodeGraphExecutable checkpoint_graph_executable;
         cudaStream_t checkpoint_graph_stream = nullptr;
@@ -1405,6 +1416,65 @@ struct Exl3TextContext::Impl {
     std::unique_ptr<Exl3CudaLinearWorkspace> batched_head_workspace, batched_head_workspace32;
     // Nonzero while a batched multi-agent BatchBinding owns the layers.
     int batch_bound = 0;
+    // GDN live checkpoint (NINFER_EXL3_GDN_LIVE_CHECKPOINT; default with
+    // concurrent lanes): the transaction keeps no recurrent copy. Attempt
+    // forwards read the live state without writing it back (device flag 0)
+    // and the retained-prefix repair advances it in place at settlement.
+    bool gdn_live = false;
+    int* gdn_write_flag = nullptr;
+    std::size_t gdn_recurrent_total_bytes = 0;
+    void live_arm_attempt(cudaStream_t stream) {
+        if(!gdn_live || !transaction || !transaction->active)return;
+        require(!transaction->live_pending && !transaction->live_host_saved,
+            "GDN live attempt after a state-writing forward");
+        cuda_check(cudaMemsetAsync(gdn_write_flag,0,sizeof(int),stream),"GDN live attempt flag");
+        transaction->live_pending=true;
+        for(auto& layer:gdn_layers)if(layer)layer->set_live_transaction(true);
+    }
+    // Before any other state-writing forward inside a live transaction the
+    // root goes to mapped host memory once, so a rollback can restore it.
+    void live_guard_write(cudaStream_t stream) {
+        if(!gdn_live || !transaction || !transaction->active)return;
+        require(!transaction->live_pending,"GDN live transaction has an unrepaired attempt");
+        if(transaction->live_host_saved)return;
+        if(!transaction->live_host_root)
+            cuda_check(cudaHostAlloc(&transaction->live_host_root,gdn_recurrent_total_bytes,
+                cudaHostAllocMapped|cudaHostAllocPortable),"allocate GDN live host root");
+        auto* cursor=static_cast<std::byte*>(transaction->live_host_root);
+        for(auto& layer:gdn_layers)if(layer) {
+            cuda_check(cudaMemcpyAsync(cursor,layer->recurrent_state_,layer->recurrent_state_bytes(),
+                cudaMemcpyDefault,stream),"save GDN live host root");
+            cursor+=layer->recurrent_state_bytes();
+        }
+        transaction->live_host_saved=true;
+    }
+    void live_restore_host_root(cudaStream_t stream) {
+        if(!gdn_live || !transaction || !transaction->live_host_saved)return;
+        const auto* cursor=static_cast<const std::byte*>(transaction->live_host_root);
+        for(auto& layer:gdn_layers)if(layer) {
+            cuda_check(cudaMemcpyAsync(layer->recurrent_state_,cursor,layer->recurrent_state_bytes(),
+                cudaMemcpyDefault,stream),"restore GDN live host root");
+            cursor+=layer->recurrent_state_bytes();
+        }
+    }
+    // Full acceptance: the owed repair advances the root by every attempted row.
+    void live_repair_all(cudaStream_t stream) {
+        if(!gdn_live || !transaction || !transaction->live_pending)return;
+        const int rows=transaction->attempted_rows;
+        require(rows>0,"GDN live repair rows");
+        for(int layer=0;layer<kLayers;++layer)
+            if(gdn_layers[layer])
+                gdn_layers[layer]->reconstruct_retained_prefix(
+                    transaction->gdn_checkpoints[layer],rows,stream);
+    }
+    void live_release(cudaStream_t stream) {
+        if(!gdn_live || !transaction)return;
+        if(transaction->live_pending || transaction->live_host_saved)
+            cuda_check(cudaMemsetAsync(gdn_write_flag,1,sizeof(int),stream),"GDN live release flag");
+        transaction->live_pending=false;
+        transaction->live_host_saved=false;
+        for(auto& layer:gdn_layers)if(layer)layer->set_live_transaction(false);
+    }
     // Owner-side fork streams for batched peers' stateful cores
     // (NINFER_EXL3_BATCH_FORK, default on); created on first lead.
     std::array<cudaStream_t,3> batch_fork_streams{};
@@ -2214,6 +2284,10 @@ struct Exl3TextContext::Impl {
     }
     ~Impl() {
         if(small_tier_storage)(void)cudaFree(small_tier_storage);
+        if(gdn_write_flag){(void)cudaFree(gdn_write_flag);gdn_write_flag=nullptr;}
+        if(transaction && transaction->live_host_root){
+            (void)cudaDeviceSynchronize();(void)cudaFreeHost(transaction->live_host_root);
+            transaction->live_host_root=nullptr;}
         for(auto& s:batch_fork_streams)if(s){(void)cudaStreamSynchronize(s);(void)cudaStreamDestroy(s);s=nullptr;}
         for(auto& e:batch_join_events)if(e){(void)cudaEventDestroy(e);e=nullptr;}
         if(batch_fork_event){(void)cudaEventDestroy(batch_fork_event);batch_fork_event=nullptr;}
@@ -5837,6 +5911,25 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 !keep_state_trace && !impl->host_kv_transaction_recurrent_trace_enabled);
         }
     }
+    {
+        static const bool gdn_live=[] {
+            const char* value=std::getenv("NINFER_EXL3_GDN_LIVE_CHECKPOINT");
+            if(value)return std::strcmp(value,"0")!=0;
+            const char* shared=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            return shared && std::strcmp(shared,"1")==0;
+        }();
+        if(gdn_live && Exl3NativeContextExtent::l0_oscar_enabled() &&
+           !impl->host_kv_transaction_recurrent_trace_enabled) {
+            impl->gdn_live=true;
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&impl->gdn_write_flag),sizeof(int)),
+                "allocate GDN live write flag");
+            cuda_check(cudaMemset(impl->gdn_write_flag,1,sizeof(int)),"initialize GDN live write flag");
+            for(auto& layer:impl->gdn_layers)if(layer) {
+                layer->set_state_write_flag(impl->gdn_write_flag);
+                impl->gdn_recurrent_total_bytes+=layer->recurrent_state_bytes();
+            }
+        }
+    }
     for (int layer = 0; layer + 1 < kLayers; ++layer) {
         if (impl->gdn_layers[layer] && impl->gdn_layers[layer + 1])
             impl->gdn_layers[layer]->set_successor(impl->gdn_layers[layer + 1].get());
@@ -7536,11 +7629,13 @@ std::size_t Exl3TextContext::transaction_bytes_required() const {
     require(host_kv || device_kv ||
             (impl_->oscar != nullptr && impl_->oscar->graph_class() == 0),
             "P2 target transaction requires eager OSCAR, HostKV or guarded device KV");
-    std::size_t bytes = 0;
+    // GDN live checkpoint: the recurrent owner is a one-byte sentinel.
+    std::size_t bytes = impl_->gdn_live ? 1 : 0;
     for (const auto& layer : impl_->gdn_layers) {
         if (!layer) continue;
-        bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
-            bytes, layer->recurrent_state_bytes());
+        if (!impl_->gdn_live)
+            bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
+                bytes, layer->recurrent_state_bytes());
         bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
             bytes, layer->physical_conv_state_bytes());
     }
@@ -7614,7 +7709,9 @@ void Exl3TextContext::prepare_transaction_impl(
                 conv_bytes, layer->physical_conv_state_bytes());
         }
         prepared->gdn_recurrent = allocate(
-            recurrent_bytes, "allocate P2 target recurrent checkpoint");
+            impl_->gdn_live ? 1 : recurrent_bytes,
+            impl_->gdn_live ? "allocate P2 target recurrent checkpoint sentinel" :
+                              "allocate P2 target recurrent checkpoint");
         prepared->gdn_conv = allocate(
             conv_bytes, "allocate P2 target convolution checkpoint");
         auto* recurrent = static_cast<std::byte*>(prepared->gdn_recurrent->ptr);
@@ -7630,15 +7727,18 @@ void Exl3TextContext::prepare_transaction_impl(
                 impl_->host_kv_transaction_recurrent_trace_enabled;
             checkpoint={recurrent_trace_alias ?
                     static_cast<void*>(impl_->gdn_layers[layer]->recurrent_state_before_) :
+                    impl_->gdn_live ?
+                    static_cast<void*>(impl_->gdn_layers[layer]->recurrent_state_) :
                     static_cast<void*>(recurrent),
                 recurrent_size,conv,conv_size};
             checkpoint.recurrent_trace_alias=recurrent_trace_alias;
+            checkpoint.recurrent_live_alias=impl_->gdn_live && !recurrent_trace_alias;
             checkpoint.model_owner=impl_->model->host_state_identity;
             checkpoint.model_layer=layer;
             checkpoint.recurrent_layer_stride_bytes=Exl3GdnRecurrentLayout::recurrent_bytes;
             checkpoint.convolution_layer_stride_bytes=
                 Exl3GdnRecurrentLayout::convolution_storage_bytes;
-            recurrent += recurrent_size;
+            if (!impl_->gdn_live) recurrent += recurrent_size;
             conv += conv_size;
         }
         prepared->oscar_cache = allocate(
@@ -7780,6 +7880,8 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                 impl_->last_rows <= impl_->prefill_capacity && impl_->tap_rows == impl_->embedding_rows &&
                 impl_->tap_rows == impl_->last_rows,
             "P2 target transaction captured rows are invalid or inconsistent");
+    if(impl_->tap_rows>16 && std::getenv("NINFER_EXL3_MEMORY_TRACE"))
+        std::fprintf(stderr,"TRANSACTION_TAP_ROWS rows=%d position=%d%c",impl_->tap_rows,position_,10);
     impl_->validate_target_projection_execution(stream);
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     cuda_check(cudaStreamIsCapturing(stream, &capture_status),
@@ -7816,11 +7918,11 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
             cuda_check(cudaMemcpyAsync(
                 tap_destination + tap * impl_->prefill_capacity * kHidden *
                     sizeof(std::uint16_t),
-                impl_->taps[tap]->ptr,tap_bytes,cudaMemcpyDeviceToDevice,stream),
+                impl_->taps[tap]->ptr,tap_bytes,cudaMemcpyDefault,stream),
                 "save P2 target hidden tap checkpoint");
         cuda_check(cudaMemcpyAsync(transaction.embedding->ptr,
                                    impl_->embedding_trace->ptr,embedding_bytes,
-                                   cudaMemcpyDeviceToDevice,stream),
+                                   cudaMemcpyDefault,stream),
                    "save P2 target embedding checkpoint");
     };
     // The ordinary device-KV probe has B2..B8 continuation frontiers. Capture
@@ -7877,11 +7979,11 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                                 tap_destination+tap*impl_->prefill_capacity*kHidden*
                                     sizeof(std::uint16_t),
                                 impl_->taps[tap]->ptr,graph_copy_bytes,
-                                cudaMemcpyDeviceToDevice,capture_stream),
+                                cudaMemcpyDefault,capture_stream),
                             "capture P2 target hidden tap checkpoint");
                     cuda_check(cudaMemcpyAsync(transaction.embedding->ptr,
                             impl_->embedding_trace->ptr,graph_copy_bytes,
-                            cudaMemcpyDeviceToDevice,capture_stream),
+                            cudaMemcpyDefault,capture_stream),
                         "capture P2 target embedding checkpoint");
                     });
                 transaction.checkpoint_graph_executable.instantiate(
@@ -7978,6 +8080,8 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
         transaction.host_kv_tail.reset();
     }
     transaction.fresh_snapshot = true;
+    transaction.live_pending = false;
+    transaction.live_host_saved = false;
     transaction.active = true;
 }
 
@@ -8027,13 +8131,13 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap) {
         cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,
                                    tap_source + tap * impl_->prefill_capacity * kHidden * sizeof(std::uint16_t),
-                                   tap_bytes, cudaMemcpyDeviceToDevice, stream),
+                                   tap_bytes, cudaMemcpyDefault, stream),
                    "restore P2 target hidden tap checkpoint");
     }
     const std::size_t embedding_bytes =
         static_cast<std::size_t>(transaction.embedding_rows) * kHidden * sizeof(std::uint16_t);
     cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr, transaction.embedding->ptr,
-                               embedding_bytes, cudaMemcpyDeviceToDevice, stream),
+                               embedding_bytes, cudaMemcpyDefault, stream),
                "restore P2 target embedding checkpoint");
     position_ = transaction.position;
     impl_->tap_rows = transaction.tap_rows;
@@ -8053,6 +8157,10 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     impl_->qkv_trace_valid = false;
     impl_->invalidate_native_mtp_hidden_capture();
+    // Live checkpoint: an unrepaired attempt left the root in place; a
+    // state-writing forward saved it to host memory first.
+    impl_->live_restore_host_root(stream);
+    impl_->live_release(stream);
     transaction.rollback_required = false;
     transaction.active = false;
 }
@@ -8071,6 +8179,12 @@ void Exl3TextContext::commit_transaction() {
             "P2 target transaction commit requires its eager OSCAR or exact HostKV mode");
     require(!impl_->transaction->rollback_required,
             "P2 target transaction requires rollback after failed prefix retention");
+    // Full acceptance of a live-checkpoint attempt: the owed repair advances
+    // the root by every attempted row before the transaction closes.
+    if (impl_->gdn_live) {
+        impl_->live_repair_all(transaction.stream);
+        impl_->live_release(transaction.stream);
+    }
     if (impl_->transaction->continuation_graph_attempt) {
         require(impl_->transaction->continuation_graph_rows ==
                     impl_->transaction->attempted_rows,
@@ -8482,6 +8596,7 @@ void Exl3TextContext::decode(std::int64_t token_id, cudaStream_t stream) {
             "P2 target transaction requires rollback after failed prefix retention");
     require(position_ < impl_->max_context, "E4A context capacity exhausted");
     impl_->validate_target_projection_execution(stream);
+    impl_->live_guard_write(stream);
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     if (impl_->continuation) impl_->continuation->rows = 0;
@@ -9622,6 +9737,8 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     const bool arm_retained_prefix = impl_->transaction &&
         impl_->transaction->active && impl_->transaction->fresh_snapshot &&
         impl_->transaction->stream == stream;
+    if (arm_retained_prefix) impl_->live_arm_attempt(stream);
+    else impl_->live_guard_write(stream);
 
     // Validation above is mutation-free. From this point any failure leaves
     // derived all-row output invalid rather than exposing a partial result.
@@ -9894,6 +10011,8 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         base_positions[c]=context.position_;
         cuda_check(cudaMemcpyAsync(impl.position_device,layout.data(),sizeof(layout),
             cudaMemcpyHostToDevice,stream),"set batched continuation base position");
+        if(arm_retained_prefix[c]) impl.live_arm_attempt(stream);
+        else impl.live_guard_write(stream);
         if(impl.transaction && impl.transaction->active) {
             impl.transaction->fresh_snapshot=false;
             impl.transaction->prefix_available=false;
@@ -10496,6 +10615,8 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     if (retained_rows == attempted_rows) {
         for (auto& layer : impl_->full_layers)
             if (layer) layer->invalidate_retained_prefix();
+        impl_->live_repair_all(stream);
+        impl_->live_release(stream);
         return;
     }
 
@@ -10660,6 +10781,7 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     impl_->continuation->rows = retained_rows;
     impl_->qkv_trace_valid = false;
     impl_->invalidate_native_mtp_hidden_capture();
+    impl_->live_release(stream);
     transaction.rollback_required = false;
 }
 
@@ -11571,6 +11693,7 @@ void Exl3TextContext::continue_rows_graph(
                "upload fixed-B8 continuation base position");
     impl_->publish_continuation_graph_roles(
         static_cast<unsigned>(rows),stream,false);
+    impl_->live_arm_attempt(stream);
     const auto replay_serial=selected_lifecycle.begin_replay(
         selected_generation,stream);
     auto* selected_roles=impl_->continuation_graph_roles(
