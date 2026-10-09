@@ -4718,6 +4718,41 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_view(
     if(impl_->batched_propose && batched_proposal_supported(block_ids))
         return impl_->batched_propose->propose(*this,block_ids,block_pos0,target_embedding_bf16,
             target_head,target_head_metadata,mask_token_id,stream);
+    // A single lane uses the batched forward as a one-member group: once the
+    // ring is full it replays one captured graph instead of eager launches.
+    static const bool solo_batched=[] {
+        const char* value=std::getenv("NINFER_DFLASH2_SOLO_BATCHED");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(solo_batched && batched_proposal_supported(block_ids)) {
+        // The legacy default stream cannot be captured: such callers fork onto
+        // a private non-blocking stream for the proposal and join back.
+        struct SoloStream {
+            cudaStream_t side=nullptr;
+            cudaEvent_t fork=nullptr,join=nullptr;
+        };
+        thread_local const SoloStream solo=[] {
+            SoloStream value;
+            cuda_check(cudaStreamCreateWithFlags(&value.side,cudaStreamNonBlocking),"solo draft stream");
+            cuda_check(cudaEventCreateWithFlags(&value.fork,cudaEventDisableTiming),"solo draft fork");
+            cuda_check(cudaEventCreateWithFlags(&value.join,cudaEventDisableTiming),"solo draft join");
+            return value;
+        }();
+        cudaStream_t run=stream;
+        if(!run) {
+            cuda_check(cudaEventRecord(solo.fork,stream),"solo draft fork");
+            cuda_check(cudaStreamWaitEvent(solo.side,solo.fork,0),"solo draft fork");
+            run=solo.side;
+        }
+        Exl3DraftBatchedRequest request{this,block_ids,block_pos0,{}};
+        Exl3DraftBatchedRequest* members[1]{&request};
+        propose_batched(members,target_embedding_bf16,target_head,target_head_metadata,run);
+        if(run!=stream) {
+            cuda_check(cudaEventRecord(solo.join,run),"solo draft join");
+            cuda_check(cudaStreamWaitEvent(stream,solo.join,0),"solo draft join");
+        }
+        return std::move(request.proposals);
+    }
     return propose_internal(block_ids,block_pos0,nullptr,0,0,0,target_embedding_bf16,
         target_head,target_head_metadata,mask_token_id,stream,true);
 }
