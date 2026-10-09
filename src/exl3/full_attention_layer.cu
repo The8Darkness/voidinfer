@@ -10229,12 +10229,18 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 mlp_in,gp,up,act,rows,stream,
                 target_down_executor_enabled_?nullptr:&weights_.down,
                 target_down_executor_enabled_?nullptr:linear_workspaces_[6]);
-        const bool paired_gate_up=!paired_m1_gate_up && !merged_gate_up && !can_share_target &&
-            !profile && !projection_timing_ &&
+        // Batched rounds of 3-4 agents: gate and up in one M32 launch.
+        const bool m32_gate_up=!paired_m1_gate_up && !merged_gate_up && !can_share_target &&
+            rows>16 && rows<=32 && !profile && !projection_timing_ && !projection_observer_ &&
+            !wide_prefill && linear_workspaces_[4]->forward_merged_pair_m32(*linear_workspaces_[5],
+                weights_.gate,weights_.gate_metadata,gp,weights_.up,weights_.up_metadata,up,
+                mlp_in,rows,stream);
+        const bool paired_gate_up=!paired_m1_gate_up && !merged_gate_up && !m32_gate_up &&
+            !can_share_target && !profile && !projection_timing_ &&
             !projection_observer_ && linear_workspaces_[4]->forward_target_prefill_gate_up_pair(
                 *linear_workspaces_[5],weights_.gate,weights_.gate_metadata,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,rows,stream);
-        const bool shared_gate=paired_m1_gate_up || merged_gate_up || paired_gate_up ||
+        const bool shared_gate=paired_m1_gate_up || merged_gate_up || paired_gate_up || m32_gate_up ||
             (can_share_target && target_gateup_executor_enabled_ &&
             target_shared_admission(Exl3TargetSharedFamily::gate,weights_.gate_metadata).has_value() &&
             target_q_executor_(Exl3TargetQContinuation{weights_.gate,weights_.gate_metadata,
@@ -10243,7 +10249,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 Exl3TargetProjectionOperator::gate);
         launch(cudaGetLastError(), "launch EXL3 gate projection"); end(9);
         begin(10);
-        const bool shared_up=paired_m1_gate_up || merged_gate_up || paired_gate_up ||
+        const bool shared_up=paired_m1_gate_up || merged_gate_up || paired_gate_up || m32_gate_up ||
             (can_share_target && target_gateup_executor_enabled_ &&
             target_shared_admission(Exl3TargetSharedFamily::up,weights_.up_metadata).has_value() &&
             target_q_executor_(Exl3TargetQContinuation{weights_.up,weights_.up_metadata,

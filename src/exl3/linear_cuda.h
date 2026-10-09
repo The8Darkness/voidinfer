@@ -778,6 +778,16 @@ public:
     // (rows*heads extra CTAs, the control_fused_staged_kernel arithmetic) and
     // a BF16 copy of the first output in the GDN convolution-input layout
     // ([feature*rows+row]) ride on the same launches.
+    // 17..32-row (3-4 agent) pair of same-input projections in one M32
+    // producer launch (shared K split filling the resident slots).
+    bool forward_merged_pair_m32(Exl3CudaLinearWorkspace& second_workspace,
+                                 const Exl3CudaLinearWeights& first_weights,
+                                 const Exl3CudaLinearMetadata& first_metadata,
+                                 std::uint16_t* first_output,
+                                 const Exl3CudaLinearWeights& second_weights,
+                                 const Exl3CudaLinearMetadata& second_metadata,
+                                 std::uint16_t* second_output,const std::uint16_t* input,
+                                 int rows,cudaStream_t stream);
     bool forward_merged_pair(Exl3CudaLinearWorkspace& second_workspace,
                              const Exl3CudaLinearWeights& first_weights,
                              const Exl3CudaLinearMetadata& first_metadata,

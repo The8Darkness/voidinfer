@@ -3100,7 +3100,11 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
                 a,b,beta_trace,g_trace,rows);
             gopt_record(gaming_submissions_,Gopt::GdnControlRowPair);
-        } else if(rows>=2 && rows<16 && gdn_control_decode_tiled_enabled()) {
+        } else if(rows>=2 && (rows<16 || (rows<=32 && !wide_prefill)) &&
+                  gdn_control_decode_tiled_enabled()) {
+            // Batched rounds (16..32 rows) too: 2x2 tiles keep every
+            // (row, head) chain and give 192-384 CTAs instead of 96 (4-agent
+            // forward -0.5 ms; 1x2 tiles measured no better).
             control_fused_tiled_kernel<2,2><<<((rows+1)/2)*(kHeads/2),128,0,stream>>>(
                 h,weights_.a_weight,weights_.b_weight,weights_.a_log,weights_.dt_bias,
                 a,b,beta_trace,g_trace,rows);
@@ -3548,6 +3552,14 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         // by the merged launches.
         merged_qkvz_side=true;
         begin(1); end(1); begin(2); end(2); begin(3); end(3);
+    } else if (rows > 16 && rows <= 32 && !profile && !projection_timing_ &&
+               !projection_observer_ && !wide_prefill &&
+               linear_workspaces_[0]->forward_merged_pair_m32(*linear_workspaces_[1],
+                   weights_.qkv,weights_.qkv_metadata,qkv,weights_.z,weights_.z_metadata,z,
+                   h,rows,stream)) {
+        // Batched rounds of 3-4 agents: QKV and Z in one M32 launch.
+        begin(1); end(1); begin(2); end(2);
+        begin(3); launch_control(); end(3);
     } else {
         begin(1); project(linear_workspaces_[0], weights_.qkv, weights_.qkv_metadata, h, qkv,
                           Exl3TargetProjectionOperator::qkv); end(1);
@@ -3658,6 +3670,12 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         ++fast_same_weights_fp16kv_gdn_m1_gate_up_pair_submissions_;
     } else if (merged_gate_up) {
         // Gate, up and the SiLU activation were produced by the merged route.
+    } else if (rows > 16 && rows <= 32 && !profile && !projection_timing_ &&
+               !projection_observer_ && !wide_prefill && !shared_gateup_enabled_ &&
+               linear_workspaces_[3]->forward_merged_pair_m32(*linear_workspaces_[4],
+                   weights_.gate,weights_.gate_metadata,gate,weights_.up,weights_.up_metadata,
+                   up,mlp_input,rows,stream)) {
+        // Batched rounds of 3-4 agents: gate and up in one M32 launch.
     } else if (dual_transform) {
         exl3_transform_input_pair(
             weights_.gate, weights_.gate_metadata, weights_.up, weights_.up_metadata,

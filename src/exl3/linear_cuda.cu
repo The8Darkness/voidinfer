@@ -3505,6 +3505,25 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
             split_count, nullptr, nullptr);
 }
 
+// Two same-input projections of 17..32 rows in one launch: blocks below
+// grid_a run the M32 128-column producer for the first tensor, the rest for
+// the second (one shared K split).
+template <int Bits>
+__global__ void exl3_gemm_m32_dual_kernel(const std::uint16_t* transformed_a,
+    const std::uint16_t* trellis_a, const std::int32_t* mul1_a, float* accum_a, int output_features_a,
+    const std::uint16_t* transformed_b, const std::uint16_t* trellis_b, const std::int32_t* mul1_b,
+    float* accum_b, int output_features_b, int rows, int input_features, int split_count, int grid_a) {
+    const int block = static_cast<int>(blockIdx.x);
+    if (block < grid_a)
+        exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, false,
+            false, false, 4, 4, 2, false, 2>(block, transformed_a, trellis_a, mul1_a, accum_a, rows,
+            input_features, output_features_a, split_count, nullptr, nullptr);
+    else
+        exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, false,
+            false, false, 4, 4, 2, false, 2>(block - grid_a, transformed_b, trellis_b, mul1_b, accum_b,
+            rows, input_features, output_features_b, split_count, nullptr, nullptr);
+}
+
 template <int Bits, bool K7ThreeWord, bool FastK6Decode, int DeepStages, int Warps,
           int TilesPerStage>
 __global__ void exl3_gemm_m1_fused_input_kernel(const std::uint16_t* raw_input,
@@ -9595,6 +9614,92 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
         coherent_wide_k6_split10_calls_[coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
         up_workspace.coherent_wide_k6_split10_calls_[up_workspace.coherent_wide_k6_operation_].fetch_add(1,std::memory_order_relaxed);
     }
+    return true;
+}
+
+bool Exl3CudaLinearWorkspace::forward_merged_pair_m32(
+    Exl3CudaLinearWorkspace& second_workspace,
+    const Exl3CudaLinearWeights& first_weights,const Exl3CudaLinearMetadata& first_metadata,
+    std::uint16_t* first_output,
+    const Exl3CudaLinearWeights& second_weights,const Exl3CudaLinearMetadata& second_metadata,
+    std::uint16_t* second_output,const std::uint16_t* input,int rows,cudaStream_t stream) {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_M32_PAIR");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(!enabled || rows<=kBatchedRows || rows>2*kBatchedRows || rows>max_rows_ ||
+       rows>second_workspace.max_rows_ || first_metadata.K!=second_metadata.K ||
+       first_metadata.K<4 || first_metadata.K>8 || in_features_!=second_workspace.in_features_ ||
+       in_features_%kHadamard!=0 || out_features_%128!=0 || second_workspace.out_features_%128!=0 ||
+       first_metadata.in_features!=in_features_ || second_metadata.in_features!=in_features_ ||
+       first_metadata.out_features!=out_features_ ||
+       second_metadata.out_features!=second_workspace.out_features_ ||
+       first_metadata.mcg || second_metadata.mcg || !first_metadata.mul1 || !second_metadata.mul1 ||
+       first_metadata.has_bias || second_metadata.has_bias ||
+       !first_weights.suh || !first_weights.svh || !second_weights.suh || !second_weights.svh ||
+       !first_weights.trellis || !second_weights.trellis || !first_weights.mul1 ||
+       !second_weights.mul1 || !input || !first_output || !second_output ||
+       coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
+       (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2))
+        return false;
+    const int out_a=out_features_, out_b=second_workspace.out_features_;
+    const bool shared_accum=second_workspace.accum_==accum_;
+    // One K split for both: the one filling four 128-column CTAs per SM.
+    int sms=0,device=0;
+    if(cudaGetDevice(&device)!=cudaSuccess ||
+       cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess) sms=170;
+    const int blocks=(out_a+out_b)/128;
+    const int k_tiles=in_features_/16;
+    const auto fits=[&](int split) {
+        const auto plane=[&](int out){return static_cast<std::size_t>(rows)*out*split*sizeof(float);};
+        return shared_accum ? plane(out_a)+plane(out_b)<=accumulation_capacity_bytes_ :
+            plane(out_a)<=accumulation_capacity_bytes_ &&
+            plane(out_b)<=second_workspace.accumulation_capacity_bytes_;
+    };
+    int split=std::clamp(4*sms/blocks,1,20);
+    while(split>1 && (k_tiles/split<16 || !fits(split))) --split;
+    if(!fits(split))return false;
+    float* second_accum=shared_accum?accum_+static_cast<std::size_t>(split)*rows*out_a:
+        second_workspace.accum_;
+    // Input transforms are staged in each workspace's transform buffer, or
+    // in the projection outputs when the workspaces share one.
+    std::uint16_t* staged_a=transformed_;
+    std::uint16_t* staged_b=second_workspace.transformed_;
+    const std::size_t staged_bytes=static_cast<std::size_t>(rows)*in_features_*sizeof(std::uint16_t);
+    if(!staged_a || !staged_b || staged_a==staged_b ||
+       transformed_capacity_bytes_<staged_bytes ||
+       second_workspace.transformed_capacity_bytes_<staged_bytes) {
+        if(out_a<in_features_ || out_b<in_features_)return false;
+        staged_a=first_output;
+        staged_b=second_output;
+    }
+    launch_input_transform_pair(stream,input,first_weights.suh,second_weights.suh,
+        staged_a,staged_b,rows,in_features_);
+    const int grid_a=out_a/128*split, grid_b=out_b/128*split;
+    const auto launch=[&](auto kernel,int bits) {
+        const std::size_t shared=8u*256u*2u*sizeof(half)+8u*8u*16u*static_cast<std::size_t>(bits)*
+            sizeof(std::uint16_t);
+        exl3_launch_pdl(kernel,dim3(grid_a+grid_b),dim3(128),shared,stream,
+            static_cast<const std::uint16_t*>(staged_a),first_weights.trellis,
+            first_weights.mul1,accum_,out_a,static_cast<const std::uint16_t*>(staged_b),
+            second_weights.trellis,second_weights.mul1,second_accum,out_b,rows,in_features_,
+            split,grid_a);
+    };
+    switch(first_metadata.K) {
+    case 4: launch(exl3_gemm_m32_dual_kernel<4>,4); break;
+    case 5: launch(exl3_gemm_m32_dual_kernel<5>,5); break;
+    case 6: launch(exl3_gemm_m32_dual_kernel<6>,6); break;
+    case 7: launch(exl3_gemm_m32_dual_kernel<7>,7); break;
+    default: launch(exl3_gemm_m32_dual_kernel<8>,8); break;
+    }
+    cuda_check(cudaGetLastError(),"launch M32 pair producers");
+    const int tasks=rows*((out_a+out_b)/kHadamard);
+    exl3_launch_pdl(exl3_pair_reduce_output_kernel,
+        dim3((tasks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+        dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,first_weights.svh,first_output,out_a,
+        second_accum,second_weights.svh,second_output,out_b,rows,split,
+        static_cast<std::uint16_t*>(nullptr));
+    cuda_check(cudaGetLastError(),"launch M32 pair reduction");
     return true;
 }
 
