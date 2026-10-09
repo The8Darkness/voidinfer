@@ -123,6 +123,18 @@ __global__ void __launch_bounds__(256, 2) prep_kernel(const float* __restrict__ 
     const std::size_t index = tile_index(chunk, head);
     const float* kc = k + static_cast<std::size_t>(row0) * kQkStride + kh * kD;
     const float* qc = q + static_cast<std::size_t>(row0) * kQkStride + kh * kD;
+    // This thread's V pairs (rows tid/64 + 4j, dims 2*(tid%64)), loaded now and
+    // consumed after the inverse so their latency hides behind it.
+    const auto* vv = reinterpret_cast<const __nv_bfloat16*>(v);
+    __nv_bfloat162 v_pairs[kC * kD / 2 / 256];
+#pragma unroll
+    for (int j = 0; j < kC * kD / 2 / 256; ++j) {
+        const int i = tid + 256 * j;
+        const int r = i / (kD / 2), d = (i % (kD / 2)) * 2, row = row0 + r;
+        v_pairs[j] = row < rows
+            ? *reinterpret_cast<const __nv_bfloat162*>(vv + (static_cast<std::size_t>(row) * kH + head) * kD + d)
+            : __floats2bfloat162_rn(0.0f, 0.0f);
+    }
     if (tid < 32) {
         float l0 = 0.0f, l1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
         const int r0 = row0 + 2 * tid, r1 = r0 + 1;
@@ -164,21 +176,9 @@ __global__ void __launch_bounds__(256, 2) prep_kernel(const float* __restrict__ 
         const int r = i / kC, c = i % kC;
         AT[r * kLd64 + c] = c < r ? Bs[r] * __expf(Ls[r] - Ls[c]) * AT[r * kLd64 + c] : 0.0f;
     }
-    {
-        // Kt_j = exp(L_last - L_j) k_j and Qg_i = gamma_i q_i (pad rows are zero).
-        const float last = Ls[kC - 1];
-        half* kt = ws.kt + index * kC * kD;
-        half* qg = ws.qg + index * kC * kD;
-        for (int i = tid; i < kC * kD; i += 256) {
-            const int r = i / kD, d = i % kD;
-            const std::size_t at = static_cast<std::size_t>(r) * kQkStride + d;
-            kt[r * kD + d] = __float2half_rn(kc[at] * __expf(last - Ls[r]));
-            qg[r * kD + d] = __float2half_rn(qc[at] * __expf(Ls[r]));
-        }
-    }
     __syncthreads();
-    // Diagonal 16x16 inverses; T[i][j] is stored at AT[j][i] (upper + diagonal).
     if (tid < kC) {
+        // Diagonal 16x16 inverses; T[i][j] is stored at AT[j][i] (upper + diagonal).
         const int b = tid / 16, c = tid % 16, base = b * 16;
         for (int i = 0; i < 16; ++i) {
             if (i < c) continue;
@@ -186,6 +186,32 @@ __global__ void __launch_bounds__(256, 2) prep_kernel(const float* __restrict__ 
             for (int j = c; j < i; ++j)
                 value -= AT[(base + i) * kLd64 + base + j] * AT[(base + c) * kLd64 + base + j];
             AT[(base + c) * kLd64 + base + i] = value;
+        }
+    } else {
+        // Meanwhile one read of K and Q: Kt_j = exp(L_last - L_j) k_j,
+        // Qg_i = gamma_i q_i (pad rows are zero) and the beta*gamma-scaled K
+        // operand of w = T (beta gamma K).
+        const float last = Ls[kC - 1];
+        half* kt = ws.kt + index * kC * kD;
+        half* qg = ws.qg + index * kC * kD;
+        for (int i = tid - kC; i < kC * kD / 4; i += 256 - kC) {
+            const int r = i / (kD / 4), d = (i % (kD / 4)) * 4;
+            const std::size_t at = static_cast<std::size_t>(r) * kQkStride + d;
+            const float4 kv = *reinterpret_cast<const float4*>(kc + at);
+            const float4 qv = *reinterpret_cast<const float4*>(qc + at);
+            const float decay_k = __expf(last - Ls[r]), gamma = __expf(Ls[r]), b = Bs[r];
+            const __half2 kt01 = __halves2half2(__float2half_rn(kv.x * decay_k), __float2half_rn(kv.y * decay_k));
+            const __half2 kt23 = __halves2half2(__float2half_rn(kv.z * decay_k), __float2half_rn(kv.w * decay_k));
+            const __half2 qg01 = __halves2half2(__float2half_rn(qv.x * gamma), __float2half_rn(qv.y * gamma));
+            const __half2 qg23 = __halves2half2(__float2half_rn(qv.z * gamma), __float2half_rn(qv.w * gamma));
+            *reinterpret_cast<__half2*>(kt + r * kD + d) = kt01;
+            *reinterpret_cast<__half2*>(kt + r * kD + d + 2) = kt23;
+            *reinterpret_cast<__half2*>(qg + r * kD + d) = qg01;
+            *reinterpret_cast<__half2*>(qg + r * kD + d + 2) = qg23;
+            Xh[r * kLdH128 + d] = __float2half_rn(kv.x * b * gamma);
+            Xh[r * kLdH128 + d + 1] = __float2half_rn(kv.y * b * gamma);
+            Xh[r * kLdH128 + d + 2] = __float2half_rn(kv.z * b * gamma);
+            Xh[r * kLdH128 + d + 3] = __float2half_rn(kv.w * b * gamma);
         }
     }
     __syncthreads();
@@ -210,27 +236,20 @@ __global__ void __launch_bounds__(256, 2) prep_kernel(const float* __restrict__ 
         }
         __syncthreads();
     }
-    // FP16 row-major T and beta*gamma-scaled K.
+    // FP16 row-major T.
     for (int i = tid; i < kC * kC; i += 256) {
         const int r = i / kC, c = i % kC;
         Th[r * kLdH64 + c] = __float2half_rn(c <= r ? AT[c * kLd64 + r] : 0.0f);
-    }
-    for (int i = tid; i < kC * kD; i += 256) {
-        const int r = i / kD, d = i % kD;
-        Xh[r * kLdH128 + d] = __float2half_rn(
-            kc[static_cast<std::size_t>(r) * kQkStride + d] * Bs[r] * __expf(Ls[r]));
     }
     __syncthreads();
     float* stage = AT + warp * 256;   // AT is free once Th is built
     t_times_half(Th, Xh, stage, ws.w + index * kC * kD, warp, lane);
     __syncthreads();
-    const auto* vv = reinterpret_cast<const __nv_bfloat16*>(v);
-    for (int i = tid; i < kC * kD / 2; i += 256) {
-        const int r = i / (kD / 2), d = (i % (kD / 2)) * 2, row = row0 + r;
-        float2 value = make_float2(0.f, 0.f);
-        if (row < rows)
-            value = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(
-                vv + (static_cast<std::size_t>(row) * kH + head) * kD + d));
+#pragma unroll
+    for (int j = 0; j < kC * kD / 2 / 256; ++j) {
+        const int i = tid + 256 * j;
+        const int r = i / (kD / 2), d = (i % (kD / 2)) * 2;
+        const float2 value = __bfloat1622float2(v_pairs[j]);
         Xh[r * kLdH128 + d] = __float2half_rn(value.x * Bs[r]);
         Xh[r * kLdH128 + d + 1] = __float2half_rn(value.y * Bs[r]);
     }
