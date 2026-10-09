@@ -456,6 +456,15 @@ struct Exl3EngineCore::Impl {
     // not qualified to overlap another lane's ingestion), decode rounds of all
     // lanes run together (shared).
     std::shared_mutex coherent_prefill_mutex;
+    // Writer-preferring turnstile: a waiting prompt pass holds it while it
+    // acquires coherent_prefill_mutex, so lanes starting new rounds queue
+    // behind the pass instead of starving it (shared_mutex grants new shared
+    // owners ahead of a waiting exclusive one).
+    std::mutex coherent_prefill_turnstile;
+    void lock_round(std::shared_lock<std::shared_mutex>& round) {
+        { const std::lock_guard turnstile(coherent_prefill_turnstile); }
+        round.lock();
+    }
     // Prompt passes (ingestion, VeriCache verifier/fix/rewind) share the
     // model's prompt-scale pool: they run one at a time, ordered on the device
     // by prompt_pass_done, while other lanes keep decoding (their rounds use
@@ -479,6 +488,7 @@ struct Exl3EngineCore::Impl {
                 if(engine.prompt_pass_done)
                     check(cudaStreamWaitEvent(stream,engine.prompt_pass_done,0));
             } else {
+                const std::lock_guard turnstile(engine.coherent_prefill_turnstile);
                 exclusive=std::unique_lock(engine.coherent_prefill_mutex);
                 if(engine.options.max_concurrency>1)check(cudaDeviceSynchronize());
             }
@@ -554,7 +564,7 @@ struct Exl3EngineCore::Impl {
             if(!std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
                 _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
             if(!std::getenv("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
-                _putenv_s("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"256":"768");
+                _putenv_s("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"256":"1536");
             // Prompt-scale passes are exclusive across lanes: one reconstruct
             // workspace serves every lane.
             if(!std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
@@ -1768,6 +1778,9 @@ struct Exl3EngineCore::Impl {
                         return !value || std::string_view(value)!="0";
                     }();
                     for(std::uint32_t i=first;i<end;++i) {
+                        if(std::getenv("NINFER_EXL3_VERICACHE_STATS"))
+                            std::fprintf(stderr,"LANE_CONTEXT lane=%u context=%p\n",i,
+                                static_cast<const void*>(lanes[i]->context_owner_for_device_round().get()));
                         lanes[i]->context_owner_for_device_round()->set_batched_verify(group.get());
                         if(batched_draft)drafts[i]->set_batched_propose(group.get());
                     }
@@ -2335,7 +2348,7 @@ struct Exl3EngineCore::Impl {
                 while(!request.cancelled && remaining) {
                     auto lt_mark=Clock::now();
                     std::shared_lock round_lock(coherent_prefill_mutex,std::defer_lock);
-                    if(!prompt_pass_overlap)round_lock.lock();
+                    if(!prompt_pass_overlap)lock_round(round_lock);
                     lt_lock+=lt_ms(lt_mark);lt_mark=Clock::now();
                     if(!output.pending_control_tokens().empty())
                         throw std::invalid_argument(
@@ -2470,7 +2483,7 @@ struct Exl3EngineCore::Impl {
             } else
             while(remaining && !request.cancelled) {
                 std::shared_lock round_lock(coherent_prefill_mutex,std::defer_lock);
-                if(!prompt_pass_overlap)round_lock.lock();
+                if(!prompt_pass_overlap)lock_round(round_lock);
                 if(round_phases)phase_mark=Clock::now();
                 if(!output.pending_control_tokens().empty())
                     throw std::invalid_argument(

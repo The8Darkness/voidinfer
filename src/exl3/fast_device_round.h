@@ -608,9 +608,11 @@ public:
                 const bool bad=delta>0?scores[i].gap>delta:scores[i].greedy!=tokens[i+1];
                 if(bad) {
                     reject=i+1;correction=scores[i].greedy;
-                    if(timed)std::fprintf(stderr,"VERICACHE_CORRECTION block_rows=%zu reject_at=%zu gap=%.3f drafted=%lld exact=%lld\n",
+                    if(timed)std::fprintf(stderr,"VERICACHE_CORRECTION block_rows=%zu reject_at=%zu gap=%.3f drafted=%lld exact=%lld round[%s] context=%p\n",
                         tokens.size(),reject,static_cast<double>(scores[i].gap),
-                        static_cast<long long>(tokens[i+1]),static_cast<long long>(correction));
+                        static_cast<long long>(tokens[i+1]),static_cast<long long>(correction),
+                        context_->round_trace(verified_frontier_+static_cast<int>(reject)).c_str(),
+                        static_cast<const void*>(context_.get()));
                     break;
                 }
                 // Accepted rows: how far each kept token trails the exact top.

@@ -837,6 +837,8 @@ constexpr int kDenseRowsCols=8;
 constexpr int kDenseRowsTileK=128;
 constexpr int kDenseRowsStages=4;
 constexpr int kDenseRowsMax=8;
+// Batched multi-agent drafting: one launch covers up to four agents' blocks.
+constexpr int kDenseRowsBatchedMax=4*kDenseRowsMax;
 constexpr int kDenseRowsThreads=kDenseRowsCols*kDenseRowsMax;
 constexpr int kDenseRowsParts=kDenseRowsCols/8;
 
@@ -847,10 +849,12 @@ __device__ __forceinline__ void dflash_cp_async_16(void* shared_ptr,const void* 
                  :: "r"(shared_address), "l"(global_ptr));
 }
 
-__global__ void __launch_bounds__(kDenseRowsThreads) dflash_dense_rows_kmajor_kernel(
+template<int MaxRows=kDenseRowsMax>
+__global__ void __launch_bounds__(kDenseRowsCols*MaxRows) dflash_dense_rows_kmajor_kernel(
     const std::uint16_t* a,const std::uint16_t* b,std::uint16_t* c,int m,int k,int n) {
+    constexpr int kDenseRowsThreads=kDenseRowsCols*MaxRows;
     __shared__ __align__(16) std::uint16_t weights[kDenseRowsStages][kDenseRowsTileK][kDenseRowsCols];
-    __shared__ __align__(16) std::uint16_t inputs[kDenseRowsStages][kDenseRowsMax][kDenseRowsTileK];
+    __shared__ __align__(16) std::uint16_t inputs[kDenseRowsStages][MaxRows][kDenseRowsTileK];
     const int tid=static_cast<int>(threadIdx.x);
     const int col0=static_cast<int>(blockIdx.x)*kDenseRowsCols;
     const int col=tid%kDenseRowsCols;
@@ -907,11 +911,15 @@ bool dflash_dense_rows_enabled() {
 
 bool launch_dflash_dense_rows_kmajor(const std::uint16_t* in,const std::uint16_t* weights,
     std::uint16_t* out,int rows,int k,int n,cudaStream_t stream) {
-    if(!dflash_dense_rows_enabled() || rows<1 || rows>kDenseRowsMax ||
+    if(!dflash_dense_rows_enabled() || rows<1 || rows>kDenseRowsBatchedMax ||
        k%kDenseRowsTileK!=0 || n%kDenseRowsCols!=0 ||
        (reinterpret_cast<std::uintptr_t>(in)|reinterpret_cast<std::uintptr_t>(weights))%16!=0)
         return false;
-    dflash_dense_rows_kmajor_kernel<<<n/kDenseRowsCols,kDenseRowsThreads,0,stream>>>(in,weights,out,rows,k,n);
+    if(rows>kDenseRowsMax)
+        dflash_dense_rows_kmajor_kernel<kDenseRowsBatchedMax><<<n/kDenseRowsCols,
+            kDenseRowsCols*kDenseRowsBatchedMax,0,stream>>>(in,weights,out,rows,k,n);
+    else
+        dflash_dense_rows_kmajor_kernel<<<n/kDenseRowsCols,kDenseRowsThreads,0,stream>>>(in,weights,out,rows,k,n);
     return true;
 }
 
@@ -4759,9 +4767,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
     for(int layer=0;layer<kLayers;++layer) {
         const auto& lay=lead.layers[layer];
         rms(current,lay.input_norm,b.ln,rows);
-        for(int i=0;i<count;++i)
-            dense(b.ln+static_cast<std::size_t>(i)*L*kHidden,lay.attn_kernel_proj,
-                b.dyn+static_cast<std::size_t>(i)*L*kConvDynamic,L,kHidden,kConvDynamic);
+        dense(b.ln,lay.attn_kernel_proj,b.dyn,rows,kHidden,kConvDynamic);
         dyn_conv(b.ln,b.dyn,lay.attn_base,b.conv,0,false);
         b.ws_q->forward(lay.q,lay.qm,b.conv,b.qproj,rows,stream);
         b.ws_kv->forward(lay.k,lay.km,b.conv,b.kblk,rows,stream);
@@ -4798,9 +4804,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         dyn_conv(b.oproj,b.dyn,lay.attn_base,b.convf,1,true);
         residual(current,b.convf,other);
         rms(other,lay.post_norm,b.ln2,rows);
-        for(int i=0;i<count;++i)
-            dense(b.ln2+static_cast<std::size_t>(i)*L*kHidden,lay.mlp_kernel_proj,
-                b.dyn2+static_cast<std::size_t>(i)*L*kConvDynamic,L,kHidden,kConvDynamic);
+        dense(b.ln2,lay.mlp_kernel_proj,b.dyn2,rows,kHidden,kConvDynamic);
         dyn_conv(b.ln2,b.dyn2,lay.mlp_base,b.conv2,0,false);
         b.ws_mlp->forward(lay.gate,lay.gm,b.conv2,b.gate,rows,stream);
         b.ws_mlp->forward(lay.up,lay.um,b.conv2,b.up,rows,stream);

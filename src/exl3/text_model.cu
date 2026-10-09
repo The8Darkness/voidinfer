@@ -1392,6 +1392,14 @@ struct Exl3TextContext::Impl {
     int fast_wmma32_split_count = 0;
     int fast_wmma32_split_capacity = 0;
     int gdn_bulk_capacity = 0;
+    struct RoundTrace { int base = -1, rows = 0, members = 0, graph = 0, member = 0; };
+    std::array<RoundTrace, 1024> round_traces{};
+    std::size_t round_trace_next = 0;
+    int trace_members = 1, trace_graph = 0, trace_member = 0;
+    // Owner of batched multi-agent rounds: every agent's final-norm rows and
+    // logits of one head pass (allocated on first lead).
+    std::unique_ptr<DeviceAllocation> batched_head_norm, batched_head_logits;
+    std::unique_ptr<Exl3CudaLinearWorkspace> batched_head_workspace;
     // Nonzero while a batched multi-agent BatchBinding owns the layers.
     int batch_bound = 0;
     std::shared_ptr<DeviceAllocation> host_layer_k, host_layer_v;
@@ -3276,13 +3284,20 @@ struct Exl3TextContext::Impl {
     void release_l0_rows_beyond(int rows) {
         for(auto& layer:full_layers)if(layer)layer->release_l0_rows_beyond(rows);
     }
+    // precomputed_norm/logits: this agent's rows of the owner's batched head
+    // (one H6 head over every agent's rows); copied into this context's
+    // continuation scratch instead of recomputing.
     void finish_batched_continuation(const std::uint16_t* hidden,int rows,int position,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream,const std::uint16_t* precomputed_norm=nullptr,
+                                     const std::uint16_t* precomputed_logits=nullptr) {
         require(continuation && continuation->capacity>=rows && rows>=2,
             "batched continuation head capacity");
         auto& scratch=*continuation;
         auto* norm=static_cast<std::uint16_t*>(scratch.final_norm->ptr);
-        for(int row=0;row<rows;++row)
+        if(precomputed_norm)
+            cuda_check(cudaMemcpyAsync(norm,precomputed_norm,static_cast<std::size_t>(rows)*kHidden*
+                sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),"copy batched head norm rows");
+        else for(int row=0;row<rows;++row)
             final_rms_norm_kernel<<<1,512,0,stream>>>(
                 hidden+static_cast<std::size_t>(row)*kHidden,model->final_norm,
                 norm+static_cast<std::size_t>(row)*kHidden);
@@ -3294,7 +3309,10 @@ struct Exl3TextContext::Impl {
         if(++last_hidden_generation==0)
             throw std::overflow_error("native MTP hidden generation exhausted");
         auto* all_logits=static_cast<std::uint16_t*>(scratch.logits->ptr);
-        if(std::strcmp(scratch.head_workspace->dispatch_name(model->lm_head_metadata,rows),
+        if(precomputed_logits)
+            cuda_check(cudaMemcpyAsync(all_logits,precomputed_logits,static_cast<std::size_t>(rows)*kVocab*
+                sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),"copy batched head logits rows");
+        else if(std::strcmp(scratch.head_workspace->dispatch_name(model->lm_head_metadata,rows),
                        "h6_small_m_single_split")==0)
             scratch.head_workspace->forward(model->lm_head,model->lm_head_metadata,
                 norm,all_logits,rows,stream);
@@ -8552,8 +8570,24 @@ bool Exl3TextContext::layer_major_from_zero() {
 
 void Exl3TextContext::continue_rows_for_verification(
     std::span<const std::int64_t> token_ids,cudaStream_t stream) {
+    const int base=position_;
+    impl_->trace_members=1;impl_->trace_graph=0;impl_->trace_member=0;
     if(batched_verify_)batched_verify_->continue_rows(*this,token_ids,stream);
     else continue_rows(token_ids,stream);
+    auto& trace=impl_->round_traces[impl_->round_trace_next++%impl_->round_traces.size()];
+    trace={base,static_cast<int>(token_ids.size()),impl_->trace_members,impl_->trace_graph,
+        impl_->trace_member};
+}
+
+std::string Exl3TextContext::round_trace(int position) const {
+    for(std::size_t i=0;i<impl_->round_traces.size();++i) {
+        const auto& t=impl_->round_traces[(impl_->round_trace_next+impl_->round_traces.size()-1-i)%
+            impl_->round_traces.size()];
+        if(t.base>=0 && position>=t.base && position<t.base+t.rows)
+            return "base="+std::to_string(t.base)+" rows="+std::to_string(t.rows)+" members="+
+                std::to_string(t.members)+" member="+std::to_string(t.member)+" graph="+std::to_string(t.graph);
+    }
+    return "untraced";
 }
 
 // Free-memory reserve kept beside the layer-major projection cache of L0 OSCAR
@@ -9902,11 +9936,54 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         peer.last_stack_output=impl_->last_stack_output+row*kHidden;
     }
     impl_->embedding_rows=impl_->tap_rows=own_rows;
-    impl_->finish_batched_continuation(impl_->last_stack_output,own_rows,base_positions[0],stream);
+    // One H6 head pass over every agent's rows (16-row single-split tiles)
+    // instead of one 8-row pass per agent: the head weights stream once per
+    // tile. Each agent's rows are contiguous in the owner's stack output.
+    constexpr int kHeadTile=16;
+    static const bool batched_head=[] {
+        const char* value=std::getenv("NINFER_EXL3_BATCHED_HEAD");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(!batched_head) {
+        impl_->finish_batched_continuation(impl_->last_stack_output,own_rows,base_positions[0],stream);
+        for(std::size_t p=0;p<peers.size();++p) {
+            auto& peer=*peers[p].context->impl_;
+            peer.finish_batched_continuation(peer.last_stack_output,
+                static_cast<int>(peers[p].tokens.size()),base_positions[p+1],stream);
+        }
+    } else {
+    if(!impl_->batched_head_workspace) {
+        constexpr std::size_t capacity=static_cast<std::size_t>(8)*(kMaxBatchedPeers+1);
+        impl_->batched_head_norm=std::make_unique<DeviceAllocation>(capacity*kHidden*sizeof(std::uint16_t),
+            "allocate batched head norm rows");
+        impl_->batched_head_logits=std::make_unique<DeviceAllocation>(capacity*kVocab*sizeof(std::uint16_t),
+            "allocate batched head logits");
+        impl_->batched_head_workspace=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,kHeadTile);
+        impl_->batched_head_workspace->set_native_continuation16(true);
+    }
+    auto* head_norm=static_cast<std::uint16_t*>(impl_->batched_head_norm->ptr);
+    auto* head_logits=static_cast<std::uint16_t*>(impl_->batched_head_logits->ptr);
+    for(int row=0;row<rows;++row)
+        final_rms_norm_kernel<<<1,512,0,stream>>>(
+            impl_->last_stack_output+static_cast<std::size_t>(row)*kHidden,impl_->model->final_norm,
+            head_norm+static_cast<std::size_t>(row)*kHidden);
+    cuda_check(cudaGetLastError(),"launch batched head final RMSNorm");
+    for(int first=0;first<rows;first+=kHeadTile) {
+        const int n=std::min(kHeadTile,rows-first);
+        impl_->batched_head_workspace->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+            head_norm+static_cast<std::size_t>(first)*kHidden,
+            head_logits+static_cast<std::size_t>(first)*kVocab,n,stream);
+    }
+    cuda_check(cudaGetLastError(),"launch batched head");
+    impl_->finish_batched_continuation(impl_->last_stack_output,own_rows,base_positions[0],stream,
+        head_norm,head_logits);
     for(std::size_t p=0;p<peers.size();++p) {
         auto& peer=*peers[p].context->impl_;
+        const auto row=static_cast<std::size_t>(first_row[p+1]);
         peer.finish_batched_continuation(peer.last_stack_output,
-            static_cast<int>(peers[p].tokens.size()),base_positions[p+1],stream);
+            static_cast<int>(peers[p].tokens.size()),base_positions[p+1],stream,
+            head_norm+row*kHidden,head_logits+row*kVocab);
+    }
     }
     for(std::size_t c=0;c<count_contexts;++c) {
         auto& context=*contexts[c];
@@ -9917,6 +9994,9 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
             cudaMemcpyHostToDevice,stream),"set batched continuation final device position");
         context.position_+=count;
         impl.continuation->rows=count;
+        impl.trace_members=static_cast<int>(count_contexts);
+        impl.trace_graph=graph?1:0;
+        impl.trace_member=static_cast<int>(c);
         if(arm_retained_prefix[c]) {
             for(int layer=0;layer<kLayers;++layer)
                 if(impl.full_layers[layer] && !impl.full_layers[layer]->retained_prefix_armed(count))

@@ -205,6 +205,11 @@ public:
                 is_cancelled(offer) || failed_;});
             if(!offer.done && !offer.claimed) {
                 if(waiting_==&offer)waiting_=nullptr;
+                // Another offer may hold the shared transport (a single that
+                // arrived while this one waited): never run two transports
+                // over the one device/host packet buffer.
+                while(busy_ && !failed_)changed_.wait(lock);
+                if(failed_)std::rethrow_exception(first_failure_);
                 const bool was_cancelled=is_cancelled(offer);
                 busy_=true;
                 lock.unlock();const bool completed=single(offer);lock.lock();offer.done=true;

@@ -1020,6 +1020,9 @@ public:
     void save_verified_root(cudaStream_t stream = nullptr);
     void restore_verified_root(cudaStream_t stream = nullptr);
     int verified_root_position() const noexcept;
+    // Diagnostic: the decode round (base, rows, batched members, graph) that
+    // produced absolute `position` (recent rounds only).
+    std::string round_trace(int position) const;
     struct RowScore {
         std::int64_t greedy = -1;
         float gap = 0.0f;
