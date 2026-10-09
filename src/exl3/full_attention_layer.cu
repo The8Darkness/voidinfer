@@ -7537,10 +7537,31 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             if(cudaMalloc(reinterpret_cast<void**>(&p),bytes)!=cudaSuccess)
                 throw std::runtime_error("L0 OSCAR storage allocation");
         };
+        // NINFER_EXL3_L0_GROWABLE (default 1): the INT2 code/meta planes keep
+        // one max_context address range per layer, physically backed only up
+        // to the rows the context occupies (released at request reset).
+        static const bool growable=[] {
+            const char* value=std::getenv("NINFER_EXL3_L0_GROWABLE");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        if(growable) {
+            const std::array<std::size_t,4> bytes{{cells*l0_oscar::kCodeBytes,cells*l0_oscar::kCodeBytes,
+                cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t),cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t)}};
+            for(std::size_t i=0;i<l0_regions_.size();++i) {
+                l0_regions_[i]=std::make_unique<Exl3GrowableDeviceRegion>();
+                l0_regions_[i]->reserve(bytes[i]);
+            }
+            l.k_codes=l0_regions_[0]->data<std::uint8_t>();
+            l.v_codes=l0_regions_[1]->data<std::uint8_t>();
+            l.k_meta=l0_regions_[2]->data<std::uint16_t>();
+            l.v_meta=l0_regions_[3]->data<std::uint16_t>();
+            ensure_l0_rows(0);
+        } else {
         alloc(l.k_codes,cells*l0_oscar::kCodeBytes);
         alloc(l.v_codes,cells*l0_oscar::kCodeBytes);
         alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
         alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+        }
         alloc(l.state,2*sizeof(int));
         cudaMemset(l.state,0,2*sizeof(int));
         const std::size_t ring_bytes=static_cast<std::size_t>(l0_oscar::kRingRows)*kKVHeads*kHeadDim*2;
@@ -7617,6 +7638,28 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
     if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
         cudaMalloc(&fakequant_watermark_, 4 * sizeof(int)) == cudaSuccess)
         cudaMemset(fakequant_watermark_, 0, 4 * sizeof(int));
+}
+
+void Exl3FullAttentionLayer::ensure_l0_rows(int rows) {
+    if(!l0_regions_[0])return;
+    // Growth margin: one 4096-row prompt block plus the window ring keeps host
+    // map calls rare (one per granule of rows).
+    const std::size_t target=static_cast<std::size_t>(std::min(cache_capacity_,
+        std::max(rows,0)+4096+l0_oscar::kRingRows))*kKVHeads;
+    l0_regions_[0]->ensure(target*l0_oscar::kCodeBytes);
+    l0_regions_[1]->ensure(target*l0_oscar::kCodeBytes);
+    l0_regions_[2]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+    l0_regions_[3]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+}
+
+void Exl3FullAttentionLayer::release_l0_rows_beyond(int rows) {
+    if(!l0_regions_[0])return;
+    const std::size_t keep=static_cast<std::size_t>(std::min(cache_capacity_,
+        std::max(rows,0)+4096+l0_oscar::kRingRows))*kKVHeads;
+    l0_regions_[0]->shrink(keep*l0_oscar::kCodeBytes);
+    l0_regions_[1]->shrink(keep*l0_oscar::kCodeBytes);
+    l0_regions_[2]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+    l0_regions_[3]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
 }
 
 void Exl3FullAttentionLayer::set_oscar(Exl3OscarContext* oscar, int model_layer) noexcept {
@@ -7696,6 +7739,7 @@ void Exl3FullAttentionLayer::l0_download_history(int first,int rows,std::uint8_t
 void Exl3FullAttentionLayer::l0_upload_history(int first,int rows,const std::uint8_t* codes,
     const std::uint16_t* meta,cudaStream_t stream) {
     if(!l0_.k_codes || rows<=0) return;
+    ensure_l0_rows(first+rows);
     if(first<0 || first+rows>l0_.capacity) throw std::invalid_argument("L0 OSCAR resume extent");
     const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kCodeBytes;
     const std::size_t meta_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kMetaFloats;

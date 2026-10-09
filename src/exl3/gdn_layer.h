@@ -586,7 +586,9 @@ public:
     // Production contexts skip trace-only work: the per-forward recurrent
     // state-before copy (3 MB per layer) and the packed conv-output/head copies;
     // only diagnostics and tests read those trace() fields.
-    void set_skip_state_trace(bool skip) noexcept { skip_state_trace_ = skip; }
+    // Skipping the state-before trace also releases its 3 MiB per layer (the
+    // remaining restore copies write a process-wide sink nobody reads).
+    void set_skip_state_trace(bool skip);
     // The next GDN layer of the stack: this layer's decode down reduction also
     // writes the successor's input RMS norm into the successor's input-norm
     // buffer, and the successor skips its own norm for exactly that input.
@@ -885,6 +887,7 @@ private:
     std::array<float*, 6> small_float_buffers_{};
     int small_rows_ = 0;
     bool small_tier_active_ = false;
+    void* small_trace_storage_ = nullptr;
     void require_tier_rows(int rows) const;
     std::array<std::size_t,22> half_buffer_bytes_{};
     std::array<std::size_t,5> wide_half_buffer_bytes_{};
@@ -906,6 +909,7 @@ private:
     std::uint16_t* conv_state_ = nullptr;
     std::uint16_t* conv_state_trace_ = nullptr;
     DeviceArena* op_workspace_ = nullptr;
+    bool op_workspace_released_ = false;
     std::array<Exl3CudaLinearWorkspace*, 6> linear_workspaces_{};
     Exl3CudaReconstructGemmWorkspace* reconstruct_gemm_ = nullptr;
     Exl3TargetProjectionTiming* projection_timing_ = nullptr;

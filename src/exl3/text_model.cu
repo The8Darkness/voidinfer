@@ -795,6 +795,7 @@ struct Exl3TextModel::Impl {
     mutable std::shared_ptr<Exl3SharedPromptPool> shared_prompt_pool;
     // Prompt-only FA2/WMMA32 attention partials shared by concurrent lanes.
     mutable std::shared_ptr<Exl3SharedPromptPool> shared_wmma;
+    mutable std::shared_ptr<Exl3SharedPromptPool> shared_hidden;
 
     TensorPayload load_tensor(const IndexedSafetensors& input, const std::string& name) {
         const auto start = std::chrono::steady_clock::now();
@@ -1465,10 +1466,17 @@ struct Exl3TextContext::Impl {
     // <= small_tier_rows. PromptTierScope selects the pool around larger passes.
     std::shared_ptr<Exl3SharedPromptPool> shared_prompt_pool;
     std::shared_ptr<Exl3SharedPromptPool> shared_wmma;
+    std::shared_ptr<Exl3SharedPromptPool> shared_hidden;
+    std::uint16_t* large_hidden_a = nullptr;
+    std::uint16_t* large_hidden_b = nullptr;
     void* small_tier_storage = nullptr;
     int small_tier_rows = 0;
     int prompt_tier_depth = 0;
-    void select_prompt_tier(bool prompt) {
+    void select_prompt_tier(bool prompt,int position,cudaStream_t stream) {
+        if(large_hidden_a) {
+            std::swap(hidden_a,large_hidden_a);
+            std::swap(hidden_b,large_hidden_b);
+        }
         for(auto& layer:full_layers)if(layer)layer->set_prompt_tier(prompt);
         for(auto& layer:gdn_layers)if(layer)layer->set_prompt_tier(prompt);
     }
@@ -3236,6 +3244,12 @@ struct Exl3TextContext::Impl {
     // Batched multi-agent continuation: this context's all-row verification
     // head over its rows of a shared layer stack (the all_head_rows path of
     // process_rows).
+    void ensure_l0_rows(int rows) {
+        for(auto& layer:full_layers)if(layer)layer->ensure_l0_rows(rows);
+    }
+    void release_l0_rows_beyond(int rows) {
+        for(auto& layer:full_layers)if(layer)layer->release_l0_rows_beyond(rows);
+    }
     void finish_batched_continuation(const std::uint16_t* hidden,int rows,int position,
                                      cudaStream_t stream) {
         require(continuation && continuation->capacity>=rows && rows>=2,
@@ -3295,6 +3309,12 @@ struct Exl3TextContext::Impl {
                 (layer_end==layer_begin+1 && gdn_layers[layer_begin] &&
                  gdn_prepared->rows==rows && !include_embedding),
                 "bulk GDN prepared input requires one layer and matching rows");
+        {
+            cudaStreamCaptureStatus capturing=cudaStreamCaptureStatusNone;
+            cuda_check(cudaStreamIsCapturing(stream,&capturing),"query forward capture for L0 backing");
+            // Captured launches read live positions; replays back their rows.
+            if(capturing==cudaStreamCaptureStatusNone)ensure_l0_rows(position+rows);
+        }
         retain_host_kv_forward_stream(stream);
         const bool fast_same_weights_wide_candidate =
             fast_same_weights_fp16kv_prefill_enabled && wide_prefill && rows>=256 &&
@@ -4854,8 +4874,12 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         return value && std::strcmp(value,"1")==0;
     }();
     const auto visit_base_allocations=[&](auto&& allocate) {
-        allocate(hidden_bytes,reinterpret_cast<void**>(&impl->hidden_a),"allocate E4A hidden A");
-        allocate(hidden_bytes,reinterpret_cast<void**>(&impl->hidden_b),"allocate E4A hidden B");
+        // Concurrent lanes keep 32-row hidden planes; the prompt-block planes
+        // live in the model's shared pool (swapped by the prompt tier).
+        const std::size_t private_hidden_bytes=share_prompt_rows?
+            static_cast<std::size_t>(32)*kHidden*sizeof(std::uint16_t):hidden_bytes;
+        allocate(private_hidden_bytes,reinterpret_cast<void**>(&impl->hidden_a),"allocate E4A hidden A");
+        allocate(private_hidden_bytes,reinterpret_cast<void**>(&impl->hidden_b),"allocate E4A hidden B");
         if (impl->gdn_bulk_prefill_enabled) {
             const auto bulk_rows=static_cast<std::size_t>(impl->gdn_bulk_capacity);
             allocate(bulk_rows*kHidden*sizeof(std::uint16_t),
@@ -5202,12 +5226,17 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     if(impl->host_kv.enabled)impl->host_kv.layer_workspace_bytes=required_kv_bytes;
     };
     Exl3ResourceInventory::Requirement tap_requirement;
-    if(capture_taps)tap_requirement.add(Exl3ResourceInventory::Domain::device,kTapLayers.size()+1,hidden_bytes);
+    // Taps and the embedding trace hold one forward's rows (at most the
+    // prefill capacity: layer-major blocks capture chunk by chunk), not the
+    // whole L0 prompt block that hidden A/B keep.
+    const std::size_t tap_plane_bytes=std::min(hidden_bytes,
+        static_cast<std::size_t>(impl->prefill_capacity)*kHidden*sizeof(std::uint16_t));
+    if(capture_taps)tap_requirement.add(Exl3ResourceInventory::Domain::device,kTapLayers.size()+1,tap_plane_bytes);
     const auto tap_extent=tap_requirement.units[static_cast<unsigned>(Exl3ResourceInventory::Domain::device)];
     require(tap_extent<=std::numeric_limits<std::size_t>::max(),"target tap extent overflow");
     const auto materialize_taps=[&] {
       if(capture_taps) {
-        const std::size_t tap_bytes=hidden_bytes;
+        const std::size_t tap_bytes=tap_plane_bytes;
         const auto expected_tap_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
             impl->persistent_bytes,static_cast<std::size_t>(tap_extent));
         for (std::size_t i = 0; i < kTapLayers.size(); ++i) {
@@ -5215,8 +5244,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->persistent_bytes += tap_bytes;
             impl->taps[i] = std::move(tap);
         }
-        impl->embedding_trace = impl->make_private_allocation(hidden_bytes, "allocate E4A embedding trace");
-        impl->persistent_bytes += hidden_bytes;
+        impl->embedding_trace = impl->make_private_allocation(tap_bytes, "allocate E4A embedding trace");
+        impl->persistent_bytes += tap_bytes;
         require(impl->persistent_bytes==expected_tap_persistent,"target tap allocation requirement mismatch");
       }
     };
@@ -5587,6 +5616,23 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     materialize_kv();trace_stage("kv");
     materialize_taps();trace_stage("taps");
     materialize_shared();trace_stage("shared");
+    if(share_prompt_rows) {
+        require(tiered,"shared prompt hidden planes require the tiered prompt pool");
+        std::lock_guard lock(impl->model->shared_numeric_mutex);
+        auto& pool=impl->model->shared_hidden;
+        if(!pool) {
+            auto created=std::make_shared<Exl3SharedPromptPool>();
+            for(std::size_t i=0;i<2;++i) {
+                cuda_check(cudaMalloc(&created->data[i],hidden_bytes),"allocate shared prompt hidden plane");
+                created->bytes[i]=hidden_bytes;
+            }
+            pool=std::move(created);
+        }
+        require(pool->bytes[0]==hidden_bytes,"shared prompt hidden geometry differs between contexts");
+        impl->large_hidden_a=static_cast<std::uint16_t*>(pool->data[0]);
+        impl->large_hidden_b=static_cast<std::uint16_t*>(pool->data[1]);
+        impl->shared_hidden=pool;
+    }
     if(share_prompt_rows && impl->fast_wmma32_split_capacity) {
         constexpr std::size_t rows=1024;
         const std::array<std::size_t,2> extents{{
@@ -5749,9 +5795,9 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     if(tiered) {
         constexpr int small_rows=32;   // four agents' verifier rows
         const auto small=Exl3LinearWorkspaceRequirements::derive(17408,17408,small_rows);
-        // Coherent continuation routes use up to 10 K partitions, and paired
-        // gate/up projections stack two planes in one accumulation view.
-        const std::size_t accumulation_bytes=small.accumulation_bytes*4;
+        // The widest small-tier use is the paired 16-row gate/up route (two
+        // stacked 10-partition planes) = 32-row M32 calls at 5 partitions x 4.
+        const std::size_t accumulation_bytes=small.accumulation_bytes*2;
         const std::size_t transform_bytes=small.transformed_bytes*2;
         const std::size_t scratch_bytes=std::max(Exl3GdnLayer::shared_scratch_bytes(small_rows),
             Exl3FullAttentionLayer::shared_scratch_bytes(small_rows,false));
@@ -8318,21 +8364,25 @@ void Exl3TextContext::set_layer_observer_for_test(
 // Selects the shared prompt pool for passes wider than the context's small
 // tier (concurrent Engine lanes run those exclusively); nests.
 struct Exl3TextContext::PromptTierScope {
-    PromptTierScope(Exl3TextContext::Impl& impl,std::size_t rows)
-        : impl_(impl),active_(impl.small_tier_rows && rows>static_cast<std::size_t>(impl.small_tier_rows)) {
-        if(active_ && impl_.prompt_tier_depth++==0)impl_.select_prompt_tier(true);
+    PromptTierScope(Exl3TextContext& context,std::size_t rows,cudaStream_t stream)
+        : context_(context),impl_(*context.impl_),stream_(stream),
+          active_(impl_.small_tier_rows && rows>static_cast<std::size_t>(impl_.small_tier_rows)) {
+        if(active_ && impl_.prompt_tier_depth++==0)impl_.select_prompt_tier(true,context_.position_,stream_);
     }
     ~PromptTierScope() {
-        if(active_ && --impl_.prompt_tier_depth==0)impl_.select_prompt_tier(false);
+        if(active_ && --impl_.prompt_tier_depth==0)
+            impl_.select_prompt_tier(false,context_.position_,stream_);
     }
     PromptTierScope(const PromptTierScope&)=delete;
     PromptTierScope& operator=(const PromptTierScope&)=delete;
+    Exl3TextContext& context_;
     Exl3TextContext::Impl& impl_;
+    cudaStream_t stream_;
     bool active_;
 };
 
 void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStream_t stream) {
-    const PromptTierScope prompt_tier(*impl_,token_ids.size());
+    const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
@@ -8401,7 +8451,7 @@ void Exl3TextContext::append_prefill_wide(std::span<const std::int64_t> token_id
 
 void Exl3TextContext::append_prefill_impl(std::span<const std::int64_t> token_ids,
                                         cudaStream_t stream, bool wide, bool exact) {
-    const PromptTierScope prompt_tier(*impl_,token_ids.size());
+    const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
@@ -8512,7 +8562,7 @@ bool Exl3TextContext::l0_layer_major_headroom() const {
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
-    const PromptTierScope prompt_tier(*impl_,token_ids.size());
+    const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
     if (Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->l0_layer_major_block) {
         // L0 OSCAR contexts hold per-row buffers for one block of
         // kL0PrefillBlockRows: the suffix is ingested layer-major block by
@@ -8962,7 +9012,7 @@ void Exl3TextContext::append_prefill_layer_major(
 
 void Exl3TextContext::append_media_embeddings_numeric(std::span<const float> embeddings,
     std::span<const std::int32_t> positions_xyz,cudaStream_t stream){
-    const PromptTierScope prompt_tier(*impl_,embeddings.size());
+    const PromptTierScope prompt_tier(*this,embeddings.size(),stream);
     Impl::require_host_kv_retirement_admission();
     require(impl_->media_features&&impl_->media_positions&&impl_->host_kv.enabled&&impl_->capture_taps&&
         !impl_->oscar&&!impl_->graph_active&&!impl_->graph_capture_active&&!impl_->host_kv_failed&&
@@ -9462,7 +9512,7 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
 
 void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
                                     cudaStream_t stream) {
-    const PromptTierScope prompt_tier(*impl_,token_ids.size());
+    const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->host_kv_failed,"HostKV continuation requires intact transfer lineage");
@@ -9764,6 +9814,8 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
     if(graph) {
         // Replay bypasses the host-side retained-prefix arming of the eager
         // forwards; reproduce it per agent exactly as the per-layer graphs do.
+        for(std::size_t c=0;c<count_contexts;++c)
+            contexts[c]->impl_->ensure_l0_rows(base_positions[c]+static_cast<int>(tokens[c].size()));
         graph->executable.launch(stream);
         ++batched_graph_replays_;
         impl_->last_stack_output=graph->stack_output;
@@ -9921,6 +9973,8 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view c
     if(std::exchange(impl_->fail_request_reset_completion_for_test,false))
         throw std::runtime_error("injected request reset completion failure");
     cuda_check(cudaDeviceSynchronize(),"complete request context reset");
+    // Growable L0 planes return backing beyond the retained frontier.
+    impl_->release_l0_rows_beyond(position_);
     const auto complete=std::chrono::steady_clock::now();
     ++impl_->request_generation;
     return Exl3RequestResetStats{
@@ -11363,6 +11417,7 @@ void Exl3TextContext::continue_rows_graph(
     try {
         require(selected_roles,"selected continuation graph roles disappeared");
         selected_roles->begin_use(selected_roles->generation(),replay_serial);
+        impl_->ensure_l0_rows(position_+rows);
         if (rows == 8) continuation.graph_executable.launch(stream);
         else additional->executable.launch(stream);
         ++continuation.graph_stats.replay_submissions;
@@ -11619,6 +11674,7 @@ void Exl3TextContext::decode_graph(std::int64_t token_id, cudaStream_t stream) {
     embedding_lookup_kernel<<<(kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->token_ids, impl_->model->embedding, impl_->hidden_a, 1);
     cuda_check(cudaGetLastError(), "launch E4B2 graph embedding lookup");
+    impl_->ensure_l0_rows(position_+1);
     impl_->graph_executable.launch(stream);
     impl_->last_rows = 1;
     impl_->qkv_trace_valid = true;

@@ -1822,9 +1822,20 @@ void gopt_gdn_pack_fixture(bool fused,const std::uint16_t* core,
     check(cudaGetLastError(),"GOPT output pack fixture");
 }
 
+// Concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): the
+// prompt-scale beta/g traces (float buffers 4/5) come from the shared pool
+// too; each layer keeps a private small-tier copy (enable_small_tier).
+static bool tiered_gdn_traces() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    return enabled;
+}
+
 std::size_t Exl3GdnLayer::shared_scratch_bytes(int rows) {
     if(rows<=0) throw std::invalid_argument("GDN shared scratch rows");
-    std::size_t per_row=(4*kHeads+2*kKeyHeads*kHeadDim+kHeads)*sizeof(float);
+    std::size_t per_row=((tiered_gdn_traces()?6:4)*kHeads+2*kKeyHeads*kHeadDim+kHeads)*sizeof(float);
     for(std::size_t i=0;i<kHalfBufferFeatures.size();++i)
         if(transient_half(i)) per_row+=kHalfBufferFeatures[i]*sizeof(std::uint16_t);
     return static_cast<std::size_t>(rows)*per_row;
@@ -1844,7 +1855,8 @@ std::size_t Exl3GdnLayer::fixed_owner_metadata_bytes() const noexcept {
     auto bytes=bounded_shared_allocation_bytes<Exl3GdnLayer>();
     for(const auto& owner:buffer_retirements_)if(owner)bytes+=Exl3LayerBufferRetirement::record_bytes();
     for(const auto* workspace:linear_workspaces_)if(workspace)bytes+=Exl3CudaLinearWorkspace::metadata_bytes();
-    if(op_workspace_)bytes+=sizeof(DeviceArena);
+    // Released trace/arena storage keeps its planned owner metadata.
+    if(op_workspace_ || op_workspace_released_)bytes+=sizeof(DeviceArena);
     return bytes;
 }
 std::size_t Exl3GdnLayer::workspace_bytes_required(int rows,bool borrowed_accumulation,
@@ -1863,7 +1875,7 @@ std::size_t Exl3GdnLayer::workspace_bytes_required(int rows,bool borrowed_accumu
         const auto extent_rows=split_wide && is_split_half(i)?std::min(rows,kPrivateRetentionRows):rows;
         add(static_cast<std::size_t>(extent_rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t));
     }
-    add(static_cast<std::size_t>(rows)*(borrowed_scratch?2:6)*kHeads*sizeof(float));
+    add(static_cast<std::size_t>(rows)*(borrowed_scratch?(tiered_gdn_traces()?0:2):6)*kHeads*sizeof(float));
     if(resident && !borrowed_scratch)add(static_cast<std::size_t>(rows)*(2*kKeyHeads*kHeadDim+kHeads)*sizeof(float));
     add(kStateBytes);add(kStateBytes);add(kConvStateStorageBytes);add(kConvStateBytes);add(1u<<20);
     return bytes;
@@ -2127,7 +2139,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
         }
         for (std::size_t i=0;i<float_buffers_.size();++i) {
             const auto bytes=control_bytes;
-            if(scratch.data && i<4) {
+            if(scratch.data && (i<4 || tiered_gdn_traces())) {
                 float_buffers_[i]=reinterpret_cast<float*>(borrow(bytes));
             } else {
                 allocate_buffer(22+static_cast<unsigned>(i),reinterpret_cast<void**>(&float_buffers_[i]),bytes,
@@ -2184,10 +2196,16 @@ void Exl3GdnLayer::enable_small_tier(const Exl3SmallTierViews& views) {
         cursor+=static_cast<std::size_t>(views.rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t);
     }
     small_float_buffers_=float_buffers_;
-    for(std::size_t i=0;i<float_buffers_.size();++i) {
-        if(float_buffer_owned_[i])continue;
+    for(std::size_t i=0;i<4;++i) {
         small_float_buffers_[i]=reinterpret_cast<float*>(cursor);
         cursor+=static_cast<std::size_t>(views.rows)*kHeads*sizeof(float);
+    }
+    if(tiered_gdn_traces()) {
+        // Retained beta/g traces: private per layer at the small-tier rows.
+        const std::size_t bytes=static_cast<std::size_t>(views.rows)*kHeads*sizeof(float);
+        check(cudaMalloc(&small_trace_storage_,2*bytes),"allocate GDN small-tier traces");
+        small_float_buffers_[4]=static_cast<float*>(small_trace_storage_);
+        small_float_buffers_[5]=reinterpret_cast<float*>(static_cast<std::byte*>(small_trace_storage_)+bytes);
     }
     for(auto* workspace:linear_workspaces_)if(workspace)workspace->attach_small_tier(views);
     small_rows_=views.rows;
@@ -2207,7 +2225,33 @@ void Exl3GdnLayer::require_tier_rows(int rows) const {
         throw std::logic_error("GDN rows exceed the small tier (prompt tier not selected)");
 }
 
+void Exl3GdnLayer::set_skip_state_trace(bool skip) {
+    skip_state_trace_ = skip;
+    static const bool release=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_RELEASE_STATE_TRACE");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(!skip || !release || !buffer_retirements_[30] || !buffer_retirements_[30]->bytes())return;
+    static void* sink=[] {
+        void* pointer=nullptr;
+        check(cudaMalloc(&pointer,kStateBytes),"allocate GDN state trace sink");
+        return pointer;
+    }();
+    check(cudaDeviceSynchronize(),"drain GDN state trace before release");
+    buffer_retirements_[30]->retire();
+    // The operation arena has no consumer on these routes either.
+    if(op_workspace_ && buffer_retirements_[33] && buffer_retirements_[33]->bytes()) {
+        delete op_workspace_;
+        op_workspace_=nullptr;
+        op_workspace_released_=true;
+        buffer_retirements_[33]->retire();
+    }
+    recurrent_state_before_=static_cast<float*>(sink);
+    trace_.state_before=recurrent_state_before_;
+}
+
 Exl3GdnLayer::~Exl3GdnLayer() {
+    if(small_trace_storage_)(void)cudaFree(small_trace_storage_);
     for(auto& owner:buffer_retirements_)if(owner)owner->retire();
     delete op_workspace_;
     for (auto*& workspace : linear_workspaces_) Exl3CudaLinearWorkspace::retire_slot(workspace);

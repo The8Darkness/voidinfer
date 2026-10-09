@@ -3,6 +3,7 @@
 #include "exl3/linear_cuda.h"
 #include "exl3/sibling_rows.h"
 #include "exl3/l0_oscar_storage.h"
+#include "exl3/growable_device_region.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/attention_page_ranges.h"
 #include "exl3/attention_position_contract.h"
@@ -692,6 +693,11 @@ public:
     // Context owning this layer: L0 decode scratch is shared by the layers of
     // one context only (set before set_kv_cache).
     void set_l0_scratch_owner(const void* owner) noexcept { l0_scratch_owner_ = owner; }
+    // Growable L0 planes: back rows [0, rows) (plus margin) before a forward
+    // may touch them; release backing beyond `rows` once nothing in flight
+    // references it (request reset).
+    void ensure_l0_rows(int rows);
+    void release_l0_rows_beyond(int rows);
     // Concurrent Engine lanes: binds the context's small (<= views.rows) tier
     // and selects it. The prompt tier (the shared prompt-scale views given at
     // construction) is selected only around exclusive prompt/verifier passes.
@@ -935,6 +941,7 @@ private:
     int* fakequant_watermark_ = nullptr;
     // L0 OSCAR INT2 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
     l0_oscar::LayerStorage l0_{};
+    std::array<std::unique_ptr<Exl3GrowableDeviceRegion>,4> l0_regions_{};
     // Arguments of attention_middle(): the stateful core between the Q/K/V
     // projections and the output projection (see full_attention_layer.cu).
     struct AttentionMiddle {

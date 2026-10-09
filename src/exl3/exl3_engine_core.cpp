@@ -536,7 +536,7 @@ struct Exl3EngineCore::Impl {
             if(!std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
                 _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
             if(!std::getenv("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
-                _putenv_s("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB","768");
+                _putenv_s("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"256":"768");
             // Prompt-scale passes are exclusive across lanes: one reconstruct
             // workspace serves every lane.
             if(!std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
@@ -845,6 +845,12 @@ struct Exl3EngineCore::Impl {
         // roots is planned and transacted through `coordinator`. A future loader
         // preflight API must return the same owner/domain/extent manifest before
         // this boundary before weight construction can join startup reservation.
+        if(std::getenv("NINFER_EXL3_MEMORY_TRACE")) {
+            cudaFree(nullptr);
+            std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);
+            std::fprintf(stderr,"STARTUP_MEMORY before_target used=%.1f MiB",(t-f)/1048576.0);
+            std::fputc(10,stderr);
+        }
         target=Exl3TextModel::load(value.exl3_package->target_directory,value.max_context,loading);
         if(public_media_enabled) {
             vision_model=make_bounded_shared<Exl3VisionModel>(
@@ -852,7 +858,15 @@ struct Exl3EngineCore::Impl {
             vision=make_bounded_shared<Exl3VisionContext>(*vision_model,1024,
                 Exl3EncodedMediaCacheLimits{});
         }
+        const auto trace_free=[](const char* stage) {
+            if(!std::getenv("NINFER_EXL3_MEMORY_TRACE"))return;
+            std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);
+            std::fprintf(stderr,"STARTUP_MEMORY %s used=%.1f MiB",stage,(t-f)/1048576.0);
+            std::fputc(10,stderr);
+        };
+        trace_free("after_target");
         drafts[0]=Exl3Dflash2DraftModel::load_impl(value.exl3_package->draft_directory,true);
+        trace_free("after_draft");
         // Contexts and optional caches join after the single initial bind.
         std::size_t scratch=vision?vision->device_bytes():0;
         for(std::uint32_t i=0;i<value.max_concurrency;++i){
@@ -1098,6 +1112,9 @@ struct Exl3EngineCore::Impl {
                 // The coherent route admits the ordinary graph families unless
                 // the eager fallback is selected.  The families themselves are
                 // selected by their own switches and captured at context creation.
+                static const bool lane_memory_trace=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+                const auto free_mib=[] {std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);return f/1048576.0;};
+                const double lane_free0=lane_memory_trace?free_mib():0.0;
                 auto context=target->create_context_reserved(coordinator,true,
                     context_startup_fault>=90 && context_startup_fault<=100?context_startup_fault-73:
                     (context_startup_fault==88?16:(context_startup_fault==86?11:(fault<=4?fault:0))),
@@ -1106,6 +1123,7 @@ struct Exl3EngineCore::Impl {
                 context->prepare_continuation_reserved(coordinator,8,
                     context_startup_fault==89?6:(context_startup_fault==87?5:(fault>=5 && fault<=7?fault-4:0)));
                 const auto continuation_bytes=context->persistent_bytes()-base_context_bytes;
+                const double lane_free1=lane_memory_trace?free_mib():0.0;
                 const auto before_repair_checkpoint=context->persistent_bytes();
                 const auto* repair_checkpoint=std::getenv("NINFER_EXL3_REPAIR_CHECKPOINT");
                 if(repair_checkpoint && std::string_view(repair_checkpoint)!="0" &&
@@ -1119,8 +1137,12 @@ struct Exl3EngineCore::Impl {
                 }
                 const auto repair_checkpoint_bytes=
                     context->persistent_bytes()-before_repair_checkpoint;
+                const double lane_free2=lane_memory_trace?free_mib():0.0;
                 lanes[i]=Exl3Dflash2Execution::create_reserved(coordinator,std::move(context),
                     drafts[i],identity.contract(),streams[i]->value,streams[i],fault>=8?fault-7:0);
+                if(lane_memory_trace)std::fprintf(stderr,
+                    "LANE_MEMORY lane=%u context+continuation=%.1f repair=%.1f execution=%.1f MiB\n",i,
+                    lane_free0-lane_free1,lane_free1-lane_free2,lane_free2-free_mib());
                 ++stats.reserved_context_startup_lanes;
                 stats.reserved_context_startup_device_bytes+=base_context_bytes;
                 stats.reserved_context_fixed_owner_metadata_bytes+=Exl3TextContext::fixed_owner_metadata_bytes();
