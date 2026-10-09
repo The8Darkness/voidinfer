@@ -8879,9 +8879,11 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 const auto hot=l0_oscar::hot_view(l0_);
                 // Every history CTA runs its share of the exact hot tiles first;
                 // their partials follow the INT2 segment partials.
-                const int hot_ctas=std::min(l0_hot_tiles(l0_.hot_slots),l0_.segments);
-                const int slot_stride=l0_.segments*kL0HistoryStreams+hot_ctas;
-                const dim3 grid(l0_.segments,kKVHeads);
+                const int segments=history_lanes_>1?
+                    std::max(4,l0_.segments/history_lanes_):l0_.segments;
+                const int hot_ctas=std::min(l0_hot_tiles(l0_.hot_slots),segments);
+                const int slot_stride=segments*kL0HistoryStreams+hot_ctas;
+                const dim3 grid(segments,kKVHeads);
                 const auto history=[&](auto kernel) {
                     static const bool configured=[&] {
                         cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -8891,13 +8893,13 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                     (void)configured;
                     kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes(),stream>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
                         reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.hist_work,rows,position,cache_capacity_,
-                        l0_.segments,position_device_,slot_stride,hot,hot_config.log2_tau,qr,
+                        segments,position_device_,slot_stride,hot,hot_config.log2_tau,qr,
                         hot_config.lambda);
                 };
                 if(hot_ctas) history(l0_history_mma_kernel<64,true>);
                 else history(l0_history_mma_kernel<64,false>);
                 l0_history_merge_kernel<<<rows*kQHeads+(hot_ctas?kKVHeads:0),256,0,stream>>>(l0_.hist_work,
-                    l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,l0_.segments,
+                    l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,segments,
                     l0_.segment_keys,position,cache_capacity_,position_device_,slot_stride,hot_ctas,
                     hot_ctas?l0_.hot_ref:nullptr,hot_ctas?l0_.hist_hot:nullptr,hot,hot_config.insert,
                     hot_config.lambda);
@@ -10097,15 +10099,17 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 kp+row*weights_.k_metadata.out_features,
                 vp+row*weights_.v_metadata.out_features,
                 attn+row*kQHeads*kHeadDim,peer.rows,peer.position,launch,
-                peer.stream?peer.stream:stream,preserve_m1_topology);
+                peer.stream?peer.stream:stream,preserve_m1_topology,batch_->peer_count+1);
             if(fork_peers)cuda_check(cudaEventRecord(batch_->join_events[static_cast<std::size_t>(i)],launch),
                 "attention peer join");
             first+=peer.rows;
         }
         if(first!=rows)throw std::logic_error("full-attention batched segment rows");
     }
+    history_lanes_=batch_?batch_->peer_count+1:1;
     attention_middle(AttentionMiddle{input_norm,qg,kp,vp,qn,kn,qr,kr,attn,gp,own_rows,position,stream,
         profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix,starts,ends});
+    history_lanes_=1;
     if(fork_peers)
         for(int i=0;i<batch_->peer_count;++i)
             cuda_check(cudaStreamWaitEvent(stream,batch_->join_events[static_cast<std::size_t>(i)],0),
@@ -10327,9 +10331,12 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
 // output returns to the owner's O-projection input.
 void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
     const std::uint16_t* kp_source,const std::uint16_t* vp_source,std::uint16_t* attn_destination,
-    int rows,int position,cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology) {
+    int rows,int position,cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology,
+    int lanes) {
     if(rows<1 || rows>max_rows_ || position<0)
         throw std::invalid_argument("full-attention peer segment rows/position");
+    struct LanesScope { int& value; LanesScope(int& v,int lanes):value(v){value=lanes;} ~LanesScope(){value=1;} }
+        lanes_scope(history_lanes_,lanes);
     require_tier_rows(rows);
     retained_prefix_available_ = false;
     retained_prefix_cleared_by_ = "peer segment";

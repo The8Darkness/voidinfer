@@ -977,8 +977,12 @@ private:
     void attention_middle(const AttentionMiddle& m);
     void run_peer_segment(const std::uint16_t* qg_source,const std::uint16_t* kp_source,
         const std::uint16_t* vp_source,std::uint16_t* attn_destination,int rows,int position,
-        cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology);
+        cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology,int lanes=1);
     const Batch* batch_ = nullptr;
+    // Agents sharing the current batched forward: the L0 verifier history
+    // splits into kHistorySegments / lanes segments per agent, so every
+    // agent's history CTAs fill one wave together.
+    int history_lanes_ = 1;
     const void* l0_scratch_owner_ = nullptr;
     bool l0_exact_ = false;          // verifier/decode rows (<= 8)
     bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)

@@ -863,7 +863,9 @@ bool gdn_decode_tiled_enabled() {
 }
 
 template<int kMax>
-__global__ void __launch_bounds__(kGdnChunkThreads) gdn_recurrence_chunk_kernel(
+// Two CTAs per SM (<= 128 registers): 192 CTAs fit one wave, and the
+// cores of batched agents co-reside instead of queueing whole waves.
+__global__ void __launch_bounds__(kGdnChunkThreads,2) gdn_recurrence_chunk_kernel(
     const std::uint16_t* q,const std::uint16_t* k,const std::uint16_t* v,const float* g,
     const float* beta,float* state,std::uint16_t* output,int rows,const int* chain_rows=nullptr,
     const int* state_write=nullptr) {
