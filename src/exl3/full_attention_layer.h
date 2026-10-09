@@ -662,6 +662,9 @@ public:
     // L0 OSCAR: after the host K/V planes were restored to `position`, reload
     // the device window (sink and recent rows) and re-encode the history.
     void l0_refresh_window(int position, cudaStream_t stream);
+    // Concurrent lanes: switch between the private decode window ring and the
+    // shared prompt-scale ring, carrying the window rows of `position`.
+    void l0_select_ring(bool prompt, int position, cudaStream_t stream);
     // Parks / reinstalls the encoded INT2 history (rows [0, watermark)).
     // Export returns the watermark; import follows l0_refresh_window.
     int l0_history_watermark(cudaStream_t stream) const;
@@ -942,6 +945,13 @@ private:
     // L0 OSCAR INT2 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
     l0_oscar::LayerStorage l0_{};
     std::array<std::unique_ptr<Exl3GrowableDeviceRegion>,4> l0_regions_{};
+    // Window ring rows (keys wrap modulo) and the shared prompt-scale ring of
+    // concurrent lanes (l0_select_ring).
+    int l0_ring_rows_ = 2048;
+    int l0_other_ring_rows_ = 2048;
+    std::uint16_t* l0_prompt_k_ring_ = nullptr;
+    std::uint16_t* l0_prompt_v_ring_ = nullptr;
+    bool l0_prompt_ring_active_ = false;
     // Arguments of attention_middle(): the stateful core between the Q/K/V
     // projections and the output projection (see full_attention_layer.cu).
     struct AttentionMiddle {

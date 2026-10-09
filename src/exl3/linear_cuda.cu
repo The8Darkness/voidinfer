@@ -6713,7 +6713,7 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         transformed_owned_ = false;
     } else {
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&transformed_), transformed_bytes),
-                   "cudaMalloc EXL3 transformed workspace");
+                   "cudaMalloc EXL3 transformed workspace"); { static const bool trace_alloc=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr; if(trace_alloc && transformed_bytes>=(256u<<10)) std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB LINEAR transformed %dx%d rows=%d%c",transformed_bytes/1048576.0,in_features_,out_features_,max_rows_,10); }
     }
     try {
         const auto constructor_failure=constructor_failure_for_test_;
@@ -6727,7 +6727,7 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
             accum_owned_ = false;
         } else {
             cuda_check(cudaMalloc(reinterpret_cast<void**>(&accum_), accum_bytes),
-                       "cudaMalloc EXL3 accumulation workspace");
+                       "cudaMalloc EXL3 accumulation workspace"); { static const bool trace_alloc=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr; if(trace_alloc && accum_bytes>=(256u<<10)) std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB LINEAR accum %dx%d rows=%d%c",accum_bytes/1048576.0,in_features_,out_features_,max_rows_,10); }
         }
     } catch (...) {
         if(!accum_)storage_retirement_->accumulation_credit.reset();
@@ -6915,7 +6915,8 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
 };
 
 std::size_t Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
-    int in_features,int out_features,int rows,bool accept_transpose_shape) {
+    int in_features,int out_features,int rows,bool accept_transpose_shape,
+    bool accept_all_model_shapes) {
     if(in_features<=0 || out_features<=0 || rows<=0 ||
         in_features%kHadamard!=0 || out_features%kHadamard!=0)
         throw std::invalid_argument("T69 reconstruct GEMM dimensions");
@@ -6924,7 +6925,8 @@ std::size_t Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
     const auto input=accept_transpose_shape?std::max(in_features,out_features):in_features;
     const auto output=accept_transpose_shape?std::max(in_features,out_features):out_features;
     required.add(Domain::device,rows,static_cast<std::uint64_t>(input)*sizeof(std::uint16_t));
-    required.add(Domain::device,in_features,static_cast<std::uint64_t>(out_features)*sizeof(std::uint16_t));
+    required.add(Domain::device,1,static_cast<std::uint64_t>(reconstruction_plane_elements(
+        in_features,out_features,accept_all_model_shapes))*sizeof(std::uint16_t));
     required.add(Domain::device,rows,
         static_cast<std::uint64_t>(output)*sizeof(float) +
         static_cast<std::uint64_t>(output / 16)*sizeof(int));
@@ -6937,7 +6939,8 @@ std::size_t Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
 Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     int in_features, int out_features, int max_rows,
     bool accept_transpose_shape, bool accept_all_model_shapes) : impl_(nullptr) {
-    const auto required_bytes=workspace_bytes_required(in_features,out_features,max_rows,accept_transpose_shape);
+    const auto required_bytes=workspace_bytes_required(in_features,out_features,max_rows,
+        accept_transpose_shape,accept_all_model_shapes);
     impl_=new Impl{};
     if (in_features <= 0 || out_features <= 0 || max_rows <= 0 ||
         in_features % kHadamard != 0 || out_features % kHadamard != 0) {
@@ -7135,8 +7138,8 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     const std::size_t transformed_bytes = static_cast<std::size_t>(max_rows) *
         (accept_transpose_shape ? maximum_features : in_features) *
         sizeof(std::uint16_t);
-    const std::size_t reconstructed_bytes = static_cast<std::size_t>(in_features) *
-        out_features * sizeof(std::uint16_t);
+    const std::size_t reconstructed_bytes = reconstruction_plane_elements(
+        in_features, out_features, accept_all_model_shapes) * sizeof(std::uint16_t);
     const std::size_t accumulation_width = accept_transpose_shape
         ? static_cast<std::size_t>(maximum_features)
         : static_cast<std::size_t>(out_features);
@@ -7356,6 +7359,8 @@ bool Exl3CudaReconstructGemmWorkspace::supports(
             metadata.out_features > 0 &&
             metadata.in_features <= impl_->in_features &&
             metadata.out_features <= impl_->out_features &&
+            static_cast<std::size_t>(metadata.in_features) * metadata.out_features <=
+                reconstruction_plane_elements(impl_->in_features, impl_->out_features, true) &&
             metadata.in_features % kHadamard == 0 &&
             metadata.out_features % kHadamard == 0;
         const bool k5_layer=(metadata.K==5 || metadata.K==4) &&
@@ -13849,7 +13854,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             transformed_input, weights.trellis, weights.mul1, accum_, rows,
             in_features_, out_features_, metadata.K);
     } else {
-        throw std::invalid_argument("EXL3 CUDA supports at most 16 rows");
+        throw std::invalid_argument("EXL3 CUDA supports at most 16 rows (K="+std::to_string(metadata.K)+" in="+std::to_string(in_features_)+" out="+std::to_string(out_features_)+" rows="+std::to_string(rows)+" admission="+std::to_string(static_cast<int>(admission))+")");
     }
 
     cuda_check(cudaGetLastError(), "launch EXL3 packed GEMV");

@@ -52,6 +52,24 @@
 #include <Windows.h>
 
 namespace ninfer::exl3 {
+// NINFER_EXL3_MEMORY_TRACE: runtime device-memory movement (>8 MiB) at
+// prompt-pass and round boundaries.
+static void runtime_memory_mark(const char* stage,unsigned lane) {
+    static const bool enabled=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    if(!enabled)return;
+    static std::mutex mutex;static std::size_t last=0;
+    std::size_t free=0,total=0;
+    if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return;
+    const std::lock_guard lock(mutex);
+    const auto delta=static_cast<long long>(last)-static_cast<long long>(free);
+    if(last && (delta<0?-delta:delta)<(8LL<<20))return;
+    std::size_t stack=0;(void)cudaDeviceGetLimit(&stack,cudaLimitStackSize);
+    std::fprintf(stderr,"RUNTIME_MEMORY %s lane=%u free=%.1f MiB delta=%.1f MiB stack=%zu%c",stage,lane,
+        free/1048576.0,last?delta/1048576.0:0.0,stack,10);
+    last=free;
+}
+
+
 namespace {
 using Clock=std::chrono::steady_clock;
 using Root=std::shared_ptr<const Exl3VeriCacheRequest>;
@@ -529,7 +547,7 @@ struct Exl3EngineCore::Impl {
             // buffers and let exclusive prompt ingestion use a smaller
             // layer-major reserve, so both lanes keep the fast prefill.
             if(!std::getenv("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS"))
-                _putenv_s("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS","4096");
+                _putenv_s("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS",value.max_concurrency>=5?"2048":"4096");
             // Decode keeps 1 GiB of device headroom; the retained layer-major
             // projection cache is capped instead (one layer's projections at
             // C3+). Oversubscribed WDDM memory corrupts batched graph replays.
@@ -541,6 +559,14 @@ struct Exl3EngineCore::Impl {
             // workspace serves every lane.
             if(!std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
                 _putenv_s("NINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
+            // The default 1 KiB per-thread stack reserves ~256 MiB of local
+            // memory for every resident thread; the driver raises the limit
+            // for any kernel that needs more. NINFER_EXL3_STACK_BYTES overrides.
+            {
+                const char* requested=std::getenv("NINFER_EXL3_STACK_BYTES");
+                const std::size_t stack=requested?std::strtoull(requested,nullptr,10):256;
+                if(stack)(void)cudaDeviceSetLimit(cudaLimitStackSize,stack);
+            }
 
         }
         const auto flag=[](const char* name) {
@@ -2078,6 +2104,7 @@ struct Exl3EngineCore::Impl {
         }
         const auto& vericache=Exl3VeriCacheConfig::get();
         std::optional<PromptPass> prefill_pass;
+        runtime_memory_mark("prefill_begin",lane_index);
         prefill_pass.emplace(*this,stream);
         try {
             (void)context->reset_for_request(identity.contract());
@@ -2249,6 +2276,7 @@ struct Exl3EngineCore::Impl {
             round->begin_prefilled();
             check(cudaStreamSynchronize(stream));
             prefill_pass.reset();
+            runtime_memory_mark("prefill_end",lane_index);
             device_lease=coordinator.enter_device_logical(*host_lease,
                 std::static_pointer_cast<const void>(lane),context->position(),
                 allowance,options.max_context);
@@ -2346,6 +2374,7 @@ struct Exl3EngineCore::Impl {
                     const BatchedInactive verify_inactive(lane_batched_verify[lane_index]);
                     const PromptPass verify_pass(*this,stream);
                     const auto verified=round->verify(unverified,vericache.delta);
+                    runtime_memory_mark("verify",lane_index);
                     lt_verify+=lt_ms(lt_mark);
                     unverified.clear();
                     terminal_seen=false;

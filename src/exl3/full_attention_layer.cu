@@ -1,3 +1,4 @@
+#include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/sibling_rows.cuh"
 #include "exl3/kv_fakequant.cuh"
@@ -7534,8 +7535,10 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         l.segments=l0_oscar::kHistorySegments;
         const std::size_t cells=static_cast<std::size_t>(capacity)*kKVHeads;
         const auto alloc=[](auto*& p,std::size_t bytes) {
-            if(cudaMalloc(reinterpret_cast<void**>(&p),bytes)!=cudaSuccess)
+            if(exl3_packed_malloc(reinterpret_cast<void**>(&p),bytes)!=cudaSuccess)
                 throw std::runtime_error("L0 OSCAR storage allocation");
+            static const bool trace_alloc=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+            if(trace_alloc && bytes>=(256u<<10))std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB FA L0%c",bytes/1048576.0,10);
         };
         // NINFER_EXL3_L0_GROWABLE (default 1): the INT2 code/meta planes keep
         // one max_context address range per layer, physically backed only up
@@ -7547,14 +7550,20 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         if(growable) {
             const std::array<std::size_t,4> bytes{{cells*l0_oscar::kCodeBytes,cells*l0_oscar::kCodeBytes,
                 cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t),cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t)}};
+            // A meta plane within one 2 MiB granule (contexts up to 64K)
+            // is allocated exactly instead of a granule-backed range.
+            constexpr std::size_t kGranule=2u<<20;
             for(std::size_t i=0;i<l0_regions_.size();++i) {
+                if(i>=2 && bytes[i]<=kGranule)continue;
                 l0_regions_[i]=std::make_unique<Exl3GrowableDeviceRegion>();
                 l0_regions_[i]->reserve(bytes[i]);
             }
             l.k_codes=l0_regions_[0]->data<std::uint8_t>();
             l.v_codes=l0_regions_[1]->data<std::uint8_t>();
-            l.k_meta=l0_regions_[2]->data<std::uint16_t>();
-            l.v_meta=l0_regions_[3]->data<std::uint16_t>();
+            if(l0_regions_[2])l.k_meta=l0_regions_[2]->data<std::uint16_t>();
+            else alloc(l.k_meta,bytes[2]);
+            if(l0_regions_[3])l.v_meta=l0_regions_[3]->data<std::uint16_t>();
+            else alloc(l.v_meta,bytes[3]);
             ensure_l0_rows(0);
         } else {
         alloc(l.k_codes,cells*l0_oscar::kCodeBytes);
@@ -7564,9 +7573,38 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         }
         alloc(l.state,2*sizeof(int));
         cudaMemset(l.state,0,2*sizeof(int));
-        const std::size_t ring_bytes=static_cast<std::size_t>(l0_oscar::kRingRows)*kKVHeads*kHeadDim*2;
+        // Concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1;
+        // NINFER_EXL3_L0_RING_TIER=0 disables): rounds (<= 32 rows) use a
+        // private ring of the exact window plus one round; prompt passes
+        // (exclusive) switch to one 2048-row ring shared per layer, copying
+        // the live window rows across on the device (l0_select_ring).
+        static const bool tiered_ring=[] {
+            const char* shared=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            const char* value=std::getenv("NINFER_EXL3_L0_RING_TIER");
+            return shared && std::strcmp(shared,"1")==0 && !(value && std::strcmp(value,"0")==0);
+        }();
+        const int small_ring_rows=(l0_oscar::recent_rows()+2*l0_oscar::kAlign-1+32+
+            l0_oscar::kAlign-1)/l0_oscar::kAlign*l0_oscar::kAlign;
+        const bool small_ring=tiered_ring && small_ring_rows<l0_oscar::kRingRows;
+        const int ring_rows=small_ring?small_ring_rows:l0_oscar::kRingRows;
+        l0_ring_rows_=ring_rows;
+        l0_other_ring_rows_=l0_oscar::kRingRows;
+        const std::size_t ring_bytes=static_cast<std::size_t>(ring_rows)*kKVHeads*kHeadDim*2;
         const std::size_t sink_bytes=static_cast<std::size_t>(l0_oscar::kSink)*kKVHeads*kHeadDim*2;
         alloc(l.k_ring,ring_bytes); alloc(l.v_ring,ring_bytes);
+        if(small_ring) {
+            static std::mutex shared_ring_mutex;
+            static std::map<const void*,std::pair<std::uint16_t*,std::uint16_t*>> shared_rings;
+            const std::lock_guard lock(shared_ring_mutex);
+            auto& shared=shared_rings[weights_.q.trellis];
+            if(!shared.first) {
+                const std::size_t large=static_cast<std::size_t>(l0_oscar::kRingRows)*kKVHeads*kHeadDim*2;
+                alloc(shared.first,large);
+                alloc(shared.second,large);
+            }
+            l0_prompt_k_ring_=shared.first;
+            l0_prompt_v_ring_=shared.second;
+        }
         alloc(l.k_sink,sink_bytes); alloc(l.v_sink,sink_bytes);
         // NINFER_EXL3_L0_EXACT (research): 1 = exact history everywhere,
         // prefill / decode = only for prefill chunks / verifier rows.
@@ -7640,26 +7678,29 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         cudaMemset(fakequant_watermark_, 0, 4 * sizeof(int));
 }
 
+static constexpr int kL0GrowthMarginRows=1024;
+
 void Exl3FullAttentionLayer::ensure_l0_rows(int rows) {
     if(!l0_regions_[0])return;
-    // Growth margin: one 4096-row prompt block plus the window ring keeps host
-    // map calls rare (one per granule of rows).
+    // Every forward and graph replay ensures its own end row first; the
+    // margin only spaces host map calls (backing grows in 2 MiB granules,
+    // 8192 code rows).
     const std::size_t target=static_cast<std::size_t>(std::min(cache_capacity_,
-        std::max(rows,0)+4096+l0_oscar::kRingRows))*kKVHeads;
+        std::max(rows,0)+kL0GrowthMarginRows))*kKVHeads;
     l0_regions_[0]->ensure(target*l0_oscar::kCodeBytes);
     l0_regions_[1]->ensure(target*l0_oscar::kCodeBytes);
-    l0_regions_[2]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
-    l0_regions_[3]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+    if(l0_regions_[2])l0_regions_[2]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+    if(l0_regions_[3])l0_regions_[3]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
 }
 
 void Exl3FullAttentionLayer::release_l0_rows_beyond(int rows) {
     if(!l0_regions_[0])return;
     const std::size_t keep=static_cast<std::size_t>(std::min(cache_capacity_,
-        std::max(rows,0)+4096+l0_oscar::kRingRows))*kKVHeads;
+        std::max(rows,0)+kL0GrowthMarginRows))*kKVHeads;
     l0_regions_[0]->shrink(keep*l0_oscar::kCodeBytes);
     l0_regions_[1]->shrink(keep*l0_oscar::kCodeBytes);
-    l0_regions_[2]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
-    l0_regions_[3]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+    if(l0_regions_[2])l0_regions_[2]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+    if(l0_regions_[3])l0_regions_[3]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
 }
 
 void Exl3FullAttentionLayer::set_oscar(Exl3OscarContext* oscar, int model_layer) noexcept {
@@ -7677,7 +7718,46 @@ void Exl3FullAttentionLayer::append_sibling_row_copies(Exl3SiblingRowCopies& out
             cache+static_cast<std::size_t>(destination)*row,row,1,row});
     if(l0_.k_ring)
         for(auto* ring:{l0_.k_ring,l0_.v_ring})
-            out.push_back({ring,ring,row,1,row,l0_oscar::kRingRows-1,source,destination});
+            out.push_back({ring,ring,row,1,row,l0_ring_rows_,source,destination});
+}
+
+void Exl3FullAttentionLayer::l0_select_ring(bool prompt,int position,cudaStream_t stream) {
+    if(!l0_prompt_k_ring_ || prompt==l0_prompt_ring_active_)return;
+    std::uint16_t* const from_k=l0_.k_ring;
+    std::uint16_t* const from_v=l0_.v_ring;
+    const int from_rows=l0_ring_rows_;
+    std::swap(l0_.k_ring,l0_prompt_k_ring_);
+    std::swap(l0_.v_ring,l0_prompt_v_ring_);
+    std::swap(l0_ring_rows_,l0_other_ring_rows_);
+    l0_prompt_ring_active_=prompt;
+    constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim;
+    const int window=std::max(l0_oscar::kSink,l0_oscar::history_end(position));
+    // Entering a prompt pass: the pass may rewind (VeriCache verify blocks)
+    // and needs every key the 2048-row ring would hold. Rows older than the
+    // live window come from the authoritative FP16 L2 record.
+    if(prompt && k_cache_ && v_cache_) {
+        const int oldest=std::max(l0_oscar::kSink,position-l0_ring_rows_+1);
+        for(int first=oldest;first<window;) {
+            const int to_slot=first%l0_ring_rows_;
+            const int rows=std::min(window-first,l0_ring_rows_-to_slot);
+            const std::size_t at=static_cast<std::size_t>(first)*row;
+            for(int plane=0;plane<2;++plane)
+                cuda_check(cudaMemcpyAsync((plane?l0_.v_ring:l0_.k_ring)+to_slot*row,
+                    (plane?v_cache_:k_cache_)+at,rows*row*sizeof(std::uint16_t),
+                    cudaMemcpyDefault,stream),"L0 OSCAR prompt ring history fill");
+            first+=rows;
+        }
+    }
+    // Carry the live window rows [max(kSink, history_end), position) across.
+    for(int first=window;first<position;) {
+        const int from_slot=first%from_rows,to_slot=first%l0_ring_rows_;
+        const int rows=std::min({position-first,from_rows-from_slot,l0_ring_rows_-to_slot});
+        for(int plane=0;plane<2;++plane)
+            cuda_check(cudaMemcpyAsync((plane?l0_.v_ring:l0_.k_ring)+to_slot*row,
+                (plane?from_v:from_k)+from_slot*row,rows*row*sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice,stream),"L0 OSCAR window ring switch");
+        first+=rows;
+    }
 }
 
 void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream) {
@@ -7692,8 +7772,8 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
     copy(l0_.v_sink,v_cache_,sink);
     // Ring rows cover [max(kSink, history_end(position)), position), split at the wrap.
     for(int first=std::max(l0_oscar::kSink,l0_oscar::history_end(position));first<position;) {
-        const int slot=first&(l0_oscar::kRingRows-1);
-        const int rows=std::min(position-first,l0_oscar::kRingRows-slot);
+        const int slot=first%l0_ring_rows_;
+        const int rows=std::min(position-first,l0_ring_rows_-slot);
         const std::size_t at=static_cast<std::size_t>(first)*kKVHeads*kHeadDim;
         const std::size_t to=static_cast<std::size_t>(slot)*kKVHeads*kHeadDim;
         copy(l0_.k_ring+to,k_cache_+at,rows);
@@ -7711,6 +7791,21 @@ void Exl3FullAttentionLayer::l0_rewind(int position, cudaStream_t stream) {
     if(!l0_.k_codes) return;
     l0_oscar::rewind_kernel<<<16,256,0,stream>>>(l0_.state,l0_oscar::hot_view(l0_),position);
     cuda_check(cudaGetLastError(),"L0 OSCAR verified-root rewind");
+    // A window ring smaller than 2048 rows no longer holds the window of a
+    // rewound position: rebuild it from the FP16 L2 record.
+    if(l0_.k_ring && l0_ring_rows_<l0_oscar::kRingRows && k_cache_ && v_cache_) {
+        constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim;
+        for(int first=std::max(l0_oscar::kSink,l0_oscar::history_end(position));first<position;) {
+            const int slot=first%l0_ring_rows_;
+            const int rows=std::min(position-first,l0_ring_rows_-slot);
+            const std::size_t at=static_cast<std::size_t>(first)*row;
+            for(int plane=0;plane<2;++plane)
+                cuda_check(cudaMemcpyAsync((plane?l0_.v_ring:l0_.k_ring)+slot*row,
+                    (plane?v_cache_:k_cache_)+at,rows*row*sizeof(std::uint16_t),
+                    cudaMemcpyDefault,stream),"L0 OSCAR rewound window fill");
+            first+=rows;
+        }
+    }
 }
 
 int Exl3FullAttentionLayer::l0_history_watermark(cudaStream_t stream) const {
@@ -8116,7 +8211,8 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
         launch(cudaGetLastError(), "append EXL3 attention KV cache");
         if (l0_.k_codes) {
             l0_oscar::window_append_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
-                kr,vp,l0_.k_ring,l0_.v_ring,l0_.k_sink,l0_.v_sink,rows,position,position_device_);
+                kr,vp,l0_.k_ring,l0_.v_ring,l0_.k_sink,l0_.v_sink,rows,position,position_device_,
+                l0_ring_rows_);
             const auto& a=l0_oscar::assets();
             // Hot slots won last round are filled from L2 beside the encode.
             struct HotBranch { cudaStream_t side=nullptr; cudaEvent_t fork=nullptr,join=nullptr; };
@@ -8199,7 +8295,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
         if (l0_prefill_history>l0_oscar::kSink) {
             if(capture_active_ || rows>l0_.prefill_rows || direct_staged_rows_ ||
                exact_prefix_rows_ || exact_page_ranges_.count ||
-               position+rows-l0_prefill_history>l0_oscar::kRingRows)
+               position+rows-l0_prefill_history>l0_ring_rows_)
                 throw std::invalid_argument("L0 OSCAR prefill route preconditions");
             if(l0_exact_prefill_) {
                 // Exact history from the FP16 L2 planes, merged straight into split 4.
@@ -8224,7 +8320,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
             }
             launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
                 cache_capacity_,l0_.prefill_split,l0_.prefill_split_stats,stream,
-                l0_prefill_history,false,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                l0_prefill_history,false,l0_.k_sink,l0_.v_sink,l0_ring_rows_);
             attention_wmma32_split_merge_kernel<5><<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
                 l0_.prefill_split,l0_.prefill_split_stats,attn,rows);
             launch(cudaGetLastError(),"L0 OSCAR prefill attention");
@@ -8240,15 +8336,15 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 fast_wmma32_split2_capacity_rows_>=rows && exl3_fa2_prefill_enabled()) {
                 // L0 OSCAR while every key still fits the device sink and window
                 // ring: read them there, not from the host-mapped cache.
-                const bool l0_window=l0_.k_ring && position+rows<=l0_oscar::kRingRows;
+                const bool l0_window=l0_.k_ring && position+rows<=l0_ring_rows_;
                 if(l0_window && position+rows>=2048)
                     launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
                         cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream,
-                        0,true,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                        0,true,l0_.k_sink,l0_.v_sink,l0_ring_rows_);
                 else if(l0_window)
                     launch_fa2_prefill_variant<1>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
                         cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream,
-                        0,true,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                        0,true,l0_.k_sink,l0_.v_sink,l0_ring_rows_);
                 else
                     launch_fa2_prefill(qr,attention_k,attention_v,attn,rows,position,
                         cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream);
@@ -8810,7 +8906,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 launch_verify_flash_mma(qr,l0_.k_ring,l0_.v_ring,exact_scores_,
                     exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
                     attn,rows,position,cache_capacity_,position_device_,stream,0,
-                    history_slot,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                    history_slot,l0_.k_sink,l0_.v_sink,l0_ring_rows_);
             else if(mma)
                 launch_verify_flash_mma(qr,attention_k,attention_v,exact_scores_,
                     exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
@@ -9598,12 +9694,13 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         const bool target_k5_candidate = rowwise && !wide_prefill &&
             workspace->target_k5_small_m_batch_candidate(
                 metadata, rows, target_k5_admission);
+        const auto coherent_admission =
+            operation == Exl3TargetProjectionOperator::gate ||
+            operation == Exl3TargetProjectionOperator::up
+                ? Exl3CudaLinearAdmission::target_continuation_gate_up
+                : target_k5_admission;
         const bool target_coherent_candidate = rowwise && !wide_prefill &&
-            workspace->coherent_continuation_candidate(metadata, rows,
-                operation == Exl3TargetProjectionOperator::gate ||
-                operation == Exl3TargetProjectionOperator::up
-                    ? Exl3CudaLinearAdmission::target_continuation_gate_up
-                    : target_k5_admission);
+            workspace->coherent_continuation_candidate(metadata, rows, coherent_admission);
         const bool target_small_m_candidate =
             target_gateup_candidate || target_down_candidate ||
             target_o_k7_candidate || target_wide_candidate || target_kv_candidate ||
@@ -9753,6 +9850,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                            ? Exl3CudaLinearAdmission::target_continuation_down
                            : (target_o_k7_candidate
                                    ? Exl3CudaLinearAdmission::target_continuation_o
+                                   : target_coherent_candidate
+                                   ? coherent_admission
                                    : Exl3CudaLinearAdmission::ordinary));
             // Batched rounds (2-4 agents, up to 32 rows) take the coherent
             // continuation routes (M16, or M32 for 17..32 rows).

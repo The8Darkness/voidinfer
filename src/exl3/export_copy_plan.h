@@ -31,8 +31,10 @@ public:
         explicit operator bool() const noexcept {return status==0;}
     };
 
+    // coalesce=false keeps this range a separate copy (sources that are
+    // distinct allocations may be address-adjacent in a packed pool).
     bool add(void* destination,const void* source,std::size_t bytes,
-             Exl3ExportPrecision precision,bool contains_padding=false) {
+             Exl3ExportPrecision precision,bool contains_padding=false,bool coalesce=true) {
         const auto element=precision==Exl3ExportPrecision::fp16?2ULL:4ULL;
         if(!destination || !source || !bytes || bytes%element)
             throw std::invalid_argument("export copy range identity/precision");
@@ -41,7 +43,7 @@ public:
         if(bytes>std::numeric_limits<std::uintptr_t>::max()-destination_address ||
            bytes>std::numeric_limits<std::uintptr_t>::max()-source_address)
             throw std::invalid_argument("export copy range overflow");
-        if(count_ && !contains_padding && !last_contains_padding_) {
+        if(count_ && coalesce && !contains_padding && !last_contains_padding_) {
             auto& previous=segments_[count_-1];
             const auto previous_destination=
                 reinterpret_cast<std::uintptr_t>(previous.destination);
@@ -65,7 +67,7 @@ public:
         segments_[count_++]={destination,source,bytes,1,precision};
         ++logical_ranges_;
         logical_bytes_=next_logical_bytes;
-        last_contains_padding_=contains_padding;
+        last_contains_padding_=contains_padding || !coalesce;
         return true;
     }
 

@@ -60,20 +60,22 @@ constexpr int kMetaFloats = 4;           // scale0, zero0, scale1, zero1 (FP16)
 constexpr int kRingRows = 2048;          // > sink-free exact window (<= 320) + one 1024-row prefill chunk
 
 // Device row of absolute key `key` in a window-ring addressed K or V plane.
-// With sink == nullptr and ring_mask == -1 this is the plain linear cache.
-__host__ __device__ __forceinline__ std::size_t window_row(int key, bool sink, int ring_mask) {
-    return static_cast<std::size_t>(sink && key < kSink ? key : (key & ring_mask));
+// With sink == nullptr and ring_rows == -1 this is the plain linear cache.
+// The ring holds ring_rows (any multiple of 64) consecutive keys.
+__host__ __device__ __forceinline__ std::size_t window_row(int key, bool sink, int ring_rows) {
+    return static_cast<std::size_t>(sink && key < kSink ? key :
+        (ring_rows < 0 ? key : key % ring_rows));
 }
 
 // Writes appended rows into the window ring (and the sink rows).
 __global__ void window_append_kernel(const std::uint16_t* k, const std::uint16_t* v,
     std::uint16_t* k_ring, std::uint16_t* v_ring, std::uint16_t* k_sink, std::uint16_t* v_sink,
-    int rows, int position, const int* position_device) {
+    int rows, int position, const int* position_device, int ring_rows = kRingRows) {
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * kKVHeadsL0 * kDim) return;
     const int row = index / (kKVHeadsL0 * kDim), offset = index % (kKVHeadsL0 * kDim);
     const int slot = (position_device ? *position_device : position) + row;
-    const std::size_t ring = static_cast<std::size_t>(slot & (kRingRows - 1)) * kKVHeadsL0 * kDim + offset;
+    const std::size_t ring = static_cast<std::size_t>(slot % ring_rows) * kKVHeadsL0 * kDim + offset;
     k_ring[ring] = k[index];
     v_ring[ring] = v[index];
     if (slot < kSink) {

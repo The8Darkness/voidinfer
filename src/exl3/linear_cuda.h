@@ -314,7 +314,15 @@ public:
 
     std::size_t workspace_bytes() const noexcept;
     static std::size_t workspace_bytes_required(int in_features,int out_features,int rows,
-        bool accept_transpose_shape);
+        bool accept_transpose_shape,bool accept_all_model_shapes=false);
+    // FP16 reconstruction plane elements: every model projection fits
+    // 17408 x 5120, so the all-model-shapes workspace is not in x out.
+    static std::size_t reconstruction_plane_elements(int in_features,int out_features,
+        bool accept_all_model_shapes) noexcept {
+        const auto full=static_cast<std::size_t>(in_features)*static_cast<std::size_t>(out_features);
+        constexpr std::size_t largest_projection=17408ull*5120ull;
+        return accept_all_model_shapes && full>largest_projection?largest_projection:full;
+    }
     Exl3ReconstructGemmStats stats() const noexcept;
     bool supports(const Exl3CudaLinearMetadata& metadata,
                   int rows) const noexcept;

@@ -1,3 +1,4 @@
+#include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/sibling_rows.cuh"
 #include "exl3/gaming_operator_fixture.h"
@@ -2119,7 +2120,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
             std::optional<Exl3VeriCacheServingCoordinator::ConstructorCredits> credits;
             if(constructor_authority)credits.emplace(constructor_authority->reserve_constructor_credits(
                 bytes,Exl3LayerBufferRetirement::record_bytes()));
-            check(cudaMalloc(pointer,bytes),label);
+            check(exl3_packed_malloc(pointer,bytes),label);static const bool trace_alloc=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;if(trace_alloc && bytes>=(256u<<10))std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB GDN %s%c",bytes/1048576.0,label,10);
             buffer_retirements_[slot]->adopt(*pointer,bytes,buffer_device);
             if(credits)buffer_retirements_[slot]->attach(std::move(credits->device),std::move(credits->metadata));
             if(buffer_fault_for_test==1 || buffer_fault_for_test==3) {
@@ -2433,11 +2434,12 @@ void Exl3GdnLayer::save_checkpoint(const Exl3GdnLayerCheckpoint& checkpoint,
 void Exl3GdnLayer::record_checkpoint_copy_nodes(
     const Exl3GdnLayerCheckpoint& checkpoint,cudaStream_t stream) const {
     validate_checkpoint_storage(checkpoint);
+    // cudaMemcpyDefault: checkpoints may live in mapped host memory.
     check(cudaMemcpyAsync(checkpoint.recurrent_state_device, recurrent_state_, kStateBytes,
-                          cudaMemcpyDeviceToDevice, stream),
+                          cudaMemcpyDefault, stream),
           "save EXL3 GDN recurrent checkpoint");
     check(cudaMemcpyAsync(checkpoint.conv_state_device, conv_state_, kConvStateStorageBytes,
-                          cudaMemcpyDeviceToDevice, stream),
+                          cudaMemcpyDefault, stream),
           "save EXL3 GDN convolution checkpoint");
 }
 
@@ -2495,14 +2497,14 @@ void Exl3GdnLayer::restore_checkpoint(const Exl3GdnLayerCheckpoint& checkpoint, 
     current_checkpoint_recurrent_ = nullptr;
     current_checkpoint_conv_ = nullptr;
     check(cudaMemcpyAsync(recurrent_state_, checkpoint.recurrent_state_device, kStateBytes,
-                          cudaMemcpyDeviceToDevice, stream),
+                          cudaMemcpyDefault, stream),
           "restore EXL3 GDN recurrent checkpoint");
     if (checkpoint.recurrent_state_device != recurrent_state_before_)
-        check(cudaMemcpyAsync(recurrent_state_before_, checkpoint.recurrent_state_device,
+        check(cudaMemcpyAsync(recurrent_state_before_, recurrent_state_,
                               kStateBytes,cudaMemcpyDeviceToDevice,stream),
               "restore EXL3 GDN recurrent state trace");
     check(cudaMemcpyAsync(conv_state_, checkpoint.conv_state_device, kConvStateStorageBytes,
-                          cudaMemcpyDeviceToDevice, stream),
+                          cudaMemcpyDefault, stream),
           "restore EXL3 GDN convolution checkpoint");
     exl3_launch_small(copy_conv_state_trace_kernel,dim3((kConvStateElements + 255) / 256),dim3(256),0,stream,
         conv_state_, conv_state_trace_);
@@ -2601,7 +2603,7 @@ void Exl3GdnLayer::enqueue_retained_prefix_reconstruct(
     const Exl3GdnLayerCheckpoint& checkpoint, int retained_rows, int attempted_rows,
     cudaStream_t stream) const {
     check(cudaMemcpyAsync(recurrent_state_, checkpoint.recurrent_state_device,
-                          kStateBytes, cudaMemcpyDeviceToDevice, stream),
+                          kStateBytes, cudaMemcpyDefault, stream),
           "restore EXL3 GDN retained prefix recurrent base");
     // The state-before buffer is a trace: the next forward rewrites it before
     // any consumer reads it, so the repair may skip restoring it.
@@ -2614,7 +2616,7 @@ void Exl3GdnLayer::enqueue_retained_prefix_reconstruct(
     }();
     if (checkpoint.recurrent_state_device != recurrent_state_before_ && !skip_trace_restore)
         check(cudaMemcpyAsync(recurrent_state_before_,checkpoint.recurrent_state_device,
-                              kStateBytes,cudaMemcpyDeviceToDevice,stream),
+                              kStateBytes,cudaMemcpyDefault,stream),
               "restore EXL3 GDN retained prefix recurrent trace");
     // Continuation history rows start at row 0 of the fixed attempt buffers.
     reconstruct_conv_prefix_kernel<<<(kQkv + 255) / 256, 256, 0, stream>>>(
@@ -3167,12 +3169,13 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         const bool target_k5_candidate = rowwise && !wide_prefill &&
             workspace->target_k5_small_m_batch_candidate(
                 metadata, rows, target_k5_admission);
+        const auto coherent_admission =
+            operation == Exl3TargetProjectionOperator::gate ||
+            operation == Exl3TargetProjectionOperator::up
+                ? Exl3CudaLinearAdmission::target_continuation_gate_up
+                : target_k5_admission;
         const bool target_coherent_candidate = rowwise && !wide_prefill &&
-            workspace->coherent_continuation_candidate(metadata, rows,
-                operation == Exl3TargetProjectionOperator::gate ||
-                operation == Exl3TargetProjectionOperator::up
-                    ? Exl3CudaLinearAdmission::target_continuation_gate_up
-                    : target_k5_admission);
+            workspace->coherent_continuation_candidate(metadata, rows, coherent_admission);
         const bool target_small_m_candidate =
             target_gateup_candidate || target_down_candidate ||
             target_o_k7_candidate || target_z_k6_candidate || target_wide_candidate ||
@@ -3338,6 +3341,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                            ? Exl3CudaLinearAdmission::target_continuation_down
                            : (target_o_k7_candidate
                                   ? Exl3CudaLinearAdmission::target_continuation_o
+                                  : target_coherent_candidate
+                                  ? coherent_admission
                                   : Exl3CudaLinearAdmission::ordinary));
             // Batched rounds (2-4 agents, up to 32 rows) take the coherent
             // continuation routes (M16, or M32 for 17..32 rows).

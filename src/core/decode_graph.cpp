@@ -3,6 +3,8 @@
 #include "core/device.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
@@ -101,6 +103,25 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
     return *this;
 }
 
+
+namespace {
+// NINFER_EXL3_MEMORY_TRACE: device memory taken by graph instantiation/upload.
+double graph_trace_free_mib() {
+    static const bool enabled=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    if(!enabled)return -1.0;
+    std::size_t free=0,total=0;
+    if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return -1.0;
+    return free/1048576.0;
+}
+void graph_trace_report(const char* stage,double before,std::size_t nodes) {
+    if(before<0)return;
+    const double after=graph_trace_free_mib();
+    if(before-after>=1.0)
+        std::fprintf(stderr,"GRAPH_MEMORY %s nodes=%zu took=%.1f MiB free=%.1f MiB%c",
+            stage,nodes,before-after,after,10);
+}
+} // namespace
+
 void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition) {
     CUDA_CHECK(definition.retirement_error_);
     if (!definition.ready()) {
@@ -137,8 +158,13 @@ void DecodeGraphExecutable::upload(cudaStream_t stream) {
     // The default upload and launch callback pointers aliased in an
     // Engine-linked Windows binary. Dispatch ordinary CUDA calls directly;
     // explicit providers remain available for failure injection.
+    const double before=graph_trace_free_mib();
     CUDA_CHECK(custom_provider_?provider_.upload(exec_,stream):
         cudaGraphUpload(exec_,stream));
+    if(before>=0) {
+        (void)cudaStreamSynchronize(stream);
+        graph_trace_report("upload",before,0);
+    }
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {

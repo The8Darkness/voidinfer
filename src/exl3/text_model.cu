@@ -1,3 +1,4 @@
+#include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/block_tree_sum.cuh"
 #include "exl3/text_model.h"
@@ -359,12 +360,32 @@ struct DeviceAllocation {
         if(l0_host_kv_plane(label)) {
             host_mapped=true;
             cuda_check(cudaHostAlloc(&ptr,bytes,cudaHostAllocMapped|cudaHostAllocPortable),label);
-        } else cuda_check(cudaMalloc(&ptr, bytes), label);
+        } else {
+            cuda_check(exl3_packed_malloc(&ptr, bytes), label);
+            static const bool trace=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+            if(trace && bytes>=(256u<<10))
+                std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB %s%c",bytes/1048576.0,label?label:"?",10);
+        }
     }
     static bool l0_host_kv_plane(const char* label) {
         const bool l0=Exl3NativeContextExtent::l0_oscar_enabled();
-        return l0 && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
-                               std::strcmp(label,"allocate E4A V cache")==0);
+        if(l0 && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
+                           std::strcmp(label,"allocate E4A V cache")==0))return true;
+        // Concurrent lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1) keep the
+        // VeriCache verified root (GDN state at the verified frontier) in
+        // mapped host memory: it is written once per verified block and read
+        // only on a correction, so ~154 MiB per lane leave the device for a
+        // few-millisecond PCIe copy per verify. NINFER_EXL3_HOST_VERIFIED_ROOT=0
+        // keeps it on the device.
+        static const bool host_root=[] {
+            const char* shared=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            const char* value=std::getenv("NINFER_EXL3_HOST_VERIFIED_ROOT");
+            if(value)return std::strcmp(value,"0")!=0;
+            return shared && std::strcmp(shared,"1")==0;
+        }();
+        return host_root && label &&
+            (std::strcmp(label,"allocate verified root recurrent state")==0 ||
+             std::strcmp(label,"allocate verified root convolution state")==0);
     }
     ~DeviceAllocation() {release();}
     DeviceAllocation(const DeviceAllocation&) = delete;
@@ -1477,7 +1498,10 @@ struct Exl3TextContext::Impl {
             std::swap(hidden_a,large_hidden_a);
             std::swap(hidden_b,large_hidden_b);
         }
-        for(auto& layer:full_layers)if(layer)layer->set_prompt_tier(prompt);
+        for(auto& layer:full_layers)if(layer) {
+            layer->set_prompt_tier(prompt);
+            layer->l0_select_ring(prompt,position,stream);
+        }
         for(auto& layer:gdn_layers)if(layer)layer->set_prompt_tier(prompt);
     }
     bool fast_same_weights_fp16kv_prefill_enabled = false;
@@ -5398,7 +5422,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
             numeric_workspace_in,numeric_workspace_out,
             impl->gdn_bulk_capacity ? impl->gdn_bulk_capacity : impl->prefill_capacity,
-            numeric_workspace_transpose):0;
+            numeric_workspace_transpose,fast_same_weights_all_model_shapes):0;
     const auto materialize_numeric=[&] {
       if(shared_numeric) {
         impl->numeric_prefill_projection_workspace=shared_numeric;
@@ -9448,9 +9472,9 @@ __global__ void sibling_row_copy_kernel(const Exl3SiblingRowCopy* entries,
     const std::ptrdiff_t shift=entry.slot_elements?
         static_cast<std::ptrdiff_t>(attempt_base)*entry.slot_elements:0;
     const std::ptrdiff_t src_shift=entry.ring_mask?
-        static_cast<std::ptrdiff_t>((attempt_base+entry.src_row)&entry.ring_mask)*entry.slot_elements:shift;
+        static_cast<std::ptrdiff_t>((attempt_base+entry.src_row)%entry.ring_mask)*entry.slot_elements:shift;
     const std::ptrdiff_t dst_shift=entry.ring_mask?
-        static_cast<std::ptrdiff_t>((attempt_base+entry.dst_row)&entry.ring_mask)*entry.slot_elements:shift;
+        static_cast<std::ptrdiff_t>((attempt_base+entry.dst_row)%entry.ring_mask)*entry.slot_elements:shift;
     for(int i=static_cast<int>(blockIdx.y*blockDim.x+threadIdx.x);i<entry.count;
         i+=static_cast<int>(gridDim.y*blockDim.x)) {
         const std::ptrdiff_t offset=static_cast<std::ptrdiff_t>(i)*entry.stride;
@@ -12354,7 +12378,7 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                     for(const auto& layer:impl_->gdn_layers)if(layer){
                         require(plan.add(slab->data+slab->offsets[index],
                             layer->recurrent_state_device(),recurrent_sizes[index]*4,
-                            Exl3ExportPrecision::fp32),
+                            Exl3ExportPrecision::fp32,false,false),
                             "recurrent export copy plan capacity");
                         ++index;
                     }
@@ -12442,14 +12466,14 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                 output.resize(l->recurrent_state_bytes()/sizeof(output[0]));
                 require(pageable_recurrent_plan.add(output.data(),
                     l->recurrent_state_device(),l->recurrent_state_bytes(),
-                    Exl3ExportPrecision::fp32),
+                    Exl3ExportPrecision::fp32,false,false),
                     "pageable recurrent export copy plan capacity");
             }
             auto& convolution=state->convolution_[gdn];
             convolution.resize(l->physical_conv_state_bytes()/sizeof(convolution[0]));
             require(convolution_plan.add(convolution.data(),
                 l->physical_conv_state_device(),l->physical_conv_state_bytes(),
-                Exl3ExportPrecision::fp16),
+                Exl3ExportPrecision::fp16,false,false),
                 "convolution export copy plan capacity");
             ++gdn;
         }
