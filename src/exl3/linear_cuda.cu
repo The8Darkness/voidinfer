@@ -7924,6 +7924,32 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         static_cast<std::size_t>(metadata.out_features) * sizeof(std::uint16_t);
     std::uint16_t* reconstructed = impl_->reconstructed;
     bool reconstruct_needed = true;
+    // A slot holds the operand this call will consume: the MXFP8 (E4M3 +
+    // E8M0 per 32) or NVFP4 (packed values, scales, global scale) image when
+    // the block-scaled route applies, else the FP16 weight. Sizing slots by
+    // that image lets a bounded cache keep whole layers resident.
+    const bool slot_block_scaled = impl_->mxfp8_enabled && fast_fp16_destination &&
+        !fused_original && rows >= 16 &&
+        metadata.in_features % 128 == 0 && metadata.out_features % 128 == 0;
+    const bool slot_mlp_shape =
+        (metadata.in_features == 5120 && metadata.out_features == 17408) ||
+        (metadata.in_features == 17408 && metadata.out_features == 5120);
+    const bool slot_gdn_qkvz_shape = metadata.in_features == 5120 &&
+        (metadata.out_features == 10240 || metadata.out_features == 6144);
+    const bool slot_nvfp4 = slot_block_scaled && (impl_->nvfp4_mode == 1 ||
+        (impl_->nvfp4_mode == 2 && slot_mlp_shape) ||
+        (impl_->nvfp4_mode == 4 && (slot_mlp_shape || slot_gdn_qkvz_shape)) ||
+        (impl_->nvfp4_mode == 3 && slot_mlp_shape && impl_->prefill_layer >= 0 &&
+         impl_->prefill_layer < 56));
+    const std::size_t elements =
+        static_cast<std::size_t>(metadata.in_features) * metadata.out_features;
+    static const bool compact_slots = [] {
+        const char* value = std::getenv("NINFER_EXL3_COMPACT_LAYER_MAJOR_SLOTS");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    const std::size_t slot_bytes = !compact_slots || !slot_block_scaled ? weight_bytes :
+        ((slot_nvfp4 ? elements / 2 + elements / 16 + sizeof(float) : elements + elements / 32) + 255) /
+            256 * 256;
     if (impl_->reuse_active && (!fused_original || original_gdn_mlp)) {
         Impl::ReuseSlot* slot = nullptr;
         for (std::size_t index = 0; index < impl_->reuse_used; ++index) {
@@ -7953,8 +7979,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
             slot->out_features = metadata.out_features;
             slot->K = metadata.K;
             slot->original_basis = fused_original;
-            if (slot->capacity < weight_bytes &&
-                impl_->reuse_capacity - slot->capacity + weight_bytes <=
+            if (slot->capacity < slot_bytes &&
+                impl_->reuse_capacity - slot->capacity + slot_bytes <=
                     impl_->reuse_budget) {
                 if (slot->data) {
                     cuda_check(cudaFree(slot->data),
@@ -7964,14 +7990,14 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                     slot->capacity = 0;
                 }
                 cuda_check(cudaMalloc(reinterpret_cast<void**>(&slot->data),
-                                      weight_bytes),
+                                      slot_bytes),
                            "allocate bounded layer-major weight slot");
-                slot->capacity = weight_bytes;
-                impl_->reuse_capacity += weight_bytes;
+                slot->capacity = slot_bytes;
+                impl_->reuse_capacity += slot_bytes;
                 impl_->stats.cached_weight_capacity_bytes = impl_->reuse_capacity;
             }
         }
-        if (slot->data && slot->capacity >= weight_bytes) {
+        if (slot->data && slot->capacity >= slot_bytes) {
             reconstructed = slot->data;
             if (slot->prefetch_pending) {
                 cuda_check(cudaStreamWaitEvent(stream,slot->prefetch_ready,0),
