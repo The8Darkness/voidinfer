@@ -438,6 +438,53 @@ struct Exl3EngineCore::Impl {
     // not qualified to overlap another lane's ingestion), decode rounds of all
     // lanes run together (shared).
     std::shared_mutex coherent_prefill_mutex;
+    // Prompt passes (ingestion, VeriCache verifier/fix/rewind) share the
+    // model's prompt-scale pool: they run one at a time, ordered on the device
+    // by prompt_pass_done, while other lanes keep decoding (their rounds use
+    // private small-tier state only) with NINFER_EXL3_PROMPT_PASS_OVERLAP=1
+    // (research: C4 176 -> 181 tok/s, but a C2 run hit an illegal address in
+    // draft completion). Default: device-exclusive passes.
+    std::mutex prompt_pass_mutex;
+    cudaEvent_t prompt_pass_done=nullptr;
+    bool prompt_pass_overlap=[] {
+        const char* value=std::getenv("NINFER_EXL3_PROMPT_PASS_OVERLAP");
+        return value && std::string_view(value)=="1";
+    }();
+    struct PromptPass {
+        Impl& engine;
+        cudaStream_t stream;
+        std::unique_lock<std::mutex> ordered;
+        std::unique_lock<std::shared_mutex> exclusive;
+        PromptPass(Impl& value,cudaStream_t pass_stream) : engine(value),stream(pass_stream) {
+            if(engine.prompt_pass_overlap) {
+                ordered=std::unique_lock(engine.prompt_pass_mutex);
+                if(engine.prompt_pass_done)
+                    check(cudaStreamWaitEvent(stream,engine.prompt_pass_done,0));
+            } else {
+                exclusive=std::unique_lock(engine.coherent_prefill_mutex);
+                if(engine.options.max_concurrency>1)check(cudaDeviceSynchronize());
+            }
+        }
+        ~PromptPass() {
+            if(!ordered.owns_lock())return;
+            if(!engine.prompt_pass_done &&
+               cudaEventCreateWithFlags(&engine.prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
+                engine.prompt_pass_done=nullptr;
+            if(engine.prompt_pass_done)(void)cudaEventRecord(engine.prompt_pass_done,stream);
+        }
+        PromptPass(const PromptPass&)=delete;
+        PromptPass& operator=(const PromptPass&)=delete;
+    };
+    // A lane in a prompt pass is not a batched-round candidate.
+    struct BatchedInactive {
+        Exl3BatchedVerifyCoordinator* coordinator;
+        explicit BatchedInactive(Exl3BatchedVerifyCoordinator* value) : coordinator(value) {
+            if(coordinator)coordinator->set_active(false);
+        }
+        ~BatchedInactive() { if(coordinator)coordinator->set_active(true); }
+        BatchedInactive(const BatchedInactive&)=delete;
+        BatchedInactive& operator=(const BatchedInactive&)=delete;
+    };
     Exl3RetirementState retirement;
     int retirement_fault=0;
     std::exception_ptr first_execution_failure;
@@ -2008,9 +2055,8 @@ struct Exl3EngineCore::Impl {
             std::fprintf(stderr,"\n");
         }
         const auto& vericache=Exl3VeriCacheConfig::get();
-        std::unique_lock prefill_lock(coherent_prefill_mutex);
-        // Rounds already submitted by other lanes finish before ingestion.
-        if(options.max_concurrency>1)check(cudaDeviceSynchronize());
+        std::optional<PromptPass> prefill_pass;
+        prefill_pass.emplace(*this,stream);
         try {
             (void)context->reset_for_request(identity.contract());
             const auto epoch=context->request_generation();
@@ -2180,7 +2226,7 @@ struct Exl3EngineCore::Impl {
             if(vericache.enabled)context->set_l0_exact_history(false);
             round->begin_prefilled();
             check(cudaStreamSynchronize(stream));
-            prefill_lock.unlock();
+            prefill_pass.reset();
             device_lease=coordinator.enter_device_logical(*host_lease,
                 std::static_pointer_cast<const void>(lane),context->position(),
                 allowance,options.max_context);
@@ -2230,7 +2276,8 @@ struct Exl3EngineCore::Impl {
                 const auto lt_ms=[](Clock::time_point from){return std::chrono::duration<double,std::milli>(Clock::now()-from).count();};
                 while(!request.cancelled && remaining) {
                     auto lt_mark=Clock::now();
-                    std::shared_lock round_lock(coherent_prefill_mutex);
+                    std::shared_lock round_lock(coherent_prefill_mutex,std::defer_lock);
+                    if(!prompt_pass_overlap)round_lock.lock();
                     lt_lock+=lt_ms(lt_mark);lt_mark=Clock::now();
                     if(!output.pending_control_tokens().empty())
                         throw std::invalid_argument(
@@ -2272,10 +2319,10 @@ struct Exl3EngineCore::Impl {
                     }
                     // Verifier and fix passes use the process-wide prompt-scale
                     // scratch: they run alone on the device like ingestion.
-                    round_lock.unlock();
+                    if(round_lock.owns_lock())round_lock.unlock();
                     lt_mark=Clock::now();
-                    std::unique_lock verify_lock(coherent_prefill_mutex);
-                    if(options.max_concurrency>1)check(cudaDeviceSynchronize());
+                    const BatchedInactive verify_inactive(lane_batched_verify[lane_index]);
+                    const PromptPass verify_pass(*this,stream);
                     const auto verified=round->verify(unverified,vericache.delta);
                     lt_verify+=lt_ms(lt_mark);
                     unverified.clear();
@@ -2343,8 +2390,8 @@ struct Exl3EngineCore::Impl {
                 }
                 // Unverified drafted tokens (cancellation) are never published: rewind.
                 if(round->frontier()!=round->verified_frontier()) {
-                    std::unique_lock rewind_lock(coherent_prefill_mutex);
-                    if(options.max_concurrency>1)check(cudaDeviceSynchronize());
+                    const BatchedInactive rewind_inactive(lane_batched_verify[lane_index]);
+                    const PromptPass rewind_pass(*this,stream);
                     round->commit_verification({});
                 }
                 if(std::getenv("NINFER_EXL3_VERICACHE_STATS")) {
@@ -2363,7 +2410,8 @@ struct Exl3EngineCore::Impl {
                 }
             } else
             while(remaining && !request.cancelled) {
-                std::shared_lock round_lock(coherent_prefill_mutex);
+                std::shared_lock round_lock(coherent_prefill_mutex,std::defer_lock);
+                if(!prompt_pass_overlap)round_lock.lock();
                 if(round_phases)phase_mark=Clock::now();
                 if(!output.pending_control_tokens().empty())
                     throw std::invalid_argument(
