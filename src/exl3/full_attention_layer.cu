@@ -8305,7 +8305,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 // Exact history from the FP16 L2 planes, merged straight into split 4.
                 l0_exact_history_staged(qr,k_cache_,v_cache_,l0_.prefill_hist,l0_.prefill_hist_stats,
                     l0_.prefill_split+static_cast<std::size_t>(4)*rows*kQHeads*kHeadDim,l0_.prefill_split_stats,4,rows,
-                    l0_prefill_history,stream);
+                    l0_prefill_history,stream,position);
             } else {
             const auto& a=l0_oscar::assets();
             constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;

@@ -264,7 +264,7 @@ inline void l0_launch_exact_history(const void* q,const std::uint16_t* k_src,con
 constexpr int kL0ExactPieceRows=8192;
 inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,const std::uint16_t* v_src,
     float* out,float* stats,float* numer,float* split_stats,int slot,int rows,int history_end,
-    cudaStream_t stream) {
+    cudaStream_t stream,int position=-1) {
     struct Stage {
         std::uint16_t* k[2]{}; std::uint16_t* v[2]{};
         cudaStream_t copy=nullptr;
@@ -284,9 +284,34 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
         return s;
     }();
     constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim;
-    // Copies read L2 rows written by earlier work on `stream`.
+    // Copies read L2 rows [kSink, history_end). When every one of them lies
+    // before the previous call's chunk (`position`, same stream: an earlier
+    // full-attention layer of this layer-major block), they were all written
+    // before that call: the copies wait on its fork and run under the layers
+    // between. Otherwise (first layer of a block, rows decoded since) they
+    // wait on this call's fork. NINFER_EXL3_L0_EARLY_HISTORY_COPY=0 always does.
+    struct EarlyFork { cudaStream_t stream=nullptr; cudaEvent_t event[2]{}; int next=0; bool valid=false; int position=-1; };
+    static EarlyFork early=[] {
+        EarlyFork e;
+        for(auto& event:e.event)
+            cuda_check(cudaEventCreateWithFlags(&event,cudaEventDisableTiming),"L0 exact early fork event");
+        return e;
+    }();
+    static const bool early_copy=[] {
+        const char* value=std::getenv("NINFER_EXL3_L0_EARLY_HISTORY_COPY");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
     cuda_check(cudaEventRecord(stage.fork,stream),"L0 exact staging fork");
-    cuda_check(cudaStreamWaitEvent(stage.copy,stage.fork,0),"L0 exact staging fork");
+    if(early_copy && early.valid && early.stream==stream && position>=0 && early.position>=0 &&
+       history_end<=early.position)
+        cuda_check(cudaStreamWaitEvent(stage.copy,early.event[early.next^1],0),"L0 exact staging early fork");
+    else
+        cuda_check(cudaStreamWaitEvent(stage.copy,stage.fork,0),"L0 exact staging fork");
+    cuda_check(cudaEventRecord(early.event[early.next],stream),"L0 exact early fork");
+    early.stream=stream;
+    early.position=position;
+    early.next^=1;
+    early.valid=true;
     const int pieces=history_end>l0::kSink?(history_end-l0::kSink+kL0ExactPieceRows-1)/kL0ExactPieceRows:1;
     const auto submit=[&](int piece) {
         const int b=piece&1,first=l0::kSink+piece*kL0ExactPieceRows;
