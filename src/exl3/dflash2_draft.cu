@@ -4318,6 +4318,25 @@ void Exl3Dflash2DraftModel::commit_target_block_internal(const std::uint16_t* co
     }
 }
 
+namespace {
+// Legacy-default-stream callers fork graph-captured draft work onto a private
+// non-blocking stream of their thread and join back.
+struct DraftSideStream {
+    cudaStream_t side=nullptr;
+    cudaEvent_t fork=nullptr,join=nullptr;
+};
+const DraftSideStream& draft_side_stream() {
+    thread_local const DraftSideStream value=[] {
+        DraftSideStream s;
+        cuda_check(cudaStreamCreateWithFlags(&s.side,cudaStreamNonBlocking),"draft side stream");
+        cuda_check(cudaEventCreateWithFlags(&s.fork,cudaEventDisableTiming),"draft side fork");
+        cuda_check(cudaEventCreateWithFlags(&s.join,cudaEventDisableTiming),"draft side join");
+        return s;
+    }();
+    return value;
+}
+}  // namespace
+
 void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* const* taps,
     int rows, long long abs_pos0, cudaStream_t stream) {
     impl_->invalidate_ring_witness();
@@ -4328,6 +4347,16 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     cuda_check(cudaStreamIsCapturing(stream, &capture), "draft prefill capture status");
     require(capture == cudaStreamCaptureStatusNone, "draft prefill commit requires eager stream");
+    if (!stream && m.prefill_batch && rows > 1 && rows <= 8 && !m.fresh_prefill.active) {
+        // Decode commits replay a captured graph, which needs a real stream.
+        const auto& side = draft_side_stream();
+        cuda_check(cudaEventRecord(side.fork, stream), "draft commit fork");
+        cuda_check(cudaStreamWaitEvent(side.side, side.fork, 0), "draft commit fork");
+        commit_prefill_block_internal(taps, rows, abs_pos0, side.side);
+        cuda_check(cudaEventRecord(side.join, side.side), "draft commit join");
+        cuda_check(cudaStreamWaitEvent(stream, side.join, 0), "draft commit join");
+        return;
+    }
     if (!m.prefill_batch || rows == 1) { commit_target_block_internal(taps, rows, abs_pos0, stream); return; }
     require(m.ring_count == 0 || abs_pos0 == m.ring_base_abs + m.ring_count,
             "draft prefill commit must extend committed span");
@@ -4355,7 +4384,7 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
         ~BatchedRoute() {
             if (on) { m.ws_fc->set_draft_batched(false); m.ws_kv->set_draft_batched(false); }
         }
-    } batched_route(m, chunk == 16);
+    };
     static const bool commit_graph = [] {
         const char* value = std::getenv("NINFER_DFLASH2_COMMIT_GRAPH");
         return !value || std::string(value) != "0";
@@ -4363,6 +4392,9 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
     // The legacy default stream cannot be captured.
     const bool graphed = commit_graph && stream && !m.fresh_prefill.active && chunk == 8 && rows <= 8 &&
         !m.gaming[Gopt::DraftRingNormRope] && !m.projection_timing.enabled && !m.projection_observer;
+    // Graphed decode commits also use the slot-filling K split (fc: 400 ->
+    // 680 CTAs on the lone 25600 x 5120 projection).
+    const BatchedRoute batched_route(m, chunk == 16 || graphed);
     if (graphed) {
         const std::uint16_t* ptrs[kLayers];
         for (int t = 0; t < kLayers; ++t) ptrs[t] = taps[t];
@@ -4797,17 +4829,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_private(
     if(solo_batched && batched_proposal_supported(block_ids)) {
         // The legacy default stream cannot be captured: such callers fork onto
         // a private non-blocking stream for the proposal and join back.
-        struct SoloStream {
-            cudaStream_t side=nullptr;
-            cudaEvent_t fork=nullptr,join=nullptr;
-        };
-        thread_local const SoloStream solo=[] {
-            SoloStream value;
-            cuda_check(cudaStreamCreateWithFlags(&value.side,cudaStreamNonBlocking),"solo draft stream");
-            cuda_check(cudaEventCreateWithFlags(&value.fork,cudaEventDisableTiming),"solo draft fork");
-            cuda_check(cudaEventCreateWithFlags(&value.join,cudaEventDisableTiming),"solo draft join");
-            return value;
-        }();
+        const auto& solo=draft_side_stream();
         cudaStream_t run=stream;
         if(!run) {
             cuda_check(cudaEventRecord(solo.fork,stream),"solo draft fork");

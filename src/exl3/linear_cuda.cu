@@ -12449,11 +12449,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     Exl3LinearWorkspaceRequirements::derive(in_features_,out_features_,rows,true,true)
         .require_disjoint_borrowed_views(transformed_input,accum_);
 
-    if (draft_batched_enabled_ && rows > 8 && out_features_ % 128 == 0 &&
+    if (draft_batched_enabled_ && out_features_ % 128 == 0 &&
         metadata.K >= 4 && metadata.K <= 7) {
         // The K split fills the resident slots within the workspace's
         // accumulation planes (coherent_m32_split; the vocabulary head keeps
-        // one). 2-agent drafts (16 rows): 2.9 -> 2.75 ms per round.
+        // one). 2-agent drafts (16 rows): 2.9 -> 2.75 ms per round; a lone
+        // 8-row draft: 1.845 -> 1.775 ms (down/o went from 400 to 680 CTAs).
         const std::size_t plane = static_cast<std::size_t>(rows) * out_features_ * sizeof(float);
         const int split = coherent_m32_split(rows);
         if (accumulation_capacity_bytes_ < plane * static_cast<std::size_t>(split))
