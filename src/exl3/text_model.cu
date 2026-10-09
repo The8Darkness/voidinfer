@@ -8744,6 +8744,9 @@ bool Exl3TextContext::l0_layer_major_headroom() const {
         impl_->numeric_prefill_projection_workspace->stats().cached_weight_capacity_bytes:0;
     const std::size_t reserve=l0_layer_major_reserve_bytes();
     constexpr std::size_t minimum_cache=256ull*1024*1024;
+    // A retained cache that already covers the minimum needs no growth: half
+    // the reserve then suffices (the block reuses what it holds).
+    if(existing>=minimum_cache && free_bytes>=reserve/2)return true;
     return free_bytes>=reserve && existing+free_bytes-reserve>=minimum_cache;
 }
 
@@ -8878,9 +8881,14 @@ void Exl3TextContext::append_prefill_layer_major(
     constexpr std::size_t minimum_cache=256ull*1024*1024;
     auto& workspace=*impl_->numeric_prefill_projection_workspace;
     const auto existing_cache=workspace.stats().cached_weight_capacity_bytes;
-    if(free_bytes<reserve_bytes ||
+    // Retained cache covering the minimum: run on it without growth when the
+    // device is below the reserve (concurrent lanes hold the rest).
+    const bool reuse_only=Exl3NativeContextExtent::l0_oscar_enabled() &&
+        existing_cache>=minimum_cache && existing_cache<=cache_limit &&
+        free_bytes>=reserve_bytes/2 && free_bytes<reserve_bytes;
+    if(!reuse_only && (free_bytes<reserve_bytes ||
        existing_cache>cache_limit ||
-       existing_cache+free_bytes-reserve_bytes<minimum_cache)
+       existing_cache+free_bytes-reserve_bytes<minimum_cache))
         throw std::runtime_error(
             "layer-major projection cache lacks bounded device headroom: free_mib="+
             std::to_string(free_bytes/(1024*1024))+
@@ -8888,11 +8896,12 @@ void Exl3TextContext::append_prefill_layer_major(
             std::to_string(existing_cache/(1024*1024))+
             " free_reserve_mib="+
             std::to_string(reserve_bytes/(1024*1024)));
-    std::size_t cache_budget=std::min(cache_limit,existing_cache+free_bytes-reserve_bytes);
+    std::size_t cache_budget=reuse_only?existing_cache:
+        std::min(cache_limit,existing_cache+free_bytes-reserve_bytes);
     // L0 OSCAR blocks re-check the reserve before each block: cache growth
     // leaves 256 MiB of slack so later small allocations keep the reserve.
     constexpr std::size_t l0_cache_slack=256ull*1024*1024;
-    if(Exl3NativeContextExtent::l0_oscar_enabled() && cache_budget>=minimum_cache+l0_cache_slack)
+    if(!reuse_only && Exl3NativeContextExtent::l0_oscar_enabled() && cache_budget>=minimum_cache+l0_cache_slack)
         cache_budget=std::max(existing_cache,cache_budget-l0_cache_slack);
     require(workspace.stats().cached_weight_capacity_bytes<=cache_budget,
             "retained layer-major cache exceeds current device budget");
