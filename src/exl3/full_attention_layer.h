@@ -317,8 +317,13 @@ public:
     void arm_captured_retained_prefix(int attempted_rows,int base_position,
                                       cudaStream_t stream);
     void note_captured_replay(int rows) noexcept { oscar_count_ += rows; }
+    bool retained_prefix_armed(int rows) const noexcept {
+        return retained_prefix_available_ && retained_prefix_rows_==rows;
+    }
+    const char* retained_prefix_cleared_by() const noexcept {return retained_prefix_cleared_by_;}
     void invalidate_retained_prefix() noexcept {
         retained_prefix_available_ = false;
+        retained_prefix_cleared_by_ = "invalidate";
     }
 
     // Optional persistent ordinary-attention cache used by the E4A model
@@ -1134,6 +1139,9 @@ private:
     std::uint64_t oscar_count_ = 0;
     std::uint64_t ordinary_count_ = 0;
     bool retained_prefix_available_ = false;
+    // Diagnostic: the last transition that cleared the retained prefix.
+    const char* retained_prefix_cleared_by_ = "none";
+    int retained_prefix_cleared_rows_ = 0;
     int retained_prefix_rows_ = 0;
     int retained_prefix_position_ = 0;
     cudaStream_t retained_prefix_stream_ = nullptr;

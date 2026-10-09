@@ -7872,7 +7872,9 @@ void Exl3FullAttentionLayer::validate_retained_prefix_reappend(
             "EXL3 full-attention retained prefix is absent or row count is invalid (available=" +
             std::to_string(retained_prefix_available_) + " retained=" + std::to_string(retained_rows) +
             " attempted=" + std::to_string(attempted_rows) + " recorded=" +
-            std::to_string(retained_prefix_rows_) + " layer=" + std::to_string(model_layer_) + ")");
+            std::to_string(retained_prefix_rows_) + " layer=" + std::to_string(model_layer_) +
+            " cleared_by=" + retained_prefix_cleared_by_ + " cleared_rows=" +
+            std::to_string(retained_prefix_cleared_rows_) + ")");
     }
     if (base_position != retained_prefix_position_) {
         throw std::invalid_argument(
@@ -7902,6 +7904,8 @@ void Exl3FullAttentionLayer::reappend_retained_prefix(
     validate_retained_prefix_reappend(
         retained_rows, attempted_rows, base_position, stream);
     retained_prefix_available_ = false;
+    retained_prefix_cleared_by_ = "reappend";
+    retained_prefix_cleared_rows_ = retained_rows;
     if (oscar_) {
         const auto* qr = buffers_[6];
         const auto* kr = buffers_[7];
@@ -9591,6 +9595,8 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             throw std::invalid_argument("direct staged history extent/profile");
     }
     retained_prefix_available_ = false;
+    retained_prefix_cleared_by_ = batch_ ? "batched forward" : "forward";
+    retained_prefix_cleared_rows_ = rows;
     // Batched multi-agent rounds: this layer's own agent owns the leading
     // own_rows; peer agents' rows follow (run_peer_segment).
     const int own_rows=batch_?batch_->own_rows:rows;
@@ -10315,6 +10321,8 @@ void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
         throw std::invalid_argument("full-attention peer segment rows/position");
     require_tier_rows(rows);
     retained_prefix_available_ = false;
+    retained_prefix_cleared_by_ = "peer segment";
+    retained_prefix_cleared_rows_ = rows;
     bool eligible_retained_prefix = preserve_m1_topology && rows >= 2 && rows <= 8 &&
         ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
          (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&

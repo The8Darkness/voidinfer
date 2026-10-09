@@ -62,7 +62,10 @@ struct Exl3LinearWorkspaceRequirements {
         };
         Exl3LinearWorkspaceRequirements result;
         result.transformed_bytes=extent(rows,std::uint64_t(input)*sizeof(std::uint16_t));
-        result.accumulation_bytes=extent(rows,std::uint64_t(output)*accumulation_splits*sizeof(float));
+        // The vocabulary head (248320 outputs) runs one K split on every route
+        // (H6 single-split tiles, scalar tile fallback).
+        const unsigned splits=output==248320?1u:accumulation_splits;
+        result.accumulation_bytes=extent(rows,std::uint64_t(output)*splits*sizeof(float));
         const auto transformed=borrowed_transform?0:result.transformed_bytes;
         const auto accumulation=borrowed_accumulation?0:result.accumulation_bytes;
         if(accumulation>std::numeric_limits<std::size_t>::max()-transformed)

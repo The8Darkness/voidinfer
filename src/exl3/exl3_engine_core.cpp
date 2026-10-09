@@ -547,7 +547,7 @@ struct Exl3EngineCore::Impl {
             // buffers and let exclusive prompt ingestion use a smaller
             // layer-major reserve, so both lanes keep the fast prefill.
             if(!std::getenv("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS"))
-                _putenv_s("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS",value.max_concurrency>=5?"2048":"4096");
+                _putenv_s("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS","4096");
             // Decode keeps 1 GiB of device headroom; the retained layer-major
             // projection cache is capped instead (one layer's projections at
             // C3+). Oversubscribed WDDM memory corrupts batched graph replays.

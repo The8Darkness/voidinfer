@@ -1392,6 +1392,8 @@ struct Exl3TextContext::Impl {
     int fast_wmma32_split_count = 0;
     int fast_wmma32_split_capacity = 0;
     int gdn_bulk_capacity = 0;
+    // Nonzero while a batched multi-agent BatchBinding owns the layers.
+    int batch_bound = 0;
     std::shared_ptr<DeviceAllocation> host_layer_k, host_layer_v;
     std::shared_ptr<Exl3AttentionStageStorage> attention_stage_storage;
     std::shared_ptr<Exl3AttentionStage> attention_stages;
@@ -3444,8 +3446,10 @@ struct Exl3TextContext::Impl {
         const bool gdn_segment_graphs_enabled=
             ((host_kv_gdn_segment_graphs_enabled && host_kv.enabled) ||
              (ordinary_gdn_segment_graphs_enabled && !host_kv.enabled));
+        // Single-context layer graphs know nothing of a batched multi-agent
+        // binding (peer segments, arming): batched forwards run eagerly.
         const bool use_host_kv_gdn_segment_graphs=
-            gdn_segment_graphs_enabled && !oscar &&
+            gdn_segment_graphs_enabled && !oscar && !batch_bound &&
             !graph_active && !graph_capture_active && !events && !layer_observer &&
             !target_projection_timing && !target_projection_observer &&
             !wide_prefill && !positions_xyz && !eager_mlp_gateup_concurrent &&
@@ -3456,7 +3460,7 @@ struct Exl3TextContext::Impl {
             use_host_kv_gdn_segment_graphs &&
             rows<=host_kv_full_graph_row_shapes;
         const bool use_ordinary_full_layer_graphs=
-            ordinary_full_layer_graphs_enabled && !host_kv.enabled && !oscar &&
+            ordinary_full_layer_graphs_enabled && !host_kv.enabled && !oscar && !batch_bound &&
             !oscar_only && !graph_active && !graph_capture_active && !events &&
             !layer_observer && !target_projection_timing &&
             !target_projection_observer && !wide_prefill && !positions_xyz &&
@@ -3481,7 +3485,7 @@ struct Exl3TextContext::Impl {
                 continuation_reference ? 1 : 0,native_mtp_hidden_capture_active() ? 1 : 0);
         const bool use_host_kv_mlp_tail_graphs=
             ((host_kv_mlp_tail_graphs_enabled && host_kv.enabled) ||
-             (ordinary_mlp_tail_graphs_enabled && !host_kv.enabled)) && !oscar &&
+             (ordinary_mlp_tail_graphs_enabled && !host_kv.enabled)) && !oscar && !batch_bound &&
             !graph_active && !graph_capture_active && !events &&
             !layer_observer && !target_projection_timing &&
             !target_projection_observer && !wide_prefill && !positions_xyz &&
@@ -9604,6 +9608,11 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     position_ += rows;
     impl_->continuation->rows = rows;
     if (arm_retained_prefix) {
+        for (int layer = 0; layer < kLayers; ++layer)
+            if (impl_->full_layers[layer] &&
+                !impl_->full_layers[layer]->retained_prefix_armed(rows))
+                std::fprintf(stderr, "RETAINED_PREFIX_UNARMED single layer=%d rows=%d cleared_by=%s%c",
+                    layer, rows, impl_->full_layers[layer]->retained_prefix_cleared_by(), 10);
         auto& transaction = *impl_->transaction;
         transaction.attempt_base_position = base_position;
         transaction.attempted_rows = rows;
@@ -9644,8 +9653,10 @@ struct Exl3TextContext::BatchBinding {
                 owner.gdn_layers[layer]->set_batch(&gdn[layer]);
             }
         }
+        ++owner.batch_bound;
     }
     ~BatchBinding() {
+        --owner.batch_bound;
         for(auto& layer:owner.full_layers)if(layer)layer->set_batch(nullptr);
         for(auto& layer:owner.gdn_layers)if(layer)layer->set_batch(nullptr);
     }
@@ -9907,6 +9918,10 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         context.position_+=count;
         impl.continuation->rows=count;
         if(arm_retained_prefix[c]) {
+            for(int layer=0;layer<kLayers;++layer)
+                if(impl.full_layers[layer] && !impl.full_layers[layer]->retained_prefix_armed(count))
+                    std::fprintf(stderr,"RETAINED_PREFIX_UNARMED batched member=%zu layer=%d rows=%d graph=%d cleared_by=%s%c",
+                        c,layer,count,graph?1:0,impl.full_layers[layer]->retained_prefix_cleared_by(),10);
             auto& transaction=*impl.transaction;
             transaction.attempt_base_position=base_positions[c];
             transaction.attempted_rows=count;
