@@ -3653,7 +3653,20 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         weights_.gate_metadata.out_features == kIntermediate &&
         weights_.up_metadata.out_features == kIntermediate;
     prefetch_weights(4,weights_.down.trellis);
-    const bool merged_gate_up = !gdn_m1_gate_up_pair && rows >= 1 && rows<=fused_rows && !profile &&
+    // Fused prefill MLP (quantized route, as in the attention layers): gate/up
+    // stay untransformed and the quantized down input is produced in one pass.
+    static const bool gdn_fused_mlp=[] {
+        const char* value=std::getenv("NINFER_EXL3_GDN_FUSED_MLP");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    const bool fused_prefill_mlp = gdn_fused_mlp && wide_prefill && reconstruct_gemm_ &&
+        !capture_active_ && !profile && !projection_timing_ &&
+        !projection_observer_ && !shared_gateup_enabled_ && !shared_down_enabled_ &&
+        rows >= 256 &&
+        reconstruct_gemm_->forward_numeric_mlp(weights_.gate, weights_.gate_metadata,
+            weights_.up, weights_.up_metadata, weights_.down, weights_.down_metadata,
+            mlp_input, gate, up, act, down, rows, stream);
+    const bool merged_gate_up = !fused_prefill_mlp && !gdn_m1_gate_up_pair && rows >= 1 && rows<=fused_rows && !profile &&
         !projection_timing_ && !projection_observer_ && !wide_prefill &&
         !shared_gateup_enabled_ && !small_m_fused_gate_up_transform_ &&
         linear_workspaces_[3]->forward_merged_gate_up_silu(*linear_workspaces_[4],
@@ -3661,7 +3674,8 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             mlp_input,gate,up,act,rows,stream,
             shared_down_enabled_?nullptr:&weights_.down,
             shared_down_enabled_?nullptr:linear_workspaces_[5]);
-    if (gdn_m1_gate_up_pair) {
+    if (fused_prefill_mlp) {
+    } else if (gdn_m1_gate_up_pair) {
         // This production-labeled route remains default-off and graph-safe:
         // all policy, geometry and storage were fixed during construction.
         linear_workspaces_[3]->forward_target_m1_gate_up_pair(
@@ -3752,7 +3766,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         !reconstruct_gemm_ && !shared_down_enabled_ &&
         !weights_.down_metadata.mcg && weights_.down_metadata.mul1 && !weights_.down_metadata.has_bias;
     begin(10);
-    if(merged_gate_up) {
+    if(merged_gate_up || fused_prefill_mlp) {
     } else if(fused_gate_up) {
         linear_workspaces_[5]->transform_gate_up(weights_.down,weights_.down_metadata,
             gate,up,act,rows,stream,wide_prefill ?
@@ -3778,15 +3792,15 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     // Production writes the layer output directly (final_output is trace-only),
     // so no device copy separates this reduction from the next layer.
     std::uint16_t* const residual_destination=skip_state_trace_?output:final_output;
-    if(!shared_down && rows>=1 && rows<=fused_rows && !profile && !projection_timing_ &&
-       !projection_observer_) {
+    if(!shared_down && !fused_prefill_mlp && rows>=1 && rows<=fused_rows && !profile &&
+       !projection_timing_ && !projection_observer_) {
         if(fuse_successor_norm)
             linear_workspaces_[5]->arm_residual_norm(post,residual_destination,
                 successor_->weights_.input_norm,successor_->half_buffers_[0],kRmsEps);
         else
             linear_workspaces_[5]->arm_residual(post,residual_destination);
     }
-    if(!shared_down)project(linear_workspaces_[5], weights_.down, weights_.down_metadata, act, down,
+    if(!shared_down && !fused_prefill_mlp)project(linear_workspaces_[5], weights_.down, weights_.down_metadata, act, down,
                        Exl3TargetProjectionOperator::down,
                        (fused_gate_up||merged_gate_up)?linear_workspaces_[5]->transformed_device():nullptr);
     if(linear_workspaces_[5]->take_norm_applied()) {
