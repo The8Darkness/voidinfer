@@ -1057,6 +1057,26 @@ __global__ void dflash_prefill_positions_kernel(std::int32_t* positions, int row
     if (row < rows) positions[row] = first + row;
 }
 
+// Device-positioned variants for the captured decode ring commit: the base
+// position is a device scalar set before each replay.
+__global__ void dflash_set_position_kernel(std::int32_t* base, int value) { *base = value; }
+__global__ void dflash_prefill_positions_device_kernel(std::int32_t* positions, int rows,
+    const std::int32_t* base) {
+    const int row = static_cast<int>(threadIdx.x);
+    if (row < rows) positions[row] = *base + row;
+}
+__global__ void dflash_prefill_ring_scatter_positions_kernel(const std::uint16_t* k,
+    const std::uint16_t* v, std::uint16_t* ring_k, std::uint16_t* ring_v,
+    int rows, const std::int32_t* positions) {
+    const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int n = kKVHeads * kHeadDim;
+    if (i >= rows * n) return;
+    const int slot = (positions[0] + i / n) & kRingMask;
+    const std::size_t dst = static_cast<std::size_t>(slot) * n + i % n;
+    ring_k[dst] = k[i];
+    ring_v[dst] = v[i];
+}
+
 __global__ void dflash_prefill_ring_scatter_kernel(const std::uint16_t* k,
     const std::uint16_t* v, std::uint16_t* ring_k, std::uint16_t* ring_v,
     int rows, int first) {
@@ -2902,6 +2922,19 @@ struct Exl3Dflash2DraftModel::Impl {
 
     bool prefill_batch = false;
     bool target_commit_batch = false;
+    // Decode ring commits of 2..8 rows replay one captured chain per row
+    // count (~76 launches -> one graph); `base` holds the ring position.
+    struct CommitGraphs {
+        std::array<cudaGraphExec_t, 9> exec{};
+        std::int32_t* base = nullptr;
+        CommitGraphs() = default;
+        CommitGraphs(const CommitGraphs&) = delete;
+        CommitGraphs& operator=(const CommitGraphs&) = delete;
+        ~CommitGraphs() {
+            for (auto graph : exec) if (graph) cudaGraphExecDestroy(graph);
+            if (base) cudaFree(base);
+        }
+    } commit_graphs;
     // Batched multi-agent drafting (set_batched_propose); null keeps every
     // proposal private to this execution.
     Exl3BatchedVerifyCoordinator* batched_propose = nullptr;
@@ -4260,6 +4293,66 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
             if (on) { m.ws_fc->set_draft_batched(false); m.ws_kv->set_draft_batched(false); }
         }
     } batched_route(m, chunk == 16);
+    static const bool commit_graph = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_COMMIT_GRAPH");
+        return !value || std::string(value) != "0";
+    }();
+    // The legacy default stream cannot be captured.
+    const bool graphed = commit_graph && stream && !m.fresh_prefill.active && chunk == 8 && rows <= 8 &&
+        !m.gaming[Gopt::DraftRingNormRope] && !m.projection_timing.enabled && !m.projection_observer;
+    if (graphed) {
+        const std::uint16_t* ptrs[kLayers];
+        for (int t = 0; t < kLayers; ++t) ptrs[t] = taps[t];
+        cuda_check(cudaMemcpyAsync(m.s.tap_ptr, ptrs, sizeof(ptrs), cudaMemcpyHostToDevice, stream),
+                   "draft commit tap pointers");
+        auto& graphs = m.commit_graphs;
+        if (!graphs.base)
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&graphs.base), sizeof(std::int32_t)),
+                       "draft commit position");
+        dflash_set_position_kernel<<<1,1,0,stream>>>(graphs.base, static_cast<int>(abs_pos0));
+        cuda_check(cudaGetLastError(), "draft commit position");
+        auto& exec = graphs.exec[static_cast<std::size_t>(rows)];
+        if (!exec) {
+            cudaGraph_t graph = nullptr;
+            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                       "draft commit capture");
+            try {
+                dflash_tap_concat_kernel<<<(rows * kLayers * kHidden + 255) / 256,256,0,stream>>>(
+                    m.s.tap_ptr,m.s.tcat,rows);
+                m.ws_fc->forward(m.fc,m.fc_meta,m.s.tcat,m.s.fc_raw,rows,stream,admission);
+                dflash_rms_norm_kernel<DFlashFmt::F16><<<rows,256,256*sizeof(float),stream>>>(
+                    m.s.fc_raw,m.hidden_norm,m.s.hctx,rows,kHidden);
+                dflash_prefill_positions_device_kernel<<<1,16,0,stream>>>(m.s.pos_ctx,rows,graphs.base);
+                for (int layer = 0; layer < kLayers; ++layer) {
+                    const auto& lay = m.layers[layer];
+                    m.ws_kv->forward(lay.k,lay.km,m.s.hctx,m.s.kctx,rows,stream);
+                    m.ws_kv->forward(lay.v,lay.vm,m.s.hctx,m.s.vctx,rows,stream);
+                    dflash_head_norm_kernel<<<rows*kKVHeads,128,128*sizeof(float),stream>>>(
+                        m.s.kctx,lay.k_norm,m.s.kctx_n,rows*kKVHeads,kHeadDim);
+                    dflash_rope_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+                        m.s.kctx_n,m.s.kctx_r,m.s.pos_ctx,rows,kKVHeads,kHeadDim);
+                    dflash_prefill_ring_scatter_positions_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,
+                        256,0,stream>>>(m.s.kctx_r,m.s.vctx,m.ring_k[layer],m.ring_v[layer],rows,
+                        m.s.pos_ctx);
+                }
+                cuda_check(cudaGetLastError(), "draft commit capture launches");
+            } catch (...) {
+                cudaGraph_t abandoned = nullptr;
+                (void)cudaStreamEndCapture(stream, &abandoned);
+                if (abandoned) cudaGraphDestroy(abandoned);
+                throw;
+            }
+            cuda_check(cudaStreamEndCapture(stream, &graph), "draft commit capture end");
+            const auto instantiated = cudaGraphInstantiate(&exec, graph, 0);
+            cudaGraphDestroy(graph);
+            cuda_check(instantiated, "draft commit graph instantiate");
+        }
+        cuda_check(cudaGraphLaunch(exec, stream), "draft commit graph launch");
+        const int dropped = std::max(0,m.ring_count+rows-kRingKeep);
+        m.ring_count = std::min(kRingKeep,m.ring_count+rows);
+        m.ring_base_abs += dropped;
+        return;
+    }
     for (int first = 0; first < rows; first += chunk) {
         const int count = std::min(chunk, rows - first);
         const int pos = static_cast<int>(abs_pos0 + first);
