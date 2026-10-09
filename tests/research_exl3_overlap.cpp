@@ -239,7 +239,8 @@ int main() {
             // OVL_SIBLINGS=1: each agent's last two rows are sibling leaves
             // (verification tree layout) as in the Engine's DFlash2 rounds.
             const bool siblings = env_int("OVL_SIBLINGS", 0) != 0;
-            const std::vector<int> sibling_offsets{1, 3};
+            // OVL_SIB_A / OVL_SIB_B: the two sibling leaves' chain offsets.
+            const std::vector<int> sibling_offsets{env_int("OVL_SIB_A", 1), env_int("OVL_SIB_B", 3)};
             const auto arm = [&] { if (siblings) for (auto* c : all) c->set_verifier_siblings(sibling_offsets); };
             const auto separate = [&] { arm(); for (int a = 0; a < agents; ++a) all[a]->continue_rows(rows_of[a], sd); };
             const auto batched = [&] { arm(); d->continue_rows_batched(peers, rows_of[0], sd); };
@@ -260,6 +261,33 @@ int main() {
                 }
                 std::cout << "OVL nbatch agent=" << a << " argmax_agree=" << agree << "/" << n
                           << " max_abs_logit_diff=" << max_abs << '\n';
+            }
+            if (siblings) {
+                // Ground truth of each sibling leaf: the plain continuation of
+                // its path (chain rows 0..o-1, then the sibling token).
+                std::vector<std::vector<float>> got;
+                for (auto* c : all) got.push_back(c->continuation_logits_host(sd));
+                const int chain = n - 2;
+                for (int a = 0; a < agents; ++a) {
+                    const std::size_t vocab = got[a].size() / static_cast<std::size_t>(n);
+                    for (int j = 0; j < 2; ++j) {
+                        const int o = sibling_offsets[static_cast<std::size_t>(j)];
+                        std::vector<std::int64_t> path(rows_of[a].begin(), rows_of[a].begin() + o);
+                        path.push_back(rows_of[a][static_cast<std::size_t>(chain + j)]);
+                        rewind();
+                        all[a]->continue_rows(path, sd);
+                        const auto truth = all[a]->continuation_logits_host(sd);
+                        const auto* t = truth.data() + (path.size() - 1) * vocab;
+                        const auto score = [&](const float* y) {
+                            const auto ty = std::max_element(t, t + vocab) - t, yy = std::max_element(y, y + vocab) - y;
+                            return double(t[ty]) - t[yy];
+                        };
+                        const auto* bs = got[a].data() + static_cast<std::size_t>(chain + j) * vocab;
+                        const auto* ss = ref[a].data() + static_cast<std::size_t>(chain + j) * vocab;
+                        std::cout << "OVL sibling-truth agent=" << a << " sibling=" << j << " offset=" << o
+                                  << " gap_batched=" << score(bs) << " gap_separate=" << score(ss) << '\n';
+                    }
+                }
             }
             rewind();
             const auto time = [&](auto&& f, const char* what) {
@@ -310,7 +338,18 @@ int main() {
                 return std::span<const std::int64_t>(ids.data() + context + 512 * a + 8 * round,
                     static_cast<std::size_t>(n));
             };
-            const auto keep_of = [&](int round, int a) { return 1 + (round * 5 + a * 3) % n; };
+            // OVL_SIBLINGS=1: the last two rows are sibling leaves at offsets
+            // varying per round/agent; a retained depth equal to a sibling's
+            // offset promotes that sibling first (the Engine's tree rounds).
+            const bool tree = env_int("OVL_SIBLINGS", 0) != 0;
+            const int chain_rows = tree ? n - 2 : n;
+            const auto offsets_of = [&](int round, int a) {
+                return std::vector<int>{1 + (round + a) % 3, 1 + (round * 3 + a) % 4};
+            };
+            const auto keep_of = [&](int round, int a) {
+                const int keep = 1 + (round * 5 + a * 3) % n;
+                return tree ? std::min(keep, chain_rows) : keep;
+            };
             // OVL_STREAMS=1: every agent owns a stream (Engine lanes); the
             // batched forward runs on agent 0's stream after every member's
             // queued work and members resume after it (coordinator events).
@@ -338,6 +377,7 @@ int main() {
                             throw;
                         }
                     }
+                    if (tree) for (int a = 0; a < agents; ++a) all[a]->set_verifier_siblings(offsets_of(r, a));
                     if (batched) {
                         std::vector<Exl3TextContext::BatchedPeer> peers;
                         for (int a = 1; a < agents; ++a) {
@@ -366,6 +406,14 @@ int main() {
                     for (int a = 0; a < agents; ++a) {
                         logits[r].push_back(all[a]->continuation_logits_host(lane_streams[a]));
                         const int keep = keep_of(r, a);
+                        if (tree && keep >= 2) {
+                            const auto offsets = offsets_of(r, a);
+                            for (int j = 0; j < 2; ++j)
+                                if (offsets[static_cast<std::size_t>(j)] == keep - 1 && (r + a) % 2 == 0) {
+                                    all[a]->promote_sibling_row(chain_rows + j, keep - 1, lane_streams[a]);
+                                    break;
+                                }
+                        }
                         if (keep < n) all[a]->retain_transaction_prefix(keep, lane_streams[a]);
                         all[a]->commit_transaction();
                     }

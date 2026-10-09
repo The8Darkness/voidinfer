@@ -1,6 +1,8 @@
 #pragma once
 
 #include <fstream>
+#include <mutex>
+#include <sstream>
 #include "exl3/native_context_extent.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/exact_outer_reference.h"
@@ -963,7 +965,12 @@ private:
                 check(cudaMemcpy(candidates.data(),draft_.last_topk_ids_device_for_test(),
                         candidates.size()*sizeof(std::int64_t),cudaMemcpyDeviceToHost),
                     "round log top-16 candidates");
-            std::ofstream log(log_path,std::ios::app);
+            // One write per record (concurrent lanes append to one file):
+            // context pointer, sibling offsets and promotions lead the record.
+            std::ostringstream log;
+            log<<static_cast<const void*>(context_.get())<<" sib=";
+            for(const auto offset:sibling_offsets)log<<offset<<',';
+            log<<" promo="<<value.verification.sibling_promotions<<' ';
             log<<value.root_position<<';';
             for(int i=0;i<value.width;++i)log<<value.proposal[static_cast<std::size_t>(i)]<<(i+1<value.width?' ':';');
             for(std::size_t i=0;i<value.committed_tokens.size();++i)
@@ -978,6 +985,9 @@ private:
             for(std::size_t i=0;i<unary.size();++i)
                 log<<unary[i]<<(i+1<unary.size()?' ':'\n');
             if(candidates.empty())log<<'\n';
+            static std::mutex log_mutex;
+            const std::lock_guard log_lock(log_mutex);
+            std::ofstream(log_path,std::ios::app)<<log.str();
         }
         const auto useful=value.committed_tokens.size();
         if(!useful || useful>static_cast<std::size_t>(value.width) ||
