@@ -12208,12 +12208,11 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
 
     if (draft_batched_enabled_ && rows > 8 && out_features_ % 128 == 0 &&
         metadata.K >= 4 && metadata.K <= 7) {
-        // Five K partitions when the workspace's own accumulation planes
-        // hold them (draft projections), else one (the vocabulary head);
-        // 17..32 rows fill the resident M32 slots (coherent_m32_split).
+        // The K split fills the resident slots within the workspace's
+        // accumulation planes (coherent_m32_split; the vocabulary head keeps
+        // one). 2-agent drafts (16 rows): 2.9 -> 2.75 ms per round.
         const std::size_t plane = static_cast<std::size_t>(rows) * out_features_ * sizeof(float);
-        const int split = rows > kBatchedRows ? coherent_m32_split(rows) :
-            accumulation_capacity_bytes_ >= plane * 5 ? 5 : 1;
+        const int split = coherent_m32_split(rows);
         if (accumulation_capacity_bytes_ < plane * static_cast<std::size_t>(split))
             throw std::logic_error("batched draft accumulation capacity");
         // A single-split head computes only its active leading columns (the
