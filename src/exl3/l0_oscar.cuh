@@ -245,10 +245,14 @@ __device__ __forceinline__ void encode_rotate(const float (*x)[kDim], const floa
     float acc[Rows];
 #pragma unroll
     for (int r = 0; r < Rows; ++r) acc[r] = 0.0f;
-    for (int i = 0; i < kDim; ++i) {
-        const float rotation = R[i * kDim + j];
+    for (int i = 0; i < kDim; i += 4) {
+        const float r0 = R[i * kDim + j], r1 = R[(i + 1) * kDim + j];
+        const float r2 = R[(i + 2) * kDim + j], r3 = R[(i + 3) * kDim + j];
 #pragma unroll
-        for (int r = 0; r < Rows; ++r) acc[r] = fmaf(x[r][i], rotation, acc[r]);
+        for (int r = 0; r < Rows; ++r) {
+            const float4 v = *reinterpret_cast<const float4*>(&x[r][i]);
+            acc[r] = fmaf(v.w, r3, fmaf(v.z, r2, fmaf(v.y, r1, fmaf(v.x, r0, acc[r]))));
+        }
     }
 #pragma unroll
     for (int r = 0; r < Rows; ++r) y[r][j] = acc[r];
@@ -257,7 +261,8 @@ __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cach
     const std::uint16_t* v_cache, int capacity, const int* position_device, int position,
     int* state, Assets a, int bank, std::uint8_t* k_codes, std::uint8_t* v_codes,
     __half* k_meta, __half* v_meta, HotView hot) {
-    __shared__ float x[kEncodeRows][kDim], y[kEncodeRows][kDim];
+    __shared__ __align__(16) float x[kEncodeRows][kDim];
+    __shared__ __align__(16) float y[kEncodeRows][kDim];
     __shared__ float extrema[kEncodeRows][16], thresholds[kEncodeRows];
     const int base = position_device ? *position_device : position;
     int wm = state[0];
@@ -295,15 +300,31 @@ __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cach
         else if (count <= 8) encode_rotate<8>(x, R, j, y);
         else encode_rotate<kEncodeRows>(x, R, j, y);
         __syncthreads();
+        // Clip threshold: the clip_index-th smallest |y| of the row (ascending,
+        // ties by dimension), found by one warp per row with a radix select
+        // over the bit patterns (non-negative floats order as unsigned).
         const int clip_index = kind ? 235 : 245;  // floor(0.92*256), floor(0.96*256)
-        for (int r = 0; r < count; ++r) {
-            const float mag = fabsf(y[r][j]);
-            int rank = 0;
-            for (int i = 0; i < kDim; ++i) {
-                const float b = fabsf(y[r][i]);
-                rank += (b < mag) || (b == mag && i < j);
+        for (int r = j >> 5; r < count; r += 8) {
+            const int lane = j & 31;
+            const float4 a0 = *reinterpret_cast<const float4*>(&y[r][lane * 8]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&y[r][lane * 8 + 4]);
+            const unsigned bits[8] = {
+                __float_as_uint(fabsf(a0.x)), __float_as_uint(fabsf(a0.y)),
+                __float_as_uint(fabsf(a0.z)), __float_as_uint(fabsf(a0.w)),
+                __float_as_uint(fabsf(a1.x)), __float_as_uint(fabsf(a1.y)),
+                __float_as_uint(fabsf(a1.z)), __float_as_uint(fabsf(a1.w))};
+            unsigned prefix = 0u, mask = 0u;
+            int rank = clip_index;
+            for (int bit = 31; bit >= 0; --bit) {
+                const unsigned b = 1u << bit;
+                int local = 0;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) local += ((bits[e] & mask) == prefix) && !(bits[e] & b);
+                const int zeros = static_cast<int>(__reduce_add_sync(0xffffffffu, static_cast<unsigned>(local)));
+                if (rank >= zeros) { rank -= zeros; prefix |= b; }
+                mask |= b;
             }
-            if (rank == clip_index) thresholds[r] = mag;
+            if (lane == 0) thresholds[r] = __uint_as_float(prefix);
         }
         __syncthreads();
         for (int r = 0; r < count; ++r) {
