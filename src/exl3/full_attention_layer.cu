@@ -1,3 +1,4 @@
+#include "exl3/segment_copy.cuh"
 #include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/sibling_rows.cuh"
@@ -10344,16 +10345,19 @@ void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
         eligible_retained_prefix = capture_status == cudaStreamCaptureStatusNone;
     }
     const auto n=static_cast<std::size_t>(rows);
-    const auto copy=[&](void* destination,const void* from,std::size_t bytes,const char* what) {
-        cuda_check(cudaMemcpyAsync(destination,from,bytes,cudaMemcpyDeviceToDevice,stream),what);
-    };
-    copy(buffers_[1],qg_source,n*weights_.q_metadata.out_features*sizeof(std::uint16_t),"full-attention peer Q");
-    copy(buffers_[2],kp_source,n*weights_.k_metadata.out_features*sizeof(std::uint16_t),"full-attention peer K");
-    copy(buffers_[3],vp_source,n*weights_.v_metadata.out_features*sizeof(std::uint16_t),"full-attention peer V");
+    // One copy launch each way (separate copy nodes add latency ahead of
+    // every peer core in the captured batched forward).
+    Exl3SegmentCopies in;
+    in.add(buffers_[1],qg_source,n*weights_.q_metadata.out_features*sizeof(std::uint16_t));
+    in.add(buffers_[2],kp_source,n*weights_.k_metadata.out_features*sizeof(std::uint16_t));
+    in.add(buffers_[3],vp_source,n*weights_.v_metadata.out_features*sizeof(std::uint16_t));
+    cuda_check(exl3_launch_segment_copies(in,stream),"full-attention peer inputs");
     attention_middle(AttentionMiddle{buffers_[0],buffers_[1],buffers_[2],buffers_[3],buffers_[4],
         buffers_[5],buffers_[6],buffers_[7],buffers_[8],buffers_[12],rows,position,stream,
         false,preserve_m1_topology,false,eligible_retained_prefix,nullptr,nullptr});
-    copy(attn_destination,buffers_[8],n*kQHeads*kHeadDim*sizeof(std::uint16_t),"full-attention peer output");
+    Exl3SegmentCopies out;
+    out.add(attn_destination,buffers_[8],n*kQHeads*kHeadDim*sizeof(std::uint16_t));
+    cuda_check(exl3_launch_segment_copies(out,stream),"full-attention peer output");
     if (eligible_retained_prefix) {
         retained_prefix_available_ = true;
         retained_prefix_rows_ = rows;

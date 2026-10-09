@@ -1,6 +1,7 @@
 #include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/sibling_rows.cuh"
+#include "exl3/segment_copy.cuh"
 #include "exl3/gaming_operator_fixture.h"
 #include "exl3/gdn_layer.h"
 #include "exl3/vericache_serving_coordinator.h"
@@ -3859,26 +3860,29 @@ void Exl3GdnLayer::run_peer_segment(const PeerSegmentSource& source,cudaStream_t
     const SegmentState segment=begin_segment(rows,stream,preserve_m1_topology,state_stream);
     if(segment.storage==Exl3GdnHistoryStorage::shared_wide)
         throw std::invalid_argument("GDN peer segment requires private history storage");
-    const auto copy=[&](void* destination,const void* from,std::size_t bytes,const char* what) {
-        check(cudaMemcpyAsync(destination,from,bytes,cudaMemcpyDeviceToDevice,stream),what);
-    };
+    // One copy launch: separate copy nodes serialized several microseconds
+    // of latency ahead of every peer core in the captured batched forward.
     const auto n=static_cast<std::size_t>(rows);
-    copy(half_buffers_[0],source.h,n*kHidden*sizeof(std::uint16_t),"GDN peer h");
-    copy(half_buffers_[1],source.qkv,n*kQkv*sizeof(std::uint16_t),"GDN peer qkv");
-    copy(half_buffers_[2],source.z,n*kZ*sizeof(std::uint16_t),"GDN peer z");
+    Exl3SegmentCopies in;
+    in.add(half_buffers_[0],source.h,n*kHidden*sizeof(std::uint16_t));
+    in.add(half_buffers_[1],source.qkv,n*kQkv*sizeof(std::uint16_t));
+    in.add(half_buffers_[2],source.z,n*kZ*sizeof(std::uint16_t));
     if(source.merged_qkvz_side)
-        copy(half_buffers_[3],source.conv_input,n*kQkv*sizeof(std::uint16_t),"GDN peer conv input");
-    copy(float_buffers_[1],source.a,n*kHeads*sizeof(float),"GDN peer a");
-    copy(float_buffers_[0],source.b,n*kHeads*sizeof(float),"GDN peer b");
-    copy(float_buffers_[5],source.g_trace,n*kHeads*sizeof(float),"GDN peer g");
-    copy(float_buffers_[4],source.beta_trace,n*kHeads*sizeof(float),"GDN peer beta");
+        in.add(half_buffers_[3],source.conv_input,n*kQkv*sizeof(std::uint16_t));
+    in.add(float_buffers_[1],source.a,n*kHeads*sizeof(float));
+    in.add(float_buffers_[0],source.b,n*kHeads*sizeof(float));
+    in.add(float_buffers_[5],source.g_trace,n*kHeads*sizeof(float));
+    in.add(float_buffers_[4],source.beta_trace,n*kHeads*sizeof(float));
+    check(exl3_launch_segment_copies(in,stream),"GDN peer segment inputs");
     cudaEvent_t* no_events=nullptr;
     gdn_middle(GdnMiddle{half_buffers_[1],reinterpret_cast<std::uint16_t*>(half_buffers_[3]),
         half_buffers_[4],half_buffers_[5],half_buffers_[6],half_buffers_[7],half_buffers_[2],
         half_buffers_[8],half_buffers_[9],half_buffers_[11],half_buffers_[21],half_buffers_[12],
         float_buffers_[5],float_buffers_[4],rows,stream,false,preserve_m1_topology,
         source.merged_qkvz_side,segment.eligible,segment.base_recurrent,false,no_events,no_events});
-    copy(source.o_input,half_buffers_[12],n*kZ*sizeof(std::uint16_t),"GDN peer gated norm output");
+    Exl3SegmentCopies out;
+    out.add(source.o_input,half_buffers_[12],n*kZ*sizeof(std::uint16_t));
+    check(exl3_launch_segment_copies(out,stream),"GDN peer gated norm output");
     end_segment(segment,rows,state_stream,preserve_m1_topology);
 }
 

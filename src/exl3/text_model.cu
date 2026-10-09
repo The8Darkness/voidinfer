@@ -1,3 +1,4 @@
+#include "exl3/segment_copy.cuh"
 #include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/block_tree_sum.cuh"
@@ -3385,13 +3386,23 @@ struct Exl3TextContext::Impl {
     void finish_batched_continuation(const std::uint16_t* hidden,int rows,int position,
                                      cudaStream_t stream,const std::uint16_t* precomputed_norm=nullptr,
                                      const std::uint16_t* precomputed_logits=nullptr) {
-        require(continuation && continuation->capacity>=rows && rows>=2,
+        require(continuation && continuation->capacity>=rows && rows>=2 &&
+                !precomputed_norm==!precomputed_logits,
             "batched continuation head capacity");
         auto& scratch=*continuation;
         auto* norm=static_cast<std::uint16_t*>(scratch.final_norm->ptr);
-        if(precomputed_norm)
-            cuda_check(cudaMemcpyAsync(norm,precomputed_norm,static_cast<std::size_t>(rows)*kHidden*
-                sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),"copy batched head norm rows");
+        auto* all_logits=static_cast<std::uint16_t*>(scratch.logits->ptr);
+        // Batched head: the member's norm rows, logits rows and final-row
+        // logits in one copy launch.
+        if(precomputed_norm && precomputed_logits) {
+            Exl3SegmentCopies copies;
+            copies.add(norm,precomputed_norm,static_cast<std::size_t>(rows)*kHidden*sizeof(std::uint16_t));
+            copies.add(all_logits,precomputed_logits,static_cast<std::size_t>(rows)*kVocab*sizeof(std::uint16_t));
+            copies.add(logits,precomputed_logits+static_cast<std::size_t>(rows-1)*kVocab,
+                kVocab*sizeof(std::uint16_t));
+            cuda_check(exl3_launch_segment_copies(copies,stream),"copy batched head rows");
+        }
+        if(precomputed_norm) {}
         else for(int row=0;row<rows;++row)
             final_rms_norm_kernel<<<1,512,0,stream>>>(
                 hidden+static_cast<std::size_t>(row)*kHidden,model->final_norm,
@@ -3403,10 +3414,7 @@ struct Exl3TextContext::Impl {
         last_hidden_source_position=position;
         if(++last_hidden_generation==0)
             throw std::overflow_error("native MTP hidden generation exhausted");
-        auto* all_logits=static_cast<std::uint16_t*>(scratch.logits->ptr);
-        if(precomputed_logits)
-            cuda_check(cudaMemcpyAsync(all_logits,precomputed_logits,static_cast<std::size_t>(rows)*kVocab*
-                sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),"copy batched head logits rows");
+        if(precomputed_logits) {}
         else if(std::strcmp(scratch.head_workspace->dispatch_name(model->lm_head_metadata,rows),
                        "h6_small_m_single_split")==0)
             scratch.head_workspace->forward(model->lm_head,model->lm_head_metadata,
@@ -3416,9 +3424,10 @@ struct Exl3TextContext::Impl {
                 norm+static_cast<std::size_t>(row)*kHidden,
                 all_logits+static_cast<std::size_t>(row)*kVocab,1,stream);
         cuda_check(cudaGetLastError(),"launch batched continuation LM head");
-        cuda_check(cudaMemcpyAsync(logits,all_logits+static_cast<std::size_t>(rows-1)*kVocab,
-            kVocab*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
-            "retain batched continuation final-row logits");
+        if(!(precomputed_norm && precomputed_logits))
+            cuda_check(cudaMemcpyAsync(logits,all_logits+static_cast<std::size_t>(rows-1)*kVocab,
+                kVocab*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
+                "retain batched continuation final-row logits");
         head_work.submitted_rows+=static_cast<std::uint64_t>(rows);
         last_rows=rows;
         if(capture_taps) {
@@ -10093,21 +10102,31 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
             false,false,nullptr,0,kLayers,nullptr,nullptr,true);
     }
-    // The owner's taps hold every row; each peer's rows move to its own taps.
-    for(std::size_t p=0;p<peers.size();++p) {
-        auto& peer=*peers[p].context->impl_;
-        const auto row=static_cast<std::size_t>(first_row[p+1]);
-        const auto count=peers[p].tokens.size();
-        for(std::size_t tap=0;tap<impl_->taps.size();++tap)
-            cuda_check(cudaMemcpyAsync(peer.taps[tap]->ptr,
-                static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr)+row*kHidden,
-                count*kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),"move batched peer taps");
-        cuda_check(cudaMemcpyAsync(peer.embedding_trace->ptr,
-            static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+row*kHidden,
-            count*kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
-            "move batched peer embedding trace");
-        peer.embedding_rows=peer.tap_rows=static_cast<int>(count);
-        peer.last_stack_output=impl_->last_stack_output+row*kHidden;
+    // The owner's taps hold every row; each peer's rows move to its own taps
+    // (batched copy launches instead of one copy per tap and peer).
+    {
+        Exl3SegmentCopies copies;
+        const auto flush=[&] {
+            cuda_check(exl3_launch_segment_copies(copies,stream),"move batched peer taps");
+            copies=Exl3SegmentCopies{};
+        };
+        for(std::size_t p=0;p<peers.size();++p) {
+            auto& peer=*peers[p].context->impl_;
+            const auto row=static_cast<std::size_t>(first_row[p+1]);
+            const auto count=peers[p].tokens.size();
+            const auto bytes=count*kHidden*sizeof(std::uint16_t);
+            for(std::size_t tap=0;tap<impl_->taps.size();++tap) {
+                if(copies.count==kSegmentCopyMax)flush();
+                copies.add(peer.taps[tap]->ptr,
+                    static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr)+row*kHidden,bytes);
+            }
+            if(copies.count==kSegmentCopyMax)flush();
+            copies.add(peer.embedding_trace->ptr,
+                static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+row*kHidden,bytes);
+            peer.embedding_rows=peer.tap_rows=static_cast<int>(count);
+            peer.last_stack_output=impl_->last_stack_output+row*kHidden;
+        }
+        flush();
     }
     impl_->embedding_rows=impl_->tap_rows=own_rows;
     // One H6 head pass over every agent's rows (16-row single-split tiles)
