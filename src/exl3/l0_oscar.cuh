@@ -232,12 +232,33 @@ __global__ void hot_clear_kernel(HotView h) {
     hot_clear(h, static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x), static_cast<int>(gridDim.x * blockDim.x));
 }
 
-// One CTA (256 threads = dims) per (row, head, K|V) task over newly aged rows.
+// One CTA (256 threads = dims) per (16-row batch, head, K|V) task over newly
+// aged rows: each rotation row R[i][:] is read once per batch instead of once
+// per row (the per-row 256 KB matrix re-reads were L2-bound). Every row keeps
+// its own sequential fmaf chain, so codes and metadata are unchanged.
+constexpr int kEncodeRows = 16;
+constexpr int kEncodeBlocks = 512;
+// y[r][j] = sum_i x[r][i] R[i][j] for rows 0..Rows-1 (sequential fmaf chain).
+template <int Rows>
+__device__ __forceinline__ void encode_rotate(const float (*x)[kDim], const float* R, int j,
+                                              float (*y)[kDim]) {
+    float acc[Rows];
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) acc[r] = 0.0f;
+    for (int i = 0; i < kDim; ++i) {
+        const float rotation = R[i * kDim + j];
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) acc[r] = fmaf(x[r][i], rotation, acc[r]);
+    }
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) y[r][j] = acc[r];
+}
 __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cache,
     const std::uint16_t* v_cache, int capacity, const int* position_device, int position,
     int* state, Assets a, int bank, std::uint8_t* k_codes, std::uint8_t* v_codes,
     __half* k_meta, __half* v_meta, HotView hot) {
-    __shared__ float x[kDim], y[kDim], scratch[16];
+    __shared__ float x[kEncodeRows][kDim], y[kEncodeRows][kDim];
+    __shared__ float extrema[kEncodeRows][16], thresholds[kEncodeRows];
     const int base = position_device ? *position_device : position;
     int wm = state[0];
     const int thread = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -248,59 +269,77 @@ __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cach
     }
     wm = max(wm, kSink);
     const int end = min(history_end(base), capacity);
-    const int tasks = max(end - wm, 0) * 8;
+    const int batches = (max(end - wm, 0) + kEncodeRows - 1) / kEncodeRows;
+    const int tasks = batches * 8;
     const int j = threadIdx.x;
     for (int t = blockIdx.x; t < tasks; t += gridDim.x) {
-        const int row = wm + t / 8, head = (t / 2) % 4, kind = t % 2;
-        const std::size_t cell = static_cast<std::size_t>(row) * kKVHeadsL0 + head;
-        const auto* src = (kind ? v_cache : k_cache) + cell * kDim;
+        const int row0 = wm + (t / 8) * kEncodeRows, head = (t / 2) % 4, kind = t % 2;
+        const int count = min(kEncodeRows, end - row0);
         const float* R = (kind ? a.rv : a.rk) + (static_cast<std::size_t>(bank) * 4 + head) * kDim * kDim;
+        const float mu = kind ? 0.0f : a.mu[(bank * 4 + head) * kDim + j];
         __syncthreads();
-        float value = __half2float(__ushort_as_half(src[j]));
-        if (!kind) value -= a.mu[(bank * 4 + head) * kDim + j];
-        x[j] = value;
-        __syncthreads();
-        float acc = 0.0f;
-        for (int i = 0; i < kDim; ++i) acc = fmaf(x[i], R[i * kDim + j], acc);
-        y[j] = acc;
-        __syncthreads();
-        const float mag = fabsf(acc);
-        int rank = 0;
-        for (int i = 0; i < kDim; ++i) {
-            const float b = fabsf(y[i]);
-            rank += (b < mag) || (b == mag && i < j);
+#pragma unroll
+        for (int r = 0; r < kEncodeRows; ++r) {
+            float value = 0.0f;
+            if (r < count) {
+                const std::size_t cell = static_cast<std::size_t>(row0 + r) * kKVHeadsL0 + head;
+                value = __half2float(__ushort_as_half((kind ? v_cache : k_cache)[cell * kDim + j]));
+                if (!kind) value -= mu;
+            }
+            x[r][j] = value;
         }
+        __syncthreads();
+        // Decode rounds age only a few rows: size the row loop to the batch.
+        if (count <= 2) encode_rotate<2>(x, R, j, y);
+        else if (count <= 4) encode_rotate<4>(x, R, j, y);
+        else if (count <= 8) encode_rotate<8>(x, R, j, y);
+        else encode_rotate<kEncodeRows>(x, R, j, y);
+        __syncthreads();
         const int clip_index = kind ? 235 : 245;  // floor(0.92*256), floor(0.96*256)
-        if (rank == clip_index) scratch[15] = mag;
-        __syncthreads();
-        const float thr = scratch[15];
-        const float clipped = fminf(fmaxf(acc, -thr), thr);
-        float mn = clipped, mx = clipped;
-        for (int o = 16; o > 0; o >>= 1) {
-            mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o));
-            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        for (int r = 0; r < count; ++r) {
+            const float mag = fabsf(y[r][j]);
+            int rank = 0;
+            for (int i = 0; i < kDim; ++i) {
+                const float b = fabsf(y[r][i]);
+                rank += (b < mag) || (b == mag && i < j);
+            }
+            if (rank == clip_index) thresholds[r] = mag;
         }
         __syncthreads();
-        if ((j & 31) == 0) { x[j >> 5] = mn; x[8 + (j >> 5)] = mx; }
+        for (int r = 0; r < count; ++r) {
+            const float thr = thresholds[r];
+            const float clipped = fminf(fmaxf(y[r][j], -thr), thr);
+            float mn = clipped, mx = clipped;
+            for (int o = 16; o > 0; o >>= 1) {
+                mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o));
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            }
+            if ((j & 31) == 0) { extrema[r][j >> 5] = mn; extrema[r][8 + (j >> 5)] = mx; }
+        }
         __syncthreads();
         const int g = j >> 7;
-        float gmn = x[g * 4], gmx = x[8 + g * 4];
-        for (int w = 1; w < 4; ++w) { gmn = fminf(gmn, x[g * 4 + w]); gmx = fmaxf(gmx, x[8 + g * 4 + w]); }
-        // Scale and zero are stored as FP16; the codes use the stored values.
-        const float scale = __half2float(__float2half_rn(fmaxf(gmx - gmn, 1.0e-6f) / 3.0f));
-        const float zero = __half2float(__float2half_rn(-gmn / scale));
-        const int code = static_cast<int>(fminf(fmaxf(floorf(clipped / scale + zero + 0.5f), 0.0f), 3.0f));
-        // pack 4 consecutive dims per byte
-        const unsigned packed = __shfl_sync(0xffffffffu, code, (j & 31) & ~3) |
-                                (__shfl_sync(0xffffffffu, code, ((j & 31) & ~3) + 1) << 2) |
-                                (__shfl_sync(0xffffffffu, code, ((j & 31) & ~3) + 2) << 4) |
-                                (__shfl_sync(0xffffffffu, code, ((j & 31) & ~3) + 3) << 6);
-        auto* codes = (kind ? v_codes : k_codes) + cell * kCodeBytes;
-        if ((j & 3) == 0) codes[j >> 2] = static_cast<std::uint8_t>(packed);
-        if ((j & 127) == 0) {
-            __half* meta = (kind ? v_meta : k_meta) + cell * kMetaFloats;
-            meta[2 * g] = __float2half_rn(scale);
-            meta[2 * g + 1] = __float2half_rn(zero);
+        for (int r = 0; r < count; ++r) {
+            const float thr = thresholds[r];
+            const float clipped = fminf(fmaxf(y[r][j], -thr), thr);
+            float gmn = extrema[r][g * 4], gmx = extrema[r][8 + g * 4];
+            for (int w = 1; w < 4; ++w) { gmn = fminf(gmn, extrema[r][g * 4 + w]); gmx = fmaxf(gmx, extrema[r][8 + g * 4 + w]); }
+            // Scale and zero are stored as FP16; the codes use the stored values.
+            const float scale = __half2float(__float2half_rn(fmaxf(gmx - gmn, 1.0e-6f) / 3.0f));
+            const float zero = __half2float(__float2half_rn(-gmn / scale));
+            const int code = static_cast<int>(fminf(fmaxf(floorf(clipped / scale + zero + 0.5f), 0.0f), 3.0f));
+            // pack 4 consecutive dims per byte
+            const unsigned packed = __shfl_sync(0xffffffffu, code, (j & 31) & ~3) |
+                                    (__shfl_sync(0xffffffffu, code, ((j & 31) & ~3) + 1) << 2) |
+                                    (__shfl_sync(0xffffffffu, code, ((j & 31) & ~3) + 2) << 4) |
+                                    (__shfl_sync(0xffffffffu, code, ((j & 31) & ~3) + 3) << 6);
+            const std::size_t cell = static_cast<std::size_t>(row0 + r) * kKVHeadsL0 + head;
+            auto* codes = (kind ? v_codes : k_codes) + cell * kCodeBytes;
+            if ((j & 3) == 0) codes[j >> 2] = static_cast<std::uint8_t>(packed);
+            if ((j & 127) == 0) {
+                __half* meta = (kind ? v_meta : k_meta) + cell * kMetaFloats;
+                meta[2 * g] = __float2half_rn(scale);
+                meta[2 * g + 1] = __float2half_rn(zero);
+            }
         }
     }
 }

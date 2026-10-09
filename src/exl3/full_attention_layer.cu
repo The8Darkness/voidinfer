@@ -8237,7 +8237,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                     l0_oscar::hot_view(l0_),k_cache_,v_cache_);
                 launch(cudaEventRecord(hot_branch.join,hot_branch.side),"L0 hot fill join");
             }
-            l0_oscar::encode_kernel<<<256,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
+            l0_oscar::encode_kernel<<<l0_oscar::kEncodeBlocks,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
                 position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
                 reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta),
                 l0_oscar::hot_view(l0_));
