@@ -1,4 +1,5 @@
 #include "exl3/l0_history_mark.h"
+#include "exl3/growable_device_region.h"
 #include "exl3/segment_copy.cuh"
 #include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
@@ -249,9 +250,20 @@ struct DeviceAllocation {
     bool device_query_failure_for_test=false;
     bool device_mismatch_for_test=false;
     bool shared_control_admitted=false;
-    // L0 OSCAR: the FP16 K/V planes live in mapped pinned host memory (the L2
-    // FP16 tier); the GPU reads only the exact windows through UVA.
+    // L0 OSCAR: the FP16 K/V planes live in pinned host memory (the L2 FP16
+    // tier) addressed by the GPU; they own no device bytes.
     bool host_mapped=false;
+    // L0 OSCAR K/V planes: host memory behind a fixed GPU address range,
+    // backed as the context grows (ensure_host_bytes) instead of pinning
+    // max_context rows per lane up front. The CPU reaches it by copies only.
+    std::unique_ptr<Exl3GrowableDeviceRegion> host_region;
+    bool cpu_visible() const noexcept {return !host_region;}
+    void ensure_host_bytes(std::size_t used) {
+        if(host_region)host_region->ensure(std::min(used,bytes));
+    }
+    void shrink_host_bytes(std::size_t used) {
+        if(host_region)host_region->shrink(std::min(used,bytes));
+    }
     Exl3SharedControlCredit* shared_control_credit=nullptr;
     static constexpr std::size_t shared_control_bytes=Exl3ReconstructionControlAllocator<std::byte>::capacity;
     void* ptr = nullptr;
@@ -304,6 +316,13 @@ struct DeviceAllocation {
     }
     void release() noexcept {
         if(!ptr)return;
+        if(host_region) {
+            host_region->reset();
+            host_region.reset();
+            if(retirement)retirement->device_credit.reset();
+            ptr=nullptr;
+            return;
+        }
         int current=-1;auto error=cleanup_failure_for_test?cudaErrorUnknown:
             (device_query_failure_for_test?cudaErrorInitializationError:cudaGetDevice(&current));
         if(error==cudaSuccess && (device_mismatch_for_test || current!=device))error=cudaErrorInvalidDevice;
@@ -365,13 +384,32 @@ struct DeviceAllocation {
         prepare_device();
         if(l0_host_kv_plane(label)) {
             host_mapped=true;
-            cuda_check(cudaHostAlloc(&ptr,bytes,cudaHostAllocMapped|cudaHostAllocPortable),label);
+            if(growable_host_planes(label,bytes)) {
+                host_region=std::make_unique<Exl3GrowableDeviceRegion>();
+                host_region->reserve(bytes,true);
+                ptr=host_region->data<void>();
+            } else
+                cuda_check(cudaHostAlloc(&ptr,bytes,cudaHostAllocMapped|cudaHostAllocPortable),label);
         } else {
             cuda_check(exl3_packed_malloc(&ptr, bytes), label);
             static const bool trace=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
             if(trace && bytes>=(256u<<10))
                 std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB %s%c",bytes/1048576.0,label?label:"?",10);
         }
+    }
+    // Long-context E4A K/V planes (max_context above 32K) grow with the
+    // context; shorter ones stay pinned at construction, which keeps exports
+    // as plain CPU copies (growable planes export through GPU DMA, ~2% of C4
+    // throughput at 4K). NINFER_EXL3_L0_GROWABLE_PLANES=0|1 forces either.
+    static bool growable_host_planes(const char* label,std::size_t bytes) {
+        static const int forced=[] {
+            const char* value=std::getenv("NINFER_EXL3_L0_GROWABLE_PLANES");
+            return value ? (std::strcmp(value,"0")!=0 ? 1 : 0) : -1;
+        }();
+        constexpr std::size_t kPinnedPlaneBytes=32768ull*kKVHeads*kHeadDim*sizeof(std::uint16_t);
+        const bool growable=forced>=0 ? forced==1 : bytes>kPinnedPlaneBytes;
+        return growable && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
+                                     std::strcmp(label,"allocate E4A V cache")==0);
     }
     static bool l0_host_kv_plane(const char* label) {
         const bool l0=Exl3NativeContextExtent::l0_oscar_enabled();
@@ -3373,11 +3411,28 @@ struct Exl3TextContext::Impl {
     // Batched multi-agent continuation: this context's all-row verification
     // head over its rows of a shared layer stack (the all_head_rows path of
     // process_rows).
+    // Growable L0 FP16 planes follow the INT2 code backing: rows used plus a
+    // margin that spaces the map calls (1024 rows = one 2 MiB granule).
+    static constexpr int kPlaneGrowthMarginRows=4096;
+    static constexpr int kL0RetainedBackingRows=16384;
+    static constexpr std::size_t kPlaneRowBytes=static_cast<std::size_t>(kKVHeads)*kHeadDim*sizeof(std::uint16_t);
     void ensure_l0_rows(int rows) {
         for(auto& layer:full_layers)if(layer)layer->ensure_l0_rows(rows);
+        const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(cache_k[layer])cache_k[layer]->ensure_host_bytes(used);
+            if(cache_v[layer])cache_v[layer]->ensure_host_bytes(used);
+        }
     }
-    void release_l0_rows_beyond(int rows) {
+    // plane_rows: rows of FP16 plane backing to keep (defaults to rows).
+    void release_l0_rows_beyond(int rows,int plane_rows=-1) {
         for(auto& layer:full_layers)if(layer)layer->release_l0_rows_beyond(rows);
+        if(plane_rows<0)plane_rows=rows;
+        const std::size_t used=static_cast<std::size_t>(std::max(plane_rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(cache_k[layer])cache_k[layer]->shrink_host_bytes(used);
+            if(cache_v[layer])cache_v[layer]->shrink_host_bytes(used);
+        }
     }
     // precomputed_norm/logits: this agent's rows of the owner's batched head
     // (one H6 head over every agent's rows); copied into this context's
@@ -10301,8 +10356,11 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view c
     if(std::exchange(impl_->fail_request_reset_completion_for_test,false))
         throw std::runtime_error("injected request reset completion failure");
     cuda_check(cudaDeviceSynchronize(),"complete request context reset");
-    // Growable L0 planes return backing beyond the retained frontier.
-    impl_->release_l0_rows_beyond(position_);
+    // Growable L0 codes and planes return backing beyond the retained
+    // frontier; the host planes keep kL0RetainedBackingRows rows so ordinary
+    // requests on this lane do not re-create pinned pages (~0.1 s per 4K
+    // prompt otherwise).
+    impl_->release_l0_rows_beyond(position_,std::max(position_,Impl::kL0RetainedBackingRows));
     const auto complete=std::chrono::steady_clock::now();
     ++impl_->request_generation;
     return Exl3RequestResetStats{
@@ -12509,6 +12567,23 @@ void Exl3TextContext::fail_export_copy_for_test(unsigned submission) {
     impl_->export_copy_fault_for_test=submission;
 }
 
+
+namespace {
+// Pinned host window for copies between the GPU-addressed growable L0 FP16
+// planes and pageable exact pages (export/restore). Per host thread: lanes
+// export and restore concurrently.
+constexpr int kL0PlaneStageRows = 8192;
+struct L0PlaneStage {
+    std::uint16_t* host = nullptr;
+    L0PlaneStage() {
+        cuda_check(cudaMallocHost(reinterpret_cast<void**>(&host),
+            static_cast<std::size_t>(kL0PlaneStageRows) * 1024 * sizeof(std::uint16_t)),
+            "L0 plane staging");
+    }
+    ~L0PlaneStage() { if (host) cudaFreeHost(host); }
+};
+L0PlaneStage& l0_plane_stage() { thread_local L0PlaneStage value; return value; }
+}  // namespace
 std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_state(cudaStream_t stream,bool share_prefix,
     bool fail_after_recurrent_plan_for_test) const {
     impl_->join_repair(stream);
@@ -12583,13 +12658,19 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     // is a host copy, run in parallel after one stream fence, each task
     // allocating and filling its own bank (no zero fill; previously one
     // synchronized cudaMemcpyAsync per 64-row page and bank, ~90 ms at 4K).
-    bool host_planes=!l2_fp8;
+    bool host_planes=!l2_fp8,staged_planes=!l2_fp8;
     for(int layer=0;layer<kLayers;++layer)
-        if(impl_->full_layers[layer])
-            host_planes=host_planes && impl_->cache_k[layer]->host_mapped &&
-                impl_->cache_v[layer]->host_mapped;
+        if(impl_->full_layers[layer]) {
+            const auto& k=*impl_->cache_k[layer];
+            const auto& v=*impl_->cache_v[layer];
+            host_planes=host_planes && k.host_mapped && v.host_mapped && k.cpu_visible() && v.cpu_visible();
+            // Growable planes: GPU-addressed host memory, copied out through a
+            // pinned window (one DMA per window and plane, pages filled in parallel).
+            staged_planes=staged_planes && k.host_mapped && v.host_mapped &&
+                !k.cpu_visible() && !v.cpu_visible();
+        }
     auto extension=extend_exact_pages(prefix_pages,prefix_position,position_,false,nullptr,0,
-        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024,!host_planes);
+        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024,!host_planes && !staged_planes);
     for(const auto& page:extension.all)
         require(page->fp8==l2_fp8 || std::find(extension.fresh.begin(),extension.fresh.end(),page)!=extension.fresh.end(),
                 "L0 L2 FP8 prefix page format");
@@ -12734,6 +12815,37 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                             output.insert(output.end(),words,words+static_cast<std::size_t>(to-from)*l0_l2_fp8::kRowWords);
                         });
                         state->kv_export_bytes_+=static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes;
+                        lo=hi;
+                    }
+                }
+            }
+            ++full;
+        } else if (impl_->full_layers[layer] && staged_planes) {
+            if(!fresh_pages.empty()) {
+                const int range_first=std::max(prefix_position,fresh_pages.front()->first);
+                auto& stage=l0_plane_stage();
+                for(int plane=0;plane<2;++plane) {
+                    const auto* source_plane=static_cast<const std::uint16_t*>(
+                        plane?impl_->cache_v[layer]->ptr:impl_->cache_k[layer]->ptr);
+                    for(int lo=range_first;lo<position_;) {
+                        const int hi=std::min(position_,(lo/64)*64+kL0PlaneStageRows);
+                        const int count=hi-lo;
+                        cuda_check(cudaMemcpyAsync(stage.host,source_plane+static_cast<std::size_t>(lo)*1024,
+                            static_cast<std::size_t>(count)*1024*sizeof(std::uint16_t),cudaMemcpyDefault,stream),
+                            "export L0 plane window");
+                        cuda_check(cudaStreamSynchronize(stream),"export L0 plane window");
+                        std::for_each(std::execution::par,fresh_pages.begin(),fresh_pages.end(),[&](const auto& page) {
+                            const int from=std::max(lo,page->first);
+                            const int to=std::min(hi,page->first+page->rows);
+                            if(to<=from) return;
+                            auto& output=plane?page->v[full]:page->k[full];
+                            // Earlier rows (cloned prefix or previous window) are present.
+                            output.reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*1024);
+                            output.resize(static_cast<std::size_t>(from-page->first)*1024);
+                            const auto* words=stage.host+static_cast<std::size_t>(from-lo)*1024;
+                            output.insert(output.end(),words,words+static_cast<std::size_t>(to-from)*1024);
+                        });
+                        state->kv_export_bytes_+=static_cast<std::size_t>(count)*1024*sizeof(std::uint16_t);
                         lo=hi;
                     }
                 }
@@ -13089,11 +13201,39 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
         if(std::exchange(impl_->host_kv_restore_failure_for_test,false))
             throw std::runtime_error("injected HostKV failure after restore upload");
     };
+    // Back the growable planes (and codes) for every restored row first.
+    impl_->ensure_l0_rows(state.position_);
     int full = 0, gdn = 0;
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl_->full_layers[layer]) {
             impl_->full_layers[layer]->invalidate_retained_prefix();
             const auto restore_kv=[&](void* destination,bool key,int first,int rows) {
+                const auto& owner=key?*impl_->cache_k[layer]:*impl_->cache_v[layer];
+                if(!state.l2_fp8_ && !warm && owner.host_mapped && !owner.cpu_visible() &&
+                   destination>=owner.ptr &&
+                   destination<static_cast<const std::uint8_t*>(owner.ptr)+owner.bytes) {
+                    // Growable plane: page-aligned windows gathered into the
+                    // pinned stage in parallel, one DMA per window.
+                    auto& stage=l0_plane_stage();
+                    for(int lo=first;lo<first+rows;lo+=kL0PlaneStageRows) {
+                        const int count=std::min(kL0PlaneStageRows,first+rows-lo);
+                        std::for_each(std::execution::par,state.kv_pages_.begin(),state.kv_pages_.end(),[&](const auto& page) {
+                            const int from=std::max(lo,page->first);
+                            const int to=std::min(lo+count,page->first+page->rows);
+                            if(to<=from) return;
+                            const auto& original=key?page->k[full]:page->v[full];
+                            std::memcpy(stage.host+static_cast<std::size_t>(from-lo)*1024,
+                                original.data()+static_cast<std::size_t>(from-page->first)*1024,
+                                static_cast<std::size_t>(to-from)*1024*sizeof(std::uint16_t));
+                        });
+                        cuda_check(cudaMemcpyAsync(static_cast<std::uint16_t*>(destination)+
+                            static_cast<std::size_t>(lo-first)*1024,stage.host,
+                            static_cast<std::size_t>(count)*1024*sizeof(std::uint16_t),cudaMemcpyDefault,stream),
+                            "restore L0 plane window");
+                        cuda_check(cudaStreamSynchronize(stream),"restore L0 plane window");
+                    }
+                    return;
+                }
                 if(state.l2_fp8_) {
                     require(!warm,"L0 L2 FP8 pages have no TurboAngle warm tail");
                     auto& staging=l0_l2_fp8::staging();

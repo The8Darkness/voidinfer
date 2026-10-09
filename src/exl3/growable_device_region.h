@@ -23,20 +23,32 @@ public:
     ~Exl3GrowableDeviceRegion() { reset(); }
 
     // Reserves `capacity` bytes of virtual address space on the current device.
-    void reserve(std::size_t capacity) {
+    // host: the backing is pinned host memory (NUMA node of the device) that
+    // only the GPU addresses, through the same contiguous range; the CPU
+    // reaches it by copies.
+    void reserve(std::size_t capacity, bool host = false) {
         if (base_) throw std::logic_error("growable region already reserved");
         CUdevice device = 0;
         check(cuCtxGetDevice(&device), "growable region device");
         prop_ = {};
         prop_.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop_.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop_.location.id = static_cast<int>(device);
+        if (host) {
+            int numa = -1;
+            if (cuDeviceGetAttribute(&numa, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device) != CUDA_SUCCESS)
+                numa = -1;
+            prop_.location.type = numa >= 0 ? CU_MEM_LOCATION_TYPE_HOST_NUMA : CU_MEM_LOCATION_TYPE_HOST;
+            prop_.location.id = numa >= 0 ? numa : 0;
+        } else {
+            prop_.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop_.location.id = static_cast<int>(device);
+        }
         check(cuMemGetAllocationGranularity(&granularity_, &prop_, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
               "growable region granularity");
         capacity_ = round_up(std::max<std::size_t>(capacity, 1));
         check(cuMemAddressReserve(&base_, capacity_, 0, 0, 0), "growable region reserve");
         access_ = {};
-        access_.location = prop_.location;
+        access_.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access_.location.id = static_cast<int>(device);
         access_.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     }
 
