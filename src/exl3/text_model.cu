@@ -1,3 +1,4 @@
+#include "exl3/l0_history_mark.h"
 #include "exl3/segment_copy.cuh"
 #include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
@@ -3464,6 +3465,10 @@ struct Exl3TextContext::Impl {
             if(capturing==cudaStreamCaptureStatusNone)ensure_l0_rows(position+rows);
         }
         retain_host_kv_forward_stream(stream);
+        // A whole multi-row pass: rows below `position` are final in every
+        // layer (see l0_history_mark.h).
+        std::optional<L0HistoryWrittenScope> history_written;
+        if(rows>8 && layer_begin==0 && layer_end==kLayers)history_written.emplace(position,stream);
         const bool fast_same_weights_wide_candidate =
             fast_same_weights_fp16kv_prefill_enabled && wide_prefill && rows>=256 &&
             !graph_capture_active && !graph_active &&
@@ -8998,6 +9003,9 @@ void Exl3TextContext::append_prefill_layer_major(
     if (!layer_profile.events.empty())
         cuda_check(cudaEventRecord(layer_profile.events[0],stream),
                    "record layer-major profile start");
+    // Rows below the block hold their final values in every layer: exact
+    // history copies of those rows overlap the layers before each attention.
+    const L0HistoryWrittenScope history_written(base_position,stream);
     for (int layer=0;layer<kLayers;++layer) {
         workspace.begin_layer_reuse(cache_budget,
             base_position+total>=8192 ||
