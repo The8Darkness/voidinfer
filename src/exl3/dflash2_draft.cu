@@ -3,6 +3,7 @@
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/linear_workspace_requirements.h"
 #include "exl3/text_model.h"
+#include "exl3/batched_verify_coordinator.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -748,9 +749,13 @@ __global__ void dflash_dyn_conv_kernel(const std::uint16_t* x,
                                        int rows,
                                        int stream,
                                        const std::uint16_t* residual=nullptr,
-                                       std::uint16_t* residual_out=nullptr) {
+                                       std::uint16_t* residual_out=nullptr,
+                                       int segment=0) {
     const int row = static_cast<int>(blockIdx.x);
     if (row >= rows) return;
+    // segment > 0: rows form independent blocks of `segment` rows (one per
+    // agent of a batched draft forward); each block's first row has no history.
+    const bool has_previous = segment > 0 ? row % segment != 0 : row > 0;
     const std::uint16_t* base_row = base + stream * (kConvKernel * kHidden);
     // Grid (rows, kHidden / blockDim): one channel per thread.
     {
@@ -758,7 +763,7 @@ __global__ void dflash_dyn_conv_kernel(const std::uint16_t* x,
         if (i >= kHidden) return;
         const int g = i / kConvGroup;
         const float x0 = half_to_float(x[row * kHidden + i]);
-        const float x1 = row > 0 ? half_to_float(x[(row - 1) * kHidden + i]) : 0.0f;
+        const float x1 = has_previous ? half_to_float(x[(row - 1) * kHidden + i]) : 0.0f;
         const float d0 = half_to_float(dyn[row * kConvDynamic +
                                           stream * (kConvKernel * kConvGroups) + g]);
         const float d1 = half_to_float(dyn[row * kConvDynamic +
@@ -2889,6 +2894,9 @@ struct Exl3Dflash2DraftModel::Impl {
 
     bool prefill_batch = false;
     bool target_commit_batch = false;
+    // Batched multi-agent drafting (set_batched_propose); null keeps every
+    // proposal private to this execution.
+    Exl3BatchedVerifyCoordinator* batched_propose = nullptr;
     Exl3CudaLinearWorkspace::Owner ws_fc;
     Exl3CudaLinearWorkspace::Owner ws_q;
     Exl3CudaLinearWorkspace::Owner ws_kv;
@@ -4586,8 +4594,277 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_view(
     std::span<const std::int64_t> block_ids,int block_pos0,
     const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
     const Exl3CudaLinearMetadata& target_head_metadata,std::int64_t mask_token_id,cudaStream_t stream) {
+    if(impl_->batched_propose && batched_proposal_supported(block_ids))
+        return impl_->batched_propose->propose(*this,block_ids,block_pos0,target_embedding_bf16,
+            target_head,target_head_metadata,mask_token_id,stream);
     return propose_internal(block_ids,block_pos0,nullptr,0,0,0,target_embedding_bf16,
         target_head,target_head_metadata,mask_token_id,stream,true);
+}
+
+std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_private(
+    std::span<const std::int64_t> block_ids,int block_pos0,
+    const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
+    const Exl3CudaLinearMetadata& target_head_metadata,std::int64_t mask_token_id,cudaStream_t stream) {
+    return propose_internal(block_ids,block_pos0,nullptr,0,0,0,target_embedding_bf16,
+        target_head,target_head_metadata,mask_token_id,stream,true);
+}
+
+void Exl3Dflash2DraftModel::set_batched_propose(Exl3BatchedVerifyCoordinator* coordinator) noexcept {
+    impl_->batched_propose=coordinator;
+}
+
+bool Exl3Dflash2DraftModel::batched_proposal_supported(std::span<const std::int64_t> block) const noexcept {
+    const Impl& m=*impl_;
+    bool gaming=false;
+    for(const auto id:{Gopt::DraftRopePair,Gopt::DraftHeadNormRope,Gopt::DraftConvResidual,
+                       Gopt::DraftResidualNorm,Gopt::DraftDenseRowPair,Gopt::DraftRingNormRope})
+        gaming=gaming || m.gaming[id];
+    return !gaming && static_cast<int>(block.size())==m.block_capacity && m.block_capacity==kBlockCap &&
+        m.fused_selector && !m.position_confidence && m.local_merge_topk &&
+        dflash_topk_segmented_enabled() && m.fast_device_liveness && !m.fused_topk_liveness &&
+        !m.projection_timing.enabled && !m.projection_observer && !m.ring_attention_observer &&
+        !m.shared_q_executor && m.parallel_ring_attention && !m.host_control_active &&
+        m.ring_count>=0 && m.ring_count<=kRingKeep &&
+        std::getenv("NINFER_DFLASH2_TIMING")==nullptr &&
+        std::getenv("NINFER_DFLASH2_DEBUG_LOGITS")==nullptr;
+}
+
+namespace {
+// Shared 32-row execution state of batched drafting. Batched forwards are
+// serialized (one coordinator group at a time); the weights stay per model.
+struct DraftBatchedScratch {
+    static constexpr int kRows = 4 * kBlockCap;
+    std::mutex mutex;
+    bool ready = false;
+    std::uint16_t *x_a=nullptr,*x_b=nullptr,*ln=nullptr,*conv=nullptr,*convf=nullptr,*dyn=nullptr,
+        *ln2=nullptr,*conv2=nullptr,*convf2=nullptr,*dyn2=nullptr,*qproj=nullptr,*qn=nullptr,*qr=nullptr,
+        *kblk=nullptr,*vblk=nullptr,*kblk_n=nullptr,*kblk_r=nullptr,*attn=nullptr,*oproj=nullptr,
+        *gate=nullptr,*up=nullptr,*act=nullptr,*down=nullptr,*final_norm=nullptr,*head_out=nullptr;
+    std::int32_t* pos=nullptr;
+    std::int64_t* ids=nullptr;
+    unsigned int* liveness=nullptr;
+    Exl3CudaLinearWorkspace::Owner ws_q,ws_kv,ws_o,ws_mlp,ws_down,ws_head;
+    void prepare() {
+        if(ready)return;
+        const auto alloc=[](auto*& pointer,std::size_t bytes,const char* label) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&pointer),bytes),label);
+        };
+        constexpr std::size_t two=sizeof(std::uint16_t),rows=kRows;
+        for(auto** plane:{&x_a,&x_b,&ln,&conv,&convf,&ln2,&conv2,&convf2,&oproj,&down,&final_norm})
+            alloc(*plane,rows*kHidden*two,"batched draft hidden plane");
+        alloc(dyn,rows*kConvDynamic*two,"batched draft dynamic conv");
+        alloc(dyn2,rows*kConvDynamic*two,"batched draft dynamic conv");
+        for(auto** plane:{&qproj,&qn,&qr,&attn})
+            alloc(*plane,rows*kQHeads*kHeadDim*two,"batched draft query plane");
+        for(auto** plane:{&kblk,&vblk,&kblk_n,&kblk_r})
+            alloc(*plane,rows*kKVHeads*kHeadDim*two,"batched draft key/value plane");
+        for(auto** plane:{&gate,&up,&act})
+            alloc(*plane,rows*kIntermediate*two,"batched draft MLP plane");
+        alloc(head_out,rows*kVocab*two,"batched draft head logits");
+        alloc(pos,rows*sizeof(std::int32_t),"batched draft positions");
+        alloc(ids,rows*sizeof(std::int64_t),"batched draft ids");
+        alloc(liveness,sizeof(unsigned int),"batched draft liveness");
+        const auto linear=[](int input,int output,int max_rows,bool batched) {
+            Exl3CudaLinearWorkspace::Owner owner(std::make_unique<Exl3CudaLinearWorkspace>(
+                input,output,max_rows,true).release());
+            if(batched)owner->enable_draft_batched();
+            return owner;
+        };
+        ws_q=linear(kHidden,kQHeads*kHeadDim,kRows,true);
+        ws_kv=linear(kHidden,kKVHeads*kHeadDim,kRows,true);
+        ws_o=linear(kQHeads*kHeadDim,kHidden,kRows,true);
+        ws_mlp=linear(kHidden,kIntermediate,kRows,true);
+        ws_down=linear(kIntermediate,kHidden,kRows,true);
+        // The H6 head runs in 16-row single-split tiles.
+        ws_head=linear(kHidden,kVocab,16,false);
+        ws_head->set_native_continuation16(true);
+        ready=true;
+    }
+};
+DraftBatchedScratch& draft_batched_scratch() {
+    static DraftBatchedScratch scratch;
+    return scratch;
+}
+} // namespace
+
+void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* const> members,
+    const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
+    const Exl3CudaLinearMetadata& target_head_metadata,cudaStream_t stream) {
+    const int count=static_cast<int>(members.size());
+    require(count>=1 && count<=4 && target_embedding_bf16,"batched draft member count");
+    const Impl& lead=*members[0]->draft->impl_;
+    for(auto* member:members) {
+        require(member && member->draft && member->draft->batched_proposal_supported(member->block) &&
+                member->draft->impl_->layers[0].q.trellis==lead.layers[0].q.trellis,
+            "batched draft member outside the shared configuration");
+        member->draft->require_no_fresh_prefill();
+        const Impl& m=*member->draft->impl_;
+        require(m.ring_base_abs>=0 && member->block_pos0==m.ring_base_abs+m.ring_count &&
+                std::all_of(member->block.begin(),member->block.end(),
+                    [](std::int64_t token){return token>=0 && token<kVocab;}),
+            "batched draft block must extend its committed ring");
+    }
+    auto& b=draft_batched_scratch();
+    const std::lock_guard lock(b.mutex);
+    b.prepare();
+    constexpr int L=kBlockCap,P=kBlockCap-1;
+    const int rows=count*L;
+    std::array<std::int64_t,DraftBatchedScratch::kRows> ids{};
+    std::array<std::int32_t,DraftBatchedScratch::kRows> positions{};
+    for(int i=0;i<count;++i)
+        for(int r=0;r<L;++r) {
+            ids[i*L+r]=members[i]->block[r];
+            positions[i*L+r]=members[i]->block_pos0+r;
+        }
+    cuda_check(cudaMemcpyAsync(b.ids,ids.data(),rows*sizeof(std::int64_t),cudaMemcpyHostToDevice,stream),
+        "upload batched draft ids");
+    cuda_check(cudaMemcpyAsync(b.pos,positions.data(),rows*sizeof(std::int32_t),cudaMemcpyHostToDevice,stream),
+        "upload batched draft positions");
+    const auto rms=[&](const std::uint16_t* in,const std::uint16_t* weight,std::uint16_t* out,int n) {
+        dflash_rms_norm_kernel<DFlashFmt::BF16><<<n,256,256*sizeof(float),stream>>>(in,weight,out,n,kHidden);
+        cuda_check(cudaGetLastError(),"batched draft RMSNorm");
+    };
+    const auto dense=[&](const std::uint16_t* in,const std::uint16_t* weight,std::uint16_t* out,int n,int k,int width) {
+        if(!(lead.dense_kmajor && launch_dflash_dense_rows_kmajor(in,weight,out,n,k,width,stream))) {
+            if(lead.dense_kmajor)
+                dflash_dense_gemm_t_kernel<true><<<dim3((width+255)/256,n),256,
+                    static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(in,weight,out,n,k,width);
+            else
+                dflash_dense_gemm_t_kernel<false><<<dim3((width+255)/256,n),256,
+                    static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(in,weight,out,n,k,width);
+        }
+        cuda_check(cudaGetLastError(),"batched draft dense projection");
+    };
+    const auto dyn_conv=[&](const std::uint16_t* x,const std::uint16_t* dyn,const std::uint16_t* base,
+                            std::uint16_t* y,int conv_stream,bool out_bf16) {
+        if(out_bf16)
+            dflash_dyn_conv_kernel<DFlashFmt::BF16><<<dim3(rows,kHidden/256),256,0,stream>>>(
+                x,dyn,base,y,rows,conv_stream,nullptr,nullptr,L);
+        else
+            dflash_dyn_conv_kernel<DFlashFmt::F16><<<dim3(rows,kHidden/256),256,0,stream>>>(
+                x,dyn,base,y,rows,conv_stream,nullptr,nullptr,L);
+        cuda_check(cudaGetLastError(),"batched draft dynamic conv");
+    };
+    const auto residual=[&](const std::uint16_t* a,const std::uint16_t* c,std::uint16_t* out) {
+        dflash_residual_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(a,c,out,rows*kHidden);
+        cuda_check(cudaGetLastError(),"batched draft residual");
+    };
+    dflash_embed_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(b.ids,target_embedding_bf16,b.x_a,rows);
+    cuda_check(cudaGetLastError(),"batched draft embedding");
+    const float scale=1.0f/std::sqrt(static_cast<float>(kHeadDim));
+    std::uint16_t* current=b.x_a;
+    std::uint16_t* other=b.x_b;
+    constexpr std::size_t q_row=static_cast<std::size_t>(kQHeads)*kHeadDim;
+    constexpr std::size_t kv_row=static_cast<std::size_t>(kKVHeads)*kHeadDim;
+    for(int layer=0;layer<kLayers;++layer) {
+        const auto& lay=lead.layers[layer];
+        rms(current,lay.input_norm,b.ln,rows);
+        for(int i=0;i<count;++i)
+            dense(b.ln+static_cast<std::size_t>(i)*L*kHidden,lay.attn_kernel_proj,
+                b.dyn+static_cast<std::size_t>(i)*L*kConvDynamic,L,kHidden,kConvDynamic);
+        dyn_conv(b.ln,b.dyn,lay.attn_base,b.conv,0,false);
+        b.ws_q->forward(lay.q,lay.qm,b.conv,b.qproj,rows,stream);
+        b.ws_kv->forward(lay.k,lay.km,b.conv,b.kblk,rows,stream);
+        b.ws_kv->forward(lay.v,lay.vm,b.conv,b.vblk,rows,stream);
+        dflash_head_norm_kernel<<<rows*kQHeads,128,128*sizeof(float),stream>>>(
+            b.qproj,lay.q_norm,b.qn,rows*kQHeads,kHeadDim);
+        dflash_head_norm_kernel<<<rows*kKVHeads,128,128*sizeof(float),stream>>>(
+            b.kblk,lay.k_norm,b.kblk_n,rows*kKVHeads,kHeadDim);
+        dflash_rope_kernel<<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+            b.qn,b.qr,b.pos,rows,kQHeads,kHeadDim);
+        dflash_rope_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+            b.kblk_n,b.kblk_r,b.pos,rows,kKVHeads,kHeadDim);
+        cuda_check(cudaGetLastError(),"batched draft Q/K norm and RoPE");
+        // Each agent attends to its own committed ring plus its own block.
+        for(int i=0;i<count;++i) {
+            Impl& m=*members[i]->draft->impl_;
+            const auto* q=b.qr+static_cast<std::size_t>(i)*L*q_row;
+            const auto* k=b.kblk_r+static_cast<std::size_t>(i)*L*kv_row;
+            const auto* v=b.vblk+static_cast<std::size_t>(i)*L*kv_row;
+            auto* out=b.attn+static_cast<std::size_t>(i)*L*q_row;
+            const int ring_start=static_cast<int>(m.ring_base_abs & kRingMask);
+            if(dflash_ring_split_selected(m.ring_count))
+                launch_ring_attention_split(q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,
+                    k,v,out,L,L,scale,m.s.ring_partial_o,m.s.ring_partial_ml,stream);
+            else if(dflash_ring_staged_enabled())
+                dflash_attention_ring_staged_kernel<<<L*kQHeads,kHeadDim,0,stream>>>(
+                    q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,k,v,out,L,L,scale);
+            else
+                dflash_attention_ring_parallel_kernel<<<L*kQHeads,kHeadDim,0,stream>>>(
+                    q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,k,v,out,L,L,scale);
+            cuda_check(cudaGetLastError(),"batched draft ring attention");
+        }
+        b.ws_o->forward(lay.o,lay.om,b.attn,b.oproj,rows,stream);
+        dyn_conv(b.oproj,b.dyn,lay.attn_base,b.convf,1,true);
+        residual(current,b.convf,other);
+        rms(other,lay.post_norm,b.ln2,rows);
+        for(int i=0;i<count;++i)
+            dense(b.ln2+static_cast<std::size_t>(i)*L*kHidden,lay.mlp_kernel_proj,
+                b.dyn2+static_cast<std::size_t>(i)*L*kConvDynamic,L,kHidden,kConvDynamic);
+        dyn_conv(b.ln2,b.dyn2,lay.mlp_base,b.conv2,0,false);
+        b.ws_mlp->forward(lay.gate,lay.gm,b.conv2,b.gate,rows,stream);
+        b.ws_mlp->forward(lay.up,lay.um,b.conv2,b.up,rows,stream);
+        dflash_silu_mul_kernel<<<(rows*kIntermediate+255)/256,256,0,stream>>>(
+            b.gate,b.up,b.act,rows*kIntermediate);
+        cuda_check(cudaGetLastError(),"batched draft SiLU-mul");
+        b.ws_down->forward(lay.down,lay.dm,b.act,b.down,rows,stream);
+        dyn_conv(b.down,b.dyn2,lay.mlp_base,b.convf2,1,true);
+        residual(other,b.convf2,other);
+        std::swap(current,other);
+    }
+    // Final norm of every agent's proposal rows (the anchor row is dropped),
+    // packed [agent][P]; one H6 head over all of them in 16-row tiles.
+    for(int i=0;i<count;++i)
+        rms(current+(static_cast<std::size_t>(i)*L+1)*kHidden,lead.norm,
+            b.final_norm+static_cast<std::size_t>(i)*P*kHidden,P);
+    const int proposal_rows=count*P;
+    b.ws_head->set_active_output_features(0);
+    for(int first=0;first<proposal_rows;first+=16) {
+        const int n=std::min(16,proposal_rows-first);
+        b.ws_head->forward(target_head,target_head_metadata,b.final_norm+static_cast<std::size_t>(first)*kHidden,
+            b.head_out+static_cast<std::size_t>(first)*kVocab,n,stream);
+    }
+    cuda_check(cudaMemsetAsync(b.liveness,0,sizeof(unsigned int),stream),"batched draft liveness zero");
+    dflash_nonfinite_flag_kernel<<<(proposal_rows*kVocab+255)/256,256,0,stream>>>(
+        b.head_out,proposal_rows*kVocab,b.liveness,kVocab,kVocab);
+    cuda_check(cudaGetLastError(),"batched draft liveness");
+    for(int i=0;i<count;++i) {
+        Impl& m=*members[i]->draft->impl_;
+        const auto* head=b.head_out+static_cast<std::size_t>(i)*P*kVocab;
+        dense(b.final_norm+static_cast<std::size_t>(i)*P*kHidden,lead.hidden_proj,m.s.hidden_proj_out,
+            P,kHidden,kRank);
+        launch_dflash_topk16_segmented(head,P,kVocab,m.s.cand_ids,m.s.cand_unary,m.s.topk_segments,
+            stream,kVocab);
+        dflash_selector_fused_chain_kernel<<<1,kSelectorFusedThreads,0,stream>>>(
+            P,members[i]->block[0],nullptr,m.s.cand_ids,m.s.hidden_proj_out,lead.pred_cb,lead.succ_cb,
+            m.s.cand_unary,m.s.proposal_out);
+        cuda_check(cudaGetLastError(),"batched draft selector");
+        members[i]->proposals.resize(P);
+        cuda_check(cudaMemcpyAsync(members[i]->proposals.data(),m.s.proposal_out,P*sizeof(std::int64_t),
+            cudaMemcpyDeviceToHost,stream),"read batched draft proposals");
+        const std::size_t candidates=m.proposal_candidates?static_cast<std::size_t>(P)*kTopK:0;
+        m.last_candidate_ids.resize(candidates);
+        m.last_candidate_unary.resize(candidates);
+        if(candidates) {
+            cuda_check(cudaMemcpyAsync(m.last_candidate_ids.data(),m.s.cand_ids,candidates*sizeof(std::int64_t),
+                cudaMemcpyDeviceToHost,stream),"read batched draft candidate IDs");
+            cuda_check(cudaMemcpyAsync(m.last_candidate_unary.data(),m.s.cand_unary,candidates*sizeof(float),
+                cudaMemcpyDeviceToHost,stream),"read batched draft candidate scores");
+        }
+        m.last_position_confidence.clear();
+        ++m.fused_selector_calls;
+        ++m.local_merge_topk_calls;
+    }
+    unsigned int bad=0;
+    cuda_check(cudaMemcpyAsync(&bad,b.liveness,sizeof(bad),cudaMemcpyDeviceToHost,stream),
+        "read batched draft liveness");
+    cuda_check(cudaStreamSynchronize(stream),"synchronize batched draft");
+    require(bad==0,"batched draft head logits non-finite; proposals would be degenerate");
+    for(auto* member:members) {
+        ++member->draft->impl_->device_liveness_checks;
+        for(const auto token:member->proposals)
+            require(token>=0 && token<kVocab,"batched draft proposal outside vocabulary");
+    }
 }
 
 std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_device_seed(

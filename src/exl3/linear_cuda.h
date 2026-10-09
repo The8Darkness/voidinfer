@@ -710,6 +710,9 @@ public:
     void set_native_continuation16(bool enabled) noexcept {
         native_continuation_rows_ = enabled ? 16 : 8;
     }
+    // Batched multi-agent drafting: 9..32 rows of the draft projection shapes
+    // run on the coherent packed producer (row-concatenated agents).
+    void enable_draft_batched() noexcept { draft_batched_enabled_ = true; }
 
     void set_reconstructed_exact(Exl3ReconstructedExactView view) noexcept {
         reconstructed_exact_ = view;
@@ -1356,6 +1359,7 @@ private:
     bool h6_small_m_enabled_ = true;
     int active_output_features_ = 0;
     bool draft_small_m_enabled_ = false;
+    bool draft_batched_enabled_ = false;
     bool target_gateup_small_m_enabled_ = false;
     bool target_gateup_k6_async_a_enabled_ = false;
     bool target_gateup_k6_n16_enabled_ = false;

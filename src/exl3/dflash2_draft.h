@@ -242,6 +242,18 @@ void dflash2_dense_t_for_test(const std::uint16_t* input,
 // It falls back for position-confidence/timing diagnostics and does not alter
 // acceptance counts, ring/W+1 semantics, or target/draft ordering.
 
+class Exl3BatchedVerifyCoordinator;
+class Exl3Dflash2DraftModel;
+// One lane's cached-ring proposal inside a batched multi-agent draft forward
+// (Exl3Dflash2DraftModel::propose_batched). The block and the result are host
+// owned by the requesting lane for the duration of the call.
+struct Exl3DraftBatchedRequest {
+    Exl3Dflash2DraftModel* draft = nullptr;
+    std::span<const std::int64_t> block;
+    int block_pos0 = 0;
+    std::vector<std::int64_t> proposals;
+};
+
 class Exl3Dflash2DraftModel {
 public:
     struct DraftPositionConfidence {
@@ -518,6 +530,26 @@ public:
         std::int64_t mask_token_id,cudaStream_t stream=nullptr);
     int ring_count() const noexcept;
     std::size_t ring_bytes() const noexcept;
+    // Batched multi-agent drafting: lanes of one coherent-device coordinator
+    // meet at their cached-ring proposals; one forward runs every member's
+    // block rows through the shared draft weights (row-concatenated
+    // projections, per-lane ring attention, per-lane selector).
+    void set_batched_propose(Exl3BatchedVerifyCoordinator* coordinator) noexcept;
+    // propose_cached_view without the batched rendezvous (solo coordinator path).
+    std::vector<std::int64_t> propose_cached_private(
+        std::span<const std::int64_t> block_ids,int block_pos0,
+        const std::uint16_t* target_embedding_bf16,
+        const Exl3CudaLinearWeights& target_head,
+        const Exl3CudaLinearMetadata& target_head_metadata,
+        std::int64_t mask_token_id,cudaStream_t stream=nullptr);
+    // The configuration propose_batched implements (default fused selector
+    // route, no observers or shared executors) and a full-width block.
+    bool batched_proposal_supported(std::span<const std::int64_t> block) const noexcept;
+    // Runs on `stream` after every member's queued work; members' own scratch
+    // receives their selector state. Up to four 8-row blocks.
+    static void propose_batched(std::span<Exl3DraftBatchedRequest* const> members,
+        const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
+        const Exl3CudaLinearMetadata& target_head_metadata,cudaStream_t stream);
     // Immutable FP16 projected K/V, bound to this resident drafter. Only proven
     // append lineage shares pages; false downloads all logical rows for audits.
     // Caller serializes commits and these eager operations on the same stream.

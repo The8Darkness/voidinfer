@@ -9678,6 +9678,11 @@ void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
     if(admission==Exl3CudaLinearAdmission::target_continuation_head &&
        !target_head_small_m_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared head requires admitted H6 small-M workspace");
+    if (draft_batched_enabled_ && rows > 8) {
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output, rows, stream, admission);
+        return;
+    }
     if (coherent_kv_split_for(metadata, rows, admission, in_features_, out_features_,
             accumulation_capacity_bytes_, max_rows_)) {
         if (coherent_fused_input_for(rows)) {
@@ -12128,6 +12133,28 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     // contract before any reconstructed or ordinary dispatch can run.
     Exl3LinearWorkspaceRequirements::derive(in_features_,out_features_,rows,true,true)
         .require_disjoint_borrowed_views(transformed_input,accum_);
+
+    if (draft_batched_enabled_ && rows > 8 && out_features_ % 128 == 0 &&
+        metadata.K >= 4 && metadata.K <= 7) {
+        // Five K partitions fit the workspace's own accumulation planes.
+        constexpr int split = 5;
+        if (accumulation_capacity_bytes_ <
+            static_cast<std::size_t>(rows) * out_features_ * split * sizeof(float))
+            throw std::logic_error("batched draft accumulation capacity");
+        if (metadata.K == 4) launch_coherent_packed_partials<4>(0, 0, stream, transformed_input,
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);
+        else if (metadata.K == 5) launch_coherent_packed_partials<5>(0, 0, stream, transformed_input,
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);
+        else if (metadata.K == 6) launch_coherent_packed_partials<6>(0, 0, stream, transformed_input,
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);
+        else launch_coherent_packed_partials<7>(0, 0, stream, transformed_input,
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);
+        cuda_check(cudaGetLastError(), "launch batched draft coherent partials");
+        launch_prefill_reduce_output<false>(stream, accum_, weights.svh, output, rows,
+            out_features_, split);
+        cuda_check(cudaGetLastError(), "launch batched draft reduction/output");
+        return;
+    }
 
     if (const int kv_split = coherent_kv_split_for(metadata, rows, admission,
             in_features_, out_features_, accumulation_capacity_bytes_, max_rows_)) {

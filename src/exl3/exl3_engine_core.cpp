@@ -1761,8 +1761,16 @@ struct Exl3EngineCore::Impl {
                         const std::vector<int> rows(peers.size(),8);
                         members[0]->prepare_batched_continuation_graph(peers,8,rows);
                     }
-                    for(std::uint32_t i=first;i<end;++i)
+                    // NINFER_EXL3_BATCHED_DRAFT=0 keeps every lane's draft
+                    // proposals private (one draft forward per lane).
+                    static const bool batched_draft=[] {
+                        const char* value=std::getenv("NINFER_EXL3_BATCHED_DRAFT");
+                        return !value || std::string_view(value)!="0";
+                    }();
+                    for(std::uint32_t i=first;i<end;++i) {
                         lanes[i]->context_owner_for_device_round()->set_batched_verify(group.get());
+                        if(batched_draft)drafts[i]->set_batched_propose(group.get());
+                    }
                     batched_verify.push_back(std::move(group));
                 }
             }
