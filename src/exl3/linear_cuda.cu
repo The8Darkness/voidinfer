@@ -2992,11 +2992,17 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     // fused-input shared memory with exl3_fused_input_shared_bytes.
     constexpr bool alias_c = DeepStages > 0 &&
         exl3_deep_ring_holds_output(raw_stage_count * raw_stage_half, output_tiles_per_block * MTiles);
+    // M32: the 32-row output tile reuses the whole drained A + B ring
+    // (launch_coherent_packed_variant), which doubles the resident CTAs per SM.
+    constexpr bool alias_c_ring = MTiles == 2 && !alias_c &&
+        exl3_deep_ring_holds_output(raw_stage_count * (256 * MTiles + raw_stage_half),
+                                    output_tiles_per_block * MTiles);
     extern __shared__ half shared[];
     half* sh_a = shared;
     auto* sh_raw = reinterpret_cast<std::uint16_t*>(
         sh_a + (FusedInput ? 0 : (AsyncA ? raw_stage_count * 256 * MTiles : 256)));
-    float* sh_c = alias_c ? reinterpret_cast<float*>(sh_raw) : reinterpret_cast<float*>(
+    float* sh_c = alias_c_ring ? reinterpret_cast<float*>(shared) :
+        alias_c ? reinterpret_cast<float*>(sh_raw) : reinterpret_cast<float*>(
         sh_raw + raw_stage_count * raw_stage_half);
     half* sh_in = alias_c ? reinterpret_cast<half*>(sh_raw + raw_stage_count * raw_stage_half)
                           : reinterpret_cast<half*>(sh_c + 16 * MTiles * output_tiles_per_block * 16);
@@ -10864,12 +10870,39 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
          admission == continuation[coherent_wide_k6_operation_]);
 }
 
+// 17..32-row (M32) calls: the K split that fills the resident slots (four
+// 128-column CTAs per SM; NINFER_EXL3_M32_SLOTS_PER_SM) in one wave, at least
+// 16 k-tiles per CTA and within the accumulation planes. A 400-CTA down
+// projection otherwise leaves 41% of the slots idle (the producer is latency
+// bound below four CTAs per SM). 4-agent forward 24.3 -> 22.1 ms; 3 or 6-8
+// slots per SM measured slower, and 9..16-row calls keep their split (the
+// same rule measured 18.0 -> 19.7 ms there).
+int Exl3CudaLinearWorkspace::coherent_m32_split(int rows) const noexcept {
+    static const int slots = [] {
+        int device = 0, sms = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+            sms = 170;
+        const char* value = std::getenv("NINFER_EXL3_M32_SLOTS_PER_SM");
+        return (value ? std::max(1, std::atoi(value)) : 4) * sms;
+    }();
+    const int blocks = std::max(1, out_features_ / 128);
+    const int k_tiles = in_features_ / 16;
+    int split = std::clamp(slots / blocks, 1, 20);
+    while (split > 1 && (k_tiles / split < 16 ||
+        static_cast<std::size_t>(rows) * static_cast<std::size_t>(out_features_) * split *
+            sizeof(float) > accumulation_capacity_bytes_))
+        --split;
+    return split;
+}
+
 // NINFER_EXL3_COHERENT_DOWN_SPLIT / NINFER_EXL3_COHERENT_O_SPLIT (10 default,
 // quality-gated within +/-0.00022 nats/token; 5 or 8): K partitions of the coherent down / O producers. A numerics-policy
 // choice (FP32 partial boundaries move); falls back to 5 when the owned
-// accumulation planes are too small.
+// accumulation planes are too small. M32 calls use coherent_m32_split.
 int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows) const {
     const char* value = std::getenv(name);
+    if (!value && rows > kBatchedRows) return coherent_m32_split(rows);
     const int base = static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
     const int split = value ? std::atoi(value) : 10;
     if (split != 5 && split != 8 && split != 10)
@@ -10885,8 +10918,7 @@ int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows)
 
 int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexcept {
     constexpr int split10 = 10;
-    // 17..32-row (M32) calls: 5 K partitions for the MLP gate/up (fewer
-    // partial planes win there), 10 elsewhere (measured, 128-column CTAs).
+    // 17..32-row (M32) calls fill the resident slots (coherent_m32_split);
     // NINFER_EXL3_COHERENT_M32_SPLIT overrides (1..10).
     if (rows > kBatchedRows) {
         static const int m32 = [] {
@@ -10894,7 +10926,7 @@ int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexce
             return value ? std::max(1, std::min(10, std::atoi(value))) : 0;
         }();
         if (m32) return m32;
-        if (coherent_wide_k6_operation_ == 4) return 5;
+        return coherent_m32_split(rows);
     }
     const auto required = static_cast<std::size_t>(rows > kBatchedRows ? rows :
         std::min(max_rows_, kBatchedRows)) *
@@ -11820,10 +11852,14 @@ static void launch_coherent_packed_variant(
     const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
     constexpr int tiles = Warps * TilesPerWarp;
     constexpr int stage_count = (Stages ? Stages : 2) * Per;
-    const std::size_t shared =
+    constexpr std::size_t ring_bytes =
         static_cast<std::size_t>(stage_count) * 256u * MTiles * sizeof(half) +
-        static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t) +
-        16u * MTiles * tiles * 16u * sizeof(float);
+        static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t);
+    constexpr std::size_t output_bytes = 16u * MTiles * tiles * 16u * sizeof(float);
+    // M32 aliases the output tile over the drained ring (the producer's
+    // alias_c_ring); the other variants keep it separate.
+    const std::size_t shared = MTiles == 2 && ring_bytes >= output_bytes ? ring_bytes :
+        ring_bytes + output_bytes;
     const int grid = output_features / (16 * tiles) * split_count;
     if constexpr (MTiles == 2 || Fp16Acc || TilesPerWarp != 1) {
         static_assert(Stages > 0, "M32/FP16-accumulate coherent producer requires deep stages");

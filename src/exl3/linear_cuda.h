@@ -960,6 +960,7 @@ public:
         int rows,Exl3CudaLinearAdmission admission) const noexcept;
     int coherent_wide_k6_split_count(int rows) const noexcept;
     int coherent_split_override(const char* name, int rows) const;
+    int coherent_m32_split(int rows) const noexcept;
     bool coherent_down_k6_candidate(const Exl3CudaLinearMetadata& metadata,
         int rows,Exl3CudaLinearAdmission admission) const noexcept;
     bool coherent_down_k7_candidate(const Exl3CudaLinearMetadata& metadata,
