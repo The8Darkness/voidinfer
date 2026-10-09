@@ -1,5 +1,6 @@
 #include "exl3/l0_history_mark.h"
 #include "exl3/growable_device_region.h"
+#include "exl3/lane_kv_source.h"
 #include "exl3/segment_copy.cuh"
 #include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
@@ -180,7 +181,11 @@ ExactPageExtension extend_exact_pages(
                 if(stats) stats->page_clone_bytes+=payload_bytes;
                 const auto clone_started=stats?std::chrono::steady_clock::now():
                     std::chrono::steady_clock::time_point{};
-                *page=*prefix[index];
+                if(const auto& source=prefix[index]->source) {
+                    // A lane-backed page may be filled concurrently by its source.
+                    std::lock_guard lock(source->mutex());
+                    *page=*prefix[index];
+                } else *page=*prefix[index];
                 if(stats) stats->page_clone_cpu_ns+=static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now()-clone_started).count());
@@ -1418,6 +1423,41 @@ struct Exl3TextContext::Impl {
     // Proven by successful ordinary restore/export, invalidated by reset.
     // Retain only immutable KV pages, never an ancestor's full recurrent image.
     int exact_prefix_position = 0;
+    // Lane-backed export pages (lane_kv_source.h): exported exact states keep
+    // their KV rows in these L0 planes until the rows are about to change.
+    std::shared_ptr<Exl3LaneKvSource> kv_source;
+    // The lane source over this context's L0 host planes (null otherwise).
+    void ensure_kv_source() {
+        if(kv_source || !Exl3NativeContextExtent::l0_oscar_enabled() || host_kv.enabled)return;
+        Exl3LaneKvSource::Planes planes;
+        bool cpu_visible=true;
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer]) {
+                if(!cache_k[layer] || !cache_v[layer] || !cache_k[layer]->host_mapped ||
+                   !cache_v[layer]->host_mapped || planes.banks>=16)return;
+                planes.k[planes.banks]=static_cast<const std::uint16_t*>(cache_k[layer]->ptr);
+                planes.v[planes.banks]=static_cast<const std::uint16_t*>(cache_v[layer]->ptr);
+                cpu_visible=cpu_visible && cache_k[layer]->cpu_visible() && cache_v[layer]->cpu_visible();
+                ++planes.banks;
+            }
+        if(!planes.banks)return;
+        planes.cpu_visible=cpu_visible;
+        kv_source=std::make_shared<Exl3LaneKvSource>(planes);
+    }
+    // Called before rows >= `row` of the L0 planes are rewritten.
+    void kv_rows_rewritten_from(int row) {
+        if(kv_source)kv_source->materialize_from(row);
+    }
+    // A reset ends the lineage without touching the planes: the fill waits
+    // for the first plane write (a forward) and a restore replaces it with
+    // its own exact handover (materialize_except).
+    int kv_rewrite_pending=-1;
+    void consume_kv_rewrite() {
+        if(kv_rewrite_pending<0)return;
+        const int row=kv_rewrite_pending;
+        kv_rewrite_pending=-1;
+        kv_rows_rewritten_from(row);
+    }
     // Complete L0 OSCAR code chunks of the resident lineage (export/restore).
     std::array<std::vector<std::shared_ptr<const Exl3ExactHostState::L0CodeChunk>>,16> l0_prefix_chunks;
     int rope_offset = 0;
@@ -2331,6 +2371,8 @@ struct Exl3TextContext::Impl {
         return true;
     }
     ~Impl() {
+        // Exported pages may outlive this context: fill them while the planes exist.
+        try {if(kv_source)kv_source->materialize_from(0);} catch(...) {}
         if(small_tier_storage)(void)cudaFree(small_tier_storage);
         if(gdn_write_flag){(void)cudaFree(gdn_write_flag);gdn_write_flag=nullptr;}
         if(transaction && transaction->live_host_root){
@@ -3417,6 +3459,7 @@ struct Exl3TextContext::Impl {
     static constexpr int kL0RetainedBackingRows=16384;
     static constexpr std::size_t kPlaneRowBytes=static_cast<std::size_t>(kKVHeads)*kHeadDim*sizeof(std::uint16_t);
     void ensure_l0_rows(int rows) {
+        consume_kv_rewrite();
         for(auto& layer:full_layers)if(layer)layer->ensure_l0_rows(rows);
         const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
         for(int layer=0;layer<kLayers;++layer) {
@@ -3428,6 +3471,8 @@ struct Exl3TextContext::Impl {
     void release_l0_rows_beyond(int rows,int plane_rows=-1) {
         for(auto& layer:full_layers)if(layer)layer->release_l0_rows_beyond(rows);
         if(plane_rows<0)plane_rows=rows;
+        // Rows still backing deferred pages stay mapped.
+        if(kv_source && kv_source->deferred_beyond(plane_rows))plane_rows=max_context;
         const std::size_t used=static_cast<std::size_t>(std::max(plane_rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
         for(int layer=0;layer<kLayers;++layer) {
             if(cache_k[layer])cache_k[layer]->shrink_host_bytes(used);
@@ -6183,6 +6228,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         impl->host_kv_retirement_failure_for_test=startup_fault==7;
         throw std::runtime_error("injected context post-transfer construction failure");
     }
+    // The lane KV source exists before any other thread can query residency.
+    impl->ensure_kv_source();
     auto result = std::unique_ptr<Exl3TextContext>(new Exl3TextContext(std::move(impl)));
     struct WrappedStartupRetirement {
         std::unique_ptr<Exl3TextContext>& owner;
@@ -7594,6 +7641,7 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     impl_->graph_capture_active = false;
     impl_->graph_reason = "not captured after context reset";
     if(!preserve_exact_payload) {
+    impl_->kv_rewrite_pending=0;
     impl_->resident_exact_state_id=0;
     impl_->exact_prefix_pages.clear();
     if(impl_->device_prefix && !impl_->device_prefix_shared)impl_->device_prefix->invalidate();
@@ -8215,6 +8263,7 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
     cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr, transaction.embedding->ptr,
                                embedding_bytes, cudaMemcpyDefault, stream),
                "restore P2 target embedding checkpoint");
+    impl_->kv_rows_rewritten_from(transaction.position);
     position_ = transaction.position;
     impl_->tap_rows = transaction.tap_rows;
     impl_->embedding_rows = transaction.embedding_rows;
@@ -10510,6 +10559,7 @@ void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
             "verified root restore needs a saved root outside a transaction");
     auto& root=*impl_->verified_root;
     impl_->join_repair(stream);
+    impl_->kv_rows_rewritten_from(root.position);
     for(int layer=0;layer<kLayers;++layer)
         if(impl_->gdn_layers[layer]) {
             impl_->gdn_layers[layer]->validate_saved_checkpoint(root.checkpoints[layer],root.position);
@@ -10867,6 +10917,7 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     // Attempt taps and embedding already contain the exact prefix. Publish
     // their shorter logical extent only after all repair work and final device
     // metadata copies were enqueued successfully.
+    impl_->kv_rows_rewritten_from(base_position + retained_rows);
     position_ = base_position + retained_rows;
     impl_->tap_rows = retained_rows;
     impl_->embedding_rows = retained_rows;
@@ -12149,6 +12200,11 @@ std::vector<float> Exl3TextContext::hidden_host(int layer, cudaStream_t stream) 
     return result;
 }
 
+
+// Every lane-backed page of `state` is filled (readers of page values).
+static void require_state_kv_payload(const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& pages) {
+    for(const auto& page:pages)if(page)exl3_require_kv_payload(*page);
+}
 std::size_t Exl3ExactHostState::payload_bytes() const noexcept {
     std::size_t bytes = logits_.size() * 2 + embedding_.size() * 2;
     for(const auto& page:kv_pages_) {
@@ -12166,6 +12222,7 @@ std::size_t Exl3ExactHostState::payload_bytes() const noexcept {
 void Exl3ExactHostState::visit_kv_for_test(const std::function<void(
     int, int, int, std::span<const std::uint16_t>,
     std::span<const std::uint16_t>)>& visitor) const {
+    require_state_kv_payload(kv_pages_);
     require(static_cast<bool>(visitor), "KV visitor missing");
     require(!l2_fp8_, "KV visitor requires FP16 pages");
     int first = 0;
@@ -12194,6 +12251,7 @@ bool Exl3ExactHostState::native_extent_valid(const int maximum_position) const n
         if(page->fp8!=l2_fp8_)return false;
         const auto elements=static_cast<std::size_t>(page->rows)*
             (l2_fp8_?l0_l2_fp8::kRowWords:1024);
+        if(!page->payload_deferred() || !page->source)
         for(int bank=0;bank<16;++bank)
             if(page->k[bank].size()!=elements || page->v[bank].size()!=elements)return false;
         first+=page->rows;
@@ -12202,6 +12260,7 @@ bool Exl3ExactHostState::native_extent_valid(const int maximum_position) const n
 }
 
 std::shared_ptr<const Exl3ExactHostState> Exl3ExactHostState::detached_payload_for_test() const {
+    require_state_kv_payload(kv_pages_);
     auto copy=create();
     copy->position_=position_;copy->device_position_=device_position_;
     copy->rope_offset_=rope_offset_;copy->tap_rows_=tap_rows_;
@@ -12221,6 +12280,7 @@ bool Exl3ExactHostState::same_payload(const Exl3ExactHostState& x) const {
     return model_identity_==x.model_identity_ && same_represented_payload_for_test(x);
 }
 bool Exl3ExactHostState::same_represented_payload_for_test(const Exl3ExactHostState& x) const {
+    require_state_kv_payload(kv_pages_);require_state_kv_payload(x.kv_pages_);
     if (position_ != x.position_ || rope_offset_ != x.rope_offset_ || device_position_ != x.device_position_ ||
         tap_rows_ != x.tap_rows_ || embedding_rows_ != x.embedding_rows_ || last_rows_ != x.last_rows_ ||
         kv_pages_.size()!=x.kv_pages_.size() || convolution_ != x.convolution_ || logits_ != x.logits_ ||
@@ -12238,6 +12298,7 @@ bool Exl3ExactHostState::same_represented_payload_for_test(const Exl3ExactHostSt
 }
 std::string Exl3ExactHostState::represented_first_difference_for_test(
     const Exl3ExactHostState& x) const {
+    require_state_kv_payload(kv_pages_);require_state_kv_payload(x.kv_pages_);
     const auto scalar=[&](const char* name,auto a,auto b)->std::string {
         if(a==b)return {};
         return std::string(name)+" expected="+std::to_string(a)+
@@ -12286,6 +12347,7 @@ std::string Exl3ExactHostState::represented_first_difference_for_test(
     return "equal";
 }
 std::uint64_t Exl3ExactHostState::represented_payload_hash_for_test() const noexcept {
+    require_state_kv_payload(kv_pages_);
     std::uint64_t hash=1469598103934665603ull;
     const auto bytes=[&](const void* data,std::size_t size) {
         const auto* p=static_cast<const std::uint8_t*>(data);
@@ -12371,6 +12433,9 @@ bool Exl3ExactHostState::is_prefix_of(const Exl3ExactHostState& x) const {
         const int rows=std::min(a.rows,position_-a.first);
         if(rows<=0 || b.rows<rows) return false;
         if(kv_pages_[page_index]==x.kv_pages_[page_index]) continue;
+        // Two pages still backed by the same lane read the same plane rows.
+        if(a.source && a.source==b.source && a.payload_deferred() && b.payload_deferred()) continue;
+        exl3_require_kv_payload(a);exl3_require_kv_payload(b);
         const std::size_t elements=static_cast<std::size_t>(rows)*1024;
         for(int bank=0;bank<16;++bank) {
             if(a.k[bank].size()<elements || b.k[bank].size()<elements ||
@@ -12669,8 +12734,20 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
             staged_planes=staged_planes && k.host_mapped && v.host_mapped &&
                 !k.cpu_visible() && !v.cpu_visible();
         }
+    // L0 contexts publish lane-backed pages: no KV copy at export, the
+    // planes keep the rows (NINFER_EXL3_L0_DEFERRED_ROOT_KV=0 copies).
+    static const bool deferred_root_kv=[] {
+        const char* value=std::getenv("NINFER_EXL3_L0_DEFERRED_ROOT_KV");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    const bool defer_kv=deferred_root_kv && !l2_fp8 && (host_planes || staged_planes) &&
+        Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->host_kv.enabled;
+    if(defer_kv)impl_->ensure_kv_source();
     auto extension=extend_exact_pages(prefix_pages,prefix_position,position_,false,nullptr,0,
-        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024,!host_planes && !staged_planes);
+        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024,
+        !host_planes && !staged_planes && !defer_kv);
+    if(defer_kv)
+        for(const auto& page:extension.fresh)impl_->kv_source->defer(page);
     for(const auto& page:extension.all)
         require(page->fp8==l2_fp8 || std::find(extension.fresh.begin(),extension.fresh.end(),page)!=extension.fresh.end(),
                 "L0 L2 FP8 prefix page format");
@@ -12819,6 +12896,8 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                     }
                 }
             }
+            ++full;
+        } else if (impl_->full_layers[layer] && defer_kv) {
             ++full;
         } else if (impl_->full_layers[layer] && staged_planes) {
             if(!fresh_pages.empty()) {
@@ -12999,6 +13078,14 @@ bool Exl3TextContext::restore_exact_host_state_if_needed(const Exl3ExactHostStat
     restore_exact_host_state(state,stream);return true;
 }
 
+bool Exl3TextContext::kv_lane_resident(const Exl3ExactHostState& state) const noexcept {
+    // A rewrite of rows >= r fills every page reaching past r, the last one
+    // included: a still-deferred last page proves all earlier rows intact.
+    return impl_->kv_source && !state.kv_pages_.empty() &&
+        state.kv_pages_.back()->source==impl_->kv_source && state.kv_pages_.back()->payload_deferred() &&
+        state.model_identity_==impl_->model->host_state_identity;
+}
+
 bool Exl3TextContext::exact_host_state_resident(const Exl3ExactHostState& state) const noexcept {
     return !impl_->host_kv_failed && !impl_->oscar && !impl_->oscar_only && state.residency_id_!=0 &&
         impl_->resident_exact_state_id==state.residency_id_ &&
@@ -13058,6 +13145,7 @@ std::shared_ptr<const Exl3TurboAngleWarmPages> Exl3TextContext::make_turboangle_
     std::shared_ptr<const Exl3ExactHostState> source,int rows) {
     require(source && rows>0 && rows<=source->position_,"TurboAngle page extent");
     require(!source->l2_fp8_,"TurboAngle pages require FP16 L2");
+    require_state_kv_payload(source->kv_pages_);
     auto warm=std::shared_ptr<Exl3TurboAngleWarmPages>(new Exl3TurboAngleWarmPages);
     warm->source_=std::move(source); warm->rows_=rows; warm->first_=warm->source_->position_-rows;
     for(int bank=0;bank<16;++bank) {
@@ -13136,6 +13224,7 @@ void Exl3TextContext::rebase_oscar_host_state_delta(const Exl3ExactHostState& ol
     cuda_check(cudaMemcpyAsync(impl_->position_device,&new_root.device_position_,sizeof(int),
         cudaMemcpyHostToDevice,stream),"upload TurboAngle L1 delta position");
     cuda_check(cudaStreamSynchronize(stream),"complete TurboAngle L1 delta rebase");
+    impl_->kv_rows_rewritten_from(0);
     position_=new_root.position_;impl_->tap_rows=new_root.tap_rows_;
     impl_->embedding_rows=new_root.embedding_rows_;impl_->last_rows=new_root.last_rows_;
     impl_->last_hidden_source=nullptr;
@@ -13188,6 +13277,48 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
         impl_->host_kv_restore_device=device;
         impl_->host_kv_failed=true;
     }
+    // Lane-backed pages: this lane's deferred pages outside the restored
+    // history are filled before the planes change; the restored state's own
+    // still-deferred pages already sit in these planes. Pages backed by
+    // another lane are filled from that lane's planes.
+    impl_->kv_rewrite_pending=-1;   // the handover below is exact
+    impl_->ensure_l0_rows(state.position_);
+    impl_->ensure_kv_source();
+    const bool all_lane_resident=kv_lane_resident(state);
+    if(impl_->kv_source)impl_->kv_source->materialize_except(state.kv_pages_);
+    // Pages still backed by another lane are copied plane to plane (one DMA
+    // per bank and contiguous run); pages filled meanwhile restore from values.
+    std::vector<const Exl3ExactKVPage*> copied_pages;
+    if(impl_->kv_source && !all_lane_resident) {
+        std::vector<const Exl3ExactKVPage*> run;
+        Exl3LaneKvSource* run_source=nullptr;
+        const auto flush=[&] {
+            if(run.empty())return;
+            if(run_source->copy_run_to(run,impl_->kv_source->planes(),stream))
+                copied_pages.insert(copied_pages.end(),run.begin(),run.end());
+            run.clear();
+        };
+        for(const auto& page:state.kv_pages_) {
+            const bool foreign=page->payload_deferred() && page->source && page->source!=impl_->kv_source;
+            if(!foreign) {flush();continue;}
+            if(!run.empty() && (page->source.get()!=run_source ||
+               run.back()->first+run.back()->rows!=page->first)) flush();
+            run_source=page->source.get();
+            run.push_back(page.get());
+        }
+        flush();
+        std::sort(copied_pages.begin(),copied_pages.end());
+    }
+    if(!all_lane_resident)
+    for(const auto& page:state.kv_pages_)
+        if(page->payload_deferred() && page->source!=impl_->kv_source &&
+           !std::binary_search(copied_pages.begin(),copied_pages.end(),page.get()))
+            exl3_require_kv_payload(*page);
+    const auto lane_resident_page=[&](const std::shared_ptr<const Exl3ExactKVPage>& page) {
+        return all_lane_resident ||
+            (impl_->kv_source && page->source==impl_->kv_source && page->payload_deferred()) ||
+            std::binary_search(copied_pages.begin(),copied_pages.end(),page.get());
+    };
     impl_->resident_exact_state_id=0;
     impl_->exact_prefix_pages.clear();
     impl_->exact_prefix_position=0;
@@ -13212,26 +13343,35 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                 if(!state.l2_fp8_ && !warm && owner.host_mapped && !owner.cpu_visible() &&
                    destination>=owner.ptr &&
                    destination<static_cast<const std::uint8_t*>(owner.ptr)+owner.bytes) {
-                    // Growable plane: page-aligned windows gathered into the
-                    // pinned stage in parallel, one DMA per window.
+                    // Growable plane: runs of contiguous pages (skipping pages
+                    // still resident in this lane) gathered into the pinned
+                    // stage in parallel, one DMA per run.
                     auto& stage=l0_plane_stage();
-                    for(int lo=first;lo<first+rows;lo+=kL0PlaneStageRows) {
-                        const int count=std::min(kL0PlaneStageRows,first+rows-lo);
-                        std::for_each(std::execution::par,state.kv_pages_.begin(),state.kv_pages_.end(),[&](const auto& page) {
-                            const int from=std::max(lo,page->first);
-                            const int to=std::min(lo+count,page->first+page->rows);
-                            if(to<=from) return;
+                    std::vector<const Exl3ExactKVPage*> pending;
+                    const auto flush=[&] {
+                        if(pending.empty()) return;
+                        const int lo=pending.front()->first;
+                        const int hi=pending.back()->first+pending.back()->rows;
+                        std::for_each(std::execution::par,pending.begin(),pending.end(),[&](const Exl3ExactKVPage* page) {
                             const auto& original=key?page->k[full]:page->v[full];
-                            std::memcpy(stage.host+static_cast<std::size_t>(from-lo)*1024,
-                                original.data()+static_cast<std::size_t>(from-page->first)*1024,
-                                static_cast<std::size_t>(to-from)*1024*sizeof(std::uint16_t));
+                            std::memcpy(stage.host+static_cast<std::size_t>(page->first-lo)*1024,
+                                original.data(),static_cast<std::size_t>(page->rows)*1024*sizeof(std::uint16_t));
                         });
                         cuda_check(cudaMemcpyAsync(static_cast<std::uint16_t*>(destination)+
                             static_cast<std::size_t>(lo-first)*1024,stage.host,
-                            static_cast<std::size_t>(count)*1024*sizeof(std::uint16_t),cudaMemcpyDefault,stream),
-                            "restore L0 plane window");
-                        cuda_check(cudaStreamSynchronize(stream),"restore L0 plane window");
+                            static_cast<std::size_t>(hi-lo)*1024*sizeof(std::uint16_t),cudaMemcpyDefault,stream),
+                            "restore L0 plane run");
+                        cuda_check(cudaStreamSynchronize(stream),"restore L0 plane run");
+                        pending.clear();
+                    };
+                    for(const auto& page:state.kv_pages_) {
+                        if(page->first<first || page->first+page->rows>first+rows) continue;
+                        if(lane_resident_page(page)) {flush();continue;}
+                        if(!pending.empty() && (pending.back()->first+pending.back()->rows!=page->first ||
+                           page->first+page->rows-pending.front()->first>kL0PlaneStageRows)) flush();
+                        pending.push_back(page.get());
                     }
+                    flush();
                     return;
                 }
                 if(state.l2_fp8_) {
@@ -13260,6 +13400,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                 }
                 for(const auto& page:state.kv_pages_) {
                     if(page->first<first || page->first>=first+rows) continue;
+                    if(!warm && lane_resident_page(page)) continue;
                     const auto& original=key?page->k[full]:page->v[full];
                     auto* dst=static_cast<std::uint16_t*>(destination)+static_cast<std::size_t>(page->first-first)*1024;
                     if(!warm || page->first+page->rows<=warm->first_) {upload(dst,original);continue;}

@@ -7,9 +7,23 @@
 #include <limits>
 #include <stdexcept>
 #include <functional>
+#include <atomic>
 #include "exl3/bounded_shared_owner.h"
 
 namespace ninfer::exl3 {
+class Exl3LaneKvSource;
+// Copyable atomic flag (pages are cloned by value).
+struct Exl3CopyableFlag {
+    std::atomic<bool> value{false};
+    Exl3CopyableFlag() = default;
+    Exl3CopyableFlag(const Exl3CopyableFlag& other) : value(other.value.load(std::memory_order_acquire)) {}
+    Exl3CopyableFlag& operator=(const Exl3CopyableFlag& other) {
+        value.store(other.value.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+    bool load() const noexcept { return value.load(std::memory_order_acquire); }
+    void store(bool v) noexcept { value.store(v, std::memory_order_release); }
+};
 // Internal backing. Published images expose only const page handles. A private
 // append may reserve a larger tail before upload; valid extents exclude it.
 struct Exl3ExactKVPage {
@@ -19,6 +33,12 @@ struct Exl3ExactKVPage {
     // 516 words: 1024 e4m3 bytes + 4 FP16 head scales.
     bool fp8=false;
     std::array<std::vector<std::uint16_t>,16> k,v;
+    // Lane-backed payload (lane_kv_source.h): while `deferred`, k/v are empty
+    // and the rows live only in `source`'s lane planes, which keep them
+    // unchanged until the source fills the page (before those rows change).
+    std::shared_ptr<Exl3LaneKvSource> source;
+    Exl3CopyableFlag deferred;
+    bool payload_deferred() const noexcept { return deferred.load(); }
     static std::shared_ptr<Exl3ExactKVPage> create(
         const std::function<RetainedDescriptorLedger::Ticket(std::uint64_t)>& reserve={}) {
         std::optional<RetainedDescriptorLedger::Ticket> credit;

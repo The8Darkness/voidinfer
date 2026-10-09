@@ -786,6 +786,9 @@ public:
     // equal-payload but different immutable image; true only after this context
     // successfully restored or exported this exact state identity.
     bool exact_host_state_resident(const Exl3ExactHostState& state) const noexcept;
+    // The L0 planes of this context still hold every KV row of `state`
+    // (its pages are lane-backed by this context; lane_kv_source.h).
+    bool kv_lane_resident(const Exl3ExactHostState& state) const noexcept;
     // Returns true only when a restore was submitted. A resident hit still
     // passes retirement/failed-lineage gates; callers own acquisition identity.
     bool restore_exact_host_state_if_needed(const Exl3ExactHostState& state,cudaStream_t stream=0);

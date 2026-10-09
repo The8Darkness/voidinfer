@@ -293,6 +293,10 @@ struct Exl3EngineCore::Request {
     OutputConsumerMode consumer;
     Clock::time_point submitted,deadline;
     std::atomic<bool> cancelled{false};
+    // Coherent-device lane affinity: the longest retained root this input
+    // extends, resolved once while queued (engine mutex).
+    bool affinity_resolved=false;
+    std::weak_ptr<const Exl3VeriCacheRequest> affinity_root;
     std::optional<Exl3RequestSamplingState> sampling;
     std::uint64_t host_preparation_generation=0;
     Exl3HostPreparationCompletion host_preparation;
@@ -1988,6 +1992,25 @@ struct Exl3EngineCore::Impl {
         std::uint32_t cancelled_rejected=0,physical_rejected=0;
         std::uint32_t identity_rejected=0,affinity_deferred=0;
     };
+    std::optional<std::size_t> coherent_home_lane_locked(Request& request) {
+        if(!request.affinity_resolved) {
+            request.affinity_resolved=true;
+            const auto input=request.ready_work.input_tokens();
+            std::shared_ptr<const Exl3VeriCacheRequest> best;
+            for(const auto& candidate:cache.roots())
+                if(candidate && candidate->compact_draft() && !candidate->prepared_identity() &&
+                   candidate->token_count()>=64 && candidate->token_count()<input.size() &&
+                   (!best || candidate->token_count()>best->token_count()) &&
+                   candidate->matches_tokens(input.first(candidate->token_count())))
+                    best=candidate;
+            request.affinity_root=best;
+        }
+        const auto root=request.affinity_root.lock();
+        if(!root || !root->state())return std::nullopt;
+        for(std::size_t index=0;index<options.max_concurrency;++index)
+            if(lanes[index] && lanes[index]->context().kv_lane_resident(*root->state()))return index;
+        return std::nullopt;
+    }
     std::optional<ReadyRequestSelection> ready_request_locked(std::size_t lane_index) {
         std::optional<ReadyRequestSelection> selected;
         std::optional<Exl3ReadyRequestCandidate> selected_age;
@@ -2023,6 +2046,14 @@ struct Exl3EngineCore::Impl {
                 eligible=preferred && preferred->lane==lane_index;
                 affine=eligible && preferred->affine;
                 locality_costs_complete=eligible && preferred->locality_costs_complete;
+                if(!eligible)increment(affinity_deferred);
+            } else if(coherent_device && options.max_concurrency>=2) {
+                // A conversation's next turn goes to the lane still holding its
+                // history (lane-backed root pages, no restore copy) unless that
+                // lane is busy; any lane may take requests without a home lane.
+                const auto home=coherent_home_lane_locked(*request);
+                eligible=!home || *home==lane_index || active[*home];
+                affine=eligible && home && *home==lane_index;
                 if(!eligible)increment(affinity_deferred);
             } else {
                 eligible=true;
