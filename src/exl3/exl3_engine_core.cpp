@@ -2143,12 +2143,14 @@ struct Exl3EngineCore::Impl {
             const auto epoch=context->request_generation();
             // VeriCache verifies against exact history: ingest the prompt exactly too.
             if(vericache.enabled)context->set_l0_exact_history(true);
-            // Conversation reuse (NINFER_EXL3_COHERENT_ROOT_REUSE=1): the longest
-            // retained device root whose tokens prefix this input is restored
-            // (target exact state + draft ring) and only the suffix is ingested.
+            // Conversation reuse (default; NINFER_EXL3_COHERENT_ROOT_REUSE=0
+            // disables): the longest retained device root whose tokens prefix
+            // this input is restored (target exact state + draft ring) and only
+            // the suffix is ingested.
             static const bool root_reuse=[] {
                 const auto* value=std::getenv("NINFER_EXL3_COHERENT_ROOT_REUSE");
-                if(!value || !*value || std::string_view(value)=="0")return false;
+                if(!value || !*value)return true;
+                if(std::string_view(value)=="0")return false;
                 if(std::string_view(value)!="1")
                     throw std::invalid_argument("NINFER_EXL3_COHERENT_ROOT_REUSE must be 0 or 1");
                 return true;
