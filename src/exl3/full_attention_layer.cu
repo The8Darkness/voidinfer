@@ -10082,23 +10082,33 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         end(3);
     }
 
-    attention_middle(AttentionMiddle{input_norm,qg,kp,vp,qn,kn,qr,kr,attn,gp,own_rows,position,stream,
-        profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix,starts,ends});
+    const bool fork_peers=batch_ && batch_->fork_event;
+    if(fork_peers)cuda_check(cudaEventRecord(batch_->fork_event,stream),"attention batched peer fork");
     if(batch_) {
         int first=own_rows;
         for(int i=0;i<batch_->peer_count;++i) {
             const auto& peer=batch_->peers[static_cast<std::size_t>(i)];
             const auto row=static_cast<std::size_t>(first);
+            const cudaStream_t launch=fork_peers?batch_->fork_streams[static_cast<std::size_t>(i)]:stream;
+            if(fork_peers)cuda_check(cudaStreamWaitEvent(launch,batch_->fork_event,0),"attention peer waits fork");
             peer.layer->run_peer_segment(
                 qg+row*weights_.q_metadata.out_features,
                 kp+row*weights_.k_metadata.out_features,
                 vp+row*weights_.v_metadata.out_features,
-                attn+row*kQHeads*kHeadDim,peer.rows,peer.position,stream,
+                attn+row*kQHeads*kHeadDim,peer.rows,peer.position,launch,
                 peer.stream?peer.stream:stream,preserve_m1_topology);
+            if(fork_peers)cuda_check(cudaEventRecord(batch_->join_events[static_cast<std::size_t>(i)],launch),
+                "attention peer join");
             first+=peer.rows;
         }
         if(first!=rows)throw std::logic_error("full-attention batched segment rows");
     }
+    attention_middle(AttentionMiddle{input_norm,qg,kp,vp,qn,kn,qr,kr,attn,gp,own_rows,position,stream,
+        profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix,starts,ends});
+    if(fork_peers)
+        for(int i=0;i<batch_->peer_count;++i)
+            cuda_check(cudaStreamWaitEvent(stream,batch_->join_events[static_cast<std::size_t>(i)],0),
+                "attention owner joins peer");
 
     prefetch_weights(4,weights_.gate.trellis);
     begin(7);

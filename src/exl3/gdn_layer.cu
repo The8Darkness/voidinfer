@@ -3536,24 +3536,34 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         begin(3);
         launch_control(); end(3);
     }
-    gdn_middle(GdnMiddle{qkv,conv_input,q,k,v,conv_output,z,z_bf16,core,gdn_norm,head_trace,
-        o_input,g_trace,beta_trace,own_rows,stream,wide_prefill,preserve_m1_topology,
-        merged_qkvz_side && !batch_,eligible_retained_prefix,base_checkpoint_recurrent,
-        collect_stage_events,starts,ends});
+    const bool fork_peers=batch_ && batch_->fork_event;
+    if(fork_peers)check(cudaEventRecord(batch_->fork_event,stream),"GDN batched peer fork");
     if(batch_) {
         int first=own_rows;
         for(int i=0;i<batch_->peer_count;++i) {
             const auto& peer=batch_->peers[static_cast<std::size_t>(i)];
             const auto row=static_cast<std::size_t>(first);
+            const cudaStream_t launch=fork_peers?batch_->fork_streams[static_cast<std::size_t>(i)]:stream;
+            if(fork_peers)check(cudaStreamWaitEvent(launch,batch_->fork_event,0),"GDN peer waits fork");
             peer.layer->run_peer_segment(PeerSegmentSource{
                 h+row*kHidden,qkv+row*kQkv,conv_input+row*kQkv,z+row*kZ,
                 a+row*kHeads,b+row*kHeads,g_trace+row*kHeads,beta_trace+row*kHeads,
-                o_input+row*kZ,peer.rows,false},stream,peer.stream?peer.stream:stream,
+                o_input+row*kZ,peer.rows,false},launch,peer.stream?peer.stream:stream,
                 preserve_m1_topology);
+            if(fork_peers)check(cudaEventRecord(batch_->join_events[static_cast<std::size_t>(i)],launch),
+                "GDN peer join");
             first+=peer.rows;
         }
         if(first!=rows)throw std::logic_error("GDN batched segment rows");
     }
+    gdn_middle(GdnMiddle{qkv,conv_input,q,k,v,conv_output,z,z_bf16,core,gdn_norm,head_trace,
+        o_input,g_trace,beta_trace,own_rows,stream,wide_prefill,preserve_m1_topology,
+        merged_qkvz_side && !batch_,eligible_retained_prefix,base_checkpoint_recurrent,
+        collect_stage_events,starts,ends});
+    if(fork_peers)
+        for(int i=0;i<batch_->peer_count;++i)
+            check(cudaStreamWaitEvent(stream,batch_->join_events[static_cast<std::size_t>(i)],0),
+                "GDN owner joins peer");
     const bool gopt_residual=gaming_[Gopt::GdnVerifierResidualNorm] &&
         rows>=1 && rows<=8 && !wide_prefill && preserve_m1_topology;
     // The O reduction also writes post = half(input + o) and the

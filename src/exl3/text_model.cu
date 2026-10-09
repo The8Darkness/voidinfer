@@ -1402,6 +1402,11 @@ struct Exl3TextContext::Impl {
     std::unique_ptr<Exl3CudaLinearWorkspace> batched_head_workspace;
     // Nonzero while a batched multi-agent BatchBinding owns the layers.
     int batch_bound = 0;
+    // Owner-side fork streams for batched peers' stateful cores
+    // (NINFER_EXL3_BATCH_FORK, default on); created on first lead.
+    std::array<cudaStream_t,3> batch_fork_streams{};
+    cudaEvent_t batch_fork_event = nullptr;
+    std::array<cudaEvent_t,3> batch_join_events{};
     std::shared_ptr<DeviceAllocation> host_layer_k, host_layer_v;
     std::shared_ptr<Exl3AttentionStageStorage> attention_stage_storage;
     std::shared_ptr<Exl3AttentionStage> attention_stages;
@@ -2206,6 +2211,9 @@ struct Exl3TextContext::Impl {
     }
     ~Impl() {
         if(small_tier_storage)(void)cudaFree(small_tier_storage);
+        for(auto& s:batch_fork_streams)if(s){(void)cudaStreamSynchronize(s);(void)cudaStreamDestroy(s);s=nullptr;}
+        for(auto& e:batch_join_events)if(e){(void)cudaEventDestroy(e);e=nullptr;}
+        if(batch_fork_event){(void)cudaEventDestroy(batch_fork_event);batch_fork_event=nullptr;}
         if(repair_stream) {
             (void)cudaStreamSynchronize(repair_stream);
             (void)cudaEventDestroy(repair_fork);
@@ -9666,6 +9674,24 @@ struct Exl3TextContext::BatchBinding {
                  int own_rows) : owner(owner_) {
         require(!peers.empty() && peers.size()<=Exl3FullAttentionLayer::kMaxBatchPeers &&
                 peers.size()<=Exl3GdnLayer::kMaxBatchPeers,"batched peer count");
+        static const bool fork=[] {
+            const char* value=std::getenv("NINFER_EXL3_BATCH_FORK");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        if(fork && !owner.batch_fork_event) {
+            for(auto& s:owner.batch_fork_streams)
+                cuda_check(cudaStreamCreateWithFlags(&s,cudaStreamNonBlocking),"batched peer fork stream");
+            for(auto& e:owner.batch_join_events)
+                cuda_check(cudaEventCreateWithFlags(&e,cudaEventDisableTiming),"batched peer join event");
+            cuda_check(cudaEventCreateWithFlags(&owner.batch_fork_event,cudaEventDisableTiming),
+                "batched peer fork event");
+        }
+        const auto arm=[&](auto& batch) {
+            if(!fork)return;
+            batch.fork_streams=owner.batch_fork_streams;
+            batch.fork_event=owner.batch_fork_event;
+            batch.join_events=owner.batch_join_events;
+        };
         for(int layer=0;layer<kLayers;++layer) {
             if(owner.full_layers[layer]) {
                 full[layer].own_rows=own_rows;
@@ -9675,6 +9701,7 @@ struct Exl3TextContext::BatchBinding {
                     full[layer].peers[p]={peers[p]->full_layers[layer].get(),peer_rows[p],peer_positions[p],
                         peer_streams.empty()?nullptr:peer_streams[p]};
                 }
+                arm(full[layer]);
                 owner.full_layers[layer]->set_batch(&full[layer]);
             } else if(owner.gdn_layers[layer]) {
                 gdn[layer].own_rows=own_rows;
@@ -9684,6 +9711,7 @@ struct Exl3TextContext::BatchBinding {
                     gdn[layer].peers[p]={peers[p]->gdn_layers[layer].get(),peer_rows[p],
                         peer_streams.empty()?nullptr:peer_streams[p]};
                 }
+                arm(gdn[layer]);
                 owner.gdn_layers[layer]->set_batch(&gdn[layer]);
             }
         }
