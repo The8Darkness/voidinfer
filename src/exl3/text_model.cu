@@ -1380,8 +1380,6 @@ struct Exl3TextContext::Impl {
     // Proven by successful ordinary restore/export, invalidated by reset.
     // Retain only immutable KV pages, never an ancestor's full recurrent image.
     int exact_prefix_position = 0;
-    // Rows below this are stale in L0 OSCAR host planes after a sparse restore.
-    int l0_planes_valid_from = 0;
     // Complete L0 OSCAR code chunks of the resident lineage (export/restore).
     std::array<std::vector<std::shared_ptr<const Exl3ExactHostState::L0CodeChunk>>,16> l0_prefix_chunks;
     int rope_offset = 0;
@@ -7622,7 +7620,6 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
                "reset E4B2 position parameter");
     if (impl_->oscar) impl_->oscar->reset();
     position_ = 0;
-    impl_->l0_planes_valid_from = 0;
     for(auto& chunks:impl_->l0_prefix_chunks) chunks.clear();
     impl_->tap_rows = 0;
     impl_->embedding_rows = 0;
@@ -12578,8 +12575,6 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     state->embedding_rows_ = impl_->embedding_rows;
     state->last_rows_ = impl_->last_rows;
     const int prefix_position=share_prefix?impl_->exact_prefix_position:0;
-    require(prefix_position>=impl_->l0_planes_valid_from,
-        "L0 OSCAR sparse-restored planes need the restored prefix pages");
     const std::vector<std::shared_ptr<const Exl3ExactKVPage>> empty_prefix;
     const auto& prefix_pages=share_prefix?impl_->exact_prefix_pages:empty_prefix;
     // L0 OSCAR FP8 L2: fresh pages hold FP8 rows (prefix pages must match).
@@ -13084,7 +13079,6 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     impl_->resident_exact_state_id=0;
     impl_->exact_prefix_pages.clear();
     impl_->exact_prefix_position=0;
-    impl_->l0_planes_valid_from=0;
     for(auto& chunks:impl_->l0_prefix_chunks) chunks.clear();
     if(oscar) impl_->oscar->reset();
     // State is immutable and constructible only by export; no untrusted plane shapes.
@@ -13159,27 +13153,13 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                     cuda_check(cudaStreamSynchronize(stream),"complete bounded OSCAR restore chunk");
                 }
             } else if(!impl_->host_kv.enabled) {
-                if(state.l0_rows_>0) {
-                    // Parked INT2 history: the FP16 planes are read only for the
-                    // sink, the exact window and rows not yet encoded; older rows
-                    // stay stale (export shares the restored pages for them).
-                    // l0_oscar::history_end: sink 64, exact recent window, 64-row alignment.
-                    const int history_end=std::max(64,((state.position_-exl3_l0_recent_rows())/64)*64);
-                    const int window=std::min(state.l0_rows_,history_end);
-                    const int first=(window/Exl3ExactKVPage::token_capacity)*Exl3ExactKVPage::token_capacity;
-                    constexpr std::size_t row=1024;
-                    const int sink=std::min(first,Exl3ExactKVPage::token_capacity);
-                    if(sink>0) {
-                        restore_kv(impl_->cache_k[layer]->ptr,true,0,sink);
-                        restore_kv(impl_->cache_v[layer]->ptr,false,0,sink);
-                    }
-                    restore_kv(static_cast<std::uint16_t*>(impl_->cache_k[layer]->ptr)+first*row,true,first,state.position_-first);
-                    restore_kv(static_cast<std::uint16_t*>(impl_->cache_v[layer]->ptr)+first*row,false,first,state.position_-first);
-                    impl_->l0_planes_valid_from=std::max(impl_->l0_planes_valid_from,first);
-                } else {
-                    restore_kv(impl_->cache_k[layer]->ptr,true,0,state.position_);
-                    restore_kv(impl_->cache_v[layer]->ptr,false,0,state.position_);
-                }
+                // The FP16 planes are the exact L2 record: VeriCache passes,
+                // exact prefill history and hot-row fills read every history
+                // row, so a restore (parked INT2 history included) writes all
+                // of them; leaving encoded rows stale fed those readers the
+                // lane's previous conversation.
+                restore_kv(impl_->cache_k[layer]->ptr,true,0,state.position_);
+                restore_kv(impl_->cache_v[layer]->ptr,false,0,state.position_);
                 impl_->full_layers[layer]->l0_refresh_window(state.position_,stream);
                 if(state.l0_rows_>0) {
                     auto& prefix=impl_->l0_prefix_chunks[full];prefix.clear();
