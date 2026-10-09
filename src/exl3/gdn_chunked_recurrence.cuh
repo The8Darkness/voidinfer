@@ -27,12 +27,12 @@
 
 namespace gdn_chunked {
 
-constexpr int kD = 128, kH = 48, kKH = 16, kC = 64, kVT = 32;
+constexpr int kD = 128, kH = 48, kKH = 16, kC = 64, kVT = 16;
 constexpr int kQkStride = kKH * kD;   // row stride of q/k in floats
 constexpr int kLd = kD + 4;           // padded smem stride (floats) for 128-wide tiles
 constexpr int kLd64 = kC + 4;         // padded stride (floats) for 64-wide tiles
-constexpr int kLdV = kVT + 4;         // padded stride (floats) for 32-wide value tiles
-constexpr int kLdH = kVT + 8;         // padded stride (halves) for 32-wide value tiles
+constexpr int kLdV = kVT + 4;         // padded stride (floats) for 16-wide value tiles
+constexpr int kLdH = kVT + 8;         // padded stride (halves) for 16-wide value tiles
 constexpr float kOutputScale = 0.08838834764831843f;
 
 using namespace nvcuda;
@@ -261,16 +261,71 @@ __global__ void __launch_bounds__(256, 2) prep_kernel(const float* __restrict__ 
     }
 }
 
-// ---- Kernel 2: sequential chunk scan with fused outputs, per (head, 32-wide value tile) ----
-constexpr std::size_t kScanSmem = sizeof(float) * (kD * kLdV + 8 * 256) +
+// ---- Kernel 2: sequential chunk scan with fused outputs, per (head, 16-wide value tile) ----
+// 384 blocks of four warps (warp w owns chunk rows 16w..16w+15 of the Delta
+// and output tiles and state rows 16w and 16(w+4)), up to three per SM so the
+// 48 x 8 recurrences all run in one wave.
+constexpr int kScanThreads = 128;
+constexpr std::size_t kScanSmem = sizeof(float) * (kD * kLdV + 4 * 256) +
                                   sizeof(half) * (kD * kLdH + kC * kLdH);
 
-__global__ void __launch_bounds__(256) scan_kernel(float* __restrict__ state,
+// One warp's state-independent operands of a chunk. The Delta operands (its
+// rows of w and its u elements) of chunk c+1 load into registers while chunk c
+// computes; qg, P and the two Kt column tiles of chunk c load at the top of its
+// step, behind the Delta product. The recurrence no longer waits on L2 latency
+// before each of its dependent products.
+struct ScanDeltaOperands {
+    HA w[kD / 16];
+    half u[8];
+};
+struct ScanTailOperands {
+    HA qg[kD / 16];
+    HA p[kC / 16];
+    HAc kt[2][kC / 16];
+};
+
+__device__ __forceinline__ void load_scan_delta(ScanDeltaOperands& o, const Workspace& ws,
+    std::size_t index, int warp, int lane, int v0) {
+    const int ti = warp;
+    const half* w = ws.w + index * kC * kD;
+    const half* u = ws.u + index * kC * kD;
+#pragma unroll
+    for (int kk = 0; kk < kD / 16; ++kk)
+        wmma::load_matrix_sync(o.w[kk], w + ti * 16 * kD + kk * 16, kD);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int e = lane + 32 * j;
+        o.u[j] = u[(ti * 16 + e / 16) * kD + v0 + e % 16];
+    }
+}
+
+__device__ __forceinline__ void load_scan_tail(ScanTailOperands& o, const Workspace& ws,
+    std::size_t index, int warp) {
+    const int ti = warp;
+    const half* qg = ws.qg + index * kC * kD;
+    const half* p = ws.p + index * kC * kC;
+    const half* kt = ws.kt + index * kC * kD;
+#pragma unroll
+    for (int kk = 0; kk < kD / 16; ++kk)
+        wmma::load_matrix_sync(o.qg[kk], qg + ti * 16 * kD + kk * 16, kD);
+#pragma unroll
+    for (int kk = 0; kk < kC / 16; ++kk)
+        if (kk <= ti) wmma::load_matrix_sync(o.p[kk], p + ti * 16 * kC + kk * 16, kC);
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        const int si = warp + 4 * t;
+#pragma unroll
+        for (int kk = 0; kk < kC / 16; ++kk)
+            wmma::load_matrix_sync(o.kt[t][kk], kt + kk * 16 * kD + si * 16, kD);
+    }
+}
+
+__global__ void __launch_bounds__(kScanThreads, 3) scan_kernel(float* __restrict__ state,
     std::uint16_t* __restrict__ output, int rows, int chunks, Workspace ws) {
     extern __shared__ float smem[];
     float* Ss = smem;                                   // [128][kLdV] FP32 state tile
     float* stages = Ss + kD * kLdV;                     // per warp [256]
-    half* Sh = reinterpret_cast<half*>(stages + 8 * 256);  // [128][kLdH] FP16 operand copy
+    half* Sh = reinterpret_cast<half*>(stages + 4 * 256);  // [128][kLdH] FP16 operand copy
     half* Dh = Sh + kD * kLdH;                          // [64][kLdH] Delta tile
     const int head = blockIdx.x, tile = blockIdx.y;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -278,53 +333,57 @@ __global__ void __launch_bounds__(256) scan_kernel(float* __restrict__ state,
     float* stage = stages + warp * 256;
     float* s_global = state + static_cast<std::size_t>(head) * kD * kD;
     auto* out = reinterpret_cast<__nv_bfloat16*>(output);
-    for (int i = tid; i < kD * kVT; i += 256) {
+    ScanDeltaOperands current;
+    if (chunks > 0) load_scan_delta(current, ws, tile_index(0, head), warp, lane, v0);
+    for (int i = tid; i < kD * kVT; i += kScanThreads) {
         const int r = i / kVT, c = i % kVT;
         const float value = s_global[r * kD + v0 + c];
         Ss[r * kLdV + c] = value;
         Sh[r * kLdH + c] = __float2half_rn(value);
     }
     __syncthreads();
-    const int ti = warp / 2, tj = warp % 2;   // this warp's 16x16 tile of the 64x32 chunk block
+    const int ti = warp;   // this warp's 16x16 tile of the 64x16 chunk block
     for (int chunk = 0; chunk < chunks; ++chunk) {
         const std::size_t index = tile_index(chunk, head);
-        const half* w = ws.w + index * kC * kD;
-        const half* u = ws.u + index * kC * kD;
+        ScanTailOperands tail;
+        load_scan_tail(tail, ws, index, warp);
+        ScanDeltaOperands next;
+        if (chunk + 1 < chunks)
+            load_scan_delta(next, ws, tile_index(chunk + 1, head), warp, lane, v0);
         // Delta tile = u - w S0.
         {
             HC acc; wmma::fill_fragment(acc, 0.0f);
 #pragma unroll
-            for (int kk = 0; kk < kD; kk += 16) {
-                HA a; HB b;
-                wmma::load_matrix_sync(a, w + ti * 16 * kD + kk, kD);
-                wmma::load_matrix_sync(b, Sh + kk * kLdH + tj * 16, kLdH);
-                wmma::mma_sync(acc, a, b, acc);
+            for (int kk = 0; kk < kD / 16; ++kk) {
+                HB b;
+                wmma::load_matrix_sync(b, Sh + kk * 16 * kLdH, kLdH);
+                wmma::mma_sync(acc, current.w[kk], b, acc);
             }
             wmma::store_matrix_sync(stage, acc, 16, wmma::mem_row_major);
             __syncwarp();
-            for (int e = lane; e < 256; e += 32) {
-                const int r = ti * 16 + e / 16, c = tj * 16 + e % 16;
-                Dh[r * kLdH + c] = __float2half_rn(__half2float(u[r * kD + v0 + c]) - stage[e]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int e = lane + 32 * j;
+                const int r = ti * 16 + e / 16, c = e % 16;
+                Dh[r * kLdH + c] = __float2half_rn(__half2float(current.u[j]) - stage[e]);
             }
         }
         __syncthreads();
         // Output tile = Qg S0 + P Delta (reads the pre-update S copy).
         {
-            const half* qg = ws.qg + index * kC * kD;
-            const half* p = ws.p + index * kC * kC;
             HC acc; wmma::fill_fragment(acc, 0.0f);
 #pragma unroll
-            for (int kk = 0; kk < kD; kk += 16) {
-                HA a; HB b;
-                wmma::load_matrix_sync(a, qg + ti * 16 * kD + kk, kD);
-                wmma::load_matrix_sync(b, Sh + kk * kLdH + tj * 16, kLdH);
-                wmma::mma_sync(acc, a, b, acc);
+            for (int kk = 0; kk < kD / 16; ++kk) {
+                HB b;
+                wmma::load_matrix_sync(b, Sh + kk * 16 * kLdH, kLdH);
+                wmma::mma_sync(acc, tail.qg[kk], b, acc);
             }
-            for (int kk = 0; kk <= ti * 16; kk += 16) {
-                HA a; HB b;
-                wmma::load_matrix_sync(a, p + ti * 16 * kC + kk, kC);
-                wmma::load_matrix_sync(b, Dh + kk * kLdH + tj * 16, kLdH);
-                wmma::mma_sync(acc, a, b, acc);
+#pragma unroll
+            for (int kk = 0; kk < kC / 16; ++kk) {
+                if (kk > ti) break;
+                HB b;
+                wmma::load_matrix_sync(b, Dh + kk * 16 * kLdH, kLdH);
+                wmma::mma_sync(acc, tail.p[kk], b, acc);
             }
             wmma::store_matrix_sync(stage, acc, 16, wmma::mem_row_major);
             __syncwarp();
@@ -332,39 +391,39 @@ __global__ void __launch_bounds__(256) scan_kernel(float* __restrict__ state,
             for (int e = lane; e < 256; e += 32) {
                 const int row = row0 + e / 16;
                 if (row < rows)
-                    out[(static_cast<std::size_t>(row) * kH + head) * kD + v0 + tj * 16 + e % 16] =
+                    out[(static_cast<std::size_t>(row) * kH + head) * kD + v0 + e % 16] =
                         __float2bfloat16_rn(stage[e] * kOutputScale);
             }
             __syncwarp();
         }
-        // S = gamma_C S0 + Kt^T Delta (128 x 32): 16 tiles, two per warp.
+        // S = gamma_C S0 + Kt^T Delta (128 x 16): 8 tiles, two per warp.
         {
-            const half* kt = ws.kt + index * kC * kD;
             const float decay = ws.decay[index];
-            for (int t = warp; t < 16; t += 8) {
-                const int si = t / 2, sj = t % 2;
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                const int si = warp + 4 * t;
                 HC acc;
-                wmma::load_matrix_sync(acc, Ss + si * 16 * kLdV + sj * 16, kLdV, wmma::mem_row_major);
+                wmma::load_matrix_sync(acc, Ss + si * 16 * kLdV, kLdV, wmma::mem_row_major);
 #pragma unroll
                 for (int e = 0; e < acc.num_elements; ++e) acc.x[e] *= decay;
 #pragma unroll
-                for (int kk = 0; kk < kC; kk += 16) {
-                    HAc a; HB b;
-                    wmma::load_matrix_sync(a, kt + kk * kD + si * 16, kD);
-                    wmma::load_matrix_sync(b, Dh + kk * kLdH + sj * 16, kLdH);
-                    wmma::mma_sync(acc, a, b, acc);
+                for (int kk = 0; kk < kC / 16; ++kk) {
+                    HB b;
+                    wmma::load_matrix_sync(b, Dh + kk * 16 * kLdH, kLdH);
+                    wmma::mma_sync(acc, tail.kt[t][kk], b, acc);
                 }
-                wmma::store_matrix_sync(Ss + si * 16 * kLdV + sj * 16, acc, kLdV, wmma::mem_row_major);
+                wmma::store_matrix_sync(Ss + si * 16 * kLdV, acc, kLdV, wmma::mem_row_major);
             }
         }
         __syncthreads();
-        for (int i = tid; i < kD * kVT; i += 256) {
+        for (int i = tid; i < kD * kVT; i += kScanThreads) {
             const int r = i / kVT, c = i % kVT;
             Sh[r * kLdH + c] = __float2half_rn(Ss[r * kLdV + c]);
         }
         __syncthreads();
+        current = next;
     }
-    for (int i = tid; i < kD * kVT; i += 256) {
+    for (int i = tid; i < kD * kVT; i += kScanThreads) {
         const int r = i / kVT, c = i % kVT;
         s_global[r * kD + v0 + c] = Ss[r * kLdV + c];
     }
@@ -390,7 +449,7 @@ inline void launch(float* q, float* k, const std::uint16_t* v, const float* alph
                         static_cast<std::size_t>(pad) * kQkStride * sizeof(float), stream);
     }
     prep_kernel<<<dim3(chunks, kH), 256, kPrepSmem, stream>>>(q, k, v, alpha, beta, rows, ws);
-    scan_kernel<<<dim3(kH, kD / kVT), 256, kScanSmem, stream>>>(state, output, rows, chunks, ws);
+    scan_kernel<<<dim3(kH, kD / kVT), kScanThreads, kScanSmem, stream>>>(state, output, rows, chunks, ws);
 }
 
 }  // namespace gdn_chunked
