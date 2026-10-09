@@ -121,7 +121,8 @@ struct ExactPageExtension {
 ExactPageExtension extend_exact_pages(
     const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& prefix,int old_position,int new_position,
     bool reuse_unique_tail=false,Exl3HostKVStats* stats=nullptr,unsigned fault_for_test=0,
-    const Exl3TextContext::SnapshotMetadataReservation& reserve_metadata={},int row_words=1024) {
+    const Exl3TextContext::SnapshotMetadataReservation& reserve_metadata={},int row_words=1024,
+    bool prepare_payload=true) {
     require(fault_for_test<=2,"exact page extension fault index");
     const auto started=stats?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(stats) ++stats->page_extension_calls;
@@ -184,6 +185,9 @@ ExactPageExtension extend_exact_pages(
         } else page=create_page();
         if(page!=deferred_tail) {
           page->first=first;page->rows=rows;
+          // !prepare_payload: the exporter allocates and fills every fresh
+          // bank itself (parallel host copies, no zero fill).
+          if(prepare_payload)
           for(int bank=0;bank<16;++bank) {
             page->k[bank].reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*row_words);
             page->v[bank].reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*row_words);
@@ -12555,8 +12559,17 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     const auto& prefix_pages=share_prefix?impl_->exact_prefix_pages:empty_prefix;
     // L0 OSCAR FP8 L2: fresh pages hold FP8 rows (prefix pages must match).
     const bool l2_fp8=Exl3NativeContextExtent::l0_oscar_enabled() && l0_l2_fp8::enabled();
+    // L0 OSCAR keeps the FP16 planes in mapped host memory: the page snapshot
+    // is a host copy, run in parallel after one stream fence, each task
+    // allocating and filling its own bank (no zero fill; previously one
+    // synchronized cudaMemcpyAsync per 64-row page and bank, ~90 ms at 4K).
+    bool host_planes=!l2_fp8;
+    for(int layer=0;layer<kLayers;++layer)
+        if(impl_->full_layers[layer])
+            host_planes=host_planes && impl_->cache_k[layer]->host_mapped &&
+                impl_->cache_v[layer]->host_mapped;
     auto extension=extend_exact_pages(prefix_pages,prefix_position,position_,false,nullptr,0,
-        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024);
+        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024,!host_planes);
     for(const auto& page:extension.all)
         require(page->fp8==l2_fp8 || std::find(extension.fresh.begin(),extension.fresh.end(),page)!=extension.fresh.end(),
                 "L0 L2 FP8 prefix page format");
@@ -12661,6 +12674,8 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         }
     }
     int full = 0, gdn = 0;
+    struct HostKvCopy { std::vector<std::uint16_t>* output; std::size_t kept; const std::uint16_t* source; std::size_t elements; };
+    std::vector<HostKvCopy> host_kv_copies;
     Exl3ExportCopyPlan<48> pageable_recurrent_plan;
     Exl3ExportCopyPlan<48> convolution_plan;
     Exl3ExportCopyPlan<batched_kv_capacity> batched_kv_plan;
@@ -12709,9 +12724,15 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                 const int skip=std::clamp(prefix_position-page->first,0,page->rows);
                 const std::size_t elements=static_cast<std::size_t>(page->rows-skip)*1024;
                 const auto copy=[&](auto& output,const void* source) {
-                    auto* destination=output.data()+skip*1024;
                     const auto* source_first=static_cast<const std::uint16_t*>(source)+
                         static_cast<std::size_t>(page->first+skip)*1024;
+                    if(host_planes) {
+                        host_kv_copies.push_back({&output,static_cast<std::size_t>(skip)*1024,
+                            source_first,elements});
+                        state->kv_export_bytes_+=elements*2;
+                        return;
+                    }
+                    auto* destination=output.data()+skip*1024;
                     if(batched_kv_export) {
                         require(batched_kv_plan.add(destination,source_first,elements*2,
                             Exl3ExportPrecision::fp16),
@@ -12746,6 +12767,17 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                 "convolution export copy plan capacity");
             ++gdn;
         }
+    }
+    if(!host_kv_copies.empty()) {
+        cuda_check(cudaStreamSynchronize(stream),"complete exact KV host plane writes");
+        std::for_each(std::execution::par,host_kv_copies.begin(),host_kv_copies.end(),
+            [](const HostKvCopy& copy) {
+                // Fresh banks are empty; a cloned partial page keeps its prefix rows.
+                auto& output=*copy.output;
+                output.reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*1024);
+                output.resize(copy.kept);
+                output.insert(output.end(),copy.source,copy.source+copy.elements);
+            });
     }
     if(batched_kv_plan.size()) {
         const auto submitted=batched_kv_plan.submit([&](const auto& segment) noexcept {
