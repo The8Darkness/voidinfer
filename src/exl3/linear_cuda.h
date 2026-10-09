@@ -713,6 +713,7 @@ public:
     // Batched multi-agent drafting: 9..32 rows of the draft projection shapes
     // run on the coherent packed producer (row-concatenated agents).
     void enable_draft_batched() noexcept { draft_batched_enabled_ = true; }
+    void set_draft_batched(bool enabled) noexcept { draft_batched_enabled_ = enabled; }
 
     void set_reconstructed_exact(Exl3ReconstructedExactView view) noexcept {
         reconstructed_exact_ = view;

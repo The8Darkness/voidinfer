@@ -4243,8 +4243,25 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
                 m.ws_kv->draft_prefill_kv_candidate(layer.vm, std::min(rows,8)),
                 "draft prefill K/V admission unavailable");
     if (m.ring_count == 0) m.ring_base_abs = abs_pos0;
-    for (int first = 0; first < rows; first += 8) {
-        const int count = std::min(8, rows - first);
+    // Fresh prefill commits of 9..16 rows run as one chunk through the
+    // row-batched coherent projections (half the launches of two 8-row
+    // chunks); NINFER_DFLASH2_PREFILL_CHUNK16=0 keeps 8-row chunks.
+    static const bool chunk16 = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_PREFILL_CHUNK16");
+        return !value || std::string(value) != "0";
+    }();
+    const int chunk = chunk16 && m.fresh_prefill.active && rows > 8 ? 16 : 8;
+    struct BatchedRoute {
+        Impl& m; bool on;
+        BatchedRoute(Impl& impl, bool enable) : m(impl), on(enable) {
+            if (on) { m.ws_fc->set_draft_batched(true); m.ws_kv->set_draft_batched(true); }
+        }
+        ~BatchedRoute() {
+            if (on) { m.ws_fc->set_draft_batched(false); m.ws_kv->set_draft_batched(false); }
+        }
+    } batched_route(m, chunk == 16);
+    for (int first = 0; first < rows; first += chunk) {
+        const int count = std::min(chunk, rows - first);
         const int pos = static_cast<int>(abs_pos0 + first);
         const std::uint16_t* ptrs[kLayers];
         for (int t = 0; t < kLayers; ++t) ptrs[t] = taps[t] + static_cast<std::size_t>(first) * kHidden;
@@ -4252,11 +4269,12 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
                    "draft prefill tap pointers");
         dflash_tap_concat_kernel<<<(count * kLayers * kHidden + 255) / 256,256,0,stream>>>(m.s.tap_ptr,m.s.tcat,count);
         cuda_check(cudaGetLastError(), "draft prefill concat");
-        m.ws_fc->forward(m.fc,m.fc_meta,m.s.tcat,m.s.fc_raw,count,stream,admission);
+        if (count > 8) m.ws_fc->forward(m.fc,m.fc_meta,m.s.tcat,m.s.fc_raw,count,stream);
+        else m.ws_fc->forward(m.fc,m.fc_meta,m.s.tcat,m.s.fc_raw,count,stream,admission);
         dflash_rms_norm_kernel<DFlashFmt::F16><<<count,256,256*sizeof(float),stream>>>(
             m.s.fc_raw,m.hidden_norm,m.s.hctx,count,kHidden);
         cuda_check(cudaGetLastError(), "draft prefill hidden norm");
-        dflash_prefill_positions_kernel<<<1,8,0,stream>>>(m.s.pos_ctx,count,pos);
+        dflash_prefill_positions_kernel<<<1,16,0,stream>>>(m.s.pos_ctx,count,pos);
         cuda_check(cudaGetLastError(), "draft prefill positions");
         for (int layer = 0; layer < kLayers; ++layer) {
             const auto& lay = m.layers[layer];
