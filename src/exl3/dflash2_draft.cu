@@ -4822,23 +4822,39 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         rms(current+(static_cast<std::size_t>(i)*L+1)*kHidden,lead.norm,
             b.final_norm+static_cast<std::size_t>(i)*P*kHidden,P);
     const int proposal_rows=count*P;
-    b.ws_head->set_active_output_features(0);
+    // Head prefix (the same rule as a private proposal): the leading
+    // head_prefix vocabulary columns, or the full head for 64 rounds after any
+    // member's anchor fell outside the prefix. One width for the whole batch.
+    int head_columns=kVocab;
+    if(lead.head_prefix>0) {
+        constexpr int kHeadPrefixHold=64;
+        bool full=false;
+        for(auto* member:members) {
+            Impl& m=*member->draft->impl_;
+            if(member->block[0]>=m.head_prefix)m.head_full_rounds=kHeadPrefixHold;
+            if(m.head_full_rounds>0) {--m.head_full_rounds;full=true;}
+        }
+        if(!full)head_columns=lead.head_prefix;
+    }
+    b.ws_head->set_active_output_features(head_columns<kVocab?head_columns:0);
     for(int first=0;first<proposal_rows;first+=16) {
         const int n=std::min(16,proposal_rows-first);
         b.ws_head->forward(target_head,target_head_metadata,b.final_norm+static_cast<std::size_t>(first)*kHidden,
             b.head_out+static_cast<std::size_t>(first)*kVocab,n,stream);
     }
+    b.ws_head->set_active_output_features(0);
     cuda_check(cudaMemsetAsync(b.liveness,0,sizeof(unsigned int),stream),"batched draft liveness zero");
-    dflash_nonfinite_flag_kernel<<<(proposal_rows*kVocab+255)/256,256,0,stream>>>(
-        b.head_out,proposal_rows*kVocab,b.liveness,kVocab,kVocab);
+    dflash_nonfinite_flag_kernel<<<(proposal_rows*head_columns+255)/256,256,0,stream>>>(
+        b.head_out,proposal_rows*head_columns,b.liveness,head_columns,kVocab);
     cuda_check(cudaGetLastError(),"batched draft liveness");
     for(int i=0;i<count;++i) {
         Impl& m=*members[i]->draft->impl_;
         const auto* head=b.head_out+static_cast<std::size_t>(i)*P*kVocab;
         dense(b.final_norm+static_cast<std::size_t>(i)*P*kHidden,lead.hidden_proj,m.s.hidden_proj_out,
             P,kHidden,kRank);
-        launch_dflash_topk16_segmented(head,P,kVocab,m.s.cand_ids,m.s.cand_unary,m.s.topk_segments,
+        launch_dflash_topk16_segmented(head,P,head_columns,m.s.cand_ids,m.s.cand_unary,m.s.topk_segments,
             stream,kVocab);
+        if(head_columns<kVocab)++m.head_prefix_calls;
         dflash_selector_fused_chain_kernel<<<1,kSelectorFusedThreads,0,stream>>>(
             P,members[i]->block[0],nullptr,m.s.cand_ids,m.s.hidden_proj_out,lead.pred_cb,lead.succ_cb,
             m.s.cand_unary,m.s.proposal_out);
