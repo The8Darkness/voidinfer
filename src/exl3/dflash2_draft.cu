@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
+#include <mma.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -907,6 +908,66 @@ bool dflash_dense_rows_enabled() {
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
+}
+
+// Tensor-core dense rows for the batched draft (up to 32 rows): c[m][n] =
+// a[m][k] b[k][n] with k-major FP16 weights. One CTA per 16 output columns
+// (32-byte weight rows), eight warps splitting K, FP32 accumulation and a
+// shared-memory reduction. A tiles read 16-row blocks, so the caller
+// guarantees round_up(m, 16) readable rows.
+constexpr int kDenseTcWarps = 8;
+__global__ void __launch_bounds__(kDenseTcWarps * 32) dflash_dense_rows_tc_kernel(
+    const std::uint16_t* __restrict__ a, const std::uint16_t* __restrict__ b,
+    std::uint16_t* __restrict__ c, int m, int k, int n) {
+    using namespace nvcuda;
+    __shared__ float partial[kDenseTcWarps][32][16];
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int col0 = static_cast<int>(blockIdx.x) * 16;
+    const int span = k / kDenseTcWarps;
+    const int k0 = warp * span;
+    const auto* ah = reinterpret_cast<const half*>(a);
+    const auto* bh = reinterpret_cast<const half*>(b);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
+    wmma::fill_fragment(acc0, 0.0f);
+    wmma::fill_fragment(acc1, 0.0f);
+    const bool second = m > 16;
+#pragma unroll 8
+    for (int kk = k0; kk < k0 + span; kk += 16) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+        wmma::load_matrix_sync(fb, bh + static_cast<std::size_t>(kk) * n + col0, n);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+        wmma::load_matrix_sync(fa, ah + kk, k);
+        wmma::mma_sync(acc0, fa, fb, acc0);
+        if (second) {
+            wmma::load_matrix_sync(fa, ah + static_cast<std::size_t>(16) * k + kk, k);
+            wmma::mma_sync(acc1, fa, fb, acc1);
+        }
+    }
+    wmma::store_matrix_sync(&partial[warp][0][0], acc0, 16, wmma::mem_row_major);
+    if (second) wmma::store_matrix_sync(&partial[warp][16][0], acc1, 16, wmma::mem_row_major);
+    __syncthreads();
+    for (int i = static_cast<int>(threadIdx.x); i < m * 16; i += kDenseTcWarps * 32) {
+        const int r = i / 16, col = i % 16;
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kDenseTcWarps; ++w) sum += partial[w][r][col];
+        c[static_cast<std::size_t>(r) * n + col0 + col] = float_to_half(sum);
+    }
+}
+
+// The tensor-core route when `capacity` rows are readable from `in`.
+bool launch_dflash_dense_rows_tc(const std::uint16_t* in, const std::uint16_t* weights,
+    std::uint16_t* out, int rows, int k, int n, int capacity, cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH2_DENSE_TC");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled || rows < 1 || rows > 32 || (rows + 15) / 16 * 16 > capacity ||
+        k % (16 * kDenseTcWarps) != 0 || n % 16 != 0 ||
+        ((reinterpret_cast<std::uintptr_t>(in) | reinterpret_cast<std::uintptr_t>(weights)) % 32) != 0)
+        return false;
+    dflash_dense_rows_tc_kernel<<<n / 16, kDenseTcWarps * 32, 0, stream>>>(in, weights, out, rows, k, n);
+    return true;
 }
 
 bool launch_dflash_dense_rows_kmajor(const std::uint16_t* in,const std::uint16_t* weights,
@@ -4718,8 +4779,17 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_view(
     if(impl_->batched_propose && batched_proposal_supported(block_ids))
         return impl_->batched_propose->propose(*this,block_ids,block_pos0,target_embedding_bf16,
             target_head,target_head_metadata,mask_token_id,stream);
-    // A single lane uses the batched forward as a one-member group: once the
-    // ring is full it replays one captured graph instead of eager launches.
+    return propose_cached_private(block_ids,block_pos0,target_embedding_bf16,target_head,
+        target_head_metadata,mask_token_id,stream);
+}
+
+std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_private(
+    std::span<const std::int64_t> block_ids,int block_pos0,
+    const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
+    const Exl3CudaLinearMetadata& target_head_metadata,std::int64_t mask_token_id,cudaStream_t stream) {
+    // A lone lane (no coordinator, or the only member of its group) uses the
+    // batched forward as a one-member group: once the ring is full it replays
+    // one captured graph instead of eager launches.
     static const bool solo_batched=[] {
         const char* value=std::getenv("NINFER_DFLASH2_SOLO_BATCHED");
         return !value || std::strcmp(value,"0")!=0;
@@ -4753,14 +4823,6 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_view(
         }
         return std::move(request.proposals);
     }
-    return propose_internal(block_ids,block_pos0,nullptr,0,0,0,target_embedding_bf16,
-        target_head,target_head_metadata,mask_token_id,stream,true);
-}
-
-std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_private(
-    std::span<const std::int64_t> block_ids,int block_pos0,
-    const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
-    const Exl3CudaLinearMetadata& target_head_metadata,std::int64_t mask_token_id,cudaStream_t stream) {
     return propose_internal(block_ids,block_pos0,nullptr,0,0,0,target_embedding_bf16,
         target_head,target_head_metadata,mask_token_id,stream,true);
 }
@@ -4910,8 +4972,11 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         dflash_rms_norm_kernel<DFlashFmt::BF16><<<n,256,256*sizeof(float),stream>>>(in,weight,out,n,kHidden);
         cuda_check(cudaGetLastError(),"batched draft RMSNorm");
     };
-    const auto dense=[&](const std::uint16_t* in,const std::uint16_t* weight,std::uint16_t* out,int n,int k,int width) {
-        if(!(lead.dense_kmajor && launch_dflash_dense_rows_kmajor(in,weight,out,n,k,width,stream))) {
+    // capacity: rows readable from `in` (32-row planes; member offsets less).
+    const auto dense=[&](const std::uint16_t* in,const std::uint16_t* weight,std::uint16_t* out,int n,int k,int width,
+                         int capacity) {
+        if(lead.dense_kmajor && launch_dflash_dense_rows_tc(in,weight,out,n,k,width,capacity,stream)) {
+        } else if(!(lead.dense_kmajor && launch_dflash_dense_rows_kmajor(in,weight,out,n,k,width,stream))) {
             if(lead.dense_kmajor)
                 dflash_dense_gemm_t_kernel<true><<<dim3((width+255)/256,n),256,
                     static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(in,weight,out,n,k,width);
@@ -4963,7 +5028,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         for(int layer=0;layer<kLayers;++layer) {
             const auto& lay=lead.layers[layer];
             rms(current,lay.input_norm,b.ln,rows);
-            dense(b.ln,lay.attn_kernel_proj,b.dyn,rows,kHidden,kConvDynamic);
+            dense(b.ln,lay.attn_kernel_proj,b.dyn,rows,kHidden,kConvDynamic,DraftBatchedScratch::kRows);
             dyn_conv(b.ln,b.dyn,lay.attn_base,b.conv,0,false);
             b.ws_q->forward(lay.q,lay.qm,b.conv,b.qproj,rows,stream);
             b.ws_kv->forward(lay.k,lay.km,b.conv,b.kblk,rows,stream);
@@ -5001,7 +5066,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             dyn_conv(b.oproj,b.dyn,lay.attn_base,b.convf,1,true);
             residual(current,b.convf,other);
             rms(other,lay.post_norm,b.ln2,rows);
-            dense(b.ln2,lay.mlp_kernel_proj,b.dyn2,rows,kHidden,kConvDynamic);
+            dense(b.ln2,lay.mlp_kernel_proj,b.dyn2,rows,kHidden,kConvDynamic,DraftBatchedScratch::kRows);
             dyn_conv(b.ln2,b.dyn2,lay.mlp_base,b.conv2,0,false);
             b.ws_mlp->forward(lay.gate,lay.gm,b.conv2,b.gate,rows,stream);
             b.ws_mlp->forward(lay.up,lay.um,b.conv2,b.up,rows,stream);
@@ -5039,7 +5104,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             Impl& m=*members[i]->draft->impl_;
             const auto* head=b.head_out+static_cast<std::size_t>(i)*P*kVocab;
             dense(b.final_norm+static_cast<std::size_t>(i)*P*kHidden,lead.hidden_proj,m.s.hidden_proj_out,
-                P,kHidden,kRank);
+                P,kHidden,kRank,DraftBatchedScratch::kRows-i*P);
             launch_dflash_topk16_segmented(head,P,head_columns,m.s.cand_ids,m.s.cand_unary,m.s.topk_segments,
                 stream,kVocab);
             dflash_selector_fused_chain_kernel<<<1,kSelectorFusedThreads,0,stream>>>(
