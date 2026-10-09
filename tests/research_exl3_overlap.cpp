@@ -322,6 +322,11 @@ int main() {
                 check(cudaEventCreateWithFlags(&ready[a], cudaEventDisableTiming), "ready");
                 check(cudaEventCreateWithFlags(&done[a], cudaEventDisableTiming), "done");
             }
+            // Device time of each round's target forward(s) (events on agent
+            // 0's stream around the batched call; around each separate call).
+            cudaEvent_t t0, t1;
+            check(cudaEventCreate(&t0), "t0"); check(cudaEventCreate(&t1), "t1");
+            double forward_ms[2] = {0, 0};
             const auto run = [&](bool batched) {
                 std::vector<std::vector<std::vector<float>>> logits(rounds);
                 for (int r = 0; r < rounds; ++r) {
@@ -340,11 +345,24 @@ int main() {
                             check(cudaStreamWaitEvent(lane_streams[0], ready[a], 0), "leader waits member");
                             peers.push_back({all[a], tokens_of(r, a), lane_streams[a]});
                         }
+                        check(cudaEventRecord(t0, lane_streams[0]), "t0");
                         d->continue_rows_batched(peers, tokens_of(r, 0), lane_streams[0]);
+                        check(cudaEventRecord(t1, lane_streams[0]), "t1");
+                        check(cudaEventSynchronize(t1), "t1 sync");
+                        float elapsed = 0; check(cudaEventElapsedTime(&elapsed, t0, t1), "elapsed");
+                        if (r >= 2) forward_ms[1] += elapsed;
                         check(cudaEventRecord(done[0], lane_streams[0]), "leader done");
                         for (int a = 1; a < agents; ++a)
                             check(cudaStreamWaitEvent(lane_streams[a], done[0], 0), "member resumes");
-                    } else for (int a = 0; a < agents; ++a) all[a]->continue_rows(tokens_of(r, a), lane_streams[a]);
+                    } else for (int a = 0; a < agents; ++a) {
+                        check(cudaStreamSynchronize(lane_streams[a]), "separate pre");
+                        check(cudaEventRecord(t0, lane_streams[a]), "t0");
+                        all[a]->continue_rows(tokens_of(r, a), lane_streams[a]);
+                        check(cudaEventRecord(t1, lane_streams[a]), "t1");
+                        check(cudaEventSynchronize(t1), "t1 sync");
+                        float elapsed = 0; check(cudaEventElapsedTime(&elapsed, t0, t1), "elapsed");
+                        if (r >= 2) forward_ms[0] += elapsed;
+                    }
                     for (int a = 0; a < agents; ++a) {
                         logits[r].push_back(all[a]->continuation_logits_host(lane_streams[a]));
                         const int keep = keep_of(r, a);
@@ -382,6 +400,8 @@ int main() {
                     }
                 }
             std::cout << "OVL rounds agents=" << agents << " rounds=" << rounds << " first_bad_round=" << first_bad_round << '\n';
+            std::cout << "OVL forward ms/round separate=" << forward_ms[0] / std::max(1, rounds - 2)
+                      << " batched=" << forward_ms[1] / std::max(1, rounds - 2) << '\n';
             return 0;
         }
         if (mode == 5) {

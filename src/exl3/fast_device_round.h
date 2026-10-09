@@ -88,6 +88,7 @@ public:
         std::uint64_t rounds=0,verified_rows=0,replayed_rows=0;
         std::uint64_t staged_bytes=0,reused_seeds=0,seed_fallbacks=0;
         double proposal_ms=0,verifier_ms=0,ring_commit_ms=0;
+        double target_seed_ms=0,draft_api_ms=0;
         std::uint64_t verified_blocks=0,corrected_blocks=0;
         std::uint64_t accepted_checked=0,accepted_off_greedy=0;
         // NINFER_EXL3_VERICACHE_STATS: synchronized step wall times.
@@ -745,6 +746,8 @@ private:
         totals_.staged_bytes+=value.staged_bytes;
         if(value.single_row){++totals_.replayed_rows;return;}
         totals_.verifier_ms+=value.verifier_ms;
+        totals_.target_seed_ms+=value.target_seed_ms;
+        totals_.draft_api_ms+=value.draft_api_ms;
         totals_.verified_rows+=value.verification.verification_rows;
         totals_.replayed_rows+=value.verification.replay_rows+
             value.authorized_replay_rows;

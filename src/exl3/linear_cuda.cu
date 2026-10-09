@@ -12136,10 +12136,11 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
 
     if (draft_batched_enabled_ && rows > 8 && out_features_ % 128 == 0 &&
         metadata.K >= 4 && metadata.K <= 7) {
-        // Five K partitions fit the workspace's own accumulation planes.
-        constexpr int split = 5;
-        if (accumulation_capacity_bytes_ <
-            static_cast<std::size_t>(rows) * out_features_ * split * sizeof(float))
+        // Five K partitions when the workspace's own accumulation planes
+        // hold them (draft projections), else one (the vocabulary head).
+        const std::size_t plane = static_cast<std::size_t>(rows) * out_features_ * sizeof(float);
+        const int split = accumulation_capacity_bytes_ >= plane * 5 ? 5 : 1;
+        if (accumulation_capacity_bytes_ < plane * static_cast<std::size_t>(split))
             throw std::logic_error("batched draft accumulation capacity");
         if (metadata.K == 4) launch_coherent_packed_partials<4>(0, 0, stream, transformed_input,
             weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);

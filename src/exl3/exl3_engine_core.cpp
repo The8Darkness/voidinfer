@@ -52,6 +52,17 @@
 #include <Windows.h>
 
 namespace ninfer::exl3 {
+namespace {
+// NINFER_EXL3_ROUND_WIDTH (2..8, research): coherent-device verifier rows per round.
+std::size_t round_width_limit() {
+    static const std::size_t value=[] {
+        const char* text=std::getenv("NINFER_EXL3_ROUND_WIDTH");
+        return text?static_cast<std::size_t>(std::clamp(std::atoi(text),2,8)):std::size_t{8};
+    }();
+    return value;
+}
+}
+
 // NINFER_EXL3_MEMORY_TRACE: runtime device-memory movement (>8 MiB) at
 // prompt-pass and round boundaries.
 static void runtime_memory_mark(const char* stage,unsigned lane) {
@@ -2366,7 +2377,7 @@ struct Exl3EngineCore::Impl {
                     const std::size_t block=static_cast<std::size_t>(vericache.block);
                     if(!terminal_seen && room && unverified.size()<block) {
                         const auto width=static_cast<int>(std::min<std::size_t>(
-                            {8,room,block-unverified.size()}));
+                            {round_width_limit(),room,block-unverified.size()}));
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
                         lt_prepare+=lt_ms(lt_mark);lt_mark=Clock::now();++lt_rounds;
                         pending_ticket=prepared_round.ticket;
@@ -2485,6 +2496,11 @@ struct Exl3EngineCore::Impl {
                         t.accepted_checked?t.accepted_gap_sum/static_cast<double>(t.accepted_checked):0.0,
                         static_cast<double>(t.max_accepted_gap),t.restore_ms,t.forward_ms,t.scores_ms,
                         t.fix_ms,t.commit_ms);
+                    std::fprintf(stderr,"ROUND_TIMING rounds=%llu verified_rows=%llu seed_ms=%.1f draft_ms=%.1f "
+                        "proposal_ms=%.1f verifier_ms=%.1f ring_commit_ms=%.1f prefill_s=%.3f decode_s=%.3f\n",
+                        static_cast<unsigned long long>(t.rounds),static_cast<unsigned long long>(t.verified_rows),
+                        t.target_seed_ms,t.draft_api_ms,t.proposal_ms,t.verifier_ms,t.ring_commit_ms,
+                        result.timings.prefill_seconds,seconds(decode));
                 }
             } else
             while(remaining && !request.cancelled) {
@@ -2497,7 +2513,7 @@ struct Exl3EngineCore::Impl {
                 const auto budget=output.model_token_budget_remaining(remaining);
                 if(!budget)throw std::logic_error(
                     "coherent-device output has no model budget or control path");
-                const auto width=static_cast<int>(std::min<std::uint32_t>(8,budget));
+                const auto width=static_cast<int>(std::min<std::size_t>(round_width_limit(),budget));
                 const auto boundary=request.publication_boundary.begin(
                     device_lease->acquisition,epoch,
                     Exl3ControlPublicationBoundary::Kind::model);

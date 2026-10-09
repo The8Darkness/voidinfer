@@ -581,6 +581,9 @@ __global__ void final_rms_norm_kernel(const std::uint16_t* input,
                                       std::uint16_t* output) {
     // 512 threads: the same per-thread x*x order and the same pairwise tree
     // (block_tree_sum_exact), with the ten loads per thread issued together.
+    // blockIdx.x selects a row of contiguous [rows][kHidden] input/output.
+    input += static_cast<std::size_t>(blockIdx.x) * kHidden;
+    output += static_cast<std::size_t>(blockIdx.x) * kHidden;
     __shared__ float partial[512];
     const int lane = static_cast<int>(threadIdx.x);
     constexpr int kPer = kHidden / 512;
@@ -1399,7 +1402,7 @@ struct Exl3TextContext::Impl {
     // Owner of batched multi-agent rounds: every agent's final-norm rows and
     // logits of one head pass (allocated on first lead).
     std::unique_ptr<DeviceAllocation> batched_head_norm, batched_head_logits;
-    std::unique_ptr<Exl3CudaLinearWorkspace> batched_head_workspace;
+    std::unique_ptr<Exl3CudaLinearWorkspace> batched_head_workspace, batched_head_workspace32;
     // Nonzero while a batched multi-agent BatchBinding owns the layers.
     int batch_bound = 0;
     // Owner-side fork streams for batched peers' stateful cores
@@ -9967,7 +9970,13 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
     // One H6 head pass over every agent's rows (16-row single-split tiles)
     // instead of one 8-row pass per agent: the head weights stream once per
     // tile. Each agent's rows are contiguous in the owner's stack output.
+    // More than 16 rows: one 32-row coherent pass (the head weights stream
+    // once); NINFER_EXL3_BATCHED_HEAD_TILE=16 keeps 16-row native tiles.
     constexpr int kHeadTile=16;
+    static const bool head32=[] {
+        const char* value=std::getenv("NINFER_EXL3_BATCHED_HEAD_TILE");
+        return !value || std::atoi(value)!=16;
+    }();
     static const bool batched_head=[] {
         const char* value=std::getenv("NINFER_EXL3_BATCHED_HEAD");
         return !value || std::strcmp(value,"0")!=0;
@@ -9991,11 +10000,16 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
     }
     auto* head_norm=static_cast<std::uint16_t*>(impl_->batched_head_norm->ptr);
     auto* head_logits=static_cast<std::uint16_t*>(impl_->batched_head_logits->ptr);
-    for(int row=0;row<rows;++row)
-        final_rms_norm_kernel<<<1,512,0,stream>>>(
-            impl_->last_stack_output+static_cast<std::size_t>(row)*kHidden,impl_->model->final_norm,
-            head_norm+static_cast<std::size_t>(row)*kHidden);
+    final_rms_norm_kernel<<<rows,512,0,stream>>>(impl_->last_stack_output,impl_->model->final_norm,head_norm);
     cuda_check(cudaGetLastError(),"launch batched head final RMSNorm");
+    if(head32 && rows>kHeadTile && rows<=2*kHeadTile) {
+        if(!impl_->batched_head_workspace32) {
+            impl_->batched_head_workspace32=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,2*kHeadTile);
+            impl_->batched_head_workspace32->enable_draft_batched();
+        }
+        impl_->batched_head_workspace32->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+            head_norm,head_logits,rows,stream);
+    } else
     for(int first=0;first<rows;first+=kHeadTile) {
         const int n=std::min(kHeadTile,rows-first);
         impl_->batched_head_workspace->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
