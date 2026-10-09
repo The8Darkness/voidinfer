@@ -11849,7 +11849,8 @@ static void launch_coherent_packed_variant(
     cudaStream_t stream, const std::uint16_t* transformed,
     const std::uint16_t* trellis, const std::int32_t* mul1, float* accum,
     int rows, int input_features, int output_features, int split_count,
-    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
+    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr,
+    int active_features = 0) {
     constexpr int tiles = Warps * TilesPerWarp;
     constexpr int stage_count = (Stages ? Stages : 2) * Per;
     constexpr std::size_t ring_bytes =
@@ -11860,7 +11861,10 @@ static void launch_coherent_packed_variant(
     // alias_c_ring); the other variants keep it separate.
     const std::size_t shared = MTiles == 2 && ring_bytes >= output_bytes ? ring_bytes :
         ring_bytes + output_bytes;
-    const int grid = output_features / (16 * tiles) * split_count;
+    // active_features (single K split only): launch the CTAs of the leading
+    // output columns; the packed trellis stride stays output_features.
+    const int grid = (active_features ? active_features : output_features) / (16 * tiles) *
+        split_count;
     if constexpr (MTiles == 2 || Fp16Acc || TilesPerWarp != 1) {
         static_assert(Stages > 0, "M32/FP16-accumulate coherent producer requires deep stages");
         if (raw_input) throw std::logic_error("M32/FP16-accumulate coherent producer reads transformed rows");
@@ -12017,8 +12021,12 @@ static void launch_coherent_packed_partials(
     const std::uint16_t* transformed, const std::uint16_t* trellis,
     const std::int32_t* mul1, float* accum, int rows, int input_features,
     int output_features, int split_count,
-    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
+    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr,
+    int active_features = 0) {
     const int stages = coherent_deep_pipeline_stages();
+    if (active_features && (split_count != 1 || raw_input || active_features % 128 ||
+                            active_features > output_features))
+        throw std::logic_error("coherent producer active columns need one K split");
     const int warps = coherent_packed_warps();
     if (raw_input && (rows < 1 || rows > 8 || stages == 0))
         throw std::logic_error("fused-input coherent producer requires the deep route and 1..8 rows");
@@ -12048,18 +12056,20 @@ static void launch_coherent_packed_partials(
         if (batch_tpw == 4) {
             if (rows > kBatchedRows)
                 launch_coherent_packed_variant<Bits, 4, 4, 2, 2, false, 4>(stream, transformed, trellis, mul1, accum,
-                    rows, input_features, output_features, split_count);
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
             else
                 launch_coherent_packed_variant<Bits, 4, 4, 2, 1, false, 4>(stream, transformed, trellis, mul1, accum,
-                    rows, input_features, output_features, split_count);
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
         } else if (rows > kBatchedRows)
             launch_coherent_packed_variant<Bits, 4, 4, 2, 2, false, 2>(stream, transformed, trellis, mul1, accum,
-                rows, input_features, output_features, split_count);
+                rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
         else
             launch_coherent_packed_variant<Bits, 4, 4, 2, 1, false, 2>(stream, transformed, trellis, mul1, accum,
-                rows, input_features, output_features, split_count);
+                rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
         return;
     }
+    if (active_features)
+        throw std::logic_error("coherent producer active columns need the 128-column batched route");
     if (rows > kBatchedRows) {
         // Batched rounds of 3-4 agents: the measured default topology only.
         if (rows > 2 * kBatchedRows || stages != 4 || warps != 4 ||
@@ -12199,19 +12209,30 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (draft_batched_enabled_ && rows > 8 && out_features_ % 128 == 0 &&
         metadata.K >= 4 && metadata.K <= 7) {
         // Five K partitions when the workspace's own accumulation planes
-        // hold them (draft projections), else one (the vocabulary head).
+        // hold them (draft projections), else one (the vocabulary head);
+        // 17..32 rows fill the resident M32 slots (coherent_m32_split).
         const std::size_t plane = static_cast<std::size_t>(rows) * out_features_ * sizeof(float);
-        const int split = accumulation_capacity_bytes_ >= plane * 5 ? 5 : 1;
+        const int split = rows > kBatchedRows ? coherent_m32_split(rows) :
+            accumulation_capacity_bytes_ >= plane * 5 ? 5 : 1;
         if (accumulation_capacity_bytes_ < plane * static_cast<std::size_t>(split))
             throw std::logic_error("batched draft accumulation capacity");
+        // A single-split head computes only its active leading columns (the
+        // draft's vocabulary prefix); the reduction still covers every column.
+        const int active = split == 1 && active_output_features_ > 0 &&
+            active_output_features_ < out_features_ && active_output_features_ % 128 == 0 ?
+            active_output_features_ : 0;
         if (metadata.K == 4) launch_coherent_packed_partials<4>(0, 0, stream, transformed_input,
-            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split,
+            nullptr, nullptr, active);
         else if (metadata.K == 5) launch_coherent_packed_partials<5>(0, 0, stream, transformed_input,
-            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split,
+            nullptr, nullptr, active);
         else if (metadata.K == 6) launch_coherent_packed_partials<6>(0, 0, stream, transformed_input,
-            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split,
+            nullptr, nullptr, active);
         else launch_coherent_packed_partials<7>(0, 0, stream, transformed_input,
-            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split);
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split,
+            nullptr, nullptr, active);
         cuda_check(cudaGetLastError(), "launch batched draft coherent partials");
         launch_prefill_reduce_output<false>(stream, accum_, weights.svh, output, rows,
             out_features_, split);

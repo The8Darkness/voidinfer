@@ -10455,32 +10455,28 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
             rows>0 && next.size()==static_cast<std::size_t>(rows) &&
             !impl_->graph_active && !impl_->graph_capture_active,
             "exact row scores need a completed eager forward and prepared continuation head");
-    auto& scratch=*impl_->continuation;
-    // Private 16-row native head (the continuation head holds 8 rows): half
-    // the head weight streams per verified block. Never freed (process-lived,
-    // like the row buffers).
+    // Private 32-row head (the batched multi-agent head route): the head
+    // weights stream once per 32 verified rows (16-row H6 tiles: 45 -> ~20 ms
+    // per 1024-row block). Never freed (process-lived, like the row buffers).
     struct Buffers {
         std::int64_t* next=nullptr; std::int64_t* greedy=nullptr; float* gap=nullptr; int rows=0;
-        Exl3CudaLinearWorkspace* head=nullptr; std::uint16_t* norm=nullptr; std::uint16_t* logits=nullptr;
-        bool head_tried=false;
+        std::unique_ptr<Exl3CudaLinearWorkspace> head; std::uint16_t* norm=nullptr; std::uint16_t* logits=nullptr;
     };
     // Process-wide: exact row scores run inside exclusive verifier passes
-    // (one lane at a time), so the 16-row head workspace (~90 MB) is shared.
+    // (one lane at a time), so the 32-row head workspace is shared.
     static Buffers buffers;
     static std::mutex buffers_mutex;
     const std::lock_guard buffers_lock(buffers_mutex);
-    constexpr int kScoreRows=16;
-    if(!buffers.head_tried) {
-        buffers.head_tried=true;
-        auto* head=new Exl3CudaLinearWorkspace(kHidden,kVocab,kScoreRows);
-        head->set_native_continuation16(true);
-        if(std::strcmp(head->dispatch_name(impl_->model->lm_head_metadata,kScoreRows),"h6_small_m_single_split")==0) {
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.norm),
-                static_cast<std::size_t>(kScoreRows)*kHidden*sizeof(std::uint16_t)),"row score head rows");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.logits),
-                static_cast<std::size_t>(kScoreRows)*kVocab*sizeof(std::uint16_t)),"row score head logits");
-            buffers.head=head;
-        } else delete head;
+    constexpr int kScoreRows=32;
+    if(!buffers.head) {
+        buffers.head=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,kScoreRows);
+        buffers.head->enable_draft_batched();
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.norm),
+            static_cast<std::size_t>(kScoreRows)*kHidden*sizeof(std::uint16_t)),"row score head rows");
+        cuda_check(cudaMemset(buffers.norm,0,static_cast<std::size_t>(kScoreRows)*kHidden*sizeof(std::uint16_t)),
+            "row score head rows");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.logits),
+            static_cast<std::size_t>(kScoreRows)*kVocab*sizeof(std::uint16_t)),"row score head logits");
     }
     if(buffers.rows<rows) {
         cudaFree(buffers.next); cudaFree(buffers.greedy); cudaFree(buffers.gap);
@@ -10492,25 +10488,16 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
     }
     cuda_check(cudaMemcpyAsync(buffers.next,next.data(),next.size_bytes(),cudaMemcpyHostToDevice,stream),
         "upload row score next tokens");
-    auto* norm=buffers.head?buffers.norm:static_cast<std::uint16_t*>(scratch.final_norm->ptr);
-    auto* all_logits=buffers.head?buffers.logits:static_cast<std::uint16_t*>(scratch.logits->ptr);
-    auto& head_workspace=buffers.head?*buffers.head:*scratch.head_workspace;
-    const int chunk=buffers.head?kScoreRows:scratch.capacity;
-    for(int first=0;first<rows;first+=chunk) {
-        const int count=std::min(chunk,rows-first);
-        for(int row=0;row<count;++row) {
-            final_rms_norm_kernel<<<1,512,0,stream>>>(
-                impl_->last_stack_output+static_cast<std::size_t>(first+row)*kHidden,
-                impl_->model->final_norm,norm+static_cast<std::size_t>(row)*kHidden);
-        }
-        const char* dispatch=head_workspace.dispatch_name(impl_->model->lm_head_metadata,count);
-        if(std::strcmp(dispatch,"h6_small_m_single_split")==0)
-            head_workspace.forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
-                norm,all_logits,count,stream);
-        else for(int row=0;row<count;++row)
-            impl_->head_workspace->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
-                norm+static_cast<std::size_t>(row)*kHidden,all_logits+static_cast<std::size_t>(row)*kVocab,1,stream);
-        exact_row_score_kernel<<<count,1024,0,stream>>>(all_logits,buffers.next+first,
+    for(int first=0;first<rows;first+=kScoreRows) {
+        const int count=std::min(kScoreRows,rows-first);
+        final_rms_norm_kernel<<<count,512,0,stream>>>(
+            impl_->last_stack_output+static_cast<std::size_t>(first)*kHidden,
+            impl_->model->final_norm,buffers.norm);
+        // The batched head route takes more than 8 rows; a short tail block
+        // also scores rows it ignores (row-independent logits).
+        buffers.head->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+            buffers.norm,buffers.logits,std::max(count,9),stream);
+        exact_row_score_kernel<<<count,1024,0,stream>>>(buffers.logits,buffers.next+first,
             buffers.greedy+first,buffers.gap+first);
         cuda_check(cudaGetLastError(),"launch exact row scores");
     }

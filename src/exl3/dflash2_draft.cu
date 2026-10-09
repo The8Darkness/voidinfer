@@ -4672,7 +4672,7 @@ struct DraftBatchedScratch {
     std::uint16_t *tcat=nullptr,*fc_raw=nullptr,*hctx=nullptr;
     std::int32_t* cpos=nullptr;
     const std::uint16_t** tap_ptr=nullptr;
-    Exl3CudaLinearWorkspace::Owner ws_q,ws_kv,ws_o,ws_mlp,ws_down,ws_head,ws_fc;
+    Exl3CudaLinearWorkspace::Owner ws_q,ws_kv,ws_o,ws_mlp,ws_down,ws_head,ws_head32,ws_fc;
     void prepare() {
         if(ready)return;
         const auto alloc=[](auto*& pointer,std::size_t bytes,const char* label) {
@@ -4704,15 +4704,22 @@ struct DraftBatchedScratch {
             if(batched)owner->enable_draft_batched();
             return owner;
         };
-        ws_q=linear(kHidden,kQHeads*kHeadDim,kRows,true);
-        ws_kv=linear(kHidden,kKVHeads*kHeadDim,kRows,true);
-        ws_o=linear(kQHeads*kHeadDim,kHidden,kRows,true);
+        // Narrow projections get 4x row planes: 32-row calls then split K
+        // until they fill the resident M32 slots (coherent_m32_split; the
+        // 17408-wide MLP already fills them at five partitions).
+        constexpr int kWideRows=4*kRows;
+        ws_q=linear(kHidden,kQHeads*kHeadDim,kWideRows,true);
+        ws_kv=linear(kHidden,kKVHeads*kHeadDim,kWideRows,true);
+        ws_o=linear(kQHeads*kHeadDim,kHidden,kWideRows,true);
         ws_mlp=linear(kHidden,kIntermediate,kRows,true);
-        ws_down=linear(kIntermediate,kHidden,kRows,true);
-        ws_fc=linear(kLayers*kHidden,kHidden,kRows,true);
-        // The H6 head runs in 16-row single-split tiles.
+        ws_down=linear(kIntermediate,kHidden,kWideRows,true);
+        ws_fc=linear(kLayers*kHidden,kHidden,kWideRows,true);
+        // The H6 head runs in 16-row single-split tiles; more than 16
+        // proposal rows (3-4 agents) take one 32-row pass (the head weights
+        // stream once).
         ws_head=linear(kHidden,kVocab,16,false);
         ws_head->set_native_continuation16(true);
+        ws_head32=linear(kHidden,kVocab,kRows,true);
         ready=true;
     }
 };
@@ -4863,6 +4870,11 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         }
         if(!full)head_columns=lead.head_prefix;
     }
+    if(proposal_rows>16) {
+        b.ws_head32->set_active_output_features(head_columns<kVocab?head_columns:0);
+        b.ws_head32->forward(target_head,target_head_metadata,b.final_norm,b.head_out,proposal_rows,stream);
+        b.ws_head32->set_active_output_features(0);
+    } else {
     b.ws_head->set_active_output_features(head_columns<kVocab?head_columns:0);
     for(int first=0;first<proposal_rows;first+=16) {
         const int n=std::min(16,proposal_rows-first);
@@ -4870,6 +4882,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             b.head_out+static_cast<std::size_t>(first)*kVocab,n,stream);
     }
     b.ws_head->set_active_output_features(0);
+    }
     cuda_check(cudaMemsetAsync(b.liveness,0,sizeof(unsigned int),stream),"batched draft liveness zero");
     dflash_nonfinite_flag_kernel<<<(proposal_rows*head_columns+255)/256,256,0,stream>>>(
         b.head_out,proposal_rows*head_columns,b.liveness,head_columns,kVocab);
