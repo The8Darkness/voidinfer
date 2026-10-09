@@ -275,6 +275,115 @@ int main() {
             time(rewind, "rewind-only");
             return 0;
         }
+        if (mode == 9) {
+            // Multi-round transactions with partial retention (the Engine's
+            // DFlash2 round shape): OVL_ROUNDS rounds of 8 rows per agent,
+            // agent a keeps a deterministic 1..8 rows each round. Runs every
+            // agent separately, rewinds, runs batched rounds, and compares
+            // each round's logits (state divergence across rounds shows up).
+            const int agents = env_int("OVL_AGENTS", 4);
+            const int rounds = env_int("OVL_ROUNDS", 48);
+            constexpr int n = 8;
+            std::vector<std::unique_ptr<Exl3TextContext>> extra;
+            std::vector<Exl3TextContext*> all{d.get(), v.get()};
+            for (int a = 2; a < agents; ++a) {
+                extra.push_back(model->create_context(true));
+                extra.back()->prepare_continuation(8);
+                ingest(*extra.back(), sd, static_cast<std::size_t>(a) * 2048);
+                all.push_back(extra.back().get());
+            }
+            std::vector<Exl3TextContext*> peer_list(all.begin() + 1, all.end());
+            if (env_int("OVL_GRAPH", 1)) d->prepare_batched_continuation_graph(peer_list, n, std::vector<int>(peer_list.size(), n));
+            for (std::size_t a = 0; a < all.size(); ++a) {
+                auto* c = all[a];
+                c->prepare_transaction();
+                c->set_gdn_repair_overlap(env_int("OVL_REPAIR_OVERLAP", 0) != 0);
+                // A completed small forward (consistent tap/embedding rows)
+                // precedes the first transaction, as in the Engine's rounds.
+                c->continue_rows(std::span<const std::int64_t>(ids.data() + context + 4000 + 8 * a, 8), sd);
+                std::cerr << "OVL warm agent=" << a << " position=" << c->position()
+                          << " tap_rows=" << c->captured_tap_rows() << "\n";
+            }
+            for (auto* c : all) c->save_verified_root(sd);
+            check(cudaStreamSynchronize(sd), "roots");
+            const auto tokens_of = [&](int round, int a) {
+                return std::span<const std::int64_t>(ids.data() + context + 512 * a + 8 * round,
+                    static_cast<std::size_t>(n));
+            };
+            const auto keep_of = [&](int round, int a) { return 1 + (round * 5 + a * 3) % n; };
+            // OVL_STREAMS=1: every agent owns a stream (Engine lanes); the
+            // batched forward runs on agent 0's stream after every member's
+            // queued work and members resume after it (coordinator events).
+            const bool own_streams = env_int("OVL_STREAMS", 1) != 0;
+            std::vector<cudaStream_t> lane_streams(all.size(), sd);
+            std::vector<cudaEvent_t> ready(all.size()), done(all.size());
+            for (std::size_t a = 0; a < all.size(); ++a) {
+                if (own_streams && a) check(cudaStreamCreateWithFlags(&lane_streams[a], cudaStreamNonBlocking), "lane stream");
+                check(cudaEventCreateWithFlags(&ready[a], cudaEventDisableTiming), "ready");
+                check(cudaEventCreateWithFlags(&done[a], cudaEventDisableTiming), "done");
+            }
+            const auto run = [&](bool batched) {
+                std::vector<std::vector<std::vector<float>>> logits(rounds);
+                for (int r = 0; r < rounds; ++r) {
+                    for (std::size_t a = 0; a < all.size(); ++a) {
+                        try { all[a]->begin_transaction(lane_streams[a]); }
+                        catch (...) {
+                            std::cerr << "OVL begin failed batched=" << batched << " round=" << r << " agent=" << a
+                                      << " tap_rows=" << all[a]->captured_tap_rows() << std::endl;
+                            throw;
+                        }
+                    }
+                    if (batched) {
+                        std::vector<Exl3TextContext::BatchedPeer> peers;
+                        for (int a = 1; a < agents; ++a) {
+                            check(cudaEventRecord(ready[a], lane_streams[a]), "member ready");
+                            check(cudaStreamWaitEvent(lane_streams[0], ready[a], 0), "leader waits member");
+                            peers.push_back({all[a], tokens_of(r, a), lane_streams[a]});
+                        }
+                        d->continue_rows_batched(peers, tokens_of(r, 0), lane_streams[0]);
+                        check(cudaEventRecord(done[0], lane_streams[0]), "leader done");
+                        for (int a = 1; a < agents; ++a)
+                            check(cudaStreamWaitEvent(lane_streams[a], done[0], 0), "member resumes");
+                    } else for (int a = 0; a < agents; ++a) all[a]->continue_rows(tokens_of(r, a), lane_streams[a]);
+                    for (int a = 0; a < agents; ++a) {
+                        logits[r].push_back(all[a]->continuation_logits_host(lane_streams[a]));
+                        const int keep = keep_of(r, a);
+                        if (keep < n) all[a]->retain_transaction_prefix(keep, lane_streams[a]);
+                        all[a]->commit_transaction();
+                    }
+                }
+                check(cudaDeviceSynchronize(), "rounds");
+                return logits;
+            };
+            const auto reference = run(false);
+            for (std::size_t a = 0; a < all.size(); ++a) all[a]->restore_verified_root(lane_streams[a]);
+            check(cudaDeviceSynchronize(), "rewind");
+            const auto got = run(true);
+            int first_bad_round = -1;
+            for (int r = 0; r < rounds; ++r)
+                for (int a = 0; a < agents; ++a) {
+                    const auto& x = reference[r][a]; const auto& y = got[r][a];
+                    const std::size_t vocab = x.size() / n;
+                    double max_abs = 0, max_gap = 0; int agree = 0;
+                    for (int row = 0; row < n; ++row) {
+                        const auto* xr = x.data() + row * vocab; const auto* yr = y.data() + row * vocab;
+                        const auto rx = std::max_element(xr, xr + vocab) - xr, ry = std::max_element(yr, yr + vocab) - yr;
+                        agree += rx == ry;
+                        // VeriCache criterion: how far the batched choice trails
+                        // the reference top logit.
+                        max_gap = std::max(max_gap, double(xr[rx]) - xr[ry]);
+                        for (std::size_t j = 0; j < vocab; ++j) max_abs = std::max(max_abs, std::abs(double(xr[j]) - yr[j]));
+                    }
+                    if (max_gap > 1.0) {
+                        if (first_bad_round < 0) first_bad_round = r;
+                        std::cout << "OVL rounds round=" << r << " agent=" << a << " keep=" << keep_of(r, a)
+                                  << " argmax_agree=" << agree << "/" << n << " max_gap=" << max_gap
+                                  << " max_abs_logit_diff=" << max_abs << '\n';
+                    }
+                }
+            std::cout << "OVL rounds agents=" << agents << " rounds=" << rounds << " first_bad_round=" << first_bad_round << '\n';
+            return 0;
+        }
         if (mode == 5) {
             // Batched multi-agent continuation vs. two separate continuations
             // from the same verified roots (logits per row, then timing).
