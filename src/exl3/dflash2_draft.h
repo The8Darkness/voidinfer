@@ -464,6 +464,11 @@ public:
     //1..16 contiguous new rows; opt-in batches native projections at most8 rows.
     void commit_prefill_block(const std::uint16_t* const* taps, int rows,
                               long long abs_pos0, cudaStream_t stream = nullptr);
+    // Fresh prefill: every remaining committed row of the scope at once
+    // (taps[t] holds `rows` contiguous rows), in 32-row row-batched chunks.
+    // Same ring result as the equivalent 16-row commit_prefill_block calls.
+    void commit_prefill_bulk(const std::uint16_t* const* taps, int rows,
+                             long long abs_pos0, cudaStream_t stream = nullptr);
     // Optional request-scoped undo for one saturated-ring prefill commit of 1..8
     // rows. begin snapshots the affected physical slots on the same eager stream;
     // exactly one matching commit_prefill_block may follow. accept keeps it;

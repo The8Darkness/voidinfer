@@ -820,6 +820,8 @@ private:
         try {
             context_->append_prefill_layer_major(input.subspan(initial),stream_,
                 &retained);
+            // Discarded calls advance the fresh scope; every committed call
+            // lies in the arena [first,total) and commits as one bulk pass.
             for(int forward=initial;forward<total;) {
                 const int forward_rows=std::min(1024,total-forward);
                 for(int row=0;row<forward_rows;row+=16) {
@@ -831,16 +833,13 @@ private:
                     }
                     if(absolute<first || absolute+count>total)
                         throw std::logic_error("fast device retained tap call outside arena");
-                    std::array<const std::uint16_t*,5> sources{};
-                    for(std::size_t tap=0;tap<5;++tap)
-                        sources[tap]=arena.ptr+
-                            (tap*static_cast<std::size_t>(rows)+absolute-first)*
-                                tap_hidden;
-                    draft_.commit_prefill_block(sources.data(),count,
-                        absolute,stream_);
                 }
                 forward+=forward_rows;
             }
+            std::array<const std::uint16_t*,5> sources{};
+            for(std::size_t tap=0;tap<5;++tap)
+                sources[tap]=arena.ptr+tap*static_cast<std::size_t>(rows)*tap_hidden;
+            draft_.commit_prefill_bulk(sources.data(),rows,first,stream_);
             check(cudaStreamSynchronize(stream_),
                 "fast device retained tap completion before arena release");
         }catch(...) {

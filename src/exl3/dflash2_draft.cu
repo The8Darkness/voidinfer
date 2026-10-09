@@ -4669,7 +4669,10 @@ struct DraftBatchedScratch {
     std::int32_t* pos=nullptr;
     std::int64_t* ids=nullptr;
     unsigned int* liveness=nullptr;
-    Exl3CudaLinearWorkspace::Owner ws_q,ws_kv,ws_o,ws_mlp,ws_down,ws_head;
+    std::uint16_t *tcat=nullptr,*fc_raw=nullptr,*hctx=nullptr;
+    std::int32_t* cpos=nullptr;
+    const std::uint16_t** tap_ptr=nullptr;
+    Exl3CudaLinearWorkspace::Owner ws_q,ws_kv,ws_o,ws_mlp,ws_down,ws_head,ws_fc;
     void prepare() {
         if(ready)return;
         const auto alloc=[](auto*& pointer,std::size_t bytes,const char* label) {
@@ -4690,6 +4693,11 @@ struct DraftBatchedScratch {
         alloc(pos,rows*sizeof(std::int32_t),"batched draft positions");
         alloc(ids,rows*sizeof(std::int64_t),"batched draft ids");
         alloc(liveness,sizeof(unsigned int),"batched draft liveness");
+        alloc(tcat,rows*kLayers*kHidden*two,"batched commit tap rows");
+        alloc(fc_raw,rows*kHidden*two,"batched commit fc rows");
+        alloc(hctx,rows*kHidden*two,"batched commit hidden rows");
+        alloc(cpos,rows*sizeof(std::int32_t),"batched commit positions");
+        alloc(tap_ptr,kLayers*sizeof(const std::uint16_t*),"batched commit tap pointers");
         const auto linear=[](int input,int output,int max_rows,bool batched) {
             Exl3CudaLinearWorkspace::Owner owner(std::make_unique<Exl3CudaLinearWorkspace>(
                 input,output,max_rows,true).release());
@@ -4701,6 +4709,7 @@ struct DraftBatchedScratch {
         ws_o=linear(kQHeads*kHeadDim,kHidden,kRows,true);
         ws_mlp=linear(kHidden,kIntermediate,kRows,true);
         ws_down=linear(kIntermediate,kHidden,kRows,true);
+        ws_fc=linear(kLayers*kHidden,kHidden,kRows,true);
         // The H6 head runs in 16-row single-split tiles.
         ws_head=linear(kHidden,kVocab,16,false);
         ws_head->set_native_continuation16(true);
@@ -4902,6 +4911,90 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         ++member->draft->impl_->device_liveness_checks;
         for(const auto token:member->proposals)
             require(token>=0 && token<kVocab,"batched draft proposal outside vocabulary");
+    }
+}
+
+void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps,int rows,
+    long long abs_pos0,cudaStream_t stream) {
+    auto& m=*impl_; auto& f=m.fresh_prefill;
+    static const bool bulk=[] {
+        const char* value=std::getenv("NINFER_DFLASH2_PREFILL_BULK");
+        return !value || std::string(value)!="0";
+    }();
+    require(taps && rows>=1,"draft bulk prefill commit extent");
+    for(int t=0;t<kLayers;++t)require(taps[t]!=nullptr,"draft bulk prefill tap pointer missing");
+    if(!bulk || !m.prefill_batch || m.gaming[Gopt::DraftRingNormRope]) {
+        // The 16-row call protocol of the same rows.
+        for(int first=0;first<rows;first+=16) {
+            const int count=std::min(16,rows-first);
+            const std::uint16_t* part[kLayers];
+            for(int t=0;t<kLayers;++t)part[t]=taps[t]+static_cast<std::size_t>(first)*kHidden;
+            commit_prefill_block(part,count,abs_pos0+first,stream);
+        }
+        return;
+    }
+    Exl3DraftHostRing::require_transfer_healthy();
+    try {
+        require(f.active && !f.failed,"draft bulk prefill requires an active fresh scope");
+        require(stream==m.fresh_prefill_stream,"draft bulk prefill stream mismatch");
+        require(m.ring_undo.phase==Impl::RingUndo::Phase::Idle,"draft bulk prefill during ring undo");
+        require(abs_pos0==f.submitted_cursor && abs_pos0+rows<=f.end &&
+                abs_pos0+16>f.end-kRingCap,
+            "draft bulk prefill must cover the remaining committed calls in order");
+        cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream,&capture),"draft bulk prefill capture status");
+        require(capture==cudaStreamCaptureStatusNone,"draft bulk prefill requires eager stream");
+        require(m.ring_count==0 || abs_pos0==m.ring_base_abs+m.ring_count,
+            "draft bulk prefill must extend committed span");
+        m.invalidate_ring_witness();
+        if(m.ring_count==0)m.ring_base_abs=abs_pos0;
+        auto& b=draft_batched_scratch();
+        const std::lock_guard lock(b.mutex);
+        b.prepare();
+        constexpr int n=kKVHeads*kHeadDim;
+        constexpr int kChunk=DraftBatchedScratch::kRows;
+        const auto admission=Exl3CudaLinearAdmission::draft_prefill_fc;
+        for(int first=0;first<rows;first+=kChunk) {
+            const int count=std::min(kChunk,rows-first);
+            const int pos=static_cast<int>(abs_pos0+first);
+            const bool batched=count>8;
+            const std::uint16_t* ptrs[kLayers];
+            for(int t=0;t<kLayers;++t)ptrs[t]=taps[t]+static_cast<std::size_t>(first)*kHidden;
+            cuda_check(cudaMemcpyAsync(b.tap_ptr,ptrs,sizeof(ptrs),cudaMemcpyHostToDevice,stream),
+                "draft bulk prefill tap pointers");
+            dflash_tap_concat_kernel<<<(count*kLayers*kHidden+255)/256,256,0,stream>>>(b.tap_ptr,b.tcat,count);
+            cuda_check(cudaGetLastError(),"draft bulk prefill concat");
+            if(batched)b.ws_fc->forward(m.fc,m.fc_meta,b.tcat,b.fc_raw,count,stream);
+            else if(count>1)m.ws_fc->forward(m.fc,m.fc_meta,b.tcat,b.fc_raw,count,stream,admission);
+            else m.ws_fc->forward(m.fc,m.fc_meta,b.tcat,b.fc_raw,1,stream);
+            dflash_rms_norm_kernel<DFlashFmt::F16><<<count,256,256*sizeof(float),stream>>>(
+                b.fc_raw,m.hidden_norm,b.hctx,count,kHidden);
+            dflash_prefill_positions_kernel<<<1,kChunk,0,stream>>>(b.cpos,count,pos);
+            cuda_check(cudaGetLastError(),"draft bulk prefill hidden norm");
+            for(int layer=0;layer<kLayers;++layer) {
+                const auto& lay=m.layers[layer];
+                auto& kv=batched?*b.ws_kv:*m.ws_kv;
+                kv.forward(lay.k,lay.km,b.hctx,b.kblk,count,stream);
+                kv.forward(lay.v,lay.vm,b.hctx,b.vblk,count,stream);
+                dflash_head_norm_kernel<<<count*kKVHeads,128,128*sizeof(float),stream>>>(
+                    b.kblk,lay.k_norm,b.kblk_n,count*kKVHeads,kHeadDim);
+                dflash_rope_kernel<<<(count*n+255)/256,256,0,stream>>>(b.kblk_n,b.kblk_r,b.cpos,count,kKVHeads,kHeadDim);
+                dflash_prefill_ring_scatter_kernel<<<(count*n+255)/256,256,0,stream>>>(
+                    b.kblk_r,b.vblk,m.ring_k[layer],m.ring_v[layer],count,pos);
+                cuda_check(cudaGetLastError(),"draft bulk prefill ring");
+            }
+            const int dropped=std::max(0,m.ring_count+count-kRingKeep);
+            m.ring_count=std::min(kRingKeep,m.ring_count+count);
+            m.ring_base_abs+=dropped;
+        }
+        f.encoded_rows+=rows;
+        f.submitted_rows+=rows;
+        f.submitted_cursor+=rows;
+    } catch(...) {
+        f.failed=true;
+        m.host_ring_failed=true;
+        m.host_ring_parent.reset();
+        throw;
     }
 }
 
