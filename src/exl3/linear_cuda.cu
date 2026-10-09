@@ -2068,8 +2068,8 @@ constexpr float kNvfp4WeightGlobal = 3.5f / (6.0f * 448.0f);
 // constant: the window words are read from shared memory once per tile and
 // each state is one funnel shift (was four 16-bit loads per value).
 template <int Bits, int Half>
-__device__ __forceinline__ float exl3_decode_column16(const std::uint32_t* __restrict__ words,
-    int column_group, std::uint32_t multiplier, float (&x)[16]) {
+__device__ __forceinline__ void exl3_decode_column16_bits(const std::uint32_t* __restrict__ words,
+    int column_group, std::uint32_t multiplier, std::uint16_t (&h)[16]) {
     constexpr int kWords32 = 8 * Bits;
     // Stream bit (MSB-first) where the window of rel=0 starts, minus
     // column_group*32*Bits (a whole number of words).
@@ -2081,7 +2081,6 @@ __device__ __forceinline__ float exl3_decode_column16(const std::uint32_t* __res
     const int base = column_group * Bits + kWord0;
 #pragma unroll
     for (int i = 0; i < kSpan; ++i) w[i] = words[(base + i) % kWords32];
-    float amax = 0.0f;
 #pragma unroll
     for (int row = 0; row < 16; ++row) {
         const int rel = ((row & 7) >> 1) * 8 + (row >= 8 ? 2 : 0) + (row & 1);
@@ -2093,11 +2092,116 @@ __device__ __forceinline__ float exl3_decode_column16(const std::uint32_t* __res
         const auto input = __ushort_as_half(static_cast<std::uint16_t>(0x6400u + byte_sum));
         const auto inverse = __ushort_as_half(static_cast<std::uint16_t>(0x1eeeu));
         const auto bias = __ushort_as_half(static_cast<std::uint16_t>(0xc931u));
-        const float value = __half2float(__hfma(input, inverse, bias));
-        x[row] = value;
-        amax = fmaxf(amax, fabsf(value));
+        h[row] = __half_as_ushort(__hfma(input, inverse, bias));
+    }
+}
+
+template <int Bits, int Half>
+__device__ __forceinline__ float exl3_decode_column16(const std::uint32_t* __restrict__ words,
+    int column_group, std::uint32_t multiplier, float (&x)[16]) {
+    std::uint16_t h[16];
+    exl3_decode_column16_bits<Bits, Half>(words, column_group, multiplier, h);
+    float amax = 0.0f;
+#pragma unroll
+    for (int row = 0; row < 16; ++row) {
+        x[row] = __half2float(__ushort_as_half(h[row]));
+        amax = fmaxf(amax, fabsf(x[row]));
     }
     return amax;
+}
+
+// Row-major FP16 reconstruction ([k][n], the exl3_reconstruct_transformed_
+// weight_kernel layout) of 32 rows x 256 columns per block: register-window
+// column decode, then a shared-memory transpose so every global store is a
+// full 16-byte row segment (was one 256-thread block and one 2-byte store per
+// value). Requires k % 32 == 0, n % 8 == 0 and 16-byte aligned output rows.
+template <int Bits>
+__global__ void __launch_bounds__(256) exl3_reconstruct_rows_kernel(
+    const std::uint16_t* __restrict__ trellis, const std::int32_t* __restrict__ mul1,
+    std::uint16_t* __restrict__ reconstructed, int k, int n) {
+    constexpr int kTilesK = 2;
+    constexpr int kWords = 16 * Bits;
+    __shared__ __align__(16) std::uint32_t packed[kTilesK][16][kWords / 2];
+    __shared__ __align__(16) std::uint16_t tile[kTilesK * 16][256 + 8];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tiles_n = n / 16;
+    const int tile_n0 = static_cast<int>(blockIdx.x) * 16;
+    const int live_tiles = min(16, tiles_n - tile_n0);
+    const int k_tile0 = static_cast<int>(blockIdx.y) * kTilesK;
+    if ((reinterpret_cast<std::uintptr_t>(trellis) & 15) == 0) {
+        constexpr int kChunks = 2 * Bits;
+#pragma unroll
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            const auto* source = reinterpret_cast<const uint4*>(trellis +
+                (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords);
+            auto* destination = reinterpret_cast<uint4*>(&packed[kt][0][0]);
+            for (int i = tid; i < live_tiles * kChunks; i += 256) destination[i] = source[i];
+        }
+    } else {
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            const std::uint16_t* source = trellis +
+                (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords;
+            auto* destination = reinterpret_cast<std::uint16_t*>(&packed[kt][0][0]);
+            for (int i = tid; i < live_tiles * kWords; i += 256) destination[i] = source[i];
+        }
+    }
+    __syncthreads();
+    const int warp = tid >> 5, lane = tid & 31;
+    const int half = warp & 1;
+    const int local_tile = (warp >> 1) * 4 + (lane >> 3);
+    const int column_group = lane & 7;
+    if (local_tile < live_tiles) {
+        const std::uint32_t multiplier = static_cast<std::uint32_t>(*mul1);
+        const int column = local_tile * 16 + half * 8 + column_group;
+#pragma unroll
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            std::uint16_t h[16];
+            if (half) exl3_decode_column16_bits<Bits, 1>(&packed[kt][local_tile][0], column_group, multiplier, h);
+            else exl3_decode_column16_bits<Bits, 0>(&packed[kt][local_tile][0], column_group, multiplier, h);
+#pragma unroll
+            for (int row = 0; row < 16; ++row) tile[kt * 16 + row][column] = h[row];
+        }
+    }
+    __syncthreads();
+    const int chunks = live_tiles * 2;   // 16-byte segments per row
+    for (int i = tid; i < kTilesK * 16 * 32; i += 256) {
+        const int row = i >> 5, chunk = i & 31;
+        if (chunk >= chunks) continue;
+        *reinterpret_cast<uint4*>(reconstructed +
+            (static_cast<std::size_t>(k_tile0) * 16 + row) * n + tile_n0 * 16 + chunk * 8) =
+            *reinterpret_cast<const uint4*>(&tile[row][chunk * 8]);
+    }
+}
+
+// Row-major FP16 reconstruction of a whole transformed weight ([k][n]).
+inline void launch_reconstruct_transformed_weight(int bits, const std::uint16_t* trellis,
+    const std::int32_t* mul1, std::uint16_t* reconstructed, int k, int n,
+    cudaStream_t stream) {
+    static const bool rows_kernel = [] {
+        const char* value = std::getenv("NINFER_EXL3_RECONSTRUCT_ROWS");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    if (rows_kernel && k % 32 == 0 && n % 8 == 0 &&
+        (reinterpret_cast<std::uintptr_t>(reconstructed) & 15) == 0) {
+        const dim3 grid((n / 16 + 15) / 16, k / 32);
+        switch (bits) {
+        case 4: exl3_reconstruct_rows_kernel<4><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        case 5: exl3_reconstruct_rows_kernel<5><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        case 6: exl3_reconstruct_rows_kernel<6><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        case 7: exl3_reconstruct_rows_kernel<7><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        case 8: exl3_reconstruct_rows_kernel<8><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        default: break;
+        }
+    }
+    const dim3 grid(n / 16, k / 16);
+    switch (bits) {
+    case 4: exl3_reconstruct_transformed_weight_kernel<4><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    case 5: exl3_reconstruct_transformed_weight_kernel<5><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    case 6: exl3_reconstruct_transformed_weight_kernel<6><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    case 7: exl3_reconstruct_transformed_weight_kernel<7><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    case 8: exl3_reconstruct_transformed_weight_kernel<8><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    default: throw std::invalid_argument("EXL3 reconstruction supports K4..K8");
+    }
 }
 
 // Fused EXL3 decode + block quantization of one transformed weight into the
@@ -7434,10 +7538,9 @@ bool Exl3CudaReconstructGemmWorkspace::prefetch_numeric_weight(
     cuda_check(cudaStreamWaitEvent(impl_->weight_prefetch_stream,
         slot->prefetch_fork,0),"join K5 weight prefetch fork");
     slot->prefetch_pending=true;
-    exl3_reconstruct_transformed_weight_kernel<5><<<
-        dim3(metadata.out_features/16,metadata.in_features/16),256,0,
-        impl_->weight_prefetch_stream>>>(weights.trellis,weights.mul1,
-            slot->data,metadata.in_features,metadata.out_features);
+    launch_reconstruct_transformed_weight(5,weights.trellis,weights.mul1,
+        slot->data,metadata.in_features,metadata.out_features,
+        impl_->weight_prefetch_stream);
     cuda_check(cudaGetLastError(),"launch K5 weight prefetch");
     cuda_check(cudaEventRecord(slot->prefetch_ready,
         impl_->weight_prefetch_stream),"record K5 weight prefetch ready");
@@ -8013,8 +8116,6 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         return;
     }
 
-    const dim3 reconstruct_grid(metadata.out_features / 16,
-                                metadata.in_features / 16);
     const std::size_t weight_bytes =
         static_cast<std::size_t>(metadata.in_features) *
         static_cast<std::size_t>(metadata.out_features) * sizeof(std::uint16_t);
@@ -8167,32 +8268,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                     metadata.out_features, nullptr,
                 metadata.in_features, metadata.out_features, stream);
     } else if (reconstruct_needed) {
-        if (metadata.K == 4) {
-            exl3_reconstruct_transformed_weight_kernel<4><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        } else if (metadata.K == 5) {
-            exl3_reconstruct_transformed_weight_kernel<5><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        } else if (metadata.K == 6) {
-            exl3_reconstruct_transformed_weight_kernel<6><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        } else if (metadata.K == 8) {
-            exl3_reconstruct_transformed_weight_kernel<8><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        } else {
-            exl3_reconstruct_transformed_weight_kernel<7><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        }
+        launch_reconstruct_transformed_weight(metadata.K, weights.trellis, weights.mul1,
+            reconstructed, metadata.in_features, metadata.out_features, stream);
     }
     if (reconstruct_needed) {
         cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
@@ -9235,9 +9312,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_v6_numeric(
     // the FP32 butterfly. The established text route deliberately keeps its
     // original full product; this specialization is admitted only here.
     launch_input_hadamard<kHadamard,true>(stream,input,weights.suh,impl_->transformed,rows,metadata.in_features);
-    exl3_reconstruct_transformed_weight_kernel<6><<<
-        dim3(metadata.out_features/16,metadata.in_features/16),256,0,stream>>>(
-        weights.trellis,weights.mul1,impl_->reconstructed,metadata.in_features,metadata.out_features);
+    launch_reconstruct_transformed_weight(6,weights.trellis,weights.mul1,
+        impl_->reconstructed,metadata.in_features,metadata.out_features,stream);
     cuda_check(cudaGetLastError(),"V6 reconstruct/input transform");
     cublas_check(cublasSetStream(impl_->handle,stream),"V6 projection stream");
     cublas_check(cublasSetWorkspace(impl_->handle,impl_->cublas_workspace,16u*1024u*1024u),
@@ -9521,18 +9597,9 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
         reinterpret_cast<std::uintptr_t>(stream));
     (void)submission;
     try {
-        const dim3 reconstruct_grid(
-            metadata.out_features / 16, metadata.in_features / 16);
-        if (metadata.K == 6) {
-            exl3_reconstruct_transformed_weight_kernel<6, false><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                weights.trellis, weights.mul1, reconstructed_exact_.data,
-                metadata.in_features, metadata.out_features);
-        } else if (metadata.K == 7) {
-            exl3_reconstruct_transformed_weight_kernel<7, false><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                weights.trellis, weights.mul1, reconstructed_exact_.data,
-                metadata.in_features, metadata.out_features);
+        if (metadata.K == 6 || metadata.K == 7) {
+            launch_reconstruct_transformed_weight(metadata.K, weights.trellis, weights.mul1,
+                reconstructed_exact_.data, metadata.in_features, metadata.out_features, stream);
         } else {
             return false;
         }
