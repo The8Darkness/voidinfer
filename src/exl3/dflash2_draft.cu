@@ -4728,6 +4728,10 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_private(
         target_head,target_head_metadata,mask_token_id,stream,true);
 }
 
+bool Exl3Dflash2DraftModel::batched_rounds() const noexcept {
+    return impl_->batched_propose != nullptr;
+}
+
 void Exl3Dflash2DraftModel::set_batched_propose(Exl3BatchedVerifyCoordinator* coordinator) noexcept {
     impl_->batched_propose=coordinator;
 }

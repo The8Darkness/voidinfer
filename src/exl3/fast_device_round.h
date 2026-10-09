@@ -920,7 +920,8 @@ private:
         if(tree) {
             const auto shape=exl3_build_verification_tree(proposed,
                 draft_.last_candidate_ids(),draft_.last_candidate_unary(),
-                value.width-1,sibling_count());
+                value.width-1,sibling_count(),
+                draft_.batched_rounds()?0.0f:kExl3TreeRowCost);
             std::copy(shape.sibling_tokens.begin(),shape.sibling_tokens.end(),
                       value.proposal.begin()+1+shape.chain_drafts);
             sibling_offsets=shape.sibling_offsets;

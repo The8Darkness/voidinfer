@@ -540,6 +540,8 @@ public:
     // block rows through the shared draft weights (row-concatenated
     // projections, per-lane ring attention, per-lane selector).
     void set_batched_propose(Exl3BatchedVerifyCoordinator* coordinator) noexcept;
+    // True when this lane's rounds may batch with other lanes.
+    bool batched_rounds() const noexcept;
     // propose_cached_view without the batched rendezvous (solo coordinator path).
     std::vector<std::int64_t> propose_cached_private(
         std::span<const std::int64_t> block_ids,int block_pos0,

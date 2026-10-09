@@ -580,12 +580,6 @@ struct Exl3EngineCore::Impl {
             // workspace serves every lane.
             if(!std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
                 _putenv_s("NINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
-            // Verification-tree sibling leaves corrupt target state under
-            // concurrent lanes (VeriCache corrections with 15-27 logit gaps at
-            // C3+, root cause open in sibling promotion); concurrent lanes
-            // verify plain chains. C4: 218 (bimodal 140-220) -> 245 tok/s.
-            if(!std::getenv("NINFER_DFLASH2_SIBLINGS"))
-                _putenv_s("NINFER_DFLASH2_SIBLINGS","0");
             // The default 1 KiB per-thread stack reserves ~256 MiB of local
             // memory for every resident thread; the driver raises the limit
             // for any kernel that needs more. NINFER_EXL3_STACK_BYTES overrides.

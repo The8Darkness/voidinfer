@@ -14,6 +14,9 @@ namespace ninfer::exl3 {
 // per verifier round time: each verifier row costs about kExl3TreeRowCost of
 // the fixed round (0.23 ms of ~16.3 ms on RTX 5090, 64 target layers), so
 // the tree may use fewer rows than the budget when leaves are unlikely.
+// Batched multi-agent rounds pass row_cost 0: their captured forwards take
+// every member's full row budget, so a narrower tree saves nothing and would
+// fall back to an eager forward.
 //
 // Node acceptance is estimated from the draft's unary top-16 softmax: a chain
 // token's conditional hit rate by its unary probability decile, and a sibling
@@ -40,7 +43,8 @@ inline constexpr std::array<std::array<float, 10>, 3> kExl3TreeSiblingHit{{
 // [D][16] in unary order. budget: maximum verifier rows minus the anchor (>= 1).
 inline Exl3VerificationTree exl3_build_verification_tree(
     std::span<const std::int64_t> drafts, std::span<const std::int64_t> candidate_ids,
-    std::span<const float> candidate_unary, int budget, int max_siblings) {
+    std::span<const float> candidate_unary, int budget, int max_siblings,
+    float row_cost = kExl3TreeRowCost) {
     constexpr int kTop = 16, kRanks = 3;
     const int depth = std::min<int>(static_cast<int>(drafts.size()), budget);
     struct Leaf { float value; int offset; std::int64_t token; };
@@ -92,7 +96,7 @@ inline Exl3VerificationTree exl3_build_verification_tree(
                           [](const Leaf& a, const Leaf& b) { return a.value > b.value; });
         for (int i = 0; i < count; ++i) value += pool[static_cast<std::size_t>(i)].value;
         // Expected committed tokens (accepted + correction/bonus) per round time.
-        const float rate = (1.0f + value) / (1.0f + kExl3TreeRowCost * static_cast<float>(nodes));
+        const float rate = (1.0f + value) / (1.0f + row_cost * static_cast<float>(nodes));
         if (rate > best_rate) {
             best_rate = rate;
             best.chain_drafts = chain;

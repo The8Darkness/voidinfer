@@ -1304,11 +1304,17 @@ struct Exl3TextContext::Impl {
     bool l0_layer_major_block=false;
     std::vector<int> verifier_sibling_offsets;
     // Sibling promotion descriptor tables, one per (source, destination, rows).
+    // Promotion copy tables per (source, destination, rows). A slot's device
+    // table is allocated once and rewritten in stream order on the lane's
+    // stream (host entries kept with the slot): a legacy-stream upload is not
+    // ordered before the promotion kernel on a non-blocking lane stream.
     struct SiblingCopyTable {
         int source=-1,destination=-1,rows=0,count=0;
+        std::vector<Exl3SiblingRowCopy> host;
         std::unique_ptr<DeviceAllocation> device;
     };
-    std::array<SiblingCopyTable,8> sibling_copy_tables{};
+    std::array<SiblingCopyTable,64> sibling_copy_tables{};
+    std::size_t sibling_copy_next=0;
     // Overlapped device-transaction checkpoint: the checkpoint graph runs on
     // its own stream (after the transaction stream's prior work and any
     // pending repair) while the caller drafts; the same joins order every
@@ -9672,13 +9678,16 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
     const int rows=impl_->continuation->rows;
     require(destination_row>=1 && destination_row<source_row && source_row<rows,
             "sibling promotion rows");
-    auto* table=&impl_->sibling_copy_tables[0];
+    Impl::SiblingCopyTable* table=nullptr;
     for(auto& entry:impl_->sibling_copy_tables) {
         if(entry.source==source_row && entry.destination==destination_row && entry.rows==rows) {
             table=&entry;break;
         }
         if(entry.source<0) {table=&entry;break;}
     }
+    // Full cache: replace slots round robin (rewritten in stream order).
+    if(!table) table=&impl_->sibling_copy_tables[impl_->sibling_copy_next++ %
+        impl_->sibling_copy_tables.size()];
     if(table->source!=source_row || table->destination!=destination_row || table->rows!=rows) {
         Exl3SiblingRowCopies copies;
         for(int layer=0;layer<kLayers;++layer) {
@@ -9700,11 +9709,13 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
         copies.push_back({logits+static_cast<std::size_t>(source_row)*kVocab,
             logits+static_cast<std::size_t>(destination_row)*kVocab,kVocab,1,0});
         const auto bytes=copies.size()*sizeof(Exl3SiblingRowCopy);
-        table->device=std::make_unique<DeviceAllocation>(bytes,"sibling promotion table");
-        cuda_check(cudaMemcpy(table->device->ptr,copies.data(),bytes,cudaMemcpyHostToDevice),
-                   "upload sibling promotion table");
+        if(!table->device || table->device->bytes<bytes)
+            table->device=std::make_unique<DeviceAllocation>(bytes,"sibling promotion table");
+        table->host=std::move(copies);
+        cuda_check(cudaMemcpyAsync(table->device->ptr,table->host.data(),bytes,
+                   cudaMemcpyHostToDevice,stream),"upload sibling promotion table");
         table->source=source_row;table->destination=destination_row;table->rows=rows;
-        table->count=static_cast<int>(copies.size());
+        table->count=static_cast<int>(table->host.size());
     }
     sibling_row_copy_kernel<<<dim3(table->count,8),256,0,stream>>>(
         static_cast<const Exl3SiblingRowCopy*>(table->device->ptr),impl_->position_device,rows);
