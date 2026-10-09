@@ -2061,13 +2061,53 @@ __global__ void exl3_reconstruct_transformed_weight_kernel(
 // NVFP4 weight global scale is a constant bound instead of a measured amax.
 constexpr float kNvfp4WeightGlobal = 3.5f / (6.0f * 448.0f);
 
+// One thread's 16 decoded values of a 16x16 trellis tile column (rows 0..15)
+// in tensor-core order, bit-identical to decode_state_generic +
+// decode_mul1_generic. Half selects columns 8..15 and is warp-uniform, so the
+// bit offset of every row inside the thread's window is a compile-time
+// constant: the window words are read from shared memory once per tile and
+// each state is one funnel shift (was four 16-bit loads per value).
+template <int Bits, int Half>
+__device__ __forceinline__ float exl3_decode_column16(const std::uint32_t* __restrict__ words,
+    int column_group, std::uint32_t multiplier, float (&x)[16]) {
+    constexpr int kWords32 = 8 * Bits;
+    // Stream bit (MSB-first) where the window of rel=0 starts, minus
+    // column_group*32*Bits (a whole number of words).
+    constexpr int kStart = Half * 4 * Bits + Bits - 16 + 256 * Bits;
+    constexpr int kWord0 = kStart / 32;
+    constexpr int kBit0 = kStart % 32;
+    constexpr int kSpan = (kBit0 + 27 * Bits) / 32 + 2;
+    std::uint32_t w[kSpan];
+    const int base = column_group * Bits + kWord0;
+#pragma unroll
+    for (int i = 0; i < kSpan; ++i) w[i] = words[(base + i) % kWords32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int row = 0; row < 16; ++row) {
+        const int rel = ((row & 7) >> 1) * 8 + (row >= 8 ? 2 : 0) + (row & 1);
+        const int bit = kBit0 + rel * Bits;
+        const std::uint32_t state =
+            __funnelshift_l(w[(bit >> 5) + 1], w[bit >> 5], bit & 31) >> 16;
+        const std::uint32_t product = state * multiplier;
+        const std::uint32_t byte_sum = __dp4a(product, 0x01010101u, 0u);
+        const auto input = __ushort_as_half(static_cast<std::uint16_t>(0x6400u + byte_sum));
+        const auto inverse = __ushort_as_half(static_cast<std::uint16_t>(0x1eeeu));
+        const auto bias = __ushort_as_half(static_cast<std::uint16_t>(0xc931u));
+        const float value = __half2float(__hfma(input, inverse, bias));
+        x[row] = value;
+        amax = fmaxf(amax, fabsf(value));
+    }
+    return amax;
+}
+
 // Fused EXL3 decode + block quantization of one transformed weight into the
 // K-major MXFP8 (Quant=32) or NVFP4 (Quant=16) prefill operand, bypassing the
 // FP16 reconstruction plane. Each thread decodes one output column over
 // Blocks consecutive quantization blocks along K from the packed trellis tiles
 // staged in shared memory, so its value bytes form whole 32-byte segments
-// (NVFP4: 4 x 16 values = 32 bytes, scales one 32-bit store; MXFP8: 32 bytes
-// per block). Grid (ceil(n/256), k/(Quant*Blocks)).
+// (NVFP4: 4 x 16 values = 32 bytes and scales one 32-bit store; MXFP8: 32
+// bytes per block). Warp w covers four tiles of column half w&1. Grid
+// (ceil(n/256), k/(Quant*Blocks)).
 template <int Bits, int Quant, int Blocks>
 __global__ void __launch_bounds__(256, 4) exl3_decode_quantize_weight_kernel(
     const std::uint16_t* __restrict__ trellis, const std::int32_t* __restrict__ mul1,
@@ -2076,43 +2116,58 @@ __global__ void __launch_bounds__(256, 4) exl3_decode_quantize_weight_kernel(
     constexpr int kTilesPerBlock = Quant / 16;
     constexpr int kTilesK = kTilesPerBlock * Blocks;
     constexpr int kWords = 16 * Bits;          // packed u16 words per 16x16 tile
-    __shared__ std::uint16_t packed[kTilesK][16][kWords];
+    __shared__ __align__(16) std::uint32_t packed[kTilesK][16][kWords / 2];
     const int tid = static_cast<int>(threadIdx.x);
     const int tiles_n = n / 16;
     const int tile_n0 = static_cast<int>(blockIdx.x) * 16;
     const int live_tiles = min(16, tiles_n - tile_n0);
     const int k_tile0 = static_cast<int>(blockIdx.y) * kTilesK;
-    for (int kt = 0; kt < kTilesK; ++kt) {
-        const std::uint16_t* source = trellis +
-            (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords;
-        for (int i = tid; i < live_tiles * kWords; i += 256)
-            packed[kt][i / kWords][i % kWords] = source[i];
+    if ((reinterpret_cast<std::uintptr_t>(trellis) & 15) == 0) {
+        // A tile is 2*Bits 16-byte chunks; consecutive tiles are contiguous.
+        constexpr int kChunks = 2 * Bits;
+#pragma unroll
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            const auto* source = reinterpret_cast<const uint4*>(trellis +
+                (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords);
+            auto* destination = reinterpret_cast<uint4*>(&packed[kt][0][0]);
+            for (int i = tid; i < live_tiles * kChunks; i += 256) destination[i] = source[i];
+        }
+    } else {
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            const std::uint16_t* source = trellis +
+                (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords;
+            auto* destination = reinterpret_cast<std::uint16_t*>(&packed[kt][0][0]);
+            for (int i = tid; i < live_tiles * kWords; i += 256) destination[i] = source[i];
+        }
     }
     if (Quant == 16 && tid == 0 && blockIdx.x == 0 && blockIdx.y == 0)
         *weight_global = kNvfp4WeightGlobal;
     __syncthreads();
-    const int local_tile = tid / 16, column_in_tile = tid % 16;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int half = warp & 1;
+    const int local_tile = (warp >> 1) * 4 + (lane >> 3);
+    const int column_group = lane & 7;
     if (local_tile >= live_tiles) return;
-    const int column = (tile_n0 + local_tile) * 16 + column_in_tile;
+    const int column = (tile_n0 + local_tile) * 16 + half * 8 + column_group;
     const std::uint32_t multiplier = static_cast<std::uint32_t>(*mul1);
     const int k0 = static_cast<int>(blockIdx.y) * Quant * Blocks;
     const int inner_blocks = (k / Quant + 3) / 4 * 4;
     std::uint32_t codes = 0;
+    std::uint32_t nv_words[Quant == 16 ? 2 * Blocks : 1];
 #pragma unroll
     for (int b = 0; b < Blocks; ++b) {
         float x[Quant];
         float amax = 0.0f;
 #pragma unroll
         for (int kt = 0; kt < kTilesPerBlock; ++kt) {
+            float column_values[16];
+            const std::uint32_t* words = &packed[b * kTilesPerBlock + kt][local_tile][0];
+            const float tile_amax = half
+                ? exl3_decode_column16<Bits, 1>(words, column_group, multiplier, column_values)
+                : exl3_decode_column16<Bits, 0>(words, column_group, multiplier, column_values);
+            amax = fmaxf(amax, tile_amax);
 #pragma unroll
-            for (int row = 0; row < 16; ++row) {
-                const int encoded = inverse_tensor_core_index(row, column_in_tile);
-                const float value = __half2float(__ushort_as_half(decode_mul1_generic(
-                    decode_state_generic(packed[b * kTilesPerBlock + kt][local_tile],
-                                         Bits, encoded), multiplier)));
-                x[kt * 16 + row] = value;
-                amax = fmaxf(amax, fabsf(value));
-            }
+            for (int row = 0; row < 16; ++row) x[kt * 16 + row] = column_values[row];
         }
         const int kb = k0 + b * Quant;
         if constexpr (Quant == 32) {
@@ -2122,14 +2177,30 @@ __global__ void __launch_bounds__(256, 4) exl3_decode_quantize_weight_kernel(
             scales[mxfp8_scale_offset(column, kb / 32, inner_blocks)] =
                 static_cast<std::uint8_t>(exponent + 127);
         } else {
-            std::uint8_t code = 0;
-            nvfp4_encode16(x, amax, kNvfp4WeightGlobal,
-                values + (static_cast<std::size_t>(column) * k + kb) / 2, code);
+            // nvfp4_encode16 with the four blocks' 32 value bytes stored at once.
+            float scale = 1.0f;
+            const std::uint8_t code = nvfp4_scale_code(
+                fmaxf(amax / (6.0f * kNvfp4WeightGlobal), 1e-30f), scale);
+            const float inverse = 1.0f / (scale * kNvfp4WeightGlobal);
+#pragma unroll
+            for (int i = 0; i < 16; i += 4) {
+                const auto low = static_cast<std::uint32_t>(__nv_cvt_float2_to_fp4x2(
+                    make_float2(x[i] * inverse, x[i + 1] * inverse), __NV_E2M1, cudaRoundNearest)) & 0xffu;
+                const auto high = static_cast<std::uint32_t>(__nv_cvt_float2_to_fp4x2(
+                    make_float2(x[i + 2] * inverse, x[i + 3] * inverse), __NV_E2M1, cudaRoundNearest)) & 0xffu;
+                const std::uint32_t pair = low | (high << 8);
+                if ((i & 4) == 0) nv_words[b * 2 + i / 8] = pair;
+                else nv_words[b * 2 + i / 8] |= pair << 16;
+            }
             codes |= static_cast<std::uint32_t>(code) << (8 * b);
         }
     }
     if constexpr (Quant == 16) {
         static_assert(Blocks == 4, "NVFP4 scale store covers four inner blocks");
+        auto* destination = reinterpret_cast<uint4*>(
+            values + (static_cast<std::size_t>(column) * k + k0) / 2);
+        destination[0] = make_uint4(nv_words[0], nv_words[1], nv_words[2], nv_words[3]);
+        destination[1] = make_uint4(nv_words[4], nv_words[5], nv_words[6], nv_words[7]);
         *reinterpret_cast<std::uint32_t*>(scales +
             mxfp8_scale_offset(column, k0 / 16, inner_blocks)) = codes;
     }
