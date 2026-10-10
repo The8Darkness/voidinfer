@@ -2759,8 +2759,16 @@ struct Exl3EngineCore::Impl {
                 lane->poison_shared_completion();
                 std::lock_guard lock(mutex);
                 failed=true;
+                throw;
             }
-            throw;
+            // Host memory pressure after a clean cancellation refuses this
+            // request only; the lane and its peers stay usable.
+            try {throw;}
+            catch(const Exl3HostResidentReserveExhausted&) {
+                throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available host memory");
+            } catch(const Exl3HostResidentBudgetExhausted&) {
+                throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds the resident page budget");
+            }
         }
     }
     void execute(Request& request,std::size_t lane_index){
@@ -2918,6 +2926,8 @@ struct Exl3EngineCore::Impl {
                 // No lease or physical lane attachment exists yet. A declared
                 // residency limit rejects this request without poisoning peers.
                 throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available resident page budget");
+            } catch(const Exl3HostResidentReserveExhausted&) {
+                throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available host memory");
             }
             lease=coordinator.acquire();
             if(!lease || lease->ticket.request_id!=ticket.request_id)

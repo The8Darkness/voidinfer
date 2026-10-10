@@ -269,6 +269,12 @@ struct DeviceAllocation {
     void shrink_host_bytes(std::size_t used) {
         if(host_region)host_region->shrink(std::min(used,bytes));
     }
+    // Host bytes ensure_host_bytes(used) would newly back.
+    std::uint64_t host_growth_bytes(std::size_t used) const {
+        if(!host_region)return 0;
+        const std::size_t target=std::min(used,bytes);
+        return target>host_region->mapped_bytes()?target-host_region->mapped_bytes():0;
+    }
     Exl3SharedControlCredit* shared_control_credit=nullptr;
     static constexpr std::size_t shared_control_bytes=Exl3ReconstructionControlAllocator<std::byte>::capacity;
     void* ptr = nullptr;
@@ -1442,7 +1448,7 @@ struct Exl3TextContext::Impl {
             }
         if(!planes.banks)return;
         planes.cpu_visible=cpu_visible;
-        kv_source=std::make_shared<Exl3LaneKvSource>(planes);
+        kv_source=Exl3LaneKvSource::create(planes);
     }
     // Called before rows >= `row` of the L0 planes are rewritten.
     void kv_rows_rewritten_from(int row) {
@@ -3460,12 +3466,24 @@ struct Exl3TextContext::Impl {
     static constexpr std::size_t kPlaneRowBytes=static_cast<std::size_t>(kKVHeads)*kHeadDim*sizeof(std::uint16_t);
     void ensure_l0_rows(int rows) {
         consume_kv_rewrite();
+        // Plane growth under host memory pressure spills idle histories first.
+        Exl3LaneKvSource::relieve_memory_pressure(plane_growth_bytes(rows));
         for(auto& layer:full_layers)if(layer)layer->ensure_l0_rows(rows);
         const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
         for(int layer=0;layer<kLayers;++layer) {
             if(cache_k[layer])cache_k[layer]->ensure_host_bytes(used);
             if(cache_v[layer])cache_v[layer]->ensure_host_bytes(used);
         }
+    }
+    // Host bytes the planes would add to back `rows` rows.
+    std::uint64_t plane_growth_bytes(int rows) const {
+        const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+        std::uint64_t bytes=0;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(cache_k[layer])bytes+=cache_k[layer]->host_growth_bytes(used);
+            if(cache_v[layer])bytes+=cache_v[layer]->host_growth_bytes(used);
+        }
+        return bytes;
     }
     // plane_rows: rows of FP16 plane backing to keep (defaults to rows).
     void release_l0_rows_beyond(int rows,int plane_rows=-1) {
@@ -12435,7 +12453,7 @@ bool Exl3ExactHostState::is_prefix_of(const Exl3ExactHostState& x) const {
         if(kv_pages_[page_index]==x.kv_pages_[page_index]) continue;
         // Two pages still backed by the same lane read the same plane rows.
         if(a.source_id.load() && a.source_id.load()==b.source_id.load() &&
-           a.payload_deferred() && b.payload_deferred()) continue;
+           a.payload_deferred() && b.payload_deferred() && !a.spilled() && !b.spilled()) continue;
         exl3_require_kv_payload(a);exl3_require_kv_payload(b);
         std::shared_lock payload(exl3_page_payload_mutex());
         const std::size_t elements=static_cast<std::size_t>(rows)*1024;
@@ -13287,6 +13305,9 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
         impl_->host_kv_restore_device=device;
         impl_->host_kv_failed=true;
     }
+    // The restored pages stay pinned (no pressure spill or foreign re-home of
+    // their payload) until the restore has read them.
+    const Exl3PagePins restore_pins(state.kv_pages_);
     // Lane-backed pages: this lane's deferred pages outside the restored
     // history are filled before the planes change; the restored state's own
     // still-deferred pages already sit in these planes. Pages backed by
@@ -13305,27 +13326,35 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     std::vector<const Exl3ExactKVPage*> resident_pages;
     std::vector<std::shared_ptr<const Exl3ExactKVPage>> adoptable;
     if(impl_->kv_source && !all_lane_resident) {
-        std::vector<std::pair<const Exl3ExactKVPage*,std::shared_ptr<Exl3LaneKvSource>>> foreign;
+        // Deferred pages of other lanes and spilled pages (any lane, this one
+        // included): rows copied straight into these planes.
+        std::vector<std::pair<std::shared_ptr<const Exl3ExactKVPage>,std::shared_ptr<Exl3LaneKvSource>>> foreign;
         {
             std::shared_lock payload(exl3_page_payload_mutex());
             for(const auto& page:state.kv_pages_) {
                 if(impl_->kv_source->holds(*page)) {resident_pages.push_back(page.get());continue;}
-                if(page->payload_deferred() && page->source)foreign.emplace_back(page.get(),page->source);
+                if(page->payload_deferred() && page->source)foreign.emplace_back(page,page->source);
             }
         }
         std::vector<const Exl3ExactKVPage*> run;
+        std::vector<std::shared_ptr<const Exl3ExactKVPage>> run_spilled;
         Exl3LaneKvSource* run_source=nullptr;
         const auto flush=[&] {
             if(run.empty())return;
-            if(run_source->copy_run_to(run,impl_->kv_source->planes(),stream))
+            if(run_source->copy_run_to(run,impl_->kv_source->planes(),stream)) {
                 resident_pages.insert(resident_pages.end(),run.begin(),run.end());
+                // Spilled pages now live in these planes: re-homed below.
+                adoptable.insert(adoptable.end(),run_spilled.begin(),run_spilled.end());
+            }
             run.clear();
+            run_spilled.clear();
         };
         for(const auto& [page,owner]:foreign) {
             if(!run.empty() && (owner.get()!=run_source ||
                run.back()->first+run.back()->rows!=page->first)) flush();
             run_source=owner.get();
-            run.push_back(page);
+            run.push_back(page.get());
+            if(page->spilled())run_spilled.push_back(page);
         }
         flush();
         std::sort(resident_pages.begin(),resident_pages.end());
@@ -13355,6 +13384,18 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     // Back the growable planes (and codes) for every restored row first.
     impl_->ensure_l0_rows(state.position_);
     std::shared_lock payload_read(exl3_page_payload_mutex());
+    // A page spilled after its fill above but before the pins took effect is
+    // brought back (pinned pages cannot be spilled again).
+    for(bool ready=false;!ready;) {
+        ready=true;
+        for(const auto& page:state.kv_pages_)
+            if(page->payload_deferred() && !lane_resident_page(page)) {ready=false;break;}
+        if(ready)break;
+        payload_read.unlock();
+        for(const auto& page:state.kv_pages_)
+            if(!lane_resident_page(page))exl3_require_kv_payload(*page);
+        payload_read.lock();
+    }
     int full = 0, gdn = 0;
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl_->full_layers[layer]) {
