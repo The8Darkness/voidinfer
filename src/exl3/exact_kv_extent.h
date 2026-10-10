@@ -24,6 +24,17 @@ struct Exl3CopyableFlag {
     bool load() const noexcept { return value.load(std::memory_order_acquire); }
     void store(bool v) noexcept { value.store(v, std::memory_order_release); }
 };
+template <class T> struct Exl3CopyablePointer {
+    std::atomic<T*> value{nullptr};
+    Exl3CopyablePointer() = default;
+    Exl3CopyablePointer(const Exl3CopyablePointer& other) : value(other.value.load(std::memory_order_acquire)) {}
+    Exl3CopyablePointer& operator=(const Exl3CopyablePointer& other) {
+        value.store(other.value.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+    T* load() const noexcept { return value.load(std::memory_order_acquire); }
+    void store(T* v) noexcept { value.store(v, std::memory_order_release); }
+};
 // Internal backing. Published images expose only const page handles. A private
 // append may reserve a larger tail before upload; valid extents exclude it.
 struct Exl3ExactKVPage {
@@ -37,6 +48,7 @@ struct Exl3ExactKVPage {
     // and the rows live only in `source`'s lane planes, which keep them
     // unchanged until the source fills the page (before those rows change).
     std::shared_ptr<Exl3LaneKvSource> source;
+    Exl3CopyablePointer<Exl3LaneKvSource> source_id;   // lock-free identity of `source`
     Exl3CopyableFlag deferred;
     bool payload_deferred() const noexcept { return deferred.load(); }
     static std::shared_ptr<Exl3ExactKVPage> create(

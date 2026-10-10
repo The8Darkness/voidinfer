@@ -2308,7 +2308,15 @@ struct Exl3EngineCore::Impl {
             }
             {
                 std::lock_guard admission(admission_mutex);
-                const auto ticket=coordinator.admit(root);
+                Exl3VeriCacheServingCoordinator::Ticket ticket;
+                // Host memory refusals reject this request only (nothing is
+                // published yet; the lane resets for its next request).
+                try {ticket=coordinator.admit(root);}
+                catch(const Exl3HostResidentBudgetExhausted&) {
+                    throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds the resident page budget");
+                } catch(const Exl3HostResidentReserveExhausted&) {
+                    throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available host memory");
+                }
                 host_lease=coordinator.acquire();
                 if(!host_lease || host_lease->ticket.request_id!=ticket.request_id)
                     throw std::logic_error("coherent-device physical/coordinator acquisition");
@@ -2705,6 +2713,16 @@ struct Exl3EngineCore::Impl {
                 }
                 coordinator.complete(*host_lease);
                 host_lease.reset();
+                // Idle lanes hold no INT2 code VRAM: active agents' contexts
+                // grow into it (NINFER_EXL3_PARK_IDLE_CODES=0 keeps them).
+                static const bool park_idle_codes=[] {
+                    const auto* value=std::getenv("NINFER_EXL3_PARK_IDLE_CODES");
+                    return !value || std::string_view(value)!="0";
+                }();
+                if(park_idle_codes) {
+                    (void)cudaStreamSynchronize(stream);
+                    context->park_l0_codes();
+                }
             } else {
                 coordinator.cancel_device_logical(*device_lease,true);
                 device_lease.reset();

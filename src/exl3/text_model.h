@@ -789,6 +789,10 @@ public:
     // The L0 planes of this context still hold every KV row of `state`
     // (its pages are lane-backed by this context; lane_kv_source.h).
     bool kv_lane_resident(const Exl3ExactHostState& state) const noexcept;
+    // Between requests: returns the device backing of the L0 INT2 codes (the
+    // exported root keeps their pinned copy) and clears exact residency, so
+    // the next request restores them; the lane-backed FP16 planes stay.
+    void park_l0_codes() noexcept;
     // Returns true only when a restore was submitted. A resident hit still
     // passes retirement/failed-lineage gates; callers own acquisition identity.
     bool restore_exact_host_state_if_needed(const Exl3ExactHostState& state,cudaStream_t stream=0);

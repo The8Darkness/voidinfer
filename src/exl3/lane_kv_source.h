@@ -5,13 +5,18 @@
 // the context's source. The source fills them from the planes only when the
 // rows they cover are about to change (lineage reset, rewind, restore of
 // another history, context destruction) or when another reader needs the
-// values (restore into another lane, comparisons, diagnostics). Restoring a
-// still-deferred page into its own lane copies nothing.
+// values. Restoring a still-deferred page into its own lane copies nothing;
+// restoring a filled page into a lane re-homes it there (adopt), so every
+// history row has one host copy.
 //
 // Rows below an exported frontier are append-only history: every operation
-// that rewrites such rows calls materialize_from/materialize_except first.
-// Fills run on the source's own stream; the planes' rows they read are not
-// written concurrently (the lane only appends beyond them).
+// that rewrites such rows fills the affected pages first.
+//
+// Locking: a page's owner (`source`), payload vectors and `deferred` flag
+// change only under the process-wide payload mutex held exclusively; readers
+// of payload vectors hold it shared. `source_id` and `deferred` are atomics
+// for lock-free identity checks. A source's own mutex guards its page list
+// and is always taken before the payload mutex.
 #include "exl3/exact_kv_extent.h"
 
 #include <cuda_runtime.h>
@@ -23,11 +28,17 @@
 #include <execution>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace ninfer::exl3 {
+
+inline std::shared_mutex& exl3_page_payload_mutex() {
+    static std::shared_mutex mutex;
+    return mutex;
+}
 
 class Exl3LaneKvSource : public std::enable_shared_from_this<Exl3LaneKvSource> {
 public:
@@ -46,82 +57,83 @@ public:
     Exl3LaneKvSource(const Exl3LaneKvSource&) = delete;
     Exl3LaneKvSource& operator=(const Exl3LaneKvSource&) = delete;
 
-    std::mutex& mutex() noexcept { return mutex_; }
+    const Planes& planes() const noexcept { return planes_; }
+
+    // The page's rows still live only in this source's planes.
+    bool holds(const Exl3ExactKVPage& page) const noexcept {
+        return page.source_id.load() == this && page.payload_deferred();
+    }
 
     // Publishes `page` (rows [first, first+rows) of these planes) as deferred.
     void defer(const std::shared_ptr<Exl3ExactKVPage>& page) {
         std::lock_guard lock(mutex_);
-        for (int bank = 0; bank < 16; ++bank) {
-            std::vector<std::uint16_t>().swap(page->k[bank]);
-            std::vector<std::uint16_t>().swap(page->v[bank]);
-        }
+        std::unique_lock payload(exl3_page_payload_mutex());
+        release_payload(*page);
         page->source = shared_from_this();
+        page->source_id.store(this);
         page->deferred.store(true);
-        if (pages_.size() >= 2 * live_hint_ + 256) prune_locked();
-        pages_.push_back(page);
+        track_locked(page);
     }
 
-    // Fills one page (another reader needs its values).
+    // Re-homes filled lane-backed pages whose rows were just restored into
+    // these planes: their payload copies are released.
+    void adopt(const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& pages) {
+        std::lock_guard lock(mutex_);
+        std::unique_lock payload(exl3_page_payload_mutex());
+        for (const auto& constant : pages) {
+            auto page = std::const_pointer_cast<Exl3ExactKVPage>(constant);
+            if (!page->source || page->payload_deferred()) continue;
+            release_payload(*page);
+            page->source = shared_from_this();
+            page->source_id.store(this);
+            page->deferred.store(true);
+            track_locked(page);
+        }
+    }
+
+    // Fills one of this source's pages (another reader needs its values).
     void materialize(const Exl3ExactKVPage& page) {
         std::lock_guard lock(mutex_);
-        if (!page.payload_deferred()) return;
+        std::unique_lock payload(exl3_page_payload_mutex());
+        if (!holds(page)) return;
         std::vector<Exl3ExactKVPage*> one{const_cast<Exl3ExactKVPage*>(&page)};
         fill_locked(one);
     }
 
-    // Fills every deferred page holding a row >= `row` (rows about to change).
+    // Fills every page of this source holding a row >= `row`.
     void materialize_from(int row) {
-        std::lock_guard lock(mutex_);
-        std::vector<std::shared_ptr<Exl3ExactKVPage>> owners;
-        std::vector<Exl3ExactKVPage*> pages;
-        for (const auto& weak : pages_)
-            if (auto page = weak.lock())
-                if (page->payload_deferred() && page->first + page->rows > row) {
-                    pages.push_back(page.get());
-                    owners.push_back(std::move(page));
-                }
-        fill_locked(pages);
-        prune_locked();
+        fill_where([&](const Exl3ExactKVPage& page) { return page.first + page.rows > row; });
     }
 
-    // Fills every deferred page except `keep` (a restore rewrites the planes
-    // with `keep`'s history, which these planes already hold).
+    // Fills every page of this source except `keep` (a restore rewrites the
+    // planes with `keep`'s history, which these planes already hold).
     void materialize_except(const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& keep) {
-        std::lock_guard lock(mutex_);
         std::vector<const Exl3ExactKVPage*> kept;
         kept.reserve(keep.size());
         for (const auto& page : keep) kept.push_back(page.get());
         std::sort(kept.begin(), kept.end());
-        std::vector<std::shared_ptr<Exl3ExactKVPage>> owners;
-        std::vector<Exl3ExactKVPage*> pages;
-        for (const auto& weak : pages_)
-            if (auto page = weak.lock())
-                if (page->payload_deferred() &&
-                    !std::binary_search(kept.begin(), kept.end(), static_cast<const Exl3ExactKVPage*>(page.get()))) {
-                    pages.push_back(page.get());
-                    owners.push_back(std::move(page));
-                }
-        fill_locked(pages);
-        prune_locked();
+        fill_where([&](const Exl3ExactKVPage& page) {
+            return !std::binary_search(kept.begin(), kept.end(), &page);
+        });
     }
 
-    // Some still-deferred page holds a row >= `row`.
+    // Some page of this source holding a row >= `row` is still deferred.
     bool deferred_beyond(int row) {
         std::lock_guard lock(mutex_);
         for (const auto& weak : pages_)
             if (auto page = weak.lock())
-                if (page->payload_deferred() && page->first + page->rows > row) return true;
+                if (holds(*page) && page->first + page->rows > row) return true;
         return false;
     }
 
-    // Copies the rows of a contiguous run of this source's still-deferred
-    // pages straight into another lane's planes (a restore there), without
-    // filling them. False if a page was filled meanwhile (use its values).
+    // Copies the rows of a contiguous run of this source's deferred pages
+    // straight into another lane's planes (a restore there), without filling
+    // them. False if a page left this source meanwhile (use its values).
     bool copy_run_to(const std::vector<const Exl3ExactKVPage*>& run, const Planes& destination,
                      cudaStream_t stream) {
-        std::lock_guard lock(mutex_);
+        std::lock_guard lock(mutex_);   // no fill or re-home of these pages meanwhile
         for (const auto* page : run)
-            if (!page->payload_deferred()) return false;
+            if (!holds(*page)) return false;
         if (run.empty()) return true;
         const int lo = run.front()->first, hi = run.back()->first + run.back()->rows;
         const std::size_t offset = static_cast<std::size_t>(lo) * kRowWords;
@@ -132,19 +144,42 @@ public:
             check(cudaMemcpyAsync(const_cast<std::uint16_t*>(destination.v[bank]) + offset, planes_.v[bank] + offset,
                 bytes, cudaMemcpyDefault, stream), "lane KV plane copy");
         }
-        // The rows stay readable only while this lock is held.
         check(cudaStreamSynchronize(stream), "lane KV plane copy");
         return true;
     }
-    const Planes& planes() const noexcept { return planes_; }
 
 private:
+    static void release_payload(Exl3ExactKVPage& page) {
+        for (int bank = 0; bank < 16; ++bank) {
+            std::vector<std::uint16_t>().swap(page.k[bank]);
+            std::vector<std::uint16_t>().swap(page.v[bank]);
+        }
+    }
+    void track_locked(const std::shared_ptr<Exl3ExactKVPage>& page) {
+        if (pages_.size() >= 2 * live_hint_ + 256) prune_locked();
+        pages_.push_back(page);
+    }
     void prune_locked() {
-        pages_.erase(std::remove_if(pages_.begin(), pages_.end(), [](const auto& weak) {
+        pages_.erase(std::remove_if(pages_.begin(), pages_.end(), [&](const auto& weak) {
             const auto page = weak.lock();
-            return !page || !page->payload_deferred();
+            return !page || !holds(*page);
         }), pages_.end());
         live_hint_ = pages_.size();
+    }
+
+    template <class Predicate> void fill_where(Predicate predicate) {
+        std::lock_guard lock(mutex_);
+        std::unique_lock payload(exl3_page_payload_mutex());
+        std::vector<std::shared_ptr<Exl3ExactKVPage>> owners;
+        std::vector<Exl3ExactKVPage*> pages;
+        for (const auto& weak : pages_)
+            if (auto page = weak.lock())
+                if (holds(*page) && predicate(*page)) {
+                    pages.push_back(page.get());
+                    owners.push_back(std::move(page));
+                }
+        fill_locked(pages);
+        prune_locked();
     }
 
     static void check(cudaError_t error, const char* what) {
@@ -152,6 +187,7 @@ private:
             throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(error));
     }
 
+    // Caller holds mutex_ and the payload mutex exclusively.
     void fill_locked(std::vector<Exl3ExactKVPage*>& pages) {
         if (pages.empty()) return;
         std::sort(pages.begin(), pages.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
@@ -213,10 +249,18 @@ private:
     std::uint16_t* stage_ = nullptr;
 };
 
-// Fills a page whose rows live in another lane's planes (or its own) before
-// its values are read.
+// Fills a lane-backed page before its values are read (whichever lane holds it).
 inline void exl3_require_kv_payload(const Exl3ExactKVPage& page) {
-    if (page.payload_deferred() && page.source) page.source->materialize(page);
+    // A re-home between reading the owner and filling retries with the new owner.
+    while (page.payload_deferred()) {
+        std::shared_ptr<Exl3LaneKvSource> owner;
+        {
+            std::shared_lock payload(exl3_page_payload_mutex());
+            owner = page.source;
+        }
+        if (!owner) return;
+        owner->materialize(page);
+    }
 }
 
 }  // namespace ninfer::exl3

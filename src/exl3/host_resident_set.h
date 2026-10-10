@@ -37,6 +37,12 @@ public:
     Exl3HostResidentBudgetExhausted()
         :std::runtime_error("resident page budget exhausted including in-flight roots") {}
 };
+// Available physical memory fell below the configured reserve.
+class Exl3HostResidentReserveExhausted : public std::runtime_error {
+public:
+    Exl3HostResidentReserveExhausted()
+        :std::runtime_error("host residency physical reserve exhausted") {}
+};
 class Exl3HostResidentSet {
 public:
     using Range=std::pair<std::uintptr_t,std::uintptr_t>;
@@ -276,7 +282,7 @@ private:
         MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
         if(!GlobalMemoryStatusEx(&memory)) throw error("available memory");
         if(memory.ullAvailPhys<reserve_ || missing>memory.ullAvailPhys-reserve_)
-            throw std::runtime_error("host residency physical reserve exhausted");
+            throw Exl3HostResidentReserveExhausted();
     }
     void set_quota(SIZE_T minimum,SIZE_T maximum,DWORD flags) {
         if(!SetProcessWorkingSetSizeEx(GetCurrentProcess(),minimum,maximum,flags)) throw error("working set quota");
