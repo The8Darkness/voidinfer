@@ -10605,9 +10605,14 @@ void Exl3TextContext::save_verified_root(cudaStream_t stream) {
     }
     auto& root=*impl_->verified_root;
     impl_->join_repair(stream);
+    // One launch for every layer's checkpoint copies (was two cudaMemcpyAsync
+    // per GDN layer, ~30 us of host time each on every verified block).
+    Exl3GdnRootCopies copies;
     for(int layer=0;layer<kLayers;++layer)
         if(impl_->gdn_layers[layer])
-            impl_->gdn_layers[layer]->save_checkpoint(root.checkpoints[layer],position_,stream);
+            copies.layer[copies.count++]=impl_->gdn_layers[layer]->save_checkpoint_copies(
+                root.checkpoints[layer],position_,stream);
+    exl3_gdn_launch_root_copies(copies,stream);
     root.position=position_;
     root.last_rows=impl_->last_rows;
     root.tap_rows=impl_->tap_rows;
@@ -10621,11 +10626,14 @@ void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
     auto& root=*impl_->verified_root;
     impl_->join_repair(stream);
     impl_->kv_rows_rewritten_from(root.position);
+    Exl3GdnRootCopies copies;
     for(int layer=0;layer<kLayers;++layer)
         if(impl_->gdn_layers[layer]) {
             impl_->gdn_layers[layer]->validate_saved_checkpoint(root.checkpoints[layer],root.position);
-            impl_->gdn_layers[layer]->restore_checkpoint(root.checkpoints[layer],stream);
+            copies.layer[copies.count++]=impl_->gdn_layers[layer]->restore_checkpoint_copies(
+                root.checkpoints[layer]);
         }
+    exl3_gdn_launch_root_copies(copies,stream);
     for(auto& layer:impl_->full_layers)
         if(layer) {
             layer->invalidate_retained_prefix();

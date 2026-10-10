@@ -490,6 +490,24 @@ struct Exl3GdnWideScratchView {
     std::size_t bytes = 0;
 };
 
+// Device copies of one GDN layer's verified-root save or restore (null
+// pointers skip that copy); exl3_gdn_launch_root_copies runs a whole
+// context's layers in one launch instead of 2-3 copies plus a kernel each.
+struct Exl3GdnRootCopy {
+    void* recurrent_dst = nullptr;
+    const void* recurrent_src = nullptr;
+    void* before_dst = nullptr;            // restore: recurrent state trace
+    void* conv_dst = nullptr;
+    const void* conv_src = nullptr;
+    std::uint16_t* trace_dst = nullptr;    // restore: convolution history trace
+};
+inline constexpr int kExl3GdnRootCopyMax = 64;
+struct Exl3GdnRootCopies {
+    Exl3GdnRootCopy layer[kExl3GdnRootCopyMax];
+    int count = 0;
+};
+void exl3_gdn_launch_root_copies(const Exl3GdnRootCopies& copies, cudaStream_t stream);
+
 class Exl3GdnLayer {
 public:
     GoptSubmissions gaming_submissions() const noexcept { return gaming_submissions_; }
@@ -639,6 +657,12 @@ public:
         const Exl3GdnLayerCheckpoint& checkpoint,int position,
         std::uint64_t generation,cudaStream_t stream);
     void restore_checkpoint(const Exl3GdnLayerCheckpoint& checkpoint, cudaStream_t stream = nullptr);
+    // save_checkpoint / restore_checkpoint with the device copies returned
+    // instead of submitted: the caller submits every layer's copies in one
+    // exl3_gdn_launch_root_copies on `stream` before other work on it.
+    Exl3GdnRootCopy save_checkpoint_copies(const Exl3GdnLayerCheckpoint& checkpoint,int position,
+                                           cudaStream_t stream);
+    Exl3GdnRootCopy restore_checkpoint_copies(const Exl3GdnLayerCheckpoint& checkpoint);
     // Synchronous host checkpoint restore, preserving FP32 recurrent and all
     // four physical BF16 convolution slots. Invalidates retention capabilities.
     void restore_host_state(std::span<const float> recurrent,

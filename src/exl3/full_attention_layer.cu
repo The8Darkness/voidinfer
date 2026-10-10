@@ -9728,7 +9728,16 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         const bool rowwise = preserve_m1_topology && rows > 1;
         const bool target_initial16 = !rowwise && rows == 16 &&
             workspace->target_initial16_candidate(metadata, rows, Exl3CudaLinearAdmission::target_initial16);
-        const bool target_wide_candidate = rowwise && wide_prefill &&
+        // Wide passes of 9..32 rows (VeriCache verify blocks) take the coherent
+        // M32 projections of batched decode rounds instead of the wide direct
+        // kernels (NINFER_EXL3_WIDE_M32=0 keeps those).
+        static const bool wide_m32_enabled = [] {
+            const char* value = std::getenv("NINFER_EXL3_WIDE_M32");
+            return !value || std::strcmp(value, "0") != 0;
+        }();
+        const bool wide_m32 = wide_m32_enabled && rowwise && wide_prefill && rows > 8 && rows <= 32 &&
+            workspace->coherent_batched_rows(metadata, rows);
+        const bool target_wide_candidate = rowwise && wide_prefill && !wide_m32 &&
             workspace->target_wide_prefill_candidate(metadata, rows, Exl3CudaLinearAdmission::target_wide_prefill);
         const bool target_gateup_m16 = !rowwise && rows == 16 &&
             (operation == Exl3TargetProjectionOperator::gate ||
@@ -9901,7 +9910,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     "numeric reconstruct cannot consume borrowed transformed input");
             reconstruct_gemm_->forward_numeric_candidate(
                 weights, metadata, source, destination, rows, projection_stream);
-        } else if (rowwise && !target_small_m_candidate && !(batch_ && rows > 8)) {
+        } else if (rowwise && !target_small_m_candidate && !(batch_ && rows > 8) && !wide_m32) {
             for (int row = 0; row < rows; ++row) {
                 if(transformed_input)
                     workspace->forward_from_transformed(weights,metadata,

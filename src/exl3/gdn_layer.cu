@@ -2499,6 +2499,87 @@ void Exl3GdnLayer::publish_checkpoint_graph_replay(
     current_checkpoint_conv_ = checkpoint.conv_state_device;
 }
 
+Exl3GdnRootCopy Exl3GdnLayer::save_checkpoint_copies(const Exl3GdnLayerCheckpoint& checkpoint,
+                                                     int position,cudaStream_t stream) {
+    validate_checkpoint_storage(checkpoint);
+    if(position<0)
+        throw std::invalid_argument("EXL3 GDN checkpoint position");
+    const auto next_generation=begin_checkpoint_graph_replay(checkpoint);
+    Exl3GdnRootCopy copy;
+    if (!checkpoint.recurrent_live_alias) {
+        copy.recurrent_dst=checkpoint.recurrent_state_device;
+        copy.recurrent_src=recurrent_state_;
+    }
+    copy.conv_dst=checkpoint.conv_state_device;
+    copy.conv_src=conv_state_;
+    publish_checkpoint_graph_replay(checkpoint,position,next_generation,stream);
+    return copy;
+}
+
+Exl3GdnRootCopy Exl3GdnLayer::restore_checkpoint_copies(const Exl3GdnLayerCheckpoint& checkpoint) {
+    validate_saved_checkpoint(checkpoint,checkpoint.position);
+    invalidate_continuation_history();
+    retained_prefix_available_ = false;
+    current_checkpoint_generation_ = 0;
+    current_checkpoint_stream_ = nullptr;
+    current_checkpoint_recurrent_ = nullptr;
+    current_checkpoint_conv_ = nullptr;
+    Exl3GdnRootCopy copy;
+    if (!checkpoint.recurrent_live_alias) {
+        copy.recurrent_dst=recurrent_state_;
+        copy.recurrent_src=checkpoint.recurrent_state_device;
+        // The state trace is the restored state (copied from the checkpoint).
+        if (checkpoint.recurrent_state_device != recurrent_state_before_)
+            copy.before_dst=recurrent_state_before_;
+    }
+    copy.conv_dst=conv_state_;
+    copy.conv_src=checkpoint.conv_state_device;
+    copy.trace_dst=conv_state_trace_;
+    trace_.state_before = recurrent_state_before_;
+    trace_.state_after = recurrent_state_;
+    return copy;
+}
+
+// grid (blocks, layers): each layer's recurrent state (to the live state and
+// its trace), physical convolution state and convolution history trace.
+static __global__ void __launch_bounds__(256) gdn_root_copies_kernel(Exl3GdnRootCopies copies) {
+    const auto& c = copies.layer[blockIdx.y];
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    const std::size_t first = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c.recurrent_src) {
+        const auto* src = static_cast<const uint4*>(c.recurrent_src);
+        auto* dst = static_cast<uint4*>(c.recurrent_dst);
+        auto* before = static_cast<uint4*>(c.before_dst);
+        for (std::size_t i = first; i < Exl3GdnRecurrentLayout::recurrent_bytes / 16; i += stride) {
+            const uint4 v = src[i];
+            dst[i] = v;
+            if (before) before[i] = v;
+        }
+    }
+    if (c.conv_src) {
+        const auto* src = static_cast<const std::uint16_t*>(c.conv_src);
+        auto* dst = static_cast<std::uint16_t*>(c.conv_dst);
+        for (std::size_t i = first; i < Exl3GdnRecurrentLayout::convolution_storage_bytes / 2; i += stride)
+            dst[i] = src[i];
+        if (c.trace_dst)
+            for (std::size_t i = first; i < Exl3GdnRecurrentLayout::convolution_history_elements; i += stride) {
+                const std::size_t channel = i / Exl3GdnRecurrentLayout::convolution_history;
+                const std::size_t slot = i % Exl3GdnRecurrentLayout::convolution_history;
+                c.trace_dst[i] = src[channel * kConvStorage + slot];
+            }
+    }
+}
+
+void exl3_gdn_launch_root_copies(const Exl3GdnRootCopies& copies, cudaStream_t stream) {
+    if (!copies.count) return;
+    if (copies.count > kExl3GdnRootCopyMax) throw std::logic_error("GDN root copy capacity");
+    static_assert(Exl3GdnRecurrentLayout::recurrent_bytes % 16 == 0, "GDN recurrent copy granularity");
+    gdn_root_copies_kernel<<<dim3(64, copies.count), 256, 0, stream>>>(copies);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string("launch GDN verified-root copies: ") + cudaGetErrorString(error));
+}
+
 void Exl3GdnLayer::restore_checkpoint(const Exl3GdnLayerCheckpoint& checkpoint, cudaStream_t stream) {
     validate_saved_checkpoint(checkpoint,checkpoint.position);
     invalidate_continuation_history();
@@ -3147,7 +3228,16 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         const bool rowwise = preserve_m1_topology && rows > 1;
         const bool target_initial16 = !rowwise && rows == 16 &&
             workspace->target_initial16_candidate(metadata, rows, Exl3CudaLinearAdmission::target_initial16);
-        const bool target_wide_candidate = rowwise && wide_prefill &&
+        // Wide passes of 9..32 rows (VeriCache verify blocks) take the coherent
+        // M32 projections of batched decode rounds instead of the wide direct
+        // kernels (NINFER_EXL3_WIDE_M32=0 keeps those).
+        static const bool wide_m32_enabled = [] {
+            const char* value = std::getenv("NINFER_EXL3_WIDE_M32");
+            return !value || std::strcmp(value, "0") != 0;
+        }();
+        const bool wide_m32 = wide_m32_enabled && rowwise && wide_prefill && rows > 8 && rows <= 32 &&
+            workspace->coherent_batched_rows(metadata, rows);
+        const bool target_wide_candidate = rowwise && wide_prefill && !wide_m32 &&
             workspace->target_wide_prefill_candidate(metadata, rows, Exl3CudaLinearAdmission::target_wide_prefill);
         const bool target_gateup_m16 = !rowwise && rows == 16 &&
             (operation == Exl3TargetProjectionOperator::gate ||
@@ -3334,7 +3424,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
                     "numeric reconstruct cannot consume borrowed transformed input");
             reconstruct_gemm_->forward_numeric_candidate(
                 weights, metadata, source, destination, rows, projection_stream);
-        } else if (rowwise && !target_small_m_candidate && !(batch_ && rows > 8)) {
+        } else if (rowwise && !target_small_m_candidate && !(batch_ && rows > 8) && !wide_m32) {
             for (int row = 0; row < rows; ++row) {
                 if(transformed_input)
                     workspace->forward_from_transformed(weights,metadata,
