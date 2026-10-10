@@ -578,6 +578,10 @@ struct Exl3EngineCore::Impl {
             // C3+). Oversubscribed WDDM memory corrupts batched graph replays.
             if(!std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
                 _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
+            // L0 exact hot rows cost 64 KiB per slot and lane; at C5+ the VRAM
+            // goes to INT2 codes instead (2048 slots C1-C4, 512 above).
+            if(!std::getenv("NINFER_EXL3_L0_HOT") && value.max_concurrency>=5)
+                _putenv_s("NINFER_EXL3_L0_HOT","512");
             if(!std::getenv("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
                 _putenv_s("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"640":"1536");
             // Prompt-scale passes are exclusive across lanes: one reconstruct
@@ -2531,6 +2535,13 @@ struct Exl3EngineCore::Impl {
                         t.accepted_checked?t.accepted_gap_sum/static_cast<double>(t.accepted_checked):0.0,
                         static_cast<double>(t.max_accepted_gap),t.restore_ms,t.forward_ms,t.scores_ms,
                         t.fix_ms,t.commit_ms);
+                    std::fprintf(stderr,"VERICACHE_GAPS over>0=%llu >0.125=%llu >0.25=%llu >0.5=%llu >1=%llu >2=%llu\n",
+                        static_cast<unsigned long long>(t.accepted_gap_over[0]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[1]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[2]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[3]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[4]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[5]));
                     std::fprintf(stderr,"ROUND_TIMING rounds=%llu verified_rows=%llu seed_ms=%.1f draft_ms=%.1f "
                         "proposal_ms=%.1f verifier_ms=%.1f ring_commit_ms=%.1f prefill_s=%.3f decode_s=%.3f\n",
                         static_cast<unsigned long long>(t.rounds),static_cast<unsigned long long>(t.verified_rows),

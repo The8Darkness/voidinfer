@@ -29,11 +29,13 @@ namespace ninfer::exl3 {
 // corrections discard the rest of a block) that are verified against exact FP16-L2
 // history before publication. "exact": every token equals the exact greedy
 // token; "1"/"tolerance": tokens whose exact logit trails the exact top by at
-// most NINFER_EXL3_VERICACHE_DELTA (default 1.0) are kept. The prompt is
+// most NINFER_EXL3_VERICACHE_DELTA (default 0.5) are kept. With 2048 exact
+// hot rows, raw L0 drafts trail the exact top by > 0.25 in ~1 of 2K tokens
+// (max gap ~0.3, 4K-32K code), so 0.5 almost never triggers a correction. The prompt is
 // ingested with exact history as well.
 struct Exl3VeriCacheConfig {
     bool enabled=false;
-    float delta=1.0f;
+    float delta=0.5f;
     // Tolerance blocks of 1024 rows (one wide verifier pass) amortize the
     // per-pass weight reconstruction best; exact mode keeps short blocks.
     int block=1024;
@@ -97,6 +99,10 @@ public:
         double restore_ms=0,forward_ms=0,scores_ms=0,fix_ms=0,commit_ms=0;
         double verify_ms=0,accepted_gap_sum=0;
         float max_accepted_gap=0;
+        // Accepted rows whose exact logit trails the exact top by more than
+        // kGapEdges[i] (research: tolerance sweeps from one DELTA=100 run).
+        static constexpr std::array<float,6> kGapEdges{0.0f,0.125f,0.25f,0.5f,1.0f,2.0f};
+        std::array<std::uint64_t,6> accepted_gap_over{};
     };
     struct Prepared {
         std::uint64_t ticket=0;
@@ -622,6 +628,8 @@ public:
                 result.max_gap=std::max(result.max_gap,scores[i].gap);
                 totals_.accepted_gap_sum+=scores[i].gap;
                 totals_.accepted_off_greedy+=scores[i].gap>0.0f?1:0;
+                for(std::size_t e=0;e<Totals::kGapEdges.size();++e)
+                    totals_.accepted_gap_over[e]+=scores[i].gap>Totals::kGapEdges[e]?1:0;
                 ++totals_.accepted_checked;
             }
             totals_.max_accepted_gap=std::max(totals_.max_accepted_gap,result.max_gap);

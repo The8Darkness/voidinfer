@@ -258,7 +258,9 @@ __device__ __forceinline__ void l0_hot_select(const l0::HotView& hot,int kv,int 
         }
     }
     __syncthreads();
-    const int take=min(valid,insert);
+    // While empty slots remain (after a prompt or restore) fill at the full
+    // won-list width: no stale slot is evicted, the cache just warms faster.
+    const int take=min(valid,shist[255]>0?l0::kHotMaxInsert:insert);
     if(take==0) return;
     l0_hot_scan(chist,ccum,false,sums[0]);   // best candidates first
     l0_hot_scan(shist,scum,true,sums[1]);    // stalest slots first

@@ -164,11 +164,12 @@ __device__ __forceinline__ float l0_block_max(float v, float* scratch) {
 // round's history LSE, `ref`) exceeds tau; an exact FP16 pass covers the hot
 // slots, and each round replaces the stalest slots with the best candidates,
 // filled from the FP16 L2 planes. NINFER_EXL3_L0_HOT = slots per KV head and
-// layer (default 512, a multiple of 32; 0 = off).
+// layer (default 2048, a multiple of 32; 0 = off). The engine lowers the
+// default to 512 at five or more lanes, where VRAM goes to INT2 codes.
 constexpr int kHotCandidates = 1024;   // per KV head and round
 constexpr int kHotMaxInsert = 64;      // per KV head and round
 struct HotConfig {
-    int slots = 512;                // per KV head and layer
+    int slots = 2048;               // per KV head and layer
     float log2_tau = -8.965784f;    // candidates: p > 2e-3 of the history mass
     int insert = 32;                // slots replaced per KV head and round at most
     float lambda = 0.01f;           // priority decay per committed token (ln units)
