@@ -578,10 +578,6 @@ struct Exl3EngineCore::Impl {
             // C3+). Oversubscribed WDDM memory corrupts batched graph replays.
             if(!std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
                 _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
-            // L0 exact hot rows cost 64 KiB per slot and lane; at C5+ the VRAM
-            // goes to INT2 codes instead (2048 slots C1-C4, 512 above).
-            if(!std::getenv("NINFER_EXL3_L0_HOT") && value.max_concurrency>=5)
-                _putenv_s("NINFER_EXL3_L0_HOT","512");
             if(!std::getenv("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
                 _putenv_s("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"640":"1536");
             // Prompt-scale passes are exclusive across lanes: one reconstruct
@@ -2135,14 +2131,13 @@ struct Exl3EngineCore::Impl {
         const auto& prepared=targets::qwen3_6::PreparedPromptAccess::view(request.prompt);
         const auto ids=request.ready_work.input_tokens();
         if(prepared.has_media() || ids.size()<2048 ||
-           ids.size()>options.max_context || request.sampling ||
+           ids.size()>options.max_context ||
            !request.options.stop.strings.empty() ||
            request.options.execution.thinking.budget.has_value() ||
-           request.options.execution.sampling.temperature!=0 ||
            request.options.execution.sampling.presence_penalty!=0 ||
            request.options.execution.sampling.frequency_penalty!=0)
             throw std::invalid_argument(
-                "coherent-device EXL3 requires C1 greedy text with saturated draft ring");
+                "coherent-device EXL3 requires text without penalties, stop strings or a thinking budget");
         if(request.cancelled) {result.finish_reason=FinishReason::Cancelled;return;}
         if(Clock::now()>=request.deadline)
             throw RequestError(RequestErrorKind::QueueTimeout,
@@ -2176,6 +2171,22 @@ struct Exl3EngineCore::Impl {
         try {
             (void)context->reset_for_request(identity.contract());
             const auto epoch=context->request_generation();
+            // Coupled sampling (sampled_select.cuh): rounds and VeriCache rows
+            // share one noise stream. An unset seed (0) gets a per-request one.
+            {
+                const auto& sp=request.options.execution.sampling;
+                std::uint64_t seed=sp.seed;
+                if(sp.temperature>0 && !seed)
+                    seed=std::hash<std::uint64_t>{}(request.ready_work.generation()^
+                        (static_cast<std::uint64_t>(Clock::now().time_since_epoch().count())<<1))|1u;
+                context->set_device_sampling({sp.temperature,sp.top_k,sp.top_p,sp.min_p,seed});
+                draft.set_sampling(context->device_sampling());
+            }
+            struct SamplingReset {
+                Exl3TextContext* context;
+                Exl3Dflash2DraftModel* draft;
+                ~SamplingReset() {context->set_device_sampling({});draft->set_sampling({});}
+            } sampling_reset{context.get(),&draft};
             // VeriCache verifies against exact history: ingest the prompt exactly too.
             if(vericache.enabled)context->set_l0_exact_history(true);
             // Conversation reuse (default; NINFER_EXL3_COHERENT_ROOT_REUSE=0
@@ -2383,6 +2394,12 @@ struct Exl3EngineCore::Impl {
                 // Draft numerically ahead with L0 rounds, verify each block, then
                 // publish only verified tokens (in <= 16-token output previews).
                 round->begin_verification(vericache.block);
+                // Adaptive verify block: a correction discards the drafted rows
+                // past it, so after one the block shrinks to a quarter (at least
+                // kMinVerifyBlock); every clean block doubles it back up to the
+                // configured size.
+                constexpr int kMinVerifyBlock=128;
+                int block_now=vericache.block;
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
                 // NINFER_EXL3_LANE_TRACE: per-request lane time attribution.
@@ -2413,7 +2430,7 @@ struct Exl3EngineCore::Impl {
                     if(!budget)throw std::logic_error(
                         "coherent-device output has no model budget or control path");
                     const std::size_t room=budget>unverified.size()?budget-unverified.size():0;
-                    const std::size_t block=static_cast<std::size_t>(vericache.block);
+                    const std::size_t block=static_cast<std::size_t>(block_now);
                     if(!terminal_seen && room && unverified.size()<block) {
                         const auto width=static_cast<int>(std::min<std::size_t>(
                             {round_width_limit(),room,block-unverified.size()}));
@@ -2451,6 +2468,8 @@ struct Exl3EngineCore::Impl {
                     const BatchedInactive verify_inactive(lane_batched_verify[lane_index]);
                     const PromptPass verify_pass(*this,stream);
                     const auto verified=round->verify(unverified,vericache.delta);
+                    block_now=verified.corrected?std::max(std::min(kMinVerifyBlock,vericache.block),block_now/4):
+                        std::min(vericache.block,block_now*2);
                     runtime_memory_mark("verify",lane_index);
                     lt_verify+=lt_ms(lt_mark);
                     unverified.clear();
@@ -4761,7 +4780,12 @@ Exl3EngineCore::Submission Exl3EngineCore::submit(targets::qwen3_6::PreparedProm
     const auto sampling_policy=Exl3SamplingPolicy::normalize(options.execution.sampling);
     const auto sampled_admission=Exl3SampledAuthorityBoundary::decide({
         sampling_policy,impl_->drafts[0]->sampled_distribution_availability()});
-    if(!sampled_admission.greedy())
+    // The coherent-device route samples on device with VeriCache-coupled
+    // selection (temperature, top_k, top_p, min_p; no penalties).
+    const bool coupled_sampling=impl_->coherent_device &&
+        options.execution.sampling.presence_penalty==0 &&
+        options.execution.sampling.frequency_penalty==0;
+    if(!sampled_admission.greedy() && !coupled_sampling)
         throw RequestError(RequestErrorKind::UnsupportedSampling,
             std::string(Exl3SampledAuthorityBoundary::message(
                 sampled_admission.disposition)));

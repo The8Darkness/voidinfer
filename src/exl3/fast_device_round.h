@@ -24,20 +24,23 @@
 
 namespace ninfer::exl3 {
 
-// VeriCache (NINFER_EXL3_VERICACHE): L0 OSCAR drafts blocks of
-// NINFER_EXL3_VERICACHE_BLOCK tokens (default 512; 64 in exact mode, where
-// corrections discard the rest of a block) that are verified against exact FP16-L2
-// history before publication. "exact": every token equals the exact greedy
-// token; "1"/"tolerance": tokens whose exact logit trails the exact top by at
-// most NINFER_EXL3_VERICACHE_DELTA (default 0.5) are kept. With 2048 exact
-// hot rows, raw L0 drafts trail the exact top by > 0.25 in ~1 of 2K tokens
-// (max gap ~0.3, 4K-32K code), so 0.5 almost never triggers a correction. The prompt is
-// ingested with exact history as well.
+// VeriCache (NINFER_EXL3_VERICACHE): L0 OSCAR drafts blocks of up to
+// NINFER_EXL3_VERICACHE_BLOCK tokens that are re-run in one pass against the
+// exact FP16-L2 history before publication; the first drafted token the exact
+// model would not have produced is replaced and the rest of the block is
+// redrafted (adaptive: the next block shrinks after a correction). A drafted
+// token is kept when its exact logit trails the exact choice by at most
+// NINFER_EXL3_VERICACHE_DELTA (sampled requests: the coupled perturbed
+// values, sampled_select.cuh). "exact": 0.0625, twice the arithmetic floor
+// measured between the decode and verifier kernels on identical exact
+// history (max 0.03 over 2K tokens), blocks of 256; "1"/"tolerance" (default):
+// 1.0 (512 hot rows: raw drafts trail by up to ~1.5 at 32K), blocks of 1024. The prompt is ingested with exact history as well.
 struct Exl3VeriCacheConfig {
     bool enabled=false;
-    float delta=0.5f;
-    // Tolerance blocks of 1024 rows (one wide verifier pass) amortize the
-    // per-pass weight reconstruction best; exact mode keeps short blocks.
+    float delta=1.0f;
+    // Blocks of 1024 rows (one wide verifier pass) amortize the per-pass
+    // weight reconstruction best; exact mode trades that for shorter
+    // redrafts after its more frequent corrections.
     int block=1024;
     static const Exl3VeriCacheConfig& get() {
         static const Exl3VeriCacheConfig value=[] {
@@ -50,8 +53,8 @@ struct Exl3VeriCacheConfig {
             if(m!="1" && m!="tolerance" && m!="exact")
                 throw std::invalid_argument("NINFER_EXL3_VERICACHE must be 0, 1, tolerance or exact");
             c.enabled=true;
-            if(m=="exact") {c.delta=0.0f;c.block=64;}
-            else if(const char* d=std::getenv("NINFER_EXL3_VERICACHE_DELTA")) c.delta=std::strtof(d,nullptr);
+            if(m=="exact") {c.delta=0.0625f;c.block=256;}
+            if(const char* d=std::getenv("NINFER_EXL3_VERICACHE_DELTA")) c.delta=std::strtof(d,nullptr);
             if(const char* b=std::getenv("NINFER_EXL3_VERICACHE_BLOCK")) c.block=std::atoi(b);
             if(c.block<1 || c.block>1024 || !(c.delta>=0.0f))
                 throw std::invalid_argument("NINFER_EXL3_VERICACHE_BLOCK must be 1..1024 and DELTA >= 0");
@@ -609,7 +612,7 @@ public:
             step(totals_.forward_ms);
             std::vector<std::int64_t> next(tokens.begin()+1,tokens.end());
             next.push_back(-1);
-            const auto scores=context_->exact_row_scores(next,stream_);
+            const auto scores=context_->exact_row_scores(next,stream_,delta);
             step(totals_.scores_ms);
             std::size_t reject=tokens.size();
             std::int64_t correction=-1;
@@ -955,6 +958,19 @@ private:
             staged+=static_cast<std::size_t>(segment.rows)*5*tap_hidden*
                 sizeof(std::uint16_t);
         };
+        // Coupled sampling keys each verifier row by the token position it
+        // predicts: chain rows by their index, sibling leaves by their depth.
+        std::vector<int> row_depths;
+        if(context_->device_sampling().active() && !sibling_offsets.empty()) {
+            for(int row=0;row<value.width-static_cast<int>(sibling_offsets.size());++row)
+                row_depths.push_back(row);
+            row_depths.insert(row_depths.end(),sibling_offsets.begin(),sibling_offsets.end());
+        }
+        context_->set_sampling_row_depths(row_depths);
+        struct RowDepthReset {
+            Exl3TextContext& context;
+            ~RowDepthReset() {context.set_sampling_row_depths({});}
+        } row_depth_reset{*context_};
         if(before_verify)before_verify(*context_);
         const auto verifier_start=Clock::now();
         value.verification=verify_exl3_outer_device_resident_reference(
