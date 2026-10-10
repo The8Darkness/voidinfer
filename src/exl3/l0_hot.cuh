@@ -6,10 +6,10 @@
 // Per layer and KV head, `slots` history rows are held as exact FP16 copies
 // of their L2 rows (original basis, post-RoPE). Each verifier round:
 //   l0_history_mma_kernel  every CTA first runs exact attention over its hot
-//                          tiles (l0_hot_cta), then its INT2 segment, which
+//                          tiles (l0_hot_cta), then its INT4 segment, which
 //                          skips hot rows and emits candidates
 //   l0_history_merge_kernel / l0_rotate_kernel
-//                          merge the INT2 partials in the rotated basis and the
+//                          merge the INT4 partials in the rotated basis and the
 //                          hot partials in the original basis, un-rotate the
 //                          former and add the latter; four extra merge CTAs
 //                          (l0_hot_select) rank the candidates against the
@@ -30,7 +30,7 @@ __device__ __forceinline__ int l0_hot_at(int row,int col) {
 }
 
 // Hot tiles of one history CTA (384 threads = 12 warps of (m-tile of 16 query
-// vectors, 64-dim value quarter)), run before its INT2 segment: 32-slot tiles
+// vectors, 64-dim value quarter)), run before its INT4 segment: 32-slot tiles
 // cta, cta + ctas, ... of KV head kv with an online softmax over FP16 MMAs,
 // one partial into slot `slot_index`. Spreading the tiles over every history
 // CTA keeps the exact pass off the critical path at any context length.
@@ -188,7 +188,7 @@ __device__ __forceinline__ void l0_hot_cta(unsigned char* smem,const std::uint16
 // empty slots stalest), pair them rank by rank while the candidate is better,
 // and publish the won (slot, row) pairs; the next round's encode_kernel fills
 // the won slots from the FP16 L2 planes. Runs as extra CTAs of the history
-// merge, after every reader of this round's hot set, so the next round's INT2
+// merge, after every reader of this round's hot set, so the next round's INT4
 // segments and hot tiles see one consistent set.
 constexpr int kL0HotSelectThreads=256;
 __device__ __forceinline__ int l0_hot_bin(float eff) {

@@ -19,7 +19,7 @@ struct Exl3NativeContextExtent {
     static constexpr std::uint32_t ordinary_limit = 32768;
     static constexpr std::uint32_t native64k_tokens = 65536;
     static constexpr std::uint32_t candidate128k_tokens = 131072;
-    // L0 OSCAR contexts keep FP16 K/V in mapped host memory and only INT2
+    // L0 OSCAR contexts keep FP16 K/V in mapped host memory and only INT4
     // history plus exact windows on the device (l0_oscar.cuh).
     static constexpr std::uint32_t l0_oscar_tokens = 262144;
     // L0 OSCAR per-row buffers (hidden states, taps) hold one layer-major prefill block.

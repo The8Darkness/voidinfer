@@ -5886,7 +5886,7 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
   const int active_rows=min(BM,rows-query_base);
   if(active_rows<=0) return;
   const int maximum_count=min(base+query_base+active_rows,capacity);
-  // L0 OSCAR: key tiles of [kSink, history_end) are served by the INT2
+  // L0 OSCAR: key tiles of [kSink, history_end) are served by the INT4
   // history kernel; virtual tile v maps to the sink tiles, then the tiles past
   // the history. Identity when history_end <= kSink.
   const int sink_tiles=ninfer::exl3::l0_oscar::kSink/BN;
@@ -6558,7 +6558,7 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const int t=lane&3;
     const int base=(position_device?*position_device:position)+query_offset;
     // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
-    // history end; the history itself is served by the INT2 kernel.
+    // history end; the history itself is served by the INT4 kernel.
     const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
     const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
@@ -6566,7 +6566,7 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const int last_count=base+rows;  // largest live key count of the block
     if(first>=last_count || base+1<1 || last_count>capacity) return;
     const int segment_end=min(first+kVerifyMmaKeys,last_count);
-    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT2
+    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT4
     // history kernel; a segment wholly inside it only publishes an empty slot.
     const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
     const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
@@ -6750,7 +6750,7 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
     const int t=lane&3;
     const int base=(position_device?*position_device:position)+query_offset;
     // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
-    // history end; the history itself is served by the INT2 kernel.
+    // history end; the history itself is served by the INT4 kernel.
     const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
     const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
@@ -6758,7 +6758,7 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
     const int last_count=base+rows;  // largest live key count of the block
     if(first>=last_count || base+1<1 || last_count>capacity) return;
     const int segment_end=min(first+kVerifyMmaKeys,last_count);
-    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT2
+    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT4
     // history kernel; a segment wholly inside it only publishes an empty slot.
     const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
     const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
@@ -7580,7 +7580,7 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             static const bool trace_alloc=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
             if(trace_alloc && bytes>=(256u<<10))std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB FA L0%c",bytes/1048576.0,10);
         };
-        // NINFER_EXL3_L0_GROWABLE (default 1): the INT2 code/meta planes keep
+        // NINFER_EXL3_L0_GROWABLE (default 1): the INT4 code/meta planes keep
         // one max_context address range per layer, physically backed only up
         // to the rows the context occupies (released at request reset).
         static const bool growable=[] {
@@ -7677,7 +7677,7 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         // (Engine lanes) decode at the same time: one set per owning context.
         static std::map<const void*,l0_oscar::LayerStorage> per_context;
         auto& shared=per_context[l0_scratch_owner_];
-        // Partial slots per (row, KV head): the INT2 segments, then one per CTA with hot tiles.
+        // Partial slots per (row, KV head): the INT4 segments, then one per CTA with hot tiles.
         const int slot_stride=l.segments*kL0HistoryStreams+std::min(l0_hot_tiles(l.hot_slots),l.segments);
         if(shared.segments<slot_stride) {
             // Earlier layers keep their (smaller) scratch; it is never released.
@@ -8351,8 +8351,15 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
             constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
             l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
                 rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
+            static const bool prefill_smem_configured=[] {
+                cuda_check(cudaFuncSetAttribute(l0_history_prefill_kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(l0_prefill_smem_bytes())),
+                    "configure L0 history prefill shared memory");
+                return true;
+            }();
+            (void)prefill_smem_configured;
             l0_history_prefill_kernel<<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
-                kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,0,stream>>>(l0_.q_rot,l0_.q_mu,
+                kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,l0_prefill_smem_bytes(),stream>>>(l0_.q_rot,l0_.q_mu,
                 l0_.k_codes,l0_.v_codes,reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.prefill_hist,
                 l0_.prefill_hist_stats,rows,l0_prefill_history);
             l0_history_split_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
@@ -8913,7 +8920,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                     launch(cudaGetLastError(),"L0 OSCAR exact history attention");
                     history_slot=l0_.hist_slot;
                 } else {
-                // The INT2 history chain (rotate, history, merge, rotate) is
+                // The INT4 history chain (rotate, history, merge, rotate) is
                 // independent of the exact-window flash pass until the final
                 // merge: it runs on a side branch of `stream` beside it.
                 // NINFER_EXL3_L0_HISTORY_FORK=0 keeps one stream.
@@ -8943,7 +8950,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 const auto& hot_config=l0_oscar::hot_config();
                 const auto hot=l0_oscar::hot_view(l0_);
                 // Every history CTA runs its share of the exact hot tiles first;
-                // their partials follow the INT2 segment partials.
+                // their partials follow the INT4 segment partials.
                 const int segments=history_lanes_>1?
                     std::max(4,l0_.segments/history_lanes_):l0_.segments;
                 const int hot_ctas=std::min(l0_hot_tiles(l0_.hot_slots),segments);

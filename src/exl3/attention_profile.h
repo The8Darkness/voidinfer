@@ -23,7 +23,7 @@ inline constexpr Exl3SegmentedAttentionRoute exl3_segmented_attention_route(
 // L0 OSCAR contexts keep only the sink and the recent window exact: verifier
 // segments cover at most this many keys past the history (l0_oscar.cuh).
 constexpr int kExl3L0ExactWindowKeys=2048;
-// L0 OSCAR (INT2 KV history in VRAM with exact hot rows, FP16 planes in mapped
+// L0 OSCAR (INT4 KV history in VRAM with exact hot rows, FP16 planes in mapped
 // host memory) is the default KV tier: NINFER_EXL3_L0_OSCAR unset or 1
 // enables it, 0 selects ordinary FP16 device KV.
 inline bool exl3_l0_oscar_enabled() {
@@ -36,7 +36,7 @@ inline bool exl3_l0_oscar_enabled() {
 // (NINFER_EXL3_L0_RECENT, 0..960 in steps of 64, default 960; the 2048-row device ring
 // also holds the 64-row alignment tail and a 1024-row prefill chunk). 0 keeps only
 // the 64-token sink and the current 64-row tail exact on the device; the rest
-// of the history is INT2 (pure OSCAR, e.g. under VeriCache verification).
+// of the history is INT4 (pure OSCAR, e.g. under VeriCache verification).
 
 inline int exl3_l0_recent_rows() {
     static const int value=[] {

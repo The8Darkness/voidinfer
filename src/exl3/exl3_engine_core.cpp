@@ -2445,7 +2445,11 @@ struct Exl3EngineCore::Impl {
                 // Initial per-token mismatch: exact checks catch every near-tie
                 // flip (~1% with 512 hot rows), the tolerance default far fewer.
                 horizon.mismatch=vericache.delta>=0.5f?0.0005:0.01;
-                int block_now=horizon.choose(vericache.block);
+                // Tolerance mode keeps the longest block: its corrections are rare
+                // and a verify pass is exclusive across lanes (at C>=2 it stalls
+                // every other lane, which the per-request model does not price).
+                const bool adaptive_horizon=vericache.delta<0.5f;
+                int block_now=adaptive_horizon?horizon.choose(vericache.block):vericache.block;
                 auto draft_mark=Clock::now();
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
@@ -2521,7 +2525,7 @@ struct Exl3EngineCore::Impl {
                     horizon.observe_pass(static_cast<int>(unverified.size()),
                         std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
                         verified.corrected,static_cast<int>(verified.tokens.size()));
-                    block_now=horizon.choose(vericache.block);
+                    if(adaptive_horizon)block_now=horizon.choose(vericache.block);
                     static const bool horizon_trace=std::getenv("NINFER_EXL3_VERICACHE_HORIZON_TRACE")!=nullptr;
                     if(horizon_trace)
                         std::fprintf(stderr,"VERICACHE_HORIZON rows=%zu corrected=%d tok_ms=%.2f pass=%.1f+%.3fx mismatch=%.4f next=%d\n",
@@ -2801,7 +2805,7 @@ struct Exl3EngineCore::Impl {
                 }
                 coordinator.complete(*host_lease);
                 host_lease.reset();
-                // Idle lanes hold no INT2 code VRAM: active agents' contexts
+                // Idle lanes hold no INT4 code VRAM: active agents' contexts
                 // grow into it (NINFER_EXL3_PARK_IDLE_CODES=0 keeps them).
                 static const bool park_idle_codes=[] {
                     const auto* value=std::getenv("NINFER_EXL3_PARK_IDLE_CODES");

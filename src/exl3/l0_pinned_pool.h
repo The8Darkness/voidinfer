@@ -3,6 +3,8 @@
 // so a resume uploads them with asynchronous DMA, carved from 64-block slabs
 // so parking does not pay a page-locking call per chunk. Blocks return to a
 // process-wide free list; slabs are kept for reuse.
+#include "exl3/l0_oscar_format.h"
+
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -16,8 +18,9 @@ namespace ninfer::exl3 {
 
 class Exl3L0PinnedPool {
 public:
-    // One 4096-row chunk: codes 2 x 4096 x 4 x 64 B + meta 2 x 4096 x 4 x 4 x 2 B.
-    static constexpr std::size_t kBlockBytes = 4096ull * 2 * 4 * 64 + 4096ull * 2 * 4 * 4 * 2;
+    // One 4096-row chunk: codes then FP16 meta (l0_oscar_format.h).
+    static constexpr std::size_t kBlockBytes = 4096ull * (l0_oscar_format::kRowCodeBytes +
+        l0_oscar_format::kRowMetaBytes);
     static constexpr std::size_t kSlabBlocks = 64;
 
     struct Block {

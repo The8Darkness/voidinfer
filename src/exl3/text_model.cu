@@ -3463,7 +3463,7 @@ struct Exl3TextContext::Impl {
     // Batched multi-agent continuation: this context's all-row verification
     // head over its rows of a shared layer stack (the all_head_rows path of
     // process_rows).
-    // Growable L0 FP16 planes follow the INT2 code backing: rows used plus a
+    // Growable L0 FP16 planes follow the INT4 code backing: rows used plus a
     // margin that spaces the map calls (1024 rows = one 2 MiB granule).
     static constexpr int kPlaneGrowthMarginRows=4096;
     static constexpr int kL0RetainedBackingRows=16384;
@@ -13566,7 +13566,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
             } else if(!impl_->host_kv.enabled) {
                 // The FP16 planes are the exact L2 record: VeriCache passes,
                 // exact prefill history and hot-row fills read every history
-                // row, so a restore (parked INT2 history included) writes all
+                // row, so a restore (parked INT4 history included) writes all
                 // of them; leaving encoded rows stale fed those readers the
                 // lane's previous conversation.
                 restore_kv(impl_->cache_k[layer]->ptr,true,0,state.position_);

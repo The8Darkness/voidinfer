@@ -386,9 +386,9 @@ private:
     std::array<std::vector<std::uint16_t>, 48> convolution_;
     std::vector<std::uint16_t> logits_, embedding_;
     std::array<std::vector<std::uint16_t>, 5> taps_;
-    // L0 OSCAR INT2 history parked with the state, so a resume skips
+    // L0 OSCAR INT4 history parked with the state, so a resume skips
     // re-encoding: per full-attention layer, immutable chunks of
-    // kL0ChunkRows encoded rows (codes [rows][4][64] K then V, FP16 meta
+    // kL0ChunkRows encoded rows (codes [rows][4][128] K then V, FP16 meta
     // [rows][4][4] K then V) covering [0, l0_rows_). Complete chunks are
     // shared with later states of the same lineage.
 public:
@@ -400,8 +400,8 @@ public:
         std::uint16_t* meta() const noexcept {
             return reinterpret_cast<std::uint16_t*>(block.data + code_bytes());
         }
-        std::size_t code_bytes() const noexcept { return static_cast<std::size_t>(rows) * 2 * 4 * 64; }
-        std::size_t meta_bytes() const noexcept { return static_cast<std::size_t>(rows) * 2 * 4 * 4 * 2; }
+        std::size_t code_bytes() const noexcept { return static_cast<std::size_t>(rows) * l0_oscar_format::kRowCodeBytes; }
+        std::size_t meta_bytes() const noexcept { return static_cast<std::size_t>(rows) * l0_oscar_format::kRowMetaBytes; }
     };
 private:
     int l0_rows_ = 0;
@@ -790,7 +790,7 @@ public:
     // The L0 planes of this context still hold every KV row of `state`
     // (its pages are lane-backed by this context; lane_kv_source.h).
     bool kv_lane_resident(const Exl3ExactHostState& state) const noexcept;
-    // Between requests: returns the device backing of the L0 INT2 codes (the
+    // Between requests: returns the device backing of the L0 INT4 codes (the
     // exported root keeps their pinned copy) and clears exact residency, so
     // the next request restores them; the lane-backed FP16 planes stay.
     void park_l0_codes() noexcept;
@@ -984,7 +984,7 @@ public:
 
     // L0 OSCAR exact history (VeriCache verifier, lossless ingestion): while
     // set, every full-attention layer attends to its history from the FP16 L2
-    // planes instead of the INT2 codes and hot rows.
+    // planes instead of the INT4 codes and hot rows.
     void set_l0_exact_history(bool exact) noexcept;
     // Batched multi-agent rounds: one target forward over this context's
     // verifier rows followed by the peer's (each 2..8 rows), sharing every

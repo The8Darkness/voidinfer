@@ -670,7 +670,7 @@ public:
     // Concurrent lanes: switch between the private decode window ring and the
     // shared prompt-scale ring, carrying the window rows of `position`.
     void l0_select_ring(bool prompt, int position, cudaStream_t stream);
-    // Parks / reinstalls the encoded INT2 history (rows [0, watermark)).
+    // Parks / reinstalls the encoded INT4 history (rows [0, watermark)).
     // Export returns the watermark; import follows l0_refresh_window.
     int l0_history_watermark(cudaStream_t stream) const;
     // Rows [first, first + rows): codes K then V ([rows][4][64] each), FP16
@@ -681,7 +681,7 @@ public:
                            const std::uint16_t* meta, cudaStream_t stream);
     void l0_set_history_watermark(int rows, int position, cudaStream_t stream);
     // L0 OSCAR exact history (l0_exact.cuh): while set, history attention reads
-    // the FP16 L2 planes instead of the INT2 codes and hot rows (VeriCache
+    // the FP16 L2 planes instead of the INT4 codes and hot rows (VeriCache
     // verifier passes and lossless ingestion). No effect without L0 storage.
     void set_l0_exact_history(bool exact) noexcept { l0_exact_ = l0_exact_prefill_ = exact; }
     // Batched multi-agent rounds: while set, forward() runs its row-independent
@@ -953,7 +953,7 @@ private:
     std::uint16_t* k_cache_ = nullptr;
     // KV-tier fidelity research (kv_fakequant.cuh): aged-row watermark and rotation bank.
     int* fakequant_watermark_ = nullptr;
-    // L0 OSCAR INT2 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
+    // L0 OSCAR INT4 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
     l0_oscar::LayerStorage l0_{};
     std::array<std::unique_ptr<Exl3GrowableDeviceRegion>,4> l0_regions_{};
     // Window ring rows (keys wrap modulo) and the shared prompt-scale ring of
