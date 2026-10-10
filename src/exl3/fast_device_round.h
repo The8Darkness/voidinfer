@@ -24,24 +24,22 @@
 
 namespace ninfer::exl3 {
 
-// VeriCache (NINFER_EXL3_VERICACHE): L0 OSCAR drafts blocks of up to
-// NINFER_EXL3_VERICACHE_BLOCK tokens that are re-run in one pass against the
-// exact FP16-L2 history before publication; the first drafted token the exact
-// model would not have produced is replaced and the rest of the block is
-// redrafted (adaptive: the next block shrinks after a correction). A drafted
-// token is kept when its exact logit trails the exact choice by at most
-// NINFER_EXL3_VERICACHE_DELTA (sampled requests: the coupled perturbed
-// values, sampled_select.cuh). "exact": 0.0625, twice the arithmetic floor
-// measured between the decode and verifier kernels on identical exact
-// history (max 0.03 over 2K tokens), blocks of 256; "1"/"tolerance" (default):
-// 1.0 (512 hot rows: raw drafts trail by up to ~1.5 at 32K), blocks of 1024. The prompt is ingested with exact history as well.
+// VeriCache (NINFER_EXL3_VERICACHE): L0 OSCAR drafts blocks of tokens that
+// are re-run in one pass against the exact FP16-L2 history before
+// publication; the first drafted token the exact model would not have
+// produced is replaced and the rest of the block is redrafted. The block
+// length is chosen per request (engine DraftHorizon, VeriCache paper) up to
+// NINFER_EXL3_VERICACHE_BLOCK. A drafted token is kept when its exact logit
+// trails the exact choice by at most NINFER_EXL3_VERICACHE_DELTA (sampled
+// requests: the coupled perturbed values, sampled_select.cuh). "exact":
+// 0.0625, twice the arithmetic floor measured between the decode and
+// verifier kernels on identical exact history (max 0.03 over 2K tokens);
+// "1"/"tolerance" (default): 1.0 (512 hot rows: raw drafts trail by up to
+// ~1.5 at 32K). The prompt is ingested with exact history as well.
 struct Exl3VeriCacheConfig {
     bool enabled=false;
     float delta=1.0f;
-    // Blocks of 1024 rows (one wide verifier pass) amortize the per-pass
-    // weight reconstruction best; exact mode trades that for shorter
-    // redrafts after its more frequent corrections.
-    int block=1024;
+    int block=1024;   // longest verify block
     static const Exl3VeriCacheConfig& get() {
         static const Exl3VeriCacheConfig value=[] {
             Exl3VeriCacheConfig c;
@@ -53,7 +51,7 @@ struct Exl3VeriCacheConfig {
             if(m!="1" && m!="tolerance" && m!="exact")
                 throw std::invalid_argument("NINFER_EXL3_VERICACHE must be 0, 1, tolerance or exact");
             c.enabled=true;
-            if(m=="exact") {c.delta=0.0625f;c.block=256;}
+            if(m=="exact") c.delta=0.0625f;
             if(const char* d=std::getenv("NINFER_EXL3_VERICACHE_DELTA")) c.delta=std::strtof(d,nullptr);
             if(const char* b=std::getenv("NINFER_EXL3_VERICACHE_BLOCK")) c.block=std::atoi(b);
             if(c.block<1 || c.block>1024 || !(c.delta>=0.0f))

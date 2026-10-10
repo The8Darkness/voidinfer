@@ -2400,12 +2400,59 @@ struct Exl3EngineCore::Impl {
                 // Full-KV prefetch (VeriCache paper): the exact history of the
                 // verified root streams to the GPU while the block drafts.
                 context->prefetch_exact_history(stream);
-                // Adaptive verify block: a correction discards the drafted rows
-                // past it, so after one the block shrinks to a quarter (at least
-                // kMinVerifyBlock); every clean block doubles it back up to the
-                // configured size.
-                constexpr int kMinVerifyBlock=128;
-                int block_now=vericache.block;
+                // Draft length per request (VeriCache paper, Fig. 8 / Alg. 1): the
+                // block that maximizes expected kept tokens per unit time from
+                // this request's measured drafting cost per token, verify-pass
+                // cost (a + b rows) and per-token mismatch rate. A mismatch at
+                // row j keeps j + 1 tokens, discards the rest of the drafted
+                // block and costs a fix pass over j + 1 rows.
+                struct DraftHorizon {
+                    double tok_ms=5.0,pass_a=25.0,pass_b=0.3,mismatch=0.004;
+                    // Recursive least squares (forgetting 0.9) of pass ms on [1, rows].
+                    double p00=100.0,p01=0.0,p11=1.0;
+                    void observe_draft(double ms,int tokens) {
+                        if(tokens>0 && ms>0) tok_ms=0.8*tok_ms+0.2*(ms/tokens);
+                    }
+                    void observe_pass(int rows,double ms,bool corrected,int checked) {
+                        if(!corrected) {
+                            constexpr double lambda=0.9;
+                            const double x0=1.0,x1=rows;
+                            const double px0=p00*x0+p01*x1,px1=p01*x0+p11*x1;
+                            const double denom=lambda+x0*px0+x1*px1;
+                            const double k0=px0/denom,k1=px1/denom;
+                            const double err=ms-(pass_a+pass_b*rows);
+                            pass_a=std::max(1.0,pass_a+k0*err);
+                            pass_b=std::max(0.0,pass_b+k1*err);
+                            const double n00=(p00-k0*px0)/lambda,n01=(p01-k0*px1)/lambda,n11=(p11-k1*px1)/lambda;
+                            p00=n00;p01=n01;p11=n11;
+                        }
+                        if(checked>0) {
+                            const double w=std::min(1.0,checked/512.0);
+                            mismatch=std::clamp((1-w)*mismatch+w*(corrected?1.0:0.0)/checked,1e-5,0.2);
+                        }
+                    }
+                    int choose(int limit) const {
+                        // Verify passes of 9..32 rows take the coherent M32 projections,
+                        // 256+ the reconstruct+GEMM route; 33..255 rows have neither.
+                        static constexpr int kCandidates[]={16,24,32,256,384,512,768,1024};
+                        int best=std::min(limit,kCandidates[0]);
+                        double best_rate=-1;
+                        for(const int x:kCandidates) {
+                            if(x>limit) break;
+                            const double miss=1.0-std::pow(1.0-mismatch,x);
+                            const double kept=miss>1e-12?miss/mismatch:x;   // tokens up to and incl. the correction
+                            const double time=x*tok_ms+pass_a+pass_b*x+miss*(pass_a+pass_b*std::min<double>(x,kept));
+                            const double rate=std::min<double>(kept,x)/time;
+                            if(rate>best_rate) {best_rate=rate;best=x;}
+                        }
+                        return best;
+                    }
+                } horizon;
+                // Initial per-token mismatch: exact checks catch every near-tie
+                // flip (~1% with 512 hot rows), the tolerance default far fewer.
+                horizon.mismatch=vericache.delta>=0.5f?0.0005:0.01;
+                int block_now=horizon.choose(vericache.block);
+                auto draft_mark=Clock::now();
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
                 // NINFER_EXL3_LANE_TRACE: per-request lane time attribution.
@@ -2473,9 +2520,19 @@ struct Exl3EngineCore::Impl {
                     lt_mark=Clock::now();
                     const BatchedInactive verify_inactive(lane_batched_verify[lane_index]);
                     const PromptPass verify_pass(*this,stream);
+                    horizon.observe_draft(std::chrono::duration<double,std::milli>(Clock::now()-draft_mark).count(),
+                        static_cast<int>(unverified.size()));
+                    const auto pass_start=Clock::now();
                     const auto verified=round->verify(unverified,vericache.delta);
-                    block_now=verified.corrected?std::max(std::min(kMinVerifyBlock,vericache.block),block_now/4):
-                        std::min(vericache.block,block_now*2);
+                    horizon.observe_pass(static_cast<int>(unverified.size()),
+                        std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
+                        verified.corrected,static_cast<int>(verified.tokens.size()));
+                    block_now=horizon.choose(vericache.block);
+                    static const bool horizon_trace=std::getenv("NINFER_EXL3_VERICACHE_HORIZON_TRACE")!=nullptr;
+                    if(horizon_trace)
+                        std::fprintf(stderr,"VERICACHE_HORIZON rows=%zu corrected=%d tok_ms=%.2f pass=%.1f+%.3fx mismatch=%.4f next=%d\n",
+                            unverified.size(),verified.corrected?1:0,horizon.tok_ms,horizon.pass_a,horizon.pass_b,
+                            horizon.mismatch,block_now);
                     runtime_memory_mark("verify",lane_index);
                     lt_verify+=lt_ms(lt_mark);
                     unverified.clear();
@@ -2541,6 +2598,7 @@ struct Exl3EngineCore::Impl {
                     round->commit_verification(retained);
                     if(finished)break;
                     context->prefetch_exact_history(stream);
+                    draft_mark=Clock::now();
                 }
                 // Unverified drafted tokens (cancellation) are never published: rewind.
                 if(round->frontier()!=round->verified_frontier()) {

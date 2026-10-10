@@ -9966,7 +9966,7 @@ void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
     if(admission==Exl3CudaLinearAdmission::target_continuation_head &&
        !target_head_small_m_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared head requires admitted H6 small-M workspace");
-    if (draft_batched_enabled_ && rows > 8) {
+    if (coherent_batched_rows(metadata, rows)) {
         transform_input(weights, metadata, input, rows, stream);
         forward_from_transformed(weights, metadata, transformed_, output, rows, stream, admission);
         return;
@@ -11133,6 +11133,21 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
 // bound below four CTAs per SM). 4-agent forward 24.3 -> 22.1 ms; 3 or 6-8
 // slots per SM measured slower, and 9..16-row calls keep their split (the
 // same rule measured 18.0 -> 19.7 ms there).
+bool Exl3CudaLinearWorkspace::coherent_batched_rows(const Exl3CudaLinearMetadata& metadata,
+    int rows) const noexcept {
+    if(rows<=8) return false;
+    if(draft_batched_enabled_) return true;
+    static const bool target_m32=[] {
+        const char* value=std::getenv("NINFER_EXL3_TARGET_COHERENT_M32");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(!target_m32 || rows>32 || rows>max_rows_ || out_features_%128 ||
+       metadata.K<4 || metadata.K>7 || metadata.mcg || !metadata.mul1 || metadata.has_bias)
+        return false;
+    const std::size_t plane=static_cast<std::size_t>(rows)*out_features_*sizeof(float);
+    return accumulation_capacity_bytes_>=plane*static_cast<std::size_t>(coherent_m32_split(rows));
+}
+
 int Exl3CudaLinearWorkspace::coherent_m32_split(int rows) const noexcept {
     static const int slots = [] {
         int device = 0, sms = 0;
@@ -12462,8 +12477,8 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     Exl3LinearWorkspaceRequirements::derive(in_features_,out_features_,rows,true,true)
         .require_disjoint_borrowed_views(transformed_input,accum_);
 
-    if (draft_batched_enabled_ && out_features_ % 128 == 0 &&
-        metadata.K >= 4 && metadata.K <= 7) {
+    if ((draft_batched_enabled_ || coherent_batched_rows(metadata, rows)) &&
+        out_features_ % 128 == 0 && metadata.K >= 4 && metadata.K <= 7) {
         // The K split fills the resident slots within the workspace's
         // accumulation planes (coherent_m32_split; the vocabulary head keeps
         // one). 2-agent drafts (16 rows): 2.9 -> 2.75 ms per round; a lone

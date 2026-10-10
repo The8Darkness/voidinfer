@@ -971,6 +971,10 @@ public:
     int coherent_wide_k6_split_count(int rows) const noexcept;
     int coherent_split_override(const char* name, int rows) const;
     int coherent_m32_split(int rows) const noexcept;
+    // Coherent packed producer for 9..32-row calls: draft-batched workspaces,
+    // and (NINFER_EXL3_TARGET_COHERENT_M32, default on) target calls of one context
+    // (VeriCache verify passes) whose shape it covers (K 4..7, 128-column).
+    bool coherent_batched_rows(const Exl3CudaLinearMetadata& metadata, int rows) const noexcept;
     bool coherent_down_k6_candidate(const Exl3CudaLinearMetadata& metadata,
         int rows,Exl3CudaLinearAdmission admission) const noexcept;
     bool coherent_down_k7_candidate(const Exl3CudaLinearMetadata& metadata,
