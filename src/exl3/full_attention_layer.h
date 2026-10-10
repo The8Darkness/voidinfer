@@ -684,6 +684,14 @@ public:
     // the FP16 L2 planes instead of the INT2 codes and hot rows (VeriCache
     // verifier passes and lossless ingestion). No effect without L0 storage.
     void set_l0_exact_history(bool exact) noexcept { l0_exact_ = l0_exact_prefill_ = exact; }
+    // VeriCache: device copy of this layer's exact history rows [64, end)
+    // (null k clears). Read by exact multi-row passes until replaced.
+    // L0 exact history rows of a pass at `position`: [64, end).
+    static int l0_history_end_for(int position) noexcept;
+    void set_exact_prefetch(const std::uint16_t* k,const std::uint16_t* v,int end,
+                            cudaEvent_t ready) noexcept {
+        exact_prefetch_k_=k;exact_prefetch_v_=v;exact_prefetch_end_=k?end:0;exact_prefetch_ready_=ready;
+    }
     // Batched multi-agent rounds: while set, forward() runs its row-independent
     // work over own_rows + every peer's rows, and each peer layer (another
     // agent's context, same model layer) runs its own stateful core on its rows
@@ -986,6 +994,10 @@ private:
     const void* l0_scratch_owner_ = nullptr;
     bool l0_exact_ = false;          // verifier/decode rows (<= 8)
     bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)
+    const std::uint16_t* exact_prefetch_k_ = nullptr;
+    const std::uint16_t* exact_prefetch_v_ = nullptr;
+    int exact_prefetch_end_ = 0;
+    cudaEvent_t exact_prefetch_ready_ = nullptr;
 
     int fakequant_bank_ = 0;
     std::uint16_t* v_cache_ = nullptr;

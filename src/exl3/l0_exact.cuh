@@ -263,9 +263,18 @@ inline void l0_launch_exact_history(const void* q,const std::uint16_t* k_src,con
 // gain at 64K-128K). 16K-row pieces halve the per-piece split partials and
 // merges against 8K (128K prefill -2.9%) for 64 MiB more staging.
 constexpr int kL0ExactPieceRows=16384;
+// VeriCache prefetch (Exl3TextContext::prefetch_exact_history): L2 rows
+// [kSink, end) of this layer streamed into device memory during drafting;
+// row i of k/v is history row kSink + i. `ready` completes the copy.
+struct L0ExactPrefetch {
+    const std::uint16_t* k=nullptr;
+    const std::uint16_t* v=nullptr;
+    int end=0;
+    cudaEvent_t ready=nullptr;
+};
 inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,const std::uint16_t* v_src,
     float* out,float* stats,float* numer,float* split_stats,int slot,int rows,int history_end,
-    cudaStream_t stream) {
+    cudaStream_t stream,const L0ExactPrefetch& prefetched={}) {
     struct Stage {
         std::uint16_t* k[2]{}; std::uint16_t* v[2]{};
         cudaStream_t copy=nullptr;
@@ -295,15 +304,31 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
         const char* value=std::getenv("NINFER_EXL3_L0_EARLY_HISTORY_COPY");
         return !value || std::strcmp(value,"0")!=0;
     }();
+    // Prefetched rows first (no copy on this pass), then the remainder staged.
+    int begin=l0::kSink;
+    if(prefetched.k && prefetched.end>l0::kSink) {
+        const int end=std::min(prefetched.end,history_end);
+        if(end>l0::kSink) {
+            if(prefetched.ready)
+                cuda_check(cudaStreamWaitEvent(stream,prefetched.ready,0),"L0 exact prefetch wait");
+            const int keys=end-l0::kSink;
+            launch_fa2_prefill_variant<4>(static_cast<const std::uint16_t*>(q),prefetched.k,prefetched.v,
+                nullptr,rows,keys,keys,out,stats,stream,0,false);
+            l0_exact_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(out,stats,4,rows,numer,
+                split_stats,slot,nullptr,nullptr,false);
+            begin=end;
+            if(begin>=history_end) return;
+        }
+    }
     cuda_check(cudaEventRecord(stage.fork,stream),"L0 exact staging fork");
     const auto& written=ninfer::exl3::l0_history_written();
     const int early_limit=early_copy && written.event && written.stream==stream &&
         written.limit>l0::kSink ? written.limit : -1;
     bool forked=early_limit<0;
     cuda_check(cudaStreamWaitEvent(stage.copy,forked?stage.fork:written.event,0),"L0 exact staging fork");
-    const int pieces=history_end>l0::kSink?(history_end-l0::kSink+kL0ExactPieceRows-1)/kL0ExactPieceRows:1;
+    const int pieces=history_end>begin?(history_end-begin+kL0ExactPieceRows-1)/kL0ExactPieceRows:1;
     const auto submit=[&](int piece) {
-        const int b=piece&1,first=l0::kSink+piece*kL0ExactPieceRows;
+        const int b=piece&1,first=begin+piece*kL0ExactPieceRows;
         const int last=std::min(history_end,first+kL0ExactPieceRows);
         cuda_check(cudaStreamWaitEvent(stage.copy,stage.consumed[b],0),"L0 exact staging reuse");
         const auto copy=[&](int from,int to) {
@@ -326,7 +351,7 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
     submit(0);
     for(int piece=0;piece<pieces;++piece) {
         if(piece+1<pieces) submit(piece+1);
-        const int b=piece&1,first=l0::kSink+piece*kL0ExactPieceRows;
+        const int b=piece&1,first=begin+piece*kL0ExactPieceRows;
         const int last=std::max(first,std::min(history_end,first+kL0ExactPieceRows));
         cuda_check(cudaStreamWaitEvent(stream,stage.ready[b],0),"L0 exact staging wait");
         // The staged piece is a plain linear cache for the FA2 prefill kernel:
@@ -336,7 +361,7 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
             launch_fa2_prefill_variant<4>(static_cast<const std::uint16_t*>(q),stage.k[b],stage.v[b],
                 nullptr,rows,piece_rows,piece_rows,out,stats,stream,0,false);
         l0_exact_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(out,stats,piece_rows>0?4:0,rows,numer,
-            split_stats,slot,nullptr,nullptr,piece>0);
+            split_stats,slot,nullptr,nullptr,piece>0 || begin>l0::kSink);
         cuda_check(cudaEventRecord(stage.consumed[b],stream),"L0 exact staging consumed");
     }
 }

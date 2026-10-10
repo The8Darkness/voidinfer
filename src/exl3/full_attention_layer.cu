@@ -7827,6 +7827,10 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
     }
 }
 
+int Exl3FullAttentionLayer::l0_history_end_for(int position) noexcept {
+    return l0_oscar::history_end(position);
+}
+
 void Exl3FullAttentionLayer::l0_rewind(int position, cudaStream_t stream) {
     if(!l0_.k_codes) return;
     l0_oscar::rewind_kernel<<<16,256,0,stream>>>(l0_.state,l0_oscar::hot_view(l0_),position);
@@ -8345,7 +8349,8 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 // Exact history from the FP16 L2 planes, merged straight into split 4.
                 l0_exact_history_staged(qr,k_cache_,v_cache_,l0_.prefill_hist,l0_.prefill_hist_stats,
                     l0_.prefill_split+static_cast<std::size_t>(4)*rows*kQHeads*kHeadDim,l0_.prefill_split_stats,4,rows,
-                    l0_prefill_history,stream);
+                    l0_prefill_history,stream,{exact_prefetch_k_,exact_prefetch_v_,exact_prefetch_end_,
+                    exact_prefetch_ready_});
             } else {
             const auto& a=l0_oscar::assets();
             constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
@@ -8902,7 +8907,24 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 if(l0_exact_) {
                     // Exact history from the FP16 L2 planes: the rotated term is
                     // zero and l0_rotate_kernel adds the original-basis numerator.
-                    const int splits=std::max(1,std::min(l0_.segments,4*l0_.prefill_rows/rows));
+                    int splits=std::max(1,std::min(l0_.segments,4*l0_.prefill_rows/rows));
+                    // VeriCache prefetched rows [kSink, end) from device memory, the
+                    // rest of the live history from the L2 planes.
+                    const int prefetched=exact_prefetch_k_?std::min(exact_prefetch_end_,
+                        std::min(l0_oscar::history_end(position),cache_capacity_)):0;
+                    if(prefetched>l0_oscar::kSink && splits>=2) {
+                        if(exact_prefetch_ready_)
+                            launch(cudaStreamWaitEvent(stream,exact_prefetch_ready_,0),"L0 exact prefetch wait");
+                        const int head=std::max(1,splits-1);
+                        l0_launch_exact_history(qr,exact_prefetch_k_,exact_prefetch_v_,l0_oscar::kSink,
+                            l0_.prefill_hist,l0_.prefill_hist_stats,rows,l0_oscar::kSink,prefetched,position,
+                            position_device_,cache_capacity_,head,stream);
+                        const std::size_t vectors=static_cast<std::size_t>(rows)*kQHeads;
+                        l0_launch_exact_history(qr,k_cache_,v_cache_,0,
+                            l0_.prefill_hist+static_cast<std::size_t>(head)*vectors*kHeadDim,
+                            l0_.prefill_hist_stats+static_cast<std::size_t>(head)*vectors*2,rows,
+                            prefetched,-1,position,position_device_,cache_capacity_,splits-head,stream);
+                    } else
                     l0_launch_exact_history(qr,k_cache_,v_cache_,0,l0_.prefill_hist,l0_.prefill_hist_stats,rows,
                         l0_oscar::kSink,-1,position,position_device_,cache_capacity_,splits,stream);
                     l0_exact_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
