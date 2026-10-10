@@ -7591,7 +7591,13 @@ bool Exl3CudaReconstructGemmWorkspace::supports(
         // K8 (attention K/V) is admitted only to the fused decode route.
         const bool k8_layer=metadata.K==8 && impl_->mxfp8_enabled &&
             impl_->fused_decode_enabled && impl_->reuse_active && rows>=256;
-        return bounded_shape && (metadata.K == 6 || metadata.K == 7 || k5_layer || k8_layer) &&
+        // Row-major wide passes (VeriCache verify, short prompt chunks) take
+        // the FP16 reconstruct + GEMM route at every stored width: the
+        // direct trellis kernels they fell back to ran ~2x slower.
+        const bool wide_fp16=!impl_->reuse_active && rows>=256 &&
+            metadata.K>=4 && metadata.K<=8;
+        return bounded_shape &&
+            (metadata.K == 6 || metadata.K == 7 || k5_layer || k8_layer || wide_fp16) &&
             metadata.mul1 && !metadata.mcg && !metadata.has_bias;
     }
     const bool primary_shape =

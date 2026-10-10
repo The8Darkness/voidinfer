@@ -54,6 +54,13 @@ int main() {
         }
         cudaDeviceSynchronize();
         std::ofstream out(out_path);
+        // LONG_NLL_TOPK_OUT: per scored position the top-LONG_NLL_TOPK (default
+        // 60) token ids (int32) then their log-probabilities (float32), for KL
+        // against a reference record.
+        const char* topk_path = std::getenv("LONG_NLL_TOPK_OUT");
+        const int topk = std::getenv("LONG_NLL_TOPK") ? std::atoi(std::getenv("LONG_NLL_TOPK")) : 60;
+        std::ofstream topk_out;
+        if (topk_path) topk_out.open(topk_path, std::ios::binary);
         double total = 0.0;
         int scored = 0;
         for (int i = 0; i < continuation; ++i) {
@@ -65,6 +72,17 @@ int main() {
             double sum = 0.0;
             for (const float l : logits) sum += std::exp(static_cast<double>(l) - mx);
             const double nll = -(static_cast<double>(logits[static_cast<std::size_t>(token)]) - mx - std::log(sum));
+            if (topk_out) {
+                std::vector<std::int32_t> order(logits.size());
+                for (std::size_t v = 0; v < order.size(); ++v) order[v] = static_cast<std::int32_t>(v);
+                std::partial_sort(order.begin(), order.begin() + topk, order.end(),
+                    [&](std::int32_t a, std::int32_t b) { return logits[a] > logits[b]; });
+                std::vector<float> lp(static_cast<std::size_t>(topk));
+                for (int j = 0; j < topk; ++j)
+                    lp[j] = static_cast<float>(static_cast<double>(logits[order[j]]) - mx - std::log(sum));
+                topk_out.write(reinterpret_cast<const char*>(order.data()), topk * sizeof(std::int32_t));
+                topk_out.write(reinterpret_cast<const char*>(lp.data()), topk * sizeof(float));
+            }
             total += nll;
             ++scored;
             // LONG_NLL_GREEDY=1: free greedy generation (token = argmax) and the
