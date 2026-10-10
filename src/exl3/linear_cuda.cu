@@ -2331,6 +2331,23 @@ void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
     }
 }
 
+// Whether a block-scaled prefill projection uses NVFP4 (else MXFP8) under
+// NVFP4 policy `mode` (see the policy at workspace construction).
+inline bool nvfp4_projection(int mode, const Exl3CudaLinearMetadata& metadata, int layer) {
+    const bool gate_up = metadata.in_features == 5120 && metadata.out_features == 17408;
+    const bool down = metadata.in_features == 17408 && metadata.out_features == 5120;
+    const bool gdn_qkvz = metadata.in_features == 5120 &&
+        (metadata.out_features == 10240 || metadata.out_features == 6144);
+    switch (mode) {
+    case 1: return true;
+    case 2: return gate_up || down;
+    case 3: return (gate_up || down) && layer >= 0 && layer < 56;
+    case 4: return gate_up || down || gdn_qkvz;
+    case 5: return down || (gate_up && layer >= 32);
+    default: return false;
+    }
+}
+
 // Transformed activations are bounded well below 4 on this model (observed
 // per-site maxima <= 0.49 over 4K/16K code and prose prefills), so the NVFP4
 // activation global scale is a static bound, as with calibrated input scales.
@@ -7215,17 +7232,20 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->mxfp8_enabled=accept_all_model_shapes &&
         (!mxfp8 || std::strcmp(mxfp8,"1")==0);
-    // NVFP4 prefill numerical policy (default 2 = MLP gate/up/down only,
-    // quality-gated; 0 = MXFP8 control; 1 = all admitted prefill projections,
-    // rejected on held-out quality: +0.039 overall, prose +0.068).
-    // Requires the MXFP8 route.
+    // NVFP4 prefill numerical policy (nvfp4_projection). Default 5 = MLP down
+    // projections of every layer + MLP gate/up of layers 32..63: lossless on
+    // the paired long-context panel (L0, exact prompt history, 24 fixtures
+    // 4K-32K: -0.0001 nats vs full-precision ingest) at 4K prefill 0.48 s.
+    // 0 = MXFP8 everywhere (lossless, 0.56 s); 2 = MLP gate/up/down (+0.029,
+    // wikitext +0.11: early-layer gate/up), 0.44 s; 1 = all projections
+    // (+0.035), 0.39 s; 3 = MLP layers 0..55 (NInfer artifact); 4 = MLP + GDN
+    // QKV/Z. Requires the MXFP8 route.
     const char* nvfp4=std::getenv("NINFER_EXL3_PREFILL_NVFP4");
-    if(nvfp4 && std::strcmp(nvfp4,"0")!=0 && std::strcmp(nvfp4,"1")!=0 &&
-       std::strcmp(nvfp4,"2")!=0 && std::strcmp(nvfp4,"3")!=0 && std::strcmp(nvfp4,"4")!=0) {
+    if(nvfp4 && (std::strlen(nvfp4)!=1 || nvfp4[0]<'0' || nvfp4[0]>'5')) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0..4");
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0..5");
     }
-    impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 2) : 0;
+    impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 5) : 0;
     const char* fused_decode=std::getenv("NINFER_EXL3_PREFILL_FUSED_DECODE");
     if(fused_decode && std::strcmp(fused_decode,"0")!=0 && std::strcmp(fused_decode,"1")!=0) {
         delete impl_; impl_=nullptr;
@@ -8128,16 +8148,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const bool slot_block_scaled = impl_->mxfp8_enabled && fast_fp16_destination &&
         !fused_original && rows >= 16 &&
         metadata.in_features % 128 == 0 && metadata.out_features % 128 == 0;
-    const bool slot_mlp_shape =
-        (metadata.in_features == 5120 && metadata.out_features == 17408) ||
-        (metadata.in_features == 17408 && metadata.out_features == 5120);
-    const bool slot_gdn_qkvz_shape = metadata.in_features == 5120 &&
-        (metadata.out_features == 10240 || metadata.out_features == 6144);
-    const bool slot_nvfp4 = slot_block_scaled && (impl_->nvfp4_mode == 1 ||
-        (impl_->nvfp4_mode == 2 && slot_mlp_shape) ||
-        (impl_->nvfp4_mode == 4 && (slot_mlp_shape || slot_gdn_qkvz_shape)) ||
-        (impl_->nvfp4_mode == 3 && slot_mlp_shape && impl_->prefill_layer >= 0 &&
-         impl_->prefill_layer < 56));
+    const bool slot_nvfp4 = slot_block_scaled &&
+        nvfp4_projection(impl_->nvfp4_mode, metadata, impl_->prefill_layer);
     const std::size_t elements =
         static_cast<std::size_t>(metadata.in_features) * metadata.out_features;
     static const bool compact_slots = [] {
@@ -8219,17 +8231,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         reconstructed != impl_->reconstructed;
     std::uint8_t* const mx_weight =
         mxfp8 ? reinterpret_cast<std::uint8_t*>(reconstructed) : nullptr;
-    const bool mlp_shape =
-        (metadata.in_features == 5120 && metadata.out_features == 17408) ||
-        (metadata.in_features == 17408 && metadata.out_features == 5120);
-    // Mode 3 mirrors the NInfer Qwen3.8 NVFP4 artifact: MLP layers 0..55.
-    const bool gdn_qkvz_shape = metadata.in_features == 5120 &&
-        (metadata.out_features == 10240 || metadata.out_features == 6144);
-    const bool nvfp4 = mxfp8 && (impl_->nvfp4_mode == 1 ||
-        (impl_->nvfp4_mode == 2 && mlp_shape) ||
-        (impl_->nvfp4_mode == 4 && (mlp_shape || gdn_qkvz_shape)) ||
-        (impl_->nvfp4_mode == 3 && mlp_shape && impl_->prefill_layer >= 0 &&
-         impl_->prefill_layer < 56));
+    const bool nvfp4 = mxfp8 &&
+        nvfp4_projection(impl_->nvfp4_mode, metadata, impl_->prefill_layer);
     // NVFP4 slot: packed values (k*n/2), block scales (n x k/16), then the
     // FP32 weight global scale, all inside the FP16-sized reuse slot.
     const std::size_t nv_value_bytes =

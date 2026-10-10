@@ -36,11 +36,21 @@ int main() {
         auto model = Exl3TextModel::load(target, context + continuation + 16);
         auto ctx = model->create_context(true);
         const std::span<const std::int64_t> all(ids.data(), ids.size());
-        ctx->prefill(all.first(16));
-        for (int at = 16; at < context;) {
-            const int rows = std::min(1024, context - at);
-            ctx->append_prefill_wide(all.subspan(at, rows));
-            at += rows;
+        // LONG_NLL_LAYER_MAJOR=1 ingests the context like a served fresh prompt
+        // (layer-major chunks with the prefill numerical policy, e.g.
+        // NINFER_EXL3_PREFILL_NVFP4); otherwise full-precision wide chunks.
+        const bool layer_major = std::getenv("LONG_NLL_LAYER_MAJOR") != nullptr;
+        if (layer_major) {
+            const int initial = Exl3TextContext::layer_major_initial_rows();
+            if (initial) ctx->prefill(all.first(initial));
+            ctx->append_prefill_layer_major(all.subspan(initial, context - initial));
+        } else {
+            ctx->prefill(all.first(16));
+            for (int at = 16; at < context;) {
+                const int rows = std::min(1024, context - at);
+                ctx->append_prefill_wide(all.subspan(at, rows));
+                at += rows;
+            }
         }
         cudaDeviceSynchronize();
         std::ofstream out(out_path);
