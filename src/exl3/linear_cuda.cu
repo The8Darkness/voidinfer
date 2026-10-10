@@ -2344,6 +2344,7 @@ inline bool nvfp4_projection(int mode, const Exl3CudaLinearMetadata& metadata, i
     case 3: return (gate_up || down) && layer >= 0 && layer < 56;
     case 4: return gate_up || down || gdn_qkvz;
     case 5: return down || (gate_up && layer >= 32);
+    case 6: return down || layer >= 32;
     default: return false;
     }
 }
@@ -7232,20 +7233,22 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->mxfp8_enabled=accept_all_model_shapes &&
         (!mxfp8 || std::strcmp(mxfp8,"1")==0);
-    // NVFP4 prefill numerical policy (nvfp4_projection). Default 5 = MLP down
-    // projections of every layer + MLP gate/up of layers 32..63: lossless on
-    // the paired long-context panel (L0, exact prompt history, 24 fixtures
-    // 4K-32K: -0.0001 nats vs full-precision ingest) at 4K prefill 0.48 s.
-    // 0 = MXFP8 everywhere (lossless, 0.56 s); 2 = MLP gate/up/down (+0.029,
-    // wikitext +0.11: early-layer gate/up), 0.44 s; 1 = all projections
-    // (+0.035), 0.39 s; 3 = MLP layers 0..55 (NInfer artifact); 4 = MLP + GDN
-    // QKV/Z. Requires the MXFP8 route.
+    // NVFP4 prefill numerical policy (nvfp4_projection), measured on the
+    // paired long-context panel (L0, exact prompt history, 24 fixtures 4K-32K,
+    // fixture-level 95% CI) against full-precision ingest. Default 6 = every
+    // projection of layers 32..63 + MLP down everywhere: +0.0012 nats
+    // [-0.003, +0.006] at 4K prefill 0.455 s. 5 = MLP down everywhere + MLP
+    // gate/up of layers 32..63: -0.0001 at 0.48 s; 0 = MXFP8 everywhere
+    // (-0.003, 0.56 s); 2 = MLP gate/up/down (+0.029, wikitext +0.11:
+    // early-layer gate/up), 0.44 s; 1 = all projections (+0.035), 0.39 s;
+    // 3 = MLP layers 0..55 (NInfer artifact); 4 = MLP + GDN QKV/Z. Requires
+    // the MXFP8 route.
     const char* nvfp4=std::getenv("NINFER_EXL3_PREFILL_NVFP4");
-    if(nvfp4 && (std::strlen(nvfp4)!=1 || nvfp4[0]<'0' || nvfp4[0]>'5')) {
+    if(nvfp4 && (std::strlen(nvfp4)!=1 || nvfp4[0]<'0' || nvfp4[0]>'6')) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0..5");
+        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0..6");
     }
-    impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 5) : 0;
+    impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 6) : 0;
     const char* fused_decode=std::getenv("NINFER_EXL3_PREFILL_FUSED_DECODE");
     if(fused_decode && std::strcmp(fused_decode,"0")!=0 && std::strcmp(fused_decode,"1")!=0) {
         delete impl_; impl_=nullptr;
