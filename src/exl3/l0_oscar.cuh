@@ -35,7 +35,7 @@
 
 namespace ninfer::exl3::l0_oscar {
 
-constexpr int kSink = 64;
+constexpr int kSink = kSinkRows;
 // Exact recent window (exl3_l0_recent_rows): device code reads the copy
 // installed at L0 storage setup (set_recent_rows) in this translation unit.
 static __constant__ int recent_rows_device = 256;

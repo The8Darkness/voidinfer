@@ -677,6 +677,10 @@ ninfer_add_host_contract_test(ninfer_exl3_verifier_horizon_policy_test
 ninfer_add_test(ninfer_exl3_greedy_device_test
   SOURCES test_exl3_greedy_device.cu
   LIBRARIES CUDA::cudart)
+ninfer_add_test(research_exl3_kv_pack
+  SOURCES research_exl3_kv_pack.cu
+  LIBRARIES CUDA::cudart)
+set_tests_properties(research_exl3_kv_pack PROPERTIES SKIP_RETURN_CODE 77)
 
 foreach(v1_mode IN ITEMS export consume)
   set(v1_target ninfer_exl3_v1_oracle_${v1_mode})

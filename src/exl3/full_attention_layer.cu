@@ -10453,3 +10453,10 @@ void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
 }
 
 } // namespace ninfer::exl3
+
+namespace ninfer::exl3::l0_oscar {
+RotationView rotation_view() {
+    const auto& a = assets();
+    return {a.rk, a.rv, a.mu};
+}
+}  // namespace ninfer::exl3::l0_oscar

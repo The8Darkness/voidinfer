@@ -57,6 +57,15 @@ struct Exl3SpillSlot {
             if (const auto release = exl3_spill_release_hook().load(std::memory_order_acquire)) release(slot);
     }
 };
+// L0 OSCAR codes and meta of one exact KV page's rows, per bank (layout of
+// Exl3ExactHostState::L0CodeChunk), pointing into page-locked chunks that
+// `owners` keep alive.
+struct Exl3PageCodes {
+    std::array<std::shared_ptr<const void>,16> owners;
+    std::array<const std::uint8_t*,16> k_codes{},v_codes{};
+    std::array<const std::uint16_t*,16> k_meta{},v_meta{};
+    int banks=0;
+};
 // Readers that are about to use a page's payload (a restore) pin it: pressure
 // spilling and re-homing leave pinned filled pages alone. Copies start unpinned.
 struct Exl3PinCount {
@@ -83,8 +92,17 @@ struct Exl3ExactKVPage {
     Exl3CopyableFlag deferred;
     // A deferred page whose rows left the source's planes for its spill file.
     Exl3SpillSlot spill;
+    // L0 OSCAR codes of the page's rows (export assigns them while the page
+    // is lane-backed); the lossless packed payload (l0_kv_pack.cuh) is coded
+    // against them. A deferred page whose rows left the planes for `packed`
+    // (in RAM) or for a spill slot holding `spill_packed_bytes` of it.
+    std::shared_ptr<const Exl3PageCodes> codes;
+    std::vector<std::uint8_t> packed;
+    Exl3CopyableFlag packed_ram;
+    std::uint32_t spill_packed_bytes=0;
     bool payload_deferred() const noexcept { return deferred.load(); }
     bool spilled() const noexcept { return spill.load() >= 0; }
+    bool packed_in_ram() const noexcept { return packed_ram.load(); }
     mutable Exl3PinCount pins;
     static std::shared_ptr<Exl3ExactKVPage> create(
         const std::function<RetainedDescriptorLedger::Ticket(std::uint64_t)>& reserve={}) {

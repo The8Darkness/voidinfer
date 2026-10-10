@@ -12,11 +12,15 @@
 // Rows below an exported frontier are append-only history: every operation
 // that rewrites such rows fills the affected pages first.
 //
-// Under host memory pressure (kv_spill_store.h) a fill writes the rows to the
-// spill file instead (the page stays deferred, now `spilled`), and filled
-// pages of every source are spilled before the planes grow. A restore copies
-// spilled rows straight into its planes and re-homes the pages; other readers
-// bring them back into RAM.
+// A fill of a page that carries its L0 OSCAR codes (export assigns them)
+// packs the rows losslessly against those codes (l0_kv_pack.cuh, ~1.36x
+// smaller): the page stays deferred, now `packed_in_ram`. Under host memory
+// pressure (kv_spill_store.h) a fill writes the packed blob (or the FP16 rows
+// of a page without codes) to the spill file instead (the page stays
+// deferred, now `spilled`), and filled or packed pages of every source are
+// spilled before the planes grow. A restore decodes packed and spilled rows
+// straight into its planes and re-homes the pages; other readers bring them
+// back into RAM as FP16. NINFER_EXL3_KV_PACK=0 fills FP16 rows.
 //
 // Locking: a page's owner (`source`), payload vectors and `deferred` flag
 // change only under the process-wide payload mutex held exclusively; readers
@@ -25,11 +29,13 @@
 // and is always taken before the payload mutex.
 #include "exl3/exact_kv_extent.h"
 #include "exl3/kv_spill_store.h"
+#include "exl3/l0_kv_pack.cuh"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -81,7 +87,12 @@ public:
 
     // The page's rows still live only in this source's planes.
     bool holds(const Exl3ExactKVPage& page) const noexcept {
-        return page.source_id.load() == this && page.payload_deferred() && !page.spilled();
+        return page.source_id.load() == this && page.payload_deferred() && !page.spilled() &&
+            !page.packed_in_ram();
+    }
+    // The page's rows live only in its packed blob (RAM), owned by this source.
+    bool packed_here(const Exl3ExactKVPage& page) const noexcept {
+        return page.source_id.load() == this && page.payload_deferred() && page.packed_in_ram();
     }
     // The page's rows live only in this source's spill slot.
     bool spilled_here(const Exl3ExactKVPage& page) const noexcept {
@@ -93,25 +104,33 @@ public:
         std::lock_guard lock(mutex_);
         std::unique_lock payload(exl3_page_payload_mutex());
         release_payload(*page);
-        page->spill.reset();
+        reset_spill(*page);
+        page->codes.reset();   // export assigns the codes of the page's (new) rows
         page->source = shared_from_this();
         page->source_id.store(this);
         page->deferred.store(true);
         track_locked(page);
     }
 
-    // Re-homes filled or spilled lane-backed pages whose rows were just
+    // Assigns `codes` to a page these planes hold (export, under the payload
+    // mutex): a later fill packs the page against them.
+    void assign_codes(const Exl3ExactKVPage& page, std::shared_ptr<const Exl3PageCodes> codes) {
+        std::unique_lock payload(exl3_page_payload_mutex());
+        if (holds(page)) const_cast<Exl3ExactKVPage&>(page).codes = std::move(codes);
+    }
+
+    // Re-homes filled, packed or spilled lane-backed pages whose rows were just
     // restored into these planes: their payload copies / slots are released.
     void adopt(const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& pages) {
         std::lock_guard lock(mutex_);
         std::unique_lock payload(exl3_page_payload_mutex());
         for (const auto& constant : pages) {
             auto page = std::const_pointer_cast<Exl3ExactKVPage>(constant);
-            if (!page->source || (page->payload_deferred() && !page->spilled())) continue;
+            if (!page->source || (page->payload_deferred() && !page->spilled() && !page->packed_in_ram())) continue;
             // Another restore still reads this page's payload.
             if (!page->payload_deferred() && page->pins.load() > 1) continue;
             release_payload(*page);
-            page->spill.reset();
+            reset_spill(*page);
             page->source = shared_from_this();
             page->source_id.store(this);
             page->deferred.store(true);
@@ -128,13 +147,18 @@ public:
             unspill_locked(mutable_page);
             return;
         }
+        if (packed_here(page)) {
+            unpack_to_payload_locked(mutable_page, mutable_page.packed.data(), mutable_page.packed.size());
+            return;
+        }
         if (!holds(page)) return;
         std::vector<Exl3ExactKVPage*> one{&mutable_page};
         fill_locked(one, false);
     }
 
-    // Host memory is short: spills filled lane-backed pages of every source
-    // (idle histories) until `extra` more bytes fit above the spill floor.
+    // Host memory is short: spills filled and packed lane-backed pages of
+    // every source (idle histories) until `extra` more bytes fit above the
+    // spill floor.
     static void relieve_memory_pressure(std::uint64_t extra) {
         if (!Exl3KvSpillStore::get() || !Exl3KvSpillStore::under_pressure(extra)) return;
         std::vector<std::shared_ptr<Exl3LaneKvSource>> sources;
@@ -282,20 +306,34 @@ public:
 
     // Copies the rows of a contiguous run of this source's deferred pages
     // straight into another lane's planes (a restore there), without filling
-    // them: from these planes, or from the spill file for spilled pages. False
-    // if a page left this source meanwhile (use its values).
+    // them: from these planes, by decoding packed pages, or from the spill
+    // file for spilled pages. False if a page left this source meanwhile (use
+    // its values).
     bool copy_run_to(const std::vector<const Exl3ExactKVPage*>& run, const Planes& destination,
                      cudaStream_t stream) {
         std::lock_guard lock(mutex_);   // no fill or re-home of these pages meanwhile
         std::shared_lock payload(exl3_page_payload_mutex());
-        bool spilled = false;
+        bool off_planes = false;
+        std::vector<const Exl3ExactKVPage*> packed;
         for (const auto* page : run) {
-            if (spilled_here(*page)) spilled = true;
+            if (packed_here(*page)) packed.push_back(page);
+            else if (spilled_here(*page)) off_planes = true;
             else if (!holds(*page)) return false;
         }
         if (run.empty()) return true;
-        if (spilled) {
+        if (!packed.empty()) {
+            std::vector<const std::uint8_t*> blobs;
+            std::vector<std::size_t> sizes;
+            for (const auto* page : packed) {
+                blobs.push_back(page->packed.data());
+                sizes.push_back(page->packed.size());
+            }
+            unpack_to_planes(packed, blobs, sizes, destination);
+            off_planes = true;
+        }
+        if (off_planes) {
             par_each(run.begin(), run.end(), [&](const Exl3ExactKVPage* page) {
+                if (packed_here(*page)) return;
                 if (spilled_here(*page)) read_slot_to_planes(*page, destination);
                 else {
                     copy_rows_to_planes(*page, destination, cudaStreamPerThread);
@@ -363,6 +401,11 @@ private:
     // A spilled page's slot straight into planes (restore), on this thread.
     void read_slot_to_planes(const Exl3ExactKVPage& page, const Planes& destination) const {
         auto* buffer = Exl3KvSpillStore::aligned_buffer();
+        if (page.spill_packed_bytes) {
+            Exl3KvSpillStore::get()->read(page.spill.load(), buffer, page.spill_packed_bytes);
+            unpack_to_planes({&page}, {buffer}, {static_cast<std::size_t>(page.spill_packed_bytes)}, destination);
+            return;
+        }
         Exl3KvSpillStore::get()->read(page.spill.load(), buffer, page_bytes(page));
         const auto* words = reinterpret_cast<const std::uint16_t*>(buffer);
         const std::size_t offset = static_cast<std::size_t>(page.first) * kRowWords;
@@ -381,6 +424,11 @@ private:
     // Caller holds mutex_ and the payload mutex exclusively.
     void unspill_locked(Exl3ExactKVPage& page) {
         auto* buffer = Exl3KvSpillStore::aligned_buffer();
+        if (page.spill_packed_bytes) {
+            Exl3KvSpillStore::get()->read(page.spill.load(), buffer, page.spill_packed_bytes);
+            unpack_to_payload_locked(page, buffer, static_cast<std::size_t>(page.spill_packed_bytes));
+            return;
+        }
         Exl3KvSpillStore::get()->read(page.spill.load(), buffer, page_bytes(page));
         const auto* words = reinterpret_cast<const std::uint16_t*>(buffer);
         const std::size_t count = static_cast<std::size_t>(page.rows) * kRowWords;
@@ -388,25 +436,136 @@ private:
             page.k[bank].assign(words + slot_offset(page, bank, 0), words + slot_offset(page, bank, 0) + count);
             page.v[bank].assign(words + slot_offset(page, bank, 1), words + slot_offset(page, bank, 1) + count);
         }
-        page.spill.reset();
+        reset_spill(page);
         page.deferred.store(false);
     }
 
-    // Spills this source's filled pages until `extra` bytes fit above the floor.
+    // Lossless packing (l0_kv_pack.cuh) of pages carrying their codes.
+    static bool packable(const Exl3ExactKVPage& page, int banks) {
+        return l0_kv_pack::enabled() && page.codes && page.codes->banks == banks;
+    }
+    l0_kv_pack::Planes pack_planes(const Planes& planes) const {
+        l0_kv_pack::Planes out{};
+        for (int bank = 0; bank < planes.banks; ++bank) {
+            out.k[bank] = const_cast<std::uint16_t*>(planes.k[bank]);
+            out.v[bank] = const_cast<std::uint16_t*>(planes.v[bank]);
+        }
+        return out;
+    }
+    static l0_kv_pack::Packer::Page pack_job(const Exl3ExactKVPage& page) {
+        l0_kv_pack::Packer::Page job;
+        job.row = page.first;
+        job.rows = page.rows;
+        const auto& codes = *page.codes;
+        for (int bank = 0; bank < codes.banks; ++bank) {
+            job.k_codes[bank] = codes.k_codes[bank];
+            job.v_codes[bank] = codes.v_codes[bank];
+            job.k_meta[bank] = codes.k_meta[bank];
+            job.v_meta[bank] = codes.v_meta[bank];
+        }
+        return job;
+    }
+    // Decodes packed pages' rows (blobs) into `destination` planes.
+    void unpack_to_planes(const std::vector<const Exl3ExactKVPage*>& pages, const std::vector<const std::uint8_t*>& blobs,
+                          const std::vector<std::size_t>& sizes, const Planes& destination) const {
+        std::vector<l0_kv_pack::Packer::Page> jobs;
+        for (const auto* page : pages) {
+            if (!page->codes) throw std::logic_error("lane KV packed page without codes");
+            jobs.push_back(pack_job(*page));
+        }
+        const auto planes = pack_planes(destination);
+        l0_kv_pack::Packer::instance().unpack(&planes, destination.banks, jobs, blobs, sizes);
+    }
+    // Caller holds mutex_ and the payload mutex exclusively: the page's packed
+    // rows (blob) become its FP16 payload.
+    void unpack_to_payload_locked(Exl3ExactKVPage& page, const std::uint8_t* blob, std::size_t bytes) {
+        if (!page.codes) throw std::logic_error("lane KV packed page without codes");
+        const std::size_t count = static_cast<std::size_t>(page.rows) * kRowWords;
+        for (int bank = 0; bank < planes_.banks; ++bank) {
+            page.k[bank].resize(count);
+            page.v[bank].resize(count);
+        }
+        l0_kv_pack::Packer::instance().unpack(nullptr, planes_.banks, {pack_job(page)}, {blob}, {bytes},
+            [&](std::size_t, int bank, int plane) { return (plane ? page.v[bank] : page.k[bank]).data(); });
+        drop_packed(page);
+        reset_spill(page);
+        page.deferred.store(false);
+    }
+    // Caller holds mutex_ and the payload mutex exclusively: packs `pages`
+    // (rows still in these planes); pages that would not shrink go to `rest`.
+    void pack_locked(const std::vector<Exl3ExactKVPage*>& pages, std::vector<Exl3ExactKVPage*>& rest) {
+        std::vector<l0_kv_pack::Packer::Page> jobs;
+        for (const auto* page : pages) jobs.push_back(pack_job(*page));
+        std::vector<std::vector<std::uint8_t>> blobs;
+        const auto started = std::chrono::steady_clock::now();
+        l0_kv_pack::Packer::instance().pack(pack_planes(planes_), planes_.banks, jobs, blobs);
+        std::size_t raw = 0, packed = 0;
+        for (std::size_t index = 0; index < pages.size(); ++index) {
+            if (blobs[index].empty()) {
+                rest.push_back(pages[index]);
+                continue;
+            }
+            raw += page_bytes(*pages[index]);
+            packed += blobs[index].size();
+            // NINFER_EXL3_TEST_KV_PACK=1 decodes every packed page and compares.
+            if (pack_test()) {
+                const std::size_t words = static_cast<std::size_t>(pages[index]->rows) * kRowWords;
+                std::vector<std::uint16_t> decoded(words * planes_.banks * 2);
+                l0_kv_pack::Packer::instance().unpack(nullptr, planes_.banks, {jobs[index]}, {blobs[index].data()},
+                    {blobs[index].size()}, [&](std::size_t, int bank, int plane) {
+                        return decoded.data() + (bank * 2 + plane) * words;
+                    });
+                if (decoded != read_rows(pages[index]->first, pages[index]->first + pages[index]->rows))
+                    throw std::logic_error("lane KV pack test mismatch");
+            }
+            pages[index]->packed = std::move(blobs[index]);
+            pages[index]->packed_ram.store(true);
+        }
+        if (std::getenv("NINFER_EXL3_VERICACHE_STATS"))
+            std::fprintf(stderr, "KV_PACK pages=%zu raw_mib=%.1f packed_mib=%.1f ratio=%.3f ms=%.1f\n", pages.size(),
+                raw / 1048576.0, packed / 1048576.0, packed ? static_cast<double>(raw) / packed : 0.0,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+    }
+    // Caller holds mutex_ and the payload mutex exclusively: writes packed
+    // pages' blobs to spill slots (on this thread's aligned buffer).
+    void spill_packed_locked(Exl3ExactKVPage& page) {
+        auto* store = Exl3KvSpillStore::get();
+        auto* buffer = Exl3KvSpillStore::aligned_buffer();
+        const std::size_t bytes = page.packed.size();
+        std::memcpy(buffer, page.packed.data(), bytes);
+        const auto slot = store->allocate();
+        try {
+            store->write(slot, buffer, bytes);
+        } catch (...) {
+            store->release(slot);
+            return;
+        }
+        drop_packed(page);
+        page.spill.store(slot);
+        page.spill_packed_bytes = static_cast<std::uint32_t>(bytes);
+    }
+
+    // Spills this source's filled and packed pages until `extra` bytes fit
+    // above the floor.
     void spill_filled(std::uint64_t extra) {
         std::lock_guard lock(mutex_);
         std::vector<std::shared_ptr<Exl3ExactKVPage>> filled;
         for (const auto& weak : pages_)
             if (auto page = weak.lock())
-                if (page->source_id.load() == this && !page->payload_deferred()) filled.push_back(std::move(page));
+                if (page->source_id.load() == this && (!page->payload_deferred() || packed_here(*page)))
+                    filled.push_back(std::move(page));
         constexpr std::size_t kBatch = 32;
         for (std::size_t begin = 0; begin < filled.size(); begin += kBatch) {
             if (!Exl3KvSpillStore::under_pressure(extra)) return;
             std::unique_lock payload(exl3_page_payload_mutex());
             const std::size_t end = std::min(filled.size(), begin + kBatch);
             par_each(filled.begin() + begin, filled.begin() + end, [&](const auto& page) {
-                if (page->source_id.load() != this || page->payload_deferred() || page->pins.load() ||
-                    !sized(*page)) return;
+                if (page->pins.load()) return;
+                if (packed_here(*page)) {
+                    spill_packed_locked(*page);
+                    return;
+                }
+                if (page->source_id.load() != this || page->payload_deferred() || !sized(*page)) return;
                 auto* buffer = Exl3KvSpillStore::aligned_buffer();
                 auto* words = reinterpret_cast<std::uint16_t*>(buffer);
                 const std::size_t count = static_cast<std::size_t>(page->rows) * kRowWords;
@@ -424,6 +583,7 @@ private:
                 }
                 release_payload(*page);
                 page->spill.store(slot);
+                page->spill_packed_bytes = 0;
                 page->deferred.store(true);
             });
         }
@@ -480,6 +640,13 @@ private:
             }
     }
 
+    static bool pack_test() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_EXL3_TEST_KV_PACK");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        return enabled;
+    }
     static bool exchange_test() {
         static const bool enabled = [] {
             const char* value = std::getenv("NINFER_EXL3_TEST_LANE_EXCHANGE");
@@ -524,6 +691,15 @@ private:
             std::vector<std::uint16_t>().swap(page.k[bank]);
             std::vector<std::uint16_t>().swap(page.v[bank]);
         }
+        drop_packed(page);
+    }
+    static void drop_packed(Exl3ExactKVPage& page) {
+        std::vector<std::uint8_t>().swap(page.packed);
+        page.packed_ram.store(false);
+    }
+    static void reset_spill(Exl3ExactKVPage& page) {
+        page.spill.reset();
+        page.spill_packed_bytes = 0;
     }
     void track_locked(const std::shared_ptr<Exl3ExactKVPage>& page) {
         if (pages_.size() >= 2 * live_hint_ + 256) prune_locked();
@@ -620,15 +796,39 @@ private:
             for (std::size_t index = begin; index < end; ++index) {
                 release_payload(*pages[index]);
                 pages[index]->spill.store(slots[index - begin]);
+                pages[index]->spill_packed_bytes = 0;
             }
         }
     }
 
-    // Caller holds mutex_ and the payload mutex exclusively. Under host
-    // memory pressure (and `may_spill`) the rows go to the spill file.
+    // Caller holds mutex_ and the payload mutex exclusively. Unless a reader
+    // needs the values (!may_spill), pages carrying their codes are packed;
+    // under host memory pressure the packed blobs or FP16 rows go to the
+    // spill file.
     void fill_locked(std::vector<Exl3ExactKVPage*>& pages, bool may_spill = true) {
         if (pages.empty()) return;
         std::sort(pages.begin(), pages.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
+        if (may_spill) {
+            std::vector<Exl3ExactKVPage*> packing, rest;
+            for (auto* page : pages) (packable(*page, planes_.banks) ? packing : rest).push_back(page);
+            if (!packing.empty()) {
+                pack_locked(packing, rest);
+                if (Exl3KvSpillStore::get()) {
+                    std::vector<Exl3ExactKVPage*> packed;
+                    std::uint64_t bytes = 0;
+                    for (auto* page : packing)
+                        if (page->packed_in_ram()) {
+                            packed.push_back(page);
+                            bytes += page->packed.size();
+                        }
+                    if (!packed.empty() && Exl3KvSpillStore::under_pressure(bytes))
+                        par_each(packed.begin(), packed.end(), [&](Exl3ExactKVPage* page) { spill_packed_locked(*page); });
+                }
+                std::sort(rest.begin(), rest.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
+                pages.swap(rest);
+                if (pages.empty()) return;
+            }
+        }
         if (may_spill && Exl3KvSpillStore::get()) {
             std::uint64_t bytes = 0;
             for (const auto* page : pages) bytes += page_bytes(*page);

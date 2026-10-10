@@ -12521,7 +12521,8 @@ bool Exl3ExactHostState::is_prefix_of(const Exl3ExactHostState& x) const {
         if(kv_pages_[page_index]==x.kv_pages_[page_index]) continue;
         // Two pages still backed by the same lane read the same plane rows.
         if(a.source_id.load() && a.source_id.load()==b.source_id.load() &&
-           a.payload_deferred() && b.payload_deferred() && !a.spilled() && !b.spilled()) continue;
+           a.payload_deferred() && b.payload_deferred() && !a.spilled() && !b.spilled() &&
+           !a.packed_in_ram() && !b.packed_in_ram()) continue;
         exl3_require_kv_payload(a);exl3_require_kv_payload(b);
         std::shared_lock payload(exl3_page_payload_mutex());
         const std::size_t elements=static_cast<std::size_t>(rows)*1024;
@@ -13143,6 +13144,35 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
             for(const auto& chunk:state->l0_chunks_[layer])
                 if(chunk->rows==Exl3ExactHostState::kL0ChunkRows) prefix.push_back(chunk);
         }
+        // Lane-backed pages wholly inside the encoded rows get their codes:
+        // a later fill packs them losslessly against these chunks
+        // (l0_kv_pack.cuh); pages the planes no longer hold keep theirs.
+        if(impl_->kv_source && l0_kv_pack::enabled()) {
+            constexpr std::size_t code_row=l0_oscar_format::kRowCodeBytes/2;
+            constexpr std::size_t meta_row=l0_oscar_format::kRowMetaBytes/4;
+            for(const auto& page:state->kv_pages_) {
+                std::shared_ptr<Exl3PageCodes> codes;
+                if(page->first>=l0_oscar::kSinkRows && page->first+page->rows<=state->l0_rows_) {
+                    codes=std::make_shared<Exl3PageCodes>();
+                    for(std::size_t layer=0;layer<full && codes;++layer) {
+                        const auto index=static_cast<std::size_t>(page->first/Exl3ExactHostState::kL0ChunkRows);
+                        const auto& chunks=state->l0_chunks_[layer];
+                        if(index>=chunks.size() || chunks[index]->first>page->first ||
+                           chunks[index]->first+chunks[index]->rows<page->first+page->rows) {codes.reset();break;}
+                        const auto& chunk=chunks[index];
+                        const std::size_t row=static_cast<std::size_t>(page->first-chunk->first);
+                        const std::size_t rows=static_cast<std::size_t>(chunk->rows);
+                        codes->owners[layer]=chunk;
+                        codes->k_codes[layer]=chunk->codes()+row*code_row;
+                        codes->v_codes[layer]=chunk->codes()+(rows+row)*code_row;
+                        codes->k_meta[layer]=chunk->meta()+row*meta_row;
+                        codes->v_meta[layer]=chunk->meta()+(rows+row)*meta_row;
+                    }
+                    if(codes)codes->banks=static_cast<int>(full);
+                }
+                impl_->kv_source->assign_codes(*page,std::move(codes));
+            }
+        }
     }
     if(share_prefix) {
         impl_->exact_prefix_pages=state->kv_pages_;
@@ -13394,7 +13424,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     std::vector<const Exl3ExactKVPage*> resident_pages;
     std::vector<std::shared_ptr<const Exl3ExactKVPage>> adoptable;
     if(impl_->kv_source && !all_lane_resident) {
-        // Deferred pages of other lanes and spilled pages (any lane, this one
+        // Deferred pages of other lanes and packed or spilled pages (any lane, this one
         // included): rows copied straight into these planes.
         std::vector<std::pair<std::shared_ptr<const Exl3ExactKVPage>,std::shared_ptr<Exl3LaneKvSource>>> foreign;
         {
@@ -13411,7 +13441,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
             if(run.empty())return;
             if(run_source->copy_run_to(run,impl_->kv_source->planes(),stream)) {
                 resident_pages.insert(resident_pages.end(),run.begin(),run.end());
-                // Spilled pages now live in these planes: re-homed below.
+                // Spilled and packed pages now live in these planes: re-homed below.
                 adoptable.insert(adoptable.end(),run_spilled.begin(),run_spilled.end());
             }
             run.clear();
@@ -13422,7 +13452,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                run.back()->first+run.back()->rows!=page->first)) flush();
             run_source=owner.get();
             run.push_back(page.get());
-            if(page->spilled())run_spilled.push_back(page);
+            if(page->spilled() || page->packed_in_ram())run_spilled.push_back(page);
         }
         flush();
         std::sort(resident_pages.begin(),resident_pages.end());

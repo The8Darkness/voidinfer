@@ -4,6 +4,17 @@
 
 namespace ninfer::exl3::l0_oscar {
 
+// Device OSCAR rotations (l0_oscar.cuh assets()) for code outside the L0
+// attention translation unit (l0_kv_pack.cuh); defined there.
+struct RotationView {
+    const float* rk = nullptr;   // [16][4][256][256]   x' = x R
+    const float* rv = nullptr;
+    const float* mu = nullptr;   // [16][4][256]
+};
+RotationView rotation_view();
+// Rows below kSink are never encoded (exact sink).
+constexpr int kSinkRows = 64;
+
 // Codes [capacity][4 KV heads][64] bytes and meta [capacity][4][scale0, zero0,
 // scale1, zero1] FP16 per K and V; state[0] encoded watermark, state[1] last
 // committed base. Query and history scratch serve up to `rows` verifier rows.
