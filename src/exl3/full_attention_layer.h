@@ -684,6 +684,17 @@ public:
     // the FP16 L2 planes instead of the INT4 codes and hot rows (VeriCache
     // verifier passes and lossless ingestion). No effect without L0 storage.
     void set_l0_exact_history(bool exact) noexcept { l0_exact_ = l0_exact_prefill_ = exact; }
+    // Exact line of folded VeriCache (Exl3TextContext::make_exact_line): the
+    // layer attends with exact history only and keeps no INT4 codes or hot
+    // rows (no encode, no hot fills); its window ring stays its own.
+    void set_l0_exact_only(bool exact_only) noexcept {
+        l0_exact_only_ = exact_only;
+        if (exact_only) l0_exact_ = l0_exact_prefill_ = true;
+    }
+    // Copies `source`'s L0 window ring and sink rows (same ring size) and,
+    // with `aging_state`, its encode watermark state.
+    void copy_l0_window_from(const Exl3FullAttentionLayer& source, cudaStream_t stream,
+                             bool aging_state);
     // Batched multi-agent rounds: while set, forward() runs its row-independent
     // work over own_rows + every peer's rows, and each peer layer (another
     // agent's context, same model layer) runs its own stateful core on its rows
@@ -985,6 +996,7 @@ private:
     int history_lanes_ = 1;
     const void* l0_scratch_owner_ = nullptr;
     bool l0_exact_ = false;          // verifier/decode rows (<= 8)
+    bool l0_exact_only_ = false;     // exact line: no codes/hot rows of its own
     bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)
 
     int fakequant_bank_ = 0;

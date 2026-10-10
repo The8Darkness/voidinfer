@@ -518,9 +518,15 @@ int main() {
                 process_coherent_down_k7_rows_for_test()-down_k7_rows_before;
             std::cout<<"COHERENT_DEVICE_ENGINE_DOWN_K7 enabled="<<coherent_down_k7
                      <<" calls="<<down_k7_calls<<" rows="<<down_k7_rows<<'\n';
-            if((coherent_down_k7 && !captured_only(down_k7_calls,0) && (down_k7_calls==0 ||
+            // Folded VeriCache rounds run their target rows through the eager
+            // batched route: the per-route row counts no longer cover the output.
+            const bool fold_rounds=[] {
+                const char* value=std::getenv("NINFER_EXL3_VERICACHE_FOLD");
+                return value && std::string_view(value)=="1";
+            }();
+            if(!fold_rounds && ((coherent_down_k7 && !captured_only(down_k7_calls,0) && (down_k7_calls==0 ||
                     down_k7_rows<static_cast<std::uint64_t>(long_outputs))) ||
-               (!coherent_down_k7 && (down_k7_calls!=0 || down_k7_rows!=0)))
+               (!coherent_down_k7 && (down_k7_calls!=0 || down_k7_rows!=0))))
                 throw std::runtime_error("device Engine K7 down dispatch mismatch");
             const auto o_k7_calls=ninfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_o_k7_calls_for_test()-o_k7_calls_before;
@@ -528,9 +534,9 @@ int main() {
                 process_coherent_o_k7_rows_for_test()-o_k7_rows_before;
             std::cout<<"COHERENT_DEVICE_ENGINE_O_K7 enabled="<<coherent_o_k7
                      <<" calls="<<o_k7_calls<<" rows="<<o_k7_rows<<'\n';
-            if((coherent_o_k7 && !captured_only(o_k7_calls,1) && (o_k7_calls==0 ||
+            if(!fold_rounds && ((coherent_o_k7 && !captured_only(o_k7_calls,1) && (o_k7_calls==0 ||
                     o_k7_rows<static_cast<std::uint64_t>(long_outputs))) ||
-               (!coherent_o_k7 && (o_k7_calls!=0 || o_k7_rows!=0)))
+               (!coherent_o_k7 && (o_k7_calls!=0 || o_k7_rows!=0))))
                 throw std::runtime_error("device Engine K7 O dispatch mismatch");
             constexpr const char* wide_names[5]={"q","qkv","z","o","gate_up"};
             for(int operation=0;operation<5;++operation) {
@@ -543,10 +549,10 @@ int main() {
                 std::cout<<"COHERENT_DEVICE_ENGINE_WIDE_K6 op="
                          <<wide_names[operation]<<" enabled="<<coherent_wide_k6
                          <<" calls="<<calls<<" rows="<<rows<<'\n';
-                if(coherent_wide_k6 ?
+                if(!fold_rounds && (coherent_wide_k6 ?
                         !captured_only(calls,2+static_cast<std::size_t>(operation)) &&
                             (calls==0 || rows<calls) :
-                        calls!=0 || rows!=0)
+                        calls!=0 || rows!=0))
                     throw std::runtime_error(
                         "device Engine coherent wide K6 dispatch mismatch");
             }

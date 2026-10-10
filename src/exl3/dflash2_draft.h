@@ -486,8 +486,11 @@ public:
     // commits overwrite and the ring metadata at the current frontier; restore
     // (frontier at most `rows` past the checkpoint) returns the ring to that
     // frontier so verified rows can be recommitted. Same eager stream.
-    void save_ring_checkpoint(int rows, cudaStream_t stream = nullptr);
+    void save_ring_checkpoint(int rows, cudaStream_t stream = nullptr, bool pending = false);
     void restore_ring_checkpoint(cudaStream_t stream = nullptr);
+    // Folded VeriCache: the pending checkpoint (saved where the next block's
+    // verification starts) becomes the restorable one.
+    void promote_ring_checkpoint();
     void rollback_prefill_ring_undo(cudaStream_t stream = nullptr);
     // Explicit eager fresh initialization on an empty logical ring. Submit the
     // original ordered1..16-row calls on the declared stream through exact end.

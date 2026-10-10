@@ -660,6 +660,78 @@ public:
             throw;
         }
     }
+    // ===== Folded exact VeriCache (one lane) =====
+    // `line` (an exact line of this context, Exl3TextContext::make_exact_line)
+    // verifies each drafted block inside the next round's batched target
+    // forward instead of a separate exact pass: the block's rows share the
+    // round's projections (one weight read). The drafting context keeps L0
+    // history between corrections; the line is exact. Roots: the line's own
+    // checkpoint and the drafting context's root + draft ring checkpoint at
+    // the verified frontier, plus pending ones where the carried block ends.
+    void begin_fold_verification(Exl3TextContext& line,int ring_rows) {
+        if(phase_!=Phase::ready || ring_rows<1 || ring_rows>2047 || !line.exact_line())
+            throw std::logic_error("folded verification begin");
+        line_=&line;
+        line.sync_exact_line_from(*context_,stream_);
+        line.save_verified_root(stream_);
+        context_->save_verified_root(stream_);
+        draft_.save_ring_checkpoint(ring_rows,stream_);
+        verified_frontier_=frontier_;
+        verify_rows_=ring_rows;
+        fold_armed_=false;
+    }
+    bool fold_active() const noexcept {return line_!=nullptr;}
+    // The next round carries `tokens` = [verified frontier, frontier) on the line.
+    void arm_fold(std::span<const std::int64_t> tokens) {
+        if(phase_!=Phase::ready || !line_ || fold_armed_ || tokens.size()<2 || tokens.size()>24 ||
+           static_cast<int>(tokens.size())!=frontier_-verified_frontier_)
+            throw std::logic_error("folded verification arm extent");
+        context_->save_verified_root_pending(stream_);
+        draft_.save_ring_checkpoint(verify_rows_,stream_,true);
+        context_->set_fold_peer(line_,tokens,stream_);
+        fold_tokens_.assign(tokens.begin(),tokens.end());
+        fold_frontier_=frontier_;
+        fold_armed_=true;
+    }
+    // After the round that carried the block settled (round_first: its first
+    // committed token, predicted by the block's last row). A round that did
+    // not carry the block (single-row) verifies it on the line alone.
+    VerifiedBlock finish_fold(std::int64_t round_first,float delta) {
+        if(phase_!=Phase::ready || !fold_armed_)throw std::logic_error("folded verification finish");
+        fold_armed_=false;
+        const bool carried=!context_->fold_pending();
+        if(!carried)context_->set_fold_peer(nullptr,{},nullptr);
+        return settle_fold(round_first,delta,carried,true);
+    }
+    // Verifies the remaining drafted tokens on the line alone (no further
+    // round: terminal, budget or cancellation).
+    VerifiedBlock flush_fold(std::span<const std::int64_t> tokens,float delta) {
+        if(phase_!=Phase::ready || !line_ || fold_armed_ ||
+           static_cast<int>(tokens.size())!=frontier_-verified_frontier_)
+            throw std::logic_error("folded verification flush");
+        if(tokens.empty())return {};
+        fold_tokens_.assign(tokens.begin(),tokens.end());
+        fold_frontier_=frontier_;
+        return settle_fold(-1,delta,false,false);
+    }
+    // End of request: the drafting context takes the line's exact state at the
+    // verified frontier (drafted tokens past it are dropped).
+    void end_fold() {
+        if(!line_)return;
+        if(phase_!=Phase::ready)throw std::logic_error("folded verification end");
+        if(fold_armed_){context_->set_fold_peer(nullptr,{},nullptr);fold_armed_=false;}
+        if(frontier_!=verified_frontier_) {
+            context_->restore_verified_root(stream_);
+            draft_.restore_ring_checkpoint(stream_);
+        }
+        context_->sync_exact_line_from(*line_,stream_,true);
+        check(cudaStreamSynchronize(stream_),"folded verification end");
+        frontier_=context_->position();
+        if(draft_.ring_base_abs()+draft_.ring_count()!=frontier_ || frontier_!=verified_frontier_)
+            throw std::logic_error("folded verification end frontier");
+        line_=nullptr;
+    }
+
     // Keeps the first `retained` verified tokens (all, or the prefix the output
     // session accepted) and moves the verified root there.
     void commit_verification(std::span<const std::int64_t> retained) {
@@ -767,6 +839,131 @@ private:
         ++totals_.rounds;
     }
     // Restores the verified root and runs `tokens` with exact history.
+    static void forward_rows(Exl3TextContext& context,std::span<const std::int64_t> tokens,
+                             cudaStream_t stream) {
+        for(std::size_t at=0;at<tokens.size();) {
+            const auto take=std::min<std::size_t>(tokens.size()-at,1024);
+            const auto part=tokens.subspan(at,take);
+            if(take>8)context.append_prefill_wide(part,stream);
+            else context.append_prefill(part,stream);
+            at+=take;
+        }
+    }
+    // Scores the carried (or line-forwarded) block; a correction re-runs the
+    // kept tokens from the roots (rewind_fold). Roots move in commit_fold.
+    VerifiedBlock settle_fold(std::int64_t round_first,float delta,bool carried,bool round_followed) {
+        phase_=Phase::executing;
+        try {
+            const auto start=Clock::now();
+            static const bool timed=std::getenv("NINFER_EXL3_VERICACHE_STATS")!=nullptr;
+            auto mark=start;
+            const auto step=[&](double& total) {
+                if(!timed)return;
+                check(cudaStreamSynchronize(stream_),"vericache fold step timing");
+                const auto now=Clock::now();
+                total+=std::chrono::duration<double,std::milli>(now-mark).count();
+                mark=now;
+            };
+            const std::span<const std::int64_t> tokens(fold_tokens_);
+            if(!carried)forward_rows(*line_,tokens,stream_);
+            if(line_->position()!=verified_frontier_+static_cast<int>(tokens.size()))
+                throw std::logic_error("folded verification line extent");
+            step(totals_.forward_ms);
+            std::vector<std::int64_t> next(tokens.begin()+1,tokens.end());
+            next.push_back(round_first);
+            const auto scores=line_->exact_row_scores(next,stream_,delta);
+            step(totals_.scores_ms);
+            VerifiedBlock result;
+            std::int64_t correction=-1;
+            std::size_t reject=tokens.size();
+            for(std::size_t i=0;i<tokens.size();++i) {
+                if(next[i]<0)break;
+                const bool bad=delta>0?scores[i].gap>delta:scores[i].greedy!=next[i];
+                if(bad) {reject=i+1;correction=scores[i].greedy;break;}
+                result.max_gap=std::max(result.max_gap,scores[i].gap);
+                totals_.accepted_gap_sum+=scores[i].gap;
+                totals_.accepted_off_greedy+=scores[i].gap>0.0f?1:0;
+                for(std::size_t e=0;e<Totals::kGapEdges.size();++e)
+                    totals_.accepted_gap_over[e]+=scores[i].gap>Totals::kGapEdges[e]?1:0;
+                ++totals_.accepted_checked;
+            }
+            totals_.max_accepted_gap=std::max(totals_.max_accepted_gap,result.max_gap);
+            result.tokens.assign(tokens.begin(),tokens.begin()+static_cast<std::ptrdiff_t>(reject));
+            if(correction>=0) {
+                result.tokens.push_back(correction);
+                result.corrected=true;
+                rewind_fold(result.tokens);
+                step(totals_.fix_ms);
+            }
+            fold_commit_=FoldCommit{true,result.corrected,round_followed,result.tokens};
+            check(cudaStreamSynchronize(stream_),"folded verification completion");
+            result.verify_ms=elapsed(start);
+            ++totals_.verified_blocks;
+            totals_.corrected_blocks+=result.corrected?1:0;
+            totals_.verify_ms+=result.verify_ms;
+            phase_=Phase::ready;
+            return result;
+        } catch(...) {
+            phase_=Phase::poisoned;
+            throw;
+        }
+    }
+    // Both lines back to the roots at the verified frontier, then `tokens`
+    // exactly on the line; the drafting context takes the line's state (its
+    // L0 aging rewound) and the draft ring re-commits the rows.
+    void rewind_fold(std::span<const std::int64_t> tokens) {
+        line_->restore_verified_root(stream_);
+        forward_rows(*line_,tokens,stream_);
+        context_->restore_verified_root(stream_);
+        context_->sync_exact_line_from(*line_,stream_,true);
+        draft_.restore_ring_checkpoint(stream_);
+        commit_captured(static_cast<int>(tokens.size()),verified_frontier_);
+        check(cudaStreamSynchronize(stream_),"folded verification rewind");
+        frontier_=context_->position();
+        if(line_->position()!=frontier_ || draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
+            throw std::logic_error("folded verification rewind frontier");
+    }
+public:
+    // Keeps the first `retained` tokens of the last folded block (all, or the
+    // prefix the output session accepted) and moves every root there.
+    void commit_fold(std::size_t retained) {
+        if(!fold_commit_.pending && !retained && phase_==Phase::ready)return;
+        if(phase_!=Phase::ready || !fold_commit_.pending || retained>fold_commit_.tokens.size())
+            throw std::logic_error("folded verification commit");
+        auto commit=std::move(fold_commit_);
+        fold_commit_={};
+        phase_=Phase::executing;
+        try {
+            if(retained<commit.tokens.size()) {
+                // Only the accepted prefix stays (the session stopped inside
+                // the block): re-run it from the roots.
+                if(!commit.corrected && commit.round_followed)
+                    context_->set_fold_peer(nullptr,{},nullptr);
+                rewind_fold(std::span<const std::int64_t>(commit.tokens).first(retained));
+                line_->save_verified_root(stream_);
+                context_->save_verified_root(stream_);
+                draft_.save_ring_checkpoint(verify_rows_,stream_);
+                verified_frontier_=frontier_;
+            } else if(commit.corrected) {
+                line_->save_verified_root(stream_);
+                context_->save_verified_root(stream_);
+                draft_.save_ring_checkpoint(verify_rows_,stream_);
+                verified_frontier_=frontier_;
+            } else {
+                line_->save_verified_root(stream_);
+                if(commit.round_followed) {
+                    context_->promote_verified_root_pending();
+                    draft_.promote_ring_checkpoint();
+                } else {
+                    context_->save_verified_root(stream_);
+                    draft_.save_ring_checkpoint(verify_rows_,stream_);
+                }
+                verified_frontier_+=static_cast<int>(commit.tokens.size());
+            }
+            phase_=Phase::ready;
+        } catch(...) {phase_=Phase::poisoned;throw;}
+    }
+private:
     void exact_forward_from_root(std::span<const std::int64_t> tokens) {
         context_->restore_verified_root(stream_);
         exact_forward(tokens);
@@ -1050,6 +1247,14 @@ private:
     cudaStream_t stream_=nullptr;
     Phase phase_=Phase::unstarted;
     int frontier_=0,verified_frontier_=0,verify_rows_=0;
+    Exl3TextContext* line_=nullptr;
+    struct FoldCommit {
+        bool pending=false,corrected=false,round_followed=false;
+        std::vector<std::int64_t> tokens;
+    } fold_commit_;
+    bool fold_armed_=false;
+    int fold_frontier_=0;
+    std::vector<std::int64_t> fold_tokens_;
     Totals totals_{};
     std::uint64_t pending_ticket_=0;
     std::optional<Step> pending_;

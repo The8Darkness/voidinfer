@@ -1437,7 +1437,7 @@ struct Exl3TextContext::Impl {
     std::shared_ptr<Exl3LaneKvSource> kv_source;
     // The lane source over this context's L0 host planes (null otherwise).
     void ensure_kv_source() {
-        if(kv_source || !Exl3NativeContextExtent::l0_oscar_enabled() || host_kv.enabled)return;
+        if(kv_source || exact_line || !Exl3NativeContextExtent::l0_oscar_enabled() || host_kv.enabled)return;
         Exl3LaneKvSource::Planes planes;
         bool cpu_visible=true;
         for(int layer=0;layer<kLayers;++layer)
@@ -1827,6 +1827,10 @@ struct Exl3TextContext::Impl {
         int position = -1, last_rows = 0, tap_rows = 0, embedding_rows = 0;
     };
     std::unique_ptr<VerifiedRoot> verified_root;
+    std::unique_ptr<VerifiedRoot> verified_root_pending;   // folded VeriCache drafting line
+    // Exact line of folded VeriCache (make_exact_line): borrowed planes, no
+    // INT4 codes, exact history only.
+    bool exact_line = false;
     Exl3CudaLinearWorkspace::Owner head_workspace;
     std::unique_ptr<DeviceAllocation> greedy_rows;
     std::array<std::shared_ptr<Exl3GreedyPacketTransfer>,2> greedy_transfers;
@@ -3470,6 +3474,9 @@ struct Exl3TextContext::Impl {
     static constexpr int kL0RetainedBackingRows=16384;
     static constexpr std::size_t kPlaneRowBytes=static_cast<std::size_t>(kKVHeads)*kHeadDim*sizeof(std::uint16_t);
     void ensure_l0_rows(int rows) {
+        // An exact line writes rows its drafting context already backs and
+        // keeps no INT4 codes: nothing to grow.
+        if(exact_line)return;
         consume_kv_rewrite();
         // Plane growth under host memory pressure spills idle histories first.
         Exl3LaneKvSource::relieve_memory_pressure(plane_growth_bytes(rows));
@@ -8874,7 +8881,13 @@ void Exl3TextContext::continue_rows_for_verification(
     std::span<const std::int64_t> token_ids,cudaStream_t stream) {
     const int base=position_;
     impl_->trace_members=1;impl_->trace_graph=0;impl_->trace_member=0;
-    if(batched_verify_)batched_verify_->continue_rows(*this,token_ids,stream);
+    if(fold_peer_) {
+        // Folded VeriCache: the exact line's block rides along this round.
+        const BatchedPeer peer{fold_peer_,std::span<const std::int64_t>(fold_tokens_),
+            fold_stream_?fold_stream_:stream};
+        fold_peer_=nullptr;
+        continue_rows_batched(std::span<const BatchedPeer>(&peer,1),token_ids,stream);
+    } else if(batched_verify_)batched_verify_->continue_rows(*this,token_ids,stream);
     else continue_rows(token_ids,stream);
     auto& trace=impl_->round_traces[impl_->round_trace_next++%impl_->round_traces.size()];
     trace={base,static_cast<int>(token_ids.size()),impl_->trace_members,impl_->trace_graph,
@@ -9436,8 +9449,9 @@ void Exl3TextContext::append_media_embeddings_numeric(std::span<const float> emb
 std::size_t Exl3TextContext::continuation_bytes_required(int capacity) const {
     const bool native16 = capacity == 16 && impl_->native_continuation16_enabled &&
         impl_->host_kv.enabled && !impl_->oscar && !impl_->transaction;
-    require((capacity >= 2 && capacity <= 8) || native16,
-            "P2 target continuation capacity must be 2..8 or explicit exact-host16");
+    require((capacity >= 2 && capacity <= 8) || native16 ||
+                (impl_->exact_line && capacity >= 2 && capacity <= 32),
+            "P2 target continuation capacity must be 2..8, explicit exact-host16 or an exact line's 2..32");
     require(impl_->capture_taps, "P2 target continuation requires captured taps");
     require(!impl_->graph_active && !impl_->graph_capture_active &&
                 (!impl_->oscar || impl_->oscar->graph_class() == 0),
@@ -9998,10 +10012,11 @@ struct Exl3TextContext::BatchBinding {
                  int own_rows) : owner(owner_) {
         require(!peers.empty() && peers.size()<=Exl3FullAttentionLayer::kMaxBatchPeers &&
                 peers.size()<=Exl3GdnLayer::kMaxBatchPeers,"batched peer count");
-        static const bool fork=[] {
+        static const bool fork_enabled=[] {
             const char* value=std::getenv("NINFER_EXL3_BATCH_FORK");
             return !value || std::strcmp(value,"0")!=0;
         }();
+        const bool fork=fork_enabled;
         if(fork && !owner.batch_fork_event) {
             for(auto& s:owner.batch_fork_streams)
                 cuda_check(cudaStreamCreateWithFlags(&s,cudaStreamNonBlocking),"batched peer fork stream");
@@ -10080,7 +10095,7 @@ void Exl3TextContext::prepare_batched_continuation_graph(std::span<Exl3TextConte
                 (!impl.transaction || !impl.transaction->active),
             "batched continuation graph capture requires idle device-KV contexts");
     }
-    require(impl_->prefill_capacity>=rows,"batched continuation exceeds the owner's row capacity");
+    require(impl_->prefill_capacity>=rows && rows<=32,"batched continuation exceeds the owner's row capacity");
     // Captured launches read the live positions from each context's
     // position_device; capture at the end of each context like the per-layer
     // graphs so capacity-sized grids cover every replay position. The owner's
@@ -10168,8 +10183,8 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         require(!impl.host_kv.enabled && !impl.host_kv_failed && !impl.oscar &&
                 (!impl.transaction || !impl.transaction->rollback_required),
             "batched continuation requires device-KV contexts outside failed transactions");
-        require(impl.continuation && count>=2 && count<=8 &&
-                count<=impl.continuation->capacity,
+        require(impl.continuation && count<=impl.continuation->capacity &&
+                (impl.exact_line ? count>=2 && count<=24 : count>=2 && count<=8),
             "batched continuation rows are outside each context's prepared capacity");
         require(std::all_of(tokens[c].begin(),tokens[c].end(),[](std::int64_t token) {
                 return token>=0 && token<kVocab; }),
@@ -10187,9 +10202,9 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         "query batched continuation stream capture state");
     require(capture_status==cudaStreamCaptureStatusNone,
         "batched continuation is unavailable during external stream capture");
-    require(impl_->prefill_capacity>=rows,"batched continuation exceeds the owner's row capacity");
+    require(impl_->prefill_capacity>=rows && rows<=32,"batched continuation exceeds the owner's row capacity");
     // Owner: rows [0, own_rows); each peer's rows follow in order.
-    std::array<std::int64_t,8*(kMaxBatchedPeers+1)> ids{};
+    std::array<std::int64_t,32> ids{};
     std::array<int,kMaxBatchedPeers+1> first_row{};
     for(std::size_t c=0,offset=0;c<count_contexts;++c) {
         first_row[c]=static_cast<int>(offset);
@@ -10296,6 +10311,13 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
                 static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+row*kHidden,bytes);
             peer.embedding_rows=peer.tap_rows=static_cast<int>(count);
             peer.last_stack_output=impl_->last_stack_output+row*kHidden;
+            if(peer.exact_line) {
+                // Scored after the round (exact_row_scores): keep the rows in
+                // the line's own buffer, not the owner's (rewritten by replays).
+                if(copies.count==kSegmentCopyMax)flush();
+                copies.add(peer.hidden_a,impl_->last_stack_output+row*kHidden,bytes);
+                peer.last_stack_output=peer.hidden_a;
+            }
         }
         flush();
     }
@@ -10574,11 +10596,19 @@ __global__ void __launch_bounds__(1024) exact_row_score_kernel(const std::uint16
 }
 } // namespace
 
-void Exl3TextContext::save_verified_root(cudaStream_t stream) {
+void Exl3TextContext::save_verified_root(cudaStream_t stream) {save_root_slot(false,stream);}
+void Exl3TextContext::save_verified_root_pending(cudaStream_t stream) {save_root_slot(true,stream);}
+void Exl3TextContext::promote_verified_root_pending() {
+    require(impl_->verified_root_pending && impl_->verified_root_pending->position>0,
+        "pending verified root missing");
+    std::swap(impl_->verified_root,impl_->verified_root_pending);
+}
+void Exl3TextContext::save_root_slot(bool pending,cudaStream_t stream) {
     require(position_>0 && impl_->last_rows>0 && !impl_->graph_capture_active &&
             (!impl_->transaction || !impl_->transaction->active),
             "verified root needs a completed forward outside a transaction");
-    if(!impl_->verified_root) {
+    auto& slot=pending?impl_->verified_root_pending:impl_->verified_root;
+    if(!slot) {
         auto root=std::make_unique<Impl::VerifiedRoot>();
         std::size_t recurrent_bytes=0,conv_bytes=0;
         for(const auto& layer:impl_->gdn_layers) if(layer) {
@@ -10602,9 +10632,9 @@ void Exl3TextContext::save_verified_root(cudaStream_t stream) {
             recurrent+=recurrent_size;
             conv+=conv_size;
         }
-        impl_->verified_root=std::move(root);
+        slot=std::move(root);
     }
-    auto& root=*impl_->verified_root;
+    auto& root=*slot;
     impl_->join_repair(stream);
     // One launch for every layer's checkpoint copies (was two cudaMemcpyAsync
     // per GDN layer, ~30 us of host time each on every verified block).
@@ -10658,7 +10688,81 @@ int Exl3TextContext::verified_root_position() const noexcept {
 }
 
 void Exl3TextContext::set_l0_exact_history(bool exact) noexcept {
-    for(auto& layer:impl_->full_layers) if(layer) layer->set_l0_exact_history(exact);
+    for(auto& layer:impl_->full_layers) if(layer) layer->set_l0_exact_history(exact || impl_->exact_line);
+}
+
+void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
+    require(&drafting!=this && drafting.impl_->model==impl_->model,"exact line needs a drafting context of its model");
+    require(Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->host_kv.enabled && !drafting.impl_->exact_line,
+        "exact line needs L0 OSCAR contexts");
+    require(impl_->max_context==drafting.impl_->max_context,"exact line needs the drafting context's capacity");
+    // The line never exports exact state: no lane-backed page source.
+    impl_->kv_source.reset();
+    impl_->exact_line=true;
+    for(int layer=0;layer<kLayers;++layer) {
+        if(!impl_->full_layers[layer])continue;
+        require(drafting.impl_->cache_k[layer] && drafting.impl_->cache_v[layer],
+            "exact line needs the drafting context's FP16 planes");
+        impl_->cache_k[layer]=drafting.impl_->cache_k[layer];
+        impl_->cache_v[layer]=drafting.impl_->cache_v[layer];
+        impl_->full_layers[layer]->set_kv_cache(static_cast<std::uint16_t*>(impl_->cache_k[layer]->ptr),
+            static_cast<std::uint16_t*>(impl_->cache_v[layer]->ptr),impl_->max_context);
+        impl_->full_layers[layer]->set_l0_exact_only(true);
+    }
+}
+
+bool Exl3TextContext::exact_line() const noexcept {return impl_->exact_line;}
+
+void Exl3TextContext::sync_exact_line_from(Exl3TextContext& source,cudaStream_t stream,bool outputs) {
+    require(&source!=this && (impl_->exact_line || source.impl_->exact_line) &&
+            source.impl_->model==impl_->model && source.position_>0 &&
+            source.impl_->last_rows>0 && !impl_->graph_capture_active &&
+            (!impl_->transaction || !impl_->transaction->active),
+        "exact line sync needs a forwarded exact-line peer of the same model");
+    impl_->join_repair(stream);
+    source.impl_->join_repair(stream);
+    Exl3GdnRootCopies copies;
+    for(int layer=0;layer<kLayers;++layer)
+        if(impl_->gdn_layers[layer])
+            copies.layer[copies.count++]=impl_->gdn_layers[layer]->live_state_copies_from(
+                *source.impl_->gdn_layers[layer]);
+    exl3_gdn_launch_root_copies(copies,stream);
+    for(int layer=0;layer<kLayers;++layer)
+        if(impl_->full_layers[layer])
+            impl_->full_layers[layer]->copy_l0_window_from(*source.impl_->full_layers[layer],stream,
+                impl_->exact_line);
+    cuda_check(cudaMemcpyAsync(impl_->position_device,source.impl_->position_device,3*sizeof(int),
+        cudaMemcpyDeviceToDevice,stream),"exact line device position");
+    if(outputs) {
+        auto& from=*source.impl_;
+        cuda_check(cudaMemcpyAsync(impl_->logits,from.logits,kVocab*sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice,stream),"exact line logits");
+        const auto rows_bytes=[](int rows){return static_cast<std::size_t>(rows)*kHidden*sizeof(std::uint16_t);};
+        for(std::size_t tap=0;tap<kTapLayers.size();++tap)
+            if(impl_->taps[tap] && from.taps[tap] && from.tap_rows>0)
+                cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,from.taps[tap]->ptr,rows_bytes(from.tap_rows),
+                    cudaMemcpyDeviceToDevice,stream),"exact line taps");
+        if(impl_->embedding_trace && from.embedding_trace && from.embedding_rows>0)
+            cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,from.embedding_trace->ptr,
+                rows_bytes(from.embedding_rows),cudaMemcpyDeviceToDevice,stream),"exact line embedding rows");
+    }
+    position_=source.position_;
+    impl_->last_rows=source.impl_->last_rows;
+    impl_->tap_rows=source.impl_->tap_rows;
+    impl_->embedding_rows=source.impl_->embedding_rows;
+    if(impl_->continuation)impl_->continuation->rows=0;
+    impl_->tap_generation.fetch_add(1,std::memory_order_release);
+    impl_->qkv_trace_valid=false;
+    impl_->invalidate_native_mtp_hidden_capture();
+}
+
+void Exl3TextContext::set_fold_peer(Exl3TextContext* line,std::span<const std::int64_t> tokens,
+    cudaStream_t line_stream) {
+    require(!line || (line!=this && line->impl_->exact_line && !tokens.empty() && tokens.size()<=24),
+        "fold peer must be an exact line verifying 1..24 rows");
+    fold_peer_=line;
+    fold_tokens_.assign(tokens.begin(),tokens.end());
+    fold_stream_=line_stream;
 }
 
 std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(

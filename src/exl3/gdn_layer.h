@@ -663,6 +663,9 @@ public:
     Exl3GdnRootCopy save_checkpoint_copies(const Exl3GdnLayerCheckpoint& checkpoint,int position,
                                            cudaStream_t stream);
     Exl3GdnRootCopy restore_checkpoint_copies(const Exl3GdnLayerCheckpoint& checkpoint);
+    // This layer's live state takes `source`'s (exact line sync); same
+    // bookkeeping as a restore.
+    Exl3GdnRootCopy live_state_copies_from(const Exl3GdnLayer& source);
     // Synchronous host checkpoint restore, preserving FP32 recurrent and all
     // four physical BF16 convolution slots. Invalidates retention capabilities.
     void restore_host_state(std::span<const float> recurrent,

@@ -3221,10 +3221,10 @@ struct Exl3Dflash2DraftModel::Impl {
         int capacity = 0, rows = 0, count = 0;
         long long base_abs = 0, frontier = 0;
         bool active = false;
-    } ring_checkpoint;
-    void copy_ring_checkpoint_slots(bool restore, cudaStream_t stream) {
+    } ring_checkpoint, ring_checkpoint_pending;   // pending: folded VeriCache next root
+    void copy_ring_checkpoint_slots(bool restore, cudaStream_t stream, bool pending = false) {
         constexpr std::size_t row_elements = static_cast<std::size_t>(kKVHeads) * kHeadDim;
-        auto& cp = ring_checkpoint;
+        auto& cp = pending ? ring_checkpoint_pending : ring_checkpoint;
         const int first_slot = static_cast<int>(cp.frontier & kRingMask);
         for (int layer = 0; layer < kLayers; ++layer)
             for (int plane = 0; plane < 2; ++plane) {
@@ -4173,13 +4173,13 @@ void Exl3Dflash2DraftModel::begin_prefill_ring_undo(int rows, long long abs_pos0
     }
 }
 
-void Exl3Dflash2DraftModel::save_ring_checkpoint(int rows, cudaStream_t stream) {
+void Exl3Dflash2DraftModel::save_ring_checkpoint(int rows, cudaStream_t stream, bool pending) {
     require_no_fresh_prefill();
     auto& m = *impl_;
     require(m.ring_undo.phase == Impl::RingUndo::Phase::Idle && !m.host_ring_failed &&
             rows >= 1 && rows <= kRingKeep,
             "draft ring checkpoint requires an idle healthy ring and 1..2047 rows");
-    auto& cp = m.ring_checkpoint;
+    auto& cp = pending ? m.ring_checkpoint_pending : m.ring_checkpoint;
     if (cp.capacity < rows) {
         if (cp.arena.ptr) { cuda_check(cudaStreamSynchronize(stream), "draft ring checkpoint drain"); cudaFree(cp.arena.ptr); cp.arena.ptr = nullptr; }
         const std::size_t bytes = static_cast<std::size_t>(kLayers) * 2 * rows * kKVHeads * kHeadDim * sizeof(std::uint16_t);
@@ -4190,8 +4190,22 @@ void Exl3Dflash2DraftModel::save_ring_checkpoint(int rows, cudaStream_t stream) 
     cp.base_abs = m.ring_base_abs;
     cp.count = m.ring_count;
     cp.frontier = m.ring_base_abs + m.ring_count;
-    m.copy_ring_checkpoint_slots(false, stream);
+    m.copy_ring_checkpoint_slots(false, stream, pending);
     cp.active = true;
+}
+
+void Exl3Dflash2DraftModel::promote_ring_checkpoint() {
+    auto& m = *impl_;
+    auto& a = m.ring_checkpoint;
+    auto& b = m.ring_checkpoint_pending;
+    require(b.active, "pending draft ring checkpoint missing");
+    std::swap(a.arena.ptr, b.arena.ptr);
+    std::swap(a.capacity, b.capacity);
+    std::swap(a.rows, b.rows);
+    std::swap(a.count, b.count);
+    std::swap(a.base_abs, b.base_abs);
+    std::swap(a.frontier, b.frontier);
+    std::swap(a.active, b.active);
 }
 
 void Exl3Dflash2DraftModel::restore_ring_checkpoint(cudaStream_t stream) {

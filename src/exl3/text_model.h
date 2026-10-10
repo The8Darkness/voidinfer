@@ -1035,6 +1035,30 @@ public:
     void save_verified_root(cudaStream_t stream = nullptr);
     void restore_verified_root(cudaStream_t stream = nullptr);
     int verified_root_position() const noexcept;
+    // Folded VeriCache (drafting line): a second root slot saved where the
+    // next block's verification starts; promoted to the verified root when
+    // that block is accepted.
+    void save_verified_root_pending(cudaStream_t stream = nullptr);
+    void promote_verified_root_pending();
+
+    // Folded exact VeriCache: an exact line is a second context of the same
+    // model that verifies a drafting context's blocks inside the drafting
+    // rounds' batched target forwards. Its full-attention layers read and
+    // write the drafting context's FP16 planes with exact history only (no
+    // INT4 codes, hot rows or KV pages of its own); its GDN state, window
+    // ring and position are its own.
+    void make_exact_line(Exl3TextContext& drafting);
+    bool exact_line() const noexcept;
+    // Takes `source`'s current state (GDN, L0 window, position; with
+    // `outputs` also its last logits, taps and embedding rows): an exact line
+    // from its drafting context, or a drafting context from its exact line.
+    void sync_exact_line_from(Exl3TextContext& source, cudaStream_t stream = nullptr,
+                              bool outputs = false);
+    // The next continue_rows_for_verification also runs `line` over `tokens`
+    // (its rows follow this context's in one batched forward).
+    void set_fold_peer(Exl3TextContext* line, std::span<const std::int64_t> tokens,
+                       cudaStream_t line_stream = nullptr);
+    bool fold_pending() const noexcept { return fold_peer_ != nullptr; }
     // Diagnostic: the decode round (base, rows, batched members, graph) that
     // produced absolute `position` (recent rounds only).
     std::string round_trace(int position) const;
@@ -1326,6 +1350,7 @@ private:
     void append_prefill_impl(std::span<const std::int64_t> token_ids,
                              cudaStream_t stream, bool wide, bool exact = false);
     void canonicalize_exact_rows(cudaStream_t stream);
+    void save_root_slot(bool pending, cudaStream_t stream);
     void prepare_transaction_impl(Exl3VeriCacheServingCoordinator*,
                                   unsigned startup_fault_for_test);
     void retain_transaction_prefix_impl(int retained_rows,
@@ -1333,6 +1358,9 @@ private:
                                         cudaStream_t stream);
     std::unique_ptr<Impl> impl_;
     Exl3BatchedVerifyCoordinator* batched_verify_ = nullptr;
+    Exl3TextContext* fold_peer_ = nullptr;
+    std::vector<std::int64_t> fold_tokens_;
+    cudaStream_t fold_stream_ = nullptr;
 public:
     std::uint64_t batched_graph_replays() const noexcept { return batched_graph_replays_; }
     std::uint64_t batched_eager_forwards() const noexcept { return batched_eager_forwards_; }

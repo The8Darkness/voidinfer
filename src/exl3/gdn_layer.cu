@@ -2540,6 +2540,26 @@ Exl3GdnRootCopy Exl3GdnLayer::restore_checkpoint_copies(const Exl3GdnLayerCheckp
     return copy;
 }
 
+Exl3GdnRootCopy Exl3GdnLayer::live_state_copies_from(const Exl3GdnLayer& source) {
+    if(&source==this)throw std::invalid_argument("GDN live state copy from itself");
+    invalidate_continuation_history();
+    retained_prefix_available_ = false;
+    current_checkpoint_generation_ = 0;
+    current_checkpoint_stream_ = nullptr;
+    current_checkpoint_recurrent_ = nullptr;
+    current_checkpoint_conv_ = nullptr;
+    Exl3GdnRootCopy copy;
+    copy.recurrent_dst=recurrent_state_;
+    copy.recurrent_src=source.recurrent_state_;
+    copy.before_dst=recurrent_state_before_;
+    copy.conv_dst=conv_state_;
+    copy.conv_src=source.conv_state_;
+    copy.trace_dst=conv_state_trace_;
+    trace_.state_before = recurrent_state_before_;
+    trace_.state_after = recurrent_state_;
+    return copy;
+}
+
 // grid (blocks, layers): each layer's recurrent state (to the live state and
 // its trace), physical convolution state and convolution history trace.
 static __global__ void __launch_bounds__(256) gdn_root_copies_kernel(Exl3GdnRootCopies copies) {

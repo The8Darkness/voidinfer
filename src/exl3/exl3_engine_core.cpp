@@ -373,6 +373,17 @@ struct Exl3EngineCore::Impl {
     std::shared_ptr<Exl3VisionContext> vision;
     std::array<std::shared_ptr<ExecutionStream>,kMaxLanes> streams;
     std::array<std::shared_ptr<Exl3Dflash2DraftModel>,kMaxLanes> drafts;
+    // Folded exact VeriCache (one lane, NINFER_EXL3_VERICACHE_FOLD=1): the
+    // lane's exact line verifies blocks inside its decode rounds.
+    std::array<std::shared_ptr<Exl3TextContext>,kMaxLanes> exact_lines;
+    static bool vericache_fold_enabled() {
+        static const bool enabled=[] {
+            const char* value=std::getenv("NINFER_EXL3_VERICACHE_FOLD");
+            return value && std::string_view(value)=="1";
+        }();
+        return enabled;
+    }
+    static constexpr int kFoldBlock=16,kFoldRows=24,kFoldRingRows=128;
     std::array<std::shared_ptr<Exl3Dflash2Execution>,kMaxLanes> lanes;
     std::array<std::shared_ptr<DraftTapStaging>,kMaxLanes> staging_owners;
     std::shared_ptr<Exl3EngineTargetQ> shared_q;
@@ -1822,6 +1833,17 @@ struct Exl3EngineCore::Impl {
                 value.max_concurrency,mib(free_bytes));
             std::fputc(10,stderr);
         }
+        if(coherent_device && value.max_concurrency==1 && vericache_fold_enabled() &&
+           Exl3NativeContextExtent::l0_oscar_enabled() && Exl3VeriCacheConfig::get().enabled &&
+           Exl3VeriCacheConfig::get().delta<0.5f) {
+            // Eager only: graphs captured at construction would keep the
+            // line's own planes, which make_exact_line replaces.
+            auto line=target->create_context_reserved(coordinator,true,0,public_media_enabled,false);
+            line->make_exact_line(*lanes[0]->context_owner_for_device_round());
+            line->prepare_continuation_reserved(coordinator,kFoldRows,0);
+            line->bind_request_compatibility("exact-line");
+            exact_lines[0]=std::move(line);
+        }
         // The overlapped GDN retained-prefix repair (side stream) corrupts
         // recurrent state under concurrent lanes (VeriCache corrections with
         // 12-20 logit gaps at C3; clean when the repair replays in order on the
@@ -2433,7 +2455,9 @@ struct Exl3EngineCore::Impl {
             if(vericache.enabled) {
                 // Draft numerically ahead with L0 rounds, verify each block, then
                 // publish only verified tokens (in <= 16-token output previews).
-                round->begin_verification(vericache.block);
+                Exl3TextContext* const fold_line=exact_lines[lane_index].get();
+                if(fold_line)round->begin_fold_verification(*fold_line,kFoldRingRows);
+                else round->begin_verification(vericache.block);
                 // Draft length per request (VeriCache paper, Fig. 8 / Alg. 1): the
                 // block that maximizes expected kept tokens per unit time from
                 // this request's measured drafting cost per token, verify-pass
@@ -2492,7 +2516,8 @@ struct Exl3EngineCore::Impl {
                 // and a verify pass is exclusive across lanes (at C>=2 it stalls
                 // every other lane, which the per-request model does not price).
                 const bool adaptive_horizon=vericache.delta<0.5f;
-                int block_now=adaptive_horizon?horizon.choose(vericache.block):vericache.block;
+                int block_now=fold_line?kFoldBlock:
+                    (adaptive_horizon?horizon.choose(vericache.block):vericache.block);
                 auto draft_mark=Clock::now();
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
@@ -2529,7 +2554,7 @@ struct Exl3EngineCore::Impl {
                         // A round may run past the chosen block (up to the pass
                         // limit): the overrun is verified in the same pass instead
                         // of cutting the round short at every block boundary.
-                        const auto pass_limit=static_cast<std::size_t>(vericache.block);
+                        const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:vericache.block);
                         const auto width=static_cast<int>(std::min<std::size_t>(
                             {round_width_limit(),room,pass_limit-unverified.size()}));
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
@@ -2559,20 +2584,64 @@ struct Exl3EngineCore::Impl {
                             static_cast<std::uint8_t>(settled.verification.accepted));
                         continue;
                     }
+                    // Folded: the block rides along the next round (its rows share
+                    // the round's projections); a block no round can carry
+                    // (terminal, budget, size) is verified on the line alone.
+                    std::vector<std::int64_t> fold_carried;
+                    bool fold_carried_terminal=false;
+                    const auto fold_verify=[&]() -> Exl3FastDeviceRound::VerifiedBlock {
+                        if(!terminal_seen && room && unverified.size()>=2 &&
+                           unverified.size()<=static_cast<std::size_t>(kFoldRows)) {
+                            round->arm_fold(unverified);
+                            const auto width=static_cast<int>(std::min<std::size_t>(
+                                {round_width_limit(),room,std::size_t{8},32-unverified.size()}));
+                            const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
+                            ++lt_rounds;
+                            pending_ticket=prepared_round.ticket;
+                            const auto& candidate=prepared_round.candidate;
+                            route.record_attempt(candidate.width,0,0);
+                            route.record_target_work(candidate.verification.verification_rows,
+                                candidate.verification.replay_rows);
+                            Exl3FastDeviceRound::Step settled;
+                            try {
+                                settled=round->settle_device_pending(*pending_ticket,
+                                    candidate.committed_tokens.size());
+                            } catch(...) {pending_ticket.reset();throw;}
+                            pending_ticket.reset();
+                            ++result.speculative.rounds;
+                            result.speculative.accepted_tokens+=settled.verification.accepted;
+                            result.speculative.accepted_prefix_per_round.push_back(
+                                static_cast<std::uint8_t>(settled.verification.accepted));
+                            auto block=round->finish_fold(settled.committed_tokens.front(),vericache.delta);
+                            if(!block.corrected) {
+                                fold_carried=settled.committed_tokens;
+                                fold_carried_terminal=settled.terminal;
+                            }
+                            return block;
+                        }
+                        return round->flush_fold(unverified,vericache.delta);
+                    };
+                    std::optional<Exl3FastDeviceRound::VerifiedBlock> folded;
+                    if(fold_line) {
+                        lt_mark=Clock::now();
+                        folded=fold_verify();
+                        lt_verify+=lt_ms(lt_mark);
+                    }
                     // Verifier and fix passes use the process-wide prompt-scale
                     // scratch: they run alone on the device like ingestion.
                     if(round_lock.owns_lock())round_lock.unlock();
                     lt_mark=Clock::now();
-                    const BatchedInactive verify_inactive(lane_batched_verify[lane_index]);
-                    const PromptPass verify_pass(*this,stream);
+                    const BatchedInactive verify_inactive(fold_line?nullptr:lane_batched_verify[lane_index]);
+                    std::optional<PromptPass> verify_pass;
+                    if(!fold_line)verify_pass.emplace(*this,stream);
                     horizon.observe_draft(std::chrono::duration<double,std::milli>(Clock::now()-draft_mark).count(),
                         static_cast<int>(unverified.size()));
                     const auto pass_start=Clock::now();
-                    const auto verified=round->verify(unverified,vericache.delta);
+                    const auto verified=folded?std::move(*folded):round->verify(unverified,vericache.delta);
                     horizon.observe_pass(static_cast<int>(unverified.size()),
                         std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
                         verified.corrected,static_cast<int>(verified.tokens.size()));
-                    if(adaptive_horizon) {
+                    if(adaptive_horizon && !fold_line) {
                         block_now=horizon.choose(vericache.block);
                         exact_mismatch.store(horizon.mismatch,std::memory_order_relaxed);
                     }
@@ -2585,6 +2654,10 @@ struct Exl3EngineCore::Impl {
                     lt_verify+=lt_ms(lt_mark);
                     unverified.clear();
                     terminal_seen=false;
+                    if(!fold_carried.empty()) {
+                        unverified=fold_carried;
+                        terminal_seen=fold_carried_terminal;
+                    }
                     std::vector<std::int64_t> retained;
                     bool finished=false;
                     for(std::size_t at=0;at<verified.tokens.size();) {
@@ -2643,12 +2716,14 @@ struct Exl3EngineCore::Impl {
                         if(decision.finished()) {result.finish_reason=decision.finish_reason;finished=true;break;}
                         if(selected.size()<chunk.size())break;
                     }
-                    round->commit_verification(retained);
+                    if(fold_line)round->commit_fold(retained.size());
+                    else round->commit_verification(retained);
                     if(finished)break;
                     draft_mark=Clock::now();
                 }
                 // Unverified drafted tokens (cancellation) are never published: rewind.
-                if(round->frontier()!=round->verified_frontier()) {
+                if(fold_line)round->end_fold();
+                else if(round->frontier()!=round->verified_frontier()) {
                     const BatchedInactive rewind_inactive(lane_batched_verify[lane_index]);
                     const PromptPass rewind_pass(*this,stream);
                     round->commit_verification({});

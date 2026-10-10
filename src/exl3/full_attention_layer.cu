@@ -7829,7 +7829,9 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
 
 void Exl3FullAttentionLayer::l0_rewind(int position, cudaStream_t stream) {
     if(!l0_.k_codes) return;
-    l0_oscar::rewind_kernel<<<16,256,0,stream>>>(l0_.state,l0_oscar::hot_view(l0_),position);
+    // An exact line keeps no hot rows (its hot arrays were never initialized).
+    l0_oscar::rewind_kernel<<<16,256,0,stream>>>(l0_.state,
+        l0_exact_only_?l0_oscar::HotView{}:l0_oscar::hot_view(l0_),position);
     cuda_check(cudaGetLastError(),"L0 OSCAR verified-root rewind");
     // A window ring smaller than 2048 rows no longer holds the window of a
     // rewound position: rebuild it from the FP16 L2 record.
@@ -8269,20 +8271,21 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 cuda_check(cudaEventCreateWithFlags(&b.join,cudaEventDisableTiming),"L0 hot fill join");
                 return b;
             }();
-            if(l0_.hot_slots) {
+            if(l0_.hot_slots && !l0_exact_only_) {
                 launch(cudaEventRecord(hot_branch.fork,stream),"L0 hot fill fork");
                 launch(cudaStreamWaitEvent(hot_branch.side,hot_branch.fork,0),"L0 hot fill fork");
                 l0_oscar::hot_fill_kernel<<<4*l0_oscar::kHotMaxInsert*2*(kHeadDim/8)/256,256,0,hot_branch.side>>>(
                     l0_oscar::hot_view(l0_),k_cache_,v_cache_);
                 launch(cudaEventRecord(hot_branch.join,hot_branch.side),"L0 hot fill join");
             }
+            if(!l0_exact_only_)
             l0_oscar::encode_kernel<<<l0_oscar::kEncodeBlocks,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
                 position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
                 reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta),
                 l0_oscar::hot_view(l0_));
             l0_oscar::advance_kernel<<<1,1,0,stream>>>(position_device_,position,l0_.state,
                 cache_capacity_);
-            if(l0_.hot_slots) launch(cudaStreamWaitEvent(stream,hot_branch.join,0),"L0 hot fill join");
+            if(l0_.hot_slots && !l0_exact_only_) launch(cudaStreamWaitEvent(stream,hot_branch.join,0),"L0 hot fill join");
             launch(cudaGetLastError(),"L0 OSCAR history encode");
         }
         if (fakequant_watermark_)
@@ -10188,7 +10191,14 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         }
         if(first!=rows)throw std::logic_error("full-attention batched segment rows");
     }
-    history_lanes_=batch_?batch_->peer_count+1:1;
+    // L0 history lanes: the agents sharing this forward's INT4 history pass.
+    // A folded exact line attends exactly (no INT4 history, no hot rows), so
+    // a fold round keeps the lone agent's layout (its hot candidates feed
+    // the next, unbatched round).
+    history_lanes_=1;
+    if(batch_)
+        for(int i=0;i<batch_->peer_count;++i)
+            if(!batch_->peers[static_cast<std::size_t>(i)].layer->l0_exact_only_)++history_lanes_;
     attention_middle(AttentionMiddle{input_norm,qg,kp,vp,qn,kn,qr,kr,attn,gp,own_rows,position,stream,
         profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix,starts,ends});
     history_lanes_=1;
@@ -10417,6 +10427,22 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
 // copied into this layer's own buffers, this layer's cache and positions run
 // the stateful core exactly as its own forward would, and the gated attention
 // output returns to the owner's O-projection input.
+void Exl3FullAttentionLayer::copy_l0_window_from(const Exl3FullAttentionLayer& source,
+    cudaStream_t stream,bool aging_state) {
+    if(!l0_.k_ring || !source.l0_.k_ring || l0_ring_rows_!=source.l0_ring_rows_)
+        throw std::invalid_argument("L0 exact line window copy needs equal L0 rings");
+    const std::size_t ring=static_cast<std::size_t>(l0_ring_rows_)*kKVHeads*kHeadDim*sizeof(std::uint16_t);
+    const std::size_t sink=static_cast<std::size_t>(l0_oscar::kSink)*kKVHeads*kHeadDim*sizeof(std::uint16_t);
+    cuda_check(cudaMemcpyAsync(l0_.k_ring,source.l0_.k_ring,ring,cudaMemcpyDeviceToDevice,stream),"L0 line ring");
+    cuda_check(cudaMemcpyAsync(l0_.v_ring,source.l0_.v_ring,ring,cudaMemcpyDeviceToDevice,stream),"L0 line ring");
+    cuda_check(cudaMemcpyAsync(l0_.k_sink,source.l0_.k_sink,sink,cudaMemcpyDeviceToDevice,stream),"L0 line sink");
+    cuda_check(cudaMemcpyAsync(l0_.v_sink,source.l0_.v_sink,sink,cudaMemcpyDeviceToDevice,stream),"L0 line sink");
+    if(aging_state)
+        cuda_check(cudaMemcpyAsync(l0_.state,source.l0_.state,2*sizeof(int),cudaMemcpyDeviceToDevice,stream),
+            "L0 line state");
+    invalidate_retained_prefix();
+}
+
 void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
     const std::uint16_t* kp_source,const std::uint16_t* vp_source,std::uint16_t* attn_destination,
     int rows,int position,cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology,
