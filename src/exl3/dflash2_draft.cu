@@ -1,4 +1,5 @@
 #include "exl3/sampled_select.cuh"
+#include "core/capture_guard.h"
 #include "exl3/gaming_operator_fixture.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/vericache_serving_coordinator.h"
@@ -4483,6 +4484,7 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
         auto& exec = graphs.exec[static_cast<std::size_t>(rows)];
         if (!exec) {
             cudaGraph_t graph = nullptr;
+            const ninfer::CudaCaptureScope capture_scope;
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
                        "draft commit capture");
             try {
@@ -5256,6 +5258,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             created.count=count;created.head_columns=head_columns;
             for(int i=0;i<count;++i)created.members[static_cast<std::size_t>(i)]=members[i]->draft->impl_.get();
             cudaGraph_t graph=nullptr;
+            const ninfer::CudaCaptureScope capture_scope;
             cuda_check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),"capture batched draft");
             try {enqueue(true);}
             catch(...) {
@@ -5376,6 +5379,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
             cuda_check(cudaGetLastError(),"draft bulk prefill position");
             if(!g.exec) {
                 cudaGraph_t graph=nullptr;
+                const ninfer::CudaCaptureScope capture_scope;
                 cuda_check(cudaStreamBeginCapture(replay,cudaStreamCaptureModeThreadLocal),
                     "draft bulk prefill capture");
                 try {

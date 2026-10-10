@@ -1,4 +1,5 @@
 #include "core/decode_graph.h"
+#include "core/capture_guard.h"
 
 #include "core/device.h"
 
@@ -48,6 +49,7 @@ DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
     CUDA_CHECK(try_reset());
 
+    const CudaCaptureScope capture_scope;
     CUDA_CHECK(provider_.begin(stream));
 
     try {

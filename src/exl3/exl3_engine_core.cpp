@@ -1,4 +1,5 @@
 #include "exl3/exl3_engine_core.h"
+#include "core/capture_guard.h"
 #include "exl3/environment_options.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/reconstruction_control_allocator.h"
@@ -483,14 +484,17 @@ struct Exl3EngineCore::Impl {
     // Prompt passes (ingestion, VeriCache verifier/fix/rewind) share the
     // model's prompt-scale pool: they run one at a time, ordered on the device
     // by prompt_pass_done, while other lanes keep decoding (their rounds use
-    // private small-tier state only) with NINFER_EXL3_PROMPT_PASS_OVERLAP=1
-    // (research: C4 176 -> 181 tok/s, but a C2 run hit an illegal address in
-    // draft completion). Default: device-exclusive passes.
+    // private small-tier state only). Default since exact VeriCache verifies
+    // every 16-32 tokens: device-exclusive passes stalled every lane (and
+    // synchronized the device) per block. Exact 4K code, 4,096 tokens: C4
+    // 227 -> 346 tok/s, C2 207 -> 225 (means of 2-3 noisy runs), 15 runs
+    // without error (an Oct 9 build once hit an illegal address in draft
+    // completion at C2). NINFER_EXL3_PROMPT_PASS_OVERLAP=0: exclusive passes.
     std::mutex prompt_pass_mutex;
     cudaEvent_t prompt_pass_done=nullptr;
     bool prompt_pass_overlap=[] {
         const char* value=std::getenv("NINFER_EXL3_PROMPT_PASS_OVERLAP");
-        return value && std::string_view(value)=="1";
+        return !value || std::string_view(value)!="0";
     }();
     struct PromptPass {
         Impl& engine;
@@ -505,7 +509,7 @@ struct Exl3EngineCore::Impl {
             } else {
                 const std::lock_guard turnstile(engine.coherent_prefill_turnstile);
                 exclusive=std::unique_lock(engine.coherent_prefill_mutex);
-                if(engine.options.max_concurrency>1)check(cudaDeviceSynchronize());
+                if(engine.options.max_concurrency>1)check(ninfer::cuda_device_synchronize_outside_capture());
             }
         }
         ~PromptPass() {
@@ -1851,7 +1855,7 @@ struct Exl3EngineCore::Impl {
             changed.notify_all();for(auto& worker:workers)if(worker.joinable())worker.join();
             retirement.begin(first_execution_failure!=nullptr);
             auto error=retirement_fault?static_cast<cudaError_t>(std::exchange(retirement_fault,0)):cudaSetDevice(options.device);
-            if(error==cudaSuccess)error=cudaDeviceSynchronize();
+            if(error==cudaSuccess)error=ninfer::cuda_device_synchronize_outside_capture();
             if(error!=cudaSuccess){retirement.complete(static_cast<int>(error));return retirement.result();}
             if(workspace_cleanup_failed()) {
                 retirement.observe_cleanup_failure(-2);return retirement.result();

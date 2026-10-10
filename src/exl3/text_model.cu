@@ -1,4 +1,5 @@
 #include "exl3/l0_history_mark.h"
+#include "core/capture_guard.h"
 #include "exl3/growable_device_region.h"
 #include "exl3/lane_kv_source.h"
 #include "exl3/segment_copy.cuh"
@@ -2149,7 +2150,7 @@ struct Exl3TextContext::Impl {
                 "drain owned-stream continuation graph uses before context mutation");
             ++continuation->graph_stats.narrow_final_use_drains;
         } else {
-            cuda_check(cudaDeviceSynchronize(),
+            cuda_check(ninfer::cuda_device_synchronize_outside_capture(),
                 "drain continuation graph uses before context mutation");
             ++continuation->graph_stats.device_final_use_drains;
         }
@@ -2326,7 +2327,7 @@ struct Exl3TextContext::Impl {
     cudaError_t retire_graph_handles() noexcept {
         return retire_graph_handles_with(
             [](int* device) noexcept {return cudaGetDevice(device);},
-            []() noexcept {return cudaDeviceSynchronize();});
+            []() noexcept {return ninfer::cuda_device_synchronize_outside_capture();});
     }
     void poison_graph_retirement(cudaError_t error) noexcept {
         if(error==cudaSuccess || graph_retirement_error)return;
@@ -2386,7 +2387,7 @@ struct Exl3TextContext::Impl {
         if(small_tier_storage)(void)cudaFree(small_tier_storage);
         if(gdn_write_flag){(void)cudaFree(gdn_write_flag);gdn_write_flag=nullptr;}
         if(transaction && transaction->live_host_root){
-            (void)cudaDeviceSynchronize();(void)cudaFreeHost(transaction->live_host_root);
+            (void)ninfer::cuda_device_synchronize_outside_capture();(void)cudaFreeHost(transaction->live_host_root);
             transaction->live_host_root=nullptr;}
         for(auto& s:batch_fork_streams)if(s){(void)cudaStreamSynchronize(s);(void)cudaStreamDestroy(s);s=nullptr;}
         for(auto& e:batch_join_events)if(e){(void)cudaEventDestroy(e);e=nullptr;}
@@ -6610,7 +6611,7 @@ Exl3TextContext::~Exl3TextContext() {
     const auto retired=exl3_retire_reconstruction_device(impl_->reconstruction_backing->device,
         [](int* device) noexcept {return static_cast<int>(cudaGetDevice(device));},
         [](int device) noexcept {return static_cast<int>(cudaSetDevice(device));},
-        []() noexcept {return static_cast<int>(cudaDeviceSynchronize());},
+        []() noexcept {return static_cast<int>(ninfer::cuda_device_synchronize_outside_capture());},
         [&]() noexcept {impl_.reset();},impl_->reconstruction_retirement_failure_for_test);
     if(retired.released)return;
     static std::atomic<Impl*> quarantine{nullptr};
@@ -10435,7 +10436,7 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view c
     // Request reuse composes default-stream target work, optional copy streams
     // and graph/explicit execution streams. T011 narrows only its proven graph
     // mutation subset; this whole-context fallback remains device-wide.
-    cuda_check(cudaDeviceSynchronize(),"drain prior request work before context reuse");
+    cuda_check(ninfer::cuda_device_synchronize_outside_capture(),"drain prior request work before context reuse");
     if(impl_->host_kv_copy_stream) {
         const auto finish_copies=[&] {
             cuda_check(cudaStreamSynchronize(impl_->host_kv_copy_stream),
@@ -10465,7 +10466,7 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view c
     reset_impl(nullptr,preserve);
     if(std::exchange(impl_->fail_request_reset_completion_for_test,false))
         throw std::runtime_error("injected request reset completion failure");
-    cuda_check(cudaDeviceSynchronize(),"complete request context reset");
+    cuda_check(ninfer::cuda_device_synchronize_outside_capture(),"complete request context reset");
     // Growable L0 codes and planes return backing beyond the retained
     // frontier; the host planes keep kL0RetainedBackingRows rows so ordinary
     // requests on this lane do not re-create pinned pages (~0.1 s per 4K
@@ -11513,7 +11514,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
         // instantiate() destroys its executable.
         if(continuation.graph_definition.ready() ||
             continuation.graph_executable.ready()) {
-            cuda_check(cudaDeviceSynchronize(),
+            cuda_check(ninfer::cuda_device_synchronize_outside_capture(),
                 "drain incompatible fixed-B8 graph before recapture");
             if(continuation.graph_lifecycle.pending())
                 require(impl_->complete_continuation_graph_use(
@@ -11605,7 +11606,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
         impl_->qkv_trace_valid = saved_qkv_trace_valid;
         continuation.rows = 0;
         if(impl_->graph_retirement_error)throw; // Never retry a failed native destroy.
-        const auto retirement=cudaDeviceSynchronize();
+        const auto retirement=ninfer::cuda_device_synchronize_outside_capture();
         if(retirement!=cudaSuccess) {
             continuation.graph_active=false;
             continuation.projection_binding.invalidate();
@@ -11731,7 +11732,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
     };
     try {
         if (graph.definition.ready() || graph.executable.ready()) {
-            cuda_check(cudaDeviceSynchronize(),
+            cuda_check(ninfer::cuda_device_synchronize_outside_capture(),
                        "drain incompatible multi-depth graph before recapture");
             if(graph.lifecycle.pending())
                 require(impl_->complete_continuation_graph_use(
@@ -11820,7 +11821,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         impl_->qkv_trace_valid = saved_qkv_trace_valid;
         continuation.rows = 0;
         if(impl_->graph_retirement_error)throw; // Preserve uncertain handles without retry.
-        const auto retirement=cudaDeviceSynchronize();
+        const auto retirement=ninfer::cuda_device_synchronize_outside_capture();
         if(retirement!=cudaSuccess) {
             graph.active=false;
             continuation.graph_active=false;
