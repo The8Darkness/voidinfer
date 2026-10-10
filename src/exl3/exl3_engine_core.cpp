@@ -2185,10 +2185,7 @@ struct Exl3EngineCore::Impl {
             struct SamplingReset {
                 Exl3TextContext* context;
                 Exl3Dflash2DraftModel* draft;
-                ~SamplingReset() {
-                    context->set_device_sampling({});draft->set_sampling({});
-                    context->clear_exact_prefetch();
-                }
+                ~SamplingReset() {context->set_device_sampling({});draft->set_sampling({});}
             } sampling_reset{context.get(),&draft};
             // VeriCache verifies against exact history: ingest the prompt exactly too.
             if(vericache.enabled)context->set_l0_exact_history(true);
@@ -2397,9 +2394,6 @@ struct Exl3EngineCore::Impl {
                 // Draft numerically ahead with L0 rounds, verify each block, then
                 // publish only verified tokens (in <= 16-token output previews).
                 round->begin_verification(vericache.block);
-                // Full-KV prefetch (VeriCache paper): the exact history of the
-                // verified root streams to the GPU while the block drafts.
-                context->prefetch_exact_history(stream);
                 // Draft length per request (VeriCache paper, Fig. 8 / Alg. 1): the
                 // block that maximizes expected kept tokens per unit time from
                 // this request's measured drafting cost per token, verify-pass
@@ -2597,7 +2591,6 @@ struct Exl3EngineCore::Impl {
                     }
                     round->commit_verification(retained);
                     if(finished)break;
-                    context->prefetch_exact_history(stream);
                     draft_mark=Clock::now();
                 }
                 // Unverified drafted tokens (cancellation) are never published: rewind.

@@ -1831,17 +1831,6 @@ struct Exl3TextContext::Impl {
     std::array<std::shared_ptr<Exl3GreedyPacketTransfer>,2> greedy_transfers;
     std::uint64_t greedy_serial = 0;
     Exl3DeviceSampling sampling;
-    // VeriCache full-KV prefetch (prefetch_exact_history): per full-attention
-    // layer a device copy of the exact history rows [64, end), extended from
-    // the host L2 planes on `copy` after every verified block (verifier-only;
-    // drafting reads the L0 codes).
-    struct ExactPrefetch {
-        std::unique_ptr<DeviceAllocation> arena;
-        int rows_cap=0,end=0;
-        cudaStream_t copy=nullptr;
-        cudaEvent_t fork=nullptr;
-        std::array<cudaEvent_t,kLayers> ready{};
-    } exact_prefetch;
     std::vector<int> sampling_row_depths;   // verification-tree rows (set_sampling_row_depths)
     std::array<Exl3GreedyRow,16> greedy_host_rows{};
     bool greedy_readback_failed=false;
@@ -10423,7 +10412,6 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_preserving(std::string_
 Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view contract,
     const Exl3ExactHostState* root,std::uint64_t expected_generation) {
     impl_->drain_repair();
-    clear_exact_prefetch();
     Impl::require_host_kv_retirement_admission();
     require(!impl_->host_kv_failed,"request reset cannot reuse failed HostKV lineage");
     require(!impl_->reconstruction_backing || !impl_->reconstruction_backing->stream.failed(),
@@ -11111,67 +11099,6 @@ void Exl3TextContext::set_device_sampling(const Exl3DeviceSampling& sampling) no
 }
 const Exl3DeviceSampling& Exl3TextContext::device_sampling() const noexcept {
     return impl_->sampling;
-}
-bool Exl3TextContext::prefetch_exact_history(cudaStream_t stream) {
-    auto& p=impl_->exact_prefetch;
-    static const std::size_t budget=[] {
-        const char* value=std::getenv("NINFER_EXL3_VERICACHE_PREFETCH_MIB");
-        return static_cast<std::size_t>(value?std::strtoull(value,nullptr,10):4096ull)<<20;
-    }();
-    constexpr int kSinkRows=64;
-    constexpr std::size_t row_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim;
-    int full=0;
-    for(const auto& layer:impl_->full_layers) if(layer) ++full;
-    if(!budget || !full) return false;
-    if(!p.arena) {
-        const std::size_t per_row=2*row_elements*sizeof(std::uint16_t)*full;
-        p.rows_cap=static_cast<int>(std::min<std::size_t>(budget/per_row,
-            static_cast<std::size_t>(std::max(0,max_context()-kSinkRows))));
-        if(p.rows_cap<1024) return false;
-        p.arena=std::make_unique<DeviceAllocation>(static_cast<std::size_t>(p.rows_cap)*per_row,
-            "VeriCache exact history prefetch");
-        cuda_check(cudaStreamCreateWithPriority(&p.copy,cudaStreamNonBlocking,0),"VeriCache prefetch stream");
-        cuda_check(cudaEventCreateWithFlags(&p.fork,cudaEventDisableTiming),"VeriCache prefetch event");
-        for(auto& event:p.ready)
-            cuda_check(cudaEventCreateWithFlags(&event,cudaEventDisableTiming),"VeriCache prefetch event");
-    }
-    const int end=std::min(Exl3FullAttentionLayer::l0_history_end_for(position_),kSinkRows+p.rows_cap);
-    if(end<=kSinkRows) {clear_exact_prefetch();return false;}
-    // The copies read rows every pass so far left final (all below the
-    // verified frontier) after this stream's queued work.
-    cuda_check(cudaEventRecord(p.fork,stream),"VeriCache prefetch fork");
-    cuda_check(cudaStreamWaitEvent(p.copy,p.fork,0),"VeriCache prefetch fork");
-    auto* base=static_cast<std::uint16_t*>(p.arena->ptr);
-    const std::size_t plane=static_cast<std::size_t>(p.rows_cap)*row_elements;
-    // Rows below the verified frontier never change within a request, so only
-    // the rows verified since the last call cross the link (the first call
-    // after a reset streams the whole history; drafting rounds keep the link
-    // for their own latency-bound transfers).
-    const int first=p.end>kSinkRows && p.end<=end?p.end:kSinkRows;
-    const std::size_t offset=static_cast<std::size_t>(first-kSinkRows)*row_elements;
-    const std::size_t bytes=static_cast<std::size_t>(end-first)*row_elements*sizeof(std::uint16_t);
-    int slot=0;
-    for(int layer=0;layer<kLayers;++layer) {
-        auto& attention=impl_->full_layers[layer];
-        if(!attention) continue;
-        auto* k=base+(2*slot)*plane;
-        auto* v=base+(2*slot+1)*plane;
-        if(bytes) {
-            cuda_check(cudaMemcpyAsync(k+offset,static_cast<const std::uint16_t*>(impl_->cache_k[layer]->ptr)+
-                first*row_elements,bytes,cudaMemcpyDefault,p.copy),"VeriCache prefetch K");
-            cuda_check(cudaMemcpyAsync(v+offset,static_cast<const std::uint16_t*>(impl_->cache_v[layer]->ptr)+
-                first*row_elements,bytes,cudaMemcpyDefault,p.copy),"VeriCache prefetch V");
-        }
-        cuda_check(cudaEventRecord(p.ready[layer],p.copy),"VeriCache prefetch ready");
-        attention->set_exact_prefetch(k,v,end,p.ready[layer]);
-        ++slot;
-    }
-    p.end=end;
-    return true;
-}
-void Exl3TextContext::clear_exact_prefetch() noexcept {
-    for(auto& layer:impl_->full_layers) if(layer) layer->set_exact_prefetch(nullptr,nullptr,0,nullptr);
-    impl_->exact_prefetch.end=0;
 }
 void Exl3TextContext::set_sampling_row_depths(std::span<const int> depths) {
     impl_->sampling_row_depths.assign(depths.begin(),depths.end());

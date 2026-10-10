@@ -927,13 +927,6 @@ public:
     // Logical depth of each verifier row (verification tree) for the coupled
     // draw keys of packets with exactly that many rows; empty = plain chain.
     void set_sampling_row_depths(std::span<const int> depths);
-    // VeriCache: stream the exact history rows of the current (verified)
-    // frontier into device memory on a copy stream, ordered after `stream`;
-    // exact multi-row passes then read them instead of staging over PCIe.
-    // NINFER_EXL3_VERICACHE_PREFETCH_MIB (default 4096, 0 = off) bounds the
-    // arena. Returns false when nothing was prefetched.
-    bool prefetch_exact_history(cudaStream_t stream);
-    void clear_exact_prefetch() noexcept;
     Exl3GreedyPacket greedy_packet(bool continuation, cudaStream_t stream = nullptr);
     Exl3PendingGreedyPacket submit_greedy_packet(
         bool continuation,std::uint64_t acquisition,std::uint64_t execution,
