@@ -1126,6 +1126,14 @@ __global__ void dflash_prefill_positions_device_kernel(std::int32_t* positions, 
     const int row = static_cast<int>(threadIdx.x);
     if (row < rows) positions[row] = *base + row;
 }
+// Captured fresh-prefill bulk commit: moves the five tap row pointers and the
+// base position to the next chunk at the end of each replay.
+__global__ void dflash_bulk_advance_kernel(const std::uint16_t** taps, std::int32_t* base,
+    int rows) {
+    const int t = static_cast<int>(threadIdx.x);
+    if (t < kLayers) taps[t] += static_cast<std::size_t>(rows) * kHidden;
+    if (t == 0) *base += rows;
+}
 __global__ void dflash_prefill_ring_scatter_positions_kernel(const std::uint16_t* k,
     const std::uint16_t* v, std::uint16_t* ring_k, std::uint16_t* ring_v,
     int rows, const std::int32_t* positions) {
@@ -2998,6 +3006,20 @@ struct Exl3Dflash2DraftModel::Impl {
             if (base) cudaFree(base);
         }
     } commit_graphs;
+    // Fresh-prefill bulk commits replay one captured whole-chunk chain per
+    // chunk (~50 launches each, host-bound when eager); `base` holds the
+    // chunk's first position and the tap pointers advance inside the graph.
+    struct BulkGraph {
+        cudaGraphExec_t exec = nullptr;
+        std::int32_t* base = nullptr;
+        BulkGraph() = default;
+        BulkGraph(const BulkGraph&) = delete;
+        BulkGraph& operator=(const BulkGraph&) = delete;
+        ~BulkGraph() {
+            if (exec) cudaGraphExecDestroy(exec);
+            if (base) cudaFree(base);
+        }
+    } bulk_graph;
     // Batched multi-agent drafting (set_batched_propose); null keeps every
     // proposal private to this execution.
     Exl3BatchedVerifyCoordinator* batched_propose = nullptr;
@@ -5249,7 +5271,82 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
         constexpr int n=kKVHeads*kHeadDim;
         constexpr int kChunk=DraftBatchedScratch::kRows;
         const auto admission=Exl3CudaLinearAdmission::draft_prefill_fc;
-        for(int first=0;first<rows;first+=kChunk) {
+        const auto advance_ring=[&](int count) {
+            const int dropped=std::max(0,m.ring_count+count-kRingKeep);
+            m.ring_count=std::min(kRingKeep,m.ring_count+count);
+            m.ring_base_abs+=dropped;
+        };
+        // Whole chunks replay one captured chain (device tap pointers and base
+        // position advance inside it); the tail chunk runs eagerly below.
+        const int whole=rows/kChunk;
+        static const bool graphed=[] {
+            const char* value=std::getenv("NINFER_DFLASH2_BULK_GRAPH");
+            return !value || std::string(value)!="0";
+        }();
+        int first=0;
+        if(graphed && whole>0 && !m.projection_timing.enabled && !m.projection_observer) {
+            auto& g=m.bulk_graph;
+            // The legacy default stream cannot be captured: replay on the
+            // draft side stream, ordered after and before `stream`.
+            const DraftSideStream* side=stream?nullptr:&draft_side_stream();
+            const cudaStream_t replay=side?side->side:stream;
+            if(side) {
+                cuda_check(cudaEventRecord(side->fork,stream),"draft bulk prefill fork");
+                cuda_check(cudaStreamWaitEvent(replay,side->fork,0),"draft bulk prefill fork");
+            }
+            if(!g.base)
+                cuda_check(cudaMalloc(reinterpret_cast<void**>(&g.base),sizeof(std::int32_t)),
+                    "draft bulk prefill position");
+            cuda_check(cudaMemcpyAsync(b.tap_ptr,taps,kLayers*sizeof(*taps),
+                cudaMemcpyHostToDevice,replay),"draft bulk prefill tap pointers");
+            dflash_set_position_kernel<<<1,1,0,replay>>>(g.base,static_cast<int>(abs_pos0));
+            cuda_check(cudaGetLastError(),"draft bulk prefill position");
+            if(!g.exec) {
+                cudaGraph_t graph=nullptr;
+                cuda_check(cudaStreamBeginCapture(replay,cudaStreamCaptureModeThreadLocal),
+                    "draft bulk prefill capture");
+                try {
+                    dflash_tap_concat_kernel<<<(kChunk*kLayers*kHidden+255)/256,256,0,replay>>>(
+                        b.tap_ptr,b.tcat,kChunk);
+                    b.ws_fc->forward(m.fc,m.fc_meta,b.tcat,b.fc_raw,kChunk,replay);
+                    dflash_rms_norm_kernel<DFlashFmt::F16><<<kChunk,256,256*sizeof(float),replay>>>(
+                        b.fc_raw,m.hidden_norm,b.hctx,kChunk,kHidden);
+                    dflash_prefill_positions_device_kernel<<<1,kChunk,0,replay>>>(b.cpos,kChunk,g.base);
+                    for(int layer=0;layer<kLayers;++layer) {
+                        const auto& lay=m.layers[layer];
+                        b.ws_kv->forward(lay.k,lay.km,b.hctx,b.kblk,kChunk,replay);
+                        b.ws_kv->forward(lay.v,lay.vm,b.hctx,b.vblk,kChunk,replay);
+                        dflash_head_norm_kernel<<<kChunk*kKVHeads,128,128*sizeof(float),replay>>>(
+                            b.kblk,lay.k_norm,b.kblk_n,kChunk*kKVHeads,kHeadDim);
+                        dflash_rope_kernel<<<(kChunk*n+255)/256,256,0,replay>>>(
+                            b.kblk_n,b.kblk_r,b.cpos,kChunk,kKVHeads,kHeadDim);
+                        dflash_prefill_ring_scatter_positions_kernel<<<(kChunk*n+255)/256,256,0,replay>>>(
+                            b.kblk_r,b.vblk,m.ring_k[layer],m.ring_v[layer],kChunk,b.cpos);
+                    }
+                    dflash_bulk_advance_kernel<<<1,32,0,replay>>>(b.tap_ptr,g.base,kChunk);
+                    cuda_check(cudaGetLastError(),"draft bulk prefill capture launches");
+                } catch(...) {
+                    cudaGraph_t abandoned=nullptr;
+                    (void)cudaStreamEndCapture(replay,&abandoned);
+                    if(abandoned)cudaGraphDestroy(abandoned);
+                    throw;
+                }
+                cuda_check(cudaStreamEndCapture(replay,&graph),"draft bulk prefill capture end");
+                const auto instantiated=cudaGraphInstantiate(&g.exec,graph,0);
+                cudaGraphDestroy(graph);
+                cuda_check(instantiated,"draft bulk prefill graph instantiate");
+            }
+            for(int chunk=0;chunk<whole;++chunk) {
+                cuda_check(cudaGraphLaunch(g.exec,replay),"draft bulk prefill graph launch");
+                advance_ring(kChunk);
+            }
+            if(side) {
+                cuda_check(cudaEventRecord(side->join,replay),"draft bulk prefill join");
+                cuda_check(cudaStreamWaitEvent(stream,side->join,0),"draft bulk prefill join");
+            }
+            first=whole*kChunk;
+        }
+        for(;first<rows;first+=kChunk) {
             const int count=std::min(kChunk,rows-first);
             const int pos=static_cast<int>(abs_pos0+first);
             const bool batched=count>8;
@@ -5278,9 +5375,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
                     b.kblk_r,b.vblk,m.ring_k[layer],m.ring_v[layer],count,pos);
                 cuda_check(cudaGetLastError(),"draft bulk prefill ring");
             }
-            const int dropped=std::max(0,m.ring_count+count-kRingKeep);
-            m.ring_count=std::min(kRingKeep,m.ring_count+count);
-            m.ring_base_abs+=dropped;
+            advance_ring(count);
         }
         f.encoded_rows+=rows;
         f.submitted_rows+=rows;
