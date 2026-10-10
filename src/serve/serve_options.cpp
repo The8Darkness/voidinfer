@@ -107,7 +107,7 @@ std::string serve_usage_text(const char* argv0) {
            "       [--exl3-round established|coherent-device]; established is the default\n"
            "       explicit EXL3: established C1/C2 eager FP16 HostKV DFlash2 K7; coherent-device\n"
            "       requires C1, ordinary FP16 Device KV, 2048..32768 context, host-root cache,\n"
-           "       and --greedy or --temperature 0; positive sampling and media are rejected\n"
+           "       greedy or VeriCache-coupled sampling (no penalties); media are rejected\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -508,15 +508,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if(options.exl3_package && options.exl3_package->round_implementation==
             Exl3RoundImplementation::CoherentDevice) {
         const auto& sampling=options.sampling_overrides;
-        if((!options.greedy && (!sampling.temperature || *sampling.temperature!=0.0f)) ||
-           (sampling.temperature && *sampling.temperature!=0.0f) ||
-           (sampling.presence_penalty && *sampling.presence_penalty!=0.0f) ||
-           (sampling.frequency_penalty && *sampling.frequency_penalty!=0.0f) ||
-           (sampling.top_p && *sampling.top_p!=1.0f) ||
-           (sampling.top_k && *sampling.top_k!=0) ||
-           (sampling.min_p && *sampling.min_p!=0.0f))
+        // Greedy or coupled sampling (temperature, top_k, top_p, min_p);
+        // presence/frequency penalties are not supported on this route.
+        if((sampling.presence_penalty && *sampling.presence_penalty!=0.0f) ||
+           (sampling.frequency_penalty && *sampling.frequency_penalty!=0.0f))
             throw std::invalid_argument(
-                "coherent-device EXL3 requires explicit greedy sampling without distribution overrides");
+                "coherent-device EXL3 does not support presence/frequency penalties");
         if(options.max_concurrency<1 || options.max_concurrency>8 || options.enable_vision || options.use_cuda_graph ||
            options.hierarchical_vericache.enabled ||
            options.speculative.backend!=SpeculativeBackend::DFlash2 ||

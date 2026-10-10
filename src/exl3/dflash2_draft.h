@@ -1,4 +1,5 @@
 #pragma once
+#include "exl3/sampled_select.h"
 #include "exl3/gaming_optimizations.h"
 #include "exl3/target_q_continuation.h"
 #include "exl3/draft_distribution_contract.h"
@@ -443,6 +444,9 @@ public:
 
     // Resets draft KV/position scratch. Does not touch the target.
     void reset(cudaStream_t stream = nullptr);
+    // Coupled sampled proposals for the request this draft serves
+    // (temperature 0 = greedy chain).
+    void set_sampling(const Exl3DeviceSampling& sampling) noexcept;
 
     // ===== E5A3 bounded draft KV ring (sliding window 2048, keep 2047) =====
     // The reference (RotatingKVCache max_size=sliding_window-1) proves draft KV

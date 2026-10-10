@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 #include <array>
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <fstream>
@@ -213,6 +214,16 @@ int main() {
             throw std::runtime_error("device Engine witness exceeded prompt headroom");
         RequestOptions request;
         request.execution.sampling.temperature=0;
+        // NINFER_TEST_ENGINE_DEVICE_SAMPLING=T[,top_p[,top_k[,seed]]]: coupled
+        // sampled decoding instead of greedy.
+        if(const auto* sampled=std::getenv("NINFER_TEST_ENGINE_DEVICE_SAMPLING"); sampled && *sampled) {
+            float temperature=0,top_p=1;int top_k=0;unsigned long long seed=0;
+            std::sscanf(sampled,"%f,%f,%d,%llu",&temperature,&top_p,&top_k,&seed);
+            request.execution.sampling.temperature=temperature;
+            request.execution.sampling.top_p=top_p;
+            request.execution.sampling.top_k=top_k;
+            if(seed)request.execution.sampling.seed=seed;
+        }
         request.execution.requested_output_tokens=16;
         request.execution.allow_prefix_reuse=false;
         if(const auto* failure=std::getenv("NINFER_TEST_ENGINE_DEVICE_FAILURE");

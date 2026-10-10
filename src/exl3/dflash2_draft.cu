@@ -1,3 +1,4 @@
+#include "exl3/sampled_select.cuh"
 #include "exl3/gaming_operator_fixture.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/vericache_serving_coordinator.h"
@@ -2534,6 +2535,51 @@ __global__ void dflash_selector_edges_kernel(int position, std::int64_t anchor,
 // reproduces the 256-wide shared-memory tree (strides 128, 64, 32 in registers,
 // then 16..1 by shuffles), so every score and the selected chain are those of
 // the former one-product-per-thread reduction.
+// Coupled sampled proposals (sampled_select.cuh): with temperature > 0 the
+// chain picks argmax logit/T + Gumbel(seed, key, token) over its candidates
+// (their target-head logits, the draft's estimate of the target distribution;
+// the selector's edge terms are not calibrated as logits)
+// truncated like the target sampler (top_k, then min_p / top_p of the
+// candidate weights), so it proposes the token the target's coupled draw
+// most likely picks. key = absolute index of the proposed token.
+struct DraftSelectSampling {
+    float inv_temperature=0.0f,top_p=1.0f,min_p=0.0f;
+    int top_k=0;
+    unsigned long long seed=0;
+    int key_base=0,pad=0;
+};
+__device__ inline int dflash_sampled_choice(const DraftSelectSampling& s,int key,
+    const float* scores,const std::int64_t* candidates) {
+    int order[kTopK];
+    for(int c=0;c<kTopK;++c) order[c]=c;
+    for(int i=1;i<kTopK;++i) {
+        const int o=order[i];int j=i;
+        while(j>0 && scores[o]>scores[order[j-1]]) {order[j]=order[j-1];--j;}
+        order[j]=o;
+    }
+    int cap=kTopK;
+    if(s.top_k>0 && s.top_k<cap) cap=s.top_k;
+    float prob[kTopK],sum=0.0f;
+    const float m=scores[order[0]]*s.inv_temperature;
+    for(int j=0;j<cap;++j) {prob[j]=__expf(scores[order[j]]*s.inv_temperature-m);sum+=prob[j];}
+    const float min_p_thresh=s.min_p>0.0f?s.min_p*prob[0]:-1.0f;
+    float cum=0.0f;int support=0;
+    for(int j=0;j<cap;++j) {
+        if(min_p_thresh>=0.0f && prob[j]<min_p_thresh) break;
+        cum+=prob[j];support=j+1;
+        if(s.top_p<1.0f && cum>=s.top_p*sum) break;
+    }
+    if(support<1) support=1;
+    int best=order[0];float best_value=-CUDART_INF_F;
+    for(int j=0;j<support;++j) {
+        const int c=order[j];
+        const float v=scores[c]*s.inv_temperature+
+            exl3_sampled_gumbel(s.seed,key,static_cast<int>(candidates[c]));
+        if(v>best_value) {best_value=v;best=c;}
+    }
+    return best;
+}
+
 constexpr int kSelectorFusedThreads = kTopK * 32;
 static_assert(kRank == 256, "selector tree is laid out for rank 256");
 
@@ -2542,7 +2588,7 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
     const std::int64_t* device_anchor, const std::int64_t* cand_ids,
     const std::uint16_t* hidden, const std::uint16_t* pred_cb,
     const std::uint16_t* succ_cb, const float* cand_unary,
-    std::int64_t* proposal_out) {
+    std::int64_t* proposal_out, const DraftSelectSampling* sampling = nullptr) {
     const int t = static_cast<int>(threadIdx.x);
     const int lane = t & 31;
     const int candidate_index = t >> 5;
@@ -2580,6 +2626,11 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
         if (t == 0) {
             float best_score = scores[0];
             int best = 0;
+            if (sampling && sampling->inv_temperature > 0.0f)
+                best = dflash_sampled_choice(*sampling, sampling->key_base + position,
+                    cand_unary + static_cast<std::size_t>(position) * kTopK,
+                    cand_ids + static_cast<std::size_t>(position) * kTopK);
+            else
             for (int c = 1; c < kTopK; ++c)
                 if (scores[c] > best_score) { best_score = scores[c]; best = c; }
             const auto selected = cand_ids[
@@ -2846,6 +2897,7 @@ void gopt_draft_dense_fixture(bool paired,bool kmajor,const std::uint16_t* input
 }
 
 struct Exl3Dflash2DraftModel::Impl {
+    Exl3DeviceSampling sampling;   // coupled proposals (propose_batched)
     Exl3GamingOptions gaming=Exl3GamingOptions::from_environment();
     GoptSubmissions gaming_submissions{};
     int device=0;
@@ -4916,6 +4968,7 @@ struct DraftBatchedScratch {
     // Captured proposal forwards (full rings): one per member set and head
     // width; ring_start holds each member's ring start for the replayed round.
     int* ring_start=nullptr;
+    DraftSelectSampling* sampling=nullptr;   // per member, uploaded every round
     struct Graph {
         std::array<const void*,4> members{};
         int count=0,head_columns=0;
@@ -4943,6 +4996,7 @@ struct DraftBatchedScratch {
         alloc(ids,rows*sizeof(std::int64_t),"batched draft ids");
         alloc(liveness,sizeof(unsigned int),"batched draft liveness");
         alloc(ring_start,4*sizeof(int),"batched draft ring starts");
+        alloc(sampling,4*sizeof(DraftSelectSampling),"batched draft sampling");
         alloc(tcat,rows*kLayers*kHidden*two,"batched commit tap rows");
         alloc(fc_raw,rows*kHidden*two,"batched commit fc rows");
         alloc(hctx,rows*kHidden*two,"batched commit hidden rows");
@@ -4978,6 +5032,10 @@ DraftBatchedScratch& draft_batched_scratch() {
     return scratch;
 }
 } // namespace
+
+void Exl3Dflash2DraftModel::set_sampling(const Exl3DeviceSampling& sampling) noexcept {
+    impl_->sampling=sampling;
+}
 
 void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* const> members,
     const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
@@ -5153,10 +5211,25 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
                 stream,kVocab);
             dflash_selector_fused_chain_kernel<<<1,kSelectorFusedThreads,0,stream>>>(
                 P,members[i]->block[0],device_scalars?b.ids+static_cast<std::size_t>(i)*L:nullptr,
-                m.s.cand_ids,m.s.hidden_proj_out,lead.pred_cb,lead.succ_cb,m.s.cand_unary,m.s.proposal_out);
+                m.s.cand_ids,m.s.hidden_proj_out,lead.pred_cb,lead.succ_cb,m.s.cand_unary,m.s.proposal_out,
+                b.sampling+i);
             cuda_check(cudaGetLastError(),"batched draft selector");
         }
     };
+    {
+        std::array<DraftSelectSampling,4> sampling{};
+        for(int i=0;i<count;++i) {
+            const auto& cfg=members[i]->draft->impl_->sampling;
+            auto& value=sampling[static_cast<std::size_t>(i)];
+            if(cfg.active()) {
+                value.inv_temperature=1.0f/cfg.temperature;value.top_p=cfg.top_p;value.min_p=cfg.min_p;
+                value.top_k=cfg.top_k;value.seed=cfg.seed;
+            }
+            value.key_base=members[i]->block_pos0+1;
+        }
+        cuda_check(cudaMemcpyAsync(b.sampling,sampling.data(),count*sizeof(DraftSelectSampling),
+            cudaMemcpyHostToDevice,stream),"upload batched draft sampling");
+    }
     // Full rings (steady state): replay one captured graph per member set and
     // head width instead of ~250 eager launches.
     static const bool graphed_drafts=[] {

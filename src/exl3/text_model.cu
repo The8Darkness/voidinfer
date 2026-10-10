@@ -19,6 +19,7 @@
 #include "exl3/reconstruction_control_allocator.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/greedy_packet.cuh"
+#include "exl3/sampled_select.cuh"
 #include "exl3/transfer_descriptor_storage.h"
 #include "exl3/scatter_piece_storage.h"
 #include "exl3/device_prefix_cache.h"
@@ -1829,6 +1830,8 @@ struct Exl3TextContext::Impl {
     std::unique_ptr<DeviceAllocation> greedy_rows;
     std::array<std::shared_ptr<Exl3GreedyPacketTransfer>,2> greedy_transfers;
     std::uint64_t greedy_serial = 0;
+    Exl3DeviceSampling sampling;
+    std::vector<int> sampling_row_depths;   // verification-tree rows (set_sampling_row_depths)
     std::array<Exl3GreedyRow,16> greedy_host_rows{};
     bool greedy_readback_failed=false;
     GreedyReadbackStats greedy_readback;
@@ -10650,7 +10653,7 @@ void Exl3TextContext::set_l0_exact_history(bool exact) noexcept {
 }
 
 std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
-    std::span<const std::int64_t> next,cudaStream_t stream) {
+    std::span<const std::int64_t> next,cudaStream_t stream,float tolerance) {
     const int rows=impl_->last_rows;
     require(impl_->continuation && impl_->continuation->capacity>0 && impl_->last_stack_output &&
             rows>0 && next.size()==static_cast<std::size_t>(rows) &&
@@ -10698,6 +10701,11 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
         // also scores rows it ignores (row-independent logits).
         buffers.head->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
             buffers.norm,buffers.logits,std::max(count,9),stream);
+        if(impl_->sampling.active())
+            exl3_sampled_score_kernel<<<count,kSampledThreads,0,stream>>>(buffers.logits,kVocab,
+                impl_->sampling,position_-rows+first+1,tolerance,buffers.next+first,
+                buffers.greedy+first,buffers.gap+first);
+        else
         exact_row_score_kernel<<<count,1024,0,stream>>>(buffers.logits,buffers.next+first,
             buffers.greedy+first,buffers.gap+first);
         cuda_check(cudaGetLastError(),"launch exact row scores");
@@ -11086,6 +11094,15 @@ void Exl3TextContext::prepare_greedy_packet() {
         impl_->persistent_bytes=next_impl;persistent_bytes_=next_public;
     }
 }
+void Exl3TextContext::set_device_sampling(const Exl3DeviceSampling& sampling) noexcept {
+    impl_->sampling=sampling;
+}
+const Exl3DeviceSampling& Exl3TextContext::device_sampling() const noexcept {
+    return impl_->sampling;
+}
+void Exl3TextContext::set_sampling_row_depths(std::span<const int> depths) {
+    impl_->sampling_row_depths.assign(depths.begin(),depths.end());
+}
 Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t stream) {
     const auto* source=continuation ? continuation_logits_device() : logits_device();
     const int rows=continuation ? continuation_rows() : 1;
@@ -11098,6 +11115,11 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
     result.serial=++impl_->greedy_serial;
     auto* output=static_cast<Exl3GreedyRow*>(impl_->greedy_rows->ptr);
     try {
+        if(impl_->sampling.active()) {
+            exl3_launch_sampled_packet(rows,stream,source,kVocab,kVocab,impl_->sampling,
+                position_-rows+1,impl_->sampling_row_depths,result.serial,output);
+        }
+        else
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,result.serial,output,impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"greedy packet reduction");
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
@@ -11156,6 +11178,12 @@ Exl3PendingGreedyPacket Exl3TextContext::submit_greedy_packet(
         acquisition,execution,reinterpret_cast<std::uintptr_t>(
             defer_host_readback?transfer->consumer_event:transfer->event));
     try {
+        if(impl_->sampling.active()) {
+            exl3_launch_sampled_packet(rows,stream,source,kVocab,kVocab,impl_->sampling,
+                position_-rows+1,impl_->sampling_row_depths,pending.serial_,
+                static_cast<Exl3GreedyRow*>(transfer->device->ptr));
+        }
+        else
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,
             pending.serial_,static_cast<Exl3GreedyRow*>(transfer->device->ptr),impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"pending greedy packet reduction");

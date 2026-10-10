@@ -15,6 +15,7 @@
 #include "exl3/safetensors.h"
 #include "exl3/recurrent_export_pool.h"
 #include "exl3/greedy_packet.h"
+#include "exl3/sampled_select.h"
 #include "exl3/mtp_runner.h"
 #include "exl3/l0_pinned_pool.h"
 
@@ -919,6 +920,13 @@ public:
     std::size_t greedy_transfer_pool_available_for_test() const noexcept;
     static std::uintptr_t greedy_transfer_identity_for_test(
         const Exl3PendingGreedyPacket&) noexcept;
+    // Coupled sampled selection for every later packet and VeriCache row
+    // score of this context (temperature 0 restores greedy argmax).
+    void set_device_sampling(const Exl3DeviceSampling& sampling) noexcept;
+    const Exl3DeviceSampling& device_sampling() const noexcept;
+    // Logical depth of each verifier row (verification tree) for the coupled
+    // draw keys of packets with exactly that many rows; empty = plain chain.
+    void set_sampling_row_depths(std::span<const int> depths);
     Exl3GreedyPacket greedy_packet(bool continuation, cudaStream_t stream = nullptr);
     Exl3PendingGreedyPacket submit_greedy_packet(
         bool continuation,std::uint64_t acquisition,std::uint64_t execution,
@@ -1034,8 +1042,11 @@ public:
         std::int64_t greedy = -1;
         float gap = 0.0f;
     };
+    // `tolerance` (sampled rows): a next token just outside the exact
+    // top-k/top-p/min-p support still gets a finite gap when raising its
+    // logit by `tolerance` would bring it into the support.
     std::vector<RowScore> exact_row_scores(std::span<const std::int64_t> next,
-                                           cudaStream_t stream = nullptr);
+                                           cudaStream_t stream = nullptr,float tolerance = 0.0f);
     int position() const noexcept { return position_; }
     const std::uint16_t* logits_device() const noexcept;
     std::vector<float> logits_host(cudaStream_t stream = nullptr) const;
