@@ -31,11 +31,11 @@ namespace ninfer::exl3 {
 // length is chosen per request (engine DraftHorizon, VeriCache paper) up to
 // NINFER_EXL3_VERICACHE_BLOCK. A drafted token is kept when its exact logit
 // trails the exact choice by at most NINFER_EXL3_VERICACHE_DELTA (sampled
-// requests: the coupled perturbed values, sampled_select.cuh). "exact":
-// 0.0625, twice the arithmetic floor measured between the decode and
-// verifier kernels on identical exact history (max 0.03 over 2K tokens);
-// "1"/"tolerance" (default): 1.0 (512 hot rows: raw drafts trail by up to
-// ~1.5 at 32K). The prompt is ingested with exact history as well.
+// requests: the coupled perturbed values, sampled_select.cuh). "1"/"exact"
+// (default): 0.0625, twice the arithmetic floor measured between the decode
+// and verifier kernels on identical exact history (max 0.03 over 2K
+// tokens); "tolerance": 1.0 (512 hot rows: raw drafts trail by up to ~1.5
+// at 32K). The prompt is ingested with exact history as well.
 struct Exl3VeriCacheConfig {
     bool enabled=false;
     float delta=1.0f;
@@ -43,15 +43,15 @@ struct Exl3VeriCacheConfig {
     static const Exl3VeriCacheConfig& get() {
         static const Exl3VeriCacheConfig value=[] {
             Exl3VeriCacheConfig c;
-            // Tolerance verification of L0 OSCAR output is the default whenever
-            // L0 is (NINFER_EXL3_VERICACHE=0 opts out).
+            // Exact verification of L0 OSCAR output is the default whenever L0
+            // is (NINFER_EXL3_VERICACHE=0 opts out, =tolerance relaxes it).
             const char* mode=std::getenv("NINFER_EXL3_VERICACHE");
             const std::string m=mode?mode:(exl3_l0_oscar_enabled()?"1":"0");
             if(m=="0"||m.empty()) return c;
             if(m!="1" && m!="tolerance" && m!="exact")
                 throw std::invalid_argument("NINFER_EXL3_VERICACHE must be 0, 1, tolerance or exact");
             c.enabled=true;
-            if(m=="exact") c.delta=0.0625f;
+            if(m!="tolerance") c.delta=0.0625f;
             if(const char* d=std::getenv("NINFER_EXL3_VERICACHE_DELTA")) c.delta=std::strtof(d,nullptr);
             if(const char* b=std::getenv("NINFER_EXL3_VERICACHE_BLOCK")) c.block=std::atoi(b);
             if(c.block<1 || c.block>1024 || !(c.delta>=0.0f))

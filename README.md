@@ -72,17 +72,24 @@ nats/token and raises top-1 agreement from 95.1% to 96.8%. It costs 0.2–0.4 ms
 round (1–2%). Rounds take 18.3 ms at 4K and 18.5–20.3 ms from 16K to 128K; parked agent contexts
 resume in 0.3–1.9 s.
 
-**VeriCache (opt-in, `NINFER_EXL3_VERICACHE=1`).** Block-parallel verification of L0 output
-against the exact FP16 history, after VeriCache (arXiv 2605.17613). The prompt is ingested with exact
-FP16 history attention. DFlash2 then drafts blocks of up to 1,024 tokens on L0 without publishing
-them. One wide exact pass over the block rescores every row against FP16 history streamed from host
-RAM. In tolerance mode (default, `NINFER_EXL3_VERICACHE_DELTA=1.0`), a token is accepted when its
-exact logit is within δ of the exact top logit. The first token outside δ is replaced by the exact
-argmax and the rest of the block is redrafted. `NINFER_EXL3_VERICACHE=exact` requires exact-greedy
-agreement on 64-token blocks. Tokens are published only after verification, and the verified prefix
-becomes the next exact root (device GDN checkpoint plus L0 rewind).
+**VeriCache (default with L0, exact).** Block-parallel verification of L0 output against the exact
+FP16 history, after VeriCache (arXiv 2605.17613). The prompt is ingested with exact FP16 history
+attention. DFlash2 then drafts blocks on L0 without publishing them. One wide exact pass over the
+block rescores every row against FP16 history streamed from host RAM. In exact mode (default,
+`NINFER_EXL3_VERICACHE=1` or `exact`), a drafted token is kept when its exact logit is within 0.0625
+of the exact top logit (twice the measured decode/verifier arithmetic floor); the first token outside
+is replaced by the exact argmax and the rest of the block is redrafted. Block lengths follow the
+measured pass cost and mismatch rate (learned across requests); rounds may run past a block into the
+same pass. `NINFER_EXL3_VERICACHE=tolerance` accepts within 1.0 on fixed 1,024-token blocks;
+`=0` disables. Tokens are published only after verification, and the verified prefix becomes the next
+exact root (device GDN checkpoint plus L0 rewind).
 
-Measured with DFlash2 on the code workload, 1,024 output tokens:
+Exact mode costs more than tolerance because L0 drafts disagree with exact history beyond the floor
+on ~0.1-0.4% of tokens at 4K and ~1% at 32K, which keeps blocks at 16-32 tokens: DFlash2 code
+workload, 1,024 tokens, verify passes take ~20-25% of decode time (tolerance ~8%); 4K 151-162 tok/s
+(tolerance 186), 32K 92-140 tok/s depending on corrections (tolerance 166).
+
+Tolerance mode, measured with DFlash2 on the code workload, 1,024 output tokens:
 
 * Tolerance mode costs +8% per round at 16K (20.06 vs 18.56 ms) and +9% at 64K (21.21 vs 19.45 ms).
 * At 128K each verifier pass takes about 0.6 s. A run with one correction (a 0.53 s fix pass)

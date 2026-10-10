@@ -2478,9 +2478,12 @@ struct Exl3EngineCore::Impl {
                         return best;
                     }
                 } horizon;
-                // Initial per-token mismatch: exact checks catch every near-tie
-                // flip (~1% with 512 hot rows), the tolerance default far fewer.
-                horizon.mismatch=vericache.delta>=0.5f?0.0005:0.01;
+                // Per-token mismatch: tolerance checks flip far less than exact
+                // ones. Exact requests start from the rate the previous exact
+                // requests ended with (INT4 L0 measures ~0.1% at 4K; a fresh
+                // per-request prior kept 1,024-token requests on 32-row blocks).
+                static std::atomic<double> exact_mismatch{0.002};
+                horizon.mismatch=vericache.delta>=0.5f?0.0005:exact_mismatch.load(std::memory_order_relaxed);
                 // Tolerance mode keeps the longest block: its corrections are rare
                 // and a verify pass is exclusive across lanes (at C>=2 it stalls
                 // every other lane, which the per-request model does not price).
@@ -2519,8 +2522,12 @@ struct Exl3EngineCore::Impl {
                     const std::size_t room=budget>unverified.size()?budget-unverified.size():0;
                     const std::size_t block=static_cast<std::size_t>(block_now);
                     if(!terminal_seen && room && unverified.size()<block) {
+                        // A round may run past the chosen block (up to the pass
+                        // limit): the overrun is verified in the same pass instead
+                        // of cutting the round short at every block boundary.
+                        const auto pass_limit=static_cast<std::size_t>(vericache.block);
                         const auto width=static_cast<int>(std::min<std::size_t>(
-                            {round_width_limit(),room,block-unverified.size()}));
+                            {round_width_limit(),room,pass_limit-unverified.size()}));
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
                         lt_prepare+=lt_ms(lt_mark);lt_mark=Clock::now();++lt_rounds;
                         pending_ticket=prepared_round.ticket;
@@ -2561,7 +2568,10 @@ struct Exl3EngineCore::Impl {
                     horizon.observe_pass(static_cast<int>(unverified.size()),
                         std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
                         verified.corrected,static_cast<int>(verified.tokens.size()));
-                    if(adaptive_horizon)block_now=horizon.choose(vericache.block);
+                    if(adaptive_horizon) {
+                        block_now=horizon.choose(vericache.block);
+                        exact_mismatch.store(horizon.mismatch,std::memory_order_relaxed);
+                    }
                     static const bool horizon_trace=std::getenv("NINFER_EXL3_VERICACHE_HORIZON_TRACE")!=nullptr;
                     if(horizon_trace)
                         std::fprintf(stderr,"VERICACHE_HORIZON rows=%zu corrected=%d tok_ms=%.2f pass=%.1f+%.3fx mismatch=%.4f next=%d\n",
