@@ -5936,28 +5936,35 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       for(int j=0;j<BN/8;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.f;
       // Scores: kQkHalfGroup consecutive 16-dimension k-steps accumulate in
       // FP16 (the double-rate tensor path), each partial is added in FP32.
+      // All groups' partials are independent accumulators (latency hiding).
+      constexpr int kQkGroups=kHeadDim/16/kQkHalfGroup;
+      unsigned hs[kQkGroups][BN/8][2];
       #pragma unroll
-      for(int kk0=0;kk0<kHeadDim/16;kk0+=kQkHalfGroup){
-        unsigned hs[BN/8][2];
+      for(int group=0;group<kQkGroups;++group)
         #pragma unroll
-        for(int j=0;j<BN/8;++j) hs[j][0]=hs[j][1]=0u;
+        for(int j=0;j<BN/8;++j) hs[group][j][0]=hs[group][j][1]=0u;
+      #pragma unroll
+      for(int step=0;step<kQkHalfGroup;++step){
         #pragma unroll
-        for(int kk=kk0;kk<kk0+kQkHalfGroup;++kk){
+        for(int group=0;group<kQkGroups;++group){
+          const int kk=group*kQkHalfGroup+step;
           #pragma unroll
           for(int pair=0;pair<BN/16;++pair){
             unsigned b[4];
             reg_attn_ldmatrix_x4(b,ks+(pair*16+(lane&7)+((lane>>4)<<3))*kStride+kk*16+((lane>>3)&1)*8);
-            mma_h(hs[2*pair],qa[kk],b[0],b[1]);
-            mma_h(hs[2*pair+1],qa[kk],b[2],b[3]);
+            mma_h(hs[group][2*pair],qa[kk],b[0],b[1]);
+            mma_h(hs[group][2*pair+1],qa[kk],b[2],b[3]);
           }
         }
+      }
+      #pragma unroll
+      for(int group=0;group<kQkGroups;++group)
         #pragma unroll
         for(int j=0;j<BN/8;++j){
-          const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hs[j][0]));
-          const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hs[j][1]));
+          const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hs[group][j][0]));
+          const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hs[group][j][1]));
           s[j][0]+=lo.x; s[j][1]+=lo.y; s[j][2]+=hi.x; s[j][3]+=hi.y;
         }
-      }
       const bool need_mask=first+BN-1>warp_min_limit;
       float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
       #pragma unroll
@@ -5993,25 +6000,32 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
         for(int n=0;n<kHeadDim/8;++n){ acc[n][0]*=scale[0]; acc[n][1]*=scale[0]; acc[n][2]*=scale[1]; acc[n][3]*=scale[1]; }
       }
       // PV: each key tile accumulates in FP16 (double-rate tensor path) and
-      // is added into the FP32 accumulator.
-      unsigned hacc[kHeadDim/8][2];
+      // is added into the FP32 accumulator, one half of the head dimension
+      // at a time (half the FP16 accumulator registers: no spills).
       #pragma unroll
-      for(int n=0;n<kHeadDim/8;++n) hacc[n][0]=hacc[n][1]=0u;
-      #pragma unroll
-      for(int kk=0;kk<BN/16;++kk){
-        const unsigned a[4]={pp[2*kk][0],pp[2*kk][1],pp[2*kk+1][0],pp[2*kk+1][1]};
+      for(int half_dim=0;half_dim<2;++half_dim){
+        constexpr int kHalfTiles=kHeadDim/16;
+        unsigned hacc[kHalfTiles][2];
         #pragma unroll
-        for(int pair=0;pair<kHeadDim/16;++pair){
-          unsigned b[4];
-          reg_attn_ldmatrix_x4_trans(b,vs+(16*kk+(lane&7)+((lane>>3)&1)*8)*kStride+pair*16+(lane>>4)*8);
-          mma_h(hacc[2*pair],a,b[0],b[1]); mma_h(hacc[2*pair+1],a,b[2],b[3]);
+        for(int n=0;n<kHalfTiles;++n) hacc[n][0]=hacc[n][1]=0u;
+        #pragma unroll
+        for(int kk=0;kk<BN/16;++kk){
+          const unsigned a[4]={pp[2*kk][0],pp[2*kk][1],pp[2*kk+1][0],pp[2*kk+1][1]};
+          #pragma unroll
+          for(int pair=0;pair<kHalfTiles/2;++pair){
+            const int column=half_dim*(kHeadDim/2)+pair*16;
+            unsigned b[4];
+            reg_attn_ldmatrix_x4_trans(b,vs+(16*kk+(lane&7)+((lane>>3)&1)*8)*kStride+column+(lane>>4)*8);
+            mma_h(hacc[2*pair],a,b[0],b[1]); mma_h(hacc[2*pair+1],a,b[2],b[3]);
+          }
         }
-      }
-      #pragma unroll
-      for(int n=0;n<kHeadDim/8;++n){
-        const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hacc[n][0]));
-        const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hacc[n][1]));
-        acc[n][0]+=lo.x; acc[n][1]+=lo.y; acc[n][2]+=hi.x; acc[n][3]+=hi.y;
+        #pragma unroll
+        for(int n=0;n<kHalfTiles;++n){
+          const int out=half_dim*kHalfTiles+n;
+          const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hacc[n][0]));
+          const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hacc[n][1]));
+          acc[out][0]+=lo.x; acc[out][1]+=lo.y; acc[out][2]+=hi.x; acc[out][3]+=hi.y;
+        }
       }
     }
     __syncthreads();
