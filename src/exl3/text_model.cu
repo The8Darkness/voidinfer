@@ -13295,6 +13295,9 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     impl_->ensure_l0_rows(state.position_);
     impl_->ensure_kv_source();
     const bool all_lane_resident=kv_lane_resident(state);
+    // Filled pages of the restored history trade places with this lane's
+    // outgoing pages (no second host copy during the handover).
+    if(impl_->kv_source && !all_lane_resident)impl_->kv_source->exchange(state.kv_pages_);
     if(impl_->kv_source)impl_->kv_source->materialize_except(state.kv_pages_);
     // Pages these planes already hold (own lane-backed pages; pages of other
     // lanes copied plane to plane, one DMA per bank and contiguous run) are

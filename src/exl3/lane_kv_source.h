@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <execution>
 #include <memory>
@@ -53,6 +55,7 @@ public:
     ~Exl3LaneKvSource() {
         if (stream_) cudaStreamDestroy(stream_);
         if (stage_) cudaFreeHost(stage_);
+        if (swap_stage_) cudaFreeHost(swap_stage_);
     }
     Exl3LaneKvSource(const Exl3LaneKvSource&) = delete;
     Exl3LaneKvSource& operator=(const Exl3LaneKvSource&) = delete;
@@ -117,6 +120,110 @@ public:
         });
     }
 
+    // Hands these planes over to a restored history (`incoming`) without a
+    // second host copy of either history: each filled lane-backed page of
+    // `incoming` whose rows coincide with a deferred page of this source
+    // outside `incoming` trades places with it. The outgoing page receives
+    // the plane rows (in the incoming page's buffers), the incoming rows go
+    // to the planes and the incoming page is re-homed here. Other deferred
+    // pages outside `incoming` are filled first, as materialize_except does.
+    void exchange(const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& incoming) {
+        std::vector<const Exl3ExactKVPage*> kept;
+        kept.reserve(incoming.size());
+        for (const auto& page : incoming) kept.push_back(page.get());
+        std::sort(kept.begin(), kept.end());
+        std::lock_guard lock(mutex_);
+        std::vector<std::shared_ptr<Exl3ExactKVPage>> outgoing;
+        for (const auto& weak : pages_)
+            if (auto page = weak.lock())
+                if (holds(*page) && !std::binary_search(kept.begin(), kept.end(), page.get()))
+                    outgoing.push_back(std::move(page));
+        if (outgoing.empty()) return;
+        const auto by_rows = [](const auto& a, const auto& b) {
+            return a->first != b->first ? a->first < b->first : a->rows < b->rows;
+        };
+        std::sort(outgoing.begin(), outgoing.end(), by_rows);
+        struct Pair { std::shared_ptr<Exl3ExactKVPage> in, out; };
+        std::vector<Pair> pairs;
+        std::vector<char> paired(outgoing.size(), 0);
+        int exchanged_rows = 0;
+        {
+            std::shared_lock payload(exl3_page_payload_mutex());
+            for (const auto& constant : incoming) {
+                if (!constant->source || constant->payload_deferred() || !sized(*constant)) continue;
+                auto at = std::lower_bound(outgoing.begin(), outgoing.end(), constant, by_rows);
+                while (at != outgoing.end() && paired[at - outgoing.begin()]) ++at;
+                if (at == outgoing.end() || (*at)->first != constant->first || (*at)->rows != constant->rows)
+                    continue;
+                paired[at - outgoing.begin()] = 1;
+                pairs.push_back({std::const_pointer_cast<Exl3ExactKVPage>(constant), *at});
+            }
+        }
+        std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) { return a.in->first < b.in->first; });
+        {
+            // Unpaired outgoing pages keep their rows before the planes change.
+            std::unique_lock payload(exl3_page_payload_mutex());
+            std::vector<Exl3ExactKVPage*> fill;
+            for (std::size_t index = 0; index < outgoing.size(); ++index)
+                if (!paired[index]) fill.push_back(outgoing[index].get());
+            fill_locked(fill);
+        }
+        // Contiguous runs of pairs, at most one stage of rows each.
+        std::size_t begin = 0;
+        while (begin < pairs.size()) {
+            std::size_t end = begin + 1;
+            const int lo = pairs[begin].in->first;
+            int hi = lo + pairs[begin].in->rows;
+            while (end < pairs.size() && pairs[end].in->first == hi &&
+                   hi + pairs[end].in->rows - lo <= kStageRows) {
+                hi += pairs[end].in->rows;
+                ++end;
+            }
+            std::unique_lock payload(exl3_page_payload_mutex());
+            bool valid = true;
+            for (std::size_t index = begin; index < end && valid; ++index)
+                valid = pairs[index].in->source && !pairs[index].in->payload_deferred() &&
+                    sized(*pairs[index].in) && holds(*pairs[index].out);
+            if (valid) {
+                // NINFER_EXL3_TEST_LANE_EXCHANGE=1 checks every run against copies.
+                std::vector<std::uint16_t> before_planes, before_pages;
+                if (exchange_test()) {
+                    before_planes = read_rows(lo, hi);
+                    before_pages = gather(pairs.data() + begin, pairs.data() + end, lo, hi);
+                }
+                exchange_run_locked(pairs.data() + begin, pairs.data() + end, lo, hi);
+                if (exchange_test() && (read_rows(lo, hi) != before_pages ||
+                    gather(pairs.data() + begin, pairs.data() + end, lo, hi) != before_planes))
+                    throw std::logic_error("lane KV exchange test mismatch");
+                exchanged_rows += hi - lo;
+                for (std::size_t index = begin; index < end; ++index) {
+                    auto& in = *pairs[index].in;
+                    auto& out = *pairs[index].out;
+                    for (int bank = 0; bank < planes_.banks; ++bank) {
+                        out.k[bank].swap(in.k[bank]);
+                        out.v[bank].swap(in.v[bank]);
+                    }
+                    out.deferred.store(false);
+                    release_payload(in);
+                    in.source = shared_from_this();
+                    in.source_id.store(this);
+                    in.deferred.store(true);
+                    track_locked(pairs[index].in);
+                }
+            } else {
+                // The planes stay unchanged for these rows: keep the outgoing rows.
+                std::vector<Exl3ExactKVPage*> fill;
+                for (std::size_t index = begin; index < end; ++index)
+                    if (holds(*pairs[index].out)) fill.push_back(pairs[index].out.get());
+                fill_locked(fill);
+            }
+            begin = end;
+        }
+        if (exchange_test())
+            std::fprintf(stderr, "LANE_KV_EXCHANGE pairs=%zu rows=%d filled=%zu\n", pairs.size(), exchanged_rows,
+                outgoing.size() - pairs.size());
+    }
+
     // Some page of this source holding a row >= `row` is still deferred.
     bool deferred_beyond(int row) {
         std::lock_guard lock(mutex_);
@@ -149,6 +256,96 @@ public:
     }
 
 private:
+    bool sized(const Exl3ExactKVPage& page) const {
+        const std::size_t words = static_cast<std::size_t>(page.rows) * kRowWords;
+        for (int bank = 0; bank < planes_.banks; ++bank)
+            if (page.k[bank].size() != words || page.v[bank].size() != words) return false;
+        return true;
+    }
+
+    // Caller holds mutex_ and the payload mutex exclusively. Swaps plane rows
+    // [lo, hi) with the buffers of a run's (contiguous) incoming pages: the
+    // planes then hold the incoming rows and the buffers the previous ones.
+    template <class Pair> void exchange_run_locked(Pair* begin, Pair* end, int lo, int hi) {
+        const std::size_t run_bytes = static_cast<std::size_t>(hi - lo) * kRowWords * sizeof(std::uint16_t);
+        if (planes_.cpu_visible) {
+            std::for_each(std::execution::par, begin, end, [&](Pair& pair) {
+                auto& in = *pair.in;
+                const std::size_t offset = static_cast<std::size_t>(in.first) * kRowWords;
+                const std::size_t words = static_cast<std::size_t>(in.rows) * kRowWords;
+                std::vector<std::uint16_t> old(words);
+                for (int bank = 0; bank < planes_.banks; ++bank)
+                    for (int plane = 0; plane < 2; ++plane) {
+                        auto* rows = const_cast<std::uint16_t*>(plane ? planes_.v[bank] : planes_.k[bank]) + offset;
+                        auto& buffer = plane ? in.v[bank] : in.k[bank];
+                        std::memcpy(old.data(), rows, words * sizeof(std::uint16_t));
+                        std::memcpy(rows, buffer.data(), words * sizeof(std::uint16_t));
+                        std::memcpy(buffer.data(), old.data(), words * sizeof(std::uint16_t));
+                    }
+            });
+            return;
+        }
+        ensure_staging(true);
+        for (int bank = 0; bank < planes_.banks; ++bank)
+            for (int plane = 0; plane < 2; ++plane) {
+                auto* rows = const_cast<std::uint16_t*>(plane ? planes_.v[bank] : planes_.k[bank]) +
+                    static_cast<std::size_t>(lo) * kRowWords;
+                check(cudaMemcpyAsync(stage_, rows, run_bytes, cudaMemcpyDefault, stream_), "lane KV exchange");
+                std::for_each(std::execution::par, begin, end, [&](Pair& pair) {
+                    const auto& buffer = plane ? pair.in->v[bank] : pair.in->k[bank];
+                    std::memcpy(swap_stage_ + static_cast<std::size_t>(pair.in->first - lo) * kRowWords,
+                        buffer.data(), buffer.size() * sizeof(std::uint16_t));
+                });
+                check(cudaStreamSynchronize(stream_), "lane KV exchange");
+                check(cudaMemcpyAsync(rows, swap_stage_, run_bytes, cudaMemcpyDefault, stream_), "lane KV exchange");
+                std::for_each(std::execution::par, begin, end, [&](Pair& pair) {
+                    auto& buffer = plane ? pair.in->v[bank] : pair.in->k[bank];
+                    std::memcpy(buffer.data(), stage_ + static_cast<std::size_t>(pair.in->first - lo) * kRowWords,
+                        buffer.size() * sizeof(std::uint16_t));
+                });
+                check(cudaStreamSynchronize(stream_), "lane KV exchange");
+            }
+    }
+
+    static bool exchange_test() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_EXL3_TEST_LANE_EXCHANGE");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        return enabled;
+    }
+    // Test helpers: plane rows [lo, hi) and a run's page buffers, bank-major.
+    std::vector<std::uint16_t> read_rows(int lo, int hi) {
+        const std::size_t words = static_cast<std::size_t>(hi - lo) * kRowWords;
+        std::vector<std::uint16_t> out(words * planes_.banks * 2);
+        for (int bank = 0; bank < planes_.banks; ++bank)
+            for (int plane = 0; plane < 2; ++plane)
+                check(cudaMemcpy(out.data() + (bank * 2 + plane) * words,
+                    (plane ? planes_.v[bank] : planes_.k[bank]) + static_cast<std::size_t>(lo) * kRowWords,
+                    words * sizeof(std::uint16_t), cudaMemcpyDefault), "lane KV exchange test");
+        return out;
+    }
+    template <class Pair> std::vector<std::uint16_t> gather(Pair* begin, Pair* end, int lo, int hi) {
+        const std::size_t words = static_cast<std::size_t>(hi - lo) * kRowWords;
+        std::vector<std::uint16_t> out(words * planes_.banks * 2);
+        for (auto* pair = begin; pair != end; ++pair)
+            for (int bank = 0; bank < planes_.banks; ++bank)
+                for (int plane = 0; plane < 2; ++plane) {
+                    const auto& buffer = plane ? pair->in->v[bank] : pair->in->k[bank];
+                    std::copy(buffer.begin(), buffer.end(), out.begin() + (bank * 2 + plane) * words +
+                        static_cast<std::size_t>(pair->in->first - lo) * kRowWords);
+                }
+        return out;
+    }
+
+    void ensure_staging(bool swap) {
+        if (!stream_) check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "lane KV source stream");
+        const std::size_t bytes = static_cast<std::size_t>(kStageRows) * kRowWords * sizeof(std::uint16_t);
+        if (!stage_) check(cudaMallocHost(reinterpret_cast<void**>(&stage_), bytes), "lane KV source stage");
+        if (swap && !swap_stage_)
+            check(cudaMallocHost(reinterpret_cast<void**>(&swap_stage_), bytes), "lane KV source stage");
+    }
+
     static void release_payload(Exl3ExactKVPage& page) {
         for (int bank = 0; bank < 16; ++bank) {
             std::vector<std::uint16_t>().swap(page.k[bank]);
@@ -206,10 +403,7 @@ private:
                 }
             });
         } else {
-            if (!stream_) check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "lane KV source stream");
-            if (!stage_)
-                check(cudaMallocHost(reinterpret_cast<void**>(&stage_),
-                    static_cast<std::size_t>(kStageRows) * kRowWords * sizeof(std::uint16_t)), "lane KV source stage");
+            ensure_staging(false);
             // Contiguous row runs of the (sorted) pages, in stage-sized windows.
             std::size_t begin = 0;
             while (begin < pages.size()) {
@@ -247,6 +441,7 @@ private:
     std::size_t live_hint_ = 0;
     cudaStream_t stream_ = nullptr;
     std::uint16_t* stage_ = nullptr;
+    std::uint16_t* swap_stage_ = nullptr;
 };
 
 // Fills a lane-backed page before its values are read (whichever lane holds it).
