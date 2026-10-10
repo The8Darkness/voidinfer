@@ -255,13 +255,14 @@ inline void l0_launch_exact_history(const void* q,const std::uint16_t* k_src,con
 
 // Exact history of a prefill / verifier chunk of more than 8 rows into the
 // prefill split slot `slot`: the L2 rows [kSink, history_end) are copied in
-// 8K-row pieces into double-buffered device staging on a copy stream (row
+// 16K-row pieces into double-buffered device staging on a copy stream (row
 // groups would otherwise each read them over PCIe), so the copy of piece i+1
 // overlaps the attention of piece i; each piece runs through the FA2 prefill
 // kernel (four key splits) and merges into the slot. The pass is bound by the
 // FA2 compute, not the copies (a deeper cross-layer prefetch ring measured no
-// gain at 64K-128K).
-constexpr int kL0ExactPieceRows=8192;
+// gain at 64K-128K). 16K-row pieces halve the per-piece split partials and
+// merges against 8K (128K prefill -2.9%) for 64 MiB more staging.
+constexpr int kL0ExactPieceRows=16384;
 inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,const std::uint16_t* v_src,
     float* out,float* stats,float* numer,float* split_stats,int slot,int rows,int history_end,
     cudaStream_t stream) {
