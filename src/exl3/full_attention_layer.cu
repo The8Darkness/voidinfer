@@ -5861,6 +5861,13 @@ __device__ __forceinline__ void cp16(void* dst,const void* src,bool valid){
 }
 __device__ __forceinline__ void commit(){ asm volatile("cp.async.commit_group;\n"); }
 template<int N> __device__ __forceinline__ void wait(){ asm volatile("cp.async.wait_group %0;\n"::"n"(N)); }
+// acc += one FP16 half of a packed pair: a single FHADD (exact conversion,
+// round-to-nearest FP32 add), instead of a conversion and an FADD.
+__device__ __forceinline__ void add_lo(float& acc,unsigned packed){
+  asm("{.reg .f16 l,h; mov.b32 {l,h}, %1; add.rn.f32.f16 %0, l, %0;}":"+f"(acc):"r"(packed)); }
+__device__ __forceinline__ void add_hi(float& acc,unsigned packed){
+  asm("{.reg .f16 l,h; mov.b32 {l,h}, %1; add.rn.f32.f16 %0, h, %0;}":"+f"(acc):"r"(packed)); }
+__device__ __forceinline__ float fast_ex2(float x){ float y; asm("ex2.approx.ftz.f32 %0, %1;":"=f"(y):"f"(x)); return y; }
 template<int S>
 __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,std::uint16_t* output,int rows,int base,int capacity,
@@ -5899,6 +5906,15 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       qa[kk][0]=l0?q0[kk*8]:0u; qa[kk][1]=l1?q1[kk*8]:0u;
       qa[kk][2]=l0?q0[kk*8+4]:0u; qa[kk][3]=l1?q1[kk*8+4]:0u;
     }
+    // The 1/16 score scale (2^-4) is folded into Q: exact.
+    #pragma unroll
+    for(int kk=0;kk<kHeadDim/16;++kk)
+      #pragma unroll
+      for(int r=0;r<4;++r){
+        half2 h=*reinterpret_cast<half2*>(&qa[kk][r]);
+        h=__hmul2(h,__float2half2_rn(0.0625f));
+        qa[kk][r]=*reinterpret_cast<unsigned*>(&h);
+      }
   }
   float acc[kHeadDim/8][4];
   #pragma unroll
@@ -5961,9 +5977,8 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       for(int group=0;group<kQkGroups;++group)
         #pragma unroll
         for(int j=0;j<BN/8;++j){
-          const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hs[group][j][0]));
-          const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hs[group][j][1]));
-          s[j][0]+=lo.x; s[j][1]+=lo.y; s[j][2]+=hi.x; s[j][3]+=hi.y;
+          add_lo(s[j][0],hs[group][j][0]); add_hi(s[j][1],hs[group][j][0]);
+          add_lo(s[j][2],hs[group][j][1]); add_hi(s[j][3],hs[group][j][1]);
         }
       const bool need_mask=first+BN-1>warp_min_limit;
       float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
@@ -5972,7 +5987,7 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
         #pragma unroll
         for(int e=0;e<4;++e){
           const int row=e<2?row0:row1; const int key=first+8*j+2*t+(e&1);
-          float sc=s[j][e]*0.0625f;
+          float sc=s[j][e];
           if(need_mask && (key>base+query_base+row || row>=active_rows)) sc=-3.402823466e+38F;
           s[j][e]=sc; tmax[e>>1]=fmaxf(tmax[e>>1],sc);
         }
@@ -5980,18 +5995,25 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       for(int i=0;i<2;++i){ tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],1)); tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],2)); }
       float scale[2];
       #pragma unroll
-      for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:exp2f((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+      for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:fast_ex2((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+      // P = 2^((s - max) log2 e): one FFMA and one MUFU.EX2 per score. A
+      // masked score (-FLT_MAX) gives 0 (explicitly on masked tiles, where
+      // the row max itself may still be the mask value).
       unsigned pp[BN/8][2]; float rs[2]={0.f,0.f};
+      const float bias[2]={-run_max[0]*1.4426950408889634f,-run_max[1]*1.4426950408889634f};
       #pragma unroll
       for(int j=0;j<BN/8;++j){
-        half p[4];
+        float p[4];
         #pragma unroll
         for(int e=0;e<4;++e){
           const float x=s[j][e];
-          p[e]=__float2half(x==-3.402823466e+38F?0.f:exp2f((x-run_max[e>>1])*1.4426950408889634f));
-          rs[e>>1]+=__half2float(p[e]);
+          p[e]=fast_ex2(fmaf(x,1.4426950408889634f,bias[e>>1]));
+          if(need_mask && x==-3.402823466e+38F) p[e]=0.f;
         }
-        pp[j][0]=reg_attn_pack(p[0],p[1]); pp[j][1]=reg_attn_pack(p[2],p[3]);
+        const half2 lo=__floats2half2_rn(p[0],p[1]), hi=__floats2half2_rn(p[2],p[3]);
+        pp[j][0]=*reinterpret_cast<const unsigned*>(&lo); pp[j][1]=*reinterpret_cast<const unsigned*>(&hi);
+        // Row sums of the rounded P (the weights PV uses).
+        add_lo(rs[0],pp[j][0]); add_hi(rs[0],pp[j][0]); add_lo(rs[1],pp[j][1]); add_hi(rs[1],pp[j][1]);
       }
       #pragma unroll
       for(int i=0;i<2;++i){ rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],1); rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],2); den[i]=den[i]*scale[i]+rs[i]; }
@@ -6022,9 +6044,8 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
         #pragma unroll
         for(int n=0;n<kHalfTiles;++n){
           const int out=half_dim*kHalfTiles+n;
-          const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hacc[n][0]));
-          const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hacc[n][1]));
-          acc[out][0]+=lo.x; acc[out][1]+=lo.y; acc[out][2]+=hi.x; acc[out][3]+=hi.y;
+          add_lo(acc[out][0],hacc[n][0]); add_hi(acc[out][1],hacc[n][0]);
+          add_lo(acc[out][2],hacc[n][1]); add_hi(acc[out][3],hacc[n][1]);
         }
       }
     }
