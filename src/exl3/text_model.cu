@@ -55,6 +55,7 @@
 #include <cstring>
 #include <fstream>
 #include <exception>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -3474,6 +3475,34 @@ struct Exl3TextContext::Impl {
             if(cache_k[layer])cache_k[layer]->ensure_host_bytes(used);
             if(cache_v[layer])cache_v[layer]->ensure_host_bytes(used);
         }
+    }
+    // Backs the planes for `rows` on a helper thread, one granule of every
+    // plane at a time in row order, so the per-chunk ensure_l0_rows of a long
+    // prompt finds its rows mapped: host page pinning costs ~0.5 ms per 2 MiB
+    // granule (~1 s of GPU idle at 64K when mapped inline). The returned
+    // future must be joined before the planes shrink or are released.
+    std::future<void> pregrow_l0_planes(int rows) {
+        const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+        std::vector<DeviceAllocation*> planes;
+        std::size_t step=0;
+        for(int layer=0;layer<kLayers;++layer)
+            for(auto* plane:{cache_k[layer].get(),cache_v[layer].get()})
+                if(plane && plane->host_growth_bytes(used)) {
+                    planes.push_back(plane);
+                    step=plane->host_region->granularity_bytes();
+                }
+        if(planes.empty() || !step)return {};
+        Exl3LaneKvSource::relieve_memory_pressure(plane_growth_bytes(rows));
+        CUcontext context=nullptr;
+        if(cuCtxGetCurrent(&context)!=CUDA_SUCCESS || !context)return {};
+        return std::async(std::launch::async,[planes=std::move(planes),used,step,context] {
+            if(cuCtxSetCurrent(context)!=CUDA_SUCCESS)
+                throw std::runtime_error("L0 plane pre-growth context");
+            for(std::size_t target=step;;target+=step) {
+                for(auto* plane:planes)plane->ensure_host_bytes(std::min(target,used));
+                if(target>=used)break;
+            }
+        });
     }
     // Host bytes the planes would add to back `rows` rows.
     std::uint64_t plane_growth_bytes(int rows) const {
@@ -8922,6 +8951,16 @@ void Exl3TextContext::append_prefill_layer_major(
                 first += static_cast<std::size_t>(take);
             }
         };
+        // Long suffixes back their FP16 planes ahead of the layers.
+        std::future<void> pregrow;
+        struct PregrowJoin {
+            std::future<void>& future;
+            ~PregrowJoin() {
+                if(future.valid())try{future.get();}catch(...){}
+            }
+        } pregrow_join{pregrow};
+        if(token_ids.size()>4096)
+            pregrow=impl_->pregrow_l0_planes(position_+static_cast<int>(token_ids.size()));
         const std::size_t block=static_cast<std::size_t>(Exl3NativeContextExtent::l0_prefill_block_rows());
         // Equal blocks of at most `block` rows: every block of a multi-block
         // suffix exceeds block / 2 rows, so the last one holds the tap tail.
@@ -8952,6 +8991,7 @@ void Exl3TextContext::append_prefill_layer_major(
                 impl_->l0_layer_major_block = false;
             } else if (!ids.empty()) row_major(ids, retained);
         }
+        if(pregrow.valid())pregrow.get();
         return;
     }
     impl_->join_repair(stream);

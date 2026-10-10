@@ -8,7 +8,9 @@
 #include <cuda.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -54,20 +56,29 @@ public:
 
     // Backs at least `bytes` from the start of the range (host call; no
     // stream ordering is needed to grow: new pages are not yet referenced).
+    // Thread-safe against concurrent ensure() calls (a helper thread may
+    // pre-grow the range granule by granule while the owner ensures less).
     void ensure(std::size_t bytes) {
         if (!base_) throw std::logic_error("growable region not reserved");
         bytes = std::min(round_up(bytes), capacity_);
-        while (mapped_ < bytes) {
+        while (mapped_.load(std::memory_order_acquire) < bytes) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            const std::size_t mapped = mapped_.load(std::memory_order_relaxed);
+            if (mapped >= bytes) break;
             CUmemGenericAllocationHandle handle = 0;
             check(cuMemCreate(&handle, granularity_, &prop_, 0), "growable region create");
-            const auto address = base_ + mapped_;
+            const auto address = base_ + mapped;
             if (cuMemMap(address, granularity_, 0, handle, 0) != CUDA_SUCCESS) {
                 cuMemRelease(handle);
                 throw std::runtime_error("growable region map");
             }
-            check(cuMemSetAccess(address, granularity_, &access_, 1), "growable region access");
+            if (cuMemSetAccess(address, granularity_, &access_, 1) != CUDA_SUCCESS) {
+                cuMemUnmap(address, granularity_);
+                cuMemRelease(handle);
+                throw std::runtime_error("growable region access");
+            }
             handles_.push_back(handle);
-            mapped_ += granularity_;
+            mapped_.store(mapped + granularity_, std::memory_order_release);
         }
     }
 
@@ -75,30 +86,36 @@ public:
     // work references the released range.
     void shrink(std::size_t bytes) {
         if (!base_) return;
+        const std::lock_guard<std::mutex> lock(mutex_);
         bytes = std::min(round_up(bytes), capacity_);
-        while (mapped_ > bytes && !handles_.empty()) {
-            mapped_ -= granularity_;
-            cuMemUnmap(base_ + mapped_, granularity_);
+        std::size_t mapped = mapped_.load(std::memory_order_relaxed);
+        while (mapped > bytes && !handles_.empty()) {
+            mapped -= granularity_;
+            cuMemUnmap(base_ + mapped, granularity_);
             cuMemRelease(handles_.back());
             handles_.pop_back();
         }
+        mapped_.store(mapped, std::memory_order_release);
     }
 
     void reset() noexcept {
         if (!base_) return;
+        const std::lock_guard<std::mutex> lock(mutex_);
+        std::size_t mapped = mapped_.load(std::memory_order_relaxed);
         while (!handles_.empty()) {
-            mapped_ -= granularity_;
-            cuMemUnmap(base_ + mapped_, granularity_);
+            mapped -= granularity_;
+            cuMemUnmap(base_ + mapped, granularity_);
             cuMemRelease(handles_.back());
             handles_.pop_back();
         }
         cuMemAddressFree(base_, capacity_);
         base_ = 0;
-        mapped_ = 0;
+        mapped_.store(0, std::memory_order_release);
     }
 
     template <class T> T* data() const noexcept { return reinterpret_cast<T*>(base_); }
-    std::size_t mapped_bytes() const noexcept { return mapped_; }
+    std::size_t mapped_bytes() const noexcept { return mapped_.load(std::memory_order_acquire); }
+    std::size_t granularity_bytes() const noexcept { return granularity_; }
     std::size_t capacity_bytes() const noexcept { return capacity_; }
 
 private:
@@ -111,7 +128,9 @@ private:
         return granularity_ ? (bytes + granularity_ - 1) / granularity_ * granularity_ : bytes;
     }
     CUdeviceptr base_ = 0;
-    std::size_t capacity_ = 0, mapped_ = 0, granularity_ = 0;
+    std::size_t capacity_ = 0, granularity_ = 0;
+    std::atomic<std::size_t> mapped_{0};
+    std::mutex mutex_;
     CUmemAllocationProp prop_{};
     CUmemAccessDesc access_{};
     std::vector<CUmemGenericAllocationHandle> handles_;
