@@ -136,6 +136,22 @@ public:
         }
         return offset==tokens.size();
     }
+    // Length of the longest common prefix of this history and `tokens`.
+    std::size_t common_prefix(std::span<const std::int64_t> tokens) const noexcept {
+        const std::size_t limit=std::min<std::size_t>(tokens.size(),static_cast<std::size_t>(position_));
+        std::size_t offset=0;
+        while(offset<limit) {
+            const auto& page=std::get<Page>(page_node(static_cast<std::uint32_t>(offset/64))->data);
+            const std::size_t rows=std::min<std::size_t>(static_cast<std::size_t>(page.rows),limit-offset);
+            const auto end=page.tokens.begin()+static_cast<std::ptrdiff_t>(rows);
+            const auto same=static_cast<std::size_t>(
+                std::mismatch(page.tokens.begin(),end,tokens.begin()+static_cast<std::ptrdiff_t>(offset)).first-
+                page.tokens.begin());
+            offset+=same;
+            if(same<rows)break;
+        }
+        return offset;
+    }
     Exl3TokenHistory append(std::span<const std::int64_t> tokens,const MetadataReservation& reserve={}) const {
         if(tokens.size()>static_cast<std::size_t>(INT32_MAX-position_)) throw std::invalid_argument("token history extent");
         for(auto token:tokens) if(token<0 || token>=248320) throw std::invalid_argument("token history token extent");

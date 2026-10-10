@@ -1008,6 +1008,9 @@ public:
     std::size_t token_count() const noexcept {return static_cast<std::size_t>(history_.position());}
     std::uint64_t token_fingerprint() const noexcept {return history_.fingerprint();}
     bool matches_tokens(std::span<const std::int64_t> tokens) const noexcept {return history_.equals(tokens);}
+    std::size_t common_prefix_tokens(std::span<const std::int64_t> tokens) const noexcept {
+        return history_.common_prefix(tokens);
+    }
     bool same_tokens(const Exl3VeriCacheRequest& other) const noexcept {return history_.same_tokens(other.history_);}
     Exl3VeriCacheReplay replay_plan(std::shared_ptr<const Exl3VeriCacheRequest> anchor={}) const;
     static Exl3TokenHistory::Stats token_storage_stats(std::span<const std::shared_ptr<const Exl3VeriCacheRequest>> requests) {

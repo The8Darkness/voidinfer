@@ -2216,8 +2216,27 @@ struct Exl3EngineCore::Impl {
             std::size_t stable=ids.size();
             if(prepared.identity.rewrite_checkpoint)
                 stable=std::min<std::size_t>(stable,prepared.identity.rewrite_checkpoint->frontier);
+            // Cross-conversation prefix sharing: when a retained root of another
+            // conversation shares at least NINFER_EXL3_SHARED_PREFIX_MIN_TOKENS
+            // (default 1024, 0 disables) leading tokens with this input beyond
+            // the reused root (agents with one system prompt and tool set), the
+            // common prefix (whole 64-row pages) gets its own retained root:
+            // later inputs restore it instead of prefilling it, and their
+            // exported states share its KV pages and code chunks.
+            static const std::size_t shared_minimum=[] {
+                const auto* value=std::getenv("NINFER_EXL3_SHARED_PREFIX_MIN_TOKENS");
+                return static_cast<std::size_t>(value && *value?std::strtoull(value,nullptr,10):1024);
+            }();
+            std::size_t shared=0;
+            if(reuse_allowed && shared_minimum)
+                for(const auto& candidate:cache.roots())
+                    if(candidate)shared=std::max(shared,candidate->common_prefix_tokens(ids)/64*64);
+            const std::size_t reused_rows=reused?reused->token_count():0;
+            const bool shared_split=shared_minimum && shared>=shared_minimum &&
+                shared>=reused_rows+shared_minimum && shared<stable;
+            const std::size_t split_floor=shared_split?shared:reused_rows;
             const bool split=reuse_allowed && stable>=64 && stable<ids.size() &&
-                (!reused || stable>reused->token_count());
+                stable>split_floor;
             const auto span_ids=std::span<const std::int64_t>(ids);
             const auto extend_device=[&](const std::shared_ptr<const Exl3VeriCacheRequest>& from,std::size_t end,
                                          bool resident) {
@@ -2230,8 +2249,25 @@ struct Exl3EngineCore::Impl {
             };
             std::shared_ptr<const Exl3VeriCacheRequest> base=reused;
             bool base_resident=false;
+            if(shared_split) {
+                if(base) base=extend_device(base,shared,false);
+                else {
+                    {
+                        Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
+                            1,epoch,false,stream);
+                        fresh.begin_fresh(span_ids.first(shared),shared>1040);
+                    }
+                    base=Exl3VeriCacheRequest::initialize_device_root(*context,draft,
+                        span_ids.first(shared),stream);
+                }
+                base_resident=true;
+                const auto admitted=cache.admit_input_authority(base,span_ids.first(shared),available());
+                if(std::getenv("NINFER_EXL3_VERICACHE_STATS"))
+                    std::fprintf(stderr,"SHARED_PREFIX_ROOT tokens=%zu reused=%zu admitted=%d%c",shared,reused_rows,
+                        admitted.admitted?1:0,10);
+            }
             if(split) {
-                if(base) base=extend_device(base,stable,false);
+                if(base) base=extend_device(base,stable,base_resident);
                 else {
                     {
                         Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
