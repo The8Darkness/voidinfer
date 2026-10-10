@@ -6950,7 +6950,7 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
     std::uint16_t* output,int rows,int position,int capacity,
     const int* position_device,cudaStream_t stream,int requested_keys=0,
     const float* history_slot=nullptr,const std::uint16_t* sink_k=nullptr,
-    const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
+    const std::uint16_t* sink_v=nullptr,int ring_mask=-1,cudaEvent_t history_join=nullptr) {
     const int count=position+rows;
     const int l0_history=history_slot?1:0;
     int keys=requested_keys?requested_keys:verify_flash_mma_keys();
@@ -6997,6 +6997,9 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
         exl3_launch_small(attention_verify_flash_mma_kernel<256>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
             sink_k,sink_v,ring_mask);
+    // The L0 history branch (other stream) produced history_slot.
+    if(history_join)
+        cuda_check(cudaStreamWaitEvent(stream,history_join,0),"L0 history join");
     launch_fused_flash_merge(workspace,output,rows,segments,position,capacity,keys,
         position_device,stream,q,k,v,history_slot,sink_k,sink_v,ring_mask);
     return keys;
@@ -8891,6 +8894,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
             if(l0_.k_codes && !mma)
                 throw std::invalid_argument("L0 OSCAR history requires the verifier MMA route");
             const float* history_slot=nullptr;
+            cudaEvent_t history_join=nullptr;
             if(l0_.k_codes) {
                 if(rows>l0_.rows) throw std::invalid_argument("L0 OSCAR history rows");
                 const auto& a=l0_oscar::assets();
@@ -8909,8 +8913,33 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                     launch(cudaGetLastError(),"L0 OSCAR exact history attention");
                     history_slot=l0_.hist_slot;
                 } else {
+                // The INT2 history chain (rotate, history, merge, rotate) is
+                // independent of the exact-window flash pass until the final
+                // merge: it runs on a side branch of `stream` beside it.
+                // NINFER_EXL3_L0_HISTORY_FORK=0 keeps one stream.
+                static const bool history_fork=[] {
+                    const char* value=std::getenv("NINFER_EXL3_L0_HISTORY_FORK");
+                    return !value || std::strcmp(value,"0")!=0;
+                }();
+                cudaStream_t hs=stream;
+                if(history_fork && stream && l0_.k_ring && mma) {
+                    struct Branch { cudaStream_t side=nullptr; cudaEvent_t fork=nullptr,join=nullptr; };
+                    // One branch per caller stream (batched peers keep their
+                    // own concurrency); per thread like the lanes' enqueues.
+                    static thread_local std::map<cudaStream_t,Branch> branches;
+                    auto& branch=branches[stream];
+                    if(!branch.side) {
+                        cuda_check(cudaStreamCreateWithFlags(&branch.side,cudaStreamNonBlocking),"L0 history stream");
+                        cuda_check(cudaEventCreateWithFlags(&branch.fork,cudaEventDisableTiming),"L0 history fork");
+                        cuda_check(cudaEventCreateWithFlags(&branch.join,cudaEventDisableTiming),"L0 history join");
+                    }
+                    launch(cudaEventRecord(branch.fork,stream),"L0 history fork");
+                    launch(cudaStreamWaitEvent(branch.side,branch.fork,0),"L0 history fork");
+                    hs=branch.side;
+                    history_join=branch.join;
+                }
                 l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
-                    rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
+                    rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,hs);
                 const auto& hot_config=l0_oscar::hot_config();
                 const auto hot=l0_oscar::hot_view(l0_);
                 // Every history CTA runs its share of the exact hot tiles first;
@@ -8927,20 +8956,21 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                         return true;
                     }();
                     (void)configured;
-                    kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes(),stream>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
+                    kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes(),hs>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
                         reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.hist_work,rows,position,cache_capacity_,
                         segments,position_device_,slot_stride,hot,hot_config.log2_tau,qr,
                         hot_config.lambda);
                 };
                 if(hot_ctas) history(l0_history_mma_kernel<64,true>);
                 else history(l0_history_mma_kernel<64,false>);
-                l0_history_merge_kernel<<<rows*kQHeads+(hot_ctas?kKVHeads:0),256,0,stream>>>(l0_.hist_work,
+                l0_history_merge_kernel<<<rows*kQHeads+(hot_ctas?kKVHeads:0),256,0,hs>>>(l0_.hist_work,
                     l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,segments,
                     l0_.segment_keys,position,cache_capacity_,position_device_,slot_stride,hot_ctas,
                     hot_ctas?l0_.hot_ref:nullptr,hot_ctas?l0_.hist_hot:nullptr,hot,hot_config.insert,
                     hot_config.lambda);
                 l0_launch_rotate<float,true>(l0_.hist_rotated,a.rvt16+l0_.bank*bank_elements,
-                    l0_.hist_slot,rows,nullptr,nullptr,stream,hot_ctas?l0_.hist_hot:nullptr);
+                    l0_.hist_slot,rows,nullptr,nullptr,hs,hot_ctas?l0_.hist_hot:nullptr);
+                if(history_join)launch(cudaEventRecord(history_join,hs),"L0 history join");
                 launch(cudaGetLastError(),"L0 OSCAR history attention");
                 history_slot=l0_.hist_slot;
                 }
@@ -8949,7 +8979,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 launch_verify_flash_mma(qr,l0_.k_ring,l0_.v_ring,exact_scores_,
                     exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
                     attn,rows,position,cache_capacity_,position_device_,stream,0,
-                    history_slot,l0_.k_sink,l0_.v_sink,l0_ring_rows_);
+                    history_slot,l0_.k_sink,l0_.v_sink,l0_ring_rows_,history_join);
             else if(mma)
                 launch_verify_flash_mma(qr,attention_k,attention_v,exact_scores_,
                     exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
