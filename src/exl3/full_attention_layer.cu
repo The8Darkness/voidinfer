@@ -6123,6 +6123,244 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
     }
   }
 }
+// FP8 math over FP8 history rows (l0_exact.cuh L0LineFp8 layout; staged
+// line passes, NINFER_EXL3_LINE_FP8_MATH=1): QK and PV run as e4m3 MMA
+// (m16n8k32, FP32 accumulate) instead of expanding K/V to FP16. Q is
+// quantized per (row, head) (absmax / 448); scores take the per-key K scale;
+// P is folded with the per-key V scale and quantized per (row, key tile).
+// Same CTA layout, splits and output format as the FA2 kernel (base 0, no
+// masking beyond the key count). K tiles land in shared memory permuted so
+// each QK n-tile's keys are adjacent rows (no bank conflicts) and its score
+// columns are the PV A-fragment keys; V tiles are transposed (dims x keys).
+__device__ __forceinline__ void mma_e4m3(float (&d)[4],const unsigned (&a)[4],unsigned b0,unsigned b1){
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    :"+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
+}
+__device__ __forceinline__ unsigned pack_e4m3x4(float a,float b,float c,float d){
+  const unsigned lo=__nv_cvt_float2_to_fp8x2(make_float2(a,b),__NV_SATFINITE,__NV_E4M3);
+  const unsigned hi=__nv_cvt_float2_to_fp8x2(make_float2(c,d),__NV_SATFINITE,__NV_E4M3);
+  return lo|(hi<<16);
+}
+constexpr int kF8Ks=kHeadDim+16;   // K row stride (bytes)
+constexpr int kF8Vt=BN+16;         // V^T row stride (bytes)
+constexpr std::size_t fp8math_smem_bytes(){
+  return 2u*kFp8Stage+static_cast<std::size_t>(BN)*kF8Ks+static_cast<std::size_t>(kHeadDim)*kF8Vt+2u*BN*sizeof(float);
+}
+template<int S>
+__global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std::uint16_t* q,const unsigned char* k8,
+    const unsigned char* v8,int rows,int keys,float* split_output,float* split_stats){
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  unsigned char* ksm=smem_raw+2*kFp8Stage;
+  unsigned char* vtm=ksm+BN*kF8Ks;
+  float* ksc=reinterpret_cast<float*>(vtm+kHeadDim*kF8Vt);
+  float* vsc=ksc+BN;
+  const int query_base=(static_cast<int>(gridDim.x)-1-static_cast<int>(blockIdx.x))*BM;
+  const int kv_head=blockIdx.y;
+  const int head_group=blockIdx.z/S, split=blockIdx.z%S;
+  const int tid=threadIdx.x, warp=tid>>5, lane=tid&31;
+  const int head_local=warp>>2, m_base=(warp&3)*16;
+  const int g=lane>>2, t=lane&3;
+  const int row0=m_base+g, row1=row0+8;
+  const int q_head=kv_head*(kQHeads/kKVHeads)+head_group*2+head_local;
+  const int active_rows=min(BM,rows-query_base);
+  if(active_rows<=0) return;
+  const int tiles=(keys+BN-1)/BN;
+  const int per=(tiles+S-1)/S;
+  const int t_begin=split*per, t_end=min(tiles,t_begin+per);
+  // Q A fragments (e4m3) and per-row scales (natural-log score units).
+  unsigned qa[kHeadDim/32][4];
+  float qscale[2];
+  {
+    const bool l0=row0<active_rows, l1=row1<active_rows;
+    const __half* q0=reinterpret_cast<const __half*>(q)+(static_cast<std::size_t>(query_base+(l0?row0:0))*kQHeads+q_head)*kHeadDim;
+    const __half* q1=reinterpret_cast<const __half*>(q)+(static_cast<std::size_t>(query_base+(l1?row1:0))*kQHeads+q_head)*kHeadDim;
+    float x[2][kHeadDim/32][8];
+    float amax[2]={0.f,0.f};
+    #pragma unroll
+    for(int kk=0;kk<kHeadDim/32;++kk)
+      #pragma unroll
+      for(int h=0;h<2;++h){
+        const uint2 r0=*reinterpret_cast<const uint2*>(q0+kk*32+16*h+4*t);
+        const uint2 r1=*reinterpret_cast<const uint2*>(q1+kk*32+16*h+4*t);
+        const __half* a=reinterpret_cast<const __half*>(&r0);
+        const __half* b=reinterpret_cast<const __half*>(&r1);
+        #pragma unroll
+        for(int i=0;i<4;++i){
+          x[0][kk][4*h+i]=l0?__half2float(a[i]):0.f; x[1][kk][4*h+i]=l1?__half2float(b[i]):0.f;
+          amax[0]=fmaxf(amax[0],fabsf(x[0][kk][4*h+i])); amax[1]=fmaxf(amax[1],fabsf(x[1][kk][4*h+i]));
+        }
+      }
+    #pragma unroll
+    for(int r=0;r<2;++r){
+      amax[r]=fmaxf(amax[r],__shfl_xor_sync(0xffffffffu,amax[r],1));
+      amax[r]=fmaxf(amax[r],__shfl_xor_sync(0xffffffffu,amax[r],2));
+      qscale[r]=amax[r]/448.f*0.0625f;
+    }
+    const float inv[2]={amax[0]>0.f?448.f/amax[0]:0.f,amax[1]>0.f?448.f/amax[1]:0.f};
+    #pragma unroll
+    for(int kk=0;kk<kHeadDim/32;++kk){
+      qa[kk][0]=pack_e4m3x4(x[0][kk][0]*inv[0],x[0][kk][1]*inv[0],x[0][kk][2]*inv[0],x[0][kk][3]*inv[0]);
+      qa[kk][1]=pack_e4m3x4(x[1][kk][0]*inv[1],x[1][kk][1]*inv[1],x[1][kk][2]*inv[1],x[1][kk][3]*inv[1]);
+      qa[kk][2]=pack_e4m3x4(x[0][kk][4]*inv[0],x[0][kk][5]*inv[0],x[0][kk][6]*inv[0],x[0][kk][7]*inv[0]);
+      qa[kk][3]=pack_e4m3x4(x[1][kk][4]*inv[1],x[1][kk][5]*inv[1],x[1][kk][6]*inv[1],x[1][kk][7]*inv[1]);
+    }
+  }
+  float acc[kHeadDim/8][4];
+  #pragma unroll
+  for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
+  float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
+  auto load=[&](int tile,int stage){
+    unsigned char* ks8=smem_raw+stage*kFp8Stage; unsigned char* vs8=ks8+BN*kHeadDim;
+    const int first=tile*BN;
+    #pragma unroll
+    for(int i=0;i<(BN*kHeadDim/16)/256;++i){
+      const int idx=tid+i*256; const int key_off=idx/(kHeadDim/16); const int chunk=(idx%(kHeadDim/16))*16;
+      const int key=first+key_off; const bool valid=key<keys;
+      const std::size_t off=static_cast<std::size_t>(valid?key:0)*kFp8RowBytes+kv_head*kHeadDim+chunk;
+      cp16(ks8+key_off*kHeadDim+chunk,k8+off,valid);
+      cp16(vs8+key_off*kHeadDim+chunk,v8+off,valid);
+    }
+    commit();
+  };
+  if(t_begin<t_end) load(t_begin,0);
+  for(int tile=t_begin;tile<t_end;++tile){
+    const int stage=(tile-t_begin)&1;
+    if(tile+1<t_end){ load(tile+1,stage^1); wait<1>(); } else wait<0>();
+    __syncthreads();
+    {
+      const unsigned char* ks8=smem_raw+stage*kFp8Stage; const unsigned char* vs8=ks8+BN*kHeadDim;
+      const int first=tile*BN;
+      // K rows: key k -> slot 8 j + g of the QK n-tile j / column g that scores it.
+      {
+        const int key=tid>>3, part=(tid&7)*32;
+        const int j=2*(key>>4)+((key>>1)&1), gg=2*((key>>2)&3)+(key&1);
+        const uint4* src=reinterpret_cast<const uint4*>(ks8+key*kHeadDim+part);
+        uint4* dst=reinterpret_cast<uint4*>(ksm+(8*j+gg)*kF8Ks+part);
+        dst[0]=src[0]; dst[1]=src[1];
+      }
+      // V transposed: thread = (key quad, 8-dim group).
+      {
+        const int kq=tid&7, dg=tid>>3;
+        uint2 r[4];
+        #pragma unroll
+        for(int i=0;i<4;++i) r[i]=*reinterpret_cast<const uint2*>(vs8+(4*kq+i)*kHeadDim+8*dg);
+        #pragma unroll
+        for(int h=0;h<2;++h){
+          const unsigned x0=h?r[0].y:r[0].x,x1=h?r[1].y:r[1].x,x2=h?r[2].y:r[2].x,x3=h?r[3].y:r[3].x;
+          const unsigned t0=__byte_perm(x0,x1,0x5140),t1=__byte_perm(x2,x3,0x5140);
+          const unsigned t2=__byte_perm(x0,x1,0x7362),t3=__byte_perm(x2,x3,0x7362);
+          unsigned char* d=vtm+(8*dg+4*h)*kF8Vt+4*kq;
+          *reinterpret_cast<unsigned*>(d)=__byte_perm(t0,t1,0x5410);
+          *reinterpret_cast<unsigned*>(d+kF8Vt)=__byte_perm(t0,t1,0x7632);
+          *reinterpret_cast<unsigned*>(d+2*kF8Vt)=__byte_perm(t2,t3,0x5410);
+          *reinterpret_cast<unsigned*>(d+3*kF8Vt)=__byte_perm(t2,t3,0x7632);
+        }
+      }
+      if(tid<2*BN){
+        const int key=tid%BN, kind=tid/BN;
+        const bool valid=first+key<keys;
+        const float sc=valid?__half2float(*reinterpret_cast<const __half*>((kind?v8:k8)+
+            static_cast<std::size_t>(first+key)*kFp8RowBytes+4*kHeadDim+kv_head*2)):0.f;
+        (kind?vsc:ksc)[key]=sc;
+      }
+    }
+    __syncthreads();
+    const int first=tile*BN;
+    if(m_base<active_rows){
+      // QK: n-tile j column c is key 4 (c >> 1) + 2 (j & 1) + (c & 1) + 16 (j >> 1).
+      float c[BN/8][4];
+      #pragma unroll
+      for(int j=0;j<BN/8;++j) c[j][0]=c[j][1]=c[j][2]=c[j][3]=0.f;
+      #pragma unroll
+      for(int kk=0;kk<kHeadDim/32;++kk)
+        #pragma unroll
+        for(int j=0;j<BN/8;++j){
+          const unsigned char* kr=ksm+(8*j+g)*kF8Ks+kk*32+4*t;
+          mma_e4m3(c[j],qa[kk],*reinterpret_cast<const unsigned*>(kr),*reinterpret_cast<const unsigned*>(kr+16));
+        }
+      float s[BN/8][4];
+      float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
+      #pragma unroll
+      for(int j=0;j<BN/8;++j)
+        #pragma unroll
+        for(int e=0;e<4;++e){
+          const int key=4*t+2*(j&1)+16*(j>>1)+(e&1);
+          const float x=first+key<keys?c[j][e]*qscale[e>>1]*ksc[key]:-3.402823466e+38F;
+          s[j][e]=x; tmax[e>>1]=fmaxf(tmax[e>>1],x);
+        }
+      #pragma unroll
+      for(int i=0;i<2;++i){ tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],1)); tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],2)); }
+      float scale[2];
+      #pragma unroll
+      for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:fast_ex2((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+      const float bias[2]={-run_max[0]*1.4426950408889634f,-run_max[1]*1.4426950408889634f};
+      float pv[BN/8][4]; float rs[2]={0.f,0.f}, pmax[2]={0.f,0.f};
+      #pragma unroll
+      for(int j=0;j<BN/8;++j)
+        #pragma unroll
+        for(int e=0;e<4;++e){
+          const int key=4*t+2*(j&1)+16*(j>>1)+(e&1);
+          const float x=s[j][e];
+          const float p=x==-3.402823466e+38F?0.f:fast_ex2(fmaf(x,1.4426950408889634f,bias[e>>1]));
+          rs[e>>1]+=p;
+          pv[j][e]=p*vsc[key];
+          pmax[e>>1]=fmaxf(pmax[e>>1],pv[j][e]);
+        }
+      #pragma unroll
+      for(int i=0;i<2;++i){
+        rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],1); rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],2); den[i]=den[i]*scale[i]+rs[i];
+        pmax[i]=fmaxf(pmax[i],__shfl_xor_sync(0xffffffffu,pmax[i],1)); pmax[i]=fmaxf(pmax[i],__shfl_xor_sync(0xffffffffu,pmax[i],2));
+      }
+      if(!__all_sync(0xffffffffu,scale[0]==1.f && scale[1]==1.f)){
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n){ acc[n][0]*=scale[0]; acc[n][1]*=scale[0]; acc[n][2]*=scale[1]; acc[n][3]*=scale[1]; }
+      }
+      const float pinv[2]={pmax[0]>0.f?448.f/pmax[0]:0.f,pmax[1]>0.f?448.f/pmax[1]:0.f};
+      const float pq[2]={pmax[0]/448.f,pmax[1]/448.f};
+      // A: row g keys 4t..4t+3 (n-tiles 0, 1), row g + 8, then keys 16 + 4t.. (n-tiles 2, 3).
+      const unsigned pa[4]={
+        pack_e4m3x4(pv[0][0]*pinv[0],pv[0][1]*pinv[0],pv[1][0]*pinv[0],pv[1][1]*pinv[0]),
+        pack_e4m3x4(pv[0][2]*pinv[1],pv[0][3]*pinv[1],pv[1][2]*pinv[1],pv[1][3]*pinv[1]),
+        pack_e4m3x4(pv[2][0]*pinv[0],pv[2][1]*pinv[0],pv[3][0]*pinv[0],pv[3][1]*pinv[0]),
+        pack_e4m3x4(pv[2][2]*pinv[1],pv[2][3]*pinv[1],pv[3][2]*pinv[1],pv[3][3]*pinv[1])};
+      #pragma unroll
+      for(int quarter=0;quarter<4;++quarter){
+        float tmp[8][4];
+        #pragma unroll
+        for(int n=0;n<8;++n) tmp[n][0]=tmp[n][1]=tmp[n][2]=tmp[n][3]=0.f;
+        #pragma unroll
+        for(int n=0;n<8;++n){
+          const unsigned char* vr=vtm+(quarter*64+8*n+g)*kF8Vt+4*t;
+          mma_e4m3(tmp[n],pa,*reinterpret_cast<const unsigned*>(vr),*reinterpret_cast<const unsigned*>(vr+16));
+        }
+        #pragma unroll
+        for(int n=0;n<8;++n){
+          float* a=acc[quarter*8+n];
+          a[0]=fmaf(pq[0],tmp[n][0],a[0]); a[1]=fmaf(pq[0],tmp[n][1],a[1]);
+          a[2]=fmaf(pq[1],tmp[n][2],a[2]); a[3]=fmaf(pq[1],tmp[n][3],a[3]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for(int i=0;i<2;++i){
+    const int row=i==0?row0:row1;
+    if(row>=active_rows) continue;
+    const std::size_t row_base=(static_cast<std::size_t>(query_base+row)*kQHeads+q_head)*kHeadDim;
+    const float inv=den[i]>0.f?1.f/den[i]:0.f;
+    #pragma unroll
+    for(int n=0;n<kHeadDim/8;++n){
+      const int dim=8*n+2*t;
+      float2* d=reinterpret_cast<float2*>(split_output+static_cast<std::size_t>(split)*rows*kQHeads*kHeadDim+row_base+dim);
+      *d=make_float2(acc[n][2*i]*inv,acc[n][2*i+1]*inv);
+    }
+    if(t==0){
+      const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+(query_base+row)*kQHeads+q_head)*2;
+      split_stats[stat]=run_max[i]; split_stats[stat+1]=den[i];
+    }
+  }
+}
 } // namespace fa2_prefill
 
 bool exl3_fa2_prefill_enabled() {
@@ -6160,6 +6398,24 @@ static void launch_fa2_prefill_variant(const std::uint16_t* q,const std::uint16_
             split_output,split_stats,output,rows);
         cuda_check(cudaGetLastError(),"launch FA2 prefill split merge");
     }
+}
+
+// Staged FP8 history with FP8 math (attention_fp8_history_kernel), four key splits.
+static void launch_fp8_history(const std::uint16_t* q,const std::uint16_t* k8,const std::uint16_t* v8,
+    int rows,int keys,float* split_output,float* split_stats,cudaStream_t stream) {
+    constexpr std::size_t bytes=fa2_prefill::fp8math_smem_bytes();
+    static const bool configured=[] {
+        cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_fp8_history_kernel<4>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
+            "configure FP8 history shared memory");
+        return true;
+    }();
+    (void)configured;
+    fa2_prefill::attention_fp8_history_kernel<4><<<
+        dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,kKVHeads,(kQHeads/kKVHeads/2)*4),256,bytes,stream>>>(
+            q,reinterpret_cast<const unsigned char*>(k8),reinterpret_cast<const unsigned char*>(v8),
+            rows,keys,split_output,split_stats);
+    cuda_check(cudaGetLastError(),"launch FP8 history attention");
 }
 
 static void launch_fa2_prefill(const std::uint16_t* q,const std::uint16_t* k,

@@ -264,6 +264,17 @@ inline void l0_launch_exact_history(const void* q,const std::uint16_t* k_src,con
 // drafting context's exact prompt passes) the FP16 history stays as staged
 // and only the rows past `valid` are packed into the mirror.
 constexpr int kL0LineFp8RowBytes=1040;   // 16-byte aligned rows (cp.async)
+// FP8 math for the line's history (NINFER_EXL3_LINE_FP8_MATH=1, opt-in):
+// Q and P also e4m3 (attention_fp8_history_kernel); otherwise FP16 math on
+// the FP8 rows. 16K/32K KL vs FP16 history equal to FP16 math (0.005-0.006),
+// rounds -0.6% at 128K, -2.6% at 254K.
+inline bool line_fp8_math() {
+    static const bool value=[] {
+        const char* v=std::getenv("NINFER_EXL3_LINE_FP8_MATH");
+        return v && std::strcmp(v,"1")==0;
+    }();
+    return value;
+}
 // The line attends the FP8 staging directly (FA2 FP8 tiles) instead of
 // expanding it to FP16 first; NINFER_EXL3_LINE_FP8_ATTENTION=0 expands.
 inline bool line_fp8_attention() {
@@ -451,8 +462,11 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
         if(piece_rows>0 && attend8) {
             const auto* k8=reinterpret_cast<const std::uint16_t*>(stage8.k[b]);
             const auto* v8=reinterpret_cast<const std::uint16_t*>(stage8.v[b]);
-            launch_fa2_prefill_variant<4,true>(static_cast<const std::uint16_t*>(q),k8,v8,
-                nullptr,rows,piece_rows,piece_rows,out,stats,stream,0,false);
+            if(line_fp8_math())
+                launch_fp8_history(static_cast<const std::uint16_t*>(q),k8,v8,rows,piece_rows,out,stats,stream);
+            else
+                launch_fa2_prefill_variant<4,true>(static_cast<const std::uint16_t*>(q),k8,v8,
+                    nullptr,rows,piece_rows,piece_rows,out,stats,stream,0,false);
         } else if(piece_rows>0)
             launch_fa2_prefill_variant<4>(static_cast<const std::uint16_t*>(q),stage.k[b],stage.v[b],
                 nullptr,rows,piece_rows,piece_rows,out,stats,stream,0,false);

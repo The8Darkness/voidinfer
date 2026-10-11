@@ -3503,6 +3503,7 @@ struct Exl3TextContext::Impl {
         // keeps no INT4 codes: nothing to grow.
         if(exact_line)return;
         consume_kv_rewrite();
+        ensure_self_fp8_history();
         // Plane growth under host memory pressure spills idle histories first.
         Exl3LaneKvSource::relieve_memory_pressure(plane_growth_bytes(rows));
         for(auto& layer:full_layers)if(layer)layer->ensure_l0_rows(rows);
@@ -3515,6 +3516,27 @@ struct Exl3TextContext::Impl {
         for(int layer=0;layer<kLayers;++layer)
             for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
                 if(region)region->ensure(mirror);
+    }
+    // TEST (NINFER_TEST_L0_FP8_HISTORY=1): this context's own staged exact
+    // passes attend its history through an FP8 mirror (quality measurement
+    // of the line's FP8 history on prompt ingestion / NLL scoring).
+    void ensure_self_fp8_history() {
+        static const bool requested=std::getenv("NINFER_TEST_L0_FP8_HISTORY")!=nullptr;
+        if(!requested || exact_line)return;
+        int first=-1;
+        for(int layer=0;layer<kLayers;++layer)if(full_layers[layer]){first=layer;break;}
+        if(first<0 || line_fp8_k[first])return;
+        const std::size_t capacity=static_cast<std::size_t>(max_context)*kLineFp8RowBytes;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(!full_layers[layer])continue;
+            for(auto* region:{&line_fp8_k[layer],&line_fp8_v[layer]}) {
+                *region=std::make_unique<Exl3GrowableDeviceRegion>();
+                (*region)->reserve(capacity,true);
+            }
+            line_fp8_valid[layer].store(0);
+            full_layers[layer]->set_l0_fp8_mirror(line_fp8_k[layer]->data<std::uint8_t>(),
+                line_fp8_v[layer]->data<std::uint8_t>(),&line_fp8_valid[layer],true);
+        }
     }
     std::size_t line_fp8_bytes(int rows) const {
         return static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kLineFp8RowBytes;
