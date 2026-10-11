@@ -78,6 +78,44 @@ void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept {
 static bool exl3_exact_line_shares_prompt_workspace() {
     return exact_line_workspace_sharing.load();
 }
+cudaError_t exl3_h2d_async(void* device,const void* host,std::size_t bytes,cudaStream_t stream) {
+    constexpr std::size_t kSlotBytes=std::size_t{256}<<10;
+    constexpr int kSlots=32;
+    if(!bytes)return cudaSuccess;
+    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+    if(!exl3_kernel_copies_enabled() || bytes>kSlotBytes ||
+       cudaStreamIsCapturing(stream,&capture)!=cudaSuccess || capture!=cudaStreamCaptureStatusNone)
+        return cudaMemcpyAsync(device,host,bytes,cudaMemcpyHostToDevice,stream);
+    cudaPointerAttributes attributes{};
+    if(cudaPointerGetAttributes(&attributes,host)==cudaSuccess && attributes.type==cudaMemoryTypeHost &&
+       attributes.devicePointer)
+        return exl3_copy_async(device,attributes.devicePointer,bytes,stream);
+    (void)cudaGetLastError();
+    struct Ring {
+        unsigned char* host=nullptr; unsigned char* device=nullptr;
+        std::array<cudaEvent_t,kSlots> done{}; std::array<bool,kSlots> used{}; int next=0;
+        std::mutex mutex;
+    };
+    static Ring ring;
+    const std::lock_guard lock(ring.mutex);
+    if(!ring.host) {
+        if(const auto error=cudaHostAlloc(reinterpret_cast<void**>(&ring.host),kSlots*kSlotBytes,cudaHostAllocMapped);
+           error!=cudaSuccess)return error;
+        if(const auto error=cudaHostGetDevicePointer(reinterpret_cast<void**>(&ring.device),ring.host,0);
+           error!=cudaSuccess)return error;
+        for(auto& event:ring.done)
+            if(const auto error=cudaEventCreateWithFlags(&event,cudaEventDisableTiming);error!=cudaSuccess)return error;
+    }
+    const int slot=ring.next;
+    ring.next=(ring.next+1)%kSlots;
+    if(ring.used[slot])
+        if(const auto error=ninfer::cuda_poll_event(ring.done[slot]);error!=cudaSuccess)return error;
+    std::memcpy(ring.host+slot*kSlotBytes,host,bytes);
+    if(const auto error=exl3_copy_async(device,ring.device+slot*kSlotBytes,bytes,stream);error!=cudaSuccess)
+        return error;
+    ring.used[slot]=true;
+    return cudaEventRecord(ring.done[slot],stream);
+}
 cudaError_t exl3_d2h_async(void* host,const void* device,std::size_t bytes,cudaStream_t stream) {
     constexpr std::size_t kKernelReadbackMax=std::size_t{1}<<20;
     if(!bytes)return cudaSuccess;
@@ -2025,8 +2063,8 @@ struct Exl3TextContext::Impl {
         }};
         const auto update=table->update(bindings);
         if(update.changed || table->uploaded_generation()!=table->generation()) {
-            cuda_check(cudaMemcpyAsync(device_record,&table->record(),
-                sizeof(Exl3DeviceGraphRoleRecord),cudaMemcpyHostToDevice,stream),
+            cuda_check(exl3_h2d_async(device_record,&table->record(),
+                sizeof(Exl3DeviceGraphRoleRecord),stream),
                 "publish continuation graph pointer roles");
             if(synchronize)
                 cuda_check(cudaStreamSynchronize(stream),
@@ -4046,9 +4084,8 @@ struct Exl3TextContext::Impl {
                             const auto extent=Exl3ExactKVExtent::view(page,host_bank,plane,position);
                             if(!extent.rows())return;
                             const auto bytes=extent.bytes();
-                            cuda_check(cudaMemcpyAsync(static_cast<std::uint16_t*>(destination)+
-                                extent.destination_offset(max_context),extent.data(),bytes,
-                                cudaMemcpyHostToDevice,stream),"stream full required layer KV");
+                            cuda_check(exl3_h2d_async(static_cast<std::uint16_t*>(destination)+
+                                extent.destination_offset(max_context),extent.data(),bytes,stream),"stream full required layer KV");
                             ++host_kv.copy_submissions;
                             if(!host_kv_batch_sync)
                                 cuda_check(cudaStreamSynchronize(stream),"complete required layer KV transfer");
@@ -8855,8 +8892,7 @@ void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStrea
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     if (impl_->continuation) impl_->continuation->rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream), "upload E4A prefill token IDs");
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream), "upload E4A prefill token IDs");
     cuda_check(cudaMemsetAsync(impl_->position_device, 0, 3*sizeof(int), stream),
                "set E4B2 prefill position parameter");
     if(impl_->host_kv_prefill_fault_for_test==1) {
@@ -8886,10 +8922,8 @@ void Exl3TextContext::decode(std::int64_t token_id, cudaStream_t stream) {
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     if (impl_->continuation) impl_->continuation->rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, &token_id, sizeof(token_id),
-                               cudaMemcpyHostToDevice, stream), "upload E4A decode token ID");
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &position_, sizeof(position_),
-                               cudaMemcpyHostToDevice, stream), "upload E4B2 decode position");
+    cuda_check(exl3_h2d_async(impl_->token_ids, &token_id, sizeof(token_id), stream), "upload E4A decode token ID");
+    cuda_check(exl3_h2d_async(impl_->position_device, &position_, sizeof(position_), stream), "upload E4B2 decode position");
     ++last_decode_h2d_;
     impl_->process_rows(impl_->token_ids, 1, position_, stream,
                         nullptr, true, false, true);
@@ -8950,15 +8984,12 @@ void Exl3TextContext::append_prefill_impl(std::span<const std::int64_t> token_id
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     if (impl_->continuation) impl_->continuation->rows = 0;
     const int base_position = position_;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream), "upload chunked prefill IDs");
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &base_position, sizeof(base_position),
-                               cudaMemcpyHostToDevice, stream), "upload chunked prefill position");
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream), "upload chunked prefill IDs");
+    cuda_check(exl3_h2d_async(impl_->position_device, &base_position, sizeof(base_position), stream), "upload chunked prefill position");
     impl_->process_rows(impl_->token_ids, rows, base_position, stream,
                         nullptr, true, rows > 1, true, true, wide);
     const int final_position = base_position + rows - 1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &final_position, sizeof(final_position),
-                               cudaMemcpyHostToDevice, stream), "publish chunked prefill position");
+    cuda_check(exl3_h2d_async(impl_->position_device, &final_position, sizeof(final_position), stream), "publish chunked prefill position");
     position_ += rows;
     ++last_decode_h2d_;
 }
@@ -9256,8 +9287,8 @@ void Exl3TextContext::append_prefill_layer_major(
     const int chunks = static_cast<int>(chunk_offsets.size());
     const int final_offset = chunk_offsets.back();
     const int final_rows = chunk_sizes.back();
-    cuda_check(cudaMemcpyAsync(impl_->token_ids,token_ids.data(),
-                               token_ids.size_bytes(),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids,token_ids.data(),
+                               token_ids.size_bytes(),stream),
                "upload layer-major prefill IDs");
     for (int offset=0;offset<total;offset+=1024) {
         const int rows=std::min(1024,total-offset);
@@ -9293,8 +9324,8 @@ void Exl3TextContext::append_prefill_layer_major(
         const auto execute_chunk=[&](int offset,int rows,
                 const Exl3GdnLayer::BulkPrefillBuffers* prepared) {
                 const int logical_position=base_position+offset;
-                cuda_check(cudaMemcpyAsync(impl_->position_device,&logical_position,
-                    sizeof(logical_position),cudaMemcpyHostToDevice,stream),
+                cuda_check(exl3_h2d_async(impl_->position_device,&logical_position,
+                    sizeof(logical_position),stream),
                     "publish layer-major causal position");
                 auto* input=(layer%2==0 ? impl_->hidden_a : impl_->hidden_b)+
                     static_cast<std::size_t>(offset)*kHidden;
@@ -9339,9 +9370,8 @@ void Exl3TextContext::append_prefill_layer_major(
                     const int relative=chunk_offsets[chunk]-block;
                     const int rows=chunk_sizes[chunk];
                     const int logical_position=base_position+block+relative;
-                    cuda_check(cudaMemcpyAsync(impl_->position_device,
-                        &logical_position,sizeof(logical_position),
-                        cudaMemcpyHostToDevice,stream),
+                    cuda_check(exl3_h2d_async(impl_->position_device,
+                        &logical_position,sizeof(logical_position),stream),
                         "publish GDN bulk MLP causal position");
                     Exl3GdnLayer::DeferredMlpBuffers slice{
                         impl_->gdn_mlp_post+
@@ -9465,8 +9495,8 @@ void Exl3TextContext::append_prefill_layer_major(
         after.rows-before.rows;
 
     const int final_position=base_position+final_offset;
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&final_position,
-                               sizeof(final_position),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,&final_position,
+                               sizeof(final_position),stream),
                "publish final layer-major head position");
     // The even layer count leaves the completed residual in hidden_a. The
     // existing final norm/head and tap-generation code publishes the same
@@ -9477,8 +9507,8 @@ void Exl3TextContext::append_prefill_layer_major(
         impl_->hidden_a+static_cast<std::size_t>(final_offset)*kHidden,
         nullptr,false);
     const int last_position=base_position+total-1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&last_position,
-                               sizeof(last_position),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,&last_position,
+                               sizeof(last_position),stream),
                "publish completed layer-major position");
     cuda_check(cudaStreamSynchronize(stream),
                "complete layer-major layers before public position commit");
@@ -9534,16 +9564,16 @@ void Exl3TextContext::append_media_embeddings_numeric(std::span<const float> emb
     if(impl_->continuation)impl_->continuation->rows=0;
     impl_->resident_exact_state_id=0;
     try {
-        cuda_check(cudaMemcpyAsync(impl_->media_features->ptr,embeddings.data(),embeddings.size_bytes(),cudaMemcpyHostToDevice,stream),"upload bounded media features");
-        cuda_check(cudaMemcpyAsync(impl_->media_positions->ptr,positions_xyz.data(),positions_xyz.size_bytes(),cudaMemcpyHostToDevice,stream),"upload bounded media positions");
+        cuda_check(exl3_h2d_async(impl_->media_features->ptr,embeddings.data(),embeddings.size_bytes(),stream),"upload bounded media features");
+        cuda_check(exl3_h2d_async(impl_->media_positions->ptr,positions_xyz.data(),positions_xyz.size_bytes(),stream),"upload bounded media positions");
         media_embedding_cast_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(static_cast<const float*>(impl_->media_features->ptr),impl_->hidden_a,rows*kHidden);
         cuda_check(cudaGetLastError(),"cast media features to ordinary FP16 L2 input");
         cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,impl_->hidden_a,std::size_t(rows)*kHidden*2,cudaMemcpyDeviceToDevice,stream),"capture injected media embeddings");
         impl_->embedding_rows=rows;impl_->tap_rows=rows;
-        cuda_check(cudaMemcpyAsync(impl_->position_device,&base,sizeof(base),cudaMemcpyHostToDevice,stream),"media logical KV position");
+        cuda_check(exl3_h2d_async(impl_->position_device,&base,sizeof(base),stream),"media logical KV position");
         impl_->process_rows(nullptr,rows,base,stream,nullptr,false,rows>1,true,true,false,static_cast<const int*>(impl_->media_positions->ptr));
         const int final_position=base+rows-1;
-        cuda_check(cudaMemcpyAsync(impl_->position_device,&final_position,sizeof(final_position),cudaMemcpyHostToDevice,stream),"media final logical position");
+        cuda_check(exl3_h2d_async(impl_->position_device,&final_position,sizeof(final_position),stream),"media final logical position");
         cuda_check(cudaStreamSynchronize(stream),"media append full completion");
         position_=base+rows;impl_->rope_offset=next_offset;++last_decode_h2d_;
     }catch(...){impl_->host_kv_failed=true;cudaStreamSynchronize(stream);throw;}
@@ -10009,8 +10039,7 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
         if(!table->device || table->device->bytes<bytes)
             table->device=std::make_unique<DeviceAllocation>(bytes,"sibling promotion table");
         table->host=std::move(copies);
-        cuda_check(cudaMemcpyAsync(table->device->ptr,table->host.data(),bytes,
-                   cudaMemcpyHostToDevice,stream),"upload sibling promotion table");
+        cuda_check(exl3_h2d_async(table->device->ptr,table->host.data(),bytes,stream),"upload sibling promotion table");
         table->source=source_row;table->destination=destination_row;table->rows=rows;
         table->count=static_cast<int>(table->host.size());
     }
@@ -10066,8 +10095,7 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     impl_->continuation->rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream),
                "upload P2 target continuation token IDs");
     const auto offsets=std::move(impl_->verifier_sibling_offsets);
     impl_->verifier_sibling_offsets.clear();
@@ -10079,14 +10107,13 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     const std::array<int,3> layout{position_,chain,
         siblings?exl3_pack_sibling_offsets(offsets,chain):0};
     const int base_position = position_;
-    cuda_check(cudaMemcpyAsync(impl_->position_device, layout.data(), sizeof(layout),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->position_device, layout.data(), sizeof(layout), stream),
                "set P2 target continuation base position");
     impl_->process_rows(impl_->token_ids, rows, base_position, stream,
                         nullptr, true, true, true);
     const std::array<int,3> final_layout{base_position + rows - 1,0,0};
-    cuda_check(cudaMemcpyAsync(impl_->position_device, final_layout.data(),
-                               sizeof(final_layout), cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->position_device, final_layout.data(),
+                               sizeof(final_layout), stream),
                "set P2 target continuation final device position");
     position_ += rows;
     impl_->continuation->rows = rows;
@@ -10314,8 +10341,7 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         std::copy(tokens[c].begin(),tokens[c].end(),ids.begin()+static_cast<std::ptrdiff_t>(offset));
         offset+=tokens[c].size();
     }
-    cuda_check(cudaMemcpyAsync(impl_->token_ids,ids.data(),static_cast<std::size_t>(rows)*sizeof(std::int64_t),
-        cudaMemcpyHostToDevice,stream),"upload batched continuation token IDs");
+    cuda_check(exl3_h2d_async(impl_->token_ids,ids.data(),static_cast<std::size_t>(rows)*sizeof(std::int64_t),stream),"upload batched continuation token IDs");
     std::array<int,kMaxBatchedPeers+1> base_positions{};
     for(std::size_t c=0;c<count_contexts;++c) {
         auto& context=*contexts[c];
@@ -10331,8 +10357,7 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         const std::array<int,3> layout{context.position_,chain,
             siblings?exl3_pack_sibling_offsets(offsets,chain):0};
         base_positions[c]=context.position_;
-        cuda_check(cudaMemcpyAsync(impl.position_device,layout.data(),sizeof(layout),
-            cudaMemcpyHostToDevice,stream),"set batched continuation base position");
+        cuda_check(exl3_h2d_async(impl.position_device,layout.data(),sizeof(layout),stream),"set batched continuation base position");
         if(arm_retained_prefix[c]) impl.live_arm_attempt(stream);
         else impl.live_guard_write(stream);
         if(impl.transaction && impl.transaction->active) {
@@ -10490,8 +10515,7 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         auto& impl=*context.impl_;
         const int count=static_cast<int>(tokens[c].size());
         const std::array<int,3> final_layout{base_positions[c]+count-1,0,0};
-        cuda_check(cudaMemcpyAsync(impl.position_device,final_layout.data(),sizeof(final_layout),
-            cudaMemcpyHostToDevice,stream),"set batched continuation final device position");
+        cuda_check(exl3_h2d_async(impl.position_device,final_layout.data(),sizeof(final_layout),stream),"set batched continuation final device position");
         context.position_+=count;
         impl.continuation->rows=count;
         impl.trace_members=static_cast<int>(count_contexts);
@@ -10774,7 +10798,7 @@ void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
             layer->l0_rewind(root.position,stream);
         }
     const std::array<int,3> layout{root.position-1,0,0};
-    cuda_check(cudaMemcpyAsync(impl_->position_device,layout.data(),sizeof(layout),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,layout.data(),sizeof(layout),stream),
         "restore verified root device position");
     position_=root.position;
     impl_->last_rows=root.last_rows;
@@ -10930,7 +10954,7 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.gap),capacity*sizeof(float)),"row score buffers");
         buffers.rows=capacity;
     }
-    cuda_check(cudaMemcpyAsync(buffers.next,next.data(),next.size_bytes(),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(buffers.next,next.data(),next.size_bytes(),stream),
         "upload row score next tokens");
     for(int first=0;first<rows;first+=kScoreRows) {
         const int count=std::min(kScoreRows,rows-first);
@@ -11191,8 +11215,8 @@ void Exl3TextContext::retain_transaction_prefix_impl(
         kVocab * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream),
         "select P2 retained-prefix logits");
     const int device_position = base_position + retained_rows - 1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &device_position,
-                               sizeof(device_position), cudaMemcpyHostToDevice,
+    cuda_check(exl3_h2d_async(impl_->position_device, &device_position,
+                               sizeof(device_position),
                                stream),
                "set P2 retained-prefix device position");
 
@@ -12156,11 +12180,9 @@ void Exl3TextContext::continue_rows_graph(
                 impl_->transaction->gdn_checkpoints[layer],base_position);
     for (auto& layer : impl_->full_layers)
         if (layer) layer->invalidate_retained_prefix();
-    cuda_check(cudaMemcpyAsync(impl_->token_ids,token_ids.data(),token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids,token_ids.data(),token_ids.size_bytes(),stream),
                "upload fixed-B8 continuation token IDs");
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&base_position,sizeof(base_position),
-                               cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,&base_position,sizeof(base_position),stream),
                "upload fixed-B8 continuation base position");
     impl_->publish_continuation_graph_roles(
         static_cast<unsigned>(rows),stream,false);
@@ -12188,8 +12210,8 @@ void Exl3TextContext::continue_rows_graph(
     // checkpoint before any eager reappend; full commit must not advance twice.
     impl_->oscar->note_graph_replay(rows);
     const int final_device_position = base_position + rows - 1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&final_device_position,
-                               sizeof(final_device_position),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,&final_device_position,
+                               sizeof(final_device_position),stream),
                "publish fixed-B8 continuation final device position");
 
     auto& transaction = *impl_->transaction;
@@ -12422,10 +12444,8 @@ void Exl3TextContext::decode_graph(std::int64_t token_id, cudaStream_t stream) {
             throw std::invalid_argument("E4C1 OSCAR split-class transition: recapture the graph");
         }
     }
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, &token_id, sizeof(token_id),
-                               cudaMemcpyHostToDevice, stream), "upload E4B2 graph token ID");
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &position_, sizeof(position_),
-                               cudaMemcpyHostToDevice, stream), "upload E4B2 graph position");
+    cuda_check(exl3_h2d_async(impl_->token_ids, &token_id, sizeof(token_id), stream), "upload E4B2 graph token ID");
+    cuda_check(exl3_h2d_async(impl_->position_device, &position_, sizeof(position_), stream), "upload E4B2 graph position");
     embedding_lookup_kernel<<<(kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->token_ids, impl_->model->embedding, impl_->hidden_a, 1);
     cuda_check(cudaGetLastError(), "launch E4B2 graph embedding lookup");
@@ -12458,8 +12478,7 @@ Exl3TextDecodeAttribution Exl3TextContext::profile_decode(std::int64_t token_id,
     try {
         events.create();
         Impl::record(events.total_start, stream, "record E4B1 total start");
-        cuda_check(cudaMemcpyAsync(impl_->token_ids, &token_id, sizeof(token_id),
-                                   cudaMemcpyHostToDevice, stream), "upload E4B1 profile token ID");
+        cuda_check(exl3_h2d_async(impl_->token_ids, &token_id, sizeof(token_id), stream), "upload E4B1 profile token ID");
         Impl::record(events.token_end, stream, "record E4B1 token end");
         impl_->process_rows(impl_->token_ids, 1, position_, stream,
                             &events, true, false, true);
@@ -13545,8 +13564,7 @@ void Exl3TextContext::rebase_oscar_host_state_delta(const Exl3ExactHostState& ol
         "TurboAngle L1 delta rebase identity/lineage/state");
     const int first=old_root.position_,rows=new_root.position_-first;
     const auto upload=[&](void* destination,const auto& source,const char* label) {
-        cuda_check(cudaMemcpyAsync(destination,source.data(),source.size()*sizeof(source[0]),
-            cudaMemcpyHostToDevice,stream),label);
+        cuda_check(exl3_h2d_async(destination,source.data(),source.size()*sizeof(source[0]),stream),label);
         cuda_check(cudaStreamSynchronize(stream),"complete TurboAngle L1 delta upload");
     };
     int full=0,gdn=0;
@@ -13583,8 +13601,7 @@ void Exl3TextContext::rebase_oscar_host_state_delta(const Exl3ExactHostState& ol
     upload(impl_->embedding_trace->ptr,new_root.embedding_,"upload TurboAngle L1 delta embedding");
     for(std::size_t tap=0;tap<kTapLayers.size();++tap)
         upload(impl_->taps[tap]->ptr,new_root.taps_[tap],"upload TurboAngle L1 delta tap");
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&new_root.device_position_,sizeof(int),
-        cudaMemcpyHostToDevice,stream),"upload TurboAngle L1 delta position");
+    cuda_check(exl3_h2d_async(impl_->position_device,&new_root.device_position_,sizeof(int),stream),"upload TurboAngle L1 delta position");
     cuda_check(cudaStreamSynchronize(stream),"complete TurboAngle L1 delta rebase");
     impl_->kv_rows_rewritten_from(0);
     position_=new_root.position_;impl_->tap_rows=new_root.tap_rows_;
@@ -13710,8 +13727,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     if(oscar) impl_->oscar->reset();
     // State is immutable and constructible only by export; no untrusted plane shapes.
     const auto upload = [&](void* dst, const auto& src) {
-        cuda_check(cudaMemcpyAsync(dst, src.data(), src.size() * sizeof(src[0]),
-                                  cudaMemcpyHostToDevice, stream), "restore exact host plane");
+        cuda_check(exl3_h2d_async(dst, src.data(), src.size() * sizeof(src[0]), stream), "restore exact host plane");
         cuda_check(cudaStreamSynchronize(stream), "complete exact host plane restore");
         if(std::exchange(impl_->host_kv_restore_failure_for_test,false))
             throw std::runtime_error("injected HostKV failure after restore upload");
@@ -13785,8 +13801,8 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                             std::memcpy(staging.host+static_cast<std::size_t>(page->first-lo)*l0_l2_fp8::kRowBytes,
                                 packed.data(),static_cast<std::size_t>(page->rows)*l0_l2_fp8::kRowBytes);
                         });
-                        cuda_check(cudaMemcpyAsync(staging.device,staging.host,
-                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,cudaMemcpyHostToDevice,stream),
+                        cuda_check(exl3_h2d_async(staging.device,staging.host,
+                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,stream),
                             "L0 L2 FP8 restore");
                         l0_l2_fp8::unpack_kernel<<<(count*4*32+255)/256,256,0,stream>>>(staging.device,
                             static_cast<std::uint16_t*>(destination)+static_cast<std::size_t>(lo-first)*1024,count);
@@ -13869,8 +13885,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     upload(impl_->logits, state.logits_);
     upload(impl_->embedding_trace->ptr, state.embedding_);
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap) upload(impl_->taps[tap]->ptr, state.taps_[tap]);
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &state.device_position_, sizeof(int),
-                              cudaMemcpyHostToDevice, stream), "restore exact host position");
+    cuda_check(exl3_h2d_async(impl_->position_device, &state.device_position_, sizeof(int), stream), "restore exact host position");
     cuda_check(cudaStreamSynchronize(stream), "complete exact host restore");
     position_ = state.position_;
     impl_->tap_rows = state.tap_rows_;
@@ -13950,8 +13965,7 @@ std::vector<std::uint16_t> Exl3TextContext::gdn_layer0_serial_for_test(
     impl_->transaction->prefix_available = false;
     impl_->transaction->rollback_required = true;
     impl_->transaction->attempted_rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream),
                "upload staged GDN T0a token IDs");
     embedding_lookup_kernel<<<(8 * kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->token_ids, impl_->model->embedding, impl_->hidden_a, 8);
@@ -14007,11 +14021,10 @@ Exl3TextContext::gdn_layer0_pair_staged_serial_for_test(
     peer.impl_->transaction->prefix_available = false;
     peer.impl_->transaction->rollback_required = true;
     peer.impl_->transaction->attempted_rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream),
                "upload staged GDN T0a first token IDs");
-    cuda_check(cudaMemcpyAsync(peer.impl_->token_ids, peer_token_ids.data(),
-                               peer_token_ids.size_bytes(), cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(peer.impl_->token_ids, peer_token_ids.data(),
+                               peer_token_ids.size_bytes(), stream),
                "upload staged GDN T0a peer token IDs");
     embedding_lookup_kernel<<<(8 * kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->token_ids, impl_->model->embedding, impl_->hidden_a, 8);
@@ -14341,8 +14354,7 @@ void Exl3TextContext::embed_token_to_device(std::int64_t token_id, std::uint16_t
             "E5A2 embed needs a device destination");
     require(impl_->model != nullptr && impl_->model->embedding != nullptr,
             "E5A2 target embeddings are unavailable");
-    cuda_check(cudaMemcpyAsync(impl_->draft_token_id, &token_id, sizeof(token_id),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->draft_token_id, &token_id, sizeof(token_id), stream),
                "E5A2 upload draft token id");
     embedding_lookup_kernel<<<(kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->draft_token_id, impl_->model->embedding,

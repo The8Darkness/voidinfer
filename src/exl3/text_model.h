@@ -45,6 +45,11 @@ void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept;
 // like cudaMemcpyAsync to pageable memory. NINFER_EXL3_KERNEL_COPIES=0 keeps
 // cudaMemcpyAsync.
 cudaError_t exl3_d2h_async(void* host, const void* device, std::size_t bytes, cudaStream_t stream);
+// Small host->device upload without a copy engine (same rationale): a pinned
+// source is read by a kernel, stream-ordered; a pageable one is staged into a
+// pinned slot that is reused only after its copy kernel ran. Captured streams
+// and uploads above 256 KiB keep cudaMemcpyAsync.
+cudaError_t exl3_h2d_async(void* device, const void* host, std::size_t bytes, cudaStream_t stream);
 class Exl3BatchedVerifyCoordinator;
 class Exl3VeriCacheServingCoordinator;
 struct Exl3GreedyPacketTransfer;

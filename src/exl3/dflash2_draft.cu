@@ -3963,9 +3963,8 @@ void Exl3Dflash2DraftModel::restore_host_ring(std::shared_ptr<const Exl3DraftHos
             if(end<=first) continue;
             for(int layer=0;layer<kLayers;++layer) {
                 const auto upload=[&](std::uint16_t* destination,const auto& plane) {
-                    cuda_check(cudaMemcpyAsync(destination+static_cast<std::size_t>(first&kRingMask)*1024,
-                        plane.data()+static_cast<std::size_t>(first-page->first)*1024,static_cast<std::size_t>(end-first)*2048,
-                        cudaMemcpyHostToDevice,stream),"draft host page restore");
+                    cuda_check(exl3_h2d_async(destination+static_cast<std::size_t>(first&kRingMask)*1024,
+                        plane.data()+static_cast<std::size_t>(first-page->first)*1024,static_cast<std::size_t>(end-first)*2048,stream),"draft host page restore");
                     cuda_check(cudaStreamSynchronize(stream),"draft host restore complete");
                 };
                 upload(m.ring_k[layer],page->k[layer]);upload(m.ring_v[layer],page->v[layer]);
@@ -4362,8 +4361,7 @@ void Exl3Dflash2DraftModel::commit_target_block_internal(const std::uint16_t* co
         const long long pos = first_abs + r;
         for (int t = 0; t < kLayers; ++t)
             ptrs[t] = taps[t] + static_cast<std::size_t>(first + r) * kHidden;
-        cuda_check(cudaMemcpyAsync(m.s.tap_ptr, ptrs, sizeof(ptrs),
-                                   cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.tap_ptr, ptrs, sizeof(ptrs), stream),
                    "E5A3 commit tap pointers");
         dflash_tap_concat_kernel<<<(kLayers * kHidden + 255) / 256, 256, 0, stream>>>(m.s.tap_ptr, m.s.tcat, 1);
         cuda_check(cudaGetLastError(), "E5A3 commit tap concat");
@@ -4372,8 +4370,7 @@ void Exl3Dflash2DraftModel::commit_target_block_internal(const std::uint16_t* co
             m.s.fc_raw, m.hidden_norm, m.s.hctx, 1, kHidden);
         cuda_check(cudaGetLastError(), "E5A3 commit hidden norm");
         const std::int32_t p32 = static_cast<std::int32_t>(pos);
-        cuda_check(cudaMemcpyAsync(m.s.pos_ctx, &p32, sizeof(p32),
-                                   cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.pos_ctx, &p32, sizeof(p32), stream),
                    "E5A3 commit absolute position");
         for (int layer = 0; layer < kLayers; ++layer) {
             const auto& lay = m.layers[layer];
@@ -4485,7 +4482,7 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
     if (graphed) {
         const std::uint16_t* ptrs[kLayers];
         for (int t = 0; t < kLayers; ++t) ptrs[t] = taps[t];
-        cuda_check(cudaMemcpyAsync(m.s.tap_ptr, ptrs, sizeof(ptrs), cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.tap_ptr, ptrs, sizeof(ptrs), stream),
                    "draft commit tap pointers");
         auto& graphs = m.commit_graphs;
         if (!graphs.base)
@@ -4541,7 +4538,7 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
         const int pos = static_cast<int>(abs_pos0 + first);
         const std::uint16_t* ptrs[kLayers];
         for (int t = 0; t < kLayers; ++t) ptrs[t] = taps[t] + static_cast<std::size_t>(first) * kHidden;
-        cuda_check(cudaMemcpyAsync(m.s.tap_ptr, ptrs, sizeof(ptrs), cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.tap_ptr, ptrs, sizeof(ptrs), stream),
                    "draft prefill tap pointers");
         dflash_tap_concat_kernel<<<(count * kLayers * kHidden + 255) / 256,256,0,stream>>>(m.s.tap_ptr,m.s.tcat,count);
         cuda_check(cudaGetLastError(), "draft prefill concat");
@@ -5080,9 +5077,9 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             ids[i*L+r]=members[i]->block[r];
             positions[i*L+r]=members[i]->block_pos0+r;
         }
-    cuda_check(cudaMemcpyAsync(b.ids,ids.data(),rows*sizeof(std::int64_t),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(b.ids,ids.data(),rows*sizeof(std::int64_t),stream),
         "upload batched draft ids");
-    cuda_check(cudaMemcpyAsync(b.pos,positions.data(),rows*sizeof(std::int32_t),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(b.pos,positions.data(),rows*sizeof(std::int32_t),stream),
         "upload batched draft positions");
     const auto rms=[&](const std::uint16_t* in,const std::uint16_t* weight,std::uint16_t* out,int n) {
         dflash_rms_norm_kernel<DFlashFmt::BF16><<<n,256,256*sizeof(float),stream>>>(in,weight,out,n,kHidden);
@@ -5241,8 +5238,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             }
             value.key_base=members[i]->block_pos0+1;
         }
-        cuda_check(cudaMemcpyAsync(b.sampling,sampling.data(),count*sizeof(DraftSelectSampling),
-            cudaMemcpyHostToDevice,stream),"upload batched draft sampling");
+        cuda_check(exl3_h2d_async(b.sampling,sampling.data(),count*sizeof(DraftSelectSampling),stream),"upload batched draft sampling");
     }
     // Full rings (steady state): replay one captured graph per member set and
     // head width instead of ~250 eager launches.
@@ -5256,7 +5252,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         std::array<int,4> starts{};
         for(int i=0;i<count;++i)
             starts[static_cast<std::size_t>(i)]=static_cast<int>(members[i]->draft->impl_->ring_base_abs & kRingMask);
-        cuda_check(cudaMemcpyAsync(b.ring_start,starts.data(),count*sizeof(int),cudaMemcpyHostToDevice,stream),
+        cuda_check(exl3_h2d_async(b.ring_start,starts.data(),count*sizeof(int),stream),
             "upload batched draft ring starts");
         DraftBatchedScratch::Graph* entry=nullptr;
         for(auto& candidate:b.graphs) {
@@ -5382,8 +5378,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
             if(!g.base)
                 cuda_check(cudaMalloc(reinterpret_cast<void**>(&g.base),sizeof(std::int32_t)),
                     "draft bulk prefill position");
-            cuda_check(cudaMemcpyAsync(b.tap_ptr,taps,kLayers*sizeof(*taps),
-                cudaMemcpyHostToDevice,replay),"draft bulk prefill tap pointers");
+            cuda_check(exl3_h2d_async(b.tap_ptr,taps,kLayers*sizeof(*taps),replay),"draft bulk prefill tap pointers");
             dflash_set_position_kernel<<<1,1,0,replay>>>(g.base,static_cast<int>(abs_pos0));
             cuda_check(cudaGetLastError(),"draft bulk prefill position");
             if(!g.exec) {
@@ -5438,7 +5433,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
             const bool batched=count>8;
             const std::uint16_t* ptrs[kLayers];
             for(int t=0;t<kLayers;++t)ptrs[t]=taps[t]+static_cast<std::size_t>(first)*kHidden;
-            cuda_check(cudaMemcpyAsync(b.tap_ptr,ptrs,sizeof(ptrs),cudaMemcpyHostToDevice,stream),
+            cuda_check(exl3_h2d_async(b.tap_ptr,ptrs,sizeof(ptrs),stream),
                 "draft bulk prefill tap pointers");
             dflash_tap_concat_kernel<<<(count*kLayers*kHidden+255)/256,256,0,stream>>>(b.tap_ptr,b.tcat,count);
             cuda_check(cudaGetLastError(),"draft bulk prefill concat");
@@ -5726,13 +5721,12 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         for (int t = 0; t < kLayers; ++t) {
             tap_base[t] = layer_taps[t] + static_cast<std::size_t>(ctx_skip) * kHidden;
         }
-        cuda_check(cudaMemcpyAsync(m.s.tap_ptr, tap_base.data(),
-                                   kLayers * sizeof(void*), cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.tap_ptr, tap_base.data(),
+                                   kLayers * sizeof(void*), stream),
                    "E5A2 upload draft tap pointer array");
     }
-    cuda_check(cudaMemcpyAsync(m.s.ids, block_ids.data(),
-                               static_cast<std::size_t>(block_len) * sizeof(std::int64_t),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(m.s.ids, block_ids.data(),
+                               static_cast<std::size_t>(block_len) * sizeof(std::int64_t), stream),
                "E5A2 upload draft block ids");
     if(device_seed) {
         cuda_check(cudaStreamWaitEvent(stream,device_seed->producer_ready,0),
@@ -5754,14 +5748,12 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     for (int i = 0; i < window_rows && !use_ring; ++i) host_pos_ctx[i] = ctx_begin_pos + i;
     for (int i = 0; i < block_len; ++i) host_pos_blk[i] = block_pos0 + i;
     if (!use_ring) {
-        cuda_check(cudaMemcpyAsync(m.s.pos_ctx, host_pos_ctx.data(),
-                                   host_pos_ctx.size() * sizeof(std::int32_t),
-                                   cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.pos_ctx, host_pos_ctx.data(),
+                                   host_pos_ctx.size() * sizeof(std::int32_t), stream),
                    "E5A2 upload draft ctx positions");
     }
-    cuda_check(cudaMemcpyAsync(m.s.pos_blk, host_pos_blk.data(),
-                               host_pos_blk.size() * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(m.s.pos_blk, host_pos_blk.data(),
+                               host_pos_blk.size() * sizeof(std::int32_t), stream),
                "E5A2 upload draft block positions");
     ph_end("uploads");
     ph_begin();
