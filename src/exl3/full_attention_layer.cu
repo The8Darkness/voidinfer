@@ -5870,6 +5870,8 @@ __device__ __forceinline__ void add_lo(float& acc,unsigned packed){
 __device__ __forceinline__ void add_hi(float& acc,unsigned packed){
   asm("{.reg .f16 l,h; mov.b32 {l,h}, %1; add.rn.f32.f16 %0, h, %0;}":"+f"(acc):"r"(packed)); }
 __device__ __forceinline__ float fast_ex2(float x){ float y; asm("ex2.approx.ftz.f32 %0, %1;":"=f"(y):"f"(x)); return y; }
+// exp(-17.5) = 2^-25.25 (ex2.approx is within 2^-22 relative): FP16 rounds it to zero.
+constexpr float kFa2NegligibleNats=17.5f;
 // Fp8: K/V are rows of 1040 bytes (e4m3 [4][256] + FP16 scale per head,
 // l0_exact.cuh L0LineFp8) from `k_cache`/`v_cache` reinterpreted as bytes,
 // base 0 and no sink/ring/history mapping. Each tile arrives as FP8 by
@@ -6042,6 +6044,13 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
         }
       #pragma unroll
       for(int i=0;i<2;++i){ tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],1)); tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],2)); }
+      // Every live row's tile scores below run_max - kFa2NegligibleNats: each P
+      // rounds to FP16 zero (<= 2^-25), so the row sums, the accumulator and
+      // the running max would not change. Skip the exponentials and PV (exact).
+      const bool negligible=__all_sync(0xffffffffu,
+          (row0>=active_rows || tmax[0]<run_max[0]-kFa2NegligibleNats) &&
+          (row1>=active_rows || tmax[1]<run_max[1]-kFa2NegligibleNats));
+      if(!negligible){
       float scale[2];
       #pragma unroll
       for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:fast_ex2((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
@@ -6096,6 +6105,7 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
           add_lo(acc[out][0],hacc[n][0]); add_hi(acc[out][1],hacc[n][0]);
           add_lo(acc[out][2],hacc[n][1]); add_hi(acc[out][3],hacc[n][1]);
         }
+      }
       }
     }
     __syncthreads();
