@@ -305,6 +305,8 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
     const auto submit=[&](int piece) {
         const int b=piece&1,first=l0::kSink+piece*kL0ExactPieceRows;
         const int last=std::min(history_end,first+kL0ExactPieceRows);
+        if(piece>=2 && ninfer::exl3::l0_exact_host_throttle())
+            cuda_check(ninfer::cuda_poll_event(stage.consumed[b]),"L0 exact staging throttle");
         cuda_check(cudaStreamWaitEvent(stage.copy,stage.consumed[b],0),"L0 exact staging reuse");
         const auto copy=[&](int from,int to) {
             if(to<=from) return;

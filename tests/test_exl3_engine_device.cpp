@@ -519,10 +519,16 @@ int main() {
             std::cout<<"COHERENT_DEVICE_ENGINE_DOWN_K7 enabled="<<coherent_down_k7
                      <<" calls="<<down_k7_calls<<" rows="<<down_k7_rows<<'\n';
             // Folded VeriCache rounds run their target rows through the eager
-            // batched route: the per-route row counts no longer cover the output.
+            // batched route, asynchronous ones share the routes with the exact
+            // line: the per-route row counts no longer cover the output.
             const bool fold_rounds=[] {
-                const char* value=std::getenv("NINFER_EXL3_VERICACHE_FOLD");
-                return value && std::string_view(value)=="1";
+                const char* fold=std::getenv("NINFER_EXL3_VERICACHE_FOLD");
+                const char* async=std::getenv("NINFER_EXL3_VERICACHE_ASYNC");
+                const char* vericache=std::getenv("NINFER_EXL3_VERICACHE");
+                const bool exact_line=!(vericache && (std::string_view(vericache)=="0" ||
+                    std::string_view(vericache)=="tolerance"));
+                return exact_line && ((fold && std::string_view(fold)=="1") ||
+                    !(async && std::string_view(async)=="0"));
             }();
             if(!fold_rounds && ((coherent_down_k7 && !captured_only(down_k7_calls,0) && (down_k7_calls==0 ||
                     down_k7_rows<static_cast<std::uint64_t>(long_outputs))) ||

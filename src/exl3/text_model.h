@@ -34,6 +34,9 @@
 namespace ninfer::exl3 {
 
 class Exl3TextContext;
+// The Engine's single-lane exact VeriCache line shares the prompt-scale
+// workspaces with its drafting context (set before the contexts are built).
+void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept;
 class Exl3BatchedVerifyCoordinator;
 class Exl3VeriCacheServingCoordinator;
 struct Exl3GreedyPacketTransfer;

@@ -1,3 +1,4 @@
+#include "core/poll_wait.h"
 #include "exl3/l0_history_mark.h"
 #include "exl3/segment_copy.cuh"
 #include "exl3/packed_device_alloc.h"

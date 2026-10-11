@@ -84,10 +84,21 @@ same pass. `NINFER_EXL3_VERICACHE=tolerance` accepts within 1.0 on fixed 1,024-t
 `=0` disables. Tokens are published only after verification, and the verified prefix becomes the next
 exact root (device GDN checkpoint plus L0 rewind).
 
-Exact mode costs more than tolerance because L0 drafts disagree with exact history beyond the floor
-on ~0.1-0.4% of tokens at 4K and ~1% at 32K, which keeps blocks at 16-32 tokens: DFlash2 code
-workload, 1,024 tokens, verify passes take ~20-25% of decode time (tolerance ~8%); 4K 151-162 tok/s
-(tolerance 186), 32K 92-140 tok/s depending on corrections (tolerance 166).
+With one lane (`--max-concurrency 1`) exact verification is asynchronous: an exact line (a second
+context on the same FP16 planes with its own GDN state and window) runs each 64-token block on its
+own stream from a worker thread while DFlash2 keeps drafting past it, so the PCIe history stream
+overlaps the HBM-bound decode rounds. A correction rewinds drafting to the verified root (L0 re-run,
+no history stream); the kept tokens and the exact replacement lead the next block on the line. Waits
+on that path poll instead of blocking in the driver (a blocked call holds the WDDM context lock and
+stalls the other thread). `NINFER_EXL3_VERICACHE_ASYNC=0` restores the synchronous pass. DFlash2
+code workload, 512-1,024 tokens, exact: 4K 169-173 tok/s (synchronous 151-162, no VeriCache 197),
+32K 150, 128K 130-137 (synchronous 76, no VeriCache 172), 254K 107-112 (synchronous 42, no
+VeriCache 158). The remaining cost is the line's own GPU work (~1.2 ms/token at 128K: projections and
+exact history attention) and the drafting a correction discards (~0.1% of tokens at 128K).
+
+Synchronous exact mode (several lanes) costs more than tolerance because L0 drafts disagree with
+exact history beyond the floor on ~0.1-0.4% of tokens at 4K and ~1% at 32K, which keeps blocks at
+16-32 tokens: verify passes take ~20-25% of decode time (tolerance ~8%).
 
 Tolerance mode, measured with DFlash2 on the code workload, 1,024 output tokens:
 

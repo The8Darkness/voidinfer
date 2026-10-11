@@ -384,6 +384,32 @@ struct Exl3EngineCore::Impl {
         return enabled;
     }
     static constexpr int kFoldBlock=16,kFoldRows=24,kFoldRingRows=128;
+    // Asynchronous exact VeriCache (single lane, default; NINFER_EXL3_VERICACHE_ASYNC=0
+    // keeps the synchronous verify pass): the line verifies a block of >= async block rows (64: one
+    // FA2 row tile; the projections cost per row) while
+    // drafting runs ahead by at most kAsyncLead tokens (L0 ages rows 256+
+    // behind the frontier: they must be the line's exact ones).
+    static bool vericache_async_enabled() {
+        static const bool enabled=[] {
+            const char* value=std::getenv("NINFER_EXL3_VERICACHE_ASYNC");
+            return !value || std::string_view(value)!="0";
+        }();
+        return enabled;
+    }
+    static int vericache_async_block() {
+        static const int block=[] {
+            const char* value=std::getenv("NINFER_EXL3_VERICACHE_ASYNC_BLOCK");
+            return value?std::clamp(std::atoi(value),1,192):64;
+        }();
+        return block;
+    }
+    static constexpr int kAsyncLead=200,kAsyncRingRows=256;
+    bool exact_line_planned(const EngineOptions& value) const {
+        return coherent_device && value.max_concurrency==1 &&
+            (vericache_fold_enabled() || vericache_async_enabled()) &&
+            Exl3NativeContextExtent::l0_oscar_enabled() && Exl3VeriCacheConfig::get().enabled &&
+            Exl3VeriCacheConfig::get().delta<0.5f;
+    }
     std::array<std::shared_ptr<Exl3Dflash2Execution>,kMaxLanes> lanes;
     std::array<std::shared_ptr<DraftTapStaging>,kMaxLanes> staging_owners;
     std::shared_ptr<Exl3EngineTargetQ> shared_q;
@@ -580,6 +606,14 @@ struct Exl3EngineCore::Impl {
             public_media_enabled?"text+qualified-v6-media":"text"},
         cache(Exl3VeriCacheServingPrefixCache::Policy{std::max(1U,value.context_cache.max_shared_prefixes.value_or(1)),64,std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30},identity),
         coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
+        // A single exact-VeriCache lane gets an exact line (below): its
+        // contexts share prompt workspaces, and with the asynchronous line two
+        // host threads drive the device (polled waits, core/poll_wait.h).
+        {
+            const bool line=exact_line_planned(value);
+            exl3_set_exact_line_workspace_sharing(line);
+            ninfer::cuda_set_poll_waits(line && vericache_async_enabled());
+        }
         if(coherent_device)require_coherent_device_profile(value);
         else require_exact_profile();
         if(coherent_device && value.max_concurrency>=2) {
@@ -1149,8 +1183,16 @@ struct Exl3EngineCore::Impl {
                         throw std::logic_error("Engine stream startup reservation identity");
                     if(context_startup_fault==31)throw std::logic_error("stream credit refusal reached allocator");
                     if(stream_fault==1)throw std::runtime_error("injected Engine stream preconstruction failure");
-                    stream_owner=make_bounded_shared<ExecutionStream>(value.max_concurrency>=2);
-                    if(value.max_concurrency>=2)
+                    // One lane with the asynchronous VeriCache line: its own
+                    // highest-priority stream, so decode kernels win the SMs
+                    // the line's PCIe-bound exact pass contends for.
+                    const bool priority_lane=exact_line_planned(value) && vericache_async_enabled();
+                    stream_owner=make_bounded_shared<ExecutionStream>(value.max_concurrency>=2 || priority_lane);
+                    if(priority_lane) {
+                        int least=0,greatest=0;
+                        check(cudaDeviceGetStreamPriorityRange(&least,&greatest));
+                        check(cudaStreamCreateWithPriority(&stream_owner->value,cudaStreamNonBlocking,greatest));
+                    } else if(value.max_concurrency>=2)
                         check(cudaStreamCreateWithFlags(&stream_owner->value,cudaStreamNonBlocking));
                     if(value.max_concurrency==2 && context_startup_fault==79+i) {
                         stream_owner->destroy_fault_for_test=static_cast<int>(cudaErrorUnknown);
@@ -1833,9 +1875,7 @@ struct Exl3EngineCore::Impl {
                 value.max_concurrency,mib(free_bytes));
             std::fputc(10,stderr);
         }
-        if(coherent_device && value.max_concurrency==1 && vericache_fold_enabled() &&
-           Exl3NativeContextExtent::l0_oscar_enabled() && Exl3VeriCacheConfig::get().enabled &&
-           Exl3VeriCacheConfig::get().delta<0.5f) {
+        if(exact_line_planned(value)) {
             // Eager only: graphs captured at construction would keep the
             // line's own planes, which make_exact_line replaces.
             auto line=target->create_context_reserved(coordinator,true,0,public_media_enabled,false);
@@ -2456,7 +2496,8 @@ struct Exl3EngineCore::Impl {
                 // Draft numerically ahead with L0 rounds, verify each block, then
                 // publish only verified tokens (in <= 16-token output previews).
                 Exl3TextContext* const fold_line=exact_lines[lane_index].get();
-                if(fold_line)round->begin_fold_verification(*fold_line,kFoldRingRows);
+                const bool async_verify=fold_line && vericache_async_enabled();
+                if(fold_line)round->begin_fold_verification(*fold_line,async_verify?kAsyncRingRows:kFoldRingRows);
                 else round->begin_verification(vericache.block);
                 // Draft length per request (VeriCache paper, Fig. 8 / Alg. 1): the
                 // block that maximizes expected kept tokens per unit time from
@@ -2550,13 +2591,43 @@ struct Exl3EngineCore::Impl {
                         "coherent-device output has no model budget or control path");
                     const std::size_t room=budget>unverified.size()?budget-unverified.size():0;
                     const std::size_t block=static_cast<std::size_t>(block_now);
-                    if(!terminal_seen && room && unverified.size()<block) {
+                    // Asynchronous: settle the block in flight once a later token
+                    // checks its last row (or drafting cannot go on), launch the
+                    // next block when the line is free, otherwise draft.
+                    std::optional<Exl3FastDeviceRound::VerifiedBlock> async_block;
+                    std::vector<std::int64_t> async_tail;
+                    bool async_tail_terminal=false;
+                    const bool async_can_draft=!terminal_seen && room &&
+                        (!async_verify || round->async_lead()<kAsyncLead);
+                    if(async_verify) {
+                        const auto rows=round->async_rows();
+                        if(round->async_pending() &&
+                           (!async_can_draft || (unverified.size()>rows && round->async_ready()))) {
+                            lt_mark=Clock::now();
+                            async_block=round->settle_async(unverified.size()>rows?unverified[rows]:-1,
+                                vericache.delta);
+                            lt_verify+=lt_ms(lt_mark);
+                            if(!async_block->corrected && unverified.size()>rows) {
+                                async_tail.assign(unverified.begin()+static_cast<std::ptrdiff_t>(rows),unverified.end());
+                                async_tail_terminal=terminal_seen;
+                            }
+                        } else if(!round->async_pending() && !unverified.empty() &&
+                                  (unverified.size()>=static_cast<std::size_t>(vericache_async_block()) ||
+                                   !async_can_draft)) {
+                            round->launch_async(unverified,vericache.delta);
+                            continue;
+                        }
+                    }
+                    if(async_verify?!async_block && async_can_draft:
+                       !terminal_seen && room && unverified.size()<block) {
                         // A round may run past the chosen block (up to the pass
                         // limit): the overrun is verified in the same pass instead
                         // of cutting the round short at every block boundary.
                         const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:vericache.block);
                         const auto width=static_cast<int>(std::min<std::size_t>(
-                            {round_width_limit(),room,pass_limit-unverified.size()}));
+                            {round_width_limit(),room,async_verify?
+                                static_cast<std::size_t>(kAsyncLead-round->async_lead()):
+                                pass_limit-unverified.size()}));
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
                         lt_prepare+=lt_ms(lt_mark);lt_mark=Clock::now();++lt_rounds;
                         pending_ticket=prepared_round.ticket;
@@ -2621,8 +2692,8 @@ struct Exl3EngineCore::Impl {
                         }
                         return round->flush_fold(unverified,vericache.delta);
                     };
-                    std::optional<Exl3FastDeviceRound::VerifiedBlock> folded;
-                    if(fold_line) {
+                    std::optional<Exl3FastDeviceRound::VerifiedBlock> folded=std::move(async_block);
+                    if(fold_line && !folded) {
                         lt_mark=Clock::now();
                         folded=fold_verify();
                         lt_verify+=lt_ms(lt_mark);
@@ -2657,6 +2728,10 @@ struct Exl3EngineCore::Impl {
                     if(!fold_carried.empty()) {
                         unverified=fold_carried;
                         terminal_seen=fold_carried_terminal;
+                    }
+                    if(!async_tail.empty()) {
+                        unverified=std::move(async_tail);
+                        terminal_seen=async_tail_terminal;
                     }
                     std::vector<std::int64_t> retained;
                     bool finished=false;
@@ -2716,8 +2791,14 @@ struct Exl3EngineCore::Impl {
                         if(decision.finished()) {result.finish_reason=decision.finish_reason;finished=true;break;}
                         if(selected.size()<chunk.size())break;
                     }
-                    if(fold_line)round->commit_fold(retained.size());
+                    if(async_verify)round->commit_async(retained.size());
+                    else if(fold_line)round->commit_fold(retained.size());
                     else round->commit_verification(retained);
+                    // A commit that kept only part of the block rewound drafting.
+                    if(round->frontier()!=round->verified_frontier()+static_cast<int>(unverified.size())) {
+                        unverified.clear();
+                        terminal_seen=false;
+                    }
                     if(finished)break;
                     draft_mark=Clock::now();
                 }

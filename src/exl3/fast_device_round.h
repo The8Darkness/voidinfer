@@ -1,9 +1,13 @@
 #pragma once
 
+#include <condition_variable>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <sstream>
 #include "exl3/native_context_extent.h"
+#include "exl3/l0_history_mark.h"
+#include "core/poll_wait.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/exact_outer_reference.h"
 #include "exl3/verification_tree.h"
@@ -181,7 +185,7 @@ public:
                 }
             }
             draft_.finish_fresh_prefill(stream_);
-            check(cudaStreamSynchronize(stream_),
+            check(poll_then_sync(stream_),
                 "fast device fresh target/draft completion");
             phase_=Phase::unstarted;
         }catch(...) {phase_=Phase::poisoned;throw;}
@@ -202,7 +206,7 @@ public:
                 commit_captured(rows,static_cast<int>(at));
                 at+=static_cast<std::size_t>(rows);
             }
-            check(cudaStreamSynchronize(stream_),"fast device suffix ingestion completion");
+            check(poll_then_sync(stream_),"fast device suffix ingestion completion");
             phase_=Phase::unstarted;
         }catch(...) {phase_=Phase::poisoned;throw;}
     }
@@ -304,7 +308,7 @@ public:
             for(std::size_t tap=0;tap<5;++tap)sources[tap]=staging_[tap];
             draft_.commit_prefill_block(sources.data(),static_cast<int>(retained),
                 value.root_position,stream_);
-            check(cudaStreamSynchronize(stream_),"fast device pending ring completion");
+            check(poll_then_sync(stream_),"fast device pending ring completion");
             value.ring_commit_ms=elapsed(ring_start);
             if(context_->position()!=value.root_position+static_cast<int>(retained) ||
                draft_.ring_base_abs()+draft_.ring_count()!=context_->position())
@@ -450,7 +454,7 @@ public:
             ring_undo_armed=true;
             draft_.commit_prefill_block(sources.data(),static_cast<int>(retained),
                 value.root_position,stream_);
-            check(cudaStreamSynchronize(stream_),
+            check(poll_then_sync(stream_),
                 "fast device pending draft completion");
             value.ring_commit_ms=elapsed(ring_start);
             if(draft_.ring_base_abs()+draft_.ring_count()!=context_->position())
@@ -465,7 +469,7 @@ public:
             context_->commit_transaction();
             if(context_->continuation_rows()>0)
                 context_->finish_exact_continuation(stream_);
-            check(cudaStreamSynchronize(stream_),
+            check(poll_then_sync(stream_),
                 "fast device pending target completion");
             frontier_=context_->position();
             record_totals(value);
@@ -538,7 +542,7 @@ public:
         if(phase_!=Phase::ready && phase_!=Phase::closed)
             throw std::logic_error("fast device round cannot finish");
         try {
-            check(cudaStreamSynchronize(stream_),"fast device round final drain");
+            check(poll_then_sync(stream_),"fast device round final drain");
             if(context_->position()!=frontier_ ||
                draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
                 throw std::logic_error("fast device round final frontier");
@@ -598,7 +602,7 @@ public:
             auto mark=start;
             const auto step=[&](double& total) {
                 if(!timed)return;
-                check(cudaStreamSynchronize(stream_),"vericache step timing");
+                check(poll_then_sync(stream_),"vericache step timing");
                 const auto now=Clock::now();
                 total+=std::chrono::duration<double,std::milli>(now-mark).count();
                 mark=now;
@@ -643,7 +647,7 @@ public:
                 commit_captured(static_cast<int>(result.tokens.size()),verified_frontier_);
                 step(totals_.fix_ms);
             }
-            check(cudaStreamSynchronize(stream_),"fast device verification completion");
+            check(poll_then_sync(stream_),"fast device verification completion");
             frontier_=context_->position();
             if(draft_.ring_base_abs()+draft_.ring_count()!=frontier_ ||
                frontier_!=verified_frontier_+static_cast<int>(result.tokens.size()))
@@ -720,17 +724,170 @@ public:
         if(!line_)return;
         if(phase_!=Phase::ready)throw std::logic_error("folded verification end");
         if(fold_armed_){context_->set_fold_peer(nullptr,{},nullptr);fold_armed_=false;}
+        if(async_) {
+            end_async();
+            return;
+        }
         if(frontier_!=verified_frontier_) {
             context_->restore_verified_root(stream_);
             draft_.restore_ring_checkpoint(stream_);
         }
         context_->sync_exact_line_from(*line_,stream_,true);
-        check(cudaStreamSynchronize(stream_),"folded verification end");
+        check(poll_then_sync(stream_),"folded verification end");
         frontier_=context_->position();
         if(draft_.ring_base_abs()+draft_.ring_count()!=frontier_ || frontier_!=verified_frontier_)
             throw std::logic_error("folded verification end frontier");
         line_=nullptr;
     }
+    // ===== Asynchronous exact VeriCache (one lane) =====
+    // The line verifies the drafted block [verified frontier, frontier) on its
+    // own stream (a worker thread) while drafting continues past it: at long
+    // context the exact pass is bound by the PCIe stream of the FP16 history,
+    // which overlaps the HBM-bound drafting rounds. Same line and roots as the
+    // fold (begin_fold_verification, commit_fold, end_fold); the drafting
+    // root and draft ring checkpoint where the block ends are the pending ones.
+    //
+    // A correction does not re-run the history on the line: the line returns
+    // to its root, the kept tokens and the exact correction (published) become
+    // the line head that the next block forwards first, sharing that block's
+    // history stream; the drafting context re-runs them on its L0 history.
+    // Roots stay at the line frontier until a block is accepted.
+    void launch_async(std::span<const std::int64_t> tokens,float delta) {
+        if(phase_!=Phase::ready || !line_ || fold_armed_ || async_inflight_ || fold_commit_.pending ||
+           tokens.empty() || static_cast<int>(tokens.size())!=frontier_-verified_frontier_ ||
+           line_->position()!=line_frontier())
+            throw std::logic_error("asynchronous verification launch extent");
+        if(!async_)async_=std::make_unique<AsyncLine>();
+        context_->save_verified_root_pending(stream_);
+        draft_.save_ring_checkpoint(verify_rows_,stream_,true);
+        fold_tokens_=line_head_;
+        fold_tokens_.insert(fold_tokens_.end(),tokens.begin(),tokens.end());
+        async_head_=line_head_.size();
+        async_root_=line_frontier();
+        fold_frontier_=frontier_;
+        async_->launch(*line_,fold_tokens_,delta,stream_);
+        async_inflight_=true;
+        async_start_=Clock::now();
+    }
+    bool async_pending() const noexcept {return async_inflight_;}
+    bool async_ready() const {return async_inflight_ && async_->done();}
+    // Unpublished (drafted) tokens of the block in flight.
+    std::size_t async_rows() const noexcept {return async_inflight_?fold_tokens_.size()-async_head_:0;}
+    // Drafted rows past the line (bounded by the draft ring checkpoint).
+    int async_lead() const noexcept {return frontier_-line_frontier();}
+    // Waits for the block in flight and checks it; `next_token` is the token
+    // drafted after it (< 0: none, the last row goes unchecked).
+    VerifiedBlock settle_async(std::int64_t next_token,float delta) {
+        if(phase_!=Phase::ready || !async_inflight_)throw std::logic_error("asynchronous verification settle");
+        phase_=Phase::executing;
+        try {
+            const auto wait_start=Clock::now();
+            auto scores=async_->wait();
+            async_inflight_=false;
+            // Async: scores_ms = line pass time (launch to scored).
+            totals_.scores_ms+=std::chrono::duration<double,std::milli>(async_->finished_-async_start_).count();
+            totals_.forward_ms+=elapsed(wait_start);
+            const std::span<const std::int64_t> tokens(fold_tokens_);
+            const std::size_t head=async_head_;
+            const int root=async_root_;
+            if(line_->position()!=root+static_cast<int>(tokens.size()))
+                throw std::logic_error("asynchronous verification line extent");
+            std::vector<std::int64_t> next(tokens.begin()+1,tokens.end());
+            next.push_back(next_token);
+            // The worker scored the last row against a placeholder: rescore
+            // when the drafted next token is not the exact greedy one.
+            if(next_token>=0 && scores.back().greedy!=next_token)
+                scores=line_->exact_row_scores(next,stream_,delta);
+            else if(next_token>=0)
+                scores.back().gap=0.0f;
+            // Rows predicting published head tokens were checked before.
+            VerifiedBlock result;
+            std::int64_t correction=-1;
+            std::size_t reject=tokens.size();
+            for(std::size_t i=head?head-1:0;i<tokens.size();++i) {
+                if(next[i]<0)break;
+                const bool bad=delta>0?scores[i].gap>delta:scores[i].greedy!=next[i];
+                if(bad) {reject=i+1;correction=scores[i].greedy;break;}
+                result.max_gap=std::max(result.max_gap,scores[i].gap);
+                totals_.accepted_gap_sum+=scores[i].gap;
+                totals_.accepted_off_greedy+=scores[i].gap>0.0f?1:0;
+                for(std::size_t e=0;e<Totals::kGapEdges.size();++e)
+                    totals_.accepted_gap_over[e]+=scores[i].gap>Totals::kGapEdges[e]?1:0;
+                ++totals_.accepted_checked;
+            }
+            totals_.max_accepted_gap=std::max(totals_.max_accepted_gap,result.max_gap);
+            result.tokens.assign(tokens.begin()+static_cast<std::ptrdiff_t>(head),
+                tokens.begin()+static_cast<std::ptrdiff_t>(reject));
+            const auto fix_start=Clock::now();
+            if(correction>=0) {
+                result.tokens.push_back(correction);
+                result.corrected=true;
+                std::vector<std::int64_t> kept(tokens.begin(),tokens.begin()+static_cast<std::ptrdiff_t>(reject));
+                kept.push_back(correction);
+                rewind_async(kept);
+                line_head_=std::move(kept);
+                totals_.fix_ms+=elapsed(fix_start);
+            }
+            fold_commit_=FoldCommit{true,result.corrected,true,result.tokens};
+            ++totals_.verified_blocks;
+            totals_.corrected_blocks+=result.corrected?1:0;
+            result.verify_ms=elapsed(async_start_);
+            totals_.verify_ms+=elapsed(wait_start);
+            phase_=Phase::ready;
+            return result;
+        } catch(...) {
+            phase_=Phase::poisoned;
+            throw;
+        }
+    }
+
+    // Keeps the first `retained` tokens of the settled block (all, or the
+    // prefix the output session accepted).
+    void commit_async(std::size_t retained) {
+        if(phase_!=Phase::ready || !fold_commit_.pending || retained>fold_commit_.tokens.size() || async_inflight_)
+            throw std::logic_error("asynchronous verification commit");
+        auto commit=std::move(fold_commit_);
+        fold_commit_={};
+        phase_=Phase::executing;
+        try {
+            if(retained<commit.tokens.size()) {
+                // The session stopped inside the block: the line runs its head
+                // and the kept prefix exactly, both lines take its state.
+                std::vector<std::int64_t> kept(fold_tokens_.begin(),
+                    fold_tokens_.begin()+static_cast<std::ptrdiff_t>(async_head_));
+                kept.insert(kept.end(),commit.tokens.begin(),
+                    commit.tokens.begin()+static_cast<std::ptrdiff_t>(retained));
+                const int root=async_root_;
+                line_->restore_verified_root(stream_);
+                if(!kept.empty())forward_rows(*line_,kept,stream_);
+                context_->restore_verified_root(stream_);
+                context_->sync_exact_line_from(*line_,stream_,true);
+                draft_.restore_ring_checkpoint(stream_);
+                if(!kept.empty())commit_captured(static_cast<int>(kept.size()),root);
+                check(poll_then_sync(stream_),"asynchronous verification partial commit");
+                frontier_=context_->position();
+                if(line_->position()!=frontier_ || draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
+                    throw std::logic_error("asynchronous verification partial commit frontier");
+                line_->save_verified_root(stream_);
+                context_->save_verified_root(stream_);
+                draft_.save_ring_checkpoint(verify_rows_,stream_);
+                line_head_.clear();
+                verified_frontier_=frontier_;
+            } else if(commit.corrected) {
+                // Roots stay at the line frontier; the drafting context holds
+                // the head (rewind_async).
+                verified_frontier_=frontier_;
+            } else {
+                line_->save_verified_root(stream_);
+                context_->promote_verified_root_pending();
+                draft_.promote_ring_checkpoint();
+                line_head_.clear();
+                verified_frontier_+=static_cast<int>(commit.tokens.size());
+            }
+            phase_=Phase::ready;
+        } catch(...) {phase_=Phase::poisoned;throw;}
+    }
+    bool async_active() const noexcept {return async_!=nullptr;}
 
     // Keeps the first `retained` verified tokens (all, or the prefix the output
     // session accepted) and moves the verified root there.
@@ -751,14 +908,14 @@ public:
                 draft_.restore_ring_checkpoint(stream_);
                 if(!retained.empty())
                     commit_captured(static_cast<int>(retained.size()),verified_frontier_);
-                check(cudaStreamSynchronize(stream_),"fast device verification rewind");
+                check(poll_then_sync(stream_),"fast device verification rewind");
                 frontier_=context_->position();
             }
             context_->save_verified_root(stream_);
             draft_.save_ring_checkpoint(verify_rows_,stream_);
             verified_frontier_=frontier_;
             if(std::getenv("NINFER_EXL3_VERICACHE_STATS")) {
-                check(cudaStreamSynchronize(stream_),"vericache commit timing");
+                check(poll_then_sync(stream_),"vericache commit timing");
                 totals_.commit_ms+=elapsed(commit_start);
             }
             // The caller finishes on a published terminal; otherwise (e.g. the
@@ -800,7 +957,7 @@ private:
     void restore_device_pending_root(bool ring_undo_armed) {
         if(ring_undo_armed)draft_.rollback_prefill_ring_undo(stream_);
         if(context_->transaction_active())context_->rollback_transaction(stream_);
-        check(cudaStreamSynchronize(stream_),
+        check(poll_then_sync(stream_),
             "fast device numerical pending rollback completion");
         if(context_->position()!=frontier_ ||
            draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
@@ -814,7 +971,7 @@ private:
             throw std::logic_error("fast device pending root unavailable");
         context_->restore_exact_host_state(*pending_root_,stream_);
         draft_.restore_host_ring(pending_ring_,stream_);
-        check(cudaStreamSynchronize(stream_),"fast device pending rollback completion");
+        check(poll_then_sync(stream_),"fast device pending rollback completion");
         if(context_->position()!=frontier_ ||
            draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
             throw std::logic_error("fast device pending rollback frontier");
@@ -859,7 +1016,7 @@ private:
             auto mark=start;
             const auto step=[&](double& total) {
                 if(!timed)return;
-                check(cudaStreamSynchronize(stream_),"vericache fold step timing");
+                check(poll_then_sync(stream_),"vericache fold step timing");
                 const auto now=Clock::now();
                 total+=std::chrono::duration<double,std::milli>(now-mark).count();
                 mark=now;
@@ -873,33 +1030,8 @@ private:
             next.push_back(round_first);
             const auto scores=line_->exact_row_scores(next,stream_,delta);
             step(totals_.scores_ms);
-            VerifiedBlock result;
-            std::int64_t correction=-1;
-            std::size_t reject=tokens.size();
-            for(std::size_t i=0;i<tokens.size();++i) {
-                if(next[i]<0)break;
-                const bool bad=delta>0?scores[i].gap>delta:scores[i].greedy!=next[i];
-                if(bad) {reject=i+1;correction=scores[i].greedy;break;}
-                result.max_gap=std::max(result.max_gap,scores[i].gap);
-                totals_.accepted_gap_sum+=scores[i].gap;
-                totals_.accepted_off_greedy+=scores[i].gap>0.0f?1:0;
-                for(std::size_t e=0;e<Totals::kGapEdges.size();++e)
-                    totals_.accepted_gap_over[e]+=scores[i].gap>Totals::kGapEdges[e]?1:0;
-                ++totals_.accepted_checked;
-            }
-            totals_.max_accepted_gap=std::max(totals_.max_accepted_gap,result.max_gap);
-            result.tokens.assign(tokens.begin(),tokens.begin()+static_cast<std::ptrdiff_t>(reject));
-            if(correction>=0) {
-                result.tokens.push_back(correction);
-                result.corrected=true;
-                rewind_fold(result.tokens);
-                step(totals_.fix_ms);
-            }
-            fold_commit_=FoldCommit{true,result.corrected,round_followed,result.tokens};
-            check(cudaStreamSynchronize(stream_),"folded verification completion");
+            auto result=judge_fold(tokens,next,scores,delta,round_followed,step);
             result.verify_ms=elapsed(start);
-            ++totals_.verified_blocks;
-            totals_.corrected_blocks+=result.corrected?1:0;
             totals_.verify_ms+=result.verify_ms;
             phase_=Phase::ready;
             return result;
@@ -907,6 +1039,83 @@ private:
             phase_=Phase::poisoned;
             throw;
         }
+    }
+    // Checks each row's exact score against the next drafted token (a row whose
+    // next token is unknown, < 0, ends the check); a correction rewinds both
+    // lines (rewind_fold). The commit stays pending for commit_fold.
+    template<class Step>
+    VerifiedBlock judge_fold(std::span<const std::int64_t> tokens,const std::vector<std::int64_t>& next,
+                             const std::vector<Exl3TextContext::RowScore>& scores,float delta,
+                             bool round_followed,const Step& step) {
+        VerifiedBlock result;
+        std::int64_t correction=-1;
+        std::size_t reject=tokens.size();
+        for(std::size_t i=0;i<tokens.size();++i) {
+            if(next[i]<0)break;
+            const bool bad=delta>0?scores[i].gap>delta:scores[i].greedy!=next[i];
+            if(bad) {reject=i+1;correction=scores[i].greedy;break;}
+            result.max_gap=std::max(result.max_gap,scores[i].gap);
+            totals_.accepted_gap_sum+=scores[i].gap;
+            totals_.accepted_off_greedy+=scores[i].gap>0.0f?1:0;
+            for(std::size_t e=0;e<Totals::kGapEdges.size();++e)
+                totals_.accepted_gap_over[e]+=scores[i].gap>Totals::kGapEdges[e]?1:0;
+            ++totals_.accepted_checked;
+        }
+        totals_.max_accepted_gap=std::max(totals_.max_accepted_gap,result.max_gap);
+        result.tokens.assign(tokens.begin(),tokens.begin()+static_cast<std::ptrdiff_t>(reject));
+        if(correction>=0) {
+            result.tokens.push_back(correction);
+            result.corrected=true;
+            rewind_fold(result.tokens);
+            step(totals_.fix_ms);
+        }
+        fold_commit_=FoldCommit{true,result.corrected,round_followed,result.tokens};
+        check(poll_then_sync(stream_),"folded verification completion");
+        ++totals_.verified_blocks;
+        totals_.corrected_blocks+=result.corrected?1:0;
+        return result;
+    }
+    // Line frontier: the published frontier minus the head the line has not
+    // run yet.
+    int line_frontier() const noexcept {return verified_frontier_-static_cast<int>(line_head_.size());}
+    // Correction: the line returns to its root; the drafting context re-runs
+    // `tokens` (the head: kept tokens and the correction) from its root on
+    // its own L0 history and re-commits them to the draft ring.
+    void rewind_async(std::span<const std::int64_t> tokens) {
+        const int root=async_root_;
+        line_->restore_verified_root(stream_);
+        context_->restore_verified_root(stream_);
+        forward_rows(*context_,tokens,stream_);
+        draft_.restore_ring_checkpoint(stream_);
+        commit_captured(static_cast<int>(tokens.size()),root);
+        check(poll_then_sync(stream_),"asynchronous verification rewind");
+        frontier_=context_->position();
+        if(line_->position()!=root || frontier_!=root+static_cast<int>(tokens.size()) ||
+           draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
+            throw std::logic_error("asynchronous verification rewind frontier");
+    }
+    // End of request: the line runs any head exactly and the drafting context
+    // takes its state at the published frontier.
+    void end_async() {
+        if(async_inflight_) {
+            // A block still in flight (cancellation): drop it.
+            async_->wait();
+            async_inflight_=false;
+        }
+        const int root=line_frontier();
+        line_->restore_verified_root(stream_);
+        if(!line_head_.empty())forward_rows(*line_,line_head_,stream_);
+        if(frontier_!=root)context_->restore_verified_root(stream_);
+        context_->sync_exact_line_from(*line_,stream_,true);
+        if(frontier_!=root)draft_.restore_ring_checkpoint(stream_);
+        if(!line_head_.empty())commit_captured(static_cast<int>(line_head_.size()),root);
+        check(poll_then_sync(stream_),"asynchronous verification end");
+        frontier_=context_->position();
+        if(draft_.ring_base_abs()+draft_.ring_count()!=frontier_ || frontier_!=verified_frontier_ ||
+           line_->position()!=frontier_)
+            throw std::logic_error("asynchronous verification end frontier");
+        line_head_.clear();
+        line_=nullptr;
     }
     // Both lines back to the roots at the verified frontier, then `tokens`
     // exactly on the line; the drafting context takes the line's state (its
@@ -918,7 +1127,7 @@ private:
         context_->sync_exact_line_from(*line_,stream_,true);
         draft_.restore_ring_checkpoint(stream_);
         commit_captured(static_cast<int>(tokens.size()),verified_frontier_);
-        check(cudaStreamSynchronize(stream_),"folded verification rewind");
+        check(poll_then_sync(stream_),"folded verification rewind");
         frontier_=context_->position();
         if(line_->position()!=frontier_ || draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
             throw std::logic_error("folded verification rewind frontier");
@@ -976,6 +1185,10 @@ private:
         if(tokens.size()>8)context_->append_prefill_wide(tokens,stream_);
         else context_->append_prefill(tokens,stream_);
         context_->set_l0_exact_history(false);
+    }
+    static cudaError_t poll_then_sync(cudaStream_t stream) {
+        const auto error=ninfer::cuda_poll_stream(stream);
+        return error!=cudaSuccess?error:cudaStreamSynchronize(stream);
     }
     static void check(cudaError_t error,const char* operation) {
         if(error!=cudaSuccess)
@@ -1048,10 +1261,10 @@ private:
             for(std::size_t tap=0;tap<5;++tap)
                 sources[tap]=arena.ptr+tap*static_cast<std::size_t>(rows)*tap_hidden;
             draft_.commit_prefill_bulk(sources.data(),rows,first,stream_);
-            check(cudaStreamSynchronize(stream_),
+            check(poll_then_sync(stream_),
                 "fast device retained tap completion before arena release");
         }catch(...) {
-            cudaStreamSynchronize(stream_);
+            poll_then_sync(stream_);
             throw;
         }
     }
@@ -1248,6 +1461,103 @@ private:
     Phase phase_=Phase::unstarted;
     int frontier_=0,verified_frontier_=0,verify_rows_=0;
     Exl3TextContext* line_=nullptr;
+    // Worker thread and stream of the asynchronous line pass: forwards the
+    // block's rows, then scores them (the last row against a placeholder).
+    class AsyncLine {
+    public:
+        AsyncLine() {
+            check(cudaGetDevice(&device_),"asynchronous verification device");
+            // Lowest priority: the pass is bound by the PCIe history stream, so
+            // its kernels fill SMs the decode lane leaves idle.
+            // NINFER_EXL3_VERICACHE_ASYNC_PRIORITY=1: highest instead.
+            int least=0,greatest=0;
+            check(cudaDeviceGetStreamPriorityRange(&least,&greatest),"asynchronous verification priority");
+            const char* priority=std::getenv("NINFER_EXL3_VERICACHE_ASYNC_PRIORITY");
+            check(cudaStreamCreateWithPriority(&stream_,cudaStreamNonBlocking,
+                priority && std::string_view(priority)=="1"?greatest:least),"asynchronous verification stream");
+            check(cudaEventCreateWithFlags(&fork_,cudaEventDisableTiming),"asynchronous verification event");
+            worker_=std::thread([this] {run();});
+        }
+        ~AsyncLine() {
+            {const std::lock_guard lock(mutex_);quit_=true;}
+            cv_.notify_all();
+            if(worker_.joinable())worker_.join();
+            if(stream_){(void)poll_then_sync(stream_);cudaStreamDestroy(stream_);}
+            if(fork_)cudaEventDestroy(fork_);
+        }
+        AsyncLine(const AsyncLine&)=delete;
+        AsyncLine& operator=(const AsyncLine&)=delete;
+        void launch(Exl3TextContext& line,std::span<const std::int64_t> tokens,float delta,cudaStream_t after) {
+            check(cudaEventRecord(fork_,after),"asynchronous verification fork");
+            {
+                const std::lock_guard lock(mutex_);
+                line_=&line;
+                tokens_.assign(tokens.begin(),tokens.end());
+                delta_=delta;
+                job_=true;done_=false;error_=nullptr;
+            }
+            cv_.notify_all();
+        }
+        bool done() {const std::lock_guard lock(mutex_);return done_;}
+        std::vector<Exl3TextContext::RowScore> wait() {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock,[&] {return done_;});
+            done_=false;
+            if(error_)std::rethrow_exception(error_);
+            return std::move(scores_);
+        }
+    private:
+        void run() {
+            (void)cudaSetDevice(device_);
+            l0_exact_host_throttle()=true;
+            std::unique_lock lock(mutex_);
+            for(;;) {
+                cv_.wait(lock,[&] {return job_ || quit_;});
+                if(quit_)return;
+                job_=false;
+                Exl3TextContext& line=*line_;
+                const std::vector<std::int64_t> tokens=tokens_;
+                const float delta=delta_;
+                lock.unlock();
+                std::vector<Exl3TextContext::RowScore> scores;
+                std::exception_ptr error;
+                try {
+                    check(cudaStreamWaitEvent(stream_,fork_,0),"asynchronous verification fork");
+                    forward_rows(line,tokens,stream_);
+                    std::vector<std::int64_t> next(tokens.begin()+1,tokens.end());
+                    next.push_back(tokens.front());
+                    scores=line.exact_row_scores(next,stream_,delta);
+                } catch(...) {error=std::current_exception();}
+                lock.lock();
+                finished_=Clock::now();
+                scores_=std::move(scores);
+                error_=error;
+                done_=true;
+                cv_.notify_all();
+            }
+        }
+    public:
+        Clock::time_point finished_{};
+    private:
+        int device_=0;
+        cudaStream_t stream_=nullptr;
+        cudaEvent_t fork_=nullptr;
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        bool job_=false,done_=false,quit_=false;
+        Exl3TextContext* line_=nullptr;
+        std::vector<std::int64_t> tokens_;
+        float delta_=0.0f;
+        std::vector<Exl3TextContext::RowScore> scores_;
+        std::exception_ptr error_;
+        std::thread worker_;
+    };
+    std::unique_ptr<AsyncLine> async_;
+    bool async_inflight_=false;
+    std::vector<std::int64_t> line_head_;   // published tokens the line has not run
+    std::size_t async_head_=0;              // head rows of the block in flight
+    int async_root_=0;                      // line frontier the block starts at
+    Clock::time_point async_start_{};
     struct FoldCommit {
         bool pending=false,corrected=false,round_followed=false;
         std::vector<std::int64_t> tokens;

@@ -17,6 +17,15 @@ struct L0HistoryWritten {
     int limit = -1;
 };
 
+// Set on a thread that enqueues exact passes beside other work (the
+// asynchronous VeriCache line): the host waits for piece i-2 before queueing
+// piece i, so a pass blocked on its copies never fills the stream's launch
+// queue (a full queue blocks launches inside the driver, stalling every
+// thread's CUDA calls).
+inline bool& l0_exact_host_throttle() {
+    thread_local bool value=false;
+    return value;
+}
 inline L0HistoryWritten& l0_history_written() {
     thread_local L0HistoryWritten value;
     return value;

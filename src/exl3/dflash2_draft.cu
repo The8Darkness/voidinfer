@@ -1,5 +1,6 @@
 #include "exl3/sampled_select.cuh"
 #include "core/capture_guard.h"
+#include "core/poll_wait.h"
 #include "exl3/gaming_operator_fixture.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/vericache_serving_coordinator.h"
@@ -6495,6 +6496,8 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
                 m.s.head_out,count,m.s.liveness_flag,head_columns,kVocab);
             cuda_check(cudaGetLastError(),"E5A2 fast liveness launch");
         }
+        if (!fused_liveness)
+            cuda_check(ninfer::cuda_poll_stream(stream),"E5A2 fast liveness poll");
         cuda_check(cudaMemcpyAsync(&fused_bad,m.s.liveness_flag,sizeof(fused_bad),
                                    cudaMemcpyDeviceToHost,stream),
                    "E5A2 fast liveness read");
@@ -6536,6 +6539,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             m.s.cand_unary, m.s.proposal_out);
         cuda_check(cudaGetLastError(), "E5A2 launch fused draft selector");
         ++m.fused_selector_calls;
+        cuda_check(ninfer::cuda_poll_stream(stream), "E5A2 fused draft proposals poll");
         cuda_check(cudaMemcpyAsync(result.data(), m.s.proposal_out,
                                    static_cast<std::size_t>(proposal_rows) *
                                        sizeof(std::int64_t),

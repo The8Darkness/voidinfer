@@ -1,5 +1,6 @@
 #include "exl3/l0_history_mark.h"
 #include "core/capture_guard.h"
+#include "core/poll_wait.h"
 #include "exl3/growable_device_region.h"
 #include "exl3/lane_kv_source.h"
 #include "exl3/segment_copy.cuh"
@@ -67,6 +68,17 @@
 #include <unordered_set>
 
 namespace ninfer::exl3 {
+// Set by the Engine before it builds a single lane that gets an exact
+// VeriCache line: the line shares the prompt-scale workspaces with the
+// drafting context it verifies (never both in a prompt pass at once).
+static std::atomic<bool> exact_line_workspace_sharing{false};
+void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept {
+    exact_line_workspace_sharing.store(enabled);
+}
+static bool exl3_exact_line_shares_prompt_workspace() {
+    return exact_line_workspace_sharing.load();
+}
+
 namespace {
 
 using Json = nlohmann::json;
@@ -5646,10 +5658,13 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         if(scratch.bytes)allocate(scratch.bytes,&scratch.data,"allocate shared target layer scratch");
         if(gdn_wide_scratch.bytes)allocate(gdn_wide_scratch.bytes,&gdn_wide_scratch.data,"allocate shared GDN wide slab");
     };
-    static const bool share_prompt_pool=[] {
+    // An exact VeriCache line (asynchronous / folded verification) never runs
+    // a prompt-scale pass while its drafting context does: they share it.
+    static const bool share_prompt_pool_env=[] {
         const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
         return value && std::strcmp(value,"1")==0;
     }();
+    const bool share_prompt_pool=share_prompt_pool_env || exl3_exact_line_shares_prompt_workspace();
     const bool tiered=share_prompt_pool && scratch.bytes!=0;
     require(!tiered || (accumulation.bytes && transformed.bytes),
         "shared prompt pool requires shared accumulation and transform views");
@@ -5696,10 +5711,11 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         ? 17408 : (numeric_prefill_k7_enabled ? kHidden : 17408);
     const bool numeric_workspace_transpose =
         fast_same_weights_all_model_shapes || !numeric_prefill_k7_enabled;
-    static const bool share_prompt_workspace=[] {
+    static const bool share_prompt_workspace_env=[] {
         const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
         return value && std::strcmp(value,"1")==0;
     }();
+    const bool share_prompt_workspace=share_prompt_workspace_env || exl3_exact_line_shares_prompt_workspace();
     std::shared_ptr<Exl3CudaReconstructGemmWorkspace> shared_numeric;
     if(share_prompt_workspace && numeric_prefill_workspace_enabled) {
         std::lock_guard lock(impl->model->shared_numeric_mutex);
@@ -10825,6 +10841,7 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
     }
     std::vector<std::int64_t> greedy(rows);
     std::vector<float> gap(rows);
+    cuda_check(ninfer::cuda_poll_stream(stream),"row scores poll");
     cuda_check(cudaMemcpyAsync(greedy.data(),buffers.greedy,rows*sizeof(std::int64_t),cudaMemcpyDeviceToHost,stream),"row score greedy");
     cuda_check(cudaMemcpyAsync(gap.data(),buffers.gap,rows*sizeof(float),cudaMemcpyDeviceToHost,stream),"row score gaps");
     cuda_check(cudaStreamSynchronize(stream),"row scores");
@@ -11238,6 +11255,7 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         // Context-owned destination survives exceptions/partial transfers. No
         // stack packet escapes or is reused after a failed completion fence.
+        cuda_check(ninfer::cuda_poll_stream(stream),"greedy packet poll");
         cuda_check(cudaMemcpyAsync(impl_->greedy_host_rows.data(),output,rows*sizeof(Exl3GreedyRow),
             cudaMemcpyDeviceToHost,stream),"greedy packet download");
         cuda_check(cudaStreamSynchronize(stream),"greedy packet readiness");
