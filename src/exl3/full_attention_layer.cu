@@ -13,6 +13,7 @@
 #include "exl3/block_tree_sum.cuh"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <mma.h>
@@ -5869,13 +5870,23 @@ __device__ __forceinline__ void add_lo(float& acc,unsigned packed){
 __device__ __forceinline__ void add_hi(float& acc,unsigned packed){
   asm("{.reg .f16 l,h; mov.b32 {l,h}, %1; add.rn.f32.f16 %0, h, %0;}":"+f"(acc):"r"(packed)); }
 __device__ __forceinline__ float fast_ex2(float x){ float y; asm("ex2.approx.ftz.f32 %0, %1;":"=f"(y):"f"(x)); return y; }
-template<int S>
+// Fp8: K/V are rows of 1040 bytes (e4m3 [4][256] + FP16 scale per head,
+// l0_exact.cuh L0LineFp8) from `k_cache`/`v_cache` reinterpreted as bytes,
+// base 0 and no sink/ring/history mapping. Each tile arrives as FP8 by
+// cp.async (double buffered) and expands to FP16 (value x scale, rounded as
+// l0_line_fp8_kernel does) into one FP16 tile: the same scores as attending
+// the expanded planes, from half the bytes.
+constexpr int kFp8RowBytes=1040;
+constexpr int kFp8Stage=2*BN*kHeadDim; // bytes (K then V)
+constexpr std::size_t fp8_smem_bytes(){ return static_cast<std::size_t>(kStage)*sizeof(half)+2u*kFp8Stage; }
+template<int S,bool Fp8=false>
 __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,std::uint16_t* output,int rows,int base,int capacity,
     float* split_output,float* split_stats,int history_end=0,
     const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,int ring_mask=-1){
   extern __shared__ __align__(16) unsigned char smem_raw[];
   half* sm=reinterpret_cast<half*>(smem_raw);
+  unsigned char* sm8=smem_raw+static_cast<std::size_t>(kStage)*sizeof(half);
   const int query_base=(static_cast<int>(gridDim.x)-1-static_cast<int>(blockIdx.x))*BM;
   const int kv_head=blockIdx.y;
   const int head_group=blockIdx.z/S, split=blockIdx.z%S;
@@ -5921,7 +5932,43 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
   #pragma unroll
   for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
   float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
+  const auto* k8=reinterpret_cast<const unsigned char*>(k_cache);
+  const auto* v8=reinterpret_cast<const unsigned char*>(v_cache);
+  auto load8=[&](int tile,int stage){
+    unsigned char* ks8=sm8+stage*kFp8Stage; unsigned char* vs8=ks8+BN*kHeadDim;
+    const int first=tile*BN;
+    #pragma unroll
+    for(int i=0;i<(BN*kHeadDim/16)/256;++i){
+      const int idx=tid+i*256; const int key_off=idx/(kHeadDim/16); const int chunk=(idx%(kHeadDim/16))*16;
+      const int key=first+key_off; const bool valid=key<maximum_count;
+      const std::size_t off=static_cast<std::size_t>(valid?key:0)*kFp8RowBytes+kv_head*kHeadDim+chunk;
+      cp16(ks8+key_off*kHeadDim+chunk,k8+off,valid);
+      cp16(vs8+key_off*kHeadDim+chunk,v8+off,valid);
+    }
+    commit();
+  };
+  // FP8 tile `stage` -> the FP16 tile (one 8-dimension group per unit).
+  auto expand8=[&](int tile,int stage){
+    const unsigned char* ks8=sm8+stage*kFp8Stage;
+    const int first=tile*BN;
+    #pragma unroll
+    for(int i=0;i<(2*BN*kHeadDim/8)/256;++i){
+      const int idx=tid+i*256; const int kind=idx/(BN*kHeadDim/8);
+      const int key_off=(idx/(kHeadDim/8))%BN; const int dim=(idx%(kHeadDim/8))*8;
+      const int key=first+key_off;
+      const unsigned char* rows8=kind?v8:k8;
+      const float scale=key<maximum_count?__half2float(*reinterpret_cast<const __half*>(
+          rows8+static_cast<std::size_t>(key)*kFp8RowBytes+4*kHeadDim+kv_head*2)):0.f;
+      const uint2 raw=*reinterpret_cast<const uint2*>(ks8+kind*BN*kHeadDim+key_off*kHeadDim+dim);
+      const unsigned char* q8=reinterpret_cast<const unsigned char*>(&raw);
+      __align__(16) half h[8];
+      #pragma unroll
+      for(int j=0;j<8;++j){ __nv_fp8_e4m3 x; x.__x=q8[j]; h[j]=__float2half_rn(static_cast<float>(x)*scale); }
+      *reinterpret_cast<uint4*>(sm+kind*BN*kStride+key_off*kStride+dim)=*reinterpret_cast<const uint4*>(h);
+    }
+  };
   auto load=[&](int tile,int stage){
+    if constexpr(Fp8){ load8(tile,stage); return; }
     half* ks=sm+stage*kStage; half* vs=ks+BN*kStride;
     const int first=real_tile(tile)*BN;
     #pragma unroll
@@ -5944,8 +5991,9 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
     const int stage=(tile-t_begin)&1;
     if(tile+1<t_end){ load(tile+1,stage^1); wait<1>(); } else wait<0>();
     __syncthreads();
+    if constexpr(Fp8){ expand8(tile,stage); __syncthreads(); }
     const int first=real_tile(tile)*BN;
-    const half* ks=sm+stage*kStage; const half* vs=ks+BN*kStride;
+    const half* ks=sm+(Fp8?0:stage*kStage); const half* vs=ks+BN*kStride;
     const bool warp_live=(m_base<active_rows) && first<=warp_max_limit;
     if(warp_live){
       float s[BN/8][4];
@@ -6087,21 +6135,21 @@ bool exl3_fa2_prefill_enabled() {
     return enabled;
 }
 
-template<int S>
+template<int S,bool Fp8=false>
 static void launch_fa2_prefill_variant(const std::uint16_t* q,const std::uint16_t* k,
     const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
     float* split_output,float* split_stats,cudaStream_t stream,int history_end=0,
     bool merge=true,const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,
     int ring_mask=-1) {
-    constexpr std::size_t bytes=fa2_prefill::smem_bytes();
+    constexpr std::size_t bytes=Fp8?fa2_prefill::fp8_smem_bytes():fa2_prefill::smem_bytes();
     static const bool configured=[] {
-        cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S>,
+        cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S,Fp8>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
             "configure FA2 prefill shared memory");
         return true;
     }();
     (void)configured;
-    fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S><<<
+    fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S,Fp8><<<
         dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,kKVHeads,(kQHeads/kKVHeads/2)*S),256,
         bytes,stream>>>(q,k,v,output,rows,position,capacity,split_output,split_stats,
             history_end,sink_k,sink_v,ring_mask);
@@ -8329,7 +8377,11 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
         // The guarded verifier route uses the same fused attention reduction
         // for scalar seeds and B2..B8 proposals.  The older tiled prefill
         // branch otherwise intercepts those small batches first.
-        const bool fused_flash_eligible=fast_fused_flash_attention_ &&
+        // The FP8 line attends its history through the staged route at every
+        // row count, so a row's verdict does not depend on its pass size.
+        const bool line_fp8_rows=l0_exact_only_ && l0_fp8_use_ && l0_.k_codes &&
+            std::min(l0_oscar::history_end(position),cache_capacity_)>l0_oscar::kSink;
+        const bool fused_flash_eligible=!line_fp8_rows && fast_fused_flash_attention_ &&
             (rows==1 || (fast_fused_flash_multirow_ && rows>=2 && rows<=8)) &&
             position>0 && (!capture_active_ || ordinary_full_layer_graph_capture_) &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
@@ -8338,7 +8390,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
             exact_attention_gqa_six_scores_ &&
             exact_attention_gqa_six_softmax_triple_values_ &&
             !exact_attention_gqa_six_softmax_fused_scalar_values_;
-        const int l0_prefill_history=(l0_.k_codes && rows>8 && !fused_flash_eligible)?
+        const int l0_prefill_history=(l0_.k_codes && (rows>8 || line_fp8_rows) && !fused_flash_eligible)?
             std::min(l0_oscar::history_end(position),cache_capacity_):0;
         if (l0_prefill_history>l0_oscar::kSink) {
             if(capture_active_ || rows>l0_.prefill_rows || direct_staged_rows_ ||
@@ -8347,9 +8399,10 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 throw std::invalid_argument("L0 OSCAR prefill route preconditions");
             if(l0_exact_prefill_) {
                 // Exact history from the FP16 L2 planes, merged straight into split 4.
+                const L0LineFp8 fp8{l0_fp8_k_,l0_fp8_v_,l0_fp8_valid_,l0_fp8_use_};
                 l0_exact_history_staged(qr,k_cache_,v_cache_,l0_.prefill_hist,l0_.prefill_hist_stats,
                     l0_.prefill_split+static_cast<std::size_t>(4)*rows*kQHeads*kHeadDim,l0_.prefill_split_stats,4,rows,
-                    l0_prefill_history,stream);
+                    l0_prefill_history,stream,l0_fp8_valid_?&fp8:nullptr);
             } else {
             const auto& a=l0_oscar::assets();
             constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;

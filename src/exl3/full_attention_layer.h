@@ -687,6 +687,12 @@ public:
     // Exact line of folded VeriCache (Exl3TextContext::make_exact_line): the
     // layer attends with exact history only and keeps no INT4 codes or hot
     // rows (no encode, no hot fills); its window ring stays its own.
+    // FP8 history mirror (l0_exact.cuh L0LineFp8) of the context's FP16
+    // planes: `use` (the asynchronous VeriCache line) attends it in staged
+    // exact passes; otherwise staged exact passes only extend it.
+    void set_l0_fp8_mirror(std::uint8_t* k, std::uint8_t* v, std::atomic<int>* valid, bool use) noexcept {
+        l0_fp8_k_ = k; l0_fp8_v_ = v; l0_fp8_valid_ = valid; l0_fp8_use_ = use;
+    }
     void set_l0_exact_only(bool exact_only) noexcept {
         l0_exact_only_ = exact_only;
         if (exact_only) l0_exact_ = l0_exact_prefill_ = true;
@@ -998,6 +1004,10 @@ private:
     bool l0_exact_ = false;          // verifier/decode rows (<= 8)
     bool l0_exact_only_ = false;     // exact line: no codes/hot rows of its own
     bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)
+    std::uint8_t* l0_fp8_k_ = nullptr;
+    std::uint8_t* l0_fp8_v_ = nullptr;
+    std::atomic<int>* l0_fp8_valid_ = nullptr;
+    bool l0_fp8_use_ = false;
 
     int fakequant_bank_ = 0;
     std::uint16_t* v_cache_ = nullptr;

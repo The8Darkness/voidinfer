@@ -253,6 +253,90 @@ inline void l0_launch_exact_history(const void* q,const std::uint16_t* k_src,con
         position,position_device,capacity,splits);
 }
 
+// FP8 history mirror of the asynchronous VeriCache line
+// (NINFER_EXL3_VERICACHE_LINE_FP8): the L2 history rows as e4m3 with one FP16
+// scale per (row, KV head) (absmax / 448), row-interleaved like
+// l0_l2_fp8.cuh (1024 value bytes + 4 scales, padded to 1040 bytes per row), in host memory beside
+// the FP16 planes. Rows [kSink, *valid) hold the FP8 image of the FP16 rows;
+// the owning context lowers `valid` before it rewrites plane rows below it.
+// use: the line attends the FP8 image (half the PCIe bytes per pass); rows
+// past `valid` arrive as FP16 and are packed on the way. Without `use` (the
+// drafting context's exact prompt passes) the FP16 history stays as staged
+// and only the rows past `valid` are packed into the mirror.
+constexpr int kL0LineFp8RowBytes=1040;   // 16-byte aligned rows (cp.async)
+// The line attends the FP8 staging directly (FA2 FP8 tiles) instead of
+// expanding it to FP16 first; NINFER_EXL3_LINE_FP8_ATTENTION=0 expands.
+inline bool line_fp8_attention() {
+    static const bool value=[] {
+        const char* v=std::getenv("NINFER_EXL3_LINE_FP8_ATTENTION");
+        return !v || std::strcmp(v,"0")!=0;
+    }();
+    return value;
+}
+struct L0LineFp8 {
+    std::uint8_t* k=nullptr;
+    std::uint8_t* v=nullptr;
+    std::atomic<int>* valid=nullptr;
+    bool use=false;
+};
+
+// One warp per (row, KV head, K|V); rows [begin, begin+gridDim.x) of the
+// piece starting at `first`. Rows below `mirrored` arrive in the FP8 staging
+// and expand into the FP16 staging; the others are read from the FP16
+// staging, packed into the mirror and, with `round`, replaced by their FP8
+// values.
+__global__ void __launch_bounds__(256) l0_line_fp8_kernel(const std::uint8_t* k8,const std::uint8_t* v8,
+    std::uint16_t* k16,std::uint16_t* v16,std::uint8_t* mirror_k,std::uint8_t* mirror_v,int first,
+    int mirrored,int begin,bool round,bool staged8=false) {
+    const int warp=static_cast<int>(threadIdx.x)>>5,lane=static_cast<int>(threadIdx.x)&31;
+    const int row=begin+static_cast<int>(blockIdx.x),head=warp&3;
+    const bool value=warp>=4;
+    __half* plane=reinterpret_cast<__half*>(value?v16:k16)+
+        (static_cast<std::size_t>(row-first)*kKVHeads+head)*kHeadDim+lane*8;
+    __half h[8];
+    if(row<mirrored) {
+        const std::uint8_t* in=(value?v8:k8)+static_cast<std::size_t>(row-first)*kL0LineFp8RowBytes;
+        const float scale=__half2float(*reinterpret_cast<const __half*>(in+1024+head*2));
+        const uint2 raw=*reinterpret_cast<const uint2*>(in+head*256+lane*8);
+        const std::uint8_t* q=reinterpret_cast<const std::uint8_t*>(&raw);
+        #pragma unroll
+        for(int i=0;i<8;++i) {
+            __nv_fp8_e4m3 x; x.__x=q[i];
+            h[i]=__float2half_rn(static_cast<float>(x)*scale);
+        }
+    } else {
+        const uint4 raw=*reinterpret_cast<const uint4*>(plane);
+        const __half* src=reinterpret_cast<const __half*>(&raw);
+        float x[8],amax=0.f;
+        #pragma unroll
+        for(int i=0;i<8;++i) { x[i]=__half2float(src[i]); amax=fmaxf(amax,fabsf(x[i])); }
+        #pragma unroll
+        for(int o=16;o>0;o>>=1) amax=fmaxf(amax,__shfl_xor_sync(0xffffffffU,amax,o));
+        const __half scale_h=__float2half_rn(amax>0.f?amax/448.f:1.f);
+        const float scale=__half2float(scale_h),inv=1.f/scale;
+        std::uint8_t q[8];
+        #pragma unroll
+        for(int i=0;i<8;++i) {
+            const __nv_fp8_e4m3 e(fminf(fmaxf(x[i]*inv,-448.f),448.f));
+            q[i]=e.__x;
+            h[i]=__float2half_rn(static_cast<float>(e)*scale);
+        }
+        std::uint8_t* out=(value?mirror_v:mirror_k)+static_cast<std::size_t>(row)*kL0LineFp8RowBytes;
+        *reinterpret_cast<uint2*>(out+head*256+lane*8)=*reinterpret_cast<const uint2*>(q);
+        if(lane==0) *reinterpret_cast<__half*>(out+1024+head*2)=scale_h;
+        if(!round) return;
+        if(staged8) {
+            // The attention reads the piece as FP8: the new rows join it.
+            std::uint8_t* st=const_cast<std::uint8_t*>(value?v8:k8)+
+                static_cast<std::size_t>(row-first)*kL0LineFp8RowBytes;
+            *reinterpret_cast<uint2*>(st+head*256+lane*8)=*reinterpret_cast<const uint2*>(q);
+            if(lane==0) *reinterpret_cast<__half*>(st+1024+head*2)=scale_h;
+            return;
+        }
+    }
+    *reinterpret_cast<uint4*>(plane)=*reinterpret_cast<const uint4*>(h);
+}
+
 // Exact history of a prefill / verifier chunk of more than 8 rows into the
 // prefill split slot `slot`: the L2 rows [kSink, history_end) are copied in
 // 16K-row pieces into double-buffered device staging on a copy stream (row
@@ -265,7 +349,7 @@ inline void l0_launch_exact_history(const void* q,const std::uint16_t* k_src,con
 constexpr int kL0ExactPieceRows=16384;
 inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,const std::uint16_t* v_src,
     float* out,float* stats,float* numer,float* split_stats,int slot,int rows,int history_end,
-    cudaStream_t stream) {
+    cudaStream_t stream,const L0LineFp8* fp8=nullptr) {
     struct Stage {
         std::uint16_t* k[2]{}; std::uint16_t* v[2]{};
         cudaStream_t copy=nullptr;
@@ -285,6 +369,20 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
         return s;
     }();
     constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim;
+    // FP8 staging of the mirror's rows (allocated with the first mirror use).
+    struct Stage8 { std::uint8_t* k[2]{}; std::uint8_t* v[2]{}; };
+    static Stage8 stage8;
+    const int valid=fp8?fp8->valid->load(std::memory_order_acquire):0;
+    if(fp8 && fp8->use && !stage8.k[0])
+        for(int b=0;b<2;++b) {
+            const std::size_t bytes=static_cast<std::size_t>(kL0ExactPieceRows)*kL0LineFp8RowBytes;
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&stage8.k[b]),bytes),"L0 line FP8 staging");
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&stage8.v[b]),bytes),"L0 line FP8 staging");
+        }
+    // Rows below this arrive from the FP8 mirror.
+    const auto mirrored_end=[&](int first,int last) {
+        return fp8 && fp8->use?std::clamp(valid,first,std::max(first,last)):first;
+    };
     // Copies read L2 rows [kSink, history_end). Rows below the live
     // "history written" mark of this stream (l0_history_mark.h: recorded by
     // the enclosing forward pass, all layers final below its limit) are copied
@@ -314,8 +412,16 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
             cuda_check(cudaMemcpyAsync(stage.k[b]+offset,k_src+from*row,(to-from)*row*2,cudaMemcpyDefault,stage.copy),"L0 exact staging copy");
             cuda_check(cudaMemcpyAsync(stage.v[b]+offset,v_src+from*row,(to-from)*row*2,cudaMemcpyDefault,stage.copy),"L0 exact staging copy");
         };
-        const int split=forked?first:std::clamp(early_limit,first,std::max(first,last));
-        copy(first,split);
+        // Mirror rows are final (written by earlier passes of this stream).
+        const int mirrored=mirrored_end(first,last);
+        if(mirrored>first) {
+            const std::size_t at=static_cast<std::size_t>(first)*kL0LineFp8RowBytes;
+            const std::size_t bytes=static_cast<std::size_t>(mirrored-first)*kL0LineFp8RowBytes;
+            cuda_check(cudaMemcpyAsync(stage8.k[b],fp8->k+at,bytes,cudaMemcpyDefault,stage.copy),"L0 line FP8 staging copy");
+            cuda_check(cudaMemcpyAsync(stage8.v[b],fp8->v+at,bytes,cudaMemcpyDefault,stage.copy),"L0 line FP8 staging copy");
+        }
+        const int split=forked?mirrored:std::clamp(early_limit,mirrored,std::max(mirrored,last));
+        copy(mirrored,split);
         if(split<last) {
             if(!forked) {
                 cuda_check(cudaStreamWaitEvent(stage.copy,stage.fork,0),"L0 exact staging fork");
@@ -334,11 +440,29 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
         // The staged piece is a plain linear cache for the FA2 prefill kernel:
         // with base = capacity = piece rows every staged key is visible.
         const int piece_rows=last-first;
-        if(piece_rows>0)
+        // FP8 attention (line): only the rows arriving as FP16 need packing.
+        const bool attend8=fp8 && fp8->use && line_fp8_attention();
+        if(fp8 && piece_rows>0) {
+            const int begin=attend8?mirrored_end(first,last):fp8->use?first:std::clamp(valid,first,last);
+            if(last>begin)
+                l0_line_fp8_kernel<<<last-begin,256,0,stream>>>(stage8.k[b],stage8.v[b],stage.k[b],stage.v[b],
+                    fp8->k,fp8->v,first,mirrored_end(first,last),begin,fp8->use,attend8);
+        }
+        if(piece_rows>0 && attend8) {
+            const auto* k8=reinterpret_cast<const std::uint16_t*>(stage8.k[b]);
+            const auto* v8=reinterpret_cast<const std::uint16_t*>(stage8.v[b]);
+            launch_fa2_prefill_variant<4,true>(static_cast<const std::uint16_t*>(q),k8,v8,
+                nullptr,rows,piece_rows,piece_rows,out,stats,stream,0,false);
+        } else if(piece_rows>0)
             launch_fa2_prefill_variant<4>(static_cast<const std::uint16_t*>(q),stage.k[b],stage.v[b],
                 nullptr,rows,piece_rows,piece_rows,out,stats,stream,0,false);
         l0_exact_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(out,stats,piece_rows>0?4:0,rows,numer,
             split_stats,slot,nullptr,nullptr,piece>0);
         cuda_check(cudaEventRecord(stage.consumed[b],stream),"L0 exact staging consumed");
+    }
+    // The packed rows join the mirror unless an owner rewrite lowered it meanwhile.
+    if(fp8 && history_end>valid) {
+        int expected=valid;
+        fp8->valid->compare_exchange_strong(expected,history_end,std::memory_order_acq_rel);
     }
 }

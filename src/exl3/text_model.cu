@@ -1467,6 +1467,7 @@ struct Exl3TextContext::Impl {
     }
     // Called before rows >= `row` of the L0 planes are rewritten.
     void kv_rows_rewritten_from(int row) {
+        line_fp8_rewritten_from(row);
         if(kv_source)kv_source->materialize_from(row);
     }
     // A reset ends the lineage without touching the planes: the fill waits
@@ -1843,6 +1844,18 @@ struct Exl3TextContext::Impl {
     // Exact line of folded VeriCache (make_exact_line): borrowed planes, no
     // INT4 codes, exact history only.
     bool exact_line = false;
+    // FP8 history mirror the asynchronous line attends (make_exact_line,
+    // NINFER_EXL3_VERICACHE_LINE_FP8; l0_exact.cuh L0LineFp8), owned by the
+    // drafting context beside its FP16 planes and grown with them.
+    std::array<std::unique_ptr<Exl3GrowableDeviceRegion>,kLayers> line_fp8_k,line_fp8_v;
+    std::array<std::atomic<int>,kLayers> line_fp8_valid{};
+    static constexpr std::size_t kLineFp8RowBytes=1040;
+    void line_fp8_rewritten_from(int row) {
+        for(auto& valid:line_fp8_valid) {
+            int value=valid.load(std::memory_order_relaxed);
+            while(value>row && !valid.compare_exchange_weak(value,std::max(row,0),std::memory_order_acq_rel)) {}
+        }
+    }
     Exl3CudaLinearWorkspace::Owner head_workspace;
     std::unique_ptr<DeviceAllocation> greedy_rows;
     std::array<std::shared_ptr<Exl3GreedyPacketTransfer>,2> greedy_transfers;
@@ -3498,6 +3511,13 @@ struct Exl3TextContext::Impl {
             if(cache_k[layer])cache_k[layer]->ensure_host_bytes(used);
             if(cache_v[layer])cache_v[layer]->ensure_host_bytes(used);
         }
+        const std::size_t mirror=line_fp8_bytes(rows);
+        for(int layer=0;layer<kLayers;++layer)
+            for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
+                if(region)region->ensure(mirror);
+    }
+    std::size_t line_fp8_bytes(int rows) const {
+        return static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kLineFp8RowBytes;
     }
     // Backs the planes for `rows` on a helper thread, one granule of every
     // plane at a time in row order, so the per-chunk ensure_l0_rows of a long
@@ -3514,16 +3534,27 @@ struct Exl3TextContext::Impl {
                     planes.push_back(plane);
                     step=plane->host_region->granularity_bytes();
                 }
-        if(planes.empty() || !step)return {};
+        const std::size_t mirror=line_fp8_bytes(rows);
+        std::vector<Exl3GrowableDeviceRegion*> mirrors;
+        for(int layer=0;layer<kLayers;++layer)
+            for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
+                if(region && region->mapped_bytes()<std::min(mirror,region->capacity_bytes())) {
+                    mirrors.push_back(region);
+                    step=region->granularity_bytes();
+                }
+        if((planes.empty() && mirrors.empty()) || !step)return {};
         Exl3LaneKvSource::relieve_memory_pressure(plane_growth_bytes(rows));
         CUcontext context=nullptr;
         if(cuCtxGetCurrent(&context)!=CUDA_SUCCESS || !context)return {};
-        return std::async(std::launch::async,[planes=std::move(planes),used,step,context] {
+        return std::async(std::launch::async,[planes=std::move(planes),mirrors=std::move(mirrors),used,mirror,
+                                              step,context] {
             if(cuCtxSetCurrent(context)!=CUDA_SUCCESS)
                 throw std::runtime_error("L0 plane pre-growth context");
             for(std::size_t target=step;;target+=step) {
                 for(auto* plane:planes)plane->ensure_host_bytes(std::min(target,used));
-                if(target>=used)break;
+                // The mirror rows are half the plane rows: one granule per two.
+                for(auto* region:mirrors)region->ensure(std::min(target/2,mirror));
+                if(target>=std::max(used,mirror))break;
             }
         });
     }
@@ -3548,6 +3579,11 @@ struct Exl3TextContext::Impl {
             if(cache_k[layer])cache_k[layer]->shrink_host_bytes(used);
             if(cache_v[layer])cache_v[layer]->shrink_host_bytes(used);
         }
+        // Mirror rows beyond the kept planes go with their backing.
+        line_fp8_rewritten_from(plane_rows);
+        for(int layer=0;layer<kLayers;++layer)
+            for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
+                if(region)region->shrink(line_fp8_bytes(plane_rows));
     }
     // precomputed_norm/logits: this agent's rows of the owner's batched head
     // (one H6 head over every agent's rows); copied into this context's
@@ -10725,6 +10761,30 @@ void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
             static_cast<std::uint16_t*>(impl_->cache_v[layer]->ptr),impl_->max_context);
         impl_->full_layers[layer]->set_l0_exact_only(true);
     }
+    // FP8 history of the asynchronous line (default; NINFER_EXL3_VERICACHE_LINE_FP8=0
+    // keeps the FP16 planes): half the PCIe bytes per pass, 128K -4%, 254K -6%
+    // per round; history past the window rounds to e4m3 (per row/head scale).
+    static const bool line_fp8=[] {
+        const char* value=std::getenv("NINFER_EXL3_VERICACHE_LINE_FP8");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(line_fp8) {
+        auto& owner=*drafting.impl_;
+        const std::size_t capacity=static_cast<std::size_t>(owner.max_context)*Impl::kLineFp8RowBytes;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(!impl_->full_layers[layer])continue;
+            for(auto* region:{&owner.line_fp8_k[layer],&owner.line_fp8_v[layer]}) {
+                *region=std::make_unique<Exl3GrowableDeviceRegion>();
+                (*region)->reserve(capacity,true);
+            }
+            owner.line_fp8_valid[layer].store(0);
+            auto* k=owner.line_fp8_k[layer]->data<std::uint8_t>();
+            auto* v=owner.line_fp8_v[layer]->data<std::uint8_t>();
+            owner.full_layers[layer]->set_l0_fp8_mirror(k,v,&owner.line_fp8_valid[layer],false);
+            impl_->full_layers[layer]->set_l0_fp8_mirror(k,v,&owner.line_fp8_valid[layer],true);
+        }
+        owner.ensure_l0_rows(std::max(drafting.position_,0));
+    }
 }
 
 bool Exl3TextContext::exact_line() const noexcept {return impl_->exact_line;}
@@ -13542,6 +13602,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     // still-deferred pages already sit in these planes. Pages backed by
     // another lane are filled from that lane's planes.
     impl_->kv_rewrite_pending=-1;   // the handover below is exact
+    impl_->line_fp8_rewritten_from(0);
     impl_->ensure_l0_rows(state.position_);
     impl_->ensure_kv_source();
     const bool all_lane_resident=kv_lane_resident(state);
