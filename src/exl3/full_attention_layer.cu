@@ -6135,16 +6135,18 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
 }
 // FP8 math over FP8 history rows (l0_exact.cuh L0LineFp8 layout; staged
 // line passes, NINFER_EXL3_LINE_FP8_MATH=1): QK and PV run as e4m3 MMA
-// (m16n8k32, FP32 accumulate) instead of expanding K/V to FP16. Q is
-// quantized per (row, head) (absmax / 448); scores take the per-key K scale;
+// (m16n8k32) instead of expanding K/V to FP16. Q is quantized per (row,
+// head); scores take the per-key K scale;
 // P is folded with the per-key V scale and quantized per (row, key tile).
 // Same CTA layout, splits and output format as the FA2 kernel (base 0, no
 // masking beyond the key count). K tiles land in shared memory permuted so
 // each QK n-tile's keys are adjacent rows (no bank conflicts) and its score
 // columns are the PV A-fragment keys; V tiles are transposed (dims x keys).
-__device__ __forceinline__ void mma_e4m3(float (&d)[4],const unsigned (&a)[4],unsigned b0,unsigned b1){
-  asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-    :"+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
+// FP16-accumulated e4m3 MMA from a zero accumulator: d[0] = row g columns
+// 2t, 2t+1, d[1] = row g + 8.
+__device__ __forceinline__ void mma_e4m3_h(unsigned (&d)[2],const unsigned (&a)[4],unsigned b0,unsigned b1){
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};\n"
+    :"=r"(d[0]),"=r"(d[1]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1),"r"(0u));
 }
 __device__ __forceinline__ unsigned pack_e4m3x4(float a,float b,float c,float d){
   const unsigned lo=__nv_cvt_float2_to_fp8x2(make_float2(a,b),__NV_SATFINITE,__NV_E4M3);
@@ -6156,6 +6158,10 @@ constexpr int kF8Vt=BN+16;         // V^T row stride (bytes)
 constexpr std::size_t fp8math_smem_bytes(){
   return 2u*kFp8Stage+static_cast<std::size_t>(BN)*kF8Ks+static_cast<std::size_t>(kHeadDim)*kF8Vt+2u*BN*sizeof(float);
 }
+// MMAs accumulate in FP16 (twice the e4m3 tensor rate of FP32 accumulation),
+// one 32-wide k step each, added in FP32. The mirror rows are e4m3 within
+// +-448; Q and P are quantized to absmax 4, so one step's sum stays within
+// 32 x 4 x 448 = 57344 < 65504.
 template<int S>
 __global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std::uint16_t* q,const unsigned char* k8,
     const unsigned char* v8,int rows,int keys,float* split_output,float* split_stats){
@@ -6177,6 +6183,7 @@ __global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std:
   const int tiles=(keys+BN-1)/BN;
   const int per=(tiles+S-1)/S;
   const int t_begin=split*per, t_end=min(tiles,t_begin+per);
+  constexpr float kQMax=4.f, kPMax=4.f;
   // Q A fragments (e4m3) and per-row scales (natural-log score units).
   unsigned qa[kHeadDim/32][4];
   float qscale[2];
@@ -6204,9 +6211,9 @@ __global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std:
     for(int r=0;r<2;++r){
       amax[r]=fmaxf(amax[r],__shfl_xor_sync(0xffffffffu,amax[r],1));
       amax[r]=fmaxf(amax[r],__shfl_xor_sync(0xffffffffu,amax[r],2));
-      qscale[r]=amax[r]/448.f*0.0625f;
+      qscale[r]=amax[r]/kQMax*0.0625f;
     }
-    const float inv[2]={amax[0]>0.f?448.f/amax[0]:0.f,amax[1]>0.f?448.f/amax[1]:0.f};
+    const float inv[2]={amax[0]>0.f?kQMax/amax[0]:0.f,amax[1]>0.f?kQMax/amax[1]:0.f};
     #pragma unroll
     for(int kk=0;kk<kHeadDim/32;++kk){
       qa[kk][0]=pack_e4m3x4(x[0][kk][0]*inv[0],x[0][kk][1]*inv[0],x[0][kk][2]*inv[0],x[0][kk][3]*inv[0]);
@@ -6286,7 +6293,9 @@ __global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std:
         #pragma unroll
         for(int j=0;j<BN/8;++j){
           const unsigned char* kr=ksm+(8*j+g)*kF8Ks+kk*32+4*t;
-          mma_e4m3(c[j],qa[kk],*reinterpret_cast<const unsigned*>(kr),*reinterpret_cast<const unsigned*>(kr+16));
+          unsigned h[2];
+          mma_e4m3_h(h,qa[kk],*reinterpret_cast<const unsigned*>(kr),*reinterpret_cast<const unsigned*>(kr+16));
+          add_lo(c[j][0],h[0]); add_hi(c[j][1],h[0]); add_lo(c[j][2],h[1]); add_hi(c[j][3],h[1]);
         }
       float s[BN/8][4];
       float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
@@ -6325,8 +6334,8 @@ __global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std:
         #pragma unroll
         for(int n=0;n<kHeadDim/8;++n){ acc[n][0]*=scale[0]; acc[n][1]*=scale[0]; acc[n][2]*=scale[1]; acc[n][3]*=scale[1]; }
       }
-      const float pinv[2]={pmax[0]>0.f?448.f/pmax[0]:0.f,pmax[1]>0.f?448.f/pmax[1]:0.f};
-      const float pq[2]={pmax[0]/448.f,pmax[1]/448.f};
+      const float pinv[2]={pmax[0]>0.f?kPMax/pmax[0]:0.f,pmax[1]>0.f?kPMax/pmax[1]:0.f};
+      const float pq[2]={pmax[0]/kPMax,pmax[1]/kPMax};
       // A: row g keys 4t..4t+3 (n-tiles 0, 1), row g + 8, then keys 16 + 4t.. (n-tiles 2, 3).
       const unsigned pa[4]={
         pack_e4m3x4(pv[0][0]*pinv[0],pv[0][1]*pinv[0],pv[1][0]*pinv[0],pv[1][1]*pinv[0]),
@@ -6334,21 +6343,14 @@ __global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std:
         pack_e4m3x4(pv[2][0]*pinv[0],pv[2][1]*pinv[0],pv[3][0]*pinv[0],pv[3][1]*pinv[0]),
         pack_e4m3x4(pv[2][2]*pinv[1],pv[2][3]*pinv[1],pv[3][2]*pinv[1],pv[3][3]*pinv[1])};
       #pragma unroll
-      for(int quarter=0;quarter<4;++quarter){
-        float tmp[8][4];
-        #pragma unroll
-        for(int n=0;n<8;++n) tmp[n][0]=tmp[n][1]=tmp[n][2]=tmp[n][3]=0.f;
-        #pragma unroll
-        for(int n=0;n<8;++n){
-          const unsigned char* vr=vtm+(quarter*64+8*n+g)*kF8Vt+4*t;
-          mma_e4m3(tmp[n],pa,*reinterpret_cast<const unsigned*>(vr),*reinterpret_cast<const unsigned*>(vr+16));
-        }
-        #pragma unroll
-        for(int n=0;n<8;++n){
-          float* a=acc[quarter*8+n];
-          a[0]=fmaf(pq[0],tmp[n][0],a[0]); a[1]=fmaf(pq[0],tmp[n][1],a[1]);
-          a[2]=fmaf(pq[1],tmp[n][2],a[2]); a[3]=fmaf(pq[1],tmp[n][3],a[3]);
-        }
+      for(int n=0;n<kHeadDim/8;++n){
+        const unsigned char* vr=vtm+(8*n+g)*kF8Vt+4*t;
+        unsigned h[2];
+        mma_e4m3_h(h,pa,*reinterpret_cast<const unsigned*>(vr),*reinterpret_cast<const unsigned*>(vr+16));
+        const float2 lo=__half22float2(*reinterpret_cast<const __half2*>(&h[0]));
+        const float2 hi=__half22float2(*reinterpret_cast<const __half2*>(&h[1]));
+        acc[n][0]=fmaf(pq[0],lo.x,acc[n][0]); acc[n][1]=fmaf(pq[0],lo.y,acc[n][1]);
+        acc[n][2]=fmaf(pq[1],hi.x,acc[n][2]); acc[n][3]=fmaf(pq[1],hi.y,acc[n][3]);
       }
     }
     __syncthreads();
