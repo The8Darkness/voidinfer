@@ -109,6 +109,7 @@ public:
             opener = true;
         }
         group->members.push_back(&mine);
+        changed_.notify_all();
         const auto target = std::min<std::size_t>(max_group(), static_cast<std::size_t>(std::max(active_, 1)));
         if (group->members.size() >= target) {
             open_ = nullptr;
@@ -116,10 +117,13 @@ public:
         } else if (opener) {
             const auto deadline = arrived + wait_;
             while (!group->closed && changed_.wait_until(lock, deadline) != std::cv_status::timeout) {
-                // Fewer active lanes now: close once everyone left has arrived.
+                // Fewer active lanes now: close once everyone left has arrived,
+                // or once the lanes still missing all wait at the draft gate
+                // (they cannot reach this one before its deadline).
                 const auto now_target = std::min<std::size_t>(max_group(),
                     static_cast<std::size_t>(std::max(active_, 1)));
-                if (!group->closed && group->members.size() >= now_target) break;
+                if (!group->closed && (group->members.size() >= now_target ||
+                    group->members.size() + waiting_draft() >= static_cast<std::size_t>(active_))) break;
             }
             if (!group->closed) {
                 if (open_ == group) open_ = nullptr;
@@ -171,6 +175,7 @@ public:
             opener = true;
         }
         group->members.push_back(&mine);
+        changed_.notify_all();
         const auto target = std::min<std::size_t>(max_group(), static_cast<std::size_t>(std::max(active_, 1)));
         if (group->members.size() >= target) {
             open_draft_ = nullptr;
@@ -178,9 +183,11 @@ public:
         } else if (opener) {
             const auto deadline = arrived + wait_;
             while (!group->closed && changed_.wait_until(lock, deadline) != std::cv_status::timeout) {
+                // As the verify gate: the missing lanes may all wait there.
                 const auto now_target = std::min<std::size_t>(max_group(),
                     static_cast<std::size_t>(std::max(active_, 1)));
-                if (!group->closed && group->members.size() >= now_target) break;
+                if (!group->closed && (group->members.size() >= now_target ||
+                    group->members.size() + waiting_verify() >= static_cast<std::size_t>(active_))) break;
             }
             if (!group->closed) {
                 if (open_draft_ == group) open_draft_ = nullptr;
@@ -193,6 +200,9 @@ public:
         if (error) std::rethrow_exception(error);
         return std::move(mine.request.proposals);
     }
+    // Lanes waiting in the other gate's open group (mutex held).
+    std::size_t waiting_verify() const { return open_ ? open_->members.size() : 0; }
+    std::size_t waiting_draft() const { return open_draft_ ? open_draft_->members.size() : 0; }
     std::uint64_t batched_drafts() const {
         std::lock_guard lock(mutex_);
         return draft_batched_;
