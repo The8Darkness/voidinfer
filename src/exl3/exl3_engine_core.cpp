@@ -2566,9 +2566,18 @@ struct Exl3EngineCore::Impl {
                         // Verify passes of 9..32 rows take the coherent M32 projections,
                         // 256+ the reconstruct+GEMM route; 33..255 rows have neither.
                         static constexpr int kCandidates[]={16,24,32,256,384,512,768,1024};
-                        int best=std::min(limit,kCandidates[0]);
+                        // Several lanes: every pass is exclusive and its fixed cost
+                        // (restore, ~2,250 eager launches, exact history) is far above
+                        // the one linear fit across both routes (HTTP C4 4K: ~27-row
+                        // passes ~72 ms vs ~512-row ~215 ms), so after an early
+                        // correction the fit drove whole runs onto 16..32-row blocks
+                        // (19-45 passes per request, 27-37 vs 53 ms/round). Only the
+                        // reconstruct route's blocks then.
+                        const int smallest=pass_weight>1.0 && limit>=256?256:0;
+                        int best=std::min(limit,std::max(smallest,kCandidates[0]));
                         double best_rate=-1;
                         for(const int x:kCandidates) {
+                            if(x<smallest) continue;
                             if(x>limit) break;
                             const double miss=1.0-std::pow(1.0-mismatch,x);
                             const double kept=miss>1e-12?miss/mismatch:x;   // tokens up to and incl. the correction
