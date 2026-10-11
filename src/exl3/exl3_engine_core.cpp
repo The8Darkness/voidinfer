@@ -2602,8 +2602,11 @@ struct Exl3EngineCore::Impl {
                     std::optional<Exl3FastDeviceRound::VerifiedBlock> async_block;
                     std::vector<std::int64_t> async_tail;
                     bool async_tail_terminal=false;
+                    // Repeated corrections can fill the lead with the line head
+                    // alone: one more round then drafts a block to launch
+                    // (head + one round stays inside the kAsyncRingRows checkpoint).
                     const bool async_can_draft=!terminal_seen && room &&
-                        (!async_verify || round->async_lead()<kAsyncLead);
+                        (!async_verify || round->async_lead()<kAsyncLead || unverified.empty());
                     if(async_verify) {
                         const auto rows=round->async_rows();
                         if(round->async_pending() &&
@@ -2631,7 +2634,8 @@ struct Exl3EngineCore::Impl {
                         const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:vericache.block);
                         const auto width=static_cast<int>(std::min<std::size_t>(
                             {round_width_limit(),room,async_verify?
-                                static_cast<std::size_t>(kAsyncLead-round->async_lead()):
+                                static_cast<std::size_t>(std::max(kAsyncLead-round->async_lead(),
+                                    unverified.empty()?static_cast<int>(round_width_limit()):0)):
                                 pass_limit-unverified.size()}));
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
                         lt_prepare+=lt_ms(lt_mark);lt_mark=Clock::now();++lt_rounds;
