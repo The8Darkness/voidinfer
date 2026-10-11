@@ -53,6 +53,32 @@ int main() {
             }
         }
         cudaDeviceSynchronize();
+        // LONG_NLL_ROW_SCORES_OUT: feed the continuation in LONG_NLL_ROWS-row
+        // steps through the verifier route and write, per row, the argmax and
+        // the logit gap of the scored token (the next teacher token, or the
+        // matching entry of LONG_NLL_NEXT_IDS, e.g. another tier's argmaxes),
+        // as VeriCache checks drafted rows (exact_row_scores).
+        if (const char* rows_path = std::getenv("LONG_NLL_ROW_SCORES_OUT")) {
+            const int step = std::getenv("LONG_NLL_ROWS") ? std::atoi(std::getenv("LONG_NLL_ROWS")) : 8;
+            std::vector<std::int64_t> scored_ids(ids.begin() + context + 1, ids.begin() + context + continuation + 1);
+            if (const char* next_path = std::getenv("LONG_NLL_NEXT_IDS")) {
+                std::ifstream nf(next_path);
+                scored_ids.clear();
+                for (std::int64_t t; nf >> t;) scored_ids.push_back(t);
+                if (static_cast<int>(scored_ids.size()) < continuation) throw std::runtime_error("LONG_NLL_NEXT_IDS too short");
+            }
+            ctx->prepare_continuation(step);
+            std::ofstream rows_out(rows_path);
+            for (int i = 0; i + step <= continuation; i += step) {
+                ctx->append_prefill(all.subspan(static_cast<std::size_t>(context + i), static_cast<std::size_t>(step)));
+                const auto scores = ctx->exact_row_scores(
+                    std::span<const std::int64_t>(scored_ids.data() + i, static_cast<std::size_t>(step)), nullptr, 1.0f);
+                for (int r = 0; r < step; ++r)
+                    rows_out << scores[r].greedy << ' ' << scores[r].gap << ' ' << scored_ids[i + r] << '\n';
+            }
+            std::cout << "LONG_NLL_ROWS_DONE context=" << context << " rows=" << continuation << '\n';
+            return 0;
+        }
         std::ofstream out(out_path);
         // LONG_NLL_TOPK_OUT: per scored position the top-LONG_NLL_TOPK (default
         // 60) token ids (int32) then their log-probabilities (float32), for KL
