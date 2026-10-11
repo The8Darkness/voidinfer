@@ -2507,6 +2507,9 @@ struct Exl3EngineCore::Impl {
                 // block and costs a fix pass over j + 1 rows.
                 struct DraftHorizon {
                     double tok_ms=5.0,pass_a=25.0,pass_b=0.3,mismatch=0.004;
+                    // Verify and fix passes are exclusive across lanes: each one
+                    // also stalls the other lanes' drafting.
+                    double pass_weight=1.0;
                     // Recursive least squares (forgetting 0.9) of pass ms on [1, rows].
                     double p00=100.0,p01=0.0,p11=1.0;
                     void observe_draft(double ms,int tokens) {
@@ -2540,7 +2543,8 @@ struct Exl3EngineCore::Impl {
                             if(x>limit) break;
                             const double miss=1.0-std::pow(1.0-mismatch,x);
                             const double kept=miss>1e-12?miss/mismatch:x;   // tokens up to and incl. the correction
-                            const double time=x*tok_ms+pass_a+pass_b*x+miss*(pass_a+pass_b*std::min<double>(x,kept));
+                            const double time=x*tok_ms+pass_weight*(pass_a+pass_b*x+
+                                miss*(pass_a+pass_b*std::min<double>(x,kept)));
                             const double rate=std::min<double>(kept,x)/time;
                             if(rate>best_rate) {best_rate=rate;best=x;}
                         }
@@ -2553,6 +2557,7 @@ struct Exl3EngineCore::Impl {
                 // per-request prior kept 1,024-token requests on 32-row blocks).
                 static std::atomic<double> exact_mismatch{0.002};
                 horizon.mismatch=vericache.delta>=0.5f?0.0005:exact_mismatch.load(std::memory_order_relaxed);
+                horizon.pass_weight=static_cast<double>(std::max<std::uint32_t>(1,options.max_concurrency));
                 // Tolerance mode keeps the longest block: its corrections are rare
                 // and a verify pass is exclusive across lanes (at C>=2 it stalls
                 // every other lane, which the per-request model does not price).
