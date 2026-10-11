@@ -78,6 +78,35 @@ void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept {
 static bool exl3_exact_line_shares_prompt_workspace() {
     return exact_line_workspace_sharing.load();
 }
+cudaError_t exl3_d2h_async(void* host,const void* device,std::size_t bytes,cudaStream_t stream) {
+    constexpr std::size_t kKernelReadbackMax=std::size_t{1}<<20;
+    if(!bytes)return cudaSuccess;
+    if(!exl3_kernel_copies_enabled() || bytes>kKernelReadbackMax)
+        return cudaMemcpyAsync(host,device,bytes,cudaMemcpyDefault,stream);
+    cudaPointerAttributes attributes{};
+    if(cudaPointerGetAttributes(&attributes,host)==cudaSuccess && attributes.type==cudaMemoryTypeHost &&
+       attributes.devicePointer)
+        return exl3_copy_async(attributes.devicePointer,device,bytes,stream);
+    (void)cudaGetLastError();
+    struct Bounce {
+        void* host=nullptr; void* device=nullptr; std::size_t bytes=0;
+        ~Bounce() {if(host)cudaFreeHost(host);}
+    };
+    thread_local Bounce bounce;
+    if(bounce.bytes<bytes) {
+        if(bounce.host){cudaFreeHost(bounce.host);bounce.host=nullptr;bounce.bytes=0;}
+        if(const auto error=cudaHostAlloc(&bounce.host,kKernelReadbackMax,cudaHostAllocMapped);error!=cudaSuccess)
+            return error;
+        if(const auto error=cudaHostGetDevicePointer(&bounce.device,bounce.host,0);error!=cudaSuccess)
+            return error;
+        bounce.bytes=kKernelReadbackMax;
+    }
+    if(const auto error=exl3_copy_async(bounce.device,device,bytes,stream);error!=cudaSuccess)return error;
+    if(const auto error=ninfer::cuda_poll_stream(stream);error!=cudaSuccess)return error;
+    if(const auto error=cudaStreamSynchronize(stream);error!=cudaSuccess)return error;
+    std::memcpy(host,bounce.host,bytes);
+    return cudaSuccess;
+}
 
 namespace {
 
@@ -2831,11 +2860,11 @@ struct Exl3TextContext::Impl {
                 bytes,bank,key_plane});
             host_kv.d2h_bytes+=bytes;++host_kv.transfer_calls;
         }
-        const auto copy=cudaMemcpyAsync(
+        const auto copy=exl3_d2h_async(
             static_cast<std::byte*>(host_kv_banked_d2h_staging->data())+staging_base,
             static_cast<const std::byte*>(source)+
                 static_cast<std::size_t>(position)*host_kv_row_bytes,
-            copy_bytes,cudaMemcpyDeviceToHost,host_kv_copy_stream);
+            copy_bytes,host_kv_copy_stream);
         cuda_check(copy,label);
         ++host_kv.copy_submissions;++host_kv.banked_d2h_planes;
         host_kv.banked_d2h_bytes+=copy_bytes;
@@ -4273,9 +4302,9 @@ struct Exl3TextContext::Impl {
                             const std::size_t bytes=static_cast<std::size_t>(page->rows-skip)*1024*2;
                             if(!bytes)continue;
                             const auto download=[&](auto& plane,const void* source) {
-                                cuda_check(cudaMemcpyAsync(plane.data()+skip*1024,
+                                cuda_check(exl3_d2h_async(plane.data()+skip*1024,
                                     static_cast<const std::uint16_t*>(source)+static_cast<std::size_t>(page->first+skip)*1024,
-                                    bytes,cudaMemcpyDeviceToHost,stream),"stream authoritative new KV");
+                                    bytes,stream),"stream authoritative new KV");
                                 ++host_kv.copy_submissions;
                                 if(!host_kv_batch_sync)
                                     cuda_check(cudaStreamSynchronize(stream),"complete new authoritative KV transfer");
@@ -10924,8 +10953,8 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
     std::vector<std::int64_t> greedy(rows);
     std::vector<float> gap(rows);
     cuda_check(ninfer::cuda_poll_stream(stream),"row scores poll");
-    cuda_check(cudaMemcpyAsync(greedy.data(),buffers.greedy,rows*sizeof(std::int64_t),cudaMemcpyDeviceToHost,stream),"row score greedy");
-    cuda_check(cudaMemcpyAsync(gap.data(),buffers.gap,rows*sizeof(float),cudaMemcpyDeviceToHost,stream),"row score gaps");
+    cuda_check(exl3_d2h_async(greedy.data(),buffers.greedy,rows*sizeof(std::int64_t),stream),"row score greedy");
+    cuda_check(exl3_d2h_async(gap.data(),buffers.gap,rows*sizeof(float),stream),"row score gaps");
     cuda_check(cudaStreamSynchronize(stream),"row scores");
     std::vector<RowScore> result(rows);
     for(int i=0;i<rows;++i) result[i]={greedy[i],gap[i]};
@@ -11239,8 +11268,8 @@ std::vector<std::uint16_t> Exl3TextContext::continuation_logits_bits_host(
             "P2 target continuation logits are invalid");
     const std::size_t count = static_cast<std::size_t>(impl_->continuation->rows) * kVocab;
     std::vector<std::uint16_t> raw(count);
-    cuda_check(cudaMemcpyAsync(raw.data(), impl_->continuation->logits->ptr,
-                               count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(raw.data(), impl_->continuation->logits->ptr,
+                               count * sizeof(std::uint16_t), stream),
                "download P2 target continuation logits");
     cuda_check(cudaStreamSynchronize(stream), "synchronize P2 target continuation logits");
     const auto rows=impl_->continuation->rows;
@@ -11338,8 +11367,7 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
         // Context-owned destination survives exceptions/partial transfers. No
         // stack packet escapes or is reused after a failed completion fence.
         cuda_check(ninfer::cuda_poll_stream(stream),"greedy packet poll");
-        cuda_check(cudaMemcpyAsync(impl_->greedy_host_rows.data(),output,rows*sizeof(Exl3GreedyRow),
-            cudaMemcpyDeviceToHost,stream),"greedy packet download");
+        cuda_check(exl3_d2h_async(impl_->greedy_host_rows.data(),output,rows*sizeof(Exl3GreedyRow),stream),"greedy packet download");
         cuda_check(cudaStreamSynchronize(stream),"greedy packet readiness");
         if(continuation)
             require(impl_->complete_continuation_graph_use(rows,stream),
@@ -11405,8 +11433,8 @@ Exl3PendingGreedyPacket Exl3TextContext::submit_greedy_packet(
             "pending greedy packet device readiness event");
         if(!defer_host_readback) {
             transfer->host_readback_submitted=true;
-            cuda_check(cudaMemcpyAsync(transfer->host,transfer->device->ptr,
-                rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost,stream),
+            cuda_check(exl3_d2h_async(transfer->host,transfer->device->ptr,
+                rows*sizeof(Exl3GreedyRow),stream),
                 "pending greedy packet download");
             cuda_check(cudaEventRecord(transfer->event,stream),
                 "pending greedy packet readiness event");
@@ -11602,8 +11630,8 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet_from_scores_for_test(
             result.serial,output,impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"greedy packet fixture reduction");
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
-        cuda_check(cudaMemcpyAsync(impl_->greedy_host_rows.data(),output,
-            rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost,stream),
+        cuda_check(exl3_d2h_async(impl_->greedy_host_rows.data(),output,
+            rows*sizeof(Exl3GreedyRow),stream),
             "greedy packet fixture download");
         cuda_check(cudaStreamSynchronize(stream),"greedy packet fixture readiness");
     } catch(...) {impl_->greedy_readback_failed=true;throw;}
@@ -12475,8 +12503,7 @@ std::vector<float> Exl3TextContext::logits_host(cudaStream_t stream) const {
     require(!impl_->transaction || !impl_->transaction->rollback_required,
             "P2 target logits are invalid until transaction rollback");
     std::vector<std::uint16_t> raw(kVocab);
-    cuda_check(cudaMemcpyAsync(raw.data(), logits_, raw.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream), "download E4A logits");
+    cuda_check(exl3_d2h_async(raw.data(), logits_, raw.size() * sizeof(std::uint16_t), stream), "download E4A logits");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4A logits");
     impl_->greedy_readback.full_score_bytes+=raw.size()*sizeof(std::uint16_t);
     std::vector<float> result;
@@ -12490,8 +12517,7 @@ std::vector<float> Exl3TextContext::hidden_host(int layer, cudaStream_t stream) 
     require(tap >= 0, "E4A hidden layer is not one of the retained tap locations");
     require(impl_->capture_taps && impl_->tap_rows > 0, "E4A hidden taps were not captured");
     std::vector<std::uint16_t> raw(static_cast<std::size_t>(impl_->tap_rows) * kHidden);
-    cuda_check(cudaMemcpyAsync(raw.data(), impl_->taps[tap]->ptr, raw.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream), "download E4A hidden tap");
+    cuda_check(exl3_d2h_async(raw.data(), impl_->taps[tap]->ptr, raw.size() * sizeof(std::uint16_t), stream), "download E4A hidden tap");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4A hidden tap");
     std::vector<float> result;
     result.reserve(raw.size());
@@ -13079,8 +13105,7 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
             batched_kv_capacity/(2*full_layer_count);
     const auto download = [&](auto& out, const void* src, std::size_t elements) {
         out.resize(elements);
-        cuda_check(cudaMemcpyAsync(out.data(), src, elements * sizeof(out[0]),
-                                  cudaMemcpyDeviceToHost, stream), "export exact host plane");
+        cuda_check(exl3_d2h_async(out.data(), src, elements * sizeof(out[0]), stream), "export exact host plane");
         // Pageable vector lifetime is bounded by this blocking API, including failure.
         cuda_check(cudaStreamSynchronize(stream), "complete exact host plane");
     };
@@ -13121,8 +13146,8 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         const auto submitted=plan.submit([&](const auto& segment) noexcept {
             if(++export_copy_submission==export_copy_fault)
                 return static_cast<int>(cudaErrorUnknown);
-            return static_cast<int>(cudaMemcpyAsync(segment.destination,
-                segment.source,segment.bytes,cudaMemcpyDeviceToHost,stream));
+            return static_cast<int>(exl3_d2h_async(segment.destination,
+                segment.source,segment.bytes,stream));
         });
         add_counter(export_stats.planned_copy_ranges,plan.logical_ranges());
         add_counter(export_stats.coalesced_copy_ranges,plan.coalesced_ranges());
@@ -13179,9 +13204,8 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                         l0_l2_fp8::pack_kernel<<<(count*4*32+255)/256,256,0,stream>>>(
                             source,staging.device,count);
                         cuda_check(cudaGetLastError(),"L0 L2 FP8 pack");
-                        cuda_check(cudaMemcpyAsync(staging.host,staging.device,
-                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,
-                            cudaMemcpyDeviceToHost,stream),"L0 L2 FP8 export");
+                        cuda_check(exl3_d2h_async(staging.host,staging.device,
+                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,stream),"L0 L2 FP8 export");
                         cuda_check(cudaStreamSynchronize(stream),"L0 L2 FP8 export");
                         // Page scatter is host memcpy bound: run the pages in parallel.
                         std::for_each(std::execution::par,fresh_pages.begin(),fresh_pages.end(),[&](const auto& page) {
@@ -13253,8 +13277,7 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                             Exl3ExportPrecision::fp16),
                             "exact KV export batched plan capacity");
                     } else {
-                        cuda_check(cudaMemcpyAsync(destination,source_first,elements*2,
-                            cudaMemcpyDeviceToHost,stream),"export exact KV page suffix");
+                        cuda_check(exl3_d2h_async(destination,source_first,elements*2,stream),"export exact KV page suffix");
                         cuda_check(cudaStreamSynchronize(stream),"complete exact KV page suffix");
                     }
                     state->kv_export_bytes_+=elements*2;
@@ -13296,8 +13319,8 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     }
     if(batched_kv_plan.size()) {
         const auto submitted=batched_kv_plan.submit([&](const auto& segment) noexcept {
-            return static_cast<int>(cudaMemcpyAsync(segment.destination,segment.source,
-                segment.bytes,cudaMemcpyDeviceToHost,stream));
+            return static_cast<int>(exl3_d2h_async(segment.destination,segment.source,
+                segment.bytes,stream));
         });
         if(!submitted)cuda_check(static_cast<cudaError_t>(submitted.status),
             "submit exact KV export batched plan");
@@ -13880,8 +13903,8 @@ std::vector<float> Exl3TextContext::gdn_state_host(int layer, cudaStream_t strea
             "E4B2 requested state from a non-GDN layer");
     const auto* gdn = impl_->gdn_layers[layer].get();
     std::vector<float> result(gdn->recurrent_state_bytes() / sizeof(float));
-    cuda_check(cudaMemcpyAsync(result.data(), gdn->recurrent_state_device(),
-                               gdn->recurrent_state_bytes(), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.data(), gdn->recurrent_state_device(),
+                               gdn->recurrent_state_bytes(), stream),
                "download E4B2 GDN state");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4B2 GDN state");
     return result;
@@ -13936,9 +13959,8 @@ std::vector<std::uint16_t> Exl3TextContext::gdn_layer0_serial_for_test(
     impl_->gdn_layers[0]->forward(impl_->hidden_a, impl_->hidden_b, 8, stream,
                                   false, true, false);
     std::vector<std::uint16_t> output(8ULL * kHidden);
-    cuda_check(cudaMemcpyAsync(output.data(), impl_->hidden_b,
-                               output.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(output.data(), impl_->hidden_b,
+                               output.size() * sizeof(std::uint16_t), stream),
                "download serial GDN T0a output");
     cuda_check(cudaStreamSynchronize(stream), "synchronize serial GDN T0a output");
     return output;
@@ -14012,13 +14034,11 @@ Exl3TextContext::gdn_layer0_pair_staged_serial_for_test(
     std::array<std::vector<std::uint16_t>, 2> outputs;
     outputs[0].resize(8ULL * kHidden);
     outputs[1].resize(8ULL * kHidden);
-    cuda_check(cudaMemcpyAsync(outputs[0].data(), impl_->hidden_b,
-                               outputs[0].size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(outputs[0].data(), impl_->hidden_b,
+                               outputs[0].size() * sizeof(std::uint16_t), stream),
                "download staged GDN T0a first output");
-    cuda_check(cudaMemcpyAsync(outputs[1].data(), peer.impl_->hidden_b,
-                               outputs[1].size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(outputs[1].data(), peer.impl_->hidden_b,
+                               outputs[1].size() * sizeof(std::uint16_t), stream),
                "download staged GDN T0a peer output");
     cuda_check(cudaStreamSynchronize(stream), "synchronize staged GDN T0a outputs");
     return outputs;
@@ -14033,8 +14053,7 @@ std::vector<std::uint16_t> Exl3TextContext::full_attention_k_host(
     std::vector<std::uint16_t> result(kKvValues);
     const auto* source = static_cast<const std::uint16_t*>(impl_->cache_k[layer]->ptr) +
         static_cast<std::size_t>(position) * kKvValues;
-    cuda_check(cudaMemcpyAsync(result.data(), source, result.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream), "download E4B2 KV entry");
+    cuda_check(exl3_d2h_async(result.data(), source, result.size() * sizeof(std::uint16_t), stream), "download E4B2 KV entry");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4B2 KV entry");
     return result;
 }
@@ -14131,14 +14150,14 @@ Exl3FullAttentionQKVHost Exl3TextContext::full_attention_qkv_host(
     result.q_rope.resize(q_values);
     result.k_rope.resize(kv_values);
     result.v_projection.resize(kv_values);
-    cuda_check(cudaMemcpyAsync(result.q_rope.data(), trace.q_rope,
-                               q_values * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.q_rope.data(), trace.q_rope,
+                               q_values * sizeof(std::uint16_t), stream),
                "download E4C1 EXL3 Q trace");
-    cuda_check(cudaMemcpyAsync(result.k_rope.data(), trace.k_rope,
-                               kv_values * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.k_rope.data(), trace.k_rope,
+                               kv_values * sizeof(std::uint16_t), stream),
                "download E4C1 EXL3 K trace");
-    cuda_check(cudaMemcpyAsync(result.v_projection.data(), trace.v_projection,
-                               kv_values * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.v_projection.data(), trace.v_projection,
+                               kv_values * sizeof(std::uint16_t), stream),
                "download E4C1 EXL3 V trace");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4C1 EXL3 QKV capture");
     return result;
@@ -14172,8 +14191,7 @@ int Exl3TextContext::last_forward_rows() const noexcept {
 
 int Exl3TextContext::device_position_host(cudaStream_t stream) const {
     int result = -1;
-    cuda_check(cudaMemcpyAsync(&result, impl_->position_device, sizeof(result),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(&result, impl_->position_device, sizeof(result), stream),
                "download P2 target device position");
     cuda_check(cudaStreamSynchronize(stream), "synchronize P2 target device position");
     return result;
@@ -14186,9 +14204,8 @@ std::vector<std::uint16_t> Exl3TextContext::gdn_physical_conv_host(
     const auto* gdn = impl_->gdn_layers[layer].get();
     std::vector<std::uint16_t> result(
         gdn->physical_conv_state_bytes() / sizeof(std::uint16_t));
-    cuda_check(cudaMemcpyAsync(result.data(), gdn->physical_conv_state_device(),
-                               gdn->physical_conv_state_bytes(),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.data(), gdn->physical_conv_state_device(),
+                               gdn->physical_conv_state_bytes(), stream),
                "download P2 GDN physical convolution state");
     cuda_check(cudaStreamSynchronize(stream),
                "synchronize P2 GDN physical convolution state");
@@ -14239,8 +14256,8 @@ std::array<std::vector<std::uint16_t>,5> Exl3TextContext::exact_tap_rows_host(cu
     std::array<std::vector<std::uint16_t>,5> result;
     for(int tap=0;tap<5;++tap) {
         result[tap].resize(static_cast<std::size_t>(impl_->tap_rows)*kHidden);
-        cuda_check(cudaMemcpyAsync(result[tap].data(),impl_->taps[tap]->ptr,
-            result[tap].size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost,stream),
+        cuda_check(exl3_d2h_async(result[tap].data(),impl_->taps[tap]->ptr,
+            result[tap].size()*sizeof(std::uint16_t),stream),
             "export authoritative tap rows");
     }
     cuda_check(cudaStreamSynchronize(stream),"complete authoritative tap rows");
@@ -14581,9 +14598,8 @@ std::shared_ptr<Exl3MtpPrefixState> Exl3TextContext::create_native_mtp_prefix_st
 std::vector<float> Exl3TextContext::embedding_host(cudaStream_t stream) const {
     require(impl_->capture_taps && impl_->embedding_rows > 0, "E4A embedding trace was not captured");
     std::vector<std::uint16_t> raw(static_cast<std::size_t>(impl_->embedding_rows) * kHidden);
-    cuda_check(cudaMemcpyAsync(raw.data(), impl_->embedding_trace->ptr,
-                               raw.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream), "download E4A embedding output");
+    cuda_check(exl3_d2h_async(raw.data(), impl_->embedding_trace->ptr,
+                               raw.size() * sizeof(std::uint16_t), stream), "download E4A embedding output");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4A embedding output");
     std::vector<float> result;
     result.reserve(raw.size());
@@ -14597,9 +14613,8 @@ std::vector<std::uint16_t> Exl3TextContext::embedding_bits_host_for_test(
             "P2 embedding bits were not captured");
     std::vector<std::uint16_t> result(
         static_cast<std::size_t>(impl_->embedding_rows) * kHidden);
-    cuda_check(cudaMemcpyAsync(result.data(), impl_->embedding_trace->ptr,
-                               result.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.data(), impl_->embedding_trace->ptr,
+                               result.size() * sizeof(std::uint16_t), stream),
                "download P2 embedding bits");
     cuda_check(cudaStreamSynchronize(stream),
                "synchronize P2 embedding bits");

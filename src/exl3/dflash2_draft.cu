@@ -3874,9 +3874,8 @@ std::shared_ptr<const Exl3DraftHostRing> Exl3Dflash2DraftModel::export_host_ring
                         if(allocation->ptr==source)allocation->uncertain_transfer_use=true;
                     m.host_ring_failed=true;Exl3DraftHostRing::retain_uncertain_transfer(result);
                 };
-                const auto submitted=cudaMemcpyAsync(plane.data()+static_cast<std::size_t>(planned.previous)*1024,
-                    source+static_cast<std::size_t>(planned.cursor&kRingMask)*1024,static_cast<std::size_t>(planned.rows)*2048,
-                    cudaMemcpyDeviceToHost,stream);
+                const auto submitted=exl3_d2h_async(plane.data()+static_cast<std::size_t>(planned.previous)*1024,
+                    source+static_cast<std::size_t>(planned.cursor&kRingMask)*1024,static_cast<std::size_t>(planned.rows)*2048,stream);
                 if(submitted!=cudaSuccess) {
                     retain_uncertain();
                     cuda_check(submitted,"draft host page suffix download");
@@ -4004,9 +4003,8 @@ std::array<std::uint64_t, 5> Exl3Dflash2DraftModel::ring_digest(cudaStream_t str
             m.ring_digest_partial);
         cuda_check(cudaGetLastError(), "E5A3 ring digest launch");
         std::vector<std::uint64_t> partial(static_cast<std::size_t>(m.ring_count));
-        cuda_check(cudaMemcpyAsync(partial.data(), m.ring_digest_partial,
-                                   partial.size() * sizeof(std::uint64_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(partial.data(), m.ring_digest_partial,
+                                   partial.size() * sizeof(std::uint64_t), stream),
                    "E5A3 ring digest download");
         cuda_check(cudaStreamSynchronize(stream), "E5A3 ring digest sync");
         std::uint64_t h = 1469598103934665603ULL;
@@ -4029,9 +4027,8 @@ std::array<std::uint64_t, 5> Exl3Dflash2DraftModel::physical_ring_digest_for_tes
             m.ring_digest_partial);
         cuda_check(cudaGetLastError(), "physical ring digest launch");
         std::vector<std::uint64_t> partial(kRingCap);
-        cuda_check(cudaMemcpyAsync(partial.data(), m.ring_digest_partial,
-                                   partial.size() * sizeof(std::uint64_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(partial.data(), m.ring_digest_partial,
+                                   partial.size() * sizeof(std::uint64_t), stream),
                    "physical ring digest download");
         cuda_check(cudaStreamSynchronize(stream), "physical ring digest sync");
         std::uint64_t h = 1469598103934665603ULL;
@@ -5295,23 +5292,20 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         Impl& m=*members[i]->draft->impl_;
         if(head_columns<kVocab)++m.head_prefix_calls;
         members[i]->proposals.resize(P);
-        cuda_check(cudaMemcpyAsync(members[i]->proposals.data(),m.s.proposal_out,P*sizeof(std::int64_t),
-            cudaMemcpyDeviceToHost,stream),"read batched draft proposals");
+        cuda_check(exl3_d2h_async(members[i]->proposals.data(),m.s.proposal_out,P*sizeof(std::int64_t),stream),"read batched draft proposals");
         const std::size_t candidates=m.proposal_candidates?static_cast<std::size_t>(P)*kTopK:0;
         m.last_candidate_ids.resize(candidates);
         m.last_candidate_unary.resize(candidates);
         if(candidates) {
-            cuda_check(cudaMemcpyAsync(m.last_candidate_ids.data(),m.s.cand_ids,candidates*sizeof(std::int64_t),
-                cudaMemcpyDeviceToHost,stream),"read batched draft candidate IDs");
-            cuda_check(cudaMemcpyAsync(m.last_candidate_unary.data(),m.s.cand_unary,candidates*sizeof(float),
-                cudaMemcpyDeviceToHost,stream),"read batched draft candidate scores");
+            cuda_check(exl3_d2h_async(m.last_candidate_ids.data(),m.s.cand_ids,candidates*sizeof(std::int64_t),stream),"read batched draft candidate IDs");
+            cuda_check(exl3_d2h_async(m.last_candidate_unary.data(),m.s.cand_unary,candidates*sizeof(float),stream),"read batched draft candidate scores");
         }
         m.last_position_confidence.clear();
         ++m.fused_selector_calls;
         ++m.local_merge_topk_calls;
     }
     unsigned int bad=0;
-    cuda_check(cudaMemcpyAsync(&bad,b.liveness,sizeof(bad),cudaMemcpyDeviceToHost,stream),
+    cuda_check(exl3_d2h_async(&bad,b.liveness,sizeof(bad),stream),
         "read batched draft liveness");
     cuda_check(cudaStreamSynchronize(stream),"synchronize batched draft");
     require(bad==0,"batched draft head logits non-finite; proposals would be degenerate");
@@ -5860,8 +5854,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     auto stage_maxabs = [&](const std::string& label, const std::uint16_t* buf, int count, bool is_bf16 = false) {
         if (!stage_trace) return;
         std::vector<std::uint16_t> host(static_cast<std::size_t>(count));
-        cuda_check(cudaMemcpyAsync(host.data(), buf, host.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream), "E5A2 maxabs download");
+        cuda_check(exl3_d2h_async(host.data(), buf, host.size() * sizeof(std::uint16_t), stream), "E5A2 maxabs download");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 maxabs sync");
         float maxabs = 0.0f;
         std::size_t over30k = 0, over60k = 0;
@@ -5883,8 +5876,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
             buf, count, nan_count, is_bf16 ? 1 : 0);
         cuda_check(cudaGetLastError(), "E5A2 nan count launch");
         unsigned long long value = 0;
-        cuda_check(cudaMemcpyAsync(&value, nan_count, sizeof(value),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(&value, nan_count, sizeof(value), stream),
                    "E5A2 nan read");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 nan sync");
         if (value > 0) {
@@ -5928,8 +5920,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         g_ref32_done = true;
         auto ref32_grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
-            cuda_check(cudaMemcpyAsync(h.data(), d, n * sizeof(std::uint16_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(h.data(), d, n * sizeof(std::uint16_t), stream),
                        "E5A2 ref32 download");
             cuda_check(cudaStreamSynchronize(stream), "E5A2 ref32 sync");
             return h;
@@ -5960,13 +5951,11 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         const auto& md = m.layers[0].om;
         std::vector<std::uint16_t> attn_h((size_t)m_rows * in);
         std::vector<std::uint16_t> oproj_dev((size_t)m_rows * out);
-        cuda_check(cudaMemcpyAsync(attn_h.data(), m.s.attn,
-                                   attn_h.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(attn_h.data(), m.s.attn,
+                                   attn_h.size() * sizeof(std::uint16_t), stream),
                    "E5A2 diff attn download");
-        cuda_check(cudaMemcpyAsync(oproj_dev.data(), m.s.oproj,
-                                   oproj_dev.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(oproj_dev.data(), m.s.oproj,
+                                   oproj_dev.size() * sizeof(std::uint16_t), stream),
                    "E5A2 diff oproj download");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 diff sync");
         const auto host_mod = read_host_linear(m.directory, m.header,
@@ -6033,9 +6022,8 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
             if (mm >= m_rows) continue;
             m.ws_o->forward(w, md, m.s.attn, m.s.oproj, mm, stream);
             std::vector<std::uint16_t> dev_mm((size_t)mm * out);
-            cuda_check(cudaMemcpyAsync(dev_mm.data(), m.s.oproj,
-                                       dev_mm.size() * sizeof(std::uint16_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(dev_mm.data(), m.s.oproj,
+                                       dev_mm.size() * sizeof(std::uint16_t), stream),
                        "E5A2 diff M download");
             cuda_check(cudaStreamSynchronize(stream), "E5A2 diff M sync");
             report(("device_M" + std::to_string(mm)).c_str(), mm, dev_mm);
@@ -6054,8 +6042,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         g_l0_attn_done = true;
         auto grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
-            cuda_check(cudaMemcpyAsync(h.data(), d, n * sizeof(std::uint16_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(h.data(), d, n * sizeof(std::uint16_t), stream),
                        "E5A2 attn diff download");
             cuda_check(cudaStreamSynchronize(stream), "E5A2 attn diff sync");
             return h;
@@ -6139,8 +6126,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         ++g_l0_conv_count;
         auto grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
-            cuda_check(cudaMemcpyAsync(h.data(), d, n * sizeof(std::uint16_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(h.data(), d, n * sizeof(std::uint16_t), stream),
                        "E5A2 conv diff download");
             cuda_check(cudaStreamSynchronize(stream), "E5A2 conv diff sync");
             return h;
@@ -6454,9 +6440,8 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     if (std::getenv("NINFER_DFLASH2_DEBUG_LOGITS") != nullptr) {
         std::vector<std::uint16_t> raw_logits(
             static_cast<std::size_t>(proposal_rows) * kVocab);
-        cuda_check(cudaMemcpyAsync(raw_logits.data(), m.s.head_out,
-                                   raw_logits.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(raw_logits.data(), m.s.head_out,
+                                   raw_logits.size() * sizeof(std::uint16_t), stream),
                    "E5A2 debug logits download");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 debug logits sync");
         for (int r = 0; r < proposal_rows; ++r) {
@@ -6498,8 +6483,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         }
         if (!fused_liveness)
             cuda_check(ninfer::cuda_poll_stream(stream),"E5A2 fast liveness poll");
-        cuda_check(cudaMemcpyAsync(&fused_bad,m.s.liveness_flag,sizeof(fused_bad),
-                                   cudaMemcpyDeviceToHost,stream),
+        cuda_check(exl3_d2h_async(&fused_bad,m.s.liveness_flag,sizeof(fused_bad),stream),
                    "E5A2 fast liveness read");
         if (!fused_liveness)
             cuda_check(cudaStreamSynchronize(stream),"E5A2 fast liveness sync");
@@ -6510,9 +6494,8 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     } else {
         std::vector<std::uint16_t> logits_h(
             static_cast<std::size_t>(proposal_rows) * kVocab);
-        cuda_check(cudaMemcpyAsync(logits_h.data(), m.s.head_out,
-                                   logits_h.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(logits_h.data(), m.s.head_out,
+                                   logits_h.size() * sizeof(std::uint16_t), stream),
                    "E5A2 draft logits guard download");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 draft logits guard sync");
         std::size_t bad = 0;
@@ -6540,23 +6523,20 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         cuda_check(cudaGetLastError(), "E5A2 launch fused draft selector");
         ++m.fused_selector_calls;
         cuda_check(ninfer::cuda_poll_stream(stream), "E5A2 fused draft proposals poll");
-        cuda_check(cudaMemcpyAsync(result.data(), m.s.proposal_out,
+        cuda_check(exl3_d2h_async(result.data(), m.s.proposal_out,
                                    static_cast<std::size_t>(proposal_rows) *
-                                       sizeof(std::int64_t),
-                                   cudaMemcpyDeviceToHost, stream),
+                                       sizeof(std::int64_t), stream),
                    "E5A2 read fused draft proposals");
         const auto candidates =
             m.proposal_candidates ? static_cast<std::size_t>(proposal_rows) * kTopK : 0;
         m.last_candidate_ids.resize(candidates);
         m.last_candidate_unary.resize(candidates);
         if (candidates) {
-            cuda_check(cudaMemcpyAsync(m.last_candidate_ids.data(), m.s.cand_ids,
-                                       candidates * sizeof(std::int64_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(m.last_candidate_ids.data(), m.s.cand_ids,
+                                       candidates * sizeof(std::int64_t), stream),
                        "E5A2 read fused draft candidate IDs");
-            cuda_check(cudaMemcpyAsync(m.last_candidate_unary.data(), m.s.cand_unary,
-                                       candidates * sizeof(float),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(m.last_candidate_unary.data(), m.s.cand_unary,
+                                       candidates * sizeof(float), stream),
                        "E5A2 read fused draft candidate scores");
         }
         timing_close(Impl::TimingCategory::Selector,
@@ -6581,17 +6561,15 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         cuda_check(cudaGetLastError(),
                    "E5A2 launch batched draft selector anchor chain");
         ++m.selector_batched_anchor_chain_calls;
-        cuda_check(cudaMemcpyAsync(result.data(), m.s.proposal_out,
+        cuda_check(exl3_d2h_async(result.data(), m.s.proposal_out,
                                    static_cast<std::size_t>(proposal_rows) *
-                                       sizeof(std::int64_t),
-                                   cudaMemcpyDeviceToHost, stream),
+                                       sizeof(std::int64_t), stream),
                    "E5A2 read batched draft proposals");
         if (m.position_confidence)
-            cuda_check(cudaMemcpyAsync(m.last_position_confidence.data(),
+            cuda_check(exl3_d2h_async(m.last_position_confidence.data(),
                                        m.s.confidence_out,
                                        static_cast<std::size_t>(proposal_rows) *
-                                           sizeof(DraftPositionConfidence),
-                                       cudaMemcpyDeviceToHost, stream),
+                                           sizeof(DraftPositionConfidence), stream),
                        "E5A2 read batched draft position confidence");
         timing_close(Impl::TimingCategory::Selector,
                      "selector_batched_final_sync");
@@ -6619,14 +6597,12 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             }
             cuda_check(cudaGetLastError(), "E5A2 launch draft selector argmax");
             std::int64_t selected = 0;
-            cuda_check(cudaMemcpyAsync(&selected, m.s.proposal_out + p, sizeof(selected),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(&selected, m.s.proposal_out + p, sizeof(selected), stream),
                        "E5A2 read draft proposal");
             if (m.position_confidence)
-                cuda_check(cudaMemcpyAsync(
+                cuda_check(exl3_d2h_async(
                                &m.last_position_confidence[static_cast<std::size_t>(p)],
-                               m.s.confidence_out + p, sizeof(DraftPositionConfidence),
-                               cudaMemcpyDeviceToHost, stream),
+                               m.s.confidence_out + p, sizeof(DraftPositionConfidence), stream),
                            "E5A2 read draft position confidence");
             if (p + 1 == proposal_rows)
                 timing_close(Impl::TimingCategory::Selector, "selector_serial_final_sync");
@@ -6639,8 +6615,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     }
     if(device_seed) {
         std::int64_t invalid=1;
-        cuda_check(cudaMemcpyAsync(&invalid,m.s.proposal_out+7,sizeof(invalid),
-            cudaMemcpyDeviceToHost,stream),"E5A3 read device seed validity");
+        cuda_check(exl3_d2h_async(&invalid,m.s.proposal_out+7,sizeof(invalid),stream),"E5A3 read device seed validity");
         cuda_check(cudaStreamSynchronize(stream),"E5A3 synchronize device seed validity");
         require(!invalid,"E5A3 authoritative device seed invalid/nonfinite");
         require(m.ring_revision==seed_ring_revision &&

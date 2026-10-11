@@ -106,8 +106,8 @@ class Exl3EngineGreedyPacketBatch {
                 second->source.consumer_recorded->store(true,std::memory_order_release);
             }
             const std::size_t rows=first.source.rows+(second?second->source.rows:0);
-            check(cudaMemcpyAsync(storage_->host,storage_->device,
-                rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost,storage_->stream));
+            check(exl3_d2h_async(storage_->host,storage_->device,
+                rows*sizeof(Exl3GreedyRow),storage_->stream));
             check(cudaEventRecord(storage_->ready,storage_->stream));
             check(cudaEventSynchronize(storage_->ready));
             const auto invalid=std::exchange(invalid_row_for_test_,0u);

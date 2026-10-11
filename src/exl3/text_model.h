@@ -37,6 +37,14 @@ class Exl3TextContext;
 // The Engine's single-lane exact VeriCache line shares the prompt-scale
 // workspaces with its drafting context (set before the contexts are built).
 void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept;
+// Small device->host readback without a copy engine (exl3_copy_async rationale:
+// the asynchronous VeriCache line's history stream occupies the copy engines
+// and a decode readback queued behind one of its pieces waits ~0.5 ms). A
+// pinned destination is written by a kernel, stream-ordered; a pageable one
+// goes through a pinned bounce buffer and returns after the stream drains,
+// like cudaMemcpyAsync to pageable memory. NINFER_EXL3_KERNEL_COPIES=0 keeps
+// cudaMemcpyAsync.
+cudaError_t exl3_d2h_async(void* host, const void* device, std::size_t bytes, cudaStream_t stream);
 class Exl3BatchedVerifyCoordinator;
 class Exl3VeriCacheServingCoordinator;
 struct Exl3GreedyPacketTransfer;

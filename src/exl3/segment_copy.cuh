@@ -6,6 +6,8 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdlib>
+#include <string_view>
 #include <cstdint>
 #include <stdexcept>
 
@@ -46,6 +48,28 @@ static __global__ void __launch_bounds__(256) exl3_segment_copy_kernel(Exl3Segme
 inline cudaError_t exl3_launch_segment_copies(const Exl3SegmentCopies& copies, cudaStream_t stream) {
     if (!copies.count) return cudaSuccess;
     exl3_segment_copy_kernel<<<dim3(32, copies.count), 256, 0, stream>>>(copies);
+    return cudaGetLastError();
+}
+
+// A copy on the SMs instead of a copy engine (exl3_d2h_async: decode
+// readbacks must not queue behind the asynchronous VeriCache line's
+// host->device history stream). Both ends must be device-accessible (device
+// memory or mapped pinned host memory). NINFER_EXL3_KERNEL_COPIES=0 keeps
+// cudaMemcpyAsync.
+inline bool exl3_kernel_copies_enabled() {
+    static const bool value = [] {
+        const char* v = std::getenv("NINFER_EXL3_KERNEL_COPIES");
+        return !v || std::string_view(v) != "0";
+    }();
+    return value;
+}
+inline cudaError_t exl3_copy_async(void* to, const void* from, std::size_t bytes, cudaStream_t stream) {
+    if (!bytes) return cudaSuccess;
+    if (!exl3_kernel_copies_enabled()) return cudaMemcpyAsync(to, from, bytes, cudaMemcpyDefault, stream);
+    Exl3SegmentCopies copy;
+    copy.add(to, from, bytes);
+    const std::size_t blocks = (bytes + 16 * 256 * 4 - 1) / (16 * 256 * 4);
+    exl3_segment_copy_kernel<<<dim3(static_cast<unsigned>(blocks < 128 ? blocks : 128), 1), 256, 0, stream>>>(copy);
     return cudaGetLastError();
 }
 
