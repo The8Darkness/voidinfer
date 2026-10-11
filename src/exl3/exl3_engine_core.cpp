@@ -404,9 +404,17 @@ struct Exl3EngineCore::Impl {
         return block;
     }
     static constexpr int kAsyncLead=200,kAsyncRingRows=256;
+    // One exact line per lane: folded or asynchronous at C1; asynchronous at
+    // C2, whose line passes join the ordered prompt passes, for requests of at
+    // least kLaneLineMinContext tokens (exact code, 1,024 tokens, HTTP C2:
+    // 16K 157 vs 115 tok/s, 31K 131 vs 115; 4K 198 vs 242, where the batched
+    // rounds leave the device no room for a line). C3+ verify in exclusive
+    // passes (C4 4K 261 vs 352, 31K 172 vs 193).
+    static constexpr int kLaneLineMinContext=12288;
     bool exact_line_planned(const EngineOptions& value) const {
-        return coherent_device && value.max_concurrency==1 &&
-            (vericache_fold_enabled() || vericache_async_enabled()) &&
+        return coherent_device &&
+            (value.max_concurrency==1?vericache_fold_enabled() || vericache_async_enabled():
+                value.max_concurrency==2 && vericache_async_enabled() && prompt_pass_overlap) &&
             Exl3NativeContextExtent::l0_oscar_enabled() && Exl3VeriCacheConfig::get().enabled &&
             Exl3VeriCacheConfig::get().delta<0.5f;
     }
@@ -559,6 +567,24 @@ struct Exl3EngineCore::Impl {
         PromptPass(const PromptPass&)=delete;
         PromptPass& operator=(const PromptPass&)=delete;
     };
+    // The asynchronous lines' passes and fixes (several lanes) in the same
+    // order as PromptPass with overlap.
+    struct LinePassOrder final : Exl3FastDeviceRound::PassOrder {
+        Impl& engine;
+        explicit LinePassOrder(Impl& value) : engine(value) {}
+        void enter(cudaStream_t stream) override {
+            engine.prompt_pass_mutex.lock();
+            if(engine.prompt_pass_done)check(cudaStreamWaitEvent(stream,engine.prompt_pass_done,0));
+        }
+        void leave(cudaStream_t stream) override {
+            if(!engine.prompt_pass_done &&
+               cudaEventCreateWithFlags(&engine.prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
+                engine.prompt_pass_done=nullptr;
+            if(engine.prompt_pass_done)(void)cudaEventRecord(engine.prompt_pass_done,stream);
+            engine.prompt_pass_mutex.unlock();
+        }
+    };
+    LinePassOrder line_pass_order{*this};
     // A lane in a prompt pass is not a batched-round candidate.
     struct BatchedInactive {
         Exl3BatchedVerifyCoordinator* coordinator;
@@ -1875,15 +1901,16 @@ struct Exl3EngineCore::Impl {
                 value.max_concurrency,mib(free_bytes));
             std::fputc(10,stderr);
         }
-        if(exact_line_planned(value)) {
-            // Eager only: graphs captured at construction would keep the
-            // line's own planes, which make_exact_line replaces.
-            auto line=target->create_context_reserved(coordinator,true,0,public_media_enabled,false);
-            line->make_exact_line(*lanes[0]->context_owner_for_device_round());
-            line->prepare_continuation_reserved(coordinator,kFoldRows,0);
-            line->bind_request_compatibility("exact-line");
-            exact_lines[0]=std::move(line);
-        }
+        if(exact_line_planned(value))
+            for(std::uint32_t i=0;i<value.max_concurrency;++i) {
+                // Eager only: graphs captured at construction would keep the
+                // line's own planes, which make_exact_line replaces.
+                auto line=target->create_context_reserved(coordinator,true,0,public_media_enabled,false);
+                line->make_exact_line(*lanes[i]->context_owner_for_device_round());
+                line->prepare_continuation_reserved(coordinator,kFoldRows,0);
+                line->bind_request_compatibility("exact-line");
+                exact_lines[i]=std::move(line);
+            }
         // The overlapped GDN retained-prefix repair (side stream) corrupts
         // recurrent state under concurrent lanes (VeriCache corrections with
         // 12-20 logit gaps at C3; clean when the repair replays in order on the
@@ -2495,8 +2522,10 @@ struct Exl3EngineCore::Impl {
             if(vericache.enabled) {
                 // Draft numerically ahead with L0 rounds, verify each block, then
                 // publish only verified tokens (in <= 16-token output previews).
-                Exl3TextContext* const fold_line=exact_lines[lane_index].get();
+                Exl3TextContext* const fold_line=options.max_concurrency==1 ||
+                    context->position()>=kLaneLineMinContext?exact_lines[lane_index].get():nullptr;
                 const bool async_verify=fold_line && vericache_async_enabled();
+                round->set_pass_order(fold_line && options.max_concurrency>1?&line_pass_order:nullptr);
                 if(fold_line)round->begin_fold_verification(*fold_line,async_verify?kAsyncRingRows:kFoldRingRows);
                 else round->begin_verification(vericache.block);
                 // Draft length per request (VeriCache paper, Fig. 8 / Alg. 1): the

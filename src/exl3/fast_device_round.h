@@ -73,6 +73,26 @@ struct Exl3VeriCacheConfig {
 // completed target/draft frontier before any output work is allowed.
 class Exl3FastDeviceRound {
 public:
+    // Several lanes: the asynchronous line's passes and the drafting
+    // context's fixes use the model's prompt-scale pool like the other lanes'
+    // prompt passes; the Engine orders them all (enter/leave bracket one
+    // pass's enqueue on `stream`). Null: the lane owns the pool.
+    struct PassOrder {
+        virtual ~PassOrder()=default;
+        virtual void enter(cudaStream_t stream)=0;
+        virtual void leave(cudaStream_t stream)=0;
+    };
+    class OrderedPass {
+    public:
+        OrderedPass(PassOrder* order,cudaStream_t stream) : order_(order),stream_(stream) {if(order_)order_->enter(stream_);}
+        ~OrderedPass() {if(order_)order_->leave(stream_);}
+        OrderedPass(const OrderedPass&)=delete;
+        OrderedPass& operator=(const OrderedPass&)=delete;
+    private:
+        PassOrder* order_;
+        cudaStream_t stream_;
+    };
+    void set_pass_order(PassOrder* order) noexcept {pass_order_=order;}
     static constexpr std::array<int,5> tap_layers{5,19,33,47,61};
     static constexpr std::size_t tap_hidden=5120;
     static constexpr std::uint64_t coherent_policy=0x434f484552454e54ULL;
@@ -676,6 +696,7 @@ public:
         if(phase_!=Phase::ready || ring_rows<1 || ring_rows>2047 || !line.exact_line())
             throw std::logic_error("folded verification begin");
         line_=&line;
+        const OrderedPass ordered(pass_order_,stream_);
         line.sync_exact_line_from(*context_,stream_);
         line.save_verified_root(stream_);
         context_->save_verified_root(stream_);
@@ -765,7 +786,7 @@ public:
         async_head_=line_head_.size();
         async_root_=line_frontier();
         fold_frontier_=frontier_;
-        async_->launch(*line_,fold_tokens_,delta,stream_);
+        async_->launch(*line_,fold_tokens_,delta,stream_,pass_order_);
         async_inflight_=true;
         async_start_=Clock::now();
     }
@@ -784,6 +805,7 @@ public:
             const auto wait_start=Clock::now();
             auto scores=async_->wait();
             async_inflight_=false;
+            const OrderedPass ordered(pass_order_,stream_);
             // Async: scores_ms = line pass time (launch to scored).
             totals_.scores_ms+=std::chrono::duration<double,std::milli>(async_->finished_-async_start_).count();
             totals_.forward_ms+=elapsed(wait_start);
@@ -853,6 +875,7 @@ public:
             if(retained<commit.tokens.size()) {
                 // The session stopped inside the block: the line runs its head
                 // and the kept prefix exactly, both lines take its state.
+                const OrderedPass ordered(pass_order_,stream_);
                 std::vector<std::int64_t> kept(fold_tokens_.begin(),
                     fold_tokens_.begin()+static_cast<std::ptrdiff_t>(async_head_));
                 kept.insert(kept.end(),commit.tokens.begin(),
@@ -1102,6 +1125,7 @@ private:
             async_->wait();
             async_inflight_=false;
         }
+        const OrderedPass ordered(pass_order_,stream_);
         const int root=line_frontier();
         line_->restore_verified_root(stream_);
         if(!line_head_.empty())forward_rows(*line_,line_head_,stream_);
@@ -1487,11 +1511,13 @@ private:
         }
         AsyncLine(const AsyncLine&)=delete;
         AsyncLine& operator=(const AsyncLine&)=delete;
-        void launch(Exl3TextContext& line,std::span<const std::int64_t> tokens,float delta,cudaStream_t after) {
+        void launch(Exl3TextContext& line,std::span<const std::int64_t> tokens,float delta,cudaStream_t after,
+                    PassOrder* order) {
             check(cudaEventRecord(fork_,after),"asynchronous verification fork");
             {
                 const std::lock_guard lock(mutex_);
                 line_=&line;
+                order_=order;
                 tokens_.assign(tokens.begin(),tokens.end());
                 delta_=delta;
                 job_=true;done_=false;error_=nullptr;
@@ -1518,11 +1544,13 @@ private:
                 Exl3TextContext& line=*line_;
                 const std::vector<std::int64_t> tokens=tokens_;
                 const float delta=delta_;
+                PassOrder* const order=order_;
                 lock.unlock();
                 std::vector<Exl3TextContext::RowScore> scores;
                 std::exception_ptr error;
                 try {
                     check(cudaStreamWaitEvent(stream_,fork_,0),"asynchronous verification fork");
+                    const OrderedPass ordered(order,stream_);
                     forward_rows(line,tokens,stream_);
                     std::vector<std::int64_t> next(tokens.begin()+1,tokens.end());
                     next.push_back(tokens.front());
@@ -1546,6 +1574,7 @@ private:
         std::condition_variable cv_;
         bool job_=false,done_=false,quit_=false;
         Exl3TextContext* line_=nullptr;
+        PassOrder* order_=nullptr;
         std::vector<std::int64_t> tokens_;
         float delta_=0.0f;
         std::vector<Exl3TextContext::RowScore> scores_;
@@ -1553,6 +1582,7 @@ private:
         std::thread worker_;
     };
     std::unique_ptr<AsyncLine> async_;
+    PassOrder* pass_order_=nullptr;
     bool async_inflight_=false;
     std::vector<std::int64_t> line_head_;   // published tokens the line has not run
     std::size_t async_head_=0;              // head rows of the block in flight
