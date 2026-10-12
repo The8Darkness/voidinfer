@@ -729,6 +729,12 @@ public:
     // references it (request reset).
     void ensure_l0_rows(int rows);
     void release_l0_rows_beyond(int rows);
+    // Device bytes currently backing the growable L0 code/meta planes.
+    std::size_t l0_code_device_bytes() const noexcept {
+        std::size_t bytes = 0;
+        for (const auto& region : l0_regions_) if (region) bytes += region->mapped_bytes();
+        return bytes;
+    }
     // Concurrent Engine lanes: binds the context's small (<= views.rows) tier
     // and selects it. The prompt tier (the shared prompt-scale views given at
     // construction) is selected only around exclusive prompt/verifier passes.

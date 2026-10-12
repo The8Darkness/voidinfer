@@ -810,6 +810,8 @@ public:
     // exported root keeps their pinned copy) and clears exact residency, so
     // the next request restores them; the lane-backed FP16 planes stay.
     void park_l0_codes() noexcept;
+    // Device bytes backing this context's L0 INT4 code planes (any thread).
+    std::size_t l0_code_device_bytes() const noexcept;
     // Returns true only when a restore was submitted. A resident hit still
     // passes retirement/failed-lineage gates; callers own acquisition identity.
     bool restore_exact_host_state_if_needed(const Exl3ExactHostState& state,cudaStream_t stream=0);

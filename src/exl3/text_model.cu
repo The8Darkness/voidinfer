@@ -13453,6 +13453,12 @@ bool Exl3TextContext::restore_exact_host_state_if_needed(const Exl3ExactHostStat
     restore_exact_host_state(state,stream);return true;
 }
 
+std::size_t Exl3TextContext::l0_code_device_bytes() const noexcept {
+    std::size_t bytes=0;
+    for(const auto& layer:impl_->full_layers)if(layer)bytes+=layer->l0_code_device_bytes();
+    return bytes;
+}
+
 void Exl3TextContext::park_l0_codes() noexcept {
     if(!Exl3NativeContextExtent::l0_oscar_enabled())return;
     impl_->resident_exact_state_id=0;

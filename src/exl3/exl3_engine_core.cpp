@@ -478,15 +478,14 @@ struct Exl3EngineCore::Impl {
     // INT4 code/meta planes grow with each lane's context on the device.
     // Past physical VRAM, WDDM silently demotes allocations to system memory
     // (one 4 x 104K run: a lane's history kernel 10x slower, every batched
-    // round ~2.5x slower). A lane only takes a request whose projected codes
-    // (input + output allowance) fit beside the other active lanes'; the
-    // request otherwise waits for a lane to finish. The budget is the free
-    // device memory at the first admission (no request active) minus
-    // NINFER_EXL3_L0_CODE_RESERVE_MIB (default 1280: layer-major projection
-    // cache and headroom); NINFER_EXL3_L0_CODE_ADMISSION=0 disables.
+    // round ~2.5x slower; 8 x 106K: the Engine failed). A lane only takes a
+    // request whose projected codes (input + output allowance) fit in the free
+    // device memory beside the growth the other active lanes still have ahead
+    // (their projections minus the codes already backed), keeping
+    // NINFER_EXL3_L0_CODE_RESERVE_MIB (default 512) free; the request otherwise
+    // waits for a lane to finish, at most until shortly before its queue
+    // deadline. NINFER_EXL3_L0_CODE_ADMISSION=0 disables.
     std::array<std::uint64_t,kMaxLanes> lane_code_projection{};
-    std::uint64_t l0_code_budget=0;
-    bool l0_code_budget_measured=false;
     static std::uint64_t projected_l0_code_bytes(std::size_t tokens) {
         // Per token: 16 full-attention layers x 4 KV heads x (K and V codes + FP16 metadata),
         // plus half a 2 MiB granule of rounding for each of the 32 code planes.
@@ -512,6 +511,9 @@ struct Exl3EngineCore::Impl {
     // well (lanes drain until it fits; smaller arrivals cannot starve it).
     bool l0_codes_fit_locked(const Request& request,std::size_t lane_index) {
         if(!l0_code_admission_enabled())return true;
+        // A request about to reach its queue deadline runs anyway (as without
+        // admission: slower, never refused for waiting on code memory).
+        if(Clock::now()+std::chrono::seconds(1)>=request.deadline)return true;
         const auto submitted=request.ready_work.submitted();
         for(const auto& queued:queue) {
             if(queued.get()==&request)break;
@@ -522,26 +524,25 @@ struct Exl3EngineCore::Impl {
         return l0_codes_fit_alone_locked(request,lane_index);
     }
     bool l0_codes_fit_alone_locked(const Request& request,std::size_t lane_index) {
-        if(!l0_code_admission_enabled())return true;
-        std::uint64_t others=0;bool any=false;
+        std::uint64_t growth=0;bool any=false;
         for(std::size_t i=0;i<options.max_concurrency;++i)
-            if(i!=lane_index && active[i]) {any=true;others+=lane_code_projection[i];}
-        if(!l0_code_budget_measured) {
-            if(any)return true;   // measured at the first admission with no lane active
-            std::size_t free=0,total=0;
-            if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return true;
-            static const std::uint64_t reserve=[] {
-                const char* value=std::getenv("NINFER_EXL3_L0_CODE_RESERVE_MIB");
-                return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):1280L)<<20;
-            }();
-            l0_code_budget=free>reserve?free-reserve:0;
-            l0_code_budget_measured=true;
-            if(std::getenv("NINFER_EXL3_MEMORY_TRACE"))
-                std::fprintf(stderr,"L0_CODE_BUDGET free=%.1f MiB budget=%.1f MiB%c",free/1048576.0,
-                    l0_code_budget/1048576.0,10);
-        }
+            if(i!=lane_index && active[i] && lanes[i]) {
+                any=true;
+                const std::uint64_t backed=lanes[i]->context().l0_code_device_bytes();
+                if(lane_code_projection[i]>backed)growth+=lane_code_projection[i]-backed;
+            }
         // A lone lane always runs (its own context bound is the Engine's max_context).
-        return !any || others+request_code_projection(request)<=l0_code_budget;
+        if(!any)return true;
+        std::size_t free=0,total=0;
+        if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return true;
+        static const std::uint64_t reserve=[] {
+            const char* value=std::getenv("NINFER_EXL3_L0_CODE_RESERVE_MIB");
+            return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):512L)<<20;
+        }();
+        // This lane's own (parked or retained) backing is reused by the request.
+        const std::uint64_t own=lanes[lane_index]?lanes[lane_index]->context().l0_code_device_bytes():0;
+        const std::uint64_t need=request_code_projection(request);
+        return growth+reserve+(need>own?need-own:0)<=free;
     }
     Exl3ReadyWorkSnapshotAuthority ready_work_authority;
     struct LaneFrontier {
@@ -3712,7 +3713,9 @@ struct Exl3EngineCore::Impl {
             bool affine=false,copy_deferred=false,copy_unknown=false,copy_fairness=false;
             {
                 std::unique_lock lock(mutex);
-                changed.wait(lock,[&] {
+                // Timed: a request deferred for L0 code memory becomes eligible
+                // shortly before its queue deadline without another event.
+                changed.wait_for(lock,std::chrono::milliseconds(250),[&] {
                     if(stopping)return true;
                     if(queue.empty())return false;
                     return ready_request_locked(lane_index).has_value();
