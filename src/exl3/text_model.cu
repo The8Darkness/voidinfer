@@ -13202,14 +13202,24 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     int full = 0, gdn = 0;
     struct HostKvCopy { std::vector<std::uint16_t>* output; std::size_t kept; const std::uint16_t* source; std::size_t elements; };
     std::vector<HostKvCopy> host_kv_copies;
-    // Recurrent planes without a pinned slab (pool exhausted by retained
-    // roots): DMA into a bounded pinned stage, one fence per stage fill, then
-    // the planes are filled in parallel with one copy each (previously a
-    // zero-filled resize and one staged pageable copy per plane: ~35 ms per
-    // export at 4K).
-    struct PageableRecurrent { std::vector<float>* output; const float* device; std::size_t bytes; };
-    std::vector<PageableRecurrent> pageable_recurrent;
-    Exl3ExportCopyPlan<48> convolution_plan;
+    // Host planes that are not slab-backed (recurrent planes once retained
+    // roots hold the pinned slab pool, convolution states, logits, embedding
+    // and taps): DMA into a bounded pinned stage, one fence per stage fill,
+    // then the vectors fill in parallel with one copy each (previously a
+    // zero-filled resize and one staged pageable copy or bounce per plane:
+    // ~35 ms per pageable recurrent export, ~10 ms of taps after a prefill).
+    struct StagedDownload {
+        const void* device; std::size_t bytes; bool fp32;
+        std::function<void(const void*)> fill;
+    };
+    std::vector<StagedDownload> staged;
+    const auto stage_vector=[&](auto& output,const void* device,std::size_t elements,bool fp32) {
+        using T=typename std::remove_reference_t<decltype(output)>::value_type;
+        staged.push_back({device,elements*sizeof(T),fp32,[&output,elements](const void* host) {
+            const auto* first=static_cast<const T*>(host);
+            output.assign(first,first+elements);
+        }});
+    };
     Exl3ExportCopyPlan<batched_kv_capacity> batched_kv_plan;
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl_->full_layers[layer] && state->l2_fp8_) {
@@ -13315,14 +13325,10 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
             const auto& l = impl_->gdn_layers[layer];
             export_stats.recurrent_bytes+=l->recurrent_state_bytes();
             if(!state->recurrent_slab_)
-                pageable_recurrent.push_back({&state->recurrent_[gdn],
-                    static_cast<const float*>(l->recurrent_state_device()),l->recurrent_state_bytes()});
-            auto& convolution=state->convolution_[gdn];
-            convolution.resize(l->physical_conv_state_bytes()/sizeof(convolution[0]));
-            require(convolution_plan.add(convolution.data(),
-                l->physical_conv_state_device(),l->physical_conv_state_bytes(),
-                Exl3ExportPrecision::fp16,false,false),
-                "convolution export copy plan capacity");
+                stage_vector(state->recurrent_[gdn],l->recurrent_state_device(),
+                    l->recurrent_state_bytes()/sizeof(float),true);
+            stage_vector(state->convolution_[gdn],l->physical_conv_state_device(),
+                l->physical_conv_state_bytes()/sizeof(std::uint16_t),false);
             ++gdn;
         }
     }
@@ -13352,68 +13358,60 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         impl_->host_kv.exact_kv_export_saved_fences+=
             batched_kv_plan.logical_ranges()-1;
     }
-    if(!pageable_recurrent.empty()) {
-        Timing recurrent_timing{export_stats.recurrent_ms};
+    stage_vector(state->logits_,impl_->logits,kVocab,false);
+    stage_vector(state->embedding_,impl_->embedding_trace->ptr,
+        static_cast<std::size_t>(impl_->embedding_rows)*kHidden,false);
+    for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap)
+        stage_vector(state->taps_[tap],impl_->taps[tap]->ptr,
+            static_cast<std::size_t>(impl_->tap_rows)*kHidden,false);
+    {
+        Timing staged_timing{export_stats.recurrent_ms};
         struct Stage {
-            float* host=nullptr; std::size_t bytes=0;
+            std::uint8_t* host=nullptr; std::size_t bytes=0;
             ~Stage(){if(host)cudaFreeHost(host);}
         };
         thread_local Stage stage;
         constexpr std::size_t kStageBytes=std::size_t{64}<<20;
         if(!stage.host) {
             void* host=nullptr;
-            cuda_check(cudaHostAlloc(&host,kStageBytes,cudaHostAllocDefault),"pageable recurrent export stage");
-            stage.host=static_cast<float*>(host);stage.bytes=kStageBytes;
+            cuda_check(cudaHostAlloc(&host,kStageBytes,cudaHostAllocDefault),"exact export stage");
+            stage.host=static_cast<std::uint8_t*>(host);stage.bytes=kStageBytes;
         }
-        for(std::size_t begin=0;begin<pageable_recurrent.size();) {
+        // Pool threads see their own thread_locals: bind this thread's stage.
+        std::uint8_t* const stage_host=stage.host;
+        for(std::size_t begin=0;begin<staged.size();) {
             std::size_t end=begin,used=0;
             std::vector<std::size_t> offsets;
-            while(end<pageable_recurrent.size() && (end==begin || used+pageable_recurrent[end].bytes<=stage.bytes)) {
-                require(pageable_recurrent[end].bytes<=stage.bytes,"recurrent plane exceeds export stage");
-                offsets.push_back(used/sizeof(float));
+            while(end<staged.size() && (end==begin || used+staged[end].bytes<=kStageBytes)) {
+                require(staged[end].bytes<=kStageBytes,"exact export plane exceeds stage");
+                offsets.push_back(used);
                 add_counter(export_stats.planned_copy_ranges,1);
                 add_counter(export_stats.copy_submissions,1);
-                add_counter(export_stats.fp32_copy_submissions,1);
+                add_counter(staged[end].fp32?export_stats.fp32_copy_submissions:
+                    export_stats.fp16_copy_submissions,1);
                 const auto submitted=++export_copy_submission==export_copy_fault?cudaErrorUnknown:
-                    cudaMemcpyAsync(stage.host+used/sizeof(float),pageable_recurrent[end].device,
-                        pageable_recurrent[end].bytes,cudaMemcpyDeviceToHost,stream);
+                    (staged[end].bytes?cudaMemcpyAsync(stage_host+used,staged[end].device,staged[end].bytes,
+                        cudaMemcpyDeviceToHost,stream):cudaSuccess);
                 if(submitted!=cudaSuccess) {
                     // The stage must not be reused while a submitted copy may still land.
                     (void)cudaStreamSynchronize(stream);
-                    cuda_check(submitted,"pageable recurrent export copy");
+                    cuda_check(submitted,"exact export copy");
                 }
-                used+=(pageable_recurrent[end].bytes+255)/256*256;
+                used+=(staged[end].bytes+255)/256*256;
                 ++end;
             }
-            cuda_check(cudaStreamSynchronize(stream),"complete pageable recurrent export copy");
+            cuda_check(cudaStreamSynchronize(stream),"complete exact export copies");
             std::atomic<bool> fill_failed{false};
-            // Pool threads see their own thread_locals: bind this thread's stage.
-            const float* const stage_host=stage.host;
             std::vector<std::size_t> indices(end-begin);
             for(std::size_t i=0;i<indices.size();++i)indices[i]=i;
             std::for_each(std::execution::par,indices.begin(),indices.end(),[&](std::size_t index) {
-                try {
-                    const auto& plane=pageable_recurrent[begin+index];
-                    const float* first=stage_host+offsets[index];
-                    plane.output->assign(first,first+plane.bytes/sizeof(float));
-                } catch(...) {fill_failed.store(true,std::memory_order_relaxed);}
+                try {staged[begin+index].fill(stage_host+offsets[index]);}
+                catch(...) {fill_failed.store(true,std::memory_order_relaxed);}
             });
             if(fill_failed.load(std::memory_order_relaxed))throw std::bad_alloc();
             begin=end;
         }
     }
-    if(convolution_plan.size()) {
-        submit_export_plan(convolution_plan,Exl3ExportPrecision::fp16,
-            "convolution export copy");
-        cuda_check(cudaStreamSynchronize(stream),
-            "complete convolution export copy plan");
-    }
-    download(state->logits_, impl_->logits, kVocab);
-    download(state->embedding_, impl_->embedding_trace->ptr,
-             static_cast<std::size_t>(impl_->embedding_rows) * kHidden);
-    for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap)
-        download(state->taps_[tap], impl_->taps[tap]->ptr,
-                 static_cast<std::size_t>(impl_->tap_rows) * kHidden);
     if(Exl3NativeContextExtent::l0_oscar_enabled()) {
         // Complete chunks already exported or restored in this lineage are shared.
         std::size_t full=0;
