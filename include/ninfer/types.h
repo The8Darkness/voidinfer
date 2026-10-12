@@ -178,6 +178,9 @@ struct PinnedExl3PackageOptions {
     std::filesystem::path target_directory;
     std::filesystem::path draft_directory;
     std::filesystem::path verified_dual_manifest;
+    // BF16 Vision tower weights (`model.visual.*`, e.g. the target's BF16
+    // checkpoint). Set: image/video requests run on the coherent-device route.
+    std::filesystem::path vision_directory;
     // Explicit package-local round identity. The established implementation remains the default.
     Exl3RoundImplementation round_implementation = Exl3RoundImplementation::Established;
 };

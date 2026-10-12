@@ -1945,6 +1945,38 @@ struct Exl3TextContext::Impl {
     std::unique_ptr<DeviceAllocation> embedding_trace;
     int* position_device = nullptr;
     std::int64_t* draft_token_id = nullptr;
+    // Vision prompts: M-RoPE table (rope_map.cuh, pointed to by
+    // position_device[4..7]) and FP16 media embedding rows.
+    struct MediaScratch {
+        void* ptr=nullptr;std::size_t bytes=0;
+        MediaScratch()=default;
+        MediaScratch(const MediaScratch&)=delete;
+        MediaScratch& operator=(const MediaScratch&)=delete;
+        ~MediaScratch(){if(ptr)(void)cudaFree(ptr);}
+        void reserve(std::size_t size,cudaStream_t stream) {
+            if(size<=bytes)return;
+            cuda_check(cudaStreamSynchronize(stream),"fence media scratch growth");
+            if(ptr){cuda_check(cudaFree(ptr),"release media scratch");ptr=nullptr;bytes=0;}
+            cuda_check(cudaMalloc(&ptr,size),"allocate media scratch");bytes=size;
+        }
+    };
+    MediaScratch rope_table,media_embeddings;
+    std::vector<Exl3TextContext::MediaRowSpan> media_spans;
+    void apply_media_rows(std::uint16_t* hidden,int first,int rows,cudaStream_t stream) {
+        for(const auto& span:media_spans) {
+            const int lo=std::max(first,span.first),hi=std::min(first+rows,span.first+span.rows);
+            if(lo>=hi)continue;
+            cudaStreamCaptureStatus capturing=cudaStreamCaptureStatusNone;
+            cuda_check(cudaStreamIsCapturing(stream,&capturing),"query media row capture");
+            require(capturing==cudaStreamCaptureStatusNone,"media prompt rows cannot be captured");
+            const auto row_bytes=static_cast<std::size_t>(kHidden)*sizeof(std::uint16_t);
+            cuda_check(cudaMemcpyAsync(hidden+static_cast<std::size_t>(lo-first)*kHidden,
+                static_cast<const std::uint8_t*>(media_embeddings.ptr)+
+                    (span.offset+static_cast<std::size_t>(lo-span.first))*row_bytes,
+                static_cast<std::size_t>(hi-lo)*row_bytes,cudaMemcpyDeviceToDevice,stream),
+                "copy media prompt rows");
+        }
+    }
     std::unique_ptr<Exl3OscarContext> oscar;
     Exl3OscarTelemetry oscar_telemetry{};
     DecodeGraphDefinition graph_definition;
@@ -2091,7 +2123,7 @@ struct Exl3TextContext::Impl {
         const auto add=[&](const void* address,std::size_t bytes) noexcept {
             result.buffers[result.count++]={address,bytes};
         };
-        add(position_device,3*sizeof(int));
+        add(position_device,8*sizeof(int));
         add(hidden_a,hidden_bytes);
         add(hidden_b,hidden_bytes);
         add(embedding_trace?embedding_trace->ptr:nullptr,hidden_bytes);
@@ -3840,6 +3872,7 @@ struct Exl3TextContext::Impl {
             embedding_lookup_kernel<<<(rows * kHidden + 255) / 256, 256, 0, stream>>>(
                 ids, model->embedding, hidden_a, rows);
             cuda_check(cudaGetLastError(), "launch E4A embedding lookup");
+            if (!media_spans.empty()) apply_media_rows(hidden_a, position, rows, stream);
             if (events) record(events->embedding_end, stream, "record E4B1 embedding end");
             embedding_range.reset();
             if (capture_taps) {
@@ -5363,8 +5396,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         allocate(token_bytes,reinterpret_cast<void**>(&impl->token_ids),"allocate E4A token ids");
         // [0] device position, [1..2] verifier layout {chain rows, packed
         // sibling offsets} (chain rows 0: every row is a chain row; see
-        // sibling_rows.cuh).
-        allocate(3*sizeof(int),reinterpret_cast<void**>(&impl->position_device),"allocate E4B2 position parameter");
+        // sibling_rows.cuh), [4..7] rotary position map (rope_map.cuh).
+        allocate(8*sizeof(int),reinterpret_cast<void**>(&impl->position_device),"allocate E4B2 position parameter");
         allocate(sizeof(std::int64_t),reinterpret_cast<void**>(&impl->draft_token_id),"allocate E5A2 draft token id");
     };
     std::size_t base_bytes=0,base_owners=0;
@@ -6155,6 +6188,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 impl->oscar_only?nullptr:static_cast<std::uint16_t*>(impl->host_kv.enabled?impl->host_layer_k->ptr:impl->cache_k[layer]->ptr),
                 impl->oscar_only?nullptr:static_cast<std::uint16_t*>(impl->host_kv.enabled?impl->host_layer_v->ptr:impl->cache_v[layer]->ptr), max_context_);
             impl->full_layers[layer]->set_position_device(impl->position_device);
+            impl->full_layers[layer]->set_rope_map(impl->position_device+4);
+            cuda_check(cudaMemset(impl->position_device+4,0,4*sizeof(int)),"clear rope map");
             impl->full_layers[layer]->set_exact_attention_scores(exact_scores,16);
             impl->full_layers[layer]->set_exact_attention_q_shared(exact_q_shared_enabled);
             impl->full_layers[layer]->set_exact_attention_query_pair(query_pair_enabled);
@@ -7764,6 +7799,37 @@ Exl3TextContext::host_kv_mlp_tail_graph_stats() const noexcept {
         impl_->host_kv_mlp_tail_graph_capture_ms};
 }
 int Exl3TextContext::rope_offset() const noexcept {return impl_->rope_offset;}
+
+void Exl3TextContext::set_rope_map(std::span<const std::int32_t> rows_thw,int delta,cudaStream_t stream) {
+    require(rows_thw.size()%3==0 && rows_thw.size()/3<=static_cast<std::size_t>(impl_->max_context),
+        "rope map table extent");
+    struct {std::int32_t rows,delta;const void* table;} map{
+        static_cast<std::int32_t>(rows_thw.size()/3),delta,nullptr};
+    if(!rows_thw.empty()) {
+        impl_->rope_table.reserve(rows_thw.size_bytes(),stream);
+        cuda_check(cudaMemcpyAsync(impl_->rope_table.ptr,rows_thw.data(),rows_thw.size_bytes(),
+            cudaMemcpyHostToDevice,stream),"upload rope map table");
+        map.table=impl_->rope_table.ptr;
+    }
+    static_assert(sizeof(map)==4*sizeof(int));
+    cuda_check(cudaMemcpyAsync(impl_->position_device+4,&map,sizeof(map),cudaMemcpyHostToDevice,stream),
+        "upload rope map");
+    // Pageable sources: fence before `map` and the caller's table go away.
+    cuda_check(cudaStreamSynchronize(stream),"fence rope map upload");
+}
+
+std::uint16_t* Exl3TextContext::media_rows_buffer(std::size_t rows,cudaStream_t stream) {
+    impl_->media_embeddings.reserve(rows*kHidden*sizeof(std::uint16_t),stream);
+    return static_cast<std::uint16_t*>(impl_->media_embeddings.ptr);
+}
+
+void Exl3TextContext::set_media_rows(std::vector<MediaRowSpan> spans) {
+    for(const auto& span:spans)
+        require(span.first>=0 && span.rows>0 && span.first+span.rows<=impl_->max_context &&
+            (span.offset+static_cast<std::size_t>(span.rows))*kHidden*sizeof(std::uint16_t)<=
+                impl_->media_embeddings.bytes,"media prompt row span");
+    impl_->media_spans=std::move(spans);
+}
 Exl3ReconstructGemmStats Exl3TextContext::numeric_prefill_projection_stats() const noexcept {
     return impl_->numeric_prefill_projection_workspace
         ? impl_->numeric_prefill_projection_workspace->stats()
@@ -7832,6 +7898,10 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     impl_->drain_continuation_graph_uses();
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
+    // Every request starts with text positions; a vision request sets its
+    // map and media rows after the reset.
+    cuda_check(cudaMemsetAsync(impl_->position_device+4,0,4*sizeof(int),stream),"reset rope map");
+    impl_->media_spans.clear();
     // A captured decode graph is bound to the prior eager/OSCAR lifecycle.
     // Invalidate its admission immediately; the objects are replaced on the
     // next synchronized capture, after reset/reingest work on this stream.
@@ -9297,6 +9367,8 @@ void Exl3TextContext::append_prefill_layer_major(
             impl_->hidden_a+static_cast<std::size_t>(offset)*kHidden,rows);
         cuda_check(cudaGetLastError(),"embed layer-major prefill rows");
     }
+    if (!impl_->media_spans.empty())
+        impl_->apply_media_rows(impl_->hidden_a,base_position,total,stream);
     if (impl_->capture_taps) {
         cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,
             impl_->hidden_a+static_cast<std::size_t>(final_offset)*kHidden,
@@ -10835,6 +10907,7 @@ void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
         impl_->full_layers[layer]->set_kv_cache(static_cast<std::uint16_t*>(impl_->cache_k[layer]->ptr),
             static_cast<std::uint16_t*>(impl_->cache_v[layer]->ptr),impl_->max_context);
         impl_->full_layers[layer]->set_l0_exact_only(true);
+        impl_->full_layers[layer]->set_rope_map(drafting.impl_->position_device+4);
     }
     // FP8 history of the asynchronous line (default; NINFER_EXL3_VERICACHE_LINE_FP8=0
     // keeps the FP16 planes): half the PCIe bytes per pass, 128K -4%, 254K -6%

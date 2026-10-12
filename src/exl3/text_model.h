@@ -690,6 +690,19 @@ public:
     void append_media_embeddings_numeric(std::span<const float> embeddings,
         std::span<const std::int32_t> positions_xyz,cudaStream_t stream=nullptr);
     int rope_offset() const noexcept;
+    // Vision prompts on the device-round route. Cache rows [0,rows_thw.size()/3)
+    // rotate at the frontend's row-major (t,h,w) M-RoPE positions and later
+    // rows at row+delta, in every layer (verifier and exact line included);
+    // an empty table with delta 0 restores text positions. Stream-ordered;
+    // set between requests.
+    void set_rope_map(std::span<const std::int32_t> rows_thw,int delta,cudaStream_t stream);
+    // Prompt rows [first,first+rows) of each span take FP16 [rows,5120]
+    // embeddings from the context's media buffer (starting at span row
+    // `offset`) instead of their token embeddings; an empty list clears.
+    // media_rows_buffer grows the buffer (fenced on `stream`).
+    struct MediaRowSpan {int first=0;int rows=0;std::size_t offset=0;};
+    std::uint16_t* media_rows_buffer(std::size_t rows,cudaStream_t stream);
+    void set_media_rows(std::vector<MediaRowSpan> spans);
     GoptSubmissions gaming_submissions() const noexcept;
     Exl3HostKVStats host_kv_stats() const noexcept;
     struct DeviceTransactionCheckpointGraphStats {

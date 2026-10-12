@@ -38,6 +38,8 @@
 #include "exl3/host_preparation_completion.h"
 #include "exl3/public_media_qualification.h"
 #include "exl3/vision_model.h"
+#include "exl3/vision_dense.h"
+#include <ninfer/targets/qwen3_6/vision_control.h>
 #include "exl3/request_sampling_state.h"
 #include "exl3/sampling_policy.h"
 #include "exl3/sampled_authority_boundary.h"
@@ -216,11 +218,12 @@ void require_exact_profile(){
             "host-kv-fp16","fp16");
 }
 void require_coherent_device_profile(const EngineOptions& options) {
-    if(options.max_concurrency<1 || options.max_concurrency>kMaxLanes || options.enable_vision || options.use_cuda_graph ||
+    if(options.max_concurrency<1 || options.max_concurrency>kMaxLanes || options.use_cuda_graph ||
+       (options.enable_vision && (!options.exl3_package || options.exl3_package->vision_directory.empty())) ||
        options.max_context<2048 || options.max_context>(Exl3NativeContextExtent::l0_oscar_enabled()?
            static_cast<int>(Exl3NativeContextExtent::l0_oscar_tokens):32768))
         throw std::invalid_argument(
-            "coherent-device EXL3 requires C1 greedy text and context 2048..32768 (262144 with L0 OSCAR)");
+            "coherent-device EXL3 requires C1..C8, vision only with a BF16 tower, and context 2048..32768 (262144 with L0 OSCAR)");
     const auto equals=[](const char* name,std::string_view expected) {
         const auto* actual=std::getenv(name);
         if(!actual || std::string_view(actual)!=expected)
@@ -361,6 +364,8 @@ struct Exl3EngineCore::Impl {
     bool coherent_ordinary_graphs=false;
     EngineOptions options;
     bool public_media_enabled=false;
+    // Coherent-device vision: BF16 tower (Exl3DenseVision) streamed from host.
+    bool dense_vision_enabled=false;
     std::optional<Exl3VerifierHorizonPolicy::CostMenu> verifier_cost_menu;
     std::optional<Exl3SuffixProposer::SelectionLimits> suffix_selection_limits;
     bool conditional_b8=false;
@@ -372,6 +377,7 @@ struct Exl3EngineCore::Impl {
     std::shared_ptr<Exl3TextModel> target;
     std::shared_ptr<Exl3VisionModel> vision_model;
     std::shared_ptr<Exl3VisionContext> vision;
+    std::unique_ptr<Exl3DenseVision> dense_vision;
     std::array<std::shared_ptr<ExecutionStream>,kMaxLanes> streams;
     std::array<std::shared_ptr<Exl3Dflash2DraftModel>,kMaxLanes> drafts;
     // Folded exact VeriCache (one lane, NINFER_EXL3_VERICACHE_FOLD=1): the
@@ -694,13 +700,15 @@ struct Exl3EngineCore::Impl {
                 Exl3PublicMediaModality::image).media_allowed() &&
             Exl3PublicMediaQualification::evaluate_current(
                 Exl3PublicMediaModality::video).media_allowed()),
+        dense_vision_enabled(coherent_device && value.enable_vision &&
+            !value.exl3_package->vision_directory.empty()),
         resources(load_pinned_frontend_resources(value.exl3_package->target_directory)),
         frontend(targets::qwen3_6::make_frontend(resources,targets::qwen3_6::FrontendOptions{
-            .vision_enabled=public_media_enabled,.max_context=value.max_context,
+            .vision_enabled=public_media_enabled || dense_vision_enabled,.max_context=value.max_context,
             .max_cache_markers_per_request=value.context_cache.max_cache_markers_per_request.value_or(4)})),
         identity{"exl3-engine-epoch-1",pinned_weights_id(value.exl3_package->target_directory),"0997f410-c3cf9e34",
             coherent_device?"coherent-device-P1-K6-B8-greedy":"ordinary-FP16-B8-greedy",
-            public_media_enabled?"text+qualified-v6-media":"text"},
+            public_media_enabled?"text+qualified-v6-media":dense_vision_enabled?"text+bf16-vision":"text"},
         cache(Exl3VeriCacheServingPrefixCache::Policy{std::max(1U,value.context_cache.max_shared_prefixes.value_or(1)),64,std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30},identity),
         coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
         // A single exact-VeriCache lane gets an exact line (below): its
@@ -950,7 +958,8 @@ struct Exl3EngineCore::Impl {
         const auto host_metadata_limit=exl3_host_metadata_limit(std::getenv("NINFER_EXL3_ENGINE_HOST_METADATA_LIMIT_BYTES"));
         if(!share_pages && prefix_rows&&std::string(prefix_rows)=="16384"&&value.max_concurrency!=1)
             throw std::invalid_argument("EXL3 Engine device prefix rows16384 require physicalC1");
-        if((value.max_concurrency!=1 && value.max_concurrency!=2 && !(coherent_device && value.max_concurrency<=kMaxLanes)) || value.enable_vision || value.use_cuda_graph || value.hierarchical_vericache.enabled ||
+        if((value.max_concurrency!=1 && value.max_concurrency!=2 && !(coherent_device && value.max_concurrency<=kMaxLanes)) ||
+            (value.enable_vision && !dense_vision_enabled) || value.use_cuda_graph || value.hierarchical_vericache.enabled ||
             !value.max_pending_requests || !value.pending_timeout_ms || value.max_context<16 ||
             value.speculative.backend!=SpeculativeBackend::DFlash2 || value.speculative.draft_tokens!=7)
             throw std::invalid_argument("EXL3 text requires C1 or explicit C2/eager/DFlash2-K7 and disabled Vision");
@@ -1062,6 +1071,18 @@ struct Exl3EngineCore::Impl {
             std::fputc(10,stderr);
         };
         trace_free("after_target");
+        if(dense_vision_enabled) {
+            const auto vision_begin=Clock::now();
+            dense_vision=std::make_unique<Exl3DenseVision>(value.exl3_package->vision_directory);
+            {
+                cudaStream_t warm=nullptr;
+                check(cudaStreamCreateWithFlags(&warm,cudaStreamNonBlocking));
+                struct Destroy {cudaStream_t s;~Destroy(){(void)cudaStreamDestroy(s);}} destroy{warm};
+                dense_vision->warm_up(warm);
+            }
+            std::fprintf(stderr,"EXL3 vision: BF16 tower %.1f MiB pinned host (streamed per request), ready in %.1f s\n",
+                dense_vision->host_bytes()/1048576.0,seconds(vision_begin));
+        }
         drafts[0]=Exl3Dflash2DraftModel::load_impl(value.exl3_package->draft_directory,true);
         trace_free("after_draft");
         // Contexts and optional caches join after the single initial bind.
@@ -2288,6 +2309,79 @@ struct Exl3EngineCore::Impl {
             throw;
         }
     }
+    // Vision prompt on a coherent-device lane: every media item is encoded by
+    // the BF16 tower into the context's media rows (scattered over its
+    // placeholder tokens), and the frontend's M-RoPE positions become the
+    // context's rotary map: prompt rows up to the last one whose position is
+    // not row+rope_delta use the table, every later row (and every generated
+    // row) rotates at row+rope_delta. The DFlash2 draft keeps cache positions.
+    void prepare_media_prompt(Request& request,Exl3TextContext& context,cudaStream_t stream) {
+        const auto& prepared=targets::qwen3_6::PreparedPromptAccess::view(request.prompt);
+        const auto begin=Clock::now();
+        const auto plan=targets::qwen3_6::plan_vision_control(prepared);
+        const auto control=targets::qwen3_6::build_vision_control(prepared,plan,0);
+        if(control.items.size()!=prepared.vision_items.size() ||
+           prepared.media_payloads.size()!=prepared.vision_items.size())
+            throw std::invalid_argument("EXL3 vision control does not cover the prepared items");
+        std::size_t total=0;
+        for(const auto& item:control.items)total+=item.merged_count;
+        auto* rows=context.media_rows_buffer(total,stream);
+        std::vector<Exl3TextContext::MediaRowSpan> spans;
+        std::size_t offset=0;
+        double encode_ms=0;
+        for(std::size_t i=0;i<control.items.size();++i) {
+            if(request.cancelled)throw RequestError(RequestErrorKind::Cancelled,"EXL3 vision cancelled");
+            const auto& item=control.items[i];
+            const auto& payload=prepared.media_payloads[i];
+            if(!payload || item.scatter_indices.size()!=item.merged_count)
+                throw std::invalid_argument("EXL3 vision item payload or scatter extent");
+            const auto stats=dense_vision->encode(*payload,item,
+                rows+offset*Exl3DenseVision::kOutputWidth,stream);
+            encode_ms+=stats.encode_ms;
+            if(const auto* dump=std::getenv("NINFER_EXL3_VISION_DUMP"); dump && *dump) {
+                std::vector<std::uint16_t> host(item.merged_count*Exl3DenseVision::kOutputWidth);
+                check(cudaMemcpy(host.data(),rows+offset*Exl3DenseVision::kOutputWidth,
+                    host.size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost));
+                const auto path=std::string(dump)+"/vision_"+std::to_string(request.ready_work.generation())+
+                    "_"+std::to_string(i)+"_"+std::to_string(item.grid.temporal)+"x"+
+                    std::to_string(item.grid.height)+"x"+std::to_string(item.grid.width)+".f16";
+                if(auto* file=std::fopen(path.c_str(),"wb")) {
+                    std::fwrite(host.data(),sizeof(std::uint16_t),host.size(),file);
+                    std::fclose(file);
+                }
+            }
+            // Scatter indices are ascending prompt rows; consecutive runs are spans.
+            for(std::size_t j=0;j<item.scatter_indices.size();) {
+                std::size_t k=j+1;
+                while(k<item.scatter_indices.size() &&
+                      item.scatter_indices[k]==item.scatter_indices[k-1]+1)++k;
+                spans.push_back({item.scatter_indices[j],static_cast<int>(k-j),offset+j});
+                j=k;
+            }
+            offset+=item.merged_count;
+        }
+        context.set_media_rows(std::move(spans));
+        const auto t=prepared.position_axis(0),h=prepared.position_axis(1),w=prepared.position_axis(2);
+        const auto ids=request.ready_work.input_tokens();
+        if(t.size()!=ids.size() || h.size()!=ids.size() || w.size()!=ids.size())
+            throw std::invalid_argument("EXL3 vision M-RoPE positions do not cover the prompt");
+        const auto delta=prepared.rope_delta;
+        std::size_t table_rows=ids.size();
+        while(table_rows>0) {
+            const auto row=static_cast<std::int64_t>(table_rows-1)+delta;
+            if(t[table_rows-1]!=row || h[table_rows-1]!=row || w[table_rows-1]!=row)break;
+            --table_rows;
+        }
+        std::vector<std::int32_t> table(table_rows*3);
+        for(std::size_t row=0;row<table_rows;++row) {
+            table[row*3]=t[row];table[row*3+1]=h[row];table[row*3+2]=w[row];
+        }
+        context.set_rope_map(table,delta,stream);
+        if(std::getenv("NINFER_EXL3_VISION_STATS"))
+            std::fprintf(stderr,"VISION_PROMPT items=%zu media_tokens=%zu prompt=%zu table_rows=%zu delta=%d encode_ms=%.1f total_ms=%.1f\n",
+                control.items.size(),total,ids.size(),table_rows,delta,encode_ms,
+                std::chrono::duration<double,std::milli>(Clock::now()-begin).count());
+    }
     void execute_coherent_device(Request& request,std::size_t lane_index) {
         auto& lane=lanes[lane_index];
         auto& draft=*drafts[lane_index];
@@ -2295,14 +2389,15 @@ struct Exl3EngineCore::Impl {
         auto& output=request.output;
         const auto& prepared=targets::qwen3_6::PreparedPromptAccess::view(request.prompt);
         const auto ids=request.ready_work.input_tokens();
-        if(prepared.has_media() || ids.size()<2048 ||
+        const bool media=prepared.has_media();
+        if((media && !dense_vision) || ids.empty() ||
            ids.size()>options.max_context ||
            !request.options.stop.strings.empty() ||
            request.options.execution.thinking.budget.has_value() ||
            request.options.execution.sampling.presence_penalty!=0 ||
            request.options.execution.sampling.frequency_penalty!=0)
             throw std::invalid_argument(
-                "coherent-device EXL3 requires text without penalties, stop strings or a thinking budget");
+                "coherent-device EXL3 requires a prompt without penalties, stop strings or a thinking budget (media needs --exl3-vision)");
         if(request.cancelled) {result.finish_reason=FinishReason::Cancelled;return;}
         if(Clock::now()>=request.deadline)
             throw RequestError(RequestErrorKind::QueueTimeout,
@@ -2352,6 +2447,7 @@ struct Exl3EngineCore::Impl {
                 Exl3Dflash2DraftModel* draft;
                 ~SamplingReset() {context->set_device_sampling({});draft->set_sampling({});}
             } sampling_reset{context.get(),&draft};
+            if(media)prepare_media_prompt(request,*context,stream);
             // VeriCache verifies against exact history: ingest the prompt exactly too.
             if(vericache.enabled)context->set_l0_exact_history(true);
             // Conversation reuse (default; NINFER_EXL3_COHERENT_ROOT_REUSE=0
@@ -2366,7 +2462,9 @@ struct Exl3EngineCore::Impl {
                     throw std::invalid_argument("NINFER_EXL3_COHERENT_ROOT_REUSE must be 0 or 1");
                 return true;
             }();
-            const bool reuse_allowed=root_reuse && options.context_cache.enabled &&
+            // Media prompts neither reuse nor publish roots: roots are matched
+            // by token ids, which do not identify the media content.
+            const bool reuse_allowed=root_reuse && options.context_cache.enabled && !media &&
                 request.options.execution.allow_prefix_reuse && prepared.identity.reusable;
             std::shared_ptr<const Exl3VeriCacheRequest> reused;
             if(reuse_allowed)
@@ -3116,7 +3214,7 @@ struct Exl3EngineCore::Impl {
                     std::move(child));
                 device_lease.reset();
                 if(terminal_root_observer)terminal_root_observer(host_lease->root);
-                if(options.context_cache.enabled &&
+                if(options.context_cache.enabled && !media &&
                    request.options.execution.allow_prefix_reuse &&
                    !request.cancelled && prepared.identity.reusable &&
                    output.completed_chat_turn() &&

@@ -336,12 +336,12 @@ ninfer_cuda_archive(ninfer_exl3_text_model)
 target_include_directories(ninfer_exl3_text_model PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_exl3_text_model PUBLIC ninfer_exl3_gdn ninfer_exl3_format ninfer_ops)
 
-# Explicit V6 numerical bring-up; not linked into the serving Engine yet.
-add_library(ninfer_exl3_vision STATIC exl3/vision_model.cu)
+# V6 numerical bring-up (research) and the serving BF16 Vision tower.
+add_library(ninfer_exl3_vision STATIC exl3/vision_model.cu exl3/vision_dense.cu)
 ninfer_internal_includes(ninfer_exl3_vision)
 ninfer_cuda_archive(ninfer_exl3_vision)
 target_include_directories(ninfer_exl3_vision PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-target_link_libraries(ninfer_exl3_vision PUBLIC ninfer_exl3_cuda ninfer_exl3_format ninfer_core PRIVATE CUDA::cublas)
+target_link_libraries(ninfer_exl3_vision PUBLIC ninfer_exl3_cuda ninfer_exl3_format ninfer_core ninfer_ops PRIVATE CUDA::cublas)
 # E5A2 minimal native DFlash2 draft adapter. Separate 5-layer draft model bound to
 # the qualified EXL3 Qwen3.8-27B target taps/head. Correctness-first and isolated
 # from the product engine; not part of the E4C1 qualified target decode path.

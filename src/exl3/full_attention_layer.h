@@ -664,6 +664,9 @@ public:
     // Decode-only graph path: kernels read the current position through this
     // stable device pointer instead of a captured host scalar.
     void set_position_device(const int* position_device) noexcept;
+    // Rotary position map of the owning context (rope_map.cuh); read by every
+    // Q/K RoPE launch, so captured graphs follow per-request vision positions.
+    void set_rope_map(const int* map) noexcept { rope_map_ = map; }
     // L0 OSCAR: after the host K/V planes were restored to `position`, reload
     // the device window (sink and recent rows) and re-encode the history.
     void l0_refresh_window(int position, cudaStream_t stream);
@@ -1137,6 +1140,7 @@ private:
     int fast_wmma32_split_count_ = 0;
     int fast_wmma32_split2_capacity_splits_ = 0;
     const int* position_device_ = nullptr;
+    const int* rope_map_ = nullptr;
     const int* mrope_positions_ = nullptr;
     int rope_offset_ = 0;
     Exl3OscarContext* oscar_ = nullptr;

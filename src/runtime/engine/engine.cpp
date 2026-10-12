@@ -126,7 +126,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if(options.exl3_package &&
        options.exl3_package->round_implementation==Exl3RoundImplementation::CoherentDevice) {
         constexpr std::uint64_t exact_kv_bytes_per_token=65536;
-        if(options.max_concurrency<1 || options.max_concurrency>8 || options.enable_vision || options.use_cuda_graph ||
+        if(options.max_concurrency<1 || options.max_concurrency>8 || options.use_cuda_graph ||
+           (options.enable_vision && options.exl3_package->vision_directory.empty()) ||
            options.hierarchical_vericache.enabled ||
            options.speculative.backend!=SpeculativeBackend::DFlash2 ||
            options.speculative.draft_tokens!=7 ||

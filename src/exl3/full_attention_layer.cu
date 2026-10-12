@@ -4,6 +4,7 @@
 #include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/sibling_rows.cuh"
+#include "exl3/rope_map.cuh"
 #include "exl3/kv_fakequant.cuh"
 #include "exl3/l0_oscar.cuh"
 #include "exl3/full_attention_layer.h"
@@ -174,7 +175,7 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
                             int rows,
                             int position,
                             const int* position_device,const int* positions_xyz,int offset,
-                            const int* chain_rows=nullptr) {
+                            const int* chain_rows=nullptr,const int* rope_map=nullptr) {
     EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kQHeads * kHeadDim;
@@ -186,6 +187,7 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
     const int base_position = position_device ? *position_device : position;
     int pos = base_position + sibling_row_offset(row, chain_rows);
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
+    else pos=exl3_rope_position(rope_map,pos,channel%(kRopeDim/2));
     float q = __half2float(__ushort_as_half(q_in[index]));
     float k = __half2float(__ushort_as_half(k_in[kv_index]));
     if (channel < kRopeDim) {
@@ -217,7 +219,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
                               int rows,
                               int position,
                               const int* position_device,const int* positions_xyz,int offset,
-                              const int* chain_rows=nullptr) {
+                              const int* chain_rows=nullptr,const int* rope_map=nullptr) {
     EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kKVHeads * kHeadDim;
@@ -227,6 +229,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
     const int base_position = position_device ? *position_device : position;
     int pos = base_position + sibling_row_offset(row, chain_rows);
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
+    else pos=exl3_rope_position(rope_map,pos,channel%(kRopeDim/2));
     float value = __half2float(__ushort_as_half(k_in[index]));
     if (channel < kRopeDim) {
         const int pair = channel < kRopeDim / 2 ? channel : channel - kRopeDim / 2;
@@ -249,7 +252,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
 __global__ void __launch_bounds__(256) decode_qk_prepare_kernel(const std::uint16_t* qg,
     const std::uint16_t* kp,const std::uint16_t* q_norm_weight,const std::uint16_t* k_norm_weight,
     std::uint16_t* qn,std::uint16_t* gate,std::uint16_t* kn,std::uint16_t* qr,std::uint16_t* kr,
-    int rows,int position,const int* position_device,const int* chain_rows) {
+    int rows,int position,const int* position_device,const int* chain_rows,const int* rope_map) {
     EXL3_PDL_SMALL_PROLOGUE();
     __shared__ float shared[256];
     __shared__ float normalized[kHeadDim];
@@ -283,7 +286,8 @@ __global__ void __launch_bounds__(256) decode_qk_prepare_kernel(const std::uint1
     normalized[channel]=__half2float(__ushort_as_half(norm_bits));
     __syncthreads();
     const int base_position=position_device?*position_device:position;
-    const int pos=base_position+sibling_row_offset(row,chain_rows);
+    const int pos=exl3_rope_position(rope_map,base_position+sibling_row_offset(row,chain_rows),
+        channel%(kRopeDim/2));
     float out=normalized[channel];
     if(channel<kRopeDim) {
         const int pair=channel<kRopeDim/2?channel:channel-kRopeDim/2;
@@ -8438,7 +8442,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
     if(qk_prepared) {
         exl3_launch_small(decode_qk_prepare_kernel,dim3(rows*(kQHeads+kKVHeads)),dim3(256),0,stream,
             qg,kp,weights_.q_norm,weights_.k_norm,qn,gp,kn,qr,kr,rows,position,position_device_,
-            position_device_?position_device_+1:nullptr);
+            position_device_?position_device_+1:nullptr,rope_map_);
         launch(cudaGetLastError(), "launch EXL3 fused decode Q/K preparation");
         begin(4); end(4); begin(5); end(5);
     } else {
@@ -8457,8 +8461,8 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
         exl3_launch_small(rope_k_kernel<true>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
     }else{
         const int* chain_rows=position_device_?position_device_+1:nullptr;
-        exl3_launch_small(rope_kernel<false>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,nullptr,0,chain_rows);
-        exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0,chain_rows);
+        exl3_launch_small(rope_kernel<false>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,nullptr,0,chain_rows,rope_map_);
+        exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0,chain_rows,rope_map_);
     }
     launch(cudaGetLastError(), "launch EXL3 RoPE"); end(5);
     }

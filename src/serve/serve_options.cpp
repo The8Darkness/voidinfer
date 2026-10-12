@@ -104,6 +104,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--no-dual-load]\n"
            "       EXL3 selection: --exl3-target DIR --exl3-draft DIR [--exl3-dual-manifest FILE]\n"
+           "                       [--exl3-vision DIR (BF16 Vision tower; enables image/video input)]\n"
            "       [--exl3-round established|coherent-device]; established is the default\n"
            "       explicit EXL3: established C1/C2 eager FP16 HostKV DFlash2 K7; coherent-device\n"
            "       requires C1, ordinary FP16 Device KV, 2048..32768 context, host-root cache,\n"
@@ -190,6 +191,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--exl3-draft") {
             if(!options.exl3_package)throw std::invalid_argument("--exl3-draft requires --exl3-target selection");
             options.exl3_package->draft_directory=require_value("--exl3-draft");
+        } else if(arg=="--exl3-vision") {
+            if(!options.exl3_package)throw std::invalid_argument("--exl3-vision requires --exl3-target selection");
+            options.exl3_package->vision_directory=require_value("--exl3-vision");
+            options.enable_vision=true;
         } else if(arg=="--exl3-dual-manifest") {
             if(!options.exl3_package)throw std::invalid_argument("EXL3 manifest requires package selection");
             options.exl3_package->verified_dual_manifest=require_value("--exl3-dual-manifest");
@@ -514,13 +519,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
            (sampling.frequency_penalty && *sampling.frequency_penalty!=0.0f))
             throw std::invalid_argument(
                 "coherent-device EXL3 does not support presence/frequency penalties");
-        if(options.max_concurrency<1 || options.max_concurrency>8 || options.enable_vision || options.use_cuda_graph ||
+        if(options.max_concurrency<1 || options.max_concurrency>8 || options.use_cuda_graph ||
+           (options.enable_vision && options.exl3_package->vision_directory.empty()) ||
            options.hierarchical_vericache.enabled ||
            options.speculative.backend!=SpeculativeBackend::DFlash2 ||
            options.speculative.draft_tokens!=7 ||
            options.speculative.proposal_head!=ProposalHead::Full)
             throw std::invalid_argument(
-                "coherent-device EXL3 requires C1..C8 text/eager/DFlash2-K7 full proposals");
+                "coherent-device EXL3 requires C1..C8 eager/DFlash2-K7 full proposals (vision: --exl3-vision DIR)");
         // L0 OSCAR (INT2 history in VRAM, FP16 K/V in mapped host memory) admits 256K.
         const char* l0_oscar=std::getenv("NINFER_EXL3_L0_OSCAR");
         const int coherent_context_limit=!l0_oscar || std::string_view(l0_oscar)!="0"?262144:32768;

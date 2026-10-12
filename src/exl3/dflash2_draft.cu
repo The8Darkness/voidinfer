@@ -1177,7 +1177,7 @@ __global__ void dflash_attention_ring_kernel(const std::uint16_t* q,
                                              const std::uint16_t* v_blk,
                                              std::uint16_t* out,
                                              int queries, int block_keys,
-                                             float scale) {
+                                             float scale, const int* block_pos = nullptr) {
     const int q_idx = static_cast<int>(blockIdx.x);
     const int query = q_idx / kQHeads;
     const int head = q_idx % kQHeads;
@@ -1191,6 +1191,9 @@ __global__ void dflash_attention_ring_kernel(const std::uint16_t* q,
     // oldest keys for late block rows at a full ring. kRingCap == sliding_window.
     int ctx_start = ctx_keys + query - (kRingCap - 1);
     if (ctx_start < 0) ctx_start = 0;
+    // Short contexts: ring keys before cache position 0 (virtual saturation
+    // padding) are not part of the context.
+    if (block_pos) ctx_start = max(ctx_start, ctx_keys - *block_pos);
     float maximum = -3.402823466e+38F;
     for (int key = ctx_start; key < ctx_keys; ++key) {
         const int slot = (ring_start_slot + key) & kRingMask;
@@ -1236,7 +1239,8 @@ __global__ void dflash_attention_ring_kernel(const std::uint16_t* q,
 __global__ void dflash_attention_ring_parallel_kernel(const std::uint16_t* q,
     const std::uint16_t* ring_k, const std::uint16_t* ring_v, int ring_start_slot,
     int ctx_keys, const std::uint16_t* k_blk, const std::uint16_t* v_blk,
-    std::uint16_t* out, int queries, int block_keys, float scale) {
+    std::uint16_t* out, int queries, int block_keys, float scale,
+    const int* block_pos = nullptr) {
     const int q_idx = static_cast<int>(blockIdx.x);
     const int query = q_idx / kQHeads;
     const int head = q_idx % kQHeads;
@@ -1254,6 +1258,9 @@ __global__ void dflash_attention_ring_parallel_kernel(const std::uint16_t* q,
     __syncthreads();
     int ctx_start = ctx_keys + query - (kRingCap - 1);
     if (ctx_start < 0) ctx_start = 0;
+    // Short contexts: ring keys before cache position 0 (virtual saturation
+    // padding) are not part of the context.
+    if (block_pos) ctx_start = max(ctx_start, ctx_keys - *block_pos);
     const int context = ctx_keys - ctx_start;
     const int keys = context + block_keys;
     __shared__ float scores[kRingKeep + kBlockCap];
@@ -1331,7 +1338,7 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
     const std::uint16_t* q, const std::uint16_t* ring_k, const std::uint16_t* ring_v,
     int ring_start_slot, int ctx_keys, const std::uint16_t* k_blk,
     const std::uint16_t* v_blk, std::uint16_t* out, int queries, int block_keys,
-    float scale) {
+    float scale, const int* block_pos = nullptr) {
     const int q_idx = static_cast<int>(blockIdx.x);
     const int query = q_idx / kQHeads;
     const int head = q_idx % kQHeads;
@@ -1348,6 +1355,9 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
     query_values[t] = half_to_float(q_row[t]);
     int ctx_start = ctx_keys + query - (kRingCap - 1);
     if (ctx_start < 0) ctx_start = 0;
+    // Short contexts: ring keys before cache position 0 (virtual saturation
+    // padding) are not part of the context.
+    if (block_pos) ctx_start = max(ctx_start, ctx_keys - *block_pos);
     const int context = ctx_keys - ctx_start;
     const int keys = context + block_keys;
     __syncthreads();
@@ -1459,9 +1469,12 @@ __global__ void __launch_bounds__(kMmaThreads) dflash_attention_ring_mma_kernel(
     const std::uint16_t* q, const std::uint16_t* ring_k, const std::uint16_t* ring_v,
     int ring_start_slot, int ctx_keys, const std::uint16_t* k_blk,
     const std::uint16_t* v_blk, int queries, int block_keys, float scale,
-    float* partial_o, float* partial_ml, const int* ring_start_device = nullptr) {
+    float* partial_o, float* partial_ml, const int* ring_start_device = nullptr,
+    const int* block_pos = nullptr) {
     // Captured batched drafts read the per-round ring start from the device.
     if (ring_start_device) ring_start_slot = *ring_start_device;
+    // Ring key index below which keys lie before cache position 0 (padding).
+    const int floor_key = block_pos ? ctx_keys - *block_pos : -2147483647;
     constexpr int group = kQHeads / kKVHeads;
     const int chunk = static_cast<int>(blockIdx.x);
     const int kv_head = static_cast<int>(blockIdx.y);
@@ -1537,7 +1550,8 @@ __global__ void __launch_bounds__(kMmaThreads) dflash_attention_ring_mma_kernel(
                 const int key = first + local;
                 // Query r / group sees context keys from ctx_keys + query - 2047 on.
                 const bool valid = r < rows && key < keys &&
-                    (key >= context || lo + key >= ctx_keys + r / group - (kRingCap - 1));
+                    (key >= context || (lo + key >= ctx_keys + r / group - (kRingCap - 1) &&
+                                        lo + key >= floor_key));
                 ss[r][local] = valid ? c[n][e] * scale : -INFINITY;
             }
         }
@@ -1656,12 +1670,12 @@ void launch_ring_attention_split(const std::uint16_t* q, const std::uint16_t* ri
     const std::uint16_t* ring_v, int ring_start_slot, int ctx_keys,
     const std::uint16_t* k_blk, const std::uint16_t* v_blk, std::uint16_t* out,
     int queries, int block_keys, float scale, float* partial_o, float* partial_ml,
-    cudaStream_t stream, const int* ring_start_device = nullptr) {
+    cudaStream_t stream, const int* ring_start_device = nullptr, const int* block_pos = nullptr) {
     const int context = ctx_keys - std::max(0, ctx_keys - (kRingCap - 1));
     const int chunks = (context + block_keys + kMmaChunk - 1) / kMmaChunk;
     dflash_attention_ring_mma_kernel<<<dim3(chunks, kKVHeads), kMmaThreads, 0, stream>>>(
         q, ring_k, ring_v, ring_start_slot, ctx_keys, k_blk, v_blk, queries, block_keys,
-        scale, partial_o, partial_ml, ring_start_device);
+        scale, partial_o, partial_ml, ring_start_device, block_pos);
     dflash_attention_ring_combine_kernel<<<dim3(queries * (kQHeads / kKVHeads), kKVHeads),
         kHeadDim, 0, stream>>>(partial_o, partial_ml, out, queries, chunks);
 }
@@ -3171,6 +3185,29 @@ struct Exl3Dflash2DraftModel::Impl {
     } ring_undo;
     long long ring_base_abs = 0;
     int ring_count = 0;
+    // Short contexts (< kRingKeep committed rows): the ring is presented as
+    // saturated, its oldest slots lying before cache position 0. They are
+    // zeroed and the ring attention masks them (block position); host ring
+    // exports carry only the real rows.
+    void saturate_virtually(cudaStream_t stream) {
+        if (ring_count <= 0 || ring_count >= kRingKeep) return;
+        const long long end = ring_base_abs + ring_count;
+        for (long long cursor = end; cursor < end + (kRingCap - ring_count);) {
+            const long long slot = cursor & kRingMask;
+            const long long rows = std::min<long long>(end + (kRingCap - ring_count) - cursor,
+                                                       kRingCap - slot);
+            const std::size_t row_bytes = static_cast<std::size_t>(kKVHeads) * kHeadDim * sizeof(std::uint16_t);
+            for (int layer = 0; layer < kLayers; ++layer) {
+                cuda_check(cudaMemsetAsync(ring_k[layer] + slot * kKVHeads * kHeadDim, 0,
+                    static_cast<std::size_t>(rows) * row_bytes, stream), "zero draft ring padding");
+                cuda_check(cudaMemsetAsync(ring_v[layer] + slot * kKVHeads * kHeadDim, 0,
+                    static_cast<std::size_t>(rows) * row_bytes, stream), "zero draft ring padding");
+            }
+            cursor += rows;
+        }
+        ring_base_abs = end - kRingKeep;
+        ring_count = kRingKeep;
+    }
     FreshPrefillStatus fresh_prefill;
     cudaStream_t fresh_prefill_stream = nullptr;
     std::size_t ring_bytes = 0;
@@ -3830,8 +3867,11 @@ std::shared_ptr<const Exl3DraftHostRing> Exl3Dflash2DraftModel::export_host_ring
     cuda_check(cudaStreamIsCapturing(stream,&capture),"draft host export capture status");
     require(capture==cudaStreamCaptureStatusNone,"draft host export requires eager stream");
     cuda_check(cudaStreamSynchronize(stream),"draft host export completed ring");
-    auto result=Exl3DraftHostRing::create_planned(Exl3DraftHostRing::planned_page_capacity(m.ring_base_abs,m.ring_count),reserve);
-    result->model_identity_=m.host_ring_identity;result->base_=m.ring_base_abs;result->count_=m.ring_count;
+    // A virtually saturated ring exports its real rows only (from position 0).
+    const long long export_base=std::max<long long>(m.ring_base_abs,0);
+    const int export_count=static_cast<int>(m.ring_base_abs+m.ring_count-export_base);
+    auto result=Exl3DraftHostRing::create_planned(Exl3DraftHostRing::planned_page_capacity(export_base,export_count),reserve);
+    result->model_identity_=m.host_ring_identity;result->base_=export_base;result->count_=export_count;
     const auto end=result->position();
     const auto parent=share_prefix?m.host_ring_parent:nullptr;
     long long cursor=result->base_;
@@ -4065,6 +4105,7 @@ void Exl3Dflash2DraftModel::restore_host_ring(std::shared_ptr<const Exl3DraftHos
             cuda_check(cudaStreamSynchronize(stream),"draft host restore complete");
         }
         m.ring_base_abs=state->base_;m.ring_count=state->count_;m.host_ring_parent=std::move(state);m.host_ring_failed=false;
+        m.saturate_virtually(stream);
         m.witness_revision=m.ring_revision;m.ring_witness_ready=true;
         m.witness_acquisition=m.ring_acquisition;m.witness_execution=m.ring_execution;
     } catch(...) {m.ring_base_abs=0;m.ring_count=0;throw;}
@@ -4204,6 +4245,7 @@ void Exl3Dflash2DraftModel::finish_fresh_prefill(cudaStream_t stream) {
         require(impl_->ring_count == count && impl_->ring_base_abs == f.end - count,
                 "fresh prefill final ring span mismatch");
         f.active = false;
+        impl_->saturate_virtually(stream);
     } catch (...) { f.failed = true; throw; }
 }
 
@@ -5154,7 +5196,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             "batched draft member outside the shared configuration");
         member->draft->require_no_fresh_prefill();
         const Impl& m=*member->draft->impl_;
-        require(m.ring_base_abs>=0 && member->block_pos0==m.ring_base_abs+m.ring_count &&
+        require(m.ring_base_abs>=-kRingKeep && member->block_pos0==m.ring_base_abs+m.ring_count &&
                 std::all_of(member->block.begin(),member->block.end(),
                     [](std::int64_t token){return token>=0 && token<kVocab;}),
             "batched draft block must extend its committed ring");
@@ -5260,13 +5302,15 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
                 if(dflash_ring_split_selected(m.ring_count))
                     launch_ring_attention_split(q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,
                         k,v,out,L,L,scale,m.s.ring_partial_o,m.s.ring_partial_ml,stream,
-                        device_scalars?b.ring_start+i:nullptr);
+                        device_scalars?b.ring_start+i:nullptr,b.pos+static_cast<std::size_t>(i)*L);
                 else if(dflash_ring_staged_enabled())
                     dflash_attention_ring_staged_kernel<<<L*kQHeads,kHeadDim,0,stream>>>(
-                        q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,k,v,out,L,L,scale);
+                        q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,k,v,out,L,L,scale,
+                        b.pos+static_cast<std::size_t>(i)*L);
                 else
                     dflash_attention_ring_parallel_kernel<<<L*kQHeads,kHeadDim,0,stream>>>(
-                        q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,k,v,out,L,L,scale);
+                        q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,k,v,out,L,L,scale,
+                        b.pos+static_cast<std::size_t>(i)*L);
                 cuda_check(cudaGetLastError(),"batched draft ring attention");
             }
             b.ws_o->forward(lay.o,lay.om,b.attn,b.oproj,rows,stream);
@@ -5642,7 +5686,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     if (use_ring) {
         require(m.ring_count >= 0 && m.ring_count <= kRingKeep,
                 "E5A3 ring length outside bounded capacity");
-        require(m.ring_base_abs>=0 && m.ring_base_abs<=std::numeric_limits<int>::max()-m.ring_count,
+        require(m.ring_base_abs>=-kRingKeep && m.ring_base_abs<=std::numeric_limits<int>::max()-m.ring_count,
                 "E5A3 committed ring position overflow");
         require(static_cast<std::int64_t>(block_pos0) == m.ring_base_abs + m.ring_count,
                 "E5A3 cached block must immediately extend the committed span");
@@ -6336,19 +6380,23 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             if (m.parallel_ring_attention && dflash_ring_split_selected(private_ring_count))
                 launch_ring_attention_split(m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index],
                     ring_start, private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len,
-                    block_len, scale, m.s.ring_partial_o, m.s.ring_partial_ml, stream);
+                    block_len, scale, m.s.ring_partial_o, m.s.ring_partial_ml, stream, nullptr,
+                    m.s.pos_blk);
             else if (m.parallel_ring_attention && dflash_ring_staged_enabled())
                 dflash_attention_ring_staged_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
-                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
+                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale,
+                    m.s.pos_blk);
             else if (m.parallel_ring_attention)
                 dflash_attention_ring_parallel_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
-                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
+                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale,
+                    m.s.pos_blk);
             else
                 dflash_attention_ring_kernel<<<block_len * kQHeads, 1, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
-                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
+                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale,
+                    m.s.pos_blk);
             cuda_check(cudaGetLastError(), "launch ring attention");
             if (m.ring_attention_observer) {
                 RingAttentionObservation observation{m.s.qr, m.ring_k[layer_index],
