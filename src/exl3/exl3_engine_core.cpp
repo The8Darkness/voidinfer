@@ -33,6 +33,7 @@
 #include "exl3/device_page_readers.h"
 #include "exl3/attention_stage_resources.h"
 #include "exl3/native_context_extent.h"
+#include "exl3/l0_oscar_format.h"
 #include "exl3/control_publication_boundary.h"
 #include "exl3/host_preparation_completion.h"
 #include "exl3/public_media_qualification.h"
@@ -473,6 +474,75 @@ struct Exl3EngineCore::Impl {
     std::condition_variable changed;
     ReservedRequestQueue<Request> queue;
     std::array<std::shared_ptr<Request>,kMaxLanes> active;
+    // L0 OSCAR code memory of concurrent lanes (coherent-device C>=2): the
+    // INT4 code/meta planes grow with each lane's context on the device.
+    // Past physical VRAM, WDDM silently demotes allocations to system memory
+    // (one 4 x 104K run: a lane's history kernel 10x slower, every batched
+    // round ~2.5x slower). A lane only takes a request whose projected codes
+    // (input + output allowance) fit beside the other active lanes'; the
+    // request otherwise waits for a lane to finish. The budget is the free
+    // device memory at the first admission (no request active) minus
+    // NINFER_EXL3_L0_CODE_RESERVE_MIB (default 1280: layer-major projection
+    // cache and headroom); NINFER_EXL3_L0_CODE_ADMISSION=0 disables.
+    std::array<std::uint64_t,kMaxLanes> lane_code_projection{};
+    std::uint64_t l0_code_budget=0;
+    bool l0_code_budget_measured=false;
+    static std::uint64_t projected_l0_code_bytes(std::size_t tokens) {
+        // Per token: 16 full-attention layers x 4 KV heads x (K and V codes + FP16 metadata),
+        // plus half a 2 MiB granule of rounding for each of the 32 code planes.
+        constexpr std::uint64_t per_token=16ull*4ull*2ull*
+            (l0_oscar_format::kCodeBytes+l0_oscar_format::kMetaHalves*2ull);
+        return static_cast<std::uint64_t>(tokens)*per_token+32ull*(1ull<<20);
+    }
+    bool l0_code_admission_enabled() const {
+        static const bool enabled=[] {
+            const char* value=std::getenv("NINFER_EXL3_L0_CODE_ADMISSION");
+            return !value || std::string_view(value)!="0";
+        }();
+        return enabled && coherent_device && options.max_concurrency>=2 &&
+            Exl3NativeContextExtent::l0_oscar_enabled();
+    }
+    std::uint64_t request_code_projection(const Request& request) const {
+        const auto input=request.ready_work.input_tokens().size();
+        const auto output=static_cast<std::size_t>(request.options.execution.requested_output_tokens);
+        return projected_l0_code_bytes(std::min<std::size_t>(input+output,options.max_context));
+    }
+    // Locked: whether `request` fits beside the other active lanes' codes.
+    // Requests younger than the oldest one waiting for code memory wait as
+    // well (lanes drain until it fits; smaller arrivals cannot starve it).
+    bool l0_codes_fit_locked(const Request& request,std::size_t lane_index) {
+        if(!l0_code_admission_enabled())return true;
+        const auto submitted=request.ready_work.submitted();
+        for(const auto& queued:queue) {
+            if(queued.get()==&request)break;
+            if(queued->cancelled.load(std::memory_order_acquire) ||
+               queued->ready_work.submitted()>submitted)continue;
+            if(!l0_codes_fit_alone_locked(*queued,lane_index))return false;
+        }
+        return l0_codes_fit_alone_locked(request,lane_index);
+    }
+    bool l0_codes_fit_alone_locked(const Request& request,std::size_t lane_index) {
+        if(!l0_code_admission_enabled())return true;
+        std::uint64_t others=0;bool any=false;
+        for(std::size_t i=0;i<options.max_concurrency;++i)
+            if(i!=lane_index && active[i]) {any=true;others+=lane_code_projection[i];}
+        if(!l0_code_budget_measured) {
+            if(any)return true;   // measured at the first admission with no lane active
+            std::size_t free=0,total=0;
+            if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return true;
+            static const std::uint64_t reserve=[] {
+                const char* value=std::getenv("NINFER_EXL3_L0_CODE_RESERVE_MIB");
+                return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):1280L)<<20;
+            }();
+            l0_code_budget=free>reserve?free-reserve:0;
+            l0_code_budget_measured=true;
+            if(std::getenv("NINFER_EXL3_MEMORY_TRACE"))
+                std::fprintf(stderr,"L0_CODE_BUDGET free=%.1f MiB budget=%.1f MiB%c",free/1048576.0,
+                    l0_code_budget/1048576.0,10);
+        }
+        // A lone lane always runs (its own context bound is the Engine's max_context).
+        return !any || others+request_code_projection(request)<=l0_code_budget;
+    }
     Exl3ReadyWorkSnapshotAuthority ready_work_authority;
     struct LaneFrontier {
         std::weak_ptr<const Exl3VeriCacheRequest> root;
@@ -2130,7 +2200,8 @@ struct Exl3EngineCore::Impl {
             const bool identity_compatible=signature.device==options.device &&
                 Exl3ReadyExecutionSignature::same_owner(signature.model_owner,target);
             const bool physical_resources=!active[lane_index] && lanes[lane_index] &&
-                drafts[lane_index] && request->result_lease.has_value();
+                drafts[lane_index] && request->result_lease.has_value() &&
+                l0_codes_fit_locked(*request,lane_index);
             if(cancelled)increment(cancelled_rejected);
             else if(!identity_compatible)increment(identity_rejected);
             else if(!physical_resources)increment(physical_rejected);
@@ -3693,6 +3764,8 @@ struct Exl3EngineCore::Impl {
                         .reason=reason});
                 }
                 queue.erase(position);active[lane_index]=request;
+                lane_code_projection[lane_index]=l0_code_admission_enabled()?
+                    request_code_projection(*request):0;
                 lane_frontiers[lane_index]={};
                 if(request_affinity) {
                     if(affine)++stats.request_affinity_assignments;
@@ -4311,7 +4384,7 @@ struct Exl3EngineCore::Impl {
             }
             request->result.timings.total_seconds=seconds(request->submitted)+request->result.timings.prepare_seconds;
             {std::lock_guard lock(request->mutex);request->done=true;}request->changed.notify_all();
-            {std::lock_guard lock(mutex);active[lane_index].reset();--outstanding;
+            {std::lock_guard lock(mutex);active[lane_index].reset();lane_code_projection[lane_index]=0;--outstanding;
                 ready_work_authority.revise();--stats.running_requests;}
             changed.notify_all();
         }
