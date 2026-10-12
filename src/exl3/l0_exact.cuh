@@ -254,7 +254,7 @@ inline void l0_launch_exact_history(const void* q,const std::uint16_t* k_src,con
 }
 
 // FP8 history mirror of the asynchronous VeriCache line
-// (NINFER_EXL3_VERICACHE_LINE_FP8): the L2 history rows as e4m3 with one FP16
+// (VOIDINFER_EXL3_VERICACHE_LINE_FP8): the L2 history rows as e4m3 with one FP16
 // scale per (row, KV head) (absmax / 448), row-interleaved like
 // l0_l2_fp8.cuh (1024 value bytes + 4 scales, padded to 1040 bytes per row), in host memory beside
 // the FP16 planes. Rows [kSink, *valid) hold the FP8 image of the FP16 rows;
@@ -264,22 +264,22 @@ inline void l0_launch_exact_history(const void* q,const std::uint16_t* k_src,con
 // drafting context's exact prompt passes) the FP16 history stays as staged
 // and only the rows past `valid` are packed into the mirror.
 constexpr int kL0LineFp8RowBytes=1040;   // 16-byte aligned rows (cp.async)
-// FP8 math for the line's history (NINFER_EXL3_LINE_FP8_MATH=1, opt-in):
+// FP8 math for the line's history (VOIDINFER_EXL3_LINE_FP8_MATH=1, opt-in):
 // Q and P also e4m3 (attention_fp8_history_kernel); otherwise FP16 math on
 // the FP8 rows. 16K/32K KL vs FP16 history equal to FP16 math (0.005-0.006),
 // rounds -0.6% at 128K, -2.6% at 254K.
 inline bool line_fp8_math() {
     static const bool value=[] {
-        const char* v=std::getenv("NINFER_EXL3_LINE_FP8_MATH");
+        const char* v=std::getenv("VOIDINFER_EXL3_LINE_FP8_MATH");
         return v && std::strcmp(v,"1")==0;
     }();
     return value;
 }
 // The line attends the FP8 staging directly (FA2 FP8 tiles) instead of
-// expanding it to FP16 first; NINFER_EXL3_LINE_FP8_ATTENTION=0 expands.
+// expanding it to FP16 first; VOIDINFER_EXL3_LINE_FP8_ATTENTION=0 expands.
 inline bool line_fp8_attention() {
     static const bool value=[] {
-        const char* v=std::getenv("NINFER_EXL3_LINE_FP8_ATTENTION");
+        const char* v=std::getenv("VOIDINFER_EXL3_LINE_FP8_ATTENTION");
         return !v || std::strcmp(v,"0")!=0;
     }();
     return value;
@@ -398,14 +398,14 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
     // "history written" mark of this stream (l0_history_mark.h: recorded by
     // the enclosing forward pass, all layers final below its limit) are copied
     // under that mark's event, overlapping the work since the pass began; the
-    // remaining rows wait for this call. NINFER_EXL3_L0_EARLY_HISTORY_COPY=0
+    // remaining rows wait for this call. VOIDINFER_EXL3_L0_EARLY_HISTORY_COPY=0
     // copies everything after this call's fork.
     static const bool early_copy=[] {
-        const char* value=std::getenv("NINFER_EXL3_L0_EARLY_HISTORY_COPY");
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_EARLY_HISTORY_COPY");
         return !value || std::strcmp(value,"0")!=0;
     }();
     cuda_check(cudaEventRecord(stage.fork,stream),"L0 exact staging fork");
-    const auto& written=ninfer::exl3::l0_history_written();
+    const auto& written=voidinfer::exl3::l0_history_written();
     const int early_limit=early_copy && written.event && written.stream==stream &&
         written.limit>l0::kSink ? written.limit : -1;
     bool forked=early_limit<0;
@@ -414,8 +414,8 @@ inline void l0_exact_history_staged(const void* q,const std::uint16_t* k_src,con
     const auto submit=[&](int piece) {
         const int b=piece&1,first=l0::kSink+piece*kL0ExactPieceRows;
         const int last=std::min(history_end,first+kL0ExactPieceRows);
-        if(piece>=2 && ninfer::exl3::l0_exact_host_throttle())
-            cuda_check(ninfer::cuda_poll_event(stage.consumed[b]),"L0 exact staging throttle");
+        if(piece>=2 && voidinfer::exl3::l0_exact_host_throttle())
+            cuda_check(voidinfer::cuda_poll_event(stage.consumed[b]),"L0 exact staging throttle");
         cuda_check(cudaStreamWaitEvent(stage.copy,stage.consumed[b],0),"L0 exact staging reuse");
         const auto copy=[&](int from,int to) {
             if(to<=from) return;

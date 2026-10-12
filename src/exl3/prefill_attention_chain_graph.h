@@ -8,7 +8,7 @@
 #include <memory>
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Retains the exact selected score/softmax/value launch chain for one of the
 // three history-bearing 1024-row chunks of a 4096-token prefill.  The body is
@@ -56,4 +56,4 @@ private:
 Exl3PrefillAttentionChainGraph::Snapshot
 exl3_prefill_attention_chain_global_snapshot() noexcept;
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

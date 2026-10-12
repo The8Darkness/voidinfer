@@ -12,8 +12,8 @@
 // Planned groups{0,1,2,19,20,39} cover256-column tile boundaries and the tail.
 // Selected-column oracle coverage is separate from full-output M1 parity.
 H6OracleStats target_down_k6_check_oracle_groups(
-    const ninfer::exl3::Exl3CudaLinearWeights& weights,
-    const ninfer::exl3::Exl3CudaLinearMetadata& metadata,
+    const voidinfer::exl3::Exl3CudaLinearWeights& weights,
+    const voidinfer::exl3::Exl3CudaLinearMetadata& metadata,
     const std::vector<std::uint16_t>& input,
     const std::vector<std::uint16_t>& actual_with_guards,
     std::size_t guard,

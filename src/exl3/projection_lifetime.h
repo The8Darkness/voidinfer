@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 inline int exl3_down_slice_columns(std::size_t bytes) {
     for(int columns:{256,512,1024,5120})
@@ -60,4 +60,4 @@ struct Exl3ExactDownLifetimePlan {
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

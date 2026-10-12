@@ -2,7 +2,7 @@
 #include "exl3/packed_projection.h"
 #include "exl3/linear_cuda.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3PackedProjectionReceipt {
     std::uint64_t physical_batches=0,rows=0,gather_bytes=0,scatter_bytes=0;
 };
@@ -104,4 +104,4 @@ inline Exl3PackedProjectionReceipt dispatch_exl3_packed_q_projection(
     return dispatch_exl3_packed_target_projection(plan,workspace,weights,metadata,input,input_elements,
         output,output_elements,live,stream,Exl3CudaLinearAdmission::target_continuation_q);
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

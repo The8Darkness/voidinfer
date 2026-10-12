@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Read represented FP16 scores, never pre-cast head accumulators. No FP
 // arithmetic reduction: only comparisons, with the lowest index winning ties.
 // Each row scans its complete logical vocabulary; stride padding is ignored.
@@ -247,7 +247,7 @@ static __global__ void __launch_bounds__(256) exl3_greedy_packet_split_kernel(
 
 inline bool exl3_greedy_wide_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_GREEDY_WIDE");
+        const char* value=std::getenv("VOIDINFER_EXL3_GREEDY_WIDE");
         return !value || (value[0]!='0');
     }();
     return enabled;
@@ -257,7 +257,7 @@ inline void exl3_launch_greedy_packet(bool warp,int rows,cudaStream_t stream,
     const std::uint16_t* scores,int vocabulary,int stride,std::uint64_t serial,
     Exl3GreedyRow* output,const Exl3GreedySplitScratch& scratch) {
     static const bool split=[] {
-        const char* value=std::getenv("NINFER_EXL3_GREEDY_SPLIT");
+        const char* value=std::getenv("VOIDINFER_EXL3_GREEDY_SPLIT");
         return !value || (value[0]!='0');
     }();
     if(split && scratch.arrivals && rows<=kGreedySplitMaxRows && stride%8==0 &&
@@ -270,4 +270,4 @@ inline void exl3_launch_greedy_packet(bool warp,int rows,cudaStream_t stream,
     else if(warp)exl3_greedy_packet_kernel<true><<<rows,256,0,stream>>>(scores,vocabulary,stride,serial,output);
     else exl3_greedy_packet_kernel<false><<<rows,256,0,stream>>>(scores,vocabulary,stride,serial,output);
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

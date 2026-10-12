@@ -19,10 +19,10 @@
 
 namespace {
 
-std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
+std::atomic<voidinfer::serve::HttpServer*> g_server{nullptr};
 
 void handle_signal(int) {
-    ninfer::serve::HttpServer* server = g_server.load();
+    voidinfer::serve::HttpServer* server = g_server.load();
     if (server != nullptr) { server->stop(); }
 }
 
@@ -42,19 +42,19 @@ std::string format_bytes(std::size_t bytes) {
 } // namespace
 
 int main(int argc, char** argv) {
-    ninfer::serve::ServeOptions options;
+    voidinfer::serve::ServeOptions options;
     try {
-        options = ninfer::serve::parse_serve_options(argc, argv);
+        options = voidinfer::serve::parse_serve_options(argc, argv);
     } catch (const std::invalid_argument& exception) {
-        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
-        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
+        voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Error, exception.what());
+        std::cerr << voidinfer::serve::serve_usage_text(argv[0]);
         return 1;
     } catch (const std::exception& exception) {
-        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
+        voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Error, exception.what());
         return 1;
     }
     if (options.help_requested) {
-        std::cout << ninfer::serve::serve_usage_text(argv[0]);
+        std::cout << voidinfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
 
@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
         // fail early if it does not.
         if (options.webui_auto) {
             options.webui_dir =
-                ninfer::serve::ensure_webui_available(ninfer::serve::resolve_webui_dir(options));
+                voidinfer::serve::ensure_webui_available(voidinfer::serve::resolve_webui_dir(options));
         } else if (!options.webui_dir.empty()) {
             std::error_code ec;
             const bool have_index =
@@ -76,31 +76,31 @@ int main(int argc, char** argv) {
             }
         }
         using Clock = std::chrono::steady_clock;
-        ninfer::serve::HttpServer server(options);
+        voidinfer::serve::HttpServer server(options);
         if (!server.bind()) {
-            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error,
+            voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Error,
                                              "failed to bind " + options.host + ':' +
                                                  std::to_string(options.port));
             return 1;
         }
 
-        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "loading model...");
-        auto load_progress_options        = ninfer::product::stderr_load_progress_options();
+        voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Info, "loading model...");
+        auto load_progress_options        = voidinfer::product::stderr_load_progress_options();
         load_progress_options.line_prefix = [] {
-            return ninfer::serve::current_console_log_prefix(ninfer::serve::ConsoleLogLevel::Info);
+            return voidinfer::serve::current_console_log_prefix(voidinfer::serve::ConsoleLogLevel::Info);
         };
-        ninfer::product::LoadProgressRenderer load_progress(std::cerr,
+        voidinfer::product::LoadProgressRenderer load_progress(std::cerr,
                                                             std::move(load_progress_options));
         const auto load_start = Clock::now();
-        ninfer::serve::GenerationService service(options, load_progress.callback());
+        voidinfer::serve::GenerationService service(options, load_progress.callback());
         std::ostringstream loaded;
         loaded << "model loaded in "
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
-        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
+        voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Info, loaded.str());
 
-        const ninfer::MemorySummary memory       = service.memory_summary();
-        const ninfer::EngineOptions& engine      = service.engine_options();
-        const ninfer::ContextCacheOptions& cache = engine.context_cache;
+        const voidinfer::MemorySummary memory       = service.memory_summary();
+        const voidinfer::EngineOptions& engine      = service.engine_options();
+        const voidinfer::ContextCacheOptions& cache = engine.context_cache;
         std::ostringstream capacity;
         capacity << "lanes=" << engine.max_concurrency << " max-context=" << engine.max_context
                  << " weights=" << format_bytes(memory.weights.capacity_bytes)
@@ -111,14 +111,14 @@ int main(int argc, char** argv) {
                  << " shared=" << *cache.max_shared_prefixes
                  << " speculative=dflash2-k7 vision=" << (engine.vision_enabled() ? "bf16" : "off");
         if (options.vision_enabled()) {
-            const ninfer::MediaCacheSummary media = service.media_cache_summary();
+            const voidinfer::MediaCacheSummary media = service.media_cache_summary();
             capacity << " media-workers=" << media.preprocess_threads
                      << " media-cache=" << format_bytes(media.capacity_bytes)
                      << " media-live=" << format_bytes(media.live_capacity_bytes);
         }
-        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());
+        voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Info, capacity.str());
 
-        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
+        voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
         server.attach(service);
 
@@ -130,19 +130,19 @@ int main(int argc, char** argv) {
         listening << "listening on http://" << options.host << ':' << options.port
                   << " (model id: " << server.public_model_id()
                   << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
-        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, listening.str());
+        voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Info, listening.str());
 
         const bool ok = server.listen();
         g_server.store(nullptr);
         if (!ok) {
-            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error,
+            voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Error,
                                              "failed to bind " + options.host + ':' +
                                                  std::to_string(options.port));
             return 1;
         }
         return 0;
     } catch (const std::exception& exception) {
-        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
+        voidinfer::serve::write_console_log(voidinfer::serve::ConsoleLogLevel::Error, exception.what());
         return 1;
     }
 }

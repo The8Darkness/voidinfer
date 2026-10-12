@@ -3,7 +3,7 @@
 // full_attention_layer.cu after the verifier MMA helpers; shares their
 // fragment layout, online softmax and fused-flash slot format.
 
-namespace l0 = ninfer::exl3::l0_oscar;
+namespace l0 = voidinfer::exl3::l0_oscar;
 
 // Verifier history attention over INT4 codes, consumed straight from the
 // codes (no FP16 tiles):

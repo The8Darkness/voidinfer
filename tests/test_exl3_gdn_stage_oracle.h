@@ -67,7 +67,7 @@ void require_gdn_stage_oracle_commit_rejected(Exl3TextContext& context,
 }
 
 void require_gdn_stage_oracle_telemetry(
-    const ninfer::exl3::Exl3GdnStageOracleTelemetry& telemetry,
+    const voidinfer::exl3::Exl3GdnStageOracleTelemetry& telemetry,
     const std::string& label) {
     require(telemetry.staged_pairs == 1 && telemetry.projection_phases == 6 &&
                 telemetry.serial_b8_projection_calls == 12 &&
@@ -90,7 +90,7 @@ void run_gdn_stage_oracle(Exl3TextModel& target,
             "gdnstageoracle target context is too small");
     require(source.size() >= kPeerOffset + kSecondPosition + kRows,
             "gdnstageoracle source fixture is too short");
-    require(env("NINFER_OSCAR_EXL3") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1",
             "gdnstageoracle requires canonical OSCAR for rollback snapshots");
 
     const auto make_slice = [&](std::size_t offset, int rows) {
@@ -159,7 +159,7 @@ void run_gdn_stage_oracle(Exl3TextModel& target,
                                  bool save_repeat) {
         first->begin_transaction();
         second->begin_transaction();
-        ninfer::exl3::Exl3GdnStageOracleTelemetry telemetry{};
+        voidinfer::exl3::Exl3GdnStageOracleTelemetry telemetry{};
         const auto outputs = first->gdn_layer0_pair_staged_serial_for_test(
             *second, first_ids, second_ids, peer_first, nullptr, -1, &telemetry);
         require_gdn_stage_oracle_commit_rejected(*first, label + " first");
@@ -191,7 +191,7 @@ void run_gdn_stage_oracle(Exl3TextModel& target,
         for (const int fail_after_lane : {0, 1}) {
             first->begin_transaction();
             second->begin_transaction();
-            ninfer::exl3::Exl3GdnStageOracleTelemetry telemetry{};
+            voidinfer::exl3::Exl3GdnStageOracleTelemetry telemetry{};
             std::string failure;
             try {
                 (void)first->gdn_layer0_pair_staged_serial_for_test(

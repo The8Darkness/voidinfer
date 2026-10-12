@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3BatchedVerifyCoordinator {
 public:
@@ -254,10 +254,10 @@ private:
         bool done = false;
         std::exception_ptr error;
     };
-    // NINFER_EXL3_BATCHED_MAX_GROUP (2..4): widest group (research).
+    // VOIDINFER_EXL3_BATCHED_MAX_GROUP (2..4): widest group (research).
     static std::size_t max_group() {
         static const std::size_t value = [] {
-            const char* text = std::getenv("NINFER_EXL3_BATCHED_MAX_GROUP");
+            const char* text = std::getenv("VOIDINFER_EXL3_BATCHED_MAX_GROUP");
             const int parsed = text ? std::atoi(text) : static_cast<int>(kMaxGroup);
             return static_cast<std::size_t>(std::max(2, std::min(static_cast<int>(kMaxGroup), parsed)));
         }();
@@ -395,4 +395,4 @@ private:
     std::array<std::uint64_t, kMaxGroup + 1> widths_{};
 };
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

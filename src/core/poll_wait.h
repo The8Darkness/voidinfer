@@ -8,7 +8,7 @@
 // the following synchronizing call nothing to wait for.
 //
 // Enabled by the Engine where two host threads drive one device concurrently
-// (the asynchronous VeriCache line); NINFER_CUDA_POLL_WAITS=0|1 forces it.
+// (the asynchronous VeriCache line); VOIDINFER_CUDA_POLL_WAITS=0|1 forces it.
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -16,7 +16,7 @@
 #include <cstdlib>
 #include <string_view>
 
-namespace ninfer {
+namespace voidinfer {
 
 inline std::atomic<bool>& cuda_poll_waits_requested() {
     static std::atomic<bool> value{false};
@@ -25,7 +25,7 @@ inline std::atomic<bool>& cuda_poll_waits_requested() {
 inline void cuda_set_poll_waits(bool enabled) noexcept { cuda_poll_waits_requested().store(enabled); }
 inline bool cuda_poll_waits_enabled() {
     static const int forced = [] {
-        const char* value = std::getenv("NINFER_CUDA_POLL_WAITS");
+        const char* value = std::getenv("VOIDINFER_CUDA_POLL_WAITS");
         return value ? (std::string_view(value) != "0" ? 1 : 0) : -1;
     }();
     return forced >= 0 ? forced == 1 : cuda_poll_waits_requested().load(std::memory_order_relaxed);
@@ -59,4 +59,4 @@ inline cudaError_t cuda_poll_event(cudaEvent_t event) {
     }
 }
 
-}  // namespace ninfer
+}  // namespace voidinfer

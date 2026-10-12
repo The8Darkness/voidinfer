@@ -1,11 +1,11 @@
 #pragma once
 
 void run_exact_wide_qualification(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==4096 && source.size()>1400,"exact wide fixture extent");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
     auto reference=target.create_context(true);reference->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto baseline=target.create_context(true),wide=target.create_context(true);
     baseline->prepare_continuation(8);wide->prepare_continuation(8);
     const auto ingest=[&](Exl3TextContext& ctx,std::span<const std::int64_t> ids,bool large) {

@@ -2,7 +2,7 @@
 
 #include "exl3/linear_cuda.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3TargetProjectionObserverSelection {
     gate_up_k6,
@@ -31,4 +31,4 @@ struct Exl3TargetProjectionObservation {
 using Exl3TargetProjectionObserver =
     void (*)(const Exl3TargetProjectionObservation&, void* user);
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

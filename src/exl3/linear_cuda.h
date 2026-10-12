@@ -13,7 +13,7 @@
 #include <optional>
 #include <limits>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // E2B intentionally exposes only device views. The packed EXL3 representation remains
 // the source of truth; callers own the immutable model allocations and the output buffer.
@@ -368,7 +368,7 @@ struct Exl3GdnControlSide {
 };
 
 // Side-stream L2 prefetch of a weight range after the work queued on
-// `stream` (NINFER_EXL3_L2_PREFETCH, default 1); join before capture ends.
+// `stream` (VOIDINFER_EXL3_L2_PREFETCH, default 1); join before capture ends.
 bool exl3_l2_prefetch_enabled();
 void exl3_l2_prefetch_fork(cudaStream_t stream,const void* data,std::size_t bytes);
 void exl3_l2_prefetch_join(cudaStream_t stream);
@@ -947,7 +947,7 @@ public:
     int coherent_split_override(const char* name, int rows) const;
     int coherent_m32_split(int rows) const noexcept;
     // Coherent packed producer for 9..32-row calls: draft-batched workspaces,
-    // and (NINFER_EXL3_TARGET_COHERENT_M32, default on) target calls of one context
+    // and (VOIDINFER_EXL3_TARGET_COHERENT_M32, default on) target calls of one context
     // (VeriCache verify passes) whose shape it covers (K 4..7, 128-column).
     bool coherent_batched_rows(const Exl3CudaLinearMetadata& metadata, int rows) const noexcept;
     bool coherent_down_k6_candidate(const Exl3CudaLinearMetadata& metadata,
@@ -1490,8 +1490,8 @@ private:
         Exl3CudaLinearAdmission admission = Exl3CudaLinearAdmission::ordinary;
     };
     bool prefill_projection_graph_enabled_ = false;
-    ninfer::DecodeGraphDefinition prefill_projection_graph_definition_{};
-    ninfer::DecodeGraphExecutable prefill_projection_graph_executable_{};
+    voidinfer::DecodeGraphDefinition prefill_projection_graph_definition_{};
+    voidinfer::DecodeGraphExecutable prefill_projection_graph_executable_{};
     std::optional<PrefillProjectionGraphBinding> prefill_projection_graph_binding_;
     std::uint64_t prefill_projection_graph_captures_ = 0;
     std::uint64_t prefill_projection_graph_replays_ = 0;
@@ -1537,4 +1537,4 @@ struct Exl3MlpGateUpConcurrencyView {
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

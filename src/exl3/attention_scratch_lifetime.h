@@ -1,7 +1,7 @@
 #pragma once
 #include <cstddef>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Ordered stages in one full-attention forward, on the same stream. Shared
 // projection callbacks must finish private scatter before returning to the layer.
 enum class Exl3AttentionScratchStep : unsigned {

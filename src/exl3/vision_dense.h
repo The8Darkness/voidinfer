@@ -1,12 +1,12 @@
 #pragma once
-#include <ninfer/targets/qwen3_6/vision_control.h>
+#include <voidinfer/targets/qwen3_6/vision_control.h>
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3DenseVisionStats {
     std::size_t patches=0,merged_tokens=0;
@@ -44,4 +44,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

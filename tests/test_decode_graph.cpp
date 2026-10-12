@@ -42,22 +42,22 @@ int main() {
     }
 
     try {
-        ninfer::DeviceContext device(0);
-        ninfer::DeviceArena storage(sizeof(std::uint32_t));
+        voidinfer::DeviceContext device(0);
+        voidinfer::DeviceArena storage(sizeof(std::uint32_t));
         CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x33, sizeof(std::uint32_t), device.stream));
         device.synchronize();
 
-        ninfer::DecodeGraphDefinition first;
+        voidinfer::DecodeGraphDefinition first;
         first.capture(device.stream, [&] {
             CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x11, sizeof(std::uint32_t), device.stream));
         });
-        ninfer::DecodeGraphDefinition second;
+        voidinfer::DecodeGraphDefinition second;
         second.capture(device.stream, [&] {
             CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x22, sizeof(std::uint32_t), device.stream));
         });
 
         int failures = 0;
-        ninfer::DecodeGraphExecutable executable;
+        voidinfer::DecodeGraphExecutable executable;
         executable.instantiate(first);
         executable.upload(device.stream);
         device.synchronize();

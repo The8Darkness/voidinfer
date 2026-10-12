@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // This is reservation admission, not a timing model. Existing explicit opt-in
 // remains the only preference for reconstruction when costs are unavailable.
@@ -46,4 +46,4 @@ inline bool exl3_reconstruction_k6_gate_up_option(const char* value,bool slab_en
     return true;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

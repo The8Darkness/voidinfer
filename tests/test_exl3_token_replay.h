@@ -2,10 +2,10 @@
 
 void run_token_replay_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using State=ninfer::exl3::Exl3ExactHostState;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using State=voidinfer::exl3::Exl3ExactHostState;
     require(source.size()>2200 && target.max_context()>=2200,"token replay fixture extent");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     std::array<std::unique_ptr<DeviceBuffer>,5> stage;
     std::array<std::uint16_t*,5> staging{};
@@ -36,7 +36,7 @@ void run_token_replay_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel&
         const auto compact=request->compact_draft(draft,staging);
         for(int use_anchor:{0,1}) {
             const auto plan=use_anchor?request->replay_plan(anchor):compact->replay_plan();
-            ninfer::exl3::RetainedDescriptorLedger metadata;
+            voidinfer::exl3::RetainedDescriptorLedger metadata;
             exact->set_request_metadata_reservation([&](std::uint64_t bytes){return metadata.acquire(bytes);});
             const auto start=std::chrono::steady_clock::now();
             auto restored=plan.restore(*exact);
@@ -46,11 +46,11 @@ void run_token_replay_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel&
                 if(Request::tap_block_metadata_credit_belongs_to(block,metadata))replay_tap_metadata+=Request::tap_block_metadata_bytes();
             });
             restored->state()->visit_page_metadata_owners([&](const auto& page){
-                if(ninfer::exl3::Exl3ExactKVPage::metadata_credit_belongs_to(page,metadata))
-                    replay_tap_metadata+=ninfer::exl3::Exl3ExactKVPage::metadata_bytes();
+                if(voidinfer::exl3::Exl3ExactKVPage::metadata_credit_belongs_to(page,metadata))
+                    replay_tap_metadata+=voidinfer::exl3::Exl3ExactKVPage::metadata_bytes();
             });
             require(Request::request_metadata_credit_belongs_to(restored,metadata) &&
-                metadata.bytes()==restored->request_metadata_bytes()+ninfer::exl3::bounded_shared_allocation_bytes<int>()+replay_tap_metadata,
+                metadata.bytes()==restored->request_metadata_bytes()+voidinfer::exl3::bounded_shared_allocation_bytes<int>()+replay_tap_metadata,
                 "replay retained temporary request credit or omitted final builder credit");
             const double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
             require(restored->state()->same_payload(*request->state()) && restored->same_taps(*request) && restored->token_suffix()==expected,
@@ -63,7 +63,7 @@ void run_token_replay_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel&
             ++cases;
             exact->reset(); // Drop context-held page owners before final-root retirement.
             std::weak_ptr<const Request> weak=restored;restored.reset();
-            require(weak.expired() && metadata.bytes()==ninfer::exl3::bounded_shared_allocation_bytes<Request>(),
+            require(weak.expired() && metadata.bytes()==voidinfer::exl3::bounded_shared_allocation_bytes<Request>(),
                 "replay request final strong retirement retained descriptor credit");
             weak.reset();require(metadata.bytes()==0,"replay request final weak credit leaked");
         }

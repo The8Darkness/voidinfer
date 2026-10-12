@@ -8,7 +8,7 @@
 #include <string>
 #include <type_traits>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 constexpr std::uint32_t kStateImageVersion = 1;
@@ -466,4 +466,4 @@ OscarMixedCacheFingerprint OscarMixedTransitionCache::make_fingerprint(
     return result;
 }
 
-} // namespace ninfer
+} // namespace voidinfer

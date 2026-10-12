@@ -6,7 +6,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Fixed request-local dependency description for the selected nondefault-
 // stream DFlash slice. CUDA submission remains in the existing operators; this
@@ -150,4 +150,4 @@ private:
     int first_error_=0;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -1,5 +1,6 @@
 #include "exl3/exl3_engine_core.h"
 #include "core/capture_guard.h"
+#include "exl3/engine_profile.h"
 #include "exl3/environment_options.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/reconstruction_control_allocator.h"
@@ -37,12 +38,12 @@
 #include "exl3/control_publication_boundary.h"
 #include "exl3/host_preparation_completion.h"
 #include "exl3/vision_dense.h"
-#include <ninfer/targets/qwen3_6/vision_control.h>
+#include <voidinfer/targets/qwen3_6/vision_control.h>
 #include "exl3/request_sampling_state.h"
 #include "exl3/sampling_policy.h"
 #include "exl3/sampled_authority_boundary.h"
 #include "exl3/sampling_control_stop_semantics.h"
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <charconv>
@@ -53,22 +54,22 @@
 #include <shared_mutex>
 #include <Windows.h>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
-// NINFER_EXL3_ROUND_WIDTH (2..8, research): coherent-device verifier rows per round.
+// VOIDINFER_EXL3_ROUND_WIDTH (2..8, research): coherent-device verifier rows per round.
 std::size_t round_width_limit() {
     static const std::size_t value=[] {
-        const char* text=std::getenv("NINFER_EXL3_ROUND_WIDTH");
+        const char* text=std::getenv("VOIDINFER_EXL3_ROUND_WIDTH");
         return text?static_cast<std::size_t>(std::clamp(std::atoi(text),2,8)):std::size_t{8};
     }();
     return value;
 }
 }
 
-// NINFER_EXL3_MEMORY_TRACE: runtime device-memory movement (>8 MiB) at
+// VOIDINFER_EXL3_MEMORY_TRACE: runtime device-memory movement (>8 MiB) at
 // prompt-pass and round boundaries.
 static void runtime_memory_mark(const char* stage,unsigned lane) {
-    static const bool enabled=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    static const bool enabled=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
     if(!enabled)return;
     static std::mutex mutex;static std::size_t last=0;
     std::size_t free=0,total=0;
@@ -186,26 +187,26 @@ void require_coherent_device_profile(const EngineOptions& options) {
             throw std::invalid_argument(std::string("coherent-device EXL3 requires ")+
                 name+"="+std::string(expected));
     };
-    equals("NINFER_EXL3_EXACT_HOST_KV","0");
-    equals("NINFER_OSCAR_EXL3","0");
-    equals("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION","1");
-    equals("NINFER_EXL3_DEVICE_GREEDY","1");
-    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL","1");
-    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED","1");
-    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32","1");
-    equals("NINFER_EXL3_FAST_LAYER_MAJOR_PREFILL","1");
+    equals("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    equals("VOIDINFER_OSCAR_EXL3","0");
+    equals("VOIDINFER_EXL3_FAST_DEVICE_KV_TRANSACTION","1");
+    equals("VOIDINFER_EXL3_DEVICE_GREEDY","1");
+    equals("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL","1");
+    equals("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED","1");
+    equals("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32","1");
+    equals("VOIDINFER_EXL3_FAST_LAYER_MAJOR_PREFILL","1");
     // K5 layer reconstruction (FP32-accumulated cuBLAS at live context >= 8192)
     // is a quality-gated numerics policy; both settings are admitted.
     {
-        const auto* k5=std::getenv("NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
+        const auto* k5=std::getenv("VOIDINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
         if(!k5 || (std::string_view(k5)!="0" && std::string_view(k5)!="1"))
             throw std::invalid_argument(
-                "coherent-device EXL3 requires NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT=0|1");
+                "coherent-device EXL3 requires VOIDINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT=0|1");
     }
-    equals("NINFER_DFLASH2_PREFILL_WINDOW","1");
-    equals("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
-    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW","1");
-    equals("NINFER_EXL3_COHERENT_DOWN_K6","1");
+    equals("VOIDINFER_DFLASH2_PREFILL_WINDOW","1");
+    equals("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
+    equals("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW","1");
+    equals("VOIDINFER_EXL3_COHERENT_DOWN_K6","1");
 }
 }
 struct Exl3EngineCore::Request {
@@ -301,7 +302,7 @@ struct Exl3EngineCore::Impl {
     std::shared_ptr<Request::CancellationOwner> cancellation_owner;
     // Admission of the ordinary graph families (each still selected by its
     // own switch) into the coherent-device context.  Qualified for GDN-segment
-    // and full-layer graphs; NINFER_EXL3_COHERENT_ORDINARY_GRAPHS=0 selects the
+    // and full-layer graphs; VOIDINFER_EXL3_COHERENT_ORDINARY_GRAPHS=0 selects the
     // eager fallback.
     bool coherent_ordinary_graphs=false;
     EngineOptions options;
@@ -319,32 +320,32 @@ struct Exl3EngineCore::Impl {
     std::unique_ptr<Exl3DenseVision> dense_vision;
     std::array<std::shared_ptr<ExecutionStream>,kMaxLanes> streams;
     std::array<std::shared_ptr<Exl3Dflash2DraftModel>,kMaxLanes> drafts;
-    // Folded exact VeriCache (one lane, NINFER_EXL3_VERICACHE_FOLD=1): the
+    // Folded exact VeriCache (one lane, VOIDINFER_EXL3_VERICACHE_FOLD=1): the
     // lane's exact line verifies blocks inside its decode rounds.
     std::array<std::shared_ptr<Exl3TextContext>,kMaxLanes> exact_lines;
     static bool vericache_fold_enabled() {
         static const bool enabled=[] {
-            const char* value=std::getenv("NINFER_EXL3_VERICACHE_FOLD");
+            const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_FOLD");
             return value && std::string_view(value)=="1";
         }();
         return enabled;
     }
     static constexpr int kFoldBlock=16,kFoldRows=24,kFoldRingRows=128;
-    // Asynchronous exact VeriCache (single lane, default; NINFER_EXL3_VERICACHE_ASYNC=0
+    // Asynchronous exact VeriCache (single lane, default; VOIDINFER_EXL3_VERICACHE_ASYNC=0
     // keeps the synchronous verify pass): the line verifies a block of >= async block rows (64: one
     // FA2 row tile; the projections cost per row) while
     // drafting runs ahead by at most kAsyncLead tokens (L0 ages rows 256+
     // behind the frontier: they must be the line's exact ones).
     static bool vericache_async_enabled() {
         static const bool enabled=[] {
-            const char* value=std::getenv("NINFER_EXL3_VERICACHE_ASYNC");
+            const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC");
             return !value || std::string_view(value)!="0";
         }();
         return enabled;
     }
     static int vericache_async_block() {
         static const int block=[] {
-            const char* value=std::getenv("NINFER_EXL3_VERICACHE_ASYNC_BLOCK");
+            const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC_BLOCK");
             return value?std::clamp(std::atoi(value),1,192):64;
         }();
         return block;
@@ -427,9 +428,9 @@ struct Exl3EngineCore::Impl {
     // request whose projected codes (input + output allowance) fit in the free
     // device memory beside the growth the other active lanes still have ahead
     // (their projections minus the codes already backed), keeping
-    // NINFER_EXL3_L0_CODE_RESERVE_MIB (default 512) free; the request otherwise
+    // VOIDINFER_EXL3_L0_CODE_RESERVE_MIB (default 512) free; the request otherwise
     // waits for a lane to finish, at most until shortly before its queue
-    // deadline. NINFER_EXL3_L0_CODE_ADMISSION=0 disables.
+    // deadline. VOIDINFER_EXL3_L0_CODE_ADMISSION=0 disables.
     std::array<std::uint64_t,kMaxLanes> lane_code_projection{};
     static std::uint64_t projected_l0_code_bytes(std::size_t tokens) {
         // Per token: 16 full-attention layers x 4 KV heads x (K and V codes + FP16 metadata),
@@ -440,7 +441,7 @@ struct Exl3EngineCore::Impl {
     }
     bool l0_code_admission_enabled() const {
         static const bool enabled=[] {
-            const char* value=std::getenv("NINFER_EXL3_L0_CODE_ADMISSION");
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_CODE_ADMISSION");
             return !value || std::string_view(value)!="0";
         }();
         return enabled && options.max_concurrency>=2 &&
@@ -481,7 +482,7 @@ struct Exl3EngineCore::Impl {
         std::size_t free=0,total=0;
         if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return true;
         static const std::uint64_t reserve=[] {
-            const char* value=std::getenv("NINFER_EXL3_L0_CODE_RESERVE_MIB");
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_CODE_RESERVE_MIB");
             return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):512L)<<20;
         }();
         // This lane's own (parked or retained) backing is reused by the request.
@@ -524,7 +525,7 @@ struct Exl3EngineCore::Impl {
     MemorySummary memory;
     std::array<std::thread,kMaxLanes> workers;
     // Batched multi-agent rounds of the coherent-device lanes
-    // (NINFER_EXL3_BATCHED_ROUNDS, default on for C2+): one coordinator per
+    // (VOIDINFER_EXL3_BATCHED_ROUNDS, default on for C2+): one coordinator per
     // group of up to four lanes (the widest batched forward).
     std::vector<std::unique_ptr<Exl3BatchedVerifyCoordinator>> batched_verify;
     std::array<Exl3BatchedVerifyCoordinator*,kMaxLanes> lane_batched_verify{};
@@ -550,11 +551,11 @@ struct Exl3EngineCore::Impl {
     // synchronized the device) per block. Exact 4K code, 4,096 tokens: C4
     // 227 -> 346 tok/s, C2 207 -> 225 (means of 2-3 noisy runs), 15 runs
     // without error (an Oct 9 build once hit an illegal address in draft
-    // completion at C2). NINFER_EXL3_PROMPT_PASS_OVERLAP=0: exclusive passes.
+    // completion at C2). VOIDINFER_EXL3_PROMPT_PASS_OVERLAP=0: exclusive passes.
     std::mutex prompt_pass_mutex;
     cudaEvent_t prompt_pass_done=nullptr;
     bool prompt_pass_overlap=[] {
-        const char* value=std::getenv("NINFER_EXL3_PROMPT_PASS_OVERLAP");
+        const char* value=std::getenv("VOIDINFER_EXL3_PROMPT_PASS_OVERLAP");
         return !value || std::string_view(value)!="0";
     }();
     struct PromptPass {
@@ -570,7 +571,7 @@ struct Exl3EngineCore::Impl {
             } else {
                 const std::lock_guard turnstile(engine.coherent_prefill_turnstile);
                 exclusive=std::unique_lock(engine.coherent_prefill_mutex);
-                if(engine.options.max_concurrency>1)check(ninfer::cuda_device_synchronize_outside_capture());
+                if(engine.options.max_concurrency>1)check(voidinfer::cuda_device_synchronize_outside_capture());
             }
         }
         ~PromptPass() {
@@ -627,7 +628,7 @@ struct Exl3EngineCore::Impl {
     explicit Impl(const EngineOptions& value,unsigned shared_allocation_fault,unsigned draft_clone_fault,unsigned first_draft_fault,unsigned context_startup_fault,
         Exl3DeviceAvailability::Provider supplied_availability):
         coherent_ordinary_graphs([] {
-            const char* value=std::getenv("NINFER_EXL3_COHERENT_ORDINARY_GRAPHS");
+            const char* value=std::getenv("VOIDINFER_EXL3_COHERENT_ORDINARY_GRAPHS");
             if(value && std::string_view(value)!="0" && std::string_view(value)!="1")
                 throw std::invalid_argument("coherent ordinary graphs must be 0 or 1");
             return !value || std::string_view(value)=="1";
@@ -647,31 +648,31 @@ struct Exl3EngineCore::Impl {
         {
             const bool line=exact_line_planned(value);
             exl3_set_exact_line_workspace_sharing(line);
-            ninfer::cuda_set_poll_waits(line && vericache_async_enabled());
+            voidinfer::cuda_set_poll_waits(line && vericache_async_enabled());
         }
         require_coherent_device_profile(value);
         if(value.max_concurrency>=2) {
             // Several resident lanes: halve the per-context L0 prompt-block row
             // buffers and let exclusive prompt ingestion use a smaller
             // layer-major reserve, so both lanes keep the fast prefill.
-            if(!std::getenv("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS"))
-                _putenv_s("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS","4096");
+            if(!std::getenv("VOIDINFER_EXL3_L0_PREFILL_BLOCK_ROWS"))
+                _putenv_s("VOIDINFER_EXL3_L0_PREFILL_BLOCK_ROWS","4096");
             // Decode keeps 1 GiB of device headroom; the retained layer-major
             // projection cache is capped instead (one layer's projections at
             // C3+). Oversubscribed WDDM memory corrupts batched graph replays.
-            if(!std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
-                _putenv_s("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
-            if(!std::getenv("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
-                _putenv_s("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"640":"1536");
+            if(!std::getenv("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
+                _putenv_s("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
+            if(!std::getenv("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
+                _putenv_s("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"640":"1536");
             // Prompt-scale passes are exclusive across lanes: one reconstruct
             // workspace serves every lane.
-            if(!std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
-                _putenv_s("NINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
+            if(!std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
+                _putenv_s("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
             // The default 1 KiB per-thread stack reserves ~256 MiB of local
             // memory for every resident thread; the driver raises the limit
-            // for any kernel that needs more. NINFER_EXL3_STACK_BYTES overrides.
+            // for any kernel that needs more. VOIDINFER_EXL3_STACK_BYTES overrides.
             {
-                const char* requested=std::getenv("NINFER_EXL3_STACK_BYTES");
+                const char* requested=std::getenv("VOIDINFER_EXL3_STACK_BYTES");
                 const std::size_t stack=requested?std::strtoull(requested,nullptr,10):256;
                 if(stack)(void)cudaDeviceSetLimit(cudaLimitStackSize,stack);
             }
@@ -683,52 +684,52 @@ struct Exl3EngineCore::Impl {
                 throw std::invalid_argument(std::string(name)+" must be0 or1");
             return value && std::string_view(value)=="1";
         };
-        const bool native64k=flag("NINFER_EXL3_EXTENDED_CONTEXT_64K");
-        const bool candidate128k=flag("NINFER_EXL3_EXTENDED_CONTEXT_128K");
-        const bool exact_host=flag("NINFER_EXL3_EXACT_HOST_KV");
-        const bool oscar_only=flag("NINFER_EXL3_OSCAR_L0_ONLY");
-        const bool device_prefix=flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
+        const bool native64k=flag("VOIDINFER_EXL3_EXTENDED_CONTEXT_64K");
+        const bool candidate128k=flag("VOIDINFER_EXL3_EXTENDED_CONTEXT_128K");
+        const bool exact_host=flag("VOIDINFER_EXL3_EXACT_HOST_KV");
+        const bool oscar_only=flag("VOIDINFER_EXL3_OSCAR_L0_ONLY");
+        const bool device_prefix=flag("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
         Exl3NativeContextExtent::refuse_candidate128k_execution(value.max_context,
             native64k,candidate128k,exact_host,oscar_only,value.max_concurrency,
             value.context_cache.host_kv_capacity_bytes,device_prefix);
         Exl3NativeContextExtent::require_native64k_engine(value.max_context,
             native64k,candidate128k,exact_host,oscar_only,
             value.max_concurrency,value.context_cache.host_kv_capacity_bytes);
-        conditional_b8 = read_binary_option("NINFER_EXL3_ENGINE_CONDITIONAL_B8",
-            "NINFER_EXL3_ENGINE_CONDITIONAL_B8 must be 0 or 1");
-        const bool device_taps_only=flag("NINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
+        conditional_b8 = read_binary_option("VOIDINFER_EXL3_ENGINE_CONDITIONAL_B8",
+            "VOIDINFER_EXL3_ENGINE_CONDITIONAL_B8 must be 0 or 1");
+        const bool device_taps_only=flag("VOIDINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
         if(device_taps_only &&
-           (!flag("NINFER_EXL3_COMMITTED_TAP_D2D") ||
-            !flag("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING")))
+           (!flag("VOIDINFER_EXL3_COMMITTED_TAP_D2D") ||
+            !flag("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING")))
             throw std::invalid_argument(
                 "device-only committed taps require direct D2D tap staging");
         if(device_taps_only && conditional_b8)
             throw std::invalid_argument(
                 "device-only committed taps are incompatible with conditional B8");
-        if(device_taps_only && flag("NINFER_EXL3_STAGED_B8_VERIFIER"))
+        if(device_taps_only && flag("VOIDINFER_EXL3_STAGED_B8_VERIFIER"))
             throw std::invalid_argument(
                 "device-only committed taps are incompatible with staged B8");
         const bool reconstruction_fallback=exl3_reconstruction_budget_fallback(
-            std::getenv("NINFER_EXL3_RECONSTRUCTION_BUDGET_FALLBACK"));
-        concurrent_prefix_preparation = read_binary_option("NINFER_EXL3_ENGINE_SHARED_PREPARATION",
-            "NINFER_EXL3_ENGINE_SHARED_PREPARATION must be 0 or 1");
-        declared_prefix_preparation = read_binary_option("NINFER_EXL3_ENGINE_DECLARED_PREFIX",
-            "NINFER_EXL3_ENGINE_DECLARED_PREFIX must be 0 or 1");
-        request_affinity = read_binary_option("NINFER_EXL3_REQUEST_AFFINITY",
-            "NINFER_EXL3_REQUEST_AFFINITY must be 0 or 1");
-        const auto* preserve_option=std::getenv("NINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
+            std::getenv("VOIDINFER_EXL3_RECONSTRUCTION_BUDGET_FALLBACK"));
+        concurrent_prefix_preparation = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_PREPARATION",
+            "VOIDINFER_EXL3_ENGINE_SHARED_PREPARATION must be 0 or 1");
+        declared_prefix_preparation = read_binary_option("VOIDINFER_EXL3_ENGINE_DECLARED_PREFIX",
+            "VOIDINFER_EXL3_ENGINE_DECLARED_PREFIX must be 0 or 1");
+        request_affinity = read_binary_option("VOIDINFER_EXL3_REQUEST_AFFINITY",
+            "VOIDINFER_EXL3_REQUEST_AFFINITY must be 0 or 1");
+        const auto* preserve_option=std::getenv("VOIDINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
         if(request_affinity && (!preserve_option || std::string_view(preserve_option)!="1"))
             throw std::invalid_argument("request affinity requires acquired-root preservation");
-        const bool share_prefix = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PREFIX",
+        const bool share_prefix = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DEVICE_PREFIX",
             "Engine shared device prefix must be0 or1") && value.max_concurrency==2;
         if(share_prefix) {
-            const auto* cache=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
+            const auto* cache=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
             if(!cache || std::string_view(cache)!="1")
                 throw std::invalid_argument("Engine shared prefix requires represented device prefix option");
         }
-        const bool share_q = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_Q",
+        const bool share_q = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_Q",
             "Engine shared target Q must be0 or1") && value.max_concurrency==2;
-        const bool batch_greedy = read_binary_option("NINFER_EXL3_ENGINE_BATCHED_GREEDY_PACKET",
+        const bool batch_greedy = read_binary_option("VOIDINFER_EXL3_ENGINE_BATCHED_GREEDY_PACKET",
             "Engine batched greedy packet must be0 or1");
         const bool device_greedy=exl3_device_greedy_enabled();
         if(batch_greedy && value.max_concurrency!=2)
@@ -737,90 +738,90 @@ struct Exl3EngineCore::Impl {
             if(!device_greedy)
                 throw std::invalid_argument("Engine batched greedy packet requires device greedy");
         }
-        const bool share_kv = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_KV",
+        const bool share_kv = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_KV",
             "Engine shared target KV must be0 or1") && value.max_concurrency==2;
-        const bool share_o = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_O",
+        const bool share_o = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_O",
             "Engine shared target O must be0 or1") && value.max_concurrency==2;
-        const bool share_gateup = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_GATEUP",
+        const bool share_gateup = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_GATEUP",
             "Engine shared gate/up must be0 or1") && value.max_concurrency==2;
         if(share_gateup) {
-            const auto* k5=std::getenv("NINFER_EXL3_TARGET_GATEUP_K5_SMALL_M");
-            const auto* k6=std::getenv("NINFER_EXL3_TARGET_GATEUP_SMALL_M");
-            const auto* k7=std::getenv("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M");
+            const auto* k5=std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_K5_SMALL_M");
+            const auto* k6=std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M");
+            const auto* k7=std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M");
             if(!share_q || ((!k5 || std::string_view(k5)!="1") &&
                 (!k6 || std::string_view(k6)!="1") && (!k7 || std::string_view(k7)!="1")))
                 throw std::invalid_argument("Engine shared gate/up requires shared Q and explicit gate/up small-M route");
         }
-        const bool share_down = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_DOWN",
+        const bool share_down = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_DOWN",
             "Engine shared down must be0 or1") && value.max_concurrency==2;
         if(share_down) {
-            const auto* k6=std::getenv("NINFER_EXL3_TARGET_DOWN_SMALL_M");
-            const auto* k7=std::getenv("NINFER_EXL3_TARGET_DOWN_K7_SMALL_M");
+            const auto* k6=std::getenv("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M");
+            const auto* k7=std::getenv("VOIDINFER_EXL3_TARGET_DOWN_K7_SMALL_M");
             if(!share_q || ((!k6 || std::string_view(k6)!="1") && (!k7 || std::string_view(k7)!="1")))
                 throw std::invalid_argument("Engine shared down requires shared Q and explicit down small-M route");
             // Family-specific 16-k6/16-k7 selections fall back for the other K.
             // The workspace retains the existing split and async-A policy.
         }
-        const bool share_head = read_binary_option("NINFER_EXL3_ENGINE_SHARED_HEAD",
+        const bool share_head = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_HEAD",
             "Engine shared head must be0 or1") && value.max_concurrency==2;
-        const auto* h6=std::getenv("NINFER_EXL3_H6_SMALL_M");
+        const auto* h6=std::getenv("VOIDINFER_EXL3_H6_SMALL_M");
         if(share_head && (!share_q || (h6 && std::string_view(h6)=="0")))
             throw std::invalid_argument("Engine shared head requires shared Q and enabled H6 small-M");
-        const bool share_gather = read_binary_option("NINFER_EXL3_ENGINE_SHARED_GATHER_REUSE",
+        const bool share_gather = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_GATHER_REUSE",
             "Engine gather reuse must be0 or1") && value.max_concurrency==2;
         if(share_o) {
-            const auto* k6=std::getenv("NINFER_EXL3_TARGET_O_K6_SMALL_M");
-            const auto* k7=std::getenv("NINFER_EXL3_TARGET_O_K7_SMALL_M");
+            const auto* k6=std::getenv("VOIDINFER_EXL3_TARGET_O_K6_SMALL_M");
+            const auto* k7=std::getenv("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M");
             if(!share_q || ((!k6 || std::string_view(k6)!="1") && (!k7 || std::string_view(k7)!="1")))
                 throw std::invalid_argument("Engine shared O requires shared Q owner and explicit O small-M route");
         }
-        const bool share_draft = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_Q_M16",
+        const bool share_draft = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_Q_M16",
             "Engine shared draft Q M16 must be0 or1") && value.max_concurrency==2;
         if(share_draft) {
-            const auto* route=std::getenv("NINFER_EXL3_DRAFT_SMALL_M");
+            const auto* route=std::getenv("VOIDINFER_EXL3_DRAFT_SMALL_M");
             if(route && std::string_view(route)!="1")
                 throw std::invalid_argument("Engine shared draft requires enabled draft small-M route");
         }
         // Target and private-draft families share one bounded rendezvous owner,
         // but neither family is a prerequisite for executing the other.
         const bool share_projection_owner=share_q || share_draft;
-        const bool share_draft_kv = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_KV_M16",
+        const bool share_draft_kv = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_KV_M16",
             "Engine draft KV must be0 or1") && value.max_concurrency==2;
         if(share_draft_kv && !share_draft)throw std::invalid_argument("Engine draft KV requires shared draft Q M16");
-        const bool share_draft_o = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_O_M16",
+        const bool share_draft_o = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_O_M16",
             "Engine draft O must be0 or1") && value.max_concurrency==2;
         if(share_draft_o && !share_draft)throw std::invalid_argument("Engine draft O requires shared draft Q M16");
-        const bool share_draft_down = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_DOWN_M16",
+        const bool share_draft_down = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_DOWN_M16",
             "Engine draft down must be0 or1") && value.max_concurrency==2;
         if(share_draft_down && !share_draft)throw std::invalid_argument("Engine draft down requires shared draft Q M16");
-        const bool share_draft_gateup = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_GATEUP_M16",
+        const bool share_draft_gateup = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_GATEUP_M16",
             "Engine shared draft gate/up M16 option requires 0 or 1");
         if(share_draft_gateup && !share_draft)
             throw std::invalid_argument("Engine draft gate/up requires C2 shared draft Q M16");
         if(share_gather && !share_gateup && !share_draft_gateup)
             throw std::invalid_argument("Engine gather reuse requires shared gate/up");
         if(share_kv) {
-            const auto* route=std::getenv("NINFER_EXL3_TARGET_KV_SMALL_M");
+            const auto* route=std::getenv("VOIDINFER_EXL3_TARGET_KV_SMALL_M");
             if(!share_q || !route || std::string_view(route)!="1")
                 throw std::invalid_argument("Engine shared KV requires shared Q and explicit KV small-M route");
         }
         if(share_q) {
-            for(const auto* name:{"NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","NINFER_EXL3_EXTENDED_STREAM_REDUCTION"}) {
+            for(const auto* name:{"VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION"}) {
                 const auto* selected=std::getenv(name);
                 if(selected && std::string_view(selected)!="0")
                     throw std::invalid_argument(std::string("Engine shared target route conflict: ")+name);
             }
-            const auto* route=std::getenv("NINFER_EXL3_TARGET_Q_K6_SMALL_M");
+            const auto* route=std::getenv("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M");
             if(!route || std::string_view(route)!="1")
                 throw std::invalid_argument("Engine shared Q requires explicit Q/K6 small-M route");
         }
         if(shared_allocation_fault && (!share_projection_owner || shared_allocation_fault>4U+unsigned(share_kv)+unsigned(share_draft)+unsigned(share_o)+unsigned(share_gateup)+unsigned(share_down)+unsigned(share_head)+unsigned(share_draft_kv)+unsigned(share_draft_o)+unsigned(share_draft_down)+unsigned(share_draft_gateup)))
             throw std::invalid_argument("shared allocation fault outside selected startup menu");
         std::uint64_t device_reserve=0;
-        const bool registered_upload = read_binary_option("NINFER_EXL3_ENGINE_REGISTERED_KV_UPLOAD",
+        const bool registered_upload = read_binary_option("VOIDINFER_EXL3_ENGINE_REGISTERED_KV_UPLOAD",
             "Engine registered KV upload must be0 or1");
         const auto* registered_upload_slots_option=
-            std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
+            std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
         if(registered_upload_slots_option &&
            std::string_view(registered_upload_slots_option)!="2" &&
            std::string_view(registered_upload_slots_option)!="32")
@@ -829,24 +830,24 @@ struct Exl3EngineCore::Impl {
         const unsigned registered_upload_slots=
             registered_upload_slots_option &&
             std::string_view(registered_upload_slots_option)=="32"?32:2;
-        const bool share_pages = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PAGES",
+        const bool share_pages = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DEVICE_PAGES",
             "Engine shared device pages must be0 or1");
-        const bool share_attention = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PAGE_ATTENTION",
+        const bool share_attention = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DEVICE_PAGE_ATTENTION",
             "shared page attention option must be 0 or 1");
-        const bool attention_staging = read_binary_option("NINFER_EXL3_ENGINE_ATTENTION_STAGING",
+        const bool attention_staging = read_binary_option("VOIDINFER_EXL3_ENGINE_ATTENTION_STAGING",
             "attention staging option must be 0 or 1");
         if(attention_staging && (share_pages || share_prefix))
             throw std::invalid_argument("attention staging and shared cache routes are exclusive");
         if(share_attention && !share_pages)throw std::invalid_argument("shared page attention requires shared device pages");
         if(share_pages && share_prefix)
             throw std::invalid_argument("shared pages and whole-prefix sharing are exclusive Engine routes");
-        if(const auto* requested=std::getenv("NINFER_EXL3_ENGINE_DEVICE_RESERVE_BYTES");requested && *requested) {
+        if(const auto* requested=std::getenv("VOIDINFER_EXL3_ENGINE_DEVICE_RESERVE_BYTES");requested && *requested) {
             const std::string_view text(requested);
             const auto parsed=std::from_chars(text.data(),text.data()+text.size(),device_reserve);
             if(parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size())
                 throw std::invalid_argument("Engine device reserve requires unsigned bytes");
         }
-        const auto* prefix_rows=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS");
+        const auto* prefix_rows=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS");
         std::uint32_t parsed_prefix_rows=0;
         if(prefix_rows && *prefix_rows) {
             const std::string_view text(prefix_rows);
@@ -860,7 +861,7 @@ struct Exl3EngineCore::Impl {
             const auto* value=std::getenv(name);return value && std::string_view(value)=="1";
         };
         if(native64k || candidate128k ||
-           selected("NINFER_EXL3_NATIVE_CONTINUATION16") || device_prefix ||
+           selected("VOIDINFER_EXL3_NATIVE_CONTINUATION16") || device_prefix ||
            share_prefix || registered_upload || share_pages || share_attention ||
            attention_staging || share_projection_owner || share_kv || share_o ||
            share_gateup || share_down || share_head || share_gather ||
@@ -870,13 +871,13 @@ struct Exl3EngineCore::Impl {
            request_affinity)
             throw std::invalid_argument(
                 "coherent-device EXL3 cannot compose with host-KV Engine candidates");
-        const auto host_metadata_limit=exl3_host_metadata_limit(std::getenv("NINFER_EXL3_ENGINE_HOST_METADATA_LIMIT_BYTES"));
+        const auto host_metadata_limit=exl3_host_metadata_limit(std::getenv("VOIDINFER_EXL3_ENGINE_HOST_METADATA_LIMIT_BYTES"));
         if(!share_pages && prefix_rows&&std::string(prefix_rows)=="16384"&&value.max_concurrency!=1)
             throw std::invalid_argument("EXL3 Engine device prefix rows16384 require physicalC1");
         if(value.max_concurrency<1 || value.max_concurrency>kMaxLanes ||
             !value.max_pending_requests || !value.pending_timeout_ms || value.max_context<16)
             throw std::invalid_argument("Engine requires C1..C8 lanes and a bounded pending queue");
-        const auto* private_prefix_option=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
+        const auto* private_prefix_option=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
         // Attention staging has independent reserved storage.  The staged
         // producer may seed that storage from this lane-private prefix and
         // upload only the uncached suffix; both candidates remain default-off.
@@ -886,7 +887,7 @@ struct Exl3EngineCore::Impl {
             std::string_view(prefix_rows)!="16384")
             throw std::invalid_argument("device prefix row menu4096/16384");
         const int private_prefix_capacity=prefix_rows && std::string_view(prefix_rows)=="16384"?16384:4096;
-        const auto* segmented_prefix_option=std::getenv("NINFER_EXL3_SEGMENTED_DEVICE_PREFIX");
+        const auto* segmented_prefix_option=std::getenv("VOIDINFER_EXL3_SEGMENTED_DEVICE_PREFIX");
         const bool segmented_prefix_requested=segmented_prefix_option && std::string_view(segmented_prefix_option)=="1";
         const bool shared_workspace_unwind_fault=share_projection_owner && context_startup_fault==83 && shared_allocation_fault==2;
         const bool valid_startup_fault=context_startup_fault==128 || context_startup_fault==31 || context_startup_fault<=11*value.max_concurrency ||
@@ -964,7 +965,7 @@ struct Exl3EngineCore::Impl {
         // roots is planned and transacted through `coordinator`. A future loader
         // preflight API must return the same owner/domain/extent manifest before
         // this boundary before weight construction can join startup reservation.
-        if(std::getenv("NINFER_EXL3_MEMORY_TRACE")) {
+        if(std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")) {
             cudaFree(nullptr);
             std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);
             std::fprintf(stderr,"STARTUP_MEMORY before_target used=%.1f MiB",(t-f)/1048576.0);
@@ -972,7 +973,7 @@ struct Exl3EngineCore::Impl {
         }
         target=Exl3TextModel::load(value.model.target_directory,value.max_context,loading);
         const auto trace_free=[](const char* stage) {
-            if(!std::getenv("NINFER_EXL3_MEMORY_TRACE"))return;
+            if(!std::getenv("VOIDINFER_EXL3_MEMORY_TRACE"))return;
             std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);
             std::fprintf(stderr,"STARTUP_MEMORY %s used=%.1f MiB",stage,(t-f)/1048576.0);
             std::fputc(10,stderr);
@@ -1233,7 +1234,7 @@ struct Exl3EngineCore::Impl {
                 // The coherent route admits the ordinary graph families unless
                 // the eager fallback is selected.  The families themselves are
                 // selected by their own switches and captured at context creation.
-                static const bool lane_memory_trace=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+                static const bool lane_memory_trace=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
                 const auto free_mib=[] {std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);return f/1048576.0;};
                 const double lane_free0=lane_memory_trace?free_mib():0.0;
                 auto context=target->create_context_reserved(coordinator,true,
@@ -1246,7 +1247,7 @@ struct Exl3EngineCore::Impl {
                 const auto continuation_bytes=context->persistent_bytes()-base_context_bytes;
                 const double lane_free1=lane_memory_trace?free_mib():0.0;
                 const auto before_repair_checkpoint=context->persistent_bytes();
-                const auto* repair_checkpoint=std::getenv("NINFER_EXL3_REPAIR_CHECKPOINT");
+                const auto* repair_checkpoint=std::getenv("VOIDINFER_EXL3_REPAIR_CHECKPOINT");
                 if(repair_checkpoint && std::string_view(repair_checkpoint)!="0" &&
                     std::string_view(repair_checkpoint)!="1")
                     throw std::invalid_argument("repair checkpoint must be0 or1");
@@ -1516,9 +1517,9 @@ struct Exl3EngineCore::Impl {
         stats.reserved_engine_tap_metadata_bytes=taps.units[static_cast<unsigned>(Domain::host_metadata)];
         scratch+=stats.reserved_engine_tap_device_bytes;
         const bool skip_context_hooks=[] {
-            const auto* skip=std::getenv("NINFER_EXL3_TEST_ENGINE_SKIP_CONTEXT_HOOKS");
+            const auto* skip=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_SKIP_CONTEXT_HOOKS");
             if(!skip || std::string_view(skip)!="1")return false;
-            const auto* root=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+            const auto* root=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_ROOT_HASH");
             if(!root || std::string_view(root)!="1")
                 throw std::invalid_argument("skip context hooks requires diagnostic root probe");
             return true;
@@ -1834,9 +1835,9 @@ struct Exl3EngineCore::Impl {
             stats.driver_unknown_device_bytes_available=true;
         }
         if(value.max_concurrency>=2) {
-            const char* batched=std::getenv("NINFER_EXL3_BATCHED_ROUNDS");
+            const char* batched=std::getenv("VOIDINFER_EXL3_BATCHED_ROUNDS");
             if(!batched || std::string_view(batched)!="0") {
-                const char* wait=std::getenv("NINFER_EXL3_BATCHED_ROUND_WAIT_US");
+                const char* wait=std::getenv("VOIDINFER_EXL3_BATCHED_ROUND_WAIT_US");
                 // Lanes [4g, 4g+4) share coordinator g; the earliest lane of a
                 // group leads its forward, one captured graph per group.
                 constexpr std::uint32_t group_lanes=Exl3BatchedVerifyCoordinator::kMaxGroup;
@@ -1849,21 +1850,21 @@ struct Exl3EngineCore::Impl {
                         group->register_context(*lanes[i]->context_owner_for_device_round());
                         lane_batched_verify[i]=group.get();
                     }
-                    const char* graphs=std::getenv("NINFER_EXL3_BATCHED_GRAPHS");
+                    const char* graphs=std::getenv("VOIDINFER_EXL3_BATCHED_GRAPHS");
                     if(!graphs || std::string_view(graphs)!="0")
                     for(const auto& members:group->groups()) {
                         std::vector<Exl3TextContext*> peers(members.begin()+1,members.end());
                         const std::vector<int> rows(peers.size(),8);
                         members[0]->prepare_batched_continuation_graph(peers,8,rows);
                     }
-                    // NINFER_EXL3_BATCHED_DRAFT=0 keeps every lane's draft
+                    // VOIDINFER_EXL3_BATCHED_DRAFT=0 keeps every lane's draft
                     // proposals private (one draft forward per lane).
                     static const bool batched_draft=[] {
-                        const char* value=std::getenv("NINFER_EXL3_BATCHED_DRAFT");
+                        const char* value=std::getenv("VOIDINFER_EXL3_BATCHED_DRAFT");
                         return !value || std::string_view(value)!="0";
                     }();
                     for(std::uint32_t i=first;i<end;++i) {
-                        if(std::getenv("NINFER_EXL3_VERICACHE_STATS"))
+                        if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
                             std::fprintf(stderr,"LANE_CONTEXT lane=%u context=%p\n",i,
                                 static_cast<const void*>(lanes[i]->context_owner_for_device_round().get()));
                         lanes[i]->context_owner_for_device_round()->set_batched_verify(group.get());
@@ -1873,7 +1874,7 @@ struct Exl3EngineCore::Impl {
                 }
             }
         }
-        if(std::getenv("NINFER_EXL3_MEMORY_TRACE")) {
+        if(std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")) {
             const auto mib=[](std::uint64_t bytes){return bytes/1048576.0;};
             std::fprintf(stderr,"ENGINE_MEMORY lanes=%u context=%.1f continuation=%.1f repair=%.1f lane=%.1f reconstruction=%.1f taps=%.1f attention_stage=%.1f draft_scratch_total=%.1f MiB\n",
                 value.max_concurrency,mib(stats.reserved_context_startup_device_bytes),
@@ -1931,7 +1932,7 @@ struct Exl3EngineCore::Impl {
             changed.notify_all();for(auto& worker:workers)if(worker.joinable())worker.join();
             retirement.begin(first_execution_failure!=nullptr);
             auto error=retirement_fault?static_cast<cudaError_t>(std::exchange(retirement_fault,0)):cudaSetDevice(options.device);
-            if(error==cudaSuccess)error=ninfer::cuda_device_synchronize_outside_capture();
+            if(error==cudaSuccess)error=voidinfer::cuda_device_synchronize_outside_capture();
             if(error!=cudaSuccess){retirement.complete(static_cast<int>(error));return retirement.result();}
             if(workspace_cleanup_failed()) {
                 retirement.observe_cleanup_failure(-2);return retirement.result();
@@ -2233,7 +2234,7 @@ struct Exl3EngineCore::Impl {
             const auto stats=dense_vision->encode(*payload,item,
                 rows+offset*Exl3DenseVision::kOutputWidth,stream);
             encode_ms+=stats.encode_ms;
-            if(const auto* dump=std::getenv("NINFER_EXL3_VISION_DUMP"); dump && *dump) {
+            if(const auto* dump=std::getenv("VOIDINFER_EXL3_VISION_DUMP"); dump && *dump) {
                 std::vector<std::uint16_t> host(item.merged_count*Exl3DenseVision::kOutputWidth);
                 check(cudaMemcpy(host.data(),rows+offset*Exl3DenseVision::kOutputWidth,
                     host.size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost));
@@ -2272,7 +2273,7 @@ struct Exl3EngineCore::Impl {
             table[row*3]=t[row];table[row*3+1]=h[row];table[row*3+2]=w[row];
         }
         context.set_rope_map(table,delta,stream);
-        if(std::getenv("NINFER_EXL3_VISION_STATS"))
+        if(std::getenv("VOIDINFER_EXL3_VISION_STATS"))
             std::fprintf(stderr,"VISION_PROMPT items=%zu media_tokens=%zu prompt=%zu table_rows=%zu delta=%d encode_ms=%.1f total_ms=%.1f\n",
                 control.items.size(),total,ids.size(),table_rows,delta,encode_ms,
                 std::chrono::duration<double,std::milli>(Clock::now()-begin).count());
@@ -2312,7 +2313,7 @@ struct Exl3EngineCore::Impl {
                 terminal_tokens.push_back(token);
         for(const auto token:request.options.stop.token_ids)
             terminal_tokens.push_back(token);
-        if(const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+        if(const auto* value=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_ROOT_HASH");
            value && std::string_view(value)=="1") {
             std::fprintf(stderr,"COHERENT_DEVICE_ENGINE_TERMINAL ids=");
             for(const auto token:terminal_tokens)
@@ -2345,16 +2346,16 @@ struct Exl3EngineCore::Impl {
             if(media)prepare_media_prompt(request,*context,stream);
             // VeriCache verifies against exact history: ingest the prompt exactly too.
             if(vericache.enabled)context->set_l0_exact_history(true);
-            // Conversation reuse (default; NINFER_EXL3_COHERENT_ROOT_REUSE=0
+            // Conversation reuse (default; VOIDINFER_EXL3_COHERENT_ROOT_REUSE=0
             // disables): the longest retained device root whose tokens prefix
             // this input is restored (target exact state + draft ring) and only
             // the suffix is ingested.
             static const bool root_reuse=[] {
-                const auto* value=std::getenv("NINFER_EXL3_COHERENT_ROOT_REUSE");
+                const auto* value=std::getenv("VOIDINFER_EXL3_COHERENT_ROOT_REUSE");
                 if(!value || !*value)return true;
                 if(std::string_view(value)=="0")return false;
                 if(std::string_view(value)!="1")
-                    throw std::invalid_argument("NINFER_EXL3_COHERENT_ROOT_REUSE must be 0 or 1");
+                    throw std::invalid_argument("VOIDINFER_EXL3_COHERENT_ROOT_REUSE must be 0 or 1");
                 return true;
             }();
             // Media prompts neither reuse nor publish roots: roots are matched
@@ -2375,14 +2376,14 @@ struct Exl3EngineCore::Impl {
             if(prepared.identity.rewrite_checkpoint)
                 stable=std::min<std::size_t>(stable,prepared.identity.rewrite_checkpoint->frontier);
             // Cross-conversation prefix sharing: when a retained root of another
-            // conversation shares at least NINFER_EXL3_SHARED_PREFIX_MIN_TOKENS
+            // conversation shares at least VOIDINFER_EXL3_SHARED_PREFIX_MIN_TOKENS
             // (default 1024, 0 disables) leading tokens with this input beyond
             // the reused root (agents with one system prompt and tool set), the
             // common prefix (whole 64-row pages) gets its own retained root:
             // later inputs restore it instead of prefilling it, and their
             // exported states share its KV pages and code chunks.
             static const std::size_t shared_minimum=[] {
-                const auto* value=std::getenv("NINFER_EXL3_SHARED_PREFIX_MIN_TOKENS");
+                const auto* value=std::getenv("VOIDINFER_EXL3_SHARED_PREFIX_MIN_TOKENS");
                 return static_cast<std::size_t>(value && *value?std::strtoull(value,nullptr,10):1024);
             }();
             std::size_t shared=0;
@@ -2420,7 +2421,7 @@ struct Exl3EngineCore::Impl {
                 }
                 base_resident=true;
                 const auto admitted=cache.admit_input_authority(base,span_ids.first(shared),available());
-                if(std::getenv("NINFER_EXL3_VERICACHE_STATS"))
+                if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
                     std::fprintf(stderr,"SHARED_PREFIX_ROOT tokens=%zu reused=%zu admitted=%d%c",shared,reused_rows,
                         admitted.admitted?1:0,10);
             }
@@ -2446,7 +2447,7 @@ struct Exl3EngineCore::Impl {
                 fresh.begin_fresh(ids,ids.size()>1040);
             }
             const bool root_diagnostic=[] {
-                const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+                const auto* value=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_ROOT_HASH");
                 return value && std::string_view(value)=="1";
             }();
             if(root_diagnostic) {
@@ -2540,7 +2541,7 @@ struct Exl3EngineCore::Impl {
                 ~BatchedLane() {
                     if(!coordinator)return;
                     coordinator->set_active(false);
-                    if(std::getenv("NINFER_EXL3_BATCHED_STATS")) {
+                    if(std::getenv("VOIDINFER_EXL3_BATCHED_STATS")) {
                         const auto widths=coordinator->width_histogram();
                         std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu (w2=%llu w3=%llu w4=%llu) eager=%llu solo=%llu timeouts=%llu wait_ms=%.1f\n",
                             static_cast<unsigned long long>(coordinator->batched_rounds()),
@@ -2572,7 +2573,7 @@ struct Exl3EngineCore::Impl {
             // Test-only host phase attribution (prepare / decide / settle /
             // publish), accumulated per request and printed after it.
             const bool round_phases=[] {
-                const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROUND_PHASES");
+                const auto* value=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_ROUND_PHASES");
                 return value && std::string_view(value)=="1";
             }();
             std::array<double,4> phase_ms{};
@@ -2669,8 +2670,8 @@ struct Exl3EngineCore::Impl {
                 auto draft_mark=Clock::now();
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
-                // NINFER_EXL3_LANE_TRACE: per-request lane time attribution.
-                static const bool lane_trace=std::getenv("NINFER_EXL3_LANE_TRACE")!=nullptr;
+                // VOIDINFER_EXL3_LANE_TRACE: per-request lane time attribution.
+                static const bool lane_trace=std::getenv("VOIDINFER_EXL3_LANE_TRACE")!=nullptr;
                 double lt_lock=0,lt_prepare=0,lt_settle=0,lt_verify=0;std::uint64_t lt_rounds=0;
                 const auto lt_begin=Clock::now();
                 struct LaneTraceReport {
@@ -2827,7 +2828,7 @@ struct Exl3EngineCore::Impl {
                         block_now=horizon.choose(vericache.block);
                         exact_mismatch.store(horizon.mismatch,std::memory_order_relaxed);
                     }
-                    static const bool horizon_trace=std::getenv("NINFER_EXL3_VERICACHE_HORIZON_TRACE")!=nullptr;
+                    static const bool horizon_trace=std::getenv("VOIDINFER_EXL3_VERICACHE_HORIZON_TRACE")!=nullptr;
                     if(horizon_trace)
                         std::fprintf(stderr,"VERICACHE_HORIZON rows=%zu corrected=%d tok_ms=%.2f pass=%.1f+%.3fx mismatch=%.4f next=%d\n",
                             unverified.size(),verified.corrected?1:0,horizon.tok_ms,horizon.pass_a,horizon.pass_b,
@@ -2920,7 +2921,7 @@ struct Exl3EngineCore::Impl {
                     const PromptPass rewind_pass(*this,stream);
                     round->commit_verification({});
                 }
-                if(std::getenv("NINFER_EXL3_VERICACHE_STATS")) {
+                if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")) {
                     const auto& t=round->totals();
                     std::fprintf(stderr,"VERICACHE blocks=%llu corrected=%llu verify_ms=%.1f block=%d delta=%.3f "
                         "checked=%llu off_greedy=%llu mean_gap=%.5f max_gap=%.4f "
@@ -3123,9 +3124,9 @@ struct Exl3EngineCore::Impl {
                 coordinator.complete(*host_lease);
                 host_lease.reset();
                 // Idle lanes hold no INT4 code VRAM: active agents' contexts
-                // grow into it (NINFER_EXL3_PARK_IDLE_CODES=0 keeps them).
+                // grow into it (VOIDINFER_EXL3_PARK_IDLE_CODES=0 keeps them).
                 static const bool park_idle_codes=[] {
-                    const auto* value=std::getenv("NINFER_EXL3_PARK_IDLE_CODES");
+                    const auto* value=std::getenv("VOIDINFER_EXL3_PARK_IDLE_CODES");
                     return !value || std::string_view(value)!="0";
                 }();
                 if(park_idle_codes) {
@@ -3138,7 +3139,7 @@ struct Exl3EngineCore::Impl {
             }
             // Test-only semantic final-state witness, observed after all timed
             // work and publication so graph and eager policies can be compared.
-            if(const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_FINAL_STATE_HASH");
+            if(const auto* value=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_FINAL_STATE_HASH");
                value && std::string_view(value)=="1")
                 std::fprintf(stderr,"COHERENT_DEVICE_ENGINE_FINAL_STATE output=%zu hash=%llu\n",
                     result.generated_token_ids.size(),static_cast<unsigned long long>(
@@ -3974,6 +3975,7 @@ void Exl3EngineCore::require_startup_retirement_available(const EngineOptions& o
 }
 Exl3EngineCore::Exl3EngineCore(const EngineOptions& options,unsigned shared_allocation_fault_for_test,unsigned draft_clone_fault_for_test,unsigned first_draft_fault_for_test,unsigned context_startup_fault_for_test,
     Exl3DeviceAvailability::Provider device_availability_provider_for_test) {
+    apply_engine_profile();
     if(!options.prefill_chunk)
         throw std::invalid_argument("EXL3 Engine prefill_chunk must be nonzero");
     require_startup_retirement_available(options);
@@ -4287,7 +4289,7 @@ void Exl3EngineCore::cancel_next_attachment_during_restore_for_test(
     std::lock_guard lock(impl_->mutex);
     if(!impl_->lanes[0] || impl_->outstanding || impl_->failed || impl_->stopping)
         throw std::logic_error("mid-restore cancellation requires idle live Engine");
-    const auto* preserve=std::getenv("NINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
+    const auto* preserve=std::getenv("VOIDINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
     if(completed_layer>=64 || (preserve && std::string_view(preserve)=="1"))
         throw std::invalid_argument("mid-restore cancellation requires layer0..63 and full restore");
     impl_->attachment_restore_cancel_hit.store(64,std::memory_order_release);
@@ -4308,7 +4310,7 @@ void Exl3EngineCore::fail_request_host_payload_for_test(unsigned phase) {
     if(!impl_->lanes[0] || impl_->lanes[1] || impl_->outstanding || impl_->failed || impl_->stopping)
         throw std::logic_error("host payload fixture requires idle live C1 Engine");
     if(phase<1 || phase>2)throw std::invalid_argument("host payload fault phase");
-    const auto* direct=std::getenv("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING");
+    const auto* direct=std::getenv("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING");
     if(direct && std::string_view(direct)=="1")throw std::logic_error("host payload fixture requires copied taps");
     impl_->request_host_payload_fault_hit.store(0);impl_->request_host_payload_fault.store(phase);
 }

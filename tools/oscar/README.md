@@ -53,14 +53,14 @@ copies of token id 198 and writes BF16 raw payloads plus provenance to
 Build the focused target in the latest build tree:
 
 ```powershell
-cmd /c "call C:\BuildTools\Common7\Tools\VsDevCmd.bat -arch=amd64 && cmake --build build --target ninfer_qwen3_6_27b_oscar_capture_test -j 1"
+cmd /c "call C:\BuildTools\Common7\Tools\VsDevCmd.bat -arch=amd64 && cmake --build build --target voidinfer_qwen3_6_27b_oscar_capture_test -j 1"
 ```
 
 Run the reproducible wrapper from an elevated/native Developer PowerShell when the isolated
 Python launcher is restricted by the host shell:
 
 ```powershell
-& .\tools\oscar\capture_qkv_smoke.ps1 -ArtifactPath $env:NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS -BuildRoot .\build
+& .\tools\oscar\capture_qkv_smoke.ps1 -ArtifactPath $env:VOIDINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS -BuildRoot .\build
 ```
 
 The validator is fail-closed: it checks the exact 16-layer topology, Q/K/V shape and token

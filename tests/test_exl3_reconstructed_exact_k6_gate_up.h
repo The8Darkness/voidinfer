@@ -2,23 +2,23 @@
 
 void run_reconstructed_exact_k6_gate_up(
     Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
-    const std::filesystem::path directory=env("NINFER_RECON_K6_GATE_UP_OUT");
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
+    const std::filesystem::path directory=env("VOIDINFER_RECON_K6_GATE_UP_OUT");
     require(!directory.empty()&&!std::filesystem::exists(directory),
         "K6 gate/up reconstruction output directory must be new");
     require(target.max_context()>=1040&&source.size()>=1040,
         "K6 gate/up reconstruction source/context extent");
-    for(const char* key:{"NINFER_EXL3_WIDE_PREFILL",
-                        "NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-                        "NINFER_EXL3_PREFILL_WIDE1024",
-                        "NINFER_EXL3_PREFILL_DIRECT_PARTIALS",
-                        "NINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
+    for(const char* key:{"VOIDINFER_EXL3_WIDE_PREFILL",
+                        "VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+                        "VOIDINFER_EXL3_PREFILL_WIDE1024",
+                        "VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",
+                        "VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
         require(env(key)=="1",std::string("K6 gate/up reconstruction direct flag ")+key);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
 
     struct Capture {
         std::array<T69ProjectionCaptureItem,2> items;
-        void observe(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+        void observe(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
             if(x.rows!=1024||x.metadata.K!=6||x.metadata.in_features!=5120||
                x.metadata.out_features!=17408||x.metadata.mcg||!x.metadata.mul1||
                x.metadata.has_bias||!x.operation)return;
@@ -42,7 +42,7 @@ void run_reconstructed_exact_k6_gate_up(
     context->set_target_projection_observer_for_test(
         [](const auto& value,void* user){static_cast<Capture*>(user)->observe(value);},
         &capture,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_exact_prefill_wide(
         std::span<const std::int64_t>(source.data()+16,1024));
     cuda_check(cudaDeviceSynchronize(),"K6 gate/up reconstruction capture complete");
@@ -56,14 +56,14 @@ void run_reconstructed_exact_k6_gate_up(
     constexpr std::size_t decoded_bytes=std::size_t(ni)*no*2;
     constexpr std::size_t output_elements=std::size_t(max_rows)*no;
     auto backing=std::make_shared<DeviceBuffer>(decoded_bytes);
-    ninfer::exl3::Exl3ReconstructionStream stream;
+    voidinfer::exl3::Exl3ReconstructionStream stream;
     stream.bind_model(model_identity,decoded_bytes,false,backing->get(),true);
     Exl3CudaLinearWorkspace workspace(ni,no,max_rows,false,false,false,false,false,true);
     DeviceBuffer direct_output(output_elements*2),candidate_output(output_elements*2);
-    ninfer::exl3::Exl3ReconstructedExactStats stats;
+    voidinfer::exl3::Exl3ReconstructedExactStats stats;
     auto invoke=[&](const T69ProjectionCaptureItem& site,bool candidate,int rows) {
         if(candidate) {
-            ninfer::exl3::Exl3ReconstructedExactView view;
+            voidinfer::exl3::Exl3ReconstructedExactView view;
             view.data=static_cast<std::uint16_t*>(backing->get());
             view.bytes=decoded_bytes;view.stats=&stats;view.allow_k6_gate_up=true;
             view.ordered_stream=&stream;view.backing_owner=backing;

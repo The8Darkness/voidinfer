@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3HierarchyCompletion {
     std::uint64_t request = 0;
@@ -205,4 +205,4 @@ private:
     std::string reason_="conservative start";
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

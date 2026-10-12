@@ -4,7 +4,7 @@ static void require(bool b,const char* s){if(!b)throw std::runtime_error(s);}
 #include "exl3_host_residency.h"
 #include <iostream>
 #include <cstring>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 static void need(bool b,const char* s){if(!b)throw std::runtime_error(s);}
 static void checked(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
 int main(){try{

@@ -7,8 +7,8 @@ void run_verification_width_profile(Exl3TextModel& target,
                                     const std::string& output) {
     require(target.max_context() == 4608 && ids.size() >= 4108 && !output.empty(),
             "verifywidth needs maxctx4608,4108 prompt IDs and output");
-    require(env("NINFER_OSCAR_EXL3") == "1" &&
-                env("NINFER_EXL3_TARGET_PROJECTION_TIMING") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1" &&
+                env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING") == "1",
             "verifywidth requires OSCAR and projection diagnostics");
     std::ofstream out(output), projections(output + ".projections.csv");
     require(out.good() && projections.good(), "verifywidth output open");
@@ -101,9 +101,9 @@ void run_verification_width_profile(Exl3TextModel& target,
                     require(records.size() == 401, "verifywidth projection inventory");
                     for (const auto& r : records)
                         projections << ctx << ',' << width << ',' << r.layer << ','
-                            << ninfer::exl3::target_projection_operator_name(r.operation) << ','
+                            << voidinfer::exl3::target_projection_operator_name(r.operation) << ','
                             << r.rows << ',' << r.K << ',' << r.in_features << ',' << r.out_features << ','
-                            << ninfer::exl3::target_projection_topology_name(r.topology) << ','
+                            << voidinfer::exl3::target_projection_topology_name(r.topology) << ','
                             << r.calls << ',' << r.microseconds << '\n';
                 }
             }

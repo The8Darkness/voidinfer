@@ -1,7 +1,7 @@
 #pragma once
 
 struct TargetQK6Qualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit = Admission::target_continuation_q;
     static constexpr int output = 12288;
     static constexpr std::size_t guard = 128;
@@ -25,13 +25,13 @@ struct TargetQK6Qualification {
         require(file.good(), "Q K6 raw evidence write");
     }
 
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
                          void* user) {
         if (std::string(observation.operation) == "q" && observation.metadata.K == 6)
             static_cast<TargetQK6Qualification*>(user)->check(observation);
     }
 
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& observation) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& observation) {
         require(observation.rows == 8 && observation.metadata.K == 6 &&
                     observation.metadata.in_features == kHidden &&
                     observation.metadata.out_features == output &&
@@ -54,11 +54,11 @@ struct TargetQK6Qualification {
                 }),
                 "Q K6 finite represented inputs");
 
-        _putenv_s("NINFER_EXL3_TARGET_Q_K6_SMALL_M", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M", "0");
         Exl3CudaLinearWorkspace baseline(kHidden, output, 8, false, false, false,
                                          false, false, false, false, {}, {}, false,
                                          false, true);
-        _putenv_s("NINFER_EXL3_TARGET_Q_K6_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M", "1");
         Exl3CudaLinearWorkspace candidate(kHidden, output, 8, false, false, false,
                                           false, false, false, false, {}, {}, false,
                                           false, true);
@@ -66,7 +66,7 @@ struct TargetQK6Qualification {
         Exl3CudaLinearWorkspace short_owner(kHidden, output, 4, false, false, false,
                                             false, false, false, false, {}, {}, false,
                                             false, true);
-        _putenv_s("NINFER_EXL3_TARGET_Q_K6_SMALL_M", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M", "0");
 
         require(candidate.target_q_k6_small_m_candidate(observation.metadata, 8, admit) &&
                     !baseline.target_q_k6_small_m_candidate(observation.metadata, 8, admit),
@@ -93,7 +93,7 @@ struct TargetQK6Qualification {
         }
         if (layers.size() == 1) {
             for (const char* disabled : {"", "0", "2", "true", "01"}) {
-                _putenv_s("NINFER_EXL3_TARGET_Q_K6_SMALL_M", disabled);
+                _putenv_s("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M", disabled);
                 Exl3CudaLinearWorkspace off(kHidden, output, 8, false, false, false,
                                              false, false, false, false, {}, {}, false,
                                              false, true);
@@ -101,7 +101,7 @@ struct TargetQK6Qualification {
                         "Q K6 exact flag1 required");
             }
         }
-        _putenv_s("NINFER_EXL3_TARGET_Q_K6_SMALL_M", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M", "0");
         require(std::string(candidate.dispatch_name(observation.metadata, 8, admit)) ==
                     "target_q_k6_small_m_mma_split" &&
                     std::string(candidate.dispatch_name(observation.metadata, 1, admit)) ==
@@ -200,9 +200,9 @@ struct TargetQK6Qualification {
 };
 
 void run_target_q_k6_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& draft) {
-    require(env("NINFER_EXL3_TARGET_Q_K6_SMALL_M") == "0",
+    require(env("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M") == "0",
             "Q K6 capture requires construction flag0");
-    auto ids = load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids = load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size() >= 512, "Q K6 prompt extent");
     std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
     TapStage stage;
@@ -228,13 +228,13 @@ void run_target_q_k6_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel&
     block.assign(1, pending);
     block.insert(block.end(), proposals.begin(), proposals.end());
 
-    TargetQK6Qualification qualification(env("NINFER_E5A4_OUT"));
+    TargetQK6Qualification qualification(env("VOIDINFER_E5A4_OUT"));
     context->prepare_transaction();
     context->prepare_continuation(8);
     const auto ring = draft.ring_digest();
     context->set_target_projection_observer_for_test(
         TargetQK6Qualification::callback, &qualification, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->begin_transaction();
     context->continue_rows(block);
     context->set_target_projection_observer_for_test(nullptr, nullptr);

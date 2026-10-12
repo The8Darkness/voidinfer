@@ -10,7 +10,7 @@
 //   (l0_oscar_format.h: two dims per byte). INT4 measured KL 0.005 / 0.008
 //   against FP16 KV at 4K / 16K vs 0.035 / 0.042 for the former INT4 codes.
 // R and mu are per-KV-head OSCAR-2 'center' rotations fitted offline
-// (<model directory>/l0_oscar or NINFER_EXL3_L0_OSCAR_ROT: k_rot_perhead.bin,
+// (<model directory>/l0_oscar or VOIDINFER_EXL3_L0_OSCAR_ROT: k_rot_perhead.bin,
 // v_rot_perhead.bin [16][4][256][256], k_mean.bin [16][4][256], fp32). Attention
 // over history uses the rotated query q R_k with the constant q . mu added to
 // every history score, accumulates values in the rotated basis and un-rotates
@@ -33,7 +33,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3::l0_oscar {
+namespace voidinfer::exl3::l0_oscar {
 
 constexpr int kSink = kSinkRows;
 // Exact recent window (exl3_l0_recent_rows): device code reads the copy
@@ -102,11 +102,11 @@ inline bool enabled() { return exl3_l0_oscar_enabled(); }
 
 inline const Assets& assets() {
     static const Assets value = [] {
-        const char* env = std::getenv("NINFER_EXL3_L0_OSCAR_ROT");
+        const char* env = std::getenv("VOIDINFER_EXL3_L0_OSCAR_ROT");
         const std::string dir = env && *env ? std::string(env) : exl3_l0_oscar_model_assets();
         if (dir.empty())
             throw std::invalid_argument("L0 OSCAR needs rotation assets: <model directory>/l0_oscar or "
-                                        "NINFER_EXL3_L0_OSCAR_ROT (NINFER_EXL3_L0_OSCAR=0 selects FP16 device KV)");
+                                        "VOIDINFER_EXL3_L0_OSCAR_ROT (VOIDINFER_EXL3_L0_OSCAR=0 selects FP16 device KV)");
         constexpr std::size_t bank = 16ull * 4 * kDim * kDim;
         std::vector<float> rk(bank), rv(bank), rvt(bank), mu(16ull * 4 * kDim);
         const auto read = [&](const char* name, std::vector<float>& out) {
@@ -167,7 +167,7 @@ __device__ __forceinline__ float l0_block_max(float v, float* scratch) {
 // in `bits` and emits rows whose INT4 probability (relative to the previous
 // round's history LSE, `ref`) exceeds tau; an exact FP16 pass covers the hot
 // slots, and each round replaces the stalest slots with the best candidates,
-// filled from the FP16 L2 planes. NINFER_EXL3_L0_HOT = slots per KV head and
+// filled from the FP16 L2 planes. VOIDINFER_EXL3_L0_HOT = slots per KV head and
 // layer (default 512, a multiple of 32; 0 = off).
 constexpr int kHotCandidates = 1024;   // per KV head and round
 constexpr int kHotMaxInsert = 64;      // per KV head and round
@@ -181,11 +181,11 @@ inline const HotConfig& hot_config() {
     static const HotConfig value = [] {
         HotConfig c;
 
-        if (const char* v = std::getenv("NINFER_EXL3_L0_HOT")) {
+        if (const char* v = std::getenv("VOIDINFER_EXL3_L0_HOT")) {
             char* end = nullptr;
             const long slots = std::strtol(v, &end, 10);
             if (!*v || *end || slots < 0 || slots > 4096 || slots % 32)
-                throw std::invalid_argument("NINFER_EXL3_L0_HOT must be 0..4096 slots, a multiple of 32");
+                throw std::invalid_argument("VOIDINFER_EXL3_L0_HOT must be 0..4096 slots, a multiple of 32");
             c.slots = static_cast<int>(slots);
         }
         return c;
@@ -443,4 +443,4 @@ inline int history_segment_keys(int capacity) {
     return keys;
 }
 
-}  // namespace ninfer::exl3::l0_oscar
+}  // namespace voidinfer::exl3::l0_oscar

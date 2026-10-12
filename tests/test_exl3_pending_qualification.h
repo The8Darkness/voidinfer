@@ -57,7 +57,7 @@ void run_pending_qualification(Exl3TextModel& target,
                                Exl3Dflash2DraftModel& draft,
                                const std::vector<std::int64_t>& source_ids) {
     require(target.max_context() >= 4096, "pendingqual requires max context at least 4096");
-    require(env("NINFER_OSCAR_EXL3") == "1", "pendingqual requires canonical OSCAR");
+    require(env("VOIDINFER_OSCAR_EXL3") == "1", "pendingqual requires canonical OSCAR");
     require(source_ids.size() >= 32, "pendingqual prompt fixture is too short");
 
     auto extended_prefix = [&](int rows) {

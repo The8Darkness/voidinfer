@@ -4,7 +4,7 @@
 #include <thread>
 
 struct T85Fp16RequestTrace {
-    std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> request;
+    std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> request;
     std::vector<std::int64_t> published;
     std::vector<double> publication_ms;
     double queue_wait_ms = 0.0;
@@ -35,9 +35,9 @@ void run_t85_fp16_c8_serving(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
     constexpr std::size_t kPrompt = 4096;
     constexpr std::size_t kPrefix = 3968;
     constexpr std::size_t kTail = 128;
@@ -51,8 +51,8 @@ void run_t85_fp16_c8_serving(
             "T85 output must be new");
     std::filesystem::create_directories(output);
 
-    const auto reserve_gib = std::stoull(env("NINFER_T85_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T85_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T85_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T85_CACHE_MIB"));
     require(reserve_gib >= 8 && cache_mib >= 1024,
             "T85 memory policy extent");
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
@@ -70,13 +70,13 @@ void run_t85_fp16_c8_serving(
         return state.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T85_NAMESPACE"), env("NINFER_T85_ARTIFACT_ID"),
-        env("NINFER_T85_TOKENIZER_ID"), env("NINFER_T85_CONFIGURATION_ID"),
-        env("NINFER_T85_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T85_NAMESPACE"), env("VOIDINFER_T85_ARTIFACT_ID"),
+        env("VOIDINFER_T85_TOKENIZER_ID"), env("VOIDINFER_T85_CONFIGURATION_ID"),
+        env("VOIDINFER_T85_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{16, 64, cache_budget, reserve}, identity);
-    ninfer::exl3::Exl3HostResidentSet residency(
+    voidinfer::exl3::Exl3HostResidentSet residency(
         memory.ullTotalPhys - reserve, reserve);
     auto context_a = target.create_context(true);
     auto context_b = target.create_context(true);
@@ -105,14 +105,14 @@ void run_t85_fp16_c8_serving(
     }
 
     struct PinResult {
-        ninfer::exl3::Exl3HostResidentSet::Stats update;
+        voidinfer::exl3::Exl3HostResidentSet::Stats update;
         Exl3HostResidency observed;
     };
     const auto pin = [&](const std::array<std::shared_ptr<const Request>, 8>& active,
                          bool observe) {
         auto roots = cache.roots();
         for (const auto& root : active) if (root) roots.push_back(root);
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for (const auto& root : roots) snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,
             [&](const void* data, std::size_t bytes) { snapshot.add(data, bytes); },
@@ -490,7 +490,7 @@ void run_t85_fp16_c8_serving(
         sample_target(*contexts[0], streams[0].value),
         sample_target(*contexts[1], streams[1].value)};
     std::array<std::shared_ptr<const Request>,2> updated;
-    std::array<ninfer::exl3::Exl3OuterReferenceResult,2> verified;
+    std::array<voidinfer::exl3::Exl3OuterReferenceResult,2> verified;
     std::array<std::exception_ptr,2> errors;
     std::thread workers[2];
     for (int physical = 0; physical < 2; ++physical)

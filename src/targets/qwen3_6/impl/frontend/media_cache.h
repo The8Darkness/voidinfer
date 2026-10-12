@@ -9,7 +9,7 @@
 #include <memory>
 #include <string_view>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace voidinfer::targets::qwen3_6::frontend_internal {
 
 struct MediaCacheKey {
     std::array<std::uint8_t, 32> digest{};
@@ -122,4 +122,4 @@ private:
 void check_preparation_control(const PreparationControl& control,
                                std::string_view stage = "preparation");
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace voidinfer::targets::qwen3_6::frontend_internal

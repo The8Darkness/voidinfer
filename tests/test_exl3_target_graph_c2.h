@@ -35,7 +35,7 @@ struct TargetGraphC2Snapshot {
     std::vector<std::uint16_t> continuation_logits;
     std::array<std::vector<std::uint16_t>, kTapCount> taps;
     std::vector<std::uint16_t> embedding;
-    std::array<ninfer::exl3::Exl3FullAttentionQKVHost, 16> qkv;
+    std::array<voidinfer::exl3::Exl3FullAttentionQKVHost, 16> qkv;
     std::array<std::vector<float>, 64> gdn_recurrent;
     std::array<std::vector<std::uint16_t>, 64> gdn_conv;
     std::vector<std::byte> oscar;
@@ -318,9 +318,9 @@ TargetGraphC2FixtureResult run_target_graph_c2_fixture(
     cuda_check(cudaStreamSynchronize(stream_b.value),
                "target-graph-c2 capture B complete");
     constexpr std::uint32_t required_routes =
-        ninfer::exl3::Exl3ContinuationGraphRouteFixedB8 |
-        ninfer::exl3::Exl3ContinuationGraphRouteChronologicalOscar |
-        ninfer::exl3::Exl3ContinuationGraphRouteGdnQkvzConcurrent;
+        voidinfer::exl3::Exl3ContinuationGraphRouteFixedB8 |
+        voidinfer::exl3::Exl3ContinuationGraphRouteChronologicalOscar |
+        voidinfer::exl3::Exl3ContinuationGraphRouteGdnQkvzConcurrent;
     const auto admission_a = a->continuation_graph_admission();
     const auto admission_b = b->continuation_graph_admission();
     require(admission_a.active && admission_b.active &&
@@ -387,7 +387,7 @@ TargetGraphC2FixtureResult run_target_graph_c2_fixture(
     for(auto* context:{a.get(),b.get()}) {
         const auto graph=context->continuation_graph_stats();
         const auto graph_domain=static_cast<unsigned>(
-            ninfer::exl3::Exl3ResourceInventory::Domain::graph_count);
+            voidinfer::exl3::Exl3ResourceInventory::Domain::graph_count);
         require(graph.preparation_attempts==2 &&
                     graph.preparation_successes==1 &&
                     graph.compatible_active_hits==1 &&
@@ -507,9 +507,9 @@ void run_target_graph_c2_lifecycle_fixture(
     const std::string& fixture, std::ofstream& lifecycle) {
     constexpr int prefix_rows = 512;
     constexpr std::uint32_t required_routes =
-        ninfer::exl3::Exl3ContinuationGraphRouteFixedB8 |
-        ninfer::exl3::Exl3ContinuationGraphRouteChronologicalOscar |
-        ninfer::exl3::Exl3ContinuationGraphRouteGdnQkvzConcurrent;
+        voidinfer::exl3::Exl3ContinuationGraphRouteFixedB8 |
+        voidinfer::exl3::Exl3ContinuationGraphRouteChronologicalOscar |
+        voidinfer::exl3::Exl3ContinuationGraphRouteGdnQkvzConcurrent;
     require(target.max_context() >= prefix_rows + 96,
             "target-graph-c2 lifecycle context extent");
 
@@ -1042,12 +1042,12 @@ void run_target_graph_c2_lifecycle_fixture(
     {
         struct RestoreProjectionOption {
             std::string value;
-            RestoreProjectionOption():value(std::getenv("NINFER_EXL3_GENERIC_SPLITS")?
-                std::getenv("NINFER_EXL3_GENERIC_SPLITS"):""){}
-            ~RestoreProjectionOption(){_putenv_s("NINFER_EXL3_GENERIC_SPLITS",value.c_str());}
+            RestoreProjectionOption():value(std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS")?
+                std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS"):""){}
+            ~RestoreProjectionOption(){_putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS",value.c_str());}
         } restore;
         const auto previous=a->continuation_graph_admission();
-        require(_putenv_s("NINFER_EXL3_GENERIC_SPLITS",restore.value=="1"?"2":"1")==0,
+        require(_putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS",restore.value=="1"?"2":"1")==0,
             "graph lifecycle option mutation failed");
         a->begin_transaction(stream_a.value);
         require(!a->continuation_graph_admission().ready,
@@ -1062,7 +1062,7 @@ void run_target_graph_c2_lifecycle_fixture(
         require(changed.capture_count==previous.capture_count+1 &&
             changed.route_generation>previous.route_generation,
             "changed projection options reused old capture");
-        require(_putenv_s("NINFER_EXL3_GENERIC_SPLITS",restore.value.c_str())==0,
+        require(_putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS",restore.value.c_str())==0,
             "graph lifecycle option restoration failed");
         require(a->capture_continuation_graph(stream_a.value),"restored projection option recapture failed");
         require(a->continuation_graph_admission().capture_count==changed.capture_count+1,
@@ -1119,10 +1119,10 @@ void run_target_graph_reset_reuse_performance(
     require(target.max_context()>=prefix_rows+8 && code.size()>=prefix_rows &&
         prose.size()>=prefix_rows,
         "target graph reset reuse performance extent");
-    require(env("NINFER_OSCAR_EXL3")=="1" &&
-        env("NINFER_E5A4_CONTINUATION_GRAPH_B8")=="1" &&
-        env("NINFER_OSCAR_CONTINUATION_COHORT_B8")=="1" &&
-        env("NINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT")=="1",
+    require(env("VOIDINFER_OSCAR_EXL3")=="1" &&
+        env("VOIDINFER_E5A4_CONTINUATION_GRAPH_B8")=="1" &&
+        env("VOIDINFER_OSCAR_CONTINUATION_COHORT_B8")=="1" &&
+        env("VOIDINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT")=="1",
         "target graph reset reuse performance qualified route");
     auto context=target.create_context(true);
     const std::string contract="target-graph-reset-reuse;maxctx="+
@@ -1234,13 +1234,13 @@ void run_target_graph_c2_screen(Exl3TextModel& target,
                                 const std::filesystem::path& output) {
     require(target.max_context() >= 4352,
             "target-graph-c2 requires max context at least 4352");
-    require(env("NINFER_OSCAR_EXL3") == "1" &&
-                env("NINFER_E5A4_CONTINUATION_GRAPH_B8") == "1" &&
-                env("NINFER_OSCAR_CONTINUATION_COHORT_B8") == "1" &&
-                env("NINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1" &&
+                env("VOIDINFER_E5A4_CONTINUATION_GRAPH_B8") == "1" &&
+                env("VOIDINFER_OSCAR_CONTINUATION_COHORT_B8") == "1" &&
+                env("VOIDINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT") == "1",
             "target-graph-c2 requires qualified B8 OSCAR GDN-QKVZ graph flags");
-    require(env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
-                env("NINFER_EXL3_TARGET_PROJECTION_TIMING_OUT").empty(),
+    require(env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
+                env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING_OUT").empty(),
             "target-graph-c2 rejects projection timing instrumentation");
     require(!output.empty() && !std::filesystem::exists(output),
             "preserve target-graph-c2 output directory");

@@ -3,8 +3,8 @@
 
 void run_branch_reference_qualification(Exl3TextModel& target,
                                        const std::vector<std::int64_t>& source) {
-    using ninfer::exl3::Exl3BranchNode;
-    using ninfer::exl3::verify_exl3_branch_reference;
+    using voidinfer::exl3::Exl3BranchNode;
+    using voidinfer::exl3::verify_exl3_branch_reference;
     require(source.size() >= 600 && target.max_context() == 1024,
             "branchref requires real fixture and maxctx1024");
     auto candidate = target.create_context(true);

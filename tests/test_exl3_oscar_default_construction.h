@@ -48,18 +48,18 @@ struct OscarDefaultConstructionRecord {
 
 inline void oscar_default_set_base(OscarDefaultEnvironmentScope& scope, int width) {
     require(width == 128 || width == 1024, "OSCAR constructor width must be 128 or 1024");
-    scope.set("NINFER_EXL3_PREFILL_BATCH_ROTATIONS", "1");
+    scope.set("VOIDINFER_EXL3_PREFILL_BATCH_ROTATIONS", "1");
     // The wide ladder is cumulative: width 1024 must still enable 128.
-    scope.set("NINFER_EXL3_PREFILL_WIDE128", "1");
-    scope.set("NINFER_EXL3_PREFILL_WIDE256", width == 1024 ? "1" : "0");
-    scope.set("NINFER_EXL3_PREFILL_WIDE512", width == 1024 ? "1" : "0");
-    scope.set("NINFER_EXL3_PREFILL_WIDE1024", width == 1024 ? "1" : "0");
+    scope.set("VOIDINFER_EXL3_PREFILL_WIDE128", "1");
+    scope.set("VOIDINFER_EXL3_PREFILL_WIDE256", width == 1024 ? "1" : "0");
+    scope.set("VOIDINFER_EXL3_PREFILL_WIDE512", width == 1024 ? "1" : "0");
+    scope.set("VOIDINFER_EXL3_PREFILL_WIDE1024", width == 1024 ? "1" : "0");
     for (const char* name : {
-             "NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS",
-             "NINFER_OSCAR_PREFILL_QUERY_PARALLEL",
-             "NINFER_OSCAR_PREFILL_PACKED_BYTE4",
-             "NINFER_OSCAR_PREFILL_PARALLEL_MERGE",
-             "NINFER_OSCAR_PREFILL_PARALLEL_SCORES"}) {
+             "VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS",
+             "VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL",
+             "VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4",
+             "VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE",
+             "VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES"}) {
         scope.unset(name);
     }
 }
@@ -72,12 +72,12 @@ inline void run_oscar_default_construction(const std::string& output_path) {
             "oscardefaultconstruction cannot create OUT directory");
     const auto cases_path = std::filesystem::path(output_path) / "cases.csv";
     const auto result_path = std::filesystem::path(output_path) / "result.txt";
-    const std::string asset_dir = env("NINFER_OSCAR_ROTATION_ASSET_DIR");
-    const std::string compat_manifest = env("NINFER_OSCAR_COMPAT_MANIFEST");
+    const std::string asset_dir = env("VOIDINFER_OSCAR_ROTATION_ASSET_DIR");
+    const std::string compat_manifest = env("VOIDINFER_OSCAR_COMPAT_MANIFEST");
     require(!asset_dir.empty() && !compat_manifest.empty(),
             "oscardefaultconstruction needs canonical OSCAR asset and compat manifest");
 
-    const auto rotations = ninfer::exl3::exl3_oscar_load_rotations(asset_dir, compat_manifest);
+    const auto rotations = voidinfer::exl3::exl3_oscar_load_rotations(asset_dir, compat_manifest);
     std::vector<OscarDefaultConstructionRecord> records;
     std::ofstream out(cases_path);
     require(out.good(), "oscardefaultconstruction cannot open OUT");
@@ -105,10 +105,10 @@ inline void run_oscar_default_construction(const std::string& output_path) {
         cuda_check(cudaDeviceSynchronize(), "OSCAR constructor prewarm sync");
         cuda_check(cudaMemGetInfo(&record.free_before, &record.total_bytes),
                    "OSCAR constructor free-before query");
-        ninfer::exl3::Exl3OscarTelemetry telemetry{};
-        std::unique_ptr<ninfer::exl3::Exl3OscarContext> context;
+        voidinfer::exl3::Exl3OscarTelemetry telemetry{};
+        std::unique_ptr<voidinfer::exl3::Exl3OscarContext> context;
         try {
-            context = ninfer::exl3::Exl3OscarContext::create(rotations, width, &telemetry);
+            context = voidinfer::exl3::Exl3OscarContext::create(rotations, width, &telemetry);
         } catch (const std::invalid_argument& error) {
             record.error = error.what();
             // Rejected constructor paths fail before a context exists; keep
@@ -150,11 +150,11 @@ inline void run_oscar_default_construction(const std::string& output_path) {
 
     const auto configure_unset = [](OscarDefaultEnvironmentScope&) {};
     const auto configure_all1 = [](OscarDefaultEnvironmentScope& scope) {
-        scope.set("NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS", "1");
-        scope.set("NINFER_OSCAR_PREFILL_QUERY_PARALLEL", "1");
-        scope.set("NINFER_OSCAR_PREFILL_PACKED_BYTE4", "1");
-        scope.set("NINFER_OSCAR_PREFILL_PARALLEL_MERGE", "1");
-        scope.set("NINFER_OSCAR_PREFILL_PARALLEL_SCORES", "1");
+        scope.set("VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS", "1");
+        scope.set("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL", "1");
+        scope.set("VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4", "1");
+        scope.set("VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE", "1");
+        scope.set("VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES", "1");
     };
     {
         // Complete one constructor lifetime before recording matrix memory.
@@ -163,8 +163,8 @@ inline void run_oscar_default_construction(const std::string& output_path) {
         configure_all1(scope);
         cuda_check(cudaFree(0), "OSCAR constructor prewarm allocation");
         cuda_check(cudaDeviceSynchronize(), "OSCAR constructor prewarm allocation sync");
-        ninfer::exl3::Exl3OscarTelemetry telemetry{};
-        auto context = ninfer::exl3::Exl3OscarContext::create(rotations, 1024, &telemetry);
+        voidinfer::exl3::Exl3OscarTelemetry telemetry{};
+        auto context = voidinfer::exl3::Exl3OscarContext::create(rotations, 1024, &telemetry);
         cuda_check(cudaDeviceSynchronize(), "OSCAR constructor prewarm create sync");
         context.reset();
         cuda_check(cudaDeviceSynchronize(), "OSCAR constructor prewarm destroy sync");
@@ -173,57 +173,57 @@ inline void run_oscar_default_construction(const std::string& output_path) {
         run_case("all_unset", width, true, configure_unset);
         run_case("all_one", width, true, configure_all1);
         run_case("coalesced_zero", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS", "0");
         });
         run_case("query_zero", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_QUERY_PARALLEL", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL", "0");
         });
         run_case("packed_zero", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_PACKED_BYTE4", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4", "0");
         });
         run_case("batch_zero_dependents_unset", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_EXL3_PREFILL_BATCH_ROTATIONS", "0");
+            scope.set("VOIDINFER_EXL3_PREFILL_BATCH_ROTATIONS", "0");
         });
         run_case("merge_zero_query_unset", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_PARALLEL_MERGE", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE", "0");
         });
         run_case("scores_zero_query_unset", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_PARALLEL_SCORES", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES", "0");
         });
         run_case("merge_other_query_unset", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_PARALLEL_MERGE", "other");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE", "other");
         });
         run_case("scores_other_query_unset", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_PARALLEL_SCORES", "other");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES", "other");
         });
         run_case("coalesced_other", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS", "other");
+            scope.set("VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS", "other");
         });
         run_case("query_other", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_QUERY_PARALLEL", "other");
+            scope.set("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL", "other");
         });
         run_case("packed_other", width, true, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_PACKED_BYTE4", "other");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4", "other");
         });
         run_case("query_one_merge_zero_reject", width, false, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_QUERY_PARALLEL", "1");
-            scope.set("NINFER_OSCAR_PREFILL_PARALLEL_MERGE", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL", "1");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE", "0");
         });
         run_case("query_one_scores_zero_reject", width, false, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_QUERY_PARALLEL", "1");
-            scope.set("NINFER_OSCAR_PREFILL_PARALLEL_SCORES", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL", "1");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES", "0");
         });
         run_case("query_one_batch_zero_reject", width, false, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_EXL3_PREFILL_BATCH_ROTATIONS", "0");
-            scope.set("NINFER_OSCAR_PREFILL_QUERY_PARALLEL", "1");
+            scope.set("VOIDINFER_EXL3_PREFILL_BATCH_ROTATIONS", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL", "1");
         });
         run_case("packed_one_query_zero_reject", width, false, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_OSCAR_PREFILL_PACKED_BYTE4", "1");
-            scope.set("NINFER_OSCAR_PREFILL_QUERY_PARALLEL", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4", "1");
+            scope.set("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL", "0");
         });
         run_case("packed_one_batch_zero_reject", width, false, [](OscarDefaultEnvironmentScope& scope) {
-            scope.set("NINFER_EXL3_PREFILL_BATCH_ROTATIONS", "0");
-            scope.set("NINFER_OSCAR_PREFILL_PACKED_BYTE4", "1");
+            scope.set("VOIDINFER_EXL3_PREFILL_BATCH_ROTATIONS", "0");
+            scope.set("VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4", "1");
         });
     }
 

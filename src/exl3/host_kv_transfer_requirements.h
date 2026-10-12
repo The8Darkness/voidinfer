@@ -4,7 +4,7 @@
 #include <iterator>
 #include <type_traits>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 inline bool exl3_host_kv_append_download_interval(int first,int rows,int position,int capacity,
     int& planned_end) noexcept {
     if(capacity<=0 || position<0 || position>capacity || first<0 || first>capacity ||

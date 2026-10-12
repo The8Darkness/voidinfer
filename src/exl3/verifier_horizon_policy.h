@@ -6,7 +6,7 @@
 #include <cmath>
 #include <array>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Uncalibrated, explicitly selected outer-horizon experiment. The default
 // keeps physical B8. A separately admitted execution route may run the same
 // decision at its native 2..8-row draft extent; neither changes L2 authority.

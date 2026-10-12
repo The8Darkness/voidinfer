@@ -1,4 +1,4 @@
-#include "ninfer/ops/gated_rmsnorm.h"
+#include "voidinfer/ops/gated_rmsnorm.h"
 #include "ops/norm_test_common.h"
 
 #include <cmath>
@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::norm;
+using namespace voidinfer;
+using namespace voidinfer::test;
+using namespace voidinfer::test::norm;
 
 namespace {
 

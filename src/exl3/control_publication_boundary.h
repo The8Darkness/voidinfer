@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Request-local ordering authority. Private CPU preview may be prepared after
 // numerical readiness, but no visible range can be queued before the resident
 // state transaction commits.

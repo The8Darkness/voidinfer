@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3SamplingReproducibility : std::uint8_t {
     // Explicit seeds, including the API's deterministic default zero, replay
@@ -142,4 +142,4 @@ private:
     std::atomic<bool> cancelled_{false};
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

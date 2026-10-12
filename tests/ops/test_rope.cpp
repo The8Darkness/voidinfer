@@ -1,4 +1,4 @@
-#include "ninfer/ops/rope.h"
+#include "voidinfer/ops/rope.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace voidinfer;
+using namespace voidinfer::test;
 
 namespace {
 

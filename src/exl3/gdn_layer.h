@@ -18,7 +18,7 @@
 #include <memory>
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3GdnLayer;
 class Exl3TextContext;
@@ -1002,4 +1002,4 @@ private:
 
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -18,13 +18,13 @@
 namespace {
 
 constexpr std::size_t kMatrixValues =
-    static_cast<std::size_t>(ninfer::kOscarMixedHeadDim) * ninfer::kOscarMixedHeadDim;
+    static_cast<std::size_t>(voidinfer::kOscarMixedHeadDim) * voidinfer::kOscarMixedHeadDim;
 constexpr std::size_t kQueryValues =
-    static_cast<std::size_t>(ninfer::kOscarMixedQueryHeads) * ninfer::kOscarMixedHeadDim;
+    static_cast<std::size_t>(voidinfer::kOscarMixedQueryHeads) * voidinfer::kOscarMixedHeadDim;
 constexpr std::size_t kRowValues =
-    static_cast<std::size_t>(ninfer::kOscarMixedKVHeads) * ninfer::kOscarMixedHeadDim;
+    static_cast<std::size_t>(voidinfer::kOscarMixedKVHeads) * voidinfer::kOscarMixedHeadDim;
 constexpr std::size_t kLayerValues =
-    kRowValues * ninfer::kOscarMixedFullAttentionLayers.size();
+    kRowValues * voidinfer::kOscarMixedFullAttentionLayers.size();
 constexpr float kAttentionScale = 1.0F / 16.0F;
 constexpr float kParityTolerance = 1.0e-6F;
 
@@ -79,12 +79,12 @@ TokenRows make_rows(std::uint32_t logical_token, std::uint32_t branch_salt) {
     TokenRows rows;
     rows.k.resize(kLayerValues);
     rows.v.resize(kLayerValues);
-    for (std::size_t layer = 0; layer < ninfer::kOscarMixedFullAttentionLayers.size(); ++layer) {
-        for (std::uint32_t head = 0; head < ninfer::kOscarMixedKVHeads; ++head) {
-            for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim;
+    for (std::size_t layer = 0; layer < voidinfer::kOscarMixedFullAttentionLayers.size(); ++layer) {
+        for (std::uint32_t head = 0; head < voidinfer::kOscarMixedKVHeads; ++head) {
+            for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim;
                  ++dimension) {
                 const std::size_t offset = layer * kRowValues +
-                    static_cast<std::size_t>(head) * ninfer::kOscarMixedHeadDim + dimension;
+                    static_cast<std::size_t>(head) * voidinfer::kOscarMixedHeadDim + dimension;
                 rows.k[offset] = float_to_bf16(deterministic_value(
                     layer, logical_token, head, dimension, branch_salt, false));
                 rows.v[offset] = float_to_bf16(deterministic_value(
@@ -97,14 +97,14 @@ TokenRows make_rows(std::uint32_t logical_token, std::uint32_t branch_salt) {
 
 std::vector<float> make_query(std::uint32_t model_layer, std::uint32_t logical_token) {
     std::vector<float> result(kQueryValues);
-    for (std::uint32_t head = 0; head < ninfer::kOscarMixedQueryHeads; ++head) {
-        for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim; ++dimension) {
+    for (std::uint32_t head = 0; head < voidinfer::kOscarMixedQueryHeads; ++head) {
+        for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim; ++dimension) {
             const std::uint32_t seed = mix(0xC3D40001U ^ model_layer * 0x9e3779b9U ^
                                            logical_token * 0x85ebca6bU ^
                                            head * 0xc2b2ae35U ^ dimension * 0x27d4eb2fU);
             const float centered = static_cast<float>(static_cast<std::int32_t>(seed % 2048U) -
                                                        1024);
-            result[static_cast<std::size_t>(head) * ninfer::kOscarMixedHeadDim + dimension] =
+            result[static_cast<std::size_t>(head) * voidinfer::kOscarMixedHeadDim + dimension] =
                 centered / 97.0F;
         }
     }
@@ -116,7 +116,7 @@ std::vector<float> load_bank(const std::filesystem::path& path) {
     if (!input) { throw std::runtime_error("cannot open OSCAR rotation bank"); }
     const auto end = input.tellg();
     if (end < 0 || static_cast<std::uint64_t>(end) !=
-                       ninfer::kOscarMixedFullAttentionLayers.size() * kMatrixValues * sizeof(float)) {
+                       voidinfer::kOscarMixedFullAttentionLayers.size() * kMatrixValues * sizeof(float)) {
         throw std::runtime_error("OSCAR rotation bank has the wrong byte count");
     }
     input.seekg(0, std::ios::beg);
@@ -157,29 +157,29 @@ void validate_runtime_manifest(const std::filesystem::path& rotation_dir) {
 }
 
 void row_rotate(const float* input, const float* matrix, bool transpose, float* output) {
-    for (std::uint32_t column = 0; column < ninfer::kOscarMixedHeadDim; ++column) {
+    for (std::uint32_t column = 0; column < voidinfer::kOscarMixedHeadDim; ++column) {
         float sum = 0.0F;
-        for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim; ++dimension) {
+        for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim; ++dimension) {
             const std::size_t matrix_index = transpose
-                ? static_cast<std::size_t>(column) * ninfer::kOscarMixedHeadDim + dimension
-                : static_cast<std::size_t>(dimension) * ninfer::kOscarMixedHeadDim + column;
+                ? static_cast<std::size_t>(column) * voidinfer::kOscarMixedHeadDim + dimension
+                : static_cast<std::size_t>(dimension) * voidinfer::kOscarMixedHeadDim + column;
             sum += input[dimension] * matrix[matrix_index];
         }
         output[column] = sum;
     }
 }
 
-ninfer::OscarMixedReadTier tier_for(std::uint32_t context, std::uint32_t logical) {
-    const std::uint32_t recent_begin = context <= ninfer::kOscarMixedPrefixTokens
+voidinfer::OscarMixedReadTier tier_for(std::uint32_t context, std::uint32_t logical) {
+    const std::uint32_t recent_begin = context <= voidinfer::kOscarMixedPrefixTokens
         ? context
-        : std::max(ninfer::kOscarMixedPrefixTokens,
-                   context > ninfer::kOscarMixedRecentTokens
-                       ? context - ninfer::kOscarMixedRecentTokens : 0U);
-    if (logical < ninfer::kOscarMixedPrefixTokens) {
-        return ninfer::OscarMixedReadTier::ProtectedPrefixBFloat16;
+        : std::max(voidinfer::kOscarMixedPrefixTokens,
+                   context > voidinfer::kOscarMixedRecentTokens
+                       ? context - voidinfer::kOscarMixedRecentTokens : 0U);
+    if (logical < voidinfer::kOscarMixedPrefixTokens) {
+        return voidinfer::OscarMixedReadTier::ProtectedPrefixBFloat16;
     }
-    if (logical < recent_begin) { return ninfer::OscarMixedReadTier::HistoricalOscarInt2G128; }
-    return ninfer::OscarMixedReadTier::RecentBFloat16;
+    if (logical < recent_begin) { return voidinfer::OscarMixedReadTier::HistoricalOscarInt2G128; }
+    return voidinfer::OscarMixedReadTier::RecentBFloat16;
 }
 
 struct ReferenceInput {
@@ -188,31 +188,31 @@ struct ReferenceInput {
 
 void decode_reference_row(const std::vector<std::uint16_t>& source, std::size_t offset,
                           bool key, bool historical, float* output) {
-    for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim; ++dimension) {
+    for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim; ++dimension) {
         output[dimension] = bf16_to_float(source[offset + dimension]);
     }
     if (!historical) { return; }
-    const auto encoded = ninfer::ops::oscar_int2_g128_encode(
-        output, ninfer::kOscarMixedHeadDim, key ? 0.96F : 0.92F);
-    ninfer::ops::oscar_int2_g128_decode(encoded, output, ninfer::kOscarMixedHeadDim);
+    const auto encoded = voidinfer::ops::oscar_int2_g128_encode(
+        output, voidinfer::kOscarMixedHeadDim, key ? 0.96F : 0.92F);
+    voidinfer::ops::oscar_int2_g128_decode(encoded, output, voidinfer::kOscarMixedHeadDim);
 }
 
-ninfer::OscarMixedAttentionTrace independent_reference(
+voidinfer::OscarMixedAttentionTrace independent_reference(
     std::size_t layer_index, std::uint32_t context, std::uint32_t query_token,
     const ReferenceInput& input, std::span<const float> q_original,
     std::span<const float> r_k, std::span<const float> r_v) {
-    require(layer_index < ninfer::kOscarMixedFullAttentionLayers.size(),
+    require(layer_index < voidinfer::kOscarMixedFullAttentionLayers.size(),
             "reference layer index is outside topology");
     require(query_token < context && context <= input.tokens.size(),
             "reference query/context is invalid");
-    ninfer::OscarMixedAttentionTrace result;
-    result.model_layer = ninfer::kOscarMixedFullAttentionLayers[layer_index];
+    voidinfer::OscarMixedAttentionTrace result;
+    result.model_layer = voidinfer::kOscarMixedFullAttentionLayers[layer_index];
     result.query_token = query_token;
     const std::uint32_t token_count = query_token + 1U;
     result.logical_positions.resize(token_count);
     result.tiers.reserve(token_count);
     result.rotated_q.resize(kQueryValues);
-    result.score_logits.resize(static_cast<std::size_t>(ninfer::kOscarMixedQueryHeads) * token_count);
+    result.score_logits.resize(static_cast<std::size_t>(voidinfer::kOscarMixedQueryHeads) * token_count);
     result.softmax.resize(result.score_logits.size());
     result.rotated_av.resize(kQueryValues);
     result.recovered_output.resize(kQueryValues);
@@ -220,52 +220,52 @@ ninfer::OscarMixedAttentionTrace independent_reference(
         result.logical_positions[logical] = logical;
         const auto tier = tier_for(context, logical);
         result.tiers.push_back(tier);
-        if (tier == ninfer::OscarMixedReadTier::ProtectedPrefixBFloat16) {
+        if (tier == voidinfer::OscarMixedReadTier::ProtectedPrefixBFloat16) {
             ++result.prefix_count;
-        } else if (tier == ninfer::OscarMixedReadTier::HistoricalOscarInt2G128) {
+        } else if (tier == voidinfer::OscarMixedReadTier::HistoricalOscarInt2G128) {
             ++result.historical_count;
         } else {
             ++result.recent_count;
         }
     }
-    for (std::uint32_t q_head = 0; q_head < ninfer::kOscarMixedQueryHeads; ++q_head) {
-        row_rotate(q_original.data() + static_cast<std::size_t>(q_head) * ninfer::kOscarMixedHeadDim,
+    for (std::uint32_t q_head = 0; q_head < voidinfer::kOscarMixedQueryHeads; ++q_head) {
+        row_rotate(q_original.data() + static_cast<std::size_t>(q_head) * voidinfer::kOscarMixedHeadDim,
                    r_k.data(), false,
-                   result.rotated_q.data() + static_cast<std::size_t>(q_head) * ninfer::kOscarMixedHeadDim);
+                   result.rotated_q.data() + static_cast<std::size_t>(q_head) * voidinfer::kOscarMixedHeadDim);
     }
-    std::vector<float> keys(static_cast<std::size_t>(token_count) * ninfer::kOscarMixedKVHeads *
-                            ninfer::kOscarMixedHeadDim);
+    std::vector<float> keys(static_cast<std::size_t>(token_count) * voidinfer::kOscarMixedKVHeads *
+                            voidinfer::kOscarMixedHeadDim);
     std::vector<float> values(keys.size());
-    std::vector<float> row(ninfer::kOscarMixedHeadDim);
+    std::vector<float> row(voidinfer::kOscarMixedHeadDim);
     for (std::uint32_t logical = 0; logical < token_count; ++logical) {
         const bool historical = tier_for(context, logical) ==
-                                ninfer::OscarMixedReadTier::HistoricalOscarInt2G128;
-        for (std::uint32_t kv_head = 0; kv_head < ninfer::kOscarMixedKVHeads; ++kv_head) {
+                                voidinfer::OscarMixedReadTier::HistoricalOscarInt2G128;
+        for (std::uint32_t kv_head = 0; kv_head < voidinfer::kOscarMixedKVHeads; ++kv_head) {
             const std::size_t row_offset = (static_cast<std::size_t>(logical) *
-                                             ninfer::kOscarMixedKVHeads + kv_head) *
-                                            ninfer::kOscarMixedHeadDim;
+                                             voidinfer::kOscarMixedKVHeads + kv_head) *
+                                            voidinfer::kOscarMixedHeadDim;
             const std::size_t source_offset = layer_index * kRowValues +
                                                static_cast<std::size_t>(kv_head) *
-                                               ninfer::kOscarMixedHeadDim;
+                                               voidinfer::kOscarMixedHeadDim;
             decode_reference_row(input.tokens[logical].k, source_offset, true, historical,
                                  keys.data() + row_offset);
             decode_reference_row(input.tokens[logical].v, source_offset, false, historical,
                                  values.data() + row_offset);
         }
     }
-    for (std::uint32_t q_head = 0; q_head < ninfer::kOscarMixedQueryHeads; ++q_head) {
-        const std::uint32_t kv_head = q_head / ninfer::kOscarMixedGqaRatio;
-        const float* q = result.rotated_q.data() + static_cast<std::size_t>(q_head) * ninfer::kOscarMixedHeadDim;
+    for (std::uint32_t q_head = 0; q_head < voidinfer::kOscarMixedQueryHeads; ++q_head) {
+        const std::uint32_t kv_head = q_head / voidinfer::kOscarMixedGqaRatio;
+        const float* q = result.rotated_q.data() + static_cast<std::size_t>(q_head) * voidinfer::kOscarMixedHeadDim;
         float* scores = result.score_logits.data() + static_cast<std::size_t>(q_head) * token_count;
         float* probabilities = result.softmax.data() + static_cast<std::size_t>(q_head) * token_count;
-        float* output = result.rotated_av.data() + static_cast<std::size_t>(q_head) * ninfer::kOscarMixedHeadDim;
-        std::fill(output, output + ninfer::kOscarMixedHeadDim, 0.0F);
+        float* output = result.rotated_av.data() + static_cast<std::size_t>(q_head) * voidinfer::kOscarMixedHeadDim;
+        std::fill(output, output + voidinfer::kOscarMixedHeadDim, 0.0F);
         for (std::uint32_t logical = 0; logical < token_count; ++logical) {
             const std::size_t row_offset = (static_cast<std::size_t>(logical) *
-                                             ninfer::kOscarMixedKVHeads + kv_head) *
-                                            ninfer::kOscarMixedHeadDim;
+                                             voidinfer::kOscarMixedKVHeads + kv_head) *
+                                            voidinfer::kOscarMixedHeadDim;
             float dot = 0.0F;
-            for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim; ++dimension) {
+            for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim; ++dimension) {
                 dot += q[dimension] * keys[row_offset + dimension];
             }
             scores[logical] = dot * kAttentionScale;
@@ -279,18 +279,18 @@ ninfer::OscarMixedAttentionTrace independent_reference(
         for (std::uint32_t logical = 0; logical < token_count; ++logical) {
             probabilities[logical] /= sum;
             const std::size_t row_offset = (static_cast<std::size_t>(logical) *
-                                             ninfer::kOscarMixedKVHeads + kv_head) *
-                                            ninfer::kOscarMixedHeadDim;
-            std::copy_n(values.data() + row_offset, ninfer::kOscarMixedHeadDim, row.data());
-            for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim; ++dimension) {
+                                             voidinfer::kOscarMixedKVHeads + kv_head) *
+                                            voidinfer::kOscarMixedHeadDim;
+            std::copy_n(values.data() + row_offset, voidinfer::kOscarMixedHeadDim, row.data());
+            for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim; ++dimension) {
                 output[dimension] += probabilities[logical] * row[dimension];
             }
         }
     }
-    for (std::uint32_t q_head = 0; q_head < ninfer::kOscarMixedQueryHeads; ++q_head) {
-        row_rotate(result.rotated_av.data() + static_cast<std::size_t>(q_head) * ninfer::kOscarMixedHeadDim,
+    for (std::uint32_t q_head = 0; q_head < voidinfer::kOscarMixedQueryHeads; ++q_head) {
+        row_rotate(result.rotated_av.data() + static_cast<std::size_t>(q_head) * voidinfer::kOscarMixedHeadDim,
                    r_v.data(), true,
-                   result.recovered_output.data() + static_cast<std::size_t>(q_head) * ninfer::kOscarMixedHeadDim);
+                   result.recovered_output.data() + static_cast<std::size_t>(q_head) * voidinfer::kOscarMixedHeadDim);
     }
     return result;
 }
@@ -334,7 +334,7 @@ struct Comparison {
     std::uint32_t historical = 0;
     std::uint32_t recent = 0;
     std::vector<std::uint32_t> logical_positions;
-    std::vector<ninfer::OscarMixedReadTier> tiers;
+    std::vector<voidinfer::OscarMixedReadTier> tiers;
     Metric q;
     Metric scores;
     Metric softmax;
@@ -344,16 +344,16 @@ struct Comparison {
 
 Comparison compare(const std::string& suite, std::size_t layer_index,
                    std::uint32_t context, std::uint32_t query,
-                   const ninfer::OscarMixedAgingLayerCache& cache,
+                   const voidinfer::OscarMixedAgingLayerCache& cache,
                    const ReferenceInput& input, const std::vector<float>& k_bank,
                    const std::vector<float>& v_bank) {
-    const std::uint32_t model_layer = ninfer::kOscarMixedFullAttentionLayers[layer_index];
+    const std::uint32_t model_layer = voidinfer::kOscarMixedFullAttentionLayers[layer_index];
     require(cache.model_layer() == model_layer && cache.context_tokens() == context,
             "reader cache does not match requested layer/context");
     const auto q = make_query(model_layer, query);
     const std::span<const float> rk(k_bank.data() + layer_index * kMatrixValues, kMatrixValues);
     const std::span<const float> rv(v_bank.data() + layer_index * kMatrixValues, kMatrixValues);
-    const ninfer::OscarMixedAttentionReader reader(cache, q, rk, rv);
+    const voidinfer::OscarMixedAttentionReader reader(cache, q, rk, rv);
     const auto actual = reader.read(query);
     const auto expected = independent_reference(layer_index, context, query, input, q, rk, rv);
     require(actual.logical_positions == expected.logical_positions && actual.tiers == expected.tiers,
@@ -392,8 +392,8 @@ void run_d4_1_microbenchmark(const std::vector<float>& k_bank,
     const std::span<const float> rv(v_bank.data() + layer_index * kMatrixValues, kMatrixValues);
     const auto profile_context = [&](std::uint32_t context) {
         const auto setup_start = std::chrono::steady_clock::now();
-        ninfer::OscarMixedAgingLayerCache cache(3, 9100U + context,
-                                                 ninfer::OscarMixedAgingAssetContract::c4_cal30k());
+        voidinfer::OscarMixedAgingLayerCache cache(3, 9100U + context,
+                                                 voidinfer::OscarMixedAgingAssetContract::c4_cal30k());
         for (std::uint32_t token = 0; token < context; ++token) {
             const auto rows = make_rows(token, 0xD4010000U);
             cache.append(token, std::span<const std::uint16_t>(rows.k.data(), kRowValues),
@@ -404,7 +404,7 @@ void run_d4_1_microbenchmark(const std::vector<float>& k_bank,
                                   .count();
         const std::uint32_t query = context - 1U;
         const auto q = make_query(3, query);
-        const ninfer::OscarMixedAttentionReader reader(cache, q, rk, rv);
+        const voidinfer::OscarMixedAttentionReader reader(cache, q, rk, rv);
         const auto trace = reader.read(query);
         require(trace.prefix_count + trace.historical_count + trace.recent_count == context,
                 "D4.1 microbenchmark tier accounting mismatch");
@@ -463,6 +463,7 @@ void write_comparison(std::ofstream& output, const Comparison& value) {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 1) { return 77; } // fixture-driven validator: skipped by bare CTest
     try {
         std::filesystem::path rotation_dir;
         std::string report_path;
@@ -478,7 +479,7 @@ int main(int argc, char** argv) {
         validate_runtime_manifest(rotation_dir);
         const auto k_bank = load_bank(rotation_dir / "k_rotation_fp32.bin");
         const auto v_bank = load_bank(rotation_dir / "v_rotation_fp32.bin");
-        const char* microbench = std::getenv("NINFER_OSCAR_D4_1_MICROBENCH");
+        const char* microbench = std::getenv("VOIDINFER_OSCAR_D4_1_MICROBENCH");
         if (microbench != nullptr && microbench[0] == '1') {
             run_d4_1_microbenchmark(k_bank, v_bank);
             return 0;
@@ -498,14 +499,14 @@ int main(int argc, char** argv) {
             forced_input.tokens.push_back(make_rows(token, 0xF00D0000U));
         }
 
-        const auto asset = ninfer::OscarMixedAgingAssetContract::c4_cal30k();
-        ninfer::OscarMixedAgingCacheBundle bundle324(7100U, asset,
-                                                     ninfer::kOscarMixedFullAttentionLayers);
+        const auto asset = voidinfer::OscarMixedAgingAssetContract::c4_cal30k();
+        voidinfer::OscarMixedAgingCacheBundle bundle324(7100U, asset,
+                                                     voidinfer::kOscarMixedFullAttentionLayers);
         for (std::uint32_t token = 0; token < 324; ++token) {
             bundle324.append(token, static_input.tokens[token].k, static_input.tokens[token].v);
         }
-        ninfer::OscarMixedAgingCacheBundle bundle332(7101U, asset,
-                                                     ninfer::kOscarMixedFullAttentionLayers);
+        voidinfer::OscarMixedAgingCacheBundle bundle332(7101U, asset,
+                                                     voidinfer::kOscarMixedFullAttentionLayers);
         for (std::uint32_t token = 0; token < 332; ++token) {
             bundle332.append(token, static_input.tokens[token].k, static_input.tokens[token].v);
         }
@@ -532,7 +533,7 @@ int main(int argc, char** argv) {
 
         // Forced decode advances one persistent cache, so each reader call consumes the actual
         // post-aging typed representation for that step rather than a pre-aging shadow.
-        ninfer::OscarMixedAgingLayerCache forced_decode_cache(3, 7103U, asset);
+        voidinfer::OscarMixedAgingLayerCache forced_decode_cache(3, 7103U, asset);
         for (std::uint32_t token = 0; token < 324; ++token) {
             const auto& rows = forced_input.tokens[token];
             forced_decode_cache.append(token,
@@ -551,15 +552,15 @@ int main(int argc, char** argv) {
         // Lightweight all-layer coverage at the final static context. Each layer gets its own
         // validated C4 matrices and exact full-attention cache rows; no GDN layer is constructed.
         std::vector<std::uint32_t> covered_layers;
-        for (std::size_t layer = 0; layer < ninfer::kOscarMixedFullAttentionLayers.size(); ++layer) {
+        for (std::size_t layer = 0; layer < voidinfer::kOscarMixedFullAttentionLayers.size(); ++layer) {
             results.push_back(compare("all-layer-static", layer, 332, 331,
-                                      bundle332.layer(ninfer::kOscarMixedFullAttentionLayers[layer]),
+                                      bundle332.layer(voidinfer::kOscarMixedFullAttentionLayers[layer]),
                                       static_input, k_bank, v_bank));
-            covered_layers.push_back(ninfer::kOscarMixedFullAttentionLayers[layer]);
+            covered_layers.push_back(voidinfer::kOscarMixedFullAttentionLayers[layer]);
         }
         require(covered_layers.size() == 16 &&
                     std::equal(covered_layers.begin(), covered_layers.end(),
-                               ninfer::kOscarMixedFullAttentionLayers.begin()),
+                               voidinfer::kOscarMixedFullAttentionLayers.begin()),
                 "all-layer coverage is incomplete");
 
         double max_q = 0.0, max_scores = 0.0, max_softmax = 0.0;

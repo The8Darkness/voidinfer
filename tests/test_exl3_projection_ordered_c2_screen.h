@@ -4,7 +4,7 @@
 // only the real layer-0/down K5 input from each request and never batches state.
 
 void capture_projection_ordered_c2_down(
-    const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+    const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
     void* user) {
     if (observation.layer != 0 || observation.operation == nullptr ||
         std::string(observation.operation) != "down") return;
@@ -41,7 +41,7 @@ TargetK6CapturedProjection capture_projection_ordered_c2_context(
     std::vector<TargetK6CapturedProjection> captured;
     context->set_target_projection_observer_for_test(
         capture_projection_ordered_c2_down, &captured, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     struct ResetObserver {
         Exl3TextContext* context = nullptr;
         ~ResetObserver() {
@@ -83,15 +83,15 @@ double time_projection_ordered_c2(
                "record ordered C2 timing begin");
     if (candidate) {
         workspace.forward(record.weights, record.metadata, input, output, 16, nullptr,
-                          ninfer::exl3::Exl3CudaLinearAdmission::target_initial16);
+                          voidinfer::exl3::Exl3CudaLinearAdmission::target_initial16);
     } else {
         constexpr std::size_t input_stride = 8u * 17408u;
         constexpr std::size_t output_stride = 8u * 5120u;
         workspace.forward(record.weights, record.metadata, input, output, 8, nullptr,
-                          ninfer::exl3::Exl3CudaLinearAdmission::target_continuation_down);
+                          voidinfer::exl3::Exl3CudaLinearAdmission::target_continuation_down);
         workspace.forward(record.weights, record.metadata, input + input_stride,
                           output + output_stride, 8, nullptr,
-                          ninfer::exl3::Exl3CudaLinearAdmission::target_continuation_down);
+                          voidinfer::exl3::Exl3CudaLinearAdmission::target_continuation_down);
     }
     cuda_check(cudaEventRecord(end.get(), nullptr),
                "record ordered C2 timing end");
@@ -116,7 +116,7 @@ void run_projection_ordered_c2_screen(
     require(!std::equal(source.begin(), source.begin() + 512,
                         source.begin() + 512),
             "ordered C2 screen requires two distinct request prefixes");
-    require(env("NINFER_EXL3_TARGET_INITIAL16_ORDERED") == "1",
+    require(env("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED") == "1",
             "ordered C2 screen requires explicit initial16 ordered admission");
     require(!output_path.empty() && !std::filesystem::exists(output_path),
             "ordered C2 screen requires a new output path");
@@ -167,9 +167,9 @@ void run_projection_ordered_c2_screen(
     Exl3CudaLinearWorkspace workspace(
         17408, 5120, 16, false, false, true, false, false, true);
     const auto serial_admission =
-        ninfer::exl3::Exl3CudaLinearAdmission::target_continuation_down;
+        voidinfer::exl3::Exl3CudaLinearAdmission::target_continuation_down;
     const auto candidate_admission =
-        ninfer::exl3::Exl3CudaLinearAdmission::target_initial16;
+        voidinfer::exl3::Exl3CudaLinearAdmission::target_initial16;
     const std::string serial_dispatch =
         workspace.dispatch_name(captures[0].metadata, 8, serial_admission);
     const std::string candidate_dispatch =

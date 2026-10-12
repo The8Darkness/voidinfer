@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // One copy of a verifier row's per-row state when an accepted sibling leaf is
 // promoted into its chain slot: dst[i * stride] = src[i * stride] for
@@ -42,4 +42,4 @@ inline int exl3_pack_sibling_offsets(std::span<const int> offsets, int chain_row
     return packed;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

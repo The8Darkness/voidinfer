@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace voidinfer::ops::detail {
 
 // Complete mixed-tier diagnostic contract. Rows are supplied in logical order within
 // each tier; the logical attention order is prefix, historical, recent.
@@ -219,4 +219,4 @@ void oscar_int2_g128_mixed_attention_launch_fused_decode_split_counts(
 void oscar_int2_g128_ensure_graph_attributes();
 OscarMixedKernelResources oscar_int2_g128_mixed_kernel_resources();
 
-} // namespace ninfer::ops::detail
+} // namespace voidinfer::ops::detail

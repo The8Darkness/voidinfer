@@ -1,7 +1,7 @@
 #pragma once
 
 struct T97PrepareTrace {
-    std::array<std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest>,8>
+    std::array<std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest>,8>
         roots{};
     std::array<std::int64_t,8> first_tokens{};
     std::array<double,8> request_ms{};
@@ -20,9 +20,9 @@ void run_t97_concurrent_prefix_prepare(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
     using Clock = std::chrono::steady_clock;
     constexpr std::size_t kPrefix = 3840;
     constexpr std::array<int,8> kTails{40,56,72,88,104,120,136,152};
@@ -33,8 +33,8 @@ void run_t97_concurrent_prefix_prepare(
     require(!output.empty() && !std::filesystem::exists(output),
             "T97 output must be new");
     std::filesystem::create_directories(output);
-    const auto reserve_gib = std::stoull(env("NINFER_T97_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T97_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T97_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T97_CACHE_MIB"));
     require(reserve_gib >= 8 && cache_mib >= 1024,
             "T97 memory policy extent");
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
@@ -52,13 +52,13 @@ void run_t97_concurrent_prefix_prepare(
         return value.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T97_NAMESPACE"), env("NINFER_T97_ARTIFACT_ID"),
-        env("NINFER_T97_TOKENIZER_ID"), env("NINFER_T97_CONFIGURATION_ID"),
-        env("NINFER_T97_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T97_NAMESPACE"), env("VOIDINFER_T97_ARTIFACT_ID"),
+        env("VOIDINFER_T97_TOKENIZER_ID"), env("VOIDINFER_T97_CONFIGURATION_ID"),
+        env("VOIDINFER_T97_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{16, 64, cache_budget, reserve}, identity);
-    ninfer::exl3::Exl3HostResidentSet residency(
+    voidinfer::exl3::Exl3HostResidentSet residency(
         memory.ullTotalPhys - reserve, reserve);
     auto context_a = target.create_context(true);
     auto context_b = target.create_context(true);
@@ -103,7 +103,7 @@ void run_t97_concurrent_prefix_prepare(
     const auto pin = [&](const std::array<std::shared_ptr<const Request>,8>& roots) {
         auto all = cache.roots();
         for (const auto& root : roots) all.push_back(root);
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for (const auto& root : all) snapshot.owners.push_back(root);
         Request::visit_host_allocations(all,
             [&](const void* data, std::size_t bytes) { snapshot.add(data, bytes); },

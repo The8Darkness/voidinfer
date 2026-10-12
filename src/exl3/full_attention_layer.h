@@ -23,8 +23,8 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
-// NINFER_EXL3_FA2_PREFILL (default 1): FA2-style prefill attention route.
+namespace voidinfer::exl3 {
+// VOIDINFER_EXL3_FA2_PREFILL (default 1): FA2-style prefill attention route.
 bool exl3_fa2_prefill_enabled();
 
 struct Exl3PrefillQkvConcurrencyView {
@@ -979,7 +979,7 @@ private:
     std::uint16_t* k_cache_ = nullptr;
     // KV-tier fidelity research (kv_fakequant.cuh): aged-row watermark and rotation bank.
     int* fakequant_watermark_ = nullptr;
-    // L0 OSCAR INT4 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
+    // L0 OSCAR INT4 history (l0_oscar.cuh); empty unless VOIDINFER_EXL3_L0_OSCAR=1.
     l0_oscar::LayerStorage l0_{};
     std::array<std::unique_ptr<Exl3GrowableDeviceRegion>,4> l0_regions_{};
     // Window ring rows (keys wrap modulo) and the shared prompt-scale ring of
@@ -1191,4 +1191,4 @@ private:
     Exl3FullAttentionLayerTimings timings_{};
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace voidinfer::ops::detail {
 
 // Historical-only diagnostic kernel contract for the official OSCAR INT2 G128
 // representation.  All tensors are contiguous FP32/byte arrays:
@@ -35,4 +35,4 @@ void oscar_int2_g128_history_attention_launch(
 
 OscarHistoryKernelResources oscar_int2_g128_history_kernel_resources();
 
-} // namespace ninfer::ops::detail
+} // namespace voidinfer::ops::detail

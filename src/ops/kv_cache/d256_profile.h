@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace voidinfer::ops {
 
 inline constexpr std::int32_t kD256KVCacheHeadDim = 256;
 inline constexpr std::int32_t kD256OscarQuantGroup = 128;
@@ -49,4 +49,4 @@ inline D256KVCacheProfile d256_kv_cache_profile(DType dtype, std::int32_t quant_
     return d256_kv_cache_profile(dtype);
 }
 
-} // namespace ninfer::ops
+} // namespace voidinfer::ops

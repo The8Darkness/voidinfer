@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Per-request sampling policy of the coherent-device route (sampled_select.cuh).
 // temperature 0 = greedy argmax; penalties are not part of this route.
@@ -14,4 +14,4 @@ struct Exl3DeviceSampling {
     bool active() const noexcept {return temperature>0.0f;}
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

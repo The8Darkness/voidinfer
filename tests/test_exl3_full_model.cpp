@@ -20,7 +20,7 @@
 #include <vector>
 
 namespace {
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 constexpr int kHidden = 5120;
 constexpr int kVocab = 248320;
 constexpr int kPrefillRows = 14;
@@ -156,10 +156,10 @@ std::vector<std::int64_t> run_prompt(Exl3TextModel& model, std::span<const std::
 
 int main() {
     try {
-        const auto target = env("NINFER_EXL3_TARGET_PATH");
-        const auto oracle_path = env("NINFER_EXL3_ORACLE_PATH");
+        const auto target = env("VOIDINFER_EXL3_TARGET_PATH");
+        const auto oracle_path = env("VOIDINFER_EXL3_ORACLE_PATH");
         if (target.empty() || oracle_path.empty()) {
-            std::cerr << "E4A skipped: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_ORACLE_PATH\n";
+            std::cerr << "E4A skipped: set VOIDINFER_EXL3_TARGET_PATH and VOIDINFER_EXL3_ORACLE_PATH\n";
             return 77;
         }
         const auto oracle = inspect_file(oracle_path);
@@ -169,7 +169,7 @@ int main() {
         const auto expected_first_logits = as_float(fixture_tensor(oracle_path, oracle, "greedy_first_logits"));
         const auto expected_tokens = as_i64(fixture_tensor(oracle_path, oracle, "greedy_tokens"));
         require(input_ids.size() == 15 && expected_tokens.size() == 16, "E4A canonical fixture dimensions changed");
-        if(const auto ownership=env("NINFER_TEST_METADATA_OWNER_RELOAD");!ownership.empty()) {
+        if(const auto ownership=env("VOIDINFER_TEST_METADATA_OWNER_RELOAD");!ownership.empty()) {
             require(ownership=="1","metadata owner reload fixture option");
             auto owner=Exl3TextModel::load(target,256);
             const auto descriptor_reuses=owner->load_stats().linear_descriptor_reuses;
@@ -220,7 +220,7 @@ int main() {
                   << " measured_vram_bytes=" << (free_before - free_after)
                   << " device_total_bytes=" << total_after << '\n';
 
-        if (env("NINFER_EXL3_PROFILE_ONLY") == "1") {
+        if (env("VOIDINFER_EXL3_PROFILE_ONLY") == "1") {
             auto profile_context = model->create_context(false);
             profile_context->prefill(std::span<const std::int64_t>(input_ids.data(), kPrefillRows));
             profile_context->decode(input_ids.back());
@@ -308,7 +308,7 @@ int main() {
         }
         std::cout << "E4A additional_prompts=3/3\n";
 
-        if (env("NINFER_EXL3_GRAPH_TEST") == "1") {
+        if (env("VOIDINFER_EXL3_GRAPH_TEST") == "1") {
             auto ungraphed = model->create_context(false);
             auto graphed = model->create_context(false);
             cudaStream_t eager_stream = nullptr;
@@ -421,7 +421,7 @@ int main() {
                     "E4B2 benchmark event creation failed");
             std::vector<double> eager_times, graph_times;
             eager_times.reserve(8); graph_times.reserve(8);
-            if (env("NINFER_EXL3_GRAPH_PROFILE_ONLY") == "1") {
+            if (env("VOIDINFER_EXL3_GRAPH_PROFILE_ONLY") == "1") {
                 cuda_check(cudaProfilerStart(), "E4B2 profiler start");
             }
             for (int sample = 0; sample < 8; ++sample) {
@@ -440,7 +440,7 @@ int main() {
                 cuda_check(cudaEventElapsedTime(&ms, start, stop), "E4B2 graph timing elapsed");
                 graph_times.push_back(ms);
             }
-            if (env("NINFER_EXL3_GRAPH_PROFILE_ONLY") == "1") {
+            if (env("VOIDINFER_EXL3_GRAPH_PROFILE_ONLY") == "1") {
                 cuda_check(cudaProfilerStop(), "E4B2 profiler stop");
             }
             cudaEventDestroy(start); cudaEventDestroy(stop);

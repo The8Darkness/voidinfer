@@ -1,16 +1,16 @@
 #pragma once
 
 void run_compact_draft_performance(Exl3TextModel& target,Exl3Dflash2DraftModel& draft) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    const std::filesystem::path fixtures=env("NINFER_COMPACT_PERF_DIR"),output=env("NINFER_COMPACT_PERF_OUTPUT");
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    const std::filesystem::path fixtures=env("VOIDINFER_COMPACT_PERF_DIR"),output=env("VOIDINFER_COMPACT_PERF_OUTPUT");
     require(!fixtures.empty() && !output.empty() && target.max_context()>=4224 &&
         !std::filesystem::exists(output/"progress.jsonl"),"compact perf evidence/context extent");
     std::ofstream progress(output/"progress.jsonl");require(progress.good(),"compact perf progress file");
     const auto terminal=load_ids((fixtures/"stop.ids").string());
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");_putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");_putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
     auto inner=target.create_context(true);require(inner->try_enable_oscar_from_environment(),"compact perf OSCAR");
     inner->prepare_transaction();inner->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     TapStage stage;std::array<std::uint16_t*,5> staging{};
     for(int tap=0;tap<5;++tap) {
@@ -18,7 +18,7 @@ void run_compact_draft_performance(Exl3TextModel& target,Exl3Dflash2DraftModel& 
         staging[tap]=static_cast<std::uint16_t*>(stage.bulk.back()->get());stage.bulk_ptrs.push_back(staging[tap]);
         stage.row_ptrs.push_back(static_cast<std::uint16_t*>(stage.rows.back()->get()));
     }
-    if(env("NINFER_COMPACT_PROFILE")=="1") {
+    if(env("VOIDINFER_COMPACT_PROFILE")=="1") {
         const auto ids=load_ids((fixtures/"code.ids").string());
         require(ids.size()==4096,"compact profile prompt extent");
         const auto now=[] {return std::chrono::steady_clock::now();};
@@ -51,12 +51,12 @@ void run_compact_draft_performance(Exl3TextModel& target,Exl3Dflash2DraftModel& 
             begin=now();auto [updated,verified]=request->verify_compact(*exact,draft,staging,tentative,terminal);end=now();outer_verify_ms+=ms(begin,end);
             const auto transferred=exact->host_kv_stats();
             kv_h2d+=transferred.h2d_bytes-transfers.h2d_bytes;kv_d2h+=transferred.d2h_bytes-transfers.d2h_bytes;
-            if(env("NINFER_COMPACT_DEFER_POST_RESTORE")!="1") {
+            if(env("VOIDINFER_COMPACT_DEFER_POST_RESTORE")!="1") {
                 begin=now();updated->restore_inner(*inner,draft,staging);end=now();post_restore_ms+=ms(begin,end);
             }
             begin=now();cuda_check(cudaDeviceSynchronize(),"compact profile publication");end=now();publication_sync_ms+=ms(begin,end);
             request=std::move(updated);committed+=verified.committed_tokens.size();
-            for(auto token:verified.committed_tokens) if(!ninfer::exl3::exl3_terminal_token(token,terminal)) ++visible;
+            for(auto token:verified.committed_tokens) if(!voidinfer::exl3::exl3_terminal_token(token,terminal)) ++visible;
             inner_accepted+=local.accepted;inner_attempted+=local.attempted_rows;inner_reconstruction+=local.state_reconstruction_rows;
             outer_executed+=verified.executed_rows;outer_matched+=verified.accepted;outer_rejections+=verified.rejected;
             if(first_release_ms==0) first_release_ms=ms(total_begin,now());
@@ -120,7 +120,7 @@ void run_compact_draft_performance(Exl3TextModel& target,Exl3Dflash2DraftModel& 
         result.elapsed_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         result.state=std::move(request);return result;
     };
-    if(env("NINFER_T77_DIRECT_TAP_PERF")=="1") {
+    if(env("VOIDINFER_T77_DIRECT_TAP_PERF")=="1") {
         constexpr int repeats=3,limit=128;
         int pairs=0,positive=0;
         std::cout << std::setprecision(10);
@@ -130,14 +130,14 @@ void run_compact_draft_performance(Exl3TextModel& target,Exl3Dflash2DraftModel& 
             const auto root=Request::initialize(*exact,ids,1024);
             const auto compact=root->compact_draft(draft,staging);
             for(int arm=0;arm<2;++arm) {
-                _putenv_s("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING",arm?"1":"0");
+                _putenv_s("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING",arm?"1":"0");
                 (void)run(compact,8,true);
             }
             for(int repeat=0;repeat<repeats;++repeat) {
                 std::array<Result,2> results;
                 for(int order=0;order<2;++order) {
                     const int arm=(repeat&1)?1-order:order;
-                    _putenv_s("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING",arm?"1":"0");
+                    _putenv_s("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING",arm?"1":"0");
                     results[arm]=run(compact,limit,false);
                     const auto path=output/(fixture+"-pair-"+std::to_string(repeat)+
                         "-arm-"+std::to_string(arm)+".ids");
@@ -145,7 +145,7 @@ void run_compact_draft_performance(Exl3TextModel& target,Exl3Dflash2DraftModel& 
                     std::ofstream file(path);for(auto token:results[arm].tokens) file<<token<<'\n';
                     file.close();require(file.good(),"T77 output file");
                 }
-                _putenv_s("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING","0");
+                _putenv_s("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING","0");
                 const auto& control=results[0];const auto& candidate=results[1];
                 require(control.tokens.size()==limit && !control.stopped &&
                     control.tokens==candidate.tokens && control.stopped==candidate.stopped &&
@@ -173,15 +173,15 @@ void run_compact_draft_performance(Exl3TextModel& target,Exl3Dflash2DraftModel& 
                     << " removed_tap_payload_bytes=6553600 work=exact state=exact ring=exact\n";
             }
         }
-        _putenv_s("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING","0");
+        _putenv_s("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING","0");
         std::cout << "T77_WORKSPACE_REUSE PASS pairs=" << pairs << " positive=" << positive
             << " fixtures=2 tokens_per_arm=128 transient_tap_payload_removed_per_arm=6553600"
                " explicit_opt_in=1\n";
         return;
     }
-    if(env("NINFER_COMPACT_RESTORE_PERF")=="1") {
-        const int repeats=std::stoi(env("NINFER_COMPACT_RESTORE_REPEATS"));
-        const int limit=std::stoi(env("NINFER_COMPACT_RESTORE_TOKENS"));
+    if(env("VOIDINFER_COMPACT_RESTORE_PERF")=="1") {
+        const int repeats=std::stoi(env("VOIDINFER_COMPACT_RESTORE_REPEATS"));
+        const int limit=std::stoi(env("VOIDINFER_COMPACT_RESTORE_TOKENS"));
         require(repeats>=1 && repeats<=3 && (limit==64 || limit==128),"compact restore performance extent");
         int pairs=0;
         std::cout << std::setprecision(10);

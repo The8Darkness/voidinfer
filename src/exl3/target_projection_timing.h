@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3TargetProjectionPhase { attempt, replay };
 
@@ -91,4 +91,4 @@ const char* target_projection_phase_name(Exl3TargetProjectionPhase phase) noexce
 const char* target_projection_operator_name(Exl3TargetProjectionOperator operation) noexcept;
 const char* target_projection_topology_name(Exl3TargetProjectionTopology topology) noexcept;
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

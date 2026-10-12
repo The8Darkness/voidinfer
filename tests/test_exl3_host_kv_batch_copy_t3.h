@@ -3,12 +3,12 @@
 void run_exact_host_kv_batch_copy_t3(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose,
     const std::vector<std::int64_t>& structured,const std::vector<std::int64_t>& heldout) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352,"host KV batch-copy T3 context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
         require(!logits.empty() && std::none_of(logits.begin(),logits.end(),
@@ -24,15 +24,15 @@ void run_exact_host_kv_batch_copy_t3(Exl3TextModel& target,
     for(const auto& fixture:fixtures) {
         require(fixture.second->size()>=prefix,"host KV batch-copy T3 fixture extent");
         const std::vector<std::int64_t> input(fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","1");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         struct Result {
             double prefill_ms=0;
             std::int64_t token=0;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
-            ninfer::exl3::Exl3HostKVStats delta;
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
+            voidinfer::exl3::Exl3HostKVStats delta;
         };
         const auto run=[&](Exl3TextContext& context) {
             const auto before=context.host_kv_stats();

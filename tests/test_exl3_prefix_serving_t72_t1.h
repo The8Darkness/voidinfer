@@ -2,18 +2,18 @@
 
 void run_prefix_serving_t72_t1(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache=ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity=ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache=voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity=voidinfer::exl3::Exl3VeriCacheServingIdentity;
     constexpr std::size_t prompt_rows=4096,prefix_rows=3968,tail_rows=128;
     require(target.max_context()>=static_cast<int>(prompt_rows) &&
         code.size()>=prompt_rows && prose.size()>=tail_rows,
         "T72 T1 4K fixture extent");
-    const auto output=std::filesystem::path(env("NINFER_T72_OUT"));
+    const auto output=std::filesystem::path(env("VOIDINFER_T72_OUT"));
     require(!output.empty() && !std::filesystem::exists(output),"T72 T1 output must be new");
     std::filesystem::create_directories(output);
-    const auto reserve_gib=std::stoull(env("NINFER_T72_RESERVE_GIB"));
-    const auto cache_mib=std::stoull(env("NINFER_T72_CACHE_MIB"));
+    const auto reserve_gib=std::stoull(env("VOIDINFER_T72_RESERVE_GIB"));
+    const auto cache_mib=std::stoull(env("VOIDINFER_T72_CACHE_MIB"));
     const std::uint64_t reserve=reserve_gib*(1ULL<<30),cache_budget=cache_mib*(1ULL<<20);
     require(reserve_gib>=4 && cache_mib>=512,"T72 T1 memory policy extent");
     MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
@@ -23,13 +23,13 @@ void run_prefix_serving_t72_t1(Exl3TextModel& target,
         MEMORYSTATUSEX state{};state.dwLength=sizeof(state);
         require(GlobalMemoryStatusEx(&state)!=0,"T72 T1 physical memory query");return state.ullAvailPhys;
     };
-    const Identity identity{env("NINFER_T72_NAMESPACE"),env("NINFER_T72_ARTIFACT_ID"),
-        env("NINFER_T72_TOKENIZER_ID"),env("NINFER_T72_CONFIGURATION_ID"),
-        env("NINFER_T72_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    const Identity identity{env("VOIDINFER_T72_NAMESPACE"),env("VOIDINFER_T72_ARTIFACT_ID"),
+        env("VOIDINFER_T72_TOKENIZER_ID"),env("VOIDINFER_T72_CONFIGURATION_ID"),
+        env("VOIDINFER_T72_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     Cache cache(Cache::Policy{4,64,cache_budget,reserve},identity);
-    ninfer::exl3::Exl3HostResidentSet residency(memory.ullTotalPhys-reserve,reserve);
+    voidinfer::exl3::Exl3HostResidentSet residency(memory.ullTotalPhys-reserve,reserve);
     auto cached_context=target.create_context(true);cached_context->prepare_continuation(8);
     auto fresh_context=target.create_context(true);fresh_context->prepare_continuation(8);
 
@@ -40,10 +40,10 @@ void run_prefix_serving_t72_t1(Exl3TextModel& target,
         !std::equal(code_prompt.begin()+prefix_rows,code_prompt.end(),
             prose_prompt.begin()+prefix_rows),"T72 T1 distinct real tails");
 
-    struct LockResult {ninfer::exl3::Exl3HostResidentSet::Stats update;Exl3HostResidency observed;};
+    struct LockResult {voidinfer::exl3::Exl3HostResidentSet::Stats update;Exl3HostResidency observed;};
     const auto pin=[&](std::shared_ptr<const Request> active={}) {
         auto roots=cache.roots();if(active) roots.push_back(std::move(active));
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for(const auto& root:roots) snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,[&](const void* data,std::size_t bytes){snapshot.add(data,bytes);},false);
         const auto update=residency.replace(std::move(snapshot));

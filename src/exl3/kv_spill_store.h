@@ -4,8 +4,8 @@
 // temporary file in fixed 4 MiB slots (64 rows x 16 banks x K/V) instead of
 // keeping them in RAM; a restore or reader brings them back.
 //
-// NINFER_EXL3_KV_SPILL=0 disables. NINFER_EXL3_KV_SPILL_DIR picks the
-// directory (default: the temp directory). NINFER_EXL3_KV_SPILL_FREE_MIB is
+// VOIDINFER_EXL3_KV_SPILL=0 disables. VOIDINFER_EXL3_KV_SPILL_DIR picks the
+// directory (default: the temp directory). VOIDINFER_EXL3_KV_SPILL_FREE_MIB is
 // the available physical memory to keep (default 12288).
 #include "exl3/exact_kv_extent.h"
 
@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3KvSpillStore {
 public:
@@ -35,7 +35,7 @@ public:
     // The process store, or null when disabled or unavailable.
     static Exl3KvSpillStore* get() {
         static Exl3KvSpillStore* store = [] () -> Exl3KvSpillStore* {
-            const char* value = std::getenv("NINFER_EXL3_KV_SPILL");
+            const char* value = std::getenv("VOIDINFER_EXL3_KV_SPILL");
             if (value && std::strcmp(value, "0") == 0) return nullptr;
             try {
                 auto* created = new Exl3KvSpillStore();
@@ -52,7 +52,7 @@ public:
     // `hard`: below half the floor (plus `extra`).
     static bool under_pressure(std::uint64_t extra = 0, bool hard = false) {
         static const std::uint64_t floor = [] {
-            const char* value = std::getenv("NINFER_EXL3_KV_SPILL_FREE_MIB");
+            const char* value = std::getenv("VOIDINFER_EXL3_KV_SPILL_FREE_MIB");
             return static_cast<std::uint64_t>(value ? std::strtoull(value, nullptr, 10) : 12288) << 20;
         }();
         MEMORYSTATUSEX memory{};
@@ -87,13 +87,13 @@ public:
     void write(std::int64_t slot, const void* buffer, std::size_t bytes) {
         io(slot, const_cast<void*>(buffer), bytes, true);
         const auto before = written_.fetch_add(bytes, std::memory_order_relaxed);
-        if (std::getenv("NINFER_EXL3_VERICACHE_STATS") && (before >> 30) != ((before + bytes) >> 30))
+        if (std::getenv("VOIDINFER_EXL3_VERICACHE_STATS") && (before >> 30) != ((before + bytes) >> 30))
             std::fprintf(stderr, "KV_SPILL written_gib=%llu live_slots=%llu\n",
                 static_cast<unsigned long long>((before + bytes) >> 30),
                 static_cast<unsigned long long>(live_slots()));
-        // NINFER_EXL3_TEST_KV_SPILL=1 reads every slot back and compares.
+        // VOIDINFER_EXL3_TEST_KV_SPILL=1 reads every slot back and compares.
         static const bool verify = [] {
-            const char* value = std::getenv("NINFER_EXL3_TEST_KV_SPILL");
+            const char* value = std::getenv("VOIDINFER_EXL3_TEST_KV_SPILL");
             return value && std::strcmp(value, "1") == 0;
         }();
         if (verify) {
@@ -125,9 +125,9 @@ public:
 private:
     Exl3KvSpillStore() {
         std::filesystem::path directory;
-        if (const char* value = std::getenv("NINFER_EXL3_KV_SPILL_DIR")) directory = value;
+        if (const char* value = std::getenv("VOIDINFER_EXL3_KV_SPILL_DIR")) directory = value;
         else directory = std::filesystem::temp_directory_path();
-        const auto path = directory / ("ninfer-kv-spill-" + std::to_string(GetCurrentProcessId()) + ".bin");
+        const auto path = directory / ("voidinfer-kv-spill-" + std::to_string(GetCurrentProcessId()) + ".bin");
         file_ = CreateFileW(path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
             nullptr);
@@ -164,4 +164,4 @@ private:
     std::atomic<std::uint64_t> written_{0};
 };
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

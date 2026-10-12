@@ -29,7 +29,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Configured page-budget refusal occurs before ownership publication or locks.
 // Keep it distinct from OS failures and failed rollback/retirement.
 class Exl3HostResidentBudgetExhausted : public std::runtime_error {
@@ -927,5 +927,5 @@ public:
         closed_=true;process_owned_=false;
     }
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3
 #endif

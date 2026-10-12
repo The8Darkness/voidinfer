@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
@@ -107,9 +107,9 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
 
 
 namespace {
-// NINFER_EXL3_MEMORY_TRACE: device memory taken by graph instantiation/upload.
+// VOIDINFER_EXL3_MEMORY_TRACE: device memory taken by graph instantiation/upload.
 double graph_trace_free_mib() {
-    static const bool enabled=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    static const bool enabled=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
     if(!enabled)return -1.0;
     std::size_t free=0,total=0;
     if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return -1.0;
@@ -184,4 +184,4 @@ cudaError_t DecodeGraphExecutable::try_reset() noexcept {
 
 void DecodeGraphExecutable::reset() noexcept { log_cuda_error("cudaGraphExecDestroy",try_reset()); }
 
-} // namespace ninfer
+} // namespace voidinfer

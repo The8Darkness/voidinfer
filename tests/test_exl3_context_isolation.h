@@ -124,9 +124,9 @@ C2IsolationSequence c2_isolation_oracle(Exl3TextModel& target,
     // single-context oracle on the pre-P17 path, then restore the caller's
     // candidate setting before the paired contexts are constructed.
     struct ScopedSerialGdnSlab {
-        std::string saved = env("NINFER_EXL3_GDN_WIDE_SLAB");
-        ScopedSerialGdnSlab() { _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB", "0"); }
-        ~ScopedSerialGdnSlab() { _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB", saved.c_str()); }
+        std::string saved = env("VOIDINFER_EXL3_GDN_WIDE_SLAB");
+        ScopedSerialGdnSlab() { _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB", "0"); }
+        ~ScopedSerialGdnSlab() { _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB", saved.c_str()); }
     } serial_slab;
     auto context = target.create_context(true);
     require(context->try_enable_oscar_from_environment(),
@@ -160,61 +160,61 @@ void run_context_isolation_qualification(
     const std::string& output_path) {
     require(target.max_context() == 1024,
             "c2isolation requires max context 1024");
-    require(env("NINFER_OSCAR_EXL3") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1",
             "c2isolation requires canonical OSCAR");
-    require(env("NINFER_EXL3_PREFILL_ROWPAIR_K6") == "0",
+    require(env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6") == "0",
             "c2isolation requires explicit P16 rowpair0");
-    const std::string count_setting = env("NINFER_CONTEXT_ISOLATION_COUNT");
+    const std::string count_setting = env("VOIDINFER_CONTEXT_ISOLATION_COUNT");
     require(count_setting.empty() || count_setting == "2" || count_setting == "4" ||
                 count_setting == "8",
             "c2isolation count must be unset, 2, 4, or 8");
     const int context_count = count_setting.empty() ? 2 : std::stoi(count_setting);
-    const std::string prefill_setting = env("NINFER_CONTEXT_ISOLATION_PREFILL");
+    const std::string prefill_setting = env("VOIDINFER_CONTEXT_ISOLATION_PREFILL");
     require(prefill_setting.empty() || prefill_setting == "1024" ||
                 prefill_setting == "128" || prefill_setting == "16",
             "c2isolation prefill must be unset, 1024, 128, or 16");
     const int prefill_width = prefill_setting.empty() ? 1024 : std::stoi(prefill_setting);
     if (prefill_width == 16) {
-        require(context_count == 2 && env("NINFER_EXL3_WIDE_PREFILL") == "0" &&
-                    env("NINFER_EXL3_PREFILL_STAGED_REDUCTION") == "0" &&
-                    env("NINFER_EXL3_PREFILL_WIDE64") == "0" &&
-                    env("NINFER_EXL3_PREFILL_WIDE128") == "0" &&
-                    env("NINFER_EXL3_PREFILL_WIDE256") == "0" &&
-                    env("NINFER_EXL3_PREFILL_WIDE512") == "0" &&
-                    env("NINFER_EXL3_PREFILL_WIDE1024") == "0" &&
-                    env("NINFER_EXL3_PREFILL_CHUNK") == "16",
+        require(context_count == 2 && env("VOIDINFER_EXL3_WIDE_PREFILL") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE64") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE128") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE256") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE512") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE1024") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_CHUNK") == "16",
                 "c2isolation width16 requires the explicit narrow control selectors");
     } else {
-        require(env("NINFER_EXL3_WIDE_PREFILL") == "1",
+        require(env("VOIDINFER_EXL3_WIDE_PREFILL") == "1",
                 "c2isolation requires wide eager prefill");
     }
     if (prefill_width == 1024) {
-        require(env("NINFER_EXL3_PREFILL_WIDE1024") == "1" &&
-                    env("NINFER_EXL3_PREFILL_CHUNK") == "1024",
+        require(env("VOIDINFER_EXL3_PREFILL_WIDE1024") == "1" &&
+                    env("VOIDINFER_EXL3_PREFILL_CHUNK") == "1024",
                 "c2isolation requires the P14 1024-row eager overlay");
     } else if (prefill_width == 128) {
-        require(env("NINFER_EXL3_PREFILL_WIDE128") == "1" &&
-                    env("NINFER_EXL3_PREFILL_WIDE64") == "1" &&
-                    env("NINFER_EXL3_PREFILL_WIDE256") == "0" &&
-                    env("NINFER_EXL3_PREFILL_WIDE512") == "0" &&
-                    env("NINFER_EXL3_PREFILL_WIDE1024") == "0" &&
-                    env("NINFER_EXL3_PREFILL_STAGED_REDUCTION") == "1" &&
-                    env("NINFER_EXL3_SHARED_ACCUM") == "1" &&
-                    env("NINFER_EXL3_PREFILL_CHUNK") == "128",
+        require(env("VOIDINFER_EXL3_PREFILL_WIDE128") == "1" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE64") == "1" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE256") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE512") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE1024") == "0" &&
+                    env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION") == "1" &&
+                    env("VOIDINFER_EXL3_SHARED_ACCUM") == "1" &&
+                    env("VOIDINFER_EXL3_PREFILL_CHUNK") == "128",
                 "c8isolation requires the P17 wide128 overlay");
     }
     if (context_count == 4 || context_count == 8) {
-        const std::string slab = env("NINFER_EXL3_GDN_WIDE_SLAB");
+        const std::string slab = env("VOIDINFER_EXL3_GDN_WIDE_SLAB");
         require((slab.empty() || slab == "1") &&
-                    (env("NINFER_EXL3_SHARED_LAYER_SCRATCH").empty() ||
-                     env("NINFER_EXL3_SHARED_LAYER_SCRATCH") == "1"),
+                    (env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH").empty() ||
+                     env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH") == "1"),
                 "c4isolation requires effective P17 GDN wide slab/shared scratch");
     }
     if (context_count == 8) {
         require(prefill_width == 128,
                 "c8isolation requires prefill width 128");
     }
-    const std::string admission_setting = env("NINFER_CONTEXT_ISOLATION_ADMISSION_ONLY");
+    const std::string admission_setting = env("VOIDINFER_CONTEXT_ISOLATION_ADMISSION_ONLY");
     require(admission_setting.empty() || admission_setting == "0" || admission_setting == "1",
             "c8isolation admission-only must be unset, 0, or 1");
     const bool admission_only = admission_setting == "1";
@@ -353,7 +353,7 @@ void run_context_isolation_qualification(
                     "c2isolation interleaved OSCAR enable failed");
         }
         if (!allocation_reported) {
-            const char* slab = std::getenv("NINFER_EXL3_GDN_WIDE_SLAB");
+            const char* slab = std::getenv("VOIDINFER_EXL3_GDN_WIDE_SLAB");
             report << "Allocation telemetry: contexts=" << context_count
                    << " prefill_width=" << prefill_width
                    << " gdn_wide_slab=" << (slab ? slab : "");

@@ -1,4 +1,4 @@
-#include "ninfer/ops/rope.h"
+#include "voidinfer/ops/rope.h"
 
 #include "ops/launcher/rope.h"
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace voidinfer::ops {
 namespace {
 
 constexpr std::int32_t kTextHeadDim = 256;
@@ -140,4 +140,4 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaS
     detail::rope_single_launch(positions, rotary_dim, theta, x, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace voidinfer::ops

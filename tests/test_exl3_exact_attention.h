@@ -3,13 +3,13 @@
 
 void run_exact_attention_operator_oracle() {
     for(int rows:{1,8,16,1024})
-        require(ninfer::exl3::Exl3FullAttentionLayer::shared_scratch_bytes(rows)-
-            ninfer::exl3::Exl3FullAttentionLayer::shared_scratch_bytes(rows,true)==
+        require(voidinfer::exl3::Exl3FullAttentionLayer::shared_scratch_bytes(rows)-
+            voidinfer::exl3::Exl3FullAttentionLayer::shared_scratch_bytes(rows,true)==
             static_cast<std::size_t>(rows)*5120*2,"coalesced input/MLP scratch extent delta");
     int cases=0;
     std::vector<std::pair<int,int>> shapes{{31,1},{321,1},{321,3},{321,8},{321,15},{321,16},
         {4096,1},{16384,1},{321,17},{321,32},{321,65}};
-    const auto* native64k=std::getenv("NINFER_TEST_EXACT_ATTENTION_NATIVE64K");
+    const auto* native64k=std::getenv("VOIDINFER_TEST_EXACT_ATTENTION_NATIVE64K");
     require(!native64k || std::string_view(native64k)=="0" || std::string_view(native64k)=="1",
         "native64K attention fixture option must be 0 or 1");
     if(native64k && std::string_view(native64k)=="1")
@@ -30,7 +30,7 @@ void run_exact_attention_operator_oracle() {
         cuda_check(cudaMemcpy(dk.get(),k.data(),k.size()*2,cudaMemcpyHostToDevice),"exactattn upload K");
         cuda_check(cudaMemcpy(dv.get(),v.data(),v.size()*2,cudaMemcpyHostToDevice),"exactattn upload V");
         const auto launch=[&](bool parallel,DeviceBuffer& destination,bool shared=false,bool paired=false,bool value_paired=false,bool gqa_pair=false,bool gqa_triple=false,bool gqa_triple_values128=false,bool gqa_triple_softmax_staged=false,bool gqa_six=false,bool gqa_six_scores=false,bool gqa_six_values_sharded=false,bool gqa_triple_values4=false,bool gqa_six_softmax_triple_values=false,bool gqa_six_packed_triples=false,bool gqa_six_extent_shards=false,bool gqa_six_query_pair_scores=false) {
-            ninfer::exl3::exl3_exact_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),
+            voidinfer::exl3::exl3_exact_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(dk.get()),static_cast<const std::uint16_t*>(dv.get()),
                 static_cast<std::uint16_t*>(destination.get()),static_cast<float*>(scores.get()),rows,position,capacity,parallel,nullptr,shared,paired,value_paired,gqa_pair,gqa_triple,gqa_triple_values128,gqa_triple_softmax_staged,gqa_six,gqa_six_scores,gqa_six_values_sharded,gqa_triple_values4,gqa_six_softmax_triple_values,gqa_six_packed_triples,gqa_six_extent_shards,gqa_six_query_pair_scores);
         };
@@ -47,7 +47,7 @@ void run_exact_attention_operator_oracle() {
             DeviceBuffer tk(k.size()*2),tv(v.size()*2),segmented(q.size()*2);
             cuda_check(cudaMemcpy(tk.get(),tail_k.data(),tail_k.size()*2,cudaMemcpyHostToDevice),"segmented poisoned K");
             cuda_check(cudaMemcpy(tv.get(),tail_v.data(),tail_v.size()*2,cudaMemcpyHostToDevice),"segmented poisoned V");
-            ninfer::exl3::exl3_exact_segmented_attention_for_test(
+            voidinfer::exl3::exl3_exact_segmented_attention_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),static_cast<const std::uint16_t*>(dk.get()),
                 static_cast<const std::uint16_t*>(dv.get()),split,static_cast<const std::uint16_t*>(tk.get()),
                 static_cast<const std::uint16_t*>(tv.get()),static_cast<std::uint16_t*>(segmented.get()),
@@ -69,7 +69,7 @@ void run_exact_attention_operator_oracle() {
             cuda_check(cudaMemcpy(pv.get(),private_v.data(),private_v.size()*2,cudaMemcpyHostToDevice),"interval private V");
             cuda_check(cudaMemcpy(sk.get(),shared_k.data(),shared_k.size()*2,cudaMemcpyHostToDevice),"interval shared K");
             cuda_check(cudaMemcpy(sv.get(),shared_v.data(),shared_v.size()*2,cudaMemcpyHostToDevice),"interval shared V");
-            ninfer::exl3::exl3_exact_segmented_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),
+            voidinfer::exl3::exl3_exact_segmented_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(sk.get())+1024,static_cast<const std::uint16_t*>(sv.get())+1024,extent,
                 static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                 static_cast<std::uint16_t*>(segmented.get()),static_cast<float*>(scores.get()),rows,position,capacity,nullptr,first);
@@ -118,21 +118,21 @@ void run_exact_attention_operator_oracle() {
             cuda_check(cudaMemcpy(pv.get(),private_v.data(),private_v.size()*2,cudaMemcpyHostToDevice),"page private V");
             cuda_check(cudaMemcpy(sk.get(),shared_k.data(),shared_k.size()*2,cudaMemcpyHostToDevice),"page shared K");
             cuda_check(cudaMemcpy(sv.get(),shared_v.data(),shared_v.size()*2,cudaMemcpyHostToDevice),"page shared V");
-            ninfer::exl3::Exl3AttentionPageRanges ranges;
+            voidinfer::exl3::Exl3AttentionPageRanges ranges;
             // Reverse order matches Engine newest-page-first acquisition.
             for(int page=page_count-1;page>=0;--page) {
                 const auto offset=(static_cast<std::size_t>(page)*guarded_rows+1)*1024;
                 ranges.append(static_cast<const std::uint16_t*>(sk.get())+offset,
                     static_cast<const std::uint16_t*>(sv.get())+offset,page_first[page],page_rows,position);
             }
-            ninfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
+            voidinfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
                 static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                 static_cast<std::uint16_t*>(paged.get()),static_cast<float*>(scores.get()),rows,position,capacity);
             require(target_continue_device_bits(static_cast<const std::uint16_t*>(paged.get()),q.size(),"multi-page output")==baseline,
                 "multi-page attention changed represented bits across private gaps");
             auto chronological=ranges;
             std::reverse(chronological.ranges,chronological.ranges+chronological.count);
-            ninfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),chronological,
+            voidinfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),chronological,
                 static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                 static_cast<std::uint16_t*>(paged.get()),static_cast<float*>(scores.get()),rows,position,capacity);
             require(target_continue_device_bits(static_cast<const std::uint16_t*>(paged.get()),q.size(),"chronological page output")==baseline,
@@ -142,27 +142,27 @@ void run_exact_attention_operator_oracle() {
                 target_continue_device_bits(static_cast<const std::uint16_t*>(pk.get()),private_k.size(),"page private K guards")==private_k &&
                 target_continue_device_bits(static_cast<const std::uint16_t*>(pv.get()),private_v.size(),"page private V guards")==private_v,
                 "page order comparison mutated represented input or poisoned gaps");
-            ninfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
+            voidinfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
                 static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                 static_cast<std::uint16_t*>(paged.get()),static_cast<float*>(scores.get()),rows,position,capacity,nullptr,true);
             require(target_continue_device_bits(static_cast<const std::uint16_t*>(paged.get()),q.size(),"Q-shared multi-page output")==
                 target_continue_device_bits(static_cast<const std::uint16_t*>(qshared.get()),q.size(),"Q-shared contiguous control"),
                 "segmented Q-shared profile changed its represented output bits");
             launch(true,gqapair,true,true,true,true);
-            ninfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
+            voidinfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
                 static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                 static_cast<std::uint16_t*>(paged.get()),static_cast<float*>(scores.get()),rows,position,capacity,nullptr,false,true);
             require(target_continue_device_bits(static_cast<const std::uint16_t*>(paged.get()),q.size(),"GQA pair multi-page output")==
                 target_continue_device_bits(static_cast<const std::uint16_t*>(gqapair.get()),q.size(),"GQA pair contiguous control"),
                 "segmented GQA pair changed represented per-head output");
-            ninfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
+            voidinfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
                 static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                 static_cast<std::uint16_t*>(paged.get()),static_cast<float*>(scores.get()),rows,position,capacity,nullptr,false,false,true);
             require(target_continue_device_bits(static_cast<const std::uint16_t*>(paged.get()),q.size(),"query-pair multi-page output")==
                 target_continue_device_bits(static_cast<const std::uint16_t*>(qshared.get()),q.size(),"query-pair canonical control"),
                 "query-pair history reuse changed causal row output");
             for(int profile=0;profile<3;++profile) {
-                ninfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),chronological,
+                voidinfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),chronological,
                     static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                     static_cast<std::uint16_t*>(paged.get()),static_cast<float*>(scores.get()),rows,position,capacity,
                     nullptr,profile==0,profile==1,profile==2);
@@ -178,7 +178,7 @@ void run_exact_attention_operator_oracle() {
             DeviceBuffer guarded_query(guarded_init.size()*2);
             cuda_check(cudaMemcpy(guarded_query.get(),guarded_init.data(),guarded_init.size()*2,cudaMemcpyHostToDevice),
                 "query-pair output guards");
-            ninfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
+            voidinfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
                 static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                 static_cast<std::uint16_t*>(guarded_query.get())+1,static_cast<float*>(scores.get()),rows,position,capacity,nullptr,false,false,true);
             const auto guarded_result=target_continue_device_bits(static_cast<const std::uint16_t*>(guarded_query.get()),
@@ -198,7 +198,7 @@ void run_exact_attention_operator_oracle() {
                 std::fill(future_v.begin()+begin,future_v.end(),0x7e00);
                 cuda_check(cudaMemcpy(pk.get(),future_k.data(),future_k.size()*2,cudaMemcpyHostToDevice),"query-pair future K poison");
                 cuda_check(cudaMemcpy(pv.get(),future_v.data(),future_v.size()*2,cudaMemcpyHostToDevice),"query-pair future V poison");
-                ninfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
+                voidinfer::exl3::exl3_exact_page_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),ranges,
                     static_cast<const std::uint16_t*>(pk.get()),static_cast<const std::uint16_t*>(pv.get()),
                     static_cast<std::uint16_t*>(paged.get()),static_cast<float*>(scores.get()),rows,position,capacity,nullptr,false,false,true);
                 const auto prefix=target_continue_device_bits(static_cast<const std::uint16_t*>(paged.get()),
@@ -213,7 +213,7 @@ void run_exact_attention_operator_oracle() {
         if(rows<=16) for(const auto range:std::array<std::pair<int,int>,4>{{{-1,1},{position+1,0},{position,1},{0,-1}}}) {
             bool refused=false;
             try {
-                ninfer::exl3::exl3_exact_segmented_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),
+                voidinfer::exl3::exl3_exact_segmented_attention_for_test(static_cast<const std::uint16_t*>(dq.get()),
                     static_cast<const std::uint16_t*>(dk.get()),static_cast<const std::uint16_t*>(dv.get()),range.second,
                     static_cast<const std::uint16_t*>(dk.get()),static_cast<const std::uint16_t*>(dv.get()),
                     static_cast<std::uint16_t*>(out.get()),static_cast<float*>(scores.get()),rows,position,capacity,nullptr,range.first);
@@ -296,7 +296,7 @@ void run_exact_attention_operator_oracle() {
                 cuda_check(cudaMemcpy(candidate->get(),initialized.data(),candidate->bytes(),
                     cudaMemcpyHostToDevice),"pair-dimensions output canary upload");
             const auto run_pair_dimensions=[&](DeviceBuffer& destination) {
-                ninfer::exl3::exl3_exact_attention_for_test(
+                voidinfer::exl3::exl3_exact_attention_for_test(
                     static_cast<const std::uint16_t*>(dq.get()),
                     static_cast<const std::uint16_t*>(dk.get()),
                     static_cast<const std::uint16_t*>(dv.get()),
@@ -397,7 +397,7 @@ void run_exact_attention_operator_oracle() {
         for(auto* allocation:{&fixed_scores,&extent_scores})
             cuda_check(cudaMemcpy(allocation->get(),score_init.data(),allocation->bytes(),cudaMemcpyHostToDevice),"extent boundary score canary");
         const auto run=[&](DeviceBuffer& output,DeviceBuffer& scores,bool extent) {
-            ninfer::exl3::exl3_exact_attention_for_test(
+            voidinfer::exl3::exl3_exact_attention_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(dk.get()),
                 static_cast<const std::uint16_t*>(dv.get()),
@@ -473,7 +473,7 @@ void run_exact_attention_extended_cap_oracle(int capacity) {
         cuda_check(cudaMemcpy(allocation->get(),score_init.data(),allocation->bytes(),cudaMemcpyHostToDevice),
             "native-cap score canary");
     const auto run=[&](DeviceBuffer& output,DeviceBuffer& scores,bool fixed_six,bool extent) {
-        ninfer::exl3::exl3_exact_attention_for_test(
+        voidinfer::exl3::exl3_exact_attention_for_test(
             static_cast<const std::uint16_t*>(dq.get()),
             static_cast<const std::uint16_t*>(dk.get()),
             static_cast<const std::uint16_t*>(dv.get()),
@@ -573,8 +573,8 @@ void run_extended_context_storage_contract(Exl3TextModel& target,int expected_co
     require((expected_context==65536||expected_context==131072)&&
             target.max_context()==expected_context,
             "extended-context contract target extent");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
     bool rejected=false;
     try {
         auto invalid=target.create_context(false);
@@ -584,14 +584,14 @@ void run_extended_context_storage_contract(Exl3TextModel& target,int expected_co
             std::string::npos;
     }
     require(rejected,"extended-context resident GPU-KV route did not fail closed");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
     auto oscar_only=target.create_context(false);
     require(oscar_only->max_context()==expected_context,"extended-context OSCAR-only extent");
     const auto oscar_bytes=oscar_only->persistent_bytes();
     oscar_only.reset();
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
     auto exact_host=target.create_context(true);
     const auto stats=exact_host->host_kv_stats();
     require(exact_host->max_context()==expected_context&&stats.enabled&&
@@ -606,9 +606,9 @@ void run_extended_context_storage_contract(Exl3TextModel& target,int expected_co
 
 void run_exact_attention_model_qualification(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
     require(source.size()>=350 && target.max_context()==1024,"exactattn model fixture extent");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","0");
     auto original=target.create_context(true);
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
     auto candidate=target.create_context(true);
     original->prepare_continuation(8);candidate->prepare_continuation(8);
     for(auto* context:{original.get(),candidate.get()}) context->prefill(std::span<const std::int64_t>(source.data(),16));

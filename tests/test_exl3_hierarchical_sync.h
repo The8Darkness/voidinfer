@@ -1,7 +1,7 @@
 #pragma once
 
 void run_hierarchical_frontier_logic() {
-    using ninfer::exl3::Exl3HierarchyFrontiers;
+    using voidinfer::exl3::Exl3HierarchyFrontiers;
     Exl3HierarchyFrontiers frontiers(7,10);
     const auto l0=frontiers.begin_l0(4);
     frontiers.complete_l1(l0,4,false);
@@ -60,26 +60,26 @@ void run_hierarchical_frontier_logic() {
 
 void run_hierarchical_sync_qualification(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using ninfer::exl3::Exl3HierarchyFrontiers;
-    using ninfer::exl3::Exl3OuterReferenceResult;
-    using ninfer::exl3::Exl3TextContext;
-    using ninfer::exl3::Exl3TurboAngleL1Context;
+    using voidinfer::exl3::Exl3HierarchyFrontiers;
+    using voidinfer::exl3::Exl3OuterReferenceResult;
+    using voidinfer::exl3::Exl3TextContext;
+    using voidinfer::exl3::Exl3TurboAngleL1Context;
     constexpr int prefix=96,budget=16,block=4;
     require(code.size()>=prefix && prose.size()>=prefix && target.max_context()==256,
         "hierarchical sync fixture/context extent");
     run_hierarchical_frontier_logic();
-    _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
-    _putenv_s("NINFER_EXL3_SHARED_ACCUM","0");
-    _putenv_s("NINFER_EXL3_SHARED_TRANSFORM","0");
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH","0");
-    _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_ACCUM","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_TRANSFORM","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","0");
+    _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
     auto l0=target.create_context(true),l1_native=target.create_context(true);
     require(l0->try_enable_oscar_from_environment() && l1_native->try_enable_oscar_from_environment(),
         "hierarchical sync OSCAR contexts");
@@ -91,7 +91,7 @@ void run_hierarchical_sync_qualification(Exl3TextModel& target,
     };
     struct Metrics {
         std::vector<std::int64_t> tokens;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
         std::size_t l0_rows=0,l0_discarded=0,l1_rows=0,l1_replay=0,l1_rejections=0;
         std::size_t l2_rows=0,l2_replay=0,l2_calls=0,l2_restores=0,l2_rejections=0,events=0;
         double wall_ms=0;
@@ -104,7 +104,7 @@ void run_hierarchical_sync_qualification(Exl3TextModel& target,
         for(int row=16;row<prefix;++row) exact->decode(source[row]);
         const auto root=exact->export_exact_host_state();
         std::vector<std::int64_t> reference;reference.reserve(budget);
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> reference8,reference16;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> reference8,reference16;
         exact->restore_exact_host_state(*root);
         for(int row=0;row<budget;++row) {
             const auto token=greedy(*exact);exact->decode(token);reference.push_back(token);
@@ -147,8 +147,8 @@ void run_hierarchical_sync_qualification(Exl3TextModel& target,
                 if(force_l2 && round==0) screened.back()=(screened.back()+1)%248320;
                 const auto l2_completion=frontiers.begin_l2();
                 Exl3OuterReferenceResult verified=screened.size()==1
-                    ? ninfer::exl3::verify_exl3_outer_reference(*exact,*current,screened,false,{},nullptr,true)
-                    : ninfer::exl3::verify_exl3_outer_batched_reference(*exact,*current,screened,false,{},nullptr,true);
+                    ? voidinfer::exl3::verify_exl3_outer_reference(*exact,*current,screened,false,{},nullptr,true)
+                    : voidinfer::exl3::verify_exl3_outer_batched_reference(*exact,*current,screened,false,{},nullptr,true);
                 metrics.l2_rows+=verified.verification_rows;metrics.l2_replay+=verified.replay_rows;
                 metrics.l2_calls+=verified.native_invocations;metrics.l2_restores+=verified.root_restores;
                 metrics.l2_rejections+=verified.rejected;

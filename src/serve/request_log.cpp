@@ -25,7 +25,7 @@
 #include <unistd.h>
 #endif
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -70,19 +70,19 @@ std::string cuda_uuid_string(const cudaUUID_t& uuid) {
     return out.str();
 }
 
-const char* finish_reason_name(ninfer::FinishReason reason) {
+const char* finish_reason_name(voidinfer::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::None:
+    case voidinfer::FinishReason::None:
         return "none";
-    case ninfer::FinishReason::OutputLimit:
+    case voidinfer::FinishReason::OutputLimit:
         return "output_limit";
-    case ninfer::FinishReason::ContextCapacity:
+    case voidinfer::FinishReason::ContextCapacity:
         return "context_capacity";
-    case ninfer::FinishReason::StopToken:
+    case voidinfer::FinishReason::StopToken:
         return "stop_token";
-    case ninfer::FinishReason::StopString:
+    case voidinfer::FinishReason::StopString:
         return "stop_string";
-    case ninfer::FinishReason::Cancelled:
+    case voidinfer::FinishReason::Cancelled:
         return "cancelled";
     }
     return "unknown";
@@ -105,19 +105,19 @@ std::string tool_choice_name(const ToolChoice& choice) {
 
 
 
-const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
+const char* prefix_reuse_path_name(voidinfer::PrefixReusePath path) {
     switch (path) {
-    case ninfer::PrefixReusePath::Root:
+    case voidinfer::PrefixReusePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::PrivateEndpoint:
+    case voidinfer::PrefixReusePath::PrivateEndpoint:
         return "private_endpoint";
-    case ninfer::PrefixReusePath::PrivateTurnClosure:
+    case voidinfer::PrefixReusePath::PrivateTurnClosure:
         return "private_turn_closure";
-    case ninfer::PrefixReusePath::PrivateResponseReplay:
+    case voidinfer::PrefixReusePath::PrivateResponseReplay:
         return "private_response_replay";
-    case ninfer::PrefixReusePath::PrivateLongAnchor:
+    case voidinfer::PrefixReusePath::PrivateLongAnchor:
         return "private_long_anchor";
-    case ninfer::PrefixReusePath::SharedStablePrefix:
+    case voidinfer::PrefixReusePath::SharedStablePrefix:
         return "shared_stable_prefix";
     }
     return "unknown";
@@ -131,7 +131,7 @@ Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, 
                 {"server_instance_id", server_instance_id}};
 }
 
-Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
+Json sampler_json(const voidinfer::ResolvedSamplingParameters& sampling) {
     return Json{{"temperature", sampling.temperature},
                 {"top_p", sampling.top_p},
                 {"top_k", sampling.top_k},
@@ -141,7 +141,7 @@ Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
                 {"seed", sampling.seed}};
 }
 
-Json preset_json(const ninfer::SamplingPreset& preset) {
+Json preset_json(const voidinfer::SamplingPreset& preset) {
     return Json{{"temperature", preset.temperature},
                 {"top_p", preset.top_p},
                 {"top_k", preset.top_k},
@@ -150,7 +150,7 @@ Json preset_json(const ninfer::SamplingPreset& preset) {
                 {"frequency_penalty", preset.frequency_penalty}};
 }
 
-Json overrides_json(const ninfer::SamplingOverrides& overrides) {
+Json overrides_json(const voidinfer::SamplingOverrides& overrides) {
     Json result{{"temperature", nullptr},
                 {"top_p", nullptr},
                 {"top_k", nullptr},
@@ -236,7 +236,7 @@ Json error_json(const ApiError& error) {
                 {"message", error.message}};
 }
 
-Json arena_json(const ninfer::ArenaMemorySummary& arena) {
+Json arena_json(const voidinfer::ArenaMemorySummary& arena) {
     return Json{{"capacity_bytes", arena.capacity_bytes},
                 {"used_bytes", arena.used_bytes},
                 {"peak_used_bytes", arena.peak_used_bytes}};
@@ -268,7 +268,7 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"shared_projection_rows",std::move(shared_projection_rows)}};
 }
 
-Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics) {
+Json materialization_json(const voidinfer::MaterializationDiagnostics& diagnostics) {
     return Json{
         {"predicted_now_ns", diagnostics.predicted_now_ns},
         {"predicted_future_loss_ns", diagnostics.predicted_future_loss_ns},
@@ -277,7 +277,7 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"projection_work", diagnostics.projection_work},
         {"planning_elapsed_ns", diagnostics.planning_elapsed_ns},
         {"search_elapsed_ns", diagnostics.search_elapsed_ns},
-        {"stop_reason", ninfer::materialization_stop_reason_name(diagnostics.stop_reason)},
+        {"stop_reason", voidinfer::materialization_stop_reason_name(diagnostics.stop_reason)},
         {"model_optimal", diagnostics.model_optimal},
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"best_remaining_lower_bound_ns", diagnostics.best_remaining_lower_bound_ns},
@@ -296,13 +296,13 @@ double nanoseconds_to_microseconds(std::uint64_t value) noexcept {
     return static_cast<double>(value) * 1.0e-3;
 }
 
-double request_host_exposed_seconds(const ninfer::GenerationEngineTiming& timing) noexcept {
+double request_host_exposed_seconds(const voidinfer::GenerationEngineTiming& timing) noexcept {
     return timing.engine_boundary_exposed_seconds + timing.program_submit_exposed_seconds +
            timing.program_post_exposed_seconds + timing.engine_commit_output_exposed_seconds +
            timing.engine_maintenance_exposed_seconds;
 }
 
-Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
+Json request_engine_timing_json(const voidinfer::GenerationEngineTiming& timing) {
     return Json{
         {"queue_wait_seconds", timing.queue_wait_seconds},
         {"host_exposed_seconds",
@@ -345,7 +345,7 @@ std::string seconds_str(double seconds) {
 }
 
 // Compact resolved-sampler summary. temperature <= 0 is the exact-argmax path.
-std::string sampler_str(const ninfer::ResolvedSamplingParameters& sampling) {
+std::string sampler_str(const voidinfer::ResolvedSamplingParameters& sampling) {
     if (sampling.temperature <= 0.0f) { return "greedy"; }
     std::ostringstream out;
     out << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
@@ -534,9 +534,9 @@ std::string format_throughput(const ThroughputReport& report) {
 
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
-    const ninfer::EngineOptions& engine_options,
-    const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
+    const voidinfer::EngineOptions& engine_options,
+    const voidinfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
+    const voidinfer::LoadSummary& load, const voidinfer::MemorySummary& memory,
     const ServerLogEnvironment& environment) {
     Json record = event_base(server_instance_id, timestamp, "server_start");
 
@@ -569,7 +569,7 @@ std::string format_server_start_json(
                                                           {"peak_staging_bytes", load.peak_staging_bytes},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
-    const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
+    const voidinfer::ContextCacheOptions& cache       = engine_options.context_cache;
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(engine_options.max_concurrency) +
         cache.device_state_slots.value();
@@ -748,11 +748,11 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path) : path_(path) {
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
-                                         const ninfer::EngineOptions& engine_options,
-                                         const ninfer::ModelSamplingDefaults& sampling_defaults,
+                                         const voidinfer::EngineOptions& engine_options,
+                                         const voidinfer::ModelSamplingDefaults& sampling_defaults,
                                          const std::string& public_model_id,
-                                         const ninfer::LoadSummary& load,
-                                         const ninfer::MemorySummary& memory) {
+                                         const voidinfer::LoadSummary& load,
+                                         const voidinfer::MemorySummary& memory) {
     if (!enabled()) { return; }
     append(format_server_start_json(server_instance_id_, unix_time_ms(), options, engine_options,
                                     sampling_defaults, public_model_id, load, memory,
@@ -797,4 +797,4 @@ void JsonlRequestLog::append(std::string record) {
     }
 }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

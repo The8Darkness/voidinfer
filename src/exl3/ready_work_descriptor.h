@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3ReadyNumericalStage : std::uint8_t {
     HostPreparation,
@@ -450,4 +450,4 @@ private:
     const Exl3ReadyCopyDemand copy_demand_;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

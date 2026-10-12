@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <type_traits>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Driver allocation extents must be supplied by a supported backend contract.
 // Zero is a declared extent only when known=true; missing observations never
 // become a zero-cost capture. Existing graph owners remain charged during capture.

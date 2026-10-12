@@ -9,7 +9,7 @@
 #include <mutex>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace voidinfer::ops::detail {
 namespace {
 
 constexpr int kQHeads = 24;
@@ -1992,4 +1992,4 @@ OscarMixedKernelResources oscar_int2_g128_mixed_kernel_resources() {
     return result;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace voidinfer::ops::detail

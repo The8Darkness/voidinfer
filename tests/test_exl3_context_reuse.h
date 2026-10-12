@@ -4,17 +4,17 @@ void run_coalesced_context_parity(Exl3TextModel& target,const std::vector<std::i
     require(source.size()>=600 && target.max_context()>=600,"coalesced context fixture extent");
     struct Restore {
         std::string value;
-        ~Restore(){_putenv_s("NINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP",value.c_str());}
-    } restore{std::getenv("NINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP")?
-        std::getenv("NINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP"):""};
-    _putenv_s("NINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP","0");
+        ~Restore(){_putenv_s("VOIDINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP",value.c_str());}
+    } restore{std::getenv("VOIDINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP")?
+        std::getenv("VOIDINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP"):""};
+    _putenv_s("VOIDINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP","0");
     auto control=target.create_context(true);
-    _putenv_s("NINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP","1");
+    _putenv_s("VOIDINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP","1");
     auto candidate=target.create_context(true);
     control->prepare_continuation(8);candidate->prepare_continuation(8);
     const std::string contract="coalesced-context;ordinary-fp16;private-state;canonical-order";
     control->bind_request_compatibility(contract);candidate->bind_request_compatibility(contract);
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     for(int prefix:{63,319,575}) {
         control->reset();candidate->reset();
         const auto prompt=std::span<const std::int64_t>(source.data(),prefix);
@@ -39,12 +39,12 @@ void run_coalesced_context_parity(Exl3TextModel& target,const std::vector<std::i
 
 void run_context_reuse_qualification(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     using Clock=std::chrono::steady_clock;
     require(target.max_context()>=1024 && code.size()>=1024 && prose.size()>=1024,
         "context reuse fixture extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     const std::string contract="target=resident-qwen3.8-27b;maxctx=4352;capture_taps=1;"
         "exact_host=1;parallel_attention=1;prefill=wide128;stream=device-barrier";
     auto reusable=target.create_context(true);reusable->prepare_continuation(8);
@@ -53,7 +53,7 @@ void run_context_reuse_qualification(Exl3TextModel& target,
 
     struct Outcome {
         std::vector<std::int64_t> tokens;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
         double total_ms=0,reset_or_create_ms=0;
     };
     const auto execute=[](Exl3TextContext& context,std::span<const std::int64_t> prompt) {
@@ -278,14 +278,14 @@ void run_context_reuse_qualification(Exl3TextModel& target,
 
 void run_context_reuse_performance(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using State=ninfer::exl3::Exl3ExactHostState;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using State=voidinfer::exl3::Exl3ExactHostState;
     using Clock=std::chrono::steady_clock;
     constexpr int rows=768;
     require(target.max_context()>=1024 && code.size()>=rows && prose.size()>=rows,
         "context reuse T1 fixture extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     const std::string contract="target=resident-qwen3.8-27b;maxctx=4352;capture_taps=1;"
         "exact_host=1;parallel_attention=1;prefill=wide128;stream=device-barrier";
     auto reused=target.create_context(true);reused->prepare_continuation(8);

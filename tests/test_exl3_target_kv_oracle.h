@@ -31,8 +31,8 @@ std::uint16_t target_kv_decode_state(const std::uint16_t* packed, int encoded, i
 // Planned groups{0,1,2,3,4,5,6,7} cover512-column tile boundaries and the tail.
 // All output columns are oracle-tested, separately from full-output M1 parity.
 H6OracleStats target_kv_check_oracle_groups(
-    const ninfer::exl3::Exl3CudaLinearWeights& weights,
-    const ninfer::exl3::Exl3CudaLinearMetadata& metadata,
+    const voidinfer::exl3::Exl3CudaLinearWeights& weights,
+    const voidinfer::exl3::Exl3CudaLinearMetadata& metadata,
     const std::vector<std::uint16_t>& input,
     const std::vector<std::uint16_t>& actual_with_guards,
     std::size_t guard,

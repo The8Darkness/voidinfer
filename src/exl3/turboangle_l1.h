@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3TurboAngleL1Decision {
     std::vector<std::int64_t> authorized_tokens;
@@ -229,4 +229,4 @@ private:
     bool screen_pending_=false;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

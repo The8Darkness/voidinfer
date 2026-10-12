@@ -158,7 +158,7 @@ MixedFixture make_fixture(int context, std::uint32_t layer) {
                 row[dimension] = bf16_to_float(float_to_bf16(source_value(
                     layer, static_cast<std::uint32_t>(logical), kv_head, dimension, false)));
             }
-            const auto encoded_k = ninfer::ops::oscar_int2_g128_encode(row.data(), kHeadDim, 0.96F);
+            const auto encoded_k = voidinfer::ops::oscar_int2_g128_encode(row.data(), kHeadDim, 0.96F);
             std::copy(encoded_k.packed.begin(), encoded_k.packed.end(),
                       fixture.historical_k_packed.begin() + (row_index + kv_head) * kCodeBytes);
             std::copy(encoded_k.scales_zeros.begin(), encoded_k.scales_zeros.end(),
@@ -167,7 +167,7 @@ MixedFixture make_fixture(int context, std::uint32_t layer) {
                 row[dimension] = bf16_to_float(float_to_bf16(source_value(
                     layer, static_cast<std::uint32_t>(logical), kv_head, dimension, true)));
             }
-            const auto encoded_v = ninfer::ops::oscar_int2_g128_encode(row.data(), kHeadDim, 0.92F);
+            const auto encoded_v = voidinfer::ops::oscar_int2_g128_encode(row.data(), kHeadDim, 0.92F);
             std::copy(encoded_v.packed.begin(), encoded_v.packed.end(),
                       fixture.historical_v_packed.begin() + (row_index + kv_head) * kCodeBytes);
             std::copy(encoded_v.scales_zeros.begin(), encoded_v.scales_zeros.end(),
@@ -400,7 +400,7 @@ struct DeviceMixed {
           output(static_cast<std::size_t>(kQHeads) * kHeadDim),
           fused_output(static_cast<std::size_t>(kQHeads) * kHeadDim),
           fused_decode_workspace(
-              ninfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes / sizeof(float)),
+              voidinfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes / sizeof(float)),
           history_scores(static_cast<std::size_t>(kQHeads) * fixture.historical),
           history_softmax(static_cast<std::size_t>(kQHeads) * fixture.historical) {
         upload(q.data, fixture.q);
@@ -414,7 +414,7 @@ struct DeviceMixed {
 };
 
 void launch_mixed(const MixedFixture& fixture, DeviceMixed& device) {
-    ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch(
+    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_launch(
         device.q.data, device.prefix_k.data, device.prefix_v.data, fixture.prefix,
         device.historical_k_packed.data, device.historical_k_metadata.data,
         device.historical_v_packed.data, device.historical_v_metadata.data, fixture.historical,
@@ -425,7 +425,7 @@ void launch_mixed(const MixedFixture& fixture, DeviceMixed& device) {
 
 void launch_history(const MixedFixture& fixture, DeviceMixed& device) {
     if (fixture.historical == 0) return;
-    ninfer::ops::detail::oscar_int2_g128_history_attention_launch(
+    voidinfer::ops::detail::oscar_int2_g128_history_attention_launch(
         device.q.data, device.historical_k_packed.data, device.historical_k_metadata.data,
         device.historical_v_packed.data, device.historical_v_metadata.data, fixture.historical,
         kAttentionScale, device.history_scores.data, device.history_softmax.data,
@@ -434,8 +434,8 @@ void launch_history(const MixedFixture& fixture, DeviceMixed& device) {
 }
 
 void launch_fused(const MixedFixture& fixture, DeviceMixed& device, bool parallel=false,
-                  int splits=ninfer::ops::detail::kOscarMixedFusedDecodeAdaptiveSplits, bool parallel_scores=false) {
-    ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
+                  int splits=voidinfer::ops::detail::kOscarMixedFusedDecodeAdaptiveSplits, bool parallel_scores=false) {
+    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
         device.q.data, device.prefix_k.data, device.prefix_v.data, fixture.prefix,
         device.historical_k_packed.data, device.historical_k_metadata.data,
         device.historical_v_packed.data, device.historical_v_metadata.data, fixture.historical,
@@ -506,10 +506,10 @@ std::uint64_t mixed_traffic_bytes(const MixedFixture& fixture) {
            static_cast<std::uint64_t>(fixture.historical) * 1216ULL;
 }
 
-ninfer::OscarMixedAgingLayerCache build_cache(const MixedFixture& fixture) {
-    auto cache = ninfer::OscarMixedAgingLayerCache(
+voidinfer::OscarMixedAgingLayerCache build_cache(const MixedFixture& fixture) {
+    auto cache = voidinfer::OscarMixedAgingLayerCache(
         fixture.layer, 0xD42B000000000001ULL,
-        ninfer::OscarMixedAgingAssetContract::c4_cal30k());
+        voidinfer::OscarMixedAgingAssetContract::c4_cal30k());
     std::vector<std::uint16_t> k_row(static_cast<std::size_t>(kKVHeads) * kHeadDim);
     std::vector<std::uint16_t> v_row(k_row.size());
     for (int logical = 0; logical < fixture.context; ++logical) {
@@ -527,15 +527,15 @@ ninfer::OscarMixedAgingLayerCache build_cache(const MixedFixture& fixture) {
     return cache;
 }
 
-MixedFixture flatten_cache(const ninfer::OscarMixedAgingLayerCache& cache,
+MixedFixture flatten_cache(const voidinfer::OscarMixedAgingLayerCache& cache,
                            std::uint32_t layer) {
     MixedFixture fixture = make_fixture(static_cast<int>(cache.context_tokens()), layer);
     for (int logical = 0; logical < fixture.context; ++logical) {
         const auto resolved = cache.resolve(static_cast<std::uint32_t>(logical));
         const auto& page = cache.pages().at(resolved.page_index);
         const int offset = resolved.metadata.page_offset;
-        if (page.metadata.k_storage == ninfer::OscarMixedStorageType::BFloat16) {
-            const auto& storage = std::get<ninfer::OscarMixedBFloat16PageStorage>(page.storage);
+        if (page.metadata.k_storage == voidinfer::OscarMixedStorageType::BFloat16) {
+            const auto& storage = std::get<voidinfer::OscarMixedBFloat16PageStorage>(page.storage);
             const std::size_t source = static_cast<std::size_t>(offset) * kKVHeads * kHeadDim;
             std::vector<std::uint16_t>* k_destination = nullptr;
             std::vector<std::uint16_t>* v_destination = nullptr;
@@ -551,7 +551,7 @@ MixedFixture flatten_cache(const ninfer::OscarMixedAgingLayerCache& cache,
             std::copy_n(storage.k.begin() + source, kKVHeads * kHeadDim, k_destination->begin() + destination);
             std::copy_n(storage.v.begin() + source, kKVHeads * kHeadDim, v_destination->begin() + destination);
         } else {
-            const auto& storage = std::get<ninfer::OscarMixedInt2G128PageStorage>(page.storage);
+            const auto& storage = std::get<voidinfer::OscarMixedInt2G128PageStorage>(page.storage);
             const std::size_t source_row = static_cast<std::size_t>(offset) * kKVHeads;
             const int destination_row = logical - fixture.prefix;
             const std::size_t destination = static_cast<std::size_t>(destination_row) * kKVHeads;
@@ -607,7 +607,7 @@ void run_parity(const MixedFixture& fixture, bool compare_reader) {
             for (int i = 0; i < kHeadDim; ++i) matrix[static_cast<std::size_t>(i) * kHeadDim + i] = 1.0F;
             return matrix;
         }();
-        const ninfer::OscarMixedAttentionReader reader(cache, fixture.q, identity, identity);
+        const voidinfer::OscarMixedAttentionReader reader(cache, fixture.q, identity, identity);
         const auto trace = reader.read(static_cast<std::uint32_t>(fixture.context - 1));
         const Metrics reader_score = compare(trace.score_logits, actual.scores);
         const Metrics reader_softmax = compare(trace.softmax, actual.softmax);
@@ -672,10 +672,10 @@ void run_query_parallel_exact(bool packed_byte4 = false) {
         }
         DeviceBuffer<std::uint16_t> old_k_device(old_k.size()),old_v_device(old_v.size());
         DeviceBuffer<float> rk(rotated_k.size()),rv(rotated_v.size()),q(queries.size()),out(queries.size());
-        DeviceBuffer<float> workspace(ninfer::ops::detail::kOscarChronologicalWorkspaceBytes/sizeof(float));
+        DeviceBuffer<float> workspace(voidinfer::ops::detail::kOscarChronologicalWorkspaceBytes/sizeof(float));
         upload(old_k_device.data,old_k);upload(old_v_device.data,old_v);
         upload(rk.data,rotated_k);upload(rv.data,rotated_v);upload(q.data,queries);
-        ninfer::ops::detail::OscarChronologicalPrefillView view{};
+        voidinfer::ops::detail::OscarChronologicalPrefillView view{};
         view.cache={device.prefix_k.data,device.prefix_v.data,
             final.historical ? device.historical_k_packed.data : dummy_packed.data,
             final.historical ? device.historical_v_packed.data : dummy_packed.data,
@@ -687,18 +687,18 @@ void run_query_parallel_exact(bool packed_byte4 = false) {
         view.old_recent_begin=old_begin;view.old_recent_head=head;
         const auto reset_arm = [&] {
             CUDA_CHECK(cudaMemset(out.data,0xA5,queries.size()*sizeof(float)));
-            CUDA_CHECK(cudaMemset(workspace.data,0xA5,ninfer::ops::detail::kOscarChronologicalWorkspaceBytes));
+            CUDA_CHECK(cudaMemset(workspace.data,0xA5,voidinfer::ops::detail::kOscarChronologicalWorkspaceBytes));
         };
         if(packed_byte4)reset_arm();
-        ninfer::ops::detail::oscar_chronological_prefill_launch(view,q.data,start,rows,workspace.data,out.data,nullptr);
+        voidinfer::ops::detail::oscar_chronological_prefill_launch(view,q.data,start,rows,workspace.data,out.data,nullptr);
         std::vector<float> actual(queries.size());
         CUDA_CHECK(cudaMemcpy(actual.data(),out.data,actual.size()*sizeof(float),cudaMemcpyDeviceToHost));
         if (packed_byte4) {
             // Workspace is reused by cohorts: this observes final contents, including unused sentinel bytes.
-            std::vector<unsigned char> baseline_workspace(ninfer::ops::detail::kOscarChronologicalWorkspaceBytes);
+            std::vector<unsigned char> baseline_workspace(voidinfer::ops::detail::kOscarChronologicalWorkspaceBytes);
             CUDA_CHECK(cudaMemcpy(baseline_workspace.data(),workspace.data,baseline_workspace.size(),cudaMemcpyDeviceToHost));
             reset_arm();
-            ninfer::ops::detail::oscar_chronological_prefill_launch(view,q.data,start,rows,workspace.data,out.data,nullptr,true);
+            voidinfer::ops::detail::oscar_chronological_prefill_launch(view,q.data,start,rows,workspace.data,out.data,nullptr,true);
             std::vector<float> candidate(actual.size());
             CUDA_CHECK(cudaMemcpy(candidate.data(),out.data,candidate.size()*sizeof(float),cudaMemcpyDeviceToHost));
             require(std::memcmp(actual.data(),candidate.data(),actual.size()*sizeof(float))==0,
@@ -778,12 +778,12 @@ int main() {
         cudaDeviceProp properties{};
         CUDA_CHECK(cudaGetDeviceProperties(&properties, 0));
         require(properties.major == 12, "D4.2b requires the SM120a test target");
-        const char* byte4_test=std::getenv("NINFER_OSCAR_PACKED_BYTE4_TEST");
+        const char* byte4_test=std::getenv("VOIDINFER_OSCAR_PACKED_BYTE4_TEST");
         if(byte4_test && std::string(byte4_test)=="1") { run_query_parallel_exact(true); return 0; }
-        const char* query_test=std::getenv("NINFER_OSCAR_QUERY_PARALLEL_TEST");
+        const char* query_test=std::getenv("VOIDINFER_OSCAR_QUERY_PARALLEL_TEST");
         if(query_test && std::string(query_test)=="1") { run_query_parallel_exact(); return 0; }
-        const char* merge_only=std::getenv("NINFER_OSCAR_PARALLEL_MERGE_TEST");
-        const char* score_flag=std::getenv("NINFER_OSCAR_PARALLEL_SCORE_TEST");
+        const char* merge_only=std::getenv("VOIDINFER_OSCAR_PARALLEL_MERGE_TEST");
+        const char* score_flag=std::getenv("VOIDINFER_OSCAR_PARALLEL_SCORE_TEST");
         const bool score_only=score_flag && std::string(score_flag)=="1";
         if(score_only || (merge_only && std::string(merge_only)=="1")) {
             int cases=0;
@@ -804,7 +804,7 @@ int main() {
             std::cout << (score_only ? "PARALLEL_SCORE_EXACT PASS cases=" : "PARALLEL_MERGE_EXACT PASS cases=") << cases << " heads=24 dimensions=256 splits=1,2,4,8,16,32,64 contexts=64,321,512,8192,32768\n";
             return 0;
         }
-        const auto resources = ninfer::ops::detail::oscar_int2_g128_mixed_kernel_resources();
+        const auto resources = voidinfer::ops::detail::oscar_int2_g128_mixed_kernel_resources();
         std::cout << "Oscar mixed GPU attention: GPU=" << properties.name << " compute="
                   << properties.major << '.' << properties.minor
                   << " q_heads=24 kv_heads=4 gqa=6 D=256 group=128\n";
@@ -814,11 +814,11 @@ int main() {
                   << " softmax_smem=" << resources.softmax_static_shared_bytes << " av_smem="
                   << resources.av_static_shared_bytes << " fused_regs=" << resources.fused_registers
                   << " fused_dynamic_smem=" << resources.fused_dynamic_shared_bytes << "\n";
-        require(ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(321) == 16 &&
-                    ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(512) == 16 &&
-                    ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(1024) == 32 &&
-                    ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(8192) == 32 &&
-                    ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(16384) == 64,
+        require(voidinfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(321) == 16 &&
+                    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(512) == 16 &&
+                    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(1024) == 32 &&
+                    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(8192) == 32 &&
+                    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(16384) == 64,
                 "adaptive fused decode split policy changed unexpectedly");
 
         // Boundaries: no historical tier, first historical row, aging/partial historical page,
@@ -836,7 +836,7 @@ int main() {
         // Verify that all qualified full-attention layer identities can dispatch the same
         // mixed path. GDN layers are intentionally absent from this bitmap.
         std::string dispatch_bitmap;
-        for (const std::uint32_t layer : ninfer::kOscarMixedFullAttentionLayers) {
+        for (const std::uint32_t layer : voidinfer::kOscarMixedFullAttentionLayers) {
             const MixedFixture fixture = make_fixture(321, layer);
             DeviceMixed device(fixture);
             launch_mixed(fixture, device);
@@ -868,7 +868,7 @@ int main() {
             const double historical_ms = fixture.historical == 0
                 ? 0.0 : benchmark_cuda([&] { launch_history(fixture, device); }, gpu_repetitions);
             const double bf16_ms = benchmark_cuda([&] {
-                ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch(
+                voidinfer::ops::detail::oscar_int2_g128_mixed_attention_launch(
                     device.q.data, device.prefix_k.data, device.prefix_v.data, fixture.prefix,
                     nullptr, nullptr, nullptr, nullptr, 0, device.recent_k.data, device.recent_v.data,
                     fixture.recent, kAttentionScale, device.scores.data, device.softmax.data,
@@ -879,9 +879,9 @@ int main() {
             const double speedup = cpu_ms / mixed_ms;
             const double traffic = static_cast<double>(mixed_traffic_bytes(fixture));
             const double bandwidth = traffic / (fused_ms * 1.0e6);
-            const int requested_splits = ninfer::ops::detail::kOscarMixedFusedDecodeAdaptiveSplits;
+            const int requested_splits = voidinfer::ops::detail::kOscarMixedFusedDecodeAdaptiveSplits;
             const int policy_splits =
-                ninfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
+                voidinfer::ops::detail::oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                     fixture.context);
             std::cout << std::fixed << std::setprecision(6)
                       << context << ',' << mixed_ms << ',' << fused_ms << ',' << historical_ms << ',' << bf16_ms

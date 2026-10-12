@@ -1,7 +1,7 @@
 #pragma once
 
-using ninfer::exl3::Exl3CudaLinearMetadata;
-using ninfer::exl3::Exl3CudaLinearWeights;
+using voidinfer::exl3::Exl3CudaLinearMetadata;
+using voidinfer::exl3::Exl3CudaLinearWeights;
 using K5OracleStats = H6OracleStats;
 
 std::uint32_t k5_oracle_load_u32(const std::uint16_t* packed, int index) {

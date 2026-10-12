@@ -106,12 +106,12 @@ void target_graph_c2_verifier_require_lane_equal(
 }
 
 void target_graph_c2_verifier_require_admission(
-    const ninfer::exl3::Exl3ContinuationGraphAdmission& admission,
+    const voidinfer::exl3::Exl3ContinuationGraphAdmission& admission,
     cudaStream_t stream, const std::string& label, bool ready) {
     constexpr std::uint32_t required =
-        ninfer::exl3::Exl3ContinuationGraphRouteFixedB8 |
-        ninfer::exl3::Exl3ContinuationGraphRouteChronologicalOscar |
-        ninfer::exl3::Exl3ContinuationGraphRouteGdnQkvzConcurrent;
+        voidinfer::exl3::Exl3ContinuationGraphRouteFixedB8 |
+        voidinfer::exl3::Exl3ContinuationGraphRouteChronologicalOscar |
+        voidinfer::exl3::Exl3ContinuationGraphRouteGdnQkvzConcurrent;
     require(admission.active && admission.capacity == 8 &&
                 admission.route_generation > 0 && admission.position_ready &&
                 admission.graph_origin_stream_identity ==
@@ -191,7 +191,7 @@ TargetGraphC2VerifierArmTrace target_graph_c2_verifier_run_arm(
     // the only restoration authority after a wrapping draft append; rewind is
     // deliberately not used because evicted slots and host-ring failure state
     // are not recoverable from a count alone.
-    std::array<std::shared_ptr<const ninfer::exl3::Exl3DraftHostRing>, 2> ring_roots;
+    std::array<std::shared_ptr<const voidinfer::exl3::Exl3DraftHostRing>, 2> ring_roots;
     std::array<long long, 2> root_bases{};
     std::array<int, 2> root_counts{};
     std::array<std::array<std::uint64_t, 5>, 2> root_digests{};
@@ -770,7 +770,7 @@ void run_target_graph_c2_verifier_t1(
     const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    const std::string phase = env("NINFER_EXL3_TARGET_GRAPH_C2_T1_PHASE");
+    const std::string phase = env("VOIDINFER_EXL3_TARGET_GRAPH_C2_T1_PHASE");
     require(phase == "preflight" || phase == "screen",
             "targetgraphc2verifiert1 phase must be preflight or screen");
     require(!output.empty() && !std::filesystem::exists(output),

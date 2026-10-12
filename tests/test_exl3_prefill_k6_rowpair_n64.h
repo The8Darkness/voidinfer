@@ -1,7 +1,7 @@
 #pragma once
 
 struct PrefillK6RowpairN64Qualification {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit=Admission::target_wide_prefill;
     static constexpr int max_rows=1024;
     static constexpr std::size_t guard=128;
@@ -10,31 +10,31 @@ struct PrefillK6RowpairN64Qualification {
     std::uint64_t values=0;
 
     PrefillK6RowpairN64Qualification() {
-        for(const char* name:{"NINFER_EXL3_WIDE_PREFILL",
-            "NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-            "NINFER_EXL3_PREFILL_DIRECT_PARTIALS",
-            "NINFER_EXL3_PREFILL_DIRECT_ASYNC_A",
-            "NINFER_EXL3_PREFILL_DIRECT_TILES64",
-            "NINFER_EXL3_PREFILL_WIDE64","NINFER_EXL3_PREFILL_WIDE128",
-            "NINFER_EXL3_PREFILL_WIDE256","NINFER_EXL3_PREFILL_WIDE512",
-            "NINFER_EXL3_PREFILL_WIDE1024"})_putenv_s(name,"1");
-        _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K6","0");
-        _putenv_s("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC","0");
-        _putenv_s("NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA","0");
-        _putenv_s("NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE","0");
-        _putenv_s("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64","0");
+        for(const char* name:{"VOIDINFER_EXL3_WIDE_PREFILL",
+            "VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+            "VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",
+            "VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A",
+            "VOIDINFER_EXL3_PREFILL_DIRECT_TILES64",
+            "VOIDINFER_EXL3_PREFILL_WIDE64","VOIDINFER_EXL3_PREFILL_WIDE128",
+            "VOIDINFER_EXL3_PREFILL_WIDE256","VOIDINFER_EXL3_PREFILL_WIDE512",
+            "VOIDINFER_EXL3_PREFILL_WIDE1024"})_putenv_s(name,"1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_ROWPAIR_N64","0");
     }
 
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+        const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         static_cast<PrefillK6RowpairN64Qualification*>(user)->check(x);
     }
     static std::unique_ptr<Exl3CudaLinearWorkspace> workspace(bool candidate) {
-        _putenv_s("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64",candidate?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_ROWPAIR_N64",candidate?"1":"0");
         return std::make_unique<Exl3CudaLinearWorkspace>(
             5120,17408,max_rows,false,true,false,false,false,true,false);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         const std::string operation=x.operation;
         if(x.rows<max_rows||x.metadata.K!=6||x.metadata.in_features!=5120||
            x.metadata.out_features!=17408||
@@ -42,7 +42,7 @@ struct PrefillK6RowpairN64Qualification {
            !operations.emplace(operation).second)return;
         cuda_check(cudaStreamSynchronize(x.stream),"K6 rowpair N64 input ready");
         auto control=workspace(false),candidate=workspace(true);
-        _putenv_s("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_ROWPAIR_N64","0");
         require(!candidate->target_k6_rowpair_n64_candidate(x.metadata,31,admit)&&
                 candidate->target_k6_rowpair_n64_candidate(x.metadata,32,admit)&&
                 candidate->target_k6_rowpair_n64_candidate(x.metadata,max_rows,admit)&&
@@ -98,7 +98,7 @@ struct PrefillK6RowpairN64Qualification {
 
 void run_prefill_k6_rowpair_n64_qualification(Exl3TextModel& target) {
     for(const char* malformed:{"2","true","01"}) {
-        _putenv_s("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64",malformed);
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_ROWPAIR_N64",malformed);
         bool rejected=false;
         try {
             Exl3CudaLinearWorkspace invalid(5120,17408,
@@ -108,14 +108,14 @@ void run_prefill_k6_rowpair_n64_qualification(Exl3TextModel& target) {
         require(rejected,"K6 rowpair N64 accepted malformed opt-in");
     }
     PrefillK6RowpairN64Qualification qualification;
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size()>=16+PrefillK6RowpairN64Qualification::max_rows,
         "K6 rowpair N64 prompt extent");
     auto context=target.create_context(true);
     context->prefill(std::span<const std::int64_t>(ids.data(),16));
     context->set_target_projection_observer_for_test(
         PrefillK6RowpairN64Qualification::callback,&qualification,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_exact_prefill_wide(std::span<const std::int64_t>(
         ids.data()+16,PrefillK6RowpairN64Qualification::max_rows));
     context->finish_exact_prefill();
@@ -131,10 +131,10 @@ void run_prefill_k6_rowpair_n64_qualification(Exl3TextModel& target) {
 struct PrefillK6SharedDecodeDiscriminator {
     bool complete=false;
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+        const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         static_cast<PrefillK6SharedDecodeDiscriminator*>(user)->run(x);
     }
-    void run(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void run(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         if(complete||x.rows!=1024||x.metadata.K!=6||
            x.metadata.in_features!=5120||x.metadata.out_features!=17408||
            std::string(x.operation)!="gate")return;
@@ -250,15 +250,15 @@ struct PrefillK6SharedDecodeDiscriminator {
 
 void run_prefill_k6_shared_decode_discriminator(Exl3TextModel& target) {
     PrefillK6RowpairN64Qualification environment;
-    _putenv_s("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_K6_ROWPAIR_N64","1");
     PrefillK6SharedDecodeDiscriminator discriminator;
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size()>=1040,"K6 shared-decode prompt extent");
     auto context=target.create_context(true);
     context->prefill(std::span<const std::int64_t>(ids.data(),16));
     context->set_target_projection_observer_for_test(
         PrefillK6SharedDecodeDiscriminator::callback,&discriminator,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_exact_prefill_wide(std::span<const std::int64_t>(
         ids.data()+16,1024));
     context->finish_exact_prefill();

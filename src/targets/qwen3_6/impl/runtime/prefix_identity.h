@@ -2,7 +2,7 @@
 
 // Compact host identity for the model inputs licensed by the resident KV/GDN state.
 
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <array>
 #include <cstddef>
@@ -11,7 +11,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace voidinfer::targets::qwen3_6::detail {
 
 class ResidentPrefixIdentity {
 public:
@@ -67,4 +67,4 @@ private:
                                   const ResidentPrefixIdentity& resident_identity,
                                   std::size_t count);
 
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace voidinfer::targets::qwen3_6::detail

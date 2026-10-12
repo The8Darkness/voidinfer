@@ -1,13 +1,13 @@
 #include "exl3/vision_dense.h"
 #include "exl3/safetensors.h"
 #include "core/tensor.h"
-#include "ninfer/ops/add_bias.h"
-#include "ninfer/ops/gelu.h"
-#include "ninfer/ops/layer_norm.h"
-#include "ninfer/ops/residual_add.h"
-#include "ninfer/ops/rope.h"
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/vision_pos_embed.h"
+#include "voidinfer/ops/add_bias.h"
+#include "voidinfer/ops/gelu.h"
+#include "voidinfer/ops/layer_norm.h"
+#include "voidinfer/ops/residual_add.h"
+#include "voidinfer/ops/rope.h"
+#include "voidinfer/ops/softmax_attention.h"
+#include "voidinfer/ops/vision_pos_embed.h"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 constexpr int H=1152,Heads=16,D=72,Inter=4304,Patch=1536,Merge=4*H,Out=5120,Positions=2304,Depth=27;
 constexpr float NormEps=1e-6F,RopeTheta=10000.0F,Scale=0.11785113019775792F;
@@ -171,7 +171,7 @@ Exl3DenseVisionStats Exl3DenseVision::encode(const targets::qwen3_6::PreparedMed
     auto& m=*impl_;
     const std::lock_guard lock(m.mutex);
     const auto start=std::chrono::steady_clock::now();
-    using ninfer::VisionPatchStorage;
+    using voidinfer::VisionPatchStorage;
     require(payload.storage==VisionPatchStorage::BFloat16,"BF16 patches required");
     const auto rows64=control.patch_count;
     require(rows64>0 && rows64%4==0 && rows64<=131072 && control.merged_count==rows64/4,"patch extent");
@@ -317,7 +317,7 @@ Exl3DenseVisionStats Exl3DenseVision::encode(const targets::qwen3_6::PreparedMed
 void Exl3DenseVision::warm_up(cudaStream_t stream) {
     constexpr int side=32,rows=side*side;
     targets::qwen3_6::PreparedMediaPayload payload;
-    payload.storage=ninfer::VisionPatchStorage::BFloat16;
+    payload.storage=voidinfer::VisionPatchStorage::BFloat16;
     payload.patch_elements=static_cast<std::size_t>(rows)*Patch;
     payload.patches=std::make_unique<std::uint16_t[]>(payload.patch_elements);
     std::fill_n(payload.patches.get(),payload.patch_elements,std::uint16_t{0x3f00});
@@ -335,4 +335,4 @@ void Exl3DenseVision::warm_up(cudaStream_t stream) {
     (void)encode(payload,control,output,stream);
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

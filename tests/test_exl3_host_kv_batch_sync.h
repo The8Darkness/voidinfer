@@ -2,15 +2,15 @@
 
 void run_exact_host_kv_batch_sync_screen(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352 && code.size()>=prefix && prose.size()>=prefix,
         "host KV batch-sync fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","0");
     auto control=target.create_context(true);control->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();

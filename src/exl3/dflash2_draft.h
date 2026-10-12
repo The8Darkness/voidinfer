@@ -21,7 +21,7 @@
 #include <limits>
 #include <atomic>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3DeviceGreedySeed;
 
@@ -230,13 +230,13 @@ void dflash2_dense_t_for_test(const std::uint16_t* input,
 //
 // All draft kernels run natively on the target GPU. EXL3-quantized projections
 // (fc/q/k/v/o/gate/up/down) reuse the qualified Exl3CudaLinearWorkspace family.
-// NINFER_DFLASH2_PROJECTION_TIMING=1 is an eager-only diagnostic sampled at
+// VOIDINFER_DFLASH2_PROJECTION_TIMING=1 is an eager-only diagnostic sampled at
 // load: it allocates persistent CUDA events and prints per-call/aggregate GPU
 // stream elapsed attribution after propose()'s existing final synchronization.
 // Intervals include host-feed gaps. The disabled model creates, records and
 // resolves no timing events and emits no timing output. Internal wall timing
 // excludes entry validation and CSV output; use the harness for full API cost.
-// NINFER_DFLASH2_FUSED_SELECTOR=1 is a separate default-off physical-C1
+// VOIDINFER_DFLASH2_FUSED_SELECTOR=1 is a separate default-off physical-C1
 // proposal-chain candidate. It preserves the candidate order, FP32 reduction
 // order, strict-greater tie rule, device-seed status slot, and proposal rows,
 // but evaluates the bounded autoregressive chain in one 256-thread kernel.
@@ -377,7 +377,7 @@ public:
     std::uint64_t local_topk_calls() const noexcept;
     std::uint64_t fused_topk_liveness_calls() const noexcept;
     // Test-only host telemetry for the most recent proposal. Empty unless the
-    // model was loaded with NINFER_DFLASH2_POSITION_CONFIDENCE=1. Each entry
+    // model was loaded with VOIDINFER_DFLASH2_POSITION_CONFIDENCE=1. Each entry
     // corresponds to one proposed position and is copied at the selector's
     // existing per-position synchronization; no post-verification label is
     // stored here.
@@ -671,4 +671,4 @@ private:
     int capacity_ = 0;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -32,7 +32,7 @@
 #include <span>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 using Json = nlohmann::json;
@@ -406,7 +406,7 @@ std::vector<std::uint16_t> host_linear_forward(const HostLinearModule& w,
 // trajectory is genuine model behavior (finite in FP32) or a shared
 // decode-scale error (runaway even in FP32). Read-only w.r.t. the device path:
 // inputs are downloaded, results only printed. No effect unless
-// NINFER_DFLASH2_REF_FP32 is set (one-shot).
+// VOIDINFER_DFLASH2_REF_FP32 is set (one-shot).
 std::vector<float> ref32_from_f16(const std::vector<std::uint16_t>& h) {
     std::vector<float> f(h.size());
     for (std::size_t i = 0; i < h.size(); ++i) f[i] = half_to_float(h[i]);
@@ -908,7 +908,7 @@ __global__ void __launch_bounds__(kDenseRowsCols*MaxRows) dflash_dense_rows_kmaj
 
 bool dflash_dense_rows_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_DFLASH2_DENSE_ROWS_PIPELINE");
+        const char* value=std::getenv("VOIDINFER_DFLASH2_DENSE_ROWS_PIPELINE");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -963,7 +963,7 @@ __global__ void __launch_bounds__(kDenseTcWarps * 32) dflash_dense_rows_tc_kerne
 bool launch_dflash_dense_rows_tc(const std::uint16_t* in, const std::uint16_t* weights,
     std::uint16_t* out, int rows, int k, int n, int capacity, cudaStream_t stream) {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_DENSE_TC");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_DENSE_TC");
         return !value || std::strcmp(value, "0") != 0;
     }();
     if (!enabled || rows < 1 || rows > 32 || (rows + 15) / 16 * 16 > capacity ||
@@ -1441,7 +1441,7 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
 
 bool dflash_ring_staged_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_RING_STAGED");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_RING_STAGED");
         return !value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -1644,7 +1644,7 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_combine_kernel
     out[static_cast<std::size_t>(q_idx) * kHeadDim + d] = float_to_half(acc / l);
 }
 
-// Split-K tensor-core route for long ring contexts (default; NINFER_DFLASH2_
+// Split-K tensor-core route for long ring contexts (default; VOIDINFER_DFLASH2_
 // RING_SPLIT=0 keeps the per-(query, head) staged kernel). Short contexts stay
 // on the staged kernel, which wins below kRingSplitMinKeys.
 constexpr int kRingSplitMinKeys = 256;
@@ -1656,7 +1656,7 @@ constexpr std::size_t kRingSplitMlFloats =
 
 bool dflash_ring_split_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_RING_SPLIT");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_RING_SPLIT");
         return !value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -2184,7 +2184,7 @@ __global__ void __launch_bounds__(32) dflash_topk16_segment_merge_kernel(
 }
 
 
-// Chunked exact top-16 (default; NINFER_DFLASH2_TOPK_CHUNKED=0 keeps the
+// Chunked exact top-16 (default; VOIDINFER_DFLASH2_TOPK_CHUNKED=0 keeps the
 // segmented insertion route). With T the 16th largest of the per-128-logit
 // chunk maxima, every top-16 logit lies in a chunk whose maximum is >= T, so
 // sorting the (value desc, id asc) pairs of those chunks yields exactly the
@@ -2343,7 +2343,7 @@ __global__ void __launch_bounds__(kTopKSelectThreads) dflash_topk16_chunk_select
 
 bool dflash_topk_chunked_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_TOPK_CHUNKED");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_TOPK_CHUNKED");
         return !value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -2351,7 +2351,7 @@ bool dflash_topk_chunked_enabled() {
 
 bool dflash_topk_segmented_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_TOPK_SEGMENTED");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_TOPK_SEGMENTED");
         return !value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -2921,7 +2921,7 @@ struct Exl3Dflash2DraftModel::Impl {
     bool parallel_topk = false;
     bool local_merge_topk = false;
     std::uint64_t local_merge_topk_calls = 0;
-    // NINFER_DFLASH2_HEAD_PREFIX=N (multiple of 128, default 98304 = 99.96% of
+    // VOIDINFER_DFLASH2_HEAD_PREFIX=N (multiple of 128, default 98304 = 99.96% of
     // code/prose tokens, 0 = off): the draft head
     // scores only token ids [0, N). The target verifies every proposal, so this
     // changes acceptance, never output. A host seed token >= N switches back to
@@ -2989,7 +2989,7 @@ struct Exl3Dflash2DraftModel::Impl {
         }
 
         void initialize() {
-            const char* requested = std::getenv("NINFER_DFLASH2_PROJECTION_TIMING");
+            const char* requested = std::getenv("VOIDINFER_DFLASH2_PROJECTION_TIMING");
             enabled = requested != nullptr && std::string(requested) == "1";
             if (!enabled) return;
             for (auto& event : events)
@@ -4590,9 +4590,9 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
     if (m.ring_count == 0) m.ring_base_abs = abs_pos0;
     // Fresh prefill commits of 9..16 rows run as one chunk through the
     // row-batched coherent projections (half the launches of two 8-row
-    // chunks); NINFER_DFLASH2_PREFILL_CHUNK16=0 keeps 8-row chunks.
+    // chunks); VOIDINFER_DFLASH2_PREFILL_CHUNK16=0 keeps 8-row chunks.
     static const bool chunk16 = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_PREFILL_CHUNK16");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_PREFILL_CHUNK16");
         return !value || std::string(value) != "0";
     }();
     const int chunk = chunk16 && m.fresh_prefill.active && rows > 8 ? 16 : 8;
@@ -4606,7 +4606,7 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
         }
     };
     static const bool commit_graph = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_COMMIT_GRAPH");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_COMMIT_GRAPH");
         return !value || std::string(value) != "0";
     }();
     // The legacy default stream cannot be captured.
@@ -4629,7 +4629,7 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
         auto& exec = graphs.exec[static_cast<std::size_t>(rows)];
         if (!exec) {
             cudaGraph_t graph = nullptr;
-            const ninfer::CudaCaptureScope capture_scope;
+            const voidinfer::CudaCaptureScope capture_scope;
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
                        "draft commit capture");
             try {
@@ -4720,69 +4720,69 @@ std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::load_impl(
     const std::filesystem::path& model_directory,bool defer_private) {
     auto impl = std::make_unique<Impl>();
     cuda_check(cudaGetDevice(&impl->device),"draft weight device");
-    const char* prefill_batch = std::getenv("NINFER_DFLASH2_PREFILL_BATCH");
+    const char* prefill_batch = std::getenv("VOIDINFER_DFLASH2_PREFILL_BATCH");
     impl->prefill_batch = prefill_batch && std::string(prefill_batch) == "1";
-    const char* target_commit_batch = std::getenv("NINFER_DFLASH2_TARGET_COMMIT_BATCH");
+    const char* target_commit_batch = std::getenv("VOIDINFER_DFLASH2_TARGET_COMMIT_BATCH");
     require(target_commit_batch == nullptr || std::string(target_commit_batch) == "0" ||
                 std::string(target_commit_batch) == "1",
-            "NINFER_DFLASH2_TARGET_COMMIT_BATCH must be 0 or 1");
+            "VOIDINFER_DFLASH2_TARGET_COMMIT_BATCH must be 0 or 1");
     impl->target_commit_batch = target_commit_batch != nullptr &&
         std::string(target_commit_batch) == "1";
     require(!impl->target_commit_batch || impl->prefill_batch,
-            "NINFER_DFLASH2_TARGET_COMMIT_BATCH requires NINFER_DFLASH2_PREFILL_BATCH=1");
-    const char* parallel_topk = std::getenv("NINFER_DFLASH2_PARALLEL_TOPK");
+            "VOIDINFER_DFLASH2_TARGET_COMMIT_BATCH requires VOIDINFER_DFLASH2_PREFILL_BATCH=1");
+    const char* parallel_topk = std::getenv("VOIDINFER_DFLASH2_PARALLEL_TOPK");
     impl->parallel_topk = parallel_topk == nullptr || std::string(parallel_topk) != "0";
-    const char* local_merge_topk = std::getenv("NINFER_DFLASH2_LOCAL_TOPK");
+    const char* local_merge_topk = std::getenv("VOIDINFER_DFLASH2_LOCAL_TOPK");
     impl->local_merge_topk = local_merge_topk && std::string(local_merge_topk) == "1";
-    const char* parallel_ring = std::getenv("NINFER_DFLASH2_PARALLEL_RING_ATTENTION");
+    const char* parallel_ring = std::getenv("VOIDINFER_DFLASH2_PARALLEL_RING_ATTENTION");
     impl->parallel_ring_attention = parallel_ring == nullptr || std::string(parallel_ring) == "1";
     const char* position_confidence =
-        std::getenv("NINFER_DFLASH2_POSITION_CONFIDENCE");
+        std::getenv("VOIDINFER_DFLASH2_POSITION_CONFIDENCE");
     require(position_confidence == nullptr ||
                 std::string(position_confidence) == "0" ||
                 std::string(position_confidence) == "1",
-            "NINFER_DFLASH2_POSITION_CONFIDENCE must be 0 or 1");
+            "VOIDINFER_DFLASH2_POSITION_CONFIDENCE must be 0 or 1");
     impl->position_confidence =
         position_confidence != nullptr && std::string(position_confidence) == "1";
-    const char* dense_kmajor=std::getenv("NINFER_DFLASH2_DENSE_KMAJOR");
+    const char* dense_kmajor=std::getenv("VOIDINFER_DFLASH2_DENSE_KMAJOR");
     require(dense_kmajor==nullptr || std::string(dense_kmajor)=="0" ||
             std::string(dense_kmajor)=="1",
-        "NINFER_DFLASH2_DENSE_KMAJOR must be 0 or 1");
+        "VOIDINFER_DFLASH2_DENSE_KMAJOR must be 0 or 1");
     impl->dense_kmajor=dense_kmajor!=nullptr && std::string(dense_kmajor)=="1";
     const char* selector_batched_anchor_chain =
-        std::getenv("NINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN");
+        std::getenv("VOIDINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN");
     require(selector_batched_anchor_chain == nullptr ||
                 std::string(selector_batched_anchor_chain) == "0" ||
                 std::string(selector_batched_anchor_chain) == "1",
-            "NINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN must be 0 or 1");
+            "VOIDINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN must be 0 or 1");
     impl->selector_batched_anchor_chain =
         selector_batched_anchor_chain != nullptr &&
         std::string(selector_batched_anchor_chain) == "1";
-    const char* fast_device_liveness=std::getenv("NINFER_DFLASH2_FAST_DEVICE_LIVENESS");
+    const char* fast_device_liveness=std::getenv("VOIDINFER_DFLASH2_FAST_DEVICE_LIVENESS");
     require(fast_device_liveness==nullptr || std::string(fast_device_liveness)=="0" ||
             std::string(fast_device_liveness)=="1",
-        "NINFER_DFLASH2_FAST_DEVICE_LIVENESS must be 0 or 1");
+        "VOIDINFER_DFLASH2_FAST_DEVICE_LIVENESS must be 0 or 1");
     impl->fast_device_liveness=fast_device_liveness!=nullptr &&
         std::string(fast_device_liveness)=="1";
-    const char* fused_topk_liveness=std::getenv("NINFER_DFLASH2_FUSED_TOPK_LIVENESS");
+    const char* fused_topk_liveness=std::getenv("VOIDINFER_DFLASH2_FUSED_TOPK_LIVENESS");
     require(fused_topk_liveness==nullptr || std::string(fused_topk_liveness)=="0" ||
             std::string(fused_topk_liveness)=="1",
-        "NINFER_DFLASH2_FUSED_TOPK_LIVENESS must be 0 or 1");
+        "VOIDINFER_DFLASH2_FUSED_TOPK_LIVENESS must be 0 or 1");
     impl->fused_topk_liveness=fused_topk_liveness!=nullptr &&
         std::string(fused_topk_liveness)=="1";
-    if(const char* prefix=std::getenv("NINFER_DFLASH2_HEAD_PREFIX")) {
+    if(const char* prefix=std::getenv("VOIDINFER_DFLASH2_HEAD_PREFIX")) {
         const int value=std::atoi(prefix);
         require(value>=0 && value%128==0 && value<=kVocab,
-            "NINFER_DFLASH2_HEAD_PREFIX must be a multiple of 128 within the vocabulary");
+            "VOIDINFER_DFLASH2_HEAD_PREFIX must be a multiple of 128 within the vocabulary");
         impl->head_prefix=value<kVocab?value:0;
     }
     require(!impl->fused_topk_liveness ||
                 (impl->fast_device_liveness && impl->local_merge_topk),
         "fused top-K liveness requires fast device liveness and local top-K");
-    const char* fused_selector=std::getenv("NINFER_DFLASH2_FUSED_SELECTOR");
+    const char* fused_selector=std::getenv("VOIDINFER_DFLASH2_FUSED_SELECTOR");
     require(fused_selector==nullptr || std::string(fused_selector)=="0" ||
             std::string(fused_selector)=="1",
-        "NINFER_DFLASH2_FUSED_SELECTOR must be 0 or 1");
+        "VOIDINFER_DFLASH2_FUSED_SELECTOR must be 0 or 1");
     impl->fused_selector=fused_selector!=nullptr &&
         std::string(fused_selector)=="1";
     // Capture the private allocation requirement before timing resources or weight
@@ -5044,7 +5044,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_private(
     // batched forward as a one-member group: once the ring is full it replays
     // one captured graph instead of eager launches.
     static const bool solo_batched=[] {
-        const char* value=std::getenv("NINFER_DFLASH2_SOLO_BATCHED");
+        const char* value=std::getenv("VOIDINFER_DFLASH2_SOLO_BATCHED");
         return !value || std::strcmp(value,"0")!=0;
     }();
     if(solo_batched && batched_proposal_supported(block_ids)) {
@@ -5090,8 +5090,8 @@ bool Exl3Dflash2DraftModel::batched_proposal_supported(std::span<const std::int6
         !m.projection_timing.enabled && !m.projection_observer && !m.ring_attention_observer &&
         !m.shared_q_executor && m.parallel_ring_attention && !m.host_control_active &&
         m.ring_count>=0 && m.ring_count<=kRingKeep &&
-        std::getenv("NINFER_DFLASH2_TIMING")==nullptr &&
-        std::getenv("NINFER_DFLASH2_DEBUG_LOGITS")==nullptr;
+        std::getenv("VOIDINFER_DFLASH2_TIMING")==nullptr &&
+        std::getenv("VOIDINFER_DFLASH2_DEBUG_LOGITS")==nullptr;
 }
 
 namespace {
@@ -5381,7 +5381,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
     // Full rings (steady state): replay one captured graph per member set and
     // head width instead of ~250 eager launches.
     static const bool graphed_drafts=[] {
-        const char* value=std::getenv("NINFER_DFLASH2_BATCHED_DRAFT_GRAPH");
+        const char* value=std::getenv("VOIDINFER_DFLASH2_BATCHED_DRAFT_GRAPH");
         return !value || std::string(value)!="0";
     }();
     bool graphed=graphed_drafts && dflash_ring_split_selected(kRingKeep);
@@ -5404,7 +5404,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             created.count=count;created.head_columns=head_columns;
             for(int i=0;i<count;++i)created.members[static_cast<std::size_t>(i)]=members[i]->draft->impl_.get();
             cudaGraph_t graph=nullptr;
-            const ninfer::CudaCaptureScope capture_scope;
+            const voidinfer::CudaCaptureScope capture_scope;
             cuda_check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),"capture batched draft");
             try {enqueue(true);}
             catch(...) {
@@ -5454,7 +5454,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
     long long abs_pos0,cudaStream_t stream) {
     auto& m=*impl_; auto& f=m.fresh_prefill;
     static const bool bulk=[] {
-        const char* value=std::getenv("NINFER_DFLASH2_PREFILL_BULK");
+        const char* value=std::getenv("VOIDINFER_DFLASH2_PREFILL_BULK");
         return !value || std::string(value)!="0";
     }();
     require(taps && rows>=1,"draft bulk prefill commit extent");
@@ -5499,7 +5499,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
         // position advance inside it); the tail chunk runs eagerly below.
         const int whole=rows/kChunk;
         static const bool graphed=[] {
-            const char* value=std::getenv("NINFER_DFLASH2_BULK_GRAPH");
+            const char* value=std::getenv("VOIDINFER_DFLASH2_BULK_GRAPH");
             return !value || std::string(value)!="0";
         }();
         int first=0;
@@ -5521,7 +5521,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
             cuda_check(cudaGetLastError(),"draft bulk prefill position");
             if(!g.exec) {
                 cudaGraph_t graph=nullptr;
-                const ninfer::CudaCaptureScope capture_scope;
+                const voidinfer::CudaCaptureScope capture_scope;
                 cuda_check(cudaStreamBeginCapture(replay,cudaStreamCaptureModeThreadLocal),
                     "draft bulk prefill capture");
                 try {
@@ -5739,18 +5739,18 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     }
     if (projection_timing.enabled) {
         for (const char* incompatible : {
-                 "NINFER_DFLASH2_TIMING", "NINFER_DFLASH2_DEBUG_LOGITS",
-                 "NINFER_DFLASH2_REF_FP32", "NINFER_DFLASH2_DIFF_L0_OPROJ",
-                 "NINFER_DFLASH2_DIFF_L0_ATTN", "NINFER_DFLASH2_DIFF_L0_CONV"}) {
+                 "VOIDINFER_DFLASH2_TIMING", "VOIDINFER_DFLASH2_DEBUG_LOGITS",
+                 "VOIDINFER_DFLASH2_REF_FP32", "VOIDINFER_DFLASH2_DIFF_L0_OPROJ",
+                 "VOIDINFER_DFLASH2_DIFF_L0_ATTN", "VOIDINFER_DFLASH2_DIFF_L0_CONV"}) {
             require(std::getenv(incompatible) == nullptr,
-                    std::string("NINFER_DFLASH2_PROJECTION_TIMING is incompatible with ") +
+                    std::string("VOIDINFER_DFLASH2_PROJECTION_TIMING is incompatible with ") +
                         incompatible);
         }
         cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
         cuda_check(cudaStreamIsCapturing(stream, &capture_status),
                    "P2 projection timing capture query");
         require(capture_status == cudaStreamCaptureStatusNone,
-                "NINFER_DFLASH2_PROJECTION_TIMING supports eager propose only");
+                "VOIDINFER_DFLASH2_PROJECTION_TIMING supports eager propose only");
         projection_api_begin = std::chrono::steady_clock::now();
         projection_timing.begin(stream);
     }
@@ -5825,9 +5825,9 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         }
     };
 
-    // E5A3 latency attribution (env-gated NINFER_DFLASH2_TIMING; serializes phases
+    // E5A3 latency attribution (env-gated VOIDINFER_DFLASH2_TIMING; serializes phases
     // when active, so GPU times are exact but the timed run is not a perf baseline).
-    const bool e5a3_timing = (std::getenv("NINFER_DFLASH2_TIMING") != nullptr);
+    const bool e5a3_timing = (std::getenv("VOIDINFER_DFLASH2_TIMING") != nullptr);
     cudaEvent_t ph_a = nullptr, ph_b = nullptr;
     std::vector<std::pair<std::string, float>> ph_ms;
     auto ph_begin = [&]() {
@@ -5972,7 +5972,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     std::unique_ptr<DeviceAllocation> nan_alloc;
     unsigned long long* nan_count = nullptr;
     static bool g_traced_once = false;
-    const bool stage_trace = (std::getenv("NINFER_DFLASH2_DEBUG_LOGITS") != nullptr) &&
+    const bool stage_trace = (std::getenv("VOIDINFER_DFLASH2_DEBUG_LOGITS") != nullptr) &&
                              !g_traced_once;
     if (stage_trace) {
         g_traced_once = true;
@@ -6046,7 +6046,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     // FP32 storage with the same EXL3 oracle. Decides FP16-range vs decode bug.
     // No effect on the device path.
     static bool g_ref32_done = false;
-    if (!use_ring && !g_ref32_done && std::getenv("NINFER_DFLASH2_REF_FP32") != nullptr) {
+    if (!use_ring && !g_ref32_done && std::getenv("VOIDINFER_DFLASH2_REF_FP32") != nullptr) {
         g_ref32_done = true;
         auto ref32_grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
@@ -6073,7 +6073,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     static bool g_l0_diff_done = false;
     auto diff_l0_oproj = [&](int m_rows) {
         if (g_l0_diff_done) return;
-        if (std::getenv("NINFER_DFLASH2_DIFF_L0_OPROJ") == nullptr) return;
+        if (std::getenv("VOIDINFER_DFLASH2_DIFF_L0_OPROJ") == nullptr) return;
         g_l0_diff_done = true;
         const int in = kQHeads * kHeadDim;   // 4096
         const int out = kHidden;             // 5120
@@ -6168,7 +6168,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     static bool g_l0_attn_done = false;
     auto diff_l0_attention = [&](int q_rows, int ctx_rows) {
         if (g_l0_attn_done) return;
-        if (std::getenv("NINFER_DFLASH2_DIFF_L0_ATTN") == nullptr) return;
+        if (std::getenv("VOIDINFER_DFLASH2_DIFF_L0_ATTN") == nullptr) return;
         g_l0_attn_done = true;
         auto grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
@@ -6252,7 +6252,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
                                    const std::uint16_t* out_dev,
                                    const std::string& tag) {
         if (g_l0_conv_count >= 2) return;
-        if (std::getenv("NINFER_DFLASH2_DIFF_L0_CONV") == nullptr) return;
+        if (std::getenv("VOIDINFER_DFLASH2_DIFF_L0_CONV") == nullptr) return;
         ++g_l0_conv_count;
         auto grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
@@ -6571,7 +6571,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     // E5A2 diagnostic (env-gated, no effect on gates): report per-row head-logit
     // finiteness/spread so a dead/zero or NaN draft path is distinguishable from a
     // live-but-degenerate one. Not part of the forced-rejection contract.
-    if (std::getenv("NINFER_DFLASH2_DEBUG_LOGITS") != nullptr) {
+    if (std::getenv("VOIDINFER_DFLASH2_DEBUG_LOGITS") != nullptr) {
         std::vector<std::uint16_t> raw_logits(
             static_cast<std::size_t>(proposal_rows) * kVocab);
         cuda_check(exl3_d2h_async(raw_logits.data(), m.s.head_out,
@@ -6616,7 +6616,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             cuda_check(cudaGetLastError(),"E5A2 fast liveness launch");
         }
         if (!fused_liveness)
-            cuda_check(ninfer::cuda_poll_stream(stream),"E5A2 fast liveness poll");
+            cuda_check(voidinfer::cuda_poll_stream(stream),"E5A2 fast liveness poll");
         cuda_check(exl3_d2h_async(&fused_bad,m.s.liveness_flag,sizeof(fused_bad),stream),
                    "E5A2 fast liveness read");
         if (!fused_liveness)
@@ -6656,7 +6656,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             m.s.cand_unary, m.s.proposal_out);
         cuda_check(cudaGetLastError(), "E5A2 launch fused draft selector");
         ++m.fused_selector_calls;
-        cuda_check(ninfer::cuda_poll_stream(stream), "E5A2 fused draft proposals poll");
+        cuda_check(voidinfer::cuda_poll_stream(stream), "E5A2 fused draft proposals poll");
         cuda_check(exl3_d2h_async(result.data(), m.s.proposal_out,
                                    static_cast<std::size_t>(proposal_rows) *
                                        sizeof(std::int64_t), stream),
@@ -7025,4 +7025,4 @@ const std::uint16_t* Exl3Dflash2TapHistory::latest_row_device(
         static_cast<std::size_t>(impl_->stored - 1) * kHidden;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3SamplingPublicationCount {
     std::size_t resident_tokens=0,visible_tokens=0;
@@ -42,4 +42,4 @@ public:
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

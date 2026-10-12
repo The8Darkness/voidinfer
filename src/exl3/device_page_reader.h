@@ -3,7 +3,7 @@
 #include "exl3/kv_transfer_lease.h"
 #include <limits>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Reuse the existing retained final-use record: the ready view is its destination
 // owner and the attention lane/event bundle is its independent auxiliary owner.
 // No registration claim is inferred from that auxiliary reference.

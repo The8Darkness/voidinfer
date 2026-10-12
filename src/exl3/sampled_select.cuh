@@ -1,7 +1,7 @@
 #pragma once
 // Coupled sampled token selection for the coherent-device route.
 //
-// Semantics are the registered EXL3 sampler's (include/ninfer/ops/sampling.h,
+// Semantics are the registered EXL3 sampler's (include/voidinfer/ops/sampling.h,
 // without penalties): candidates are the top min(top_k, 20) logits (top_k <= 0
 // or >= 20 keeps 20) ordered by value with the lower token id winning ties;
 // weights exp(logit/T - max); min_p drops the suffix below min_p * max weight;
@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 
 constexpr int kSampledCandidates=20;
@@ -255,4 +255,4 @@ inline void exl3_launch_sampled_packet(int rows,cudaStream_t stream,const std::u
         keys,serial,output);
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

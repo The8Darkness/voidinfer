@@ -14,7 +14,7 @@
 #include <vector>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Redundant represented KV only. Authoritative pages and publication remain on
 // the host; these weak tags must never perturb page COW or retain a host root.
 class Exl3DevicePrefixCache : public std::enable_shared_from_this<Exl3DevicePrefixCache> {

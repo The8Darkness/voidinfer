@@ -7,7 +7,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace voidinfer::ops {
 namespace {
 
 template <int Bits>
@@ -164,7 +164,7 @@ void cyclic_oscar_requantize_launch(
     }
     const bool source_q2_transposed = source_layout == OscarKVLayout::TransposedQ2;
     const bool destination_q2_transposed = destination_layout == OscarKVLayout::TransposedQ2;
-#define NINFER_OSCAR_REQUANTIZE_DESTINATION(SOURCE_BITS)                                      \
+#define VOIDINFER_OSCAR_REQUANTIZE_DESTINATION(SOURCE_BITS)                                      \
     switch (destination_bits) {                                                               \
     case 2:                                                                                   \
         launch_typed<SOURCE_BITS, 2>(                                                         \
@@ -189,19 +189,19 @@ void cyclic_oscar_requantize_launch(
     }
     switch (source_bits) {
     case 2:
-        NINFER_OSCAR_REQUANTIZE_DESTINATION(2)
+        VOIDINFER_OSCAR_REQUANTIZE_DESTINATION(2)
         break;
     case 3:
-        NINFER_OSCAR_REQUANTIZE_DESTINATION(3)
+        VOIDINFER_OSCAR_REQUANTIZE_DESTINATION(3)
         break;
     case 4:
-        NINFER_OSCAR_REQUANTIZE_DESTINATION(4)
+        VOIDINFER_OSCAR_REQUANTIZE_DESTINATION(4)
         break;
     default:
         throw std::invalid_argument("OSCAR source bit width is invalid");
     }
-#undef NINFER_OSCAR_REQUANTIZE_DESTINATION
+#undef VOIDINFER_OSCAR_REQUANTIZE_DESTINATION
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops
+} // namespace voidinfer::ops

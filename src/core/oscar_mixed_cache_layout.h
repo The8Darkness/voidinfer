@@ -10,7 +10,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer {
+namespace voidinfer {
 
 inline constexpr std::uint32_t kOscarMixedPageTokens     = 64;
 inline constexpr std::uint32_t kOscarMixedPrefixTokens   = 64;
@@ -73,7 +73,7 @@ struct OscarMixedPageMetadata {
     std::uint16_t occupied_tokens        = 0;
     std::uint16_t capacity_tokens        = kOscarMixedPageTokens;
     std::uint16_t layout_version         = kOscarMixedLayoutVersion;
-    std::uint16_t group_size             = ninfer::ops::kOscarInt2G128GroupSize;
+    std::uint16_t group_size             = voidinfer::ops::kOscarInt2G128GroupSize;
     OscarMixedStorageType k_storage      = OscarMixedStorageType::BFloat16;
     OscarMixedStorageType v_storage      = OscarMixedStorageType::BFloat16;
     OscarMixedRegionRole role             = OscarMixedRegionRole::ProtectedPrefix;
@@ -90,7 +90,7 @@ struct OscarMixedSlotMetadata {
     std::uint32_t physical_page_index   = 0;
     std::uint16_t page_offset           = 0;
     std::uint16_t layout_version        = kOscarMixedLayoutVersion;
-    std::uint16_t group_size            = ninfer::ops::kOscarInt2G128GroupSize;
+    std::uint16_t group_size            = voidinfer::ops::kOscarInt2G128GroupSize;
     OscarMixedStorageType k_storage     = OscarMixedStorageType::BFloat16;
     OscarMixedStorageType v_storage     = OscarMixedStorageType::BFloat16;
     OscarMixedRegionRole role            = OscarMixedRegionRole::ProtectedPrefix;
@@ -331,4 +331,4 @@ private:
     std::vector<OscarMixedAgingLayerCache> layers_;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

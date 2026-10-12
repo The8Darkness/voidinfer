@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
@@ -241,4 +241,4 @@ void CudaCompletionEvent::synchronize() const {
     CUDA_CHECK(cudaEventSynchronize(event_));
 }
 
-} // namespace ninfer
+} // namespace voidinfer

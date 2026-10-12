@@ -4,7 +4,7 @@
 #include <thread>
 
 struct T86Fp16RequestTrace {
-    std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> request;
+    std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> request;
     std::vector<std::int64_t> published;
     std::vector<double> publication_ms;
     double queue_wait_ms = 0.0;
@@ -40,10 +40,10 @@ void run_t86_fp16_c8_serving(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
-    using Coordinator = ninfer::exl3::Exl3VeriCacheServingCoordinator;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
+    using Coordinator = voidinfer::exl3::Exl3VeriCacheServingCoordinator;
     constexpr std::size_t kPrompt = 4096;
     constexpr std::size_t kPrefix = 3968;
     constexpr std::size_t kTail = 128;
@@ -57,8 +57,8 @@ void run_t86_fp16_c8_serving(
             "T86 output must be new");
     std::filesystem::create_directories(output);
 
-    const auto reserve_gib = std::stoull(env("NINFER_T86_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T86_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T86_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T86_CACHE_MIB"));
     require(reserve_gib >= 8 && cache_mib >= 1024,
             "T86 memory policy extent");
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
@@ -76,13 +76,13 @@ void run_t86_fp16_c8_serving(
         return state.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T86_NAMESPACE"), env("NINFER_T86_ARTIFACT_ID"),
-        env("NINFER_T86_TOKENIZER_ID"), env("NINFER_T86_CONFIGURATION_ID"),
-        env("NINFER_T86_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T86_NAMESPACE"), env("VOIDINFER_T86_ARTIFACT_ID"),
+        env("VOIDINFER_T86_TOKENIZER_ID"), env("VOIDINFER_T86_CONFIGURATION_ID"),
+        env("VOIDINFER_T86_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{16, 64, cache_budget, reserve}, identity);
-    std::unique_ptr<ninfer::exl3::Exl3HostResidentSet> direct_residency;
+    std::unique_ptr<voidinfer::exl3::Exl3HostResidentSet> direct_residency;
     auto context_a = target.create_context(true);
     auto context_b = target.create_context(true);
     context_a->prepare_continuation(8);
@@ -110,14 +110,14 @@ void run_t86_fp16_c8_serving(
     }
 
     struct PinResult {
-        ninfer::exl3::Exl3HostResidentSet::Stats update;
+        voidinfer::exl3::Exl3HostResidentSet::Stats update;
         Exl3HostResidency observed;
     };
     const auto pin = [&](const std::array<std::shared_ptr<const Request>, 8>& active,
                          bool observe) {
         auto roots = cache.roots();
         for (const auto& root : active) if (root) roots.push_back(root);
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for (const auto& root : roots) snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,
             [&](const void* data, std::size_t bytes) { snapshot.add(data, bytes); },
@@ -178,7 +178,7 @@ void run_t86_fp16_c8_serving(
                     preparation[request].executed_prompt_tokens == kTail,
                 "T86 cached preparation accounting");
     }
-    direct_residency = std::make_unique<ninfer::exl3::Exl3HostResidentSet>(
+    direct_residency = std::make_unique<voidinfer::exl3::Exl3HostResidentSet>(
         memory.ullTotalPhys - reserve, reserve);
     const auto initial_lock = pin(initial, true);
     require(initial_lock.observed.resident_tensor_bytes <
@@ -252,7 +252,7 @@ void run_t86_fp16_c8_serving(
                 std::chrono::steady_clock::now() - admission_started).count();
             result.ready_residency = observe(current);
         } else {
-            direct_residency = std::make_unique<ninfer::exl3::Exl3HostResidentSet>(
+            direct_residency = std::make_unique<voidinfer::exl3::Exl3HostResidentSet>(
                 memory.ullTotalPhys - reserve, reserve);
             result.ready_residency = pin(current, true).observed;
         }
@@ -561,7 +561,7 @@ void run_t86_fp16_c8_serving(
     require(queued_exact, "T86 queued cancellation gate");
 
     // Pair cancellation after verification and before resident publication.
-    direct_residency = std::make_unique<ninfer::exl3::Exl3HostResidentSet>(
+    direct_residency = std::make_unique<voidinfer::exl3::Exl3HostResidentSet>(
         memory.ullTotalPhys - reserve, reserve);
     contexts[0]->restore_exact_host_state(*initial[0]->state(), streams[0].value);
     const auto control_pending = sample_target(*contexts[0], streams[0].value);
@@ -580,7 +580,7 @@ void run_t86_fp16_c8_serving(
         sample_target(*contexts[0], streams[0].value),
         sample_target(*contexts[1], streams[1].value)};
     std::array<std::shared_ptr<const Request>,2> updated;
-    std::array<ninfer::exl3::Exl3OuterReferenceResult,2> verified;
+    std::array<voidinfer::exl3::Exl3OuterReferenceResult,2> verified;
     std::array<std::exception_ptr,2> errors;
     std::thread workers[2];
     for (int physical = 0; physical < 2; ++physical)

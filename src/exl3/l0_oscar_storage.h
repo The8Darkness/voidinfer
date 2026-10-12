@@ -2,7 +2,7 @@
 // Per-layer device storage of the L0 OSCAR INT4 KV history (l0_oscar.cuh).
 #include <cstdint>
 
-namespace ninfer::exl3::l0_oscar {
+namespace voidinfer::exl3::l0_oscar {
 
 // Device OSCAR rotations (l0_oscar.cuh assets()) for code outside the L0
 // attention translation unit (l0_kv_pack.cuh); defined there.
@@ -60,4 +60,4 @@ struct LayerStorage {
     int hot_slots = 0, hot_words = 0;
 };
 
-}  // namespace ninfer::exl3::l0_oscar
+}  // namespace voidinfer::exl3::l0_oscar

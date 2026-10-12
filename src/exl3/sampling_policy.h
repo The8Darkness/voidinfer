@@ -8,7 +8,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3NormalizedSamplingPolicy {
     runtime::ResolvedSamplingParameters requested;
@@ -60,4 +60,4 @@ public:
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

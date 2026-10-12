@@ -3,7 +3,7 @@
 #include <iostream>
 #include <cstdlib>
 
-using Set=ninfer::exl3::Exl3HostResidentSet;
+using Set=voidinfer::exl3::Exl3HostResidentSet;
 void require(bool value,const char* message) {if(!value) throw std::runtime_error(message);}
 struct Block {
     unsigned char* data=nullptr;std::size_t size;
@@ -15,10 +15,10 @@ struct Block {
 };
 struct Root {std::shared_ptr<Block> block;std::size_t first,bytes;};
 struct DeviceLifetimeFixture {
-    std::optional<ninfer::exl3::RetainedDeviceLedger::Ticket> ticket;
+    std::optional<voidinfer::exl3::RetainedDeviceLedger::Ticket> ticket;
     unsigned attachments=0;
     static bool attach(const std::shared_ptr<const void>& owner,
-        ninfer::exl3::RetainedDeviceLedger::Ticket credit) noexcept {
+        voidinfer::exl3::RetainedDeviceLedger::Ticket credit) noexcept {
         auto* fixture=const_cast<DeviceLifetimeFixture*>(static_cast<const DeviceLifetimeFixture*>(owner.get()));
         if(!fixture || fixture->ticket || credit.bytes()!=40)return false;
         fixture->ticket.emplace(std::move(credit));++fixture->attachments;return true;
@@ -40,8 +40,8 @@ std::pair<std::size_t,std::size_t> inspect(const Block& block,std::size_t first,
 }
 int main() {
     try {
-        if(const auto* mode=std::getenv("NINFER_TEST_FAILED_FACTORY_CEILING");mode && std::string(mode)=="1") {
-            using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        if(const auto* mode=std::getenv("VOIDINFER_TEST_FAILED_FACTORY_CEILING");mode && std::string(mode)=="1") {
+            using Inventory=voidinfer::exl3::Exl3ResourceInventory;
             require(!Set::failed_close_reservation_ceiling_for_test(),"failed ceiling fixture requires fresh process");
             Inventory::Requirement planning;planning.configuration=91;
             planning.add(Inventory::Domain::host_metadata,1,64);
@@ -77,7 +77,7 @@ int main() {
         }
         SIZE_T original_min=0,original_max=0;DWORD original_flags=0;
         require(GetProcessWorkingSetSizeEx(GetCurrentProcess(),&original_min,&original_max,&original_flags)!=0,"original test quota");
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         {
         Set registry(40ULL<<20,8ULL<<30);
         auto limits=Inventory::unlimited();limits[0]=100;
@@ -118,7 +118,7 @@ int main() {
                     }
                     bool refused=false;
                     try{extend(rejected);}
-                    catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=invalid==2;}
+                    catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=invalid==2;}
                     catch(const std::invalid_argument&){refused=invalid!=2;}
                     require(refused,"invalid extension did not report expected refusal");
                     // The failed extension must leave the prior promise usable.
@@ -272,7 +272,7 @@ int main() {
             auto owner=std::make_shared<int>();
             const Inventory::Allocation device{owner,0,Inventory::Domain::device,40};
             Set::Snapshot initial;initial.resources.add(device);registry.replace(std::move(initial));
-            std::optional<ninfer::exl3::RetainedDeviceLedger::Ticket> lifetime;
+            std::optional<voidinfer::exl3::RetainedDeviceLedger::Ticket> lifetime;
             require(!registry.retire_reserved_device_to_lifetime(device,[](auto) noexcept {return false;}),
                 "refused device lifetime attachment released allocation");
             require(registry.retained_resource_units()[0]==40,"refused device lifetime changed charge");
@@ -289,7 +289,7 @@ int main() {
             const auto factory=[&](auto) {called=true;Inventory result;
                 result.add({std::make_shared<int>(),0,Inventory::Domain::device,70});return result;};
             bool refused=false;
-            try{registry.allocate_reserved(incoming,factory);}catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            try{registry.allocate_reserved(incoming,factory);}catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && !called,"detached device lifetime bypassed admission budget");
             lifetime.reset();
             require(registry.retained_resource_units()[0]==0,"released device lifetime retained charge");
@@ -302,7 +302,7 @@ int main() {
             auto owner=std::make_shared<int>();
             const Inventory::Allocation registration{owner,0,domain,40};
             Set::Snapshot initial;initial.resources.add(registration);registry.replace(std::move(initial));
-            std::optional<ninfer::exl3::RetainedCudaRegistrationLedger::Ticket> lifetime;
+            std::optional<voidinfer::exl3::RetainedCudaRegistrationLedger::Ticket> lifetime;
             require(!registry.retire_reserved_registration_to_lifetime(registration,[](auto) noexcept {return false;}),
                 "refused registration attachment released charge");
             require(registry.retained_resource_units()[index]==40,"refused registration transfer changed budget");
@@ -318,7 +318,7 @@ int main() {
             const auto factory=[&](auto){called=true;Inventory actual;
                 actual.add({std::make_shared<int>(),0,domain,incoming.units[index]});return actual;};
             bool refused=false;try{registry.allocate_reserved(incoming,factory);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && !called,"detached registration bypassed admission budget");
             lifetime.reset();require(registry.retained_resource_units()[index]==0,"unregister credit release did not restore capacity");
             registry.allocate_reserved(incoming,factory);require(called,"released registration did not restore admission");
@@ -352,7 +352,7 @@ int main() {
             const auto factory=[&](auto) {allocated=true;Inventory result;
                 result.add({std::make_shared<int>(4),0,Inventory::Domain::host_metadata,1});return result;};
             refused=false;try{registry.allocate_reserved(incoming,factory);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && !allocated,"live retired metadata released allocation budget");
             borrower.reset();
             require(registry.collect_retired_metadata(tracking,retired),"matching expired metadata not collected");

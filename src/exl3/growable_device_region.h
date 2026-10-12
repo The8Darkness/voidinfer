@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3GrowableDeviceRegion {
 public:
@@ -208,4 +208,4 @@ private:
     std::size_t capacity_ = 0;
 };
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

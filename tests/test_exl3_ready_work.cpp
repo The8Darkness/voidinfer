@@ -16,7 +16,7 @@ int check(bool value,const char* message) {
 }
 
 int main() {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     using Clock=Exl3ReadyWorkDescriptor::Clock;
     int failures=0;
     const auto model=std::make_shared<int>(7);

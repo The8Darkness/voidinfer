@@ -83,7 +83,7 @@ void require_target_continue_state_equal(Exl3TextContext& actual,
 void run_target_continuation_qualification(Exl3TextModel& target,
                                            const std::vector<std::int64_t>& source_ids) {
     require(target.max_context() == 1024, "targetcontinue requires max context 1024");
-    require(env("NINFER_OSCAR_EXL3") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1",
             "targetcontinue requires canonical OSCAR");
     require(!source_ids.empty(), "targetcontinue prompt fixture is empty");
 
@@ -113,7 +113,7 @@ void run_target_continuation_qualification(Exl3TextModel& target,
                     block->persistent_bytes() - persistent_before == kExpectedBytes,
                 "targetcontinue allocation accounting mismatch");
         const std::string head = block->continuation_head_dispatch();
-        const bool h6_opt_out = env("NINFER_EXL3_H6_SMALL_M") == "0";
+        const bool h6_opt_out = env("VOIDINFER_EXL3_H6_SMALL_M") == "0";
         require(head == (h6_opt_out ? "h6_single_split_per_row"
                                    : "h6_small_m_single_split"),
                 "targetcontinue H6 route mismatch");

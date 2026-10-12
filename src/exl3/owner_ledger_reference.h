@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Independent, bounded ownership oracle for prepared tests. It deliberately
 // does not consume Exl3ResourceInventory records or candidate traversal output.
@@ -165,4 +165,4 @@ private:
     std::array<Reference,maximum_references> references_{};
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

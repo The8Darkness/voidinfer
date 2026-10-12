@@ -1,7 +1,7 @@
 #pragma once
 
 void run_turboangle_host_oracle() {
-    using ninfer::exl3::TurboAngle256;
+    using voidinfer::exl3::TurboAngle256;
     constexpr double pi=3.1415926535897932384626433832795;
     int cases=0;
     for(int fixture=0;fixture<5;++fixture) for(bool key:{false,true}) {
@@ -85,7 +85,7 @@ void run_warm_tier_qualification(Exl3TextModel& target,const std::vector<std::in
         restore_total[arm]+=restore_ms;
         std::vector<std::int64_t> tentative;
         for(int i=0;i<4;++i) {const auto token=sample_target(*inner); tentative.push_back(token); inner->decode(token);}
-        const auto result=ninfer::exl3::verify_exl3_outer_reference(*exact,*l2,tentative);
+        const auto result=voidinfer::exl3::verify_exl3_outer_reference(*exact,*l2,tentative);
         accepted[arm]+=result.accepted;
         require(std::equal(result.committed_tokens.begin(),result.committed_tokens.end(),oracle_tokens.begin()),
                 "warmtier unauthorized outer output");

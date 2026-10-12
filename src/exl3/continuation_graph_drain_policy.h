@@ -4,7 +4,7 @@
 #include <memory>
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Pure admission decision for the one default-off graph final-use narrowing.
 // Native synchronization remains in TextContext; this value never certifies
@@ -29,4 +29,4 @@ public:
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

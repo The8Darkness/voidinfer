@@ -1,5 +1,5 @@
 #pragma once
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 #include "runtime/contract/types.h"
 #include "exl3/retirement_state.h"
 #include "exl3/verifier_horizon_policy.h"
@@ -7,14 +7,13 @@
 #include "exl3/vericache_request.h"
 #include "exl3/resource_availability.h"
 #include "exl3/ready_work_descriptor.h"
-#include <ninfer/targets/qwen3_6/frontend.h>
+#include <voidinfer/targets/qwen3_6/frontend.h>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class Exl3VeriCacheRequest;
 class Exl3PackedCostPolicy;
 struct Exl3DevicePageWeakComponents;
-// Concrete pinned EXL3 package/core behind the existing Engine facade. It does
-// not alias a .ninfer package or use that package's numerical Program.
+// The EXL3 engine behind the Engine facade: pinned target/draft package, coherent-device lanes.
 class Exl3EngineCore {
     struct Impl;
     struct Request;

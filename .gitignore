@@ -78,7 +78,7 @@ observability/
 *.dmp
 
 # Model/checkpoint and tensor artifacts
-*.ninfer
+*.voidinfer
 *.ckpt
 *.onnx
 *.pt

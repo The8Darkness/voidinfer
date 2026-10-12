@@ -18,7 +18,7 @@ namespace {
 
 constexpr char kMagic[] = "OSCAR21\0";
 constexpr std::uint32_t kVersion = 1;
-constexpr int kD = ninfer::ops::kOscarInt2G128HeadDim;
+constexpr int kD = voidinfer::ops::kOscarInt2G128HeadDim;
 
 struct Reader {
     explicit Reader(const std::string& path) : stream(path, std::ios::binary) {
@@ -123,10 +123,10 @@ int run(const std::string& fixture_path, const std::string& report_path) {
             reader.bytes(expected_packed.data(), expected_packed.size());
             reader.bytes(expected_decoded.data(), sizeof(expected_decoded));
 
-            const auto encoded = ninfer::ops::oscar_int2_g128_encode(
+            const auto encoded = voidinfer::ops::oscar_int2_g128_encode(
                 input.data(), kD, clip_ratio);
             std::array<float, kD> decoded{};
-            ninfer::ops::oscar_int2_g128_decode(encoded, decoded.data(), kD);
+            voidinfer::ops::oscar_int2_g128_decode(encoded, decoded.data(), kD);
             const float clipped_error = max_abs_difference(
                 encoded.clipped.data(), expected_clipped.data(), kD);
             const float scale_error = max_abs_difference(
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
         if (argc == 1) { return 77; } // fixture-driven validator: skipped by bare CTest
         if (argc != 5 || std::string(argv[1]) != "--fixture" ||
             std::string(argv[3]) != "--report") {
-            std::cerr << "usage: ninfer_oscar_int2_g128_test --fixture <golden.bin> "
+            std::cerr << "usage: voidinfer_oscar_int2_g128_test --fixture <golden.bin> "
                          "--report <report.json>\n";
             return 2;
         }

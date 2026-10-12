@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 namespace {
 
@@ -49,12 +49,12 @@ constexpr float kRmsEps = 1.0e-6f;
 constexpr std::array<int,17> kBufferFeatures={{kHidden,kQProjection,kKVProjection,kKVProjection,
     kQHeads*kHeadDim,kKVHeads*kHeadDim,kQHeads*kHeadDim,kKVHeads*kHeadDim,
     kQHeads*kHeadDim,kHidden,kHidden,kHidden,kIntermediate,kIntermediate,kIntermediate,kHidden,kHidden}};
-// Concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1) keep every
+// Concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1) keep every
 // prompt-scale buffer in the shared scratch: rows retained across forwards
 // live in each layer's private small tier instead (enable_small_tier).
 bool tiered_prompt_buffers() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
         return value && std::strcmp(value,"1")==0;
     }();
     return enabled;
@@ -3069,7 +3069,7 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
 
 bool wmma32_vector_loads_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_WMMA32_VECTOR_LOADS");
+        const char* value=std::getenv("VOIDINFER_EXL3_WMMA32_VECTOR_LOADS");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -3077,7 +3077,7 @@ bool wmma32_vector_loads_enabled() {
 
 bool fused_flash_staged_k_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_FLASH_STAGED_K");
+        const char* value=std::getenv("VOIDINFER_EXL3_FLASH_STAGED_K");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -5564,7 +5564,7 @@ constexpr std::size_t reg_attn_shared_bytes() {
 
 bool wmma32_register_q_global() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_WMMA32_REGISTER_Q_GLOBAL");
+        const char* value=std::getenv("VOIDINFER_EXL3_WMMA32_REGISTER_Q_GLOBAL");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -5847,7 +5847,7 @@ __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_pr
 }
 
 
-// FA2-style GQA-6 prefill attention (NINFER_EXL3_FA2_PREFILL, default 1; 0 =
+// FA2-style GQA-6 prefill attention (VOIDINFER_EXL3_FA2_PREFILL, default 1; 0 =
 // the register WMMA32 route). Eight warps cover two query heads x 64 rows and
 // share every 32-key K/V tile; Q A-fragments stay in registers; K/V tiles are
 // double buffered with cp.async; causal masking only on diagonal tiles; row
@@ -5907,9 +5907,9 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
   // L0 OSCAR: key tiles of [kSink, history_end) are served by the INT4
   // history kernel; virtual tile v maps to the sink tiles, then the tiles past
   // the history. Identity when history_end <= kSink.
-  const int sink_tiles=ninfer::exl3::l0_oscar::kSink/BN;
-  const int skip=history_end>ninfer::exl3::l0_oscar::kSink?
-      (history_end-ninfer::exl3::l0_oscar::kSink)/BN:0;
+  const int sink_tiles=voidinfer::exl3::l0_oscar::kSink/BN;
+  const int skip=history_end>voidinfer::exl3::l0_oscar::kSink?
+      (history_end-voidinfer::exl3::l0_oscar::kSink)/BN:0;
   const int tiles=(maximum_count+BN-1)/BN-skip;
   const auto real_tile=[&](int tile){ return tile<sink_tiles?tile:tile+skip; };
   const int per=(tiles+S-1)/S;
@@ -5982,8 +5982,8 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       const int idx=tid+i*256; const int key_off=idx/(kHeadDim/8); const int dim=(idx%(kHeadDim/8))*8;
       const int key=first+key_off; const bool valid=key<maximum_count;
       const int k_index=valid?key:0;
-      const bool in_sink=sink_k && k_index<ninfer::exl3::l0_oscar::kSink;
-      const std::size_t off=(ninfer::exl3::l0_oscar::window_row(k_index,sink_k!=nullptr,ring_mask)*
+      const bool in_sink=sink_k && k_index<voidinfer::exl3::l0_oscar::kSink;
+      const std::size_t off=(voidinfer::exl3::l0_oscar::window_row(k_index,sink_k!=nullptr,ring_mask)*
           kKVHeads+kv_head)*kHeadDim+dim;
       cp16(ks+key_off*kStride+dim,(in_sink?sink_k:k_cache)+off,valid);
       cp16(vs+key_off*kStride+dim,(in_sink?sink_v:v_cache)+off,valid);
@@ -6138,7 +6138,7 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
   }
 }
 // FP8 math over FP8 history rows (l0_exact.cuh L0LineFp8 layout; staged
-// line passes, NINFER_EXL3_LINE_FP8_MATH=1): QK and PV run as e4m3 MMA
+// line passes, VOIDINFER_EXL3_LINE_FP8_MATH=1): QK and PV run as e4m3 MMA
 // (m16n8k32) instead of expanding K/V to FP16. Q is quantized per (row,
 // head); scores take the per-key K scale;
 // P is folded with the per-key V scale and quantized per (row, key tile).
@@ -6381,10 +6381,10 @@ __global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std:
 
 bool exl3_fa2_prefill_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_FA2_PREFILL");
+        const char* value=std::getenv("VOIDINFER_EXL3_FA2_PREFILL");
         if(!value || std::strcmp(value,"1")==0) return true;
         if(std::strcmp(value,"0")==0) return false;
-        throw std::invalid_argument("NINFER_EXL3_FA2_PREFILL must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_FA2_PREFILL must be 0 or 1");
     }();
     return enabled;
 }
@@ -6480,11 +6480,11 @@ void launch_wmma32_register_prefill(const std::uint16_t* q,const std::uint16_t* 
 
 int wmma32_register_heads() {
     static const int heads=[] {
-        const char* value=std::getenv("NINFER_EXL3_WMMA32_REGISTER");
+        const char* value=std::getenv("VOIDINFER_EXL3_WMMA32_REGISTER");
         if(!value) return 2;
         const int parsed=std::atoi(value);
         if(parsed!=0 && parsed!=1 && parsed!=2 && parsed!=3)
-            throw std::invalid_argument("NINFER_EXL3_WMMA32_REGISTER must be 0, 1, 2 or 3");
+            throw std::invalid_argument("VOIDINFER_EXL3_WMMA32_REGISTER must be 0, 1, 2 or 3");
         return parsed;
     }();
     return heads;
@@ -6747,9 +6747,9 @@ __global__ void __launch_bounds__(kMergeGroups*kHeadDim) attention_fused_flash_m
     const int count=base+query+1;
     std::uint16_t* out=output+(query*kQHeads+kv_head*H+head)*kHeadDim+tid;
     if(count<1 || count>capacity) { if(group==0) *out=0; return; }
-    const int l0_end=history_slot?min(ninfer::exl3::l0_oscar::history_end(
+    const int l0_end=history_slot?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
-    const int live_segments=l0_end>ninfer::exl3::l0_oscar::kSink?
+    const int live_segments=l0_end>voidinfer::exl3::l0_oscar::kSink?
         min(segments,1+(count-l0_end+keys-1)/keys):min(segments,(count+keys-1)/keys);
     const float* slots=workspace+
         (static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments*kFastFusedFlashStride;
@@ -6766,8 +6766,8 @@ __global__ void __launch_bounds__(kMergeGroups*kHeadDim) attention_fused_flash_m
     const bool history_live=history && history[kFastFusedFlashValues+H+head]>0.0f;
     float self_score=-INFINITY,self_value=0.0f;
     if(self_q) {
-        const bool in_sink=sink_k && count-1<ninfer::exl3::l0_oscar::kSink;
-        const std::size_t kv=ninfer::exl3::l0_oscar::window_row(count-1,sink_k!=nullptr,ring_mask)*
+        const bool in_sink=sink_k && count-1<voidinfer::exl3::l0_oscar::kSink;
+        const std::size_t kv=voidinfer::exl3::l0_oscar::window_row(count-1,sink_k!=nullptr,ring_mask)*
             kKVHeads*kHeadDim+kv_head*kHeadDim+tid;
         const std::uint16_t* key_plane=in_sink?sink_k:self_k;
         const std::uint16_t* value_plane=in_sink?sink_v:self_v;
@@ -6832,7 +6832,7 @@ __global__ void __launch_bounds__(kMergeGroups*kHeadDim) attention_fused_flash_m
 
 bool fused_flash_merge_heads_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_FLASH_MERGE_HEADS");
+        const char* value=std::getenv("VOIDINFER_EXL3_FLASH_MERGE_HEADS");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -6880,17 +6880,17 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const int base=(position_device?*position_device:position)+query_offset;
     // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
     // history end; the history itself is served by the INT4 kernel.
-    const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+    const int l0_end=l0_history?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
-    const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
+    const bool l0_remap=l0_end>voidinfer::exl3::l0_oscar::kSink;
     const int first=l0_remap&&segment>0?l0_end+(segment-1)*kVerifyMmaKeys:segment*kVerifyMmaKeys;
     const int last_count=base+rows;  // largest live key count of the block
     if(first>=last_count || base+1<1 || last_count>capacity) return;
     const int segment_end=min(first+kVerifyMmaKeys,last_count);
     // L0 OSCAR: keys in [history_begin, history_end) are served by the INT4
     // history kernel; a segment wholly inside it only publishes an empty slot.
-    const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
-    const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+    const int history_begin=l0_history?voidinfer::exl3::l0_oscar::kSink:0;
+    const int history_end=l0_history?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
     if(first>=history_begin && segment_end<=history_end) {
         if(tid<rows*H) {
@@ -6933,8 +6933,8 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
             const int key=chunk_first+key_offset;
             uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
             if(key<segment_end) {
-                const bool in_sink=sink_k && key<ninfer::exl3::l0_oscar::kSink;
-                const std::size_t offset=(ninfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
+                const bool in_sink=sink_k && key<voidinfer::exl3::l0_oscar::kSink;
+                const std::size_t offset=(voidinfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
                     ring_mask)*kKVHeads+kv_head)*kHeadDim+dim;
                 key_bits=*reinterpret_cast<const uint4*>((in_sink?sink_k:k_cache)+offset);
                 value_bits=*reinterpret_cast<const uint4*>((in_sink?sink_v:v_cache)+offset);
@@ -7072,17 +7072,17 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
     const int base=(position_device?*position_device:position)+query_offset;
     // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
     // history end; the history itself is served by the INT4 kernel.
-    const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+    const int l0_end=l0_history?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
-    const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
+    const bool l0_remap=l0_end>voidinfer::exl3::l0_oscar::kSink;
     const int first=l0_remap&&segment>0?l0_end+(segment-1)*kVerifyMmaKeys:segment*kVerifyMmaKeys;
     const int last_count=base+rows;  // largest live key count of the block
     if(first>=last_count || base+1<1 || last_count>capacity) return;
     const int segment_end=min(first+kVerifyMmaKeys,last_count);
     // L0 OSCAR: keys in [history_begin, history_end) are served by the INT4
     // history kernel; a segment wholly inside it only publishes an empty slot.
-    const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
-    const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+    const int history_begin=l0_history?voidinfer::exl3::l0_oscar::kSink:0;
+    const int history_end=l0_history?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
     if(first>=history_begin && segment_end<=history_end) {
         if(tid<rows*H) {
@@ -7126,8 +7126,8 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
             const int key=chunk_first+key_offset;
             uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
             if(key<segment_end) {
-                const bool in_sink=sink_k && key<ninfer::exl3::l0_oscar::kSink;
-                const std::size_t offset=(ninfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
+                const bool in_sink=sink_k && key<voidinfer::exl3::l0_oscar::kSink;
+                const std::size_t offset=(voidinfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
                     ring_mask)*kKVHeads+kv_head)*kHeadDim+dim;
                 key_bits=*reinterpret_cast<const uint4*>((in_sink?sink_k:k_cache)+offset);
                 value_bits=*reinterpret_cast<const uint4*>((in_sink?sink_v:v_cache)+offset);
@@ -7242,7 +7242,7 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
 
 bool verify_flash_mma_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA");
+        const char* value=std::getenv("VOIDINFER_EXL3_VERIFY_FLASH_MMA");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -7254,11 +7254,11 @@ bool verify_flash_mma_enabled() {
 // scratch would exceed the owned plane falls back to the next longer one.
 int verify_flash_mma_keys() {
     static const int keys=[] {
-        const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS");
+        const char* value=std::getenv("VOIDINFER_EXL3_VERIFY_FLASH_MMA_KEYS");
         if(!value) return 64;
         const int parsed=std::atoi(value);
         if(parsed!=64 && parsed!=128 && parsed!=256)
-            throw std::invalid_argument("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS must be 64, 128 or 256");
+            throw std::invalid_argument("VOIDINFER_EXL3_VERIFY_FLASH_MMA_KEYS must be 64, 128 or 256");
         return parsed;
     }();
     return keys;
@@ -7289,7 +7289,7 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
     const int segments=segment_count(keys);
     const dim3 grid(segments,kKVHeads);
     static const bool decode_kernel=[] {
-        const char* value=std::getenv("NINFER_EXL3_DECODE_FLASH_MMA");
+        const char* value=std::getenv("VOIDINFER_EXL3_DECODE_FLASH_MMA");
         return !value || std::strcmp(value,"0")!=0;
     }();
     if(decode_kernel && rows*kFastFusedFlashHeads<=16) {
@@ -7513,61 +7513,61 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
         fakequant_bank_ = constructed++ % 16;
     }
     coalesce_input_mlp_=coalesce_input_mlp;
-    small_m_fused_gate_up_transform_ = read_binary_option("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",
+    small_m_fused_gate_up_transform_ = read_binary_option("VOIDINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",
         "small-M fused gate/up transform must be 0 or 1");
-    fast_fused_flash_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH",
+    fast_fused_flash_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH",
         "FAST same-weight FP16-KV fused flash must be 0 or 1");
-    fast_fused_flash_attention_keys256_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_KEYS256",
+    fast_fused_flash_attention_keys256_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_KEYS256",
         "FAST same-weight FP16-KV fused flash keys256 must be 0 or 1");
     fast_fused_flash_multirow_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW",
         "FAST same-weight FP16-KV fused flash multirow must be 0 or 1");
-    fast_cublas_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_CUBLAS_ATTENTION",
+    fast_cublas_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_CUBLAS_ATTENTION",
         "FAST same-weight FP16-KV cuBLAS attention must be 0 or 1");
-    fast_online_decode_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE",
+    fast_online_decode_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE",
         "FAST same-weight FP16-KV online decode attention must be 0 or 1");
-    fast_online_decode_attention_warp_heads_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE_WARP_HEADS",
+    fast_online_decode_attention_warp_heads_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE_WARP_HEADS",
         "FAST same-weight FP16-KV online decode warp-heads must be 0 or 1");
-    fast_whole_context_fused_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_WHOLE_CONTEXT",
+    fast_whole_context_fused_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_WHOLE_CONTEXT",
         "FAST same-weight FP16-KV whole-context fused attention must be 0 or 1");
-    fast_prefill_tiled_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED",
+    fast_prefill_tiled_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED",
         "FAST same-weight FP16-KV tiled prefill attention must be 0 or 1");
-    fast_prefill_rows4_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS4",
+    fast_prefill_rows4_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS4",
         "FAST same-weight FP16-KV four-row prefill attention must be 0 or 1");
-    fast_prefill_rows8_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8",
+    fast_prefill_rows8_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8",
         "FAST same-weight FP16-KV eight-row prefill attention must be 0 or 1");
-    fast_prefill_rows8_threads128_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8_THREADS128",
+    fast_prefill_rows8_threads128_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8_THREADS128",
         "FAST same-weight FP16-KV eight-row prefill 128-thread launch must be 0 or 1");
-    fast_prefill_wmma_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA",
+    fast_prefill_wmma_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA",
         "FAST same-weight FP16-KV WMMA prefill must be 0 or 1");
     const char* explicit_wmma32 = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32");
     const char* fast_prefill_scope = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
     fast_prefill_wmma32_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32",
         "FAST same-weight FP16-KV WMMA32 prefill must be 0 or 1") ||
         (!explicit_wmma32 && fast_prefill_scope &&
          std::strcmp(fast_prefill_scope, "1") == 0);
     fast_prefill_wmma64_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64",
         "FAST same-weight FP16-KV WMMA64 prefill must be 0 or 1");
     if (fast_prefill_wmma64_attention_ && !fast_prefill_wmma32_attention_)
         throw std::invalid_argument("WMMA64 requires WMMA32 prefill policy");
     fast_prefill_wmma64_register_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER",
         "FAST same-weight FP16-KV WMMA64 register prefill must be 0 or 1");
     if (fast_prefill_wmma64_register_attention_ &&
         !fast_prefill_wmma64_attention_)
         throw std::invalid_argument("WMMA64 register candidate requires WMMA64");
     fast_prefill_wmma64_register_keys64_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER_KEYS64",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER_KEYS64",
         "FAST same-weight FP16-KV WMMA64 register keys64 must be 0 or 1");
     if (fast_prefill_wmma64_register_keys64_attention_ &&
         !fast_prefill_wmma64_register_attention_)
         throw std::invalid_argument("WMMA64 keys64 requires register candidate");
     fast_prefill_wmma64_shared_heads_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_HEADS2",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_HEADS2",
         "FAST same-weight FP16-KV WMMA64 shared heads must be 0 or 1");
     if (fast_prefill_wmma64_shared_heads_attention_ &&
         !fast_prefill_wmma64_register_attention_)
@@ -7576,33 +7576,33 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
         fast_prefill_wmma64_shared_heads_attention_)
         throw std::invalid_argument("WMMA64 keys64 excludes shared heads");
     fast_prefill_wmma32_padded_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32_PADDED",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32_PADDED",
         "FAST same-weight FP16-KV WMMA32 padded tile must be 0 or 1");
     if (fast_prefill_wmma32_padded_attention_ &&
         !fast_prefill_wmma32_attention_)
         throw std::invalid_argument("padded WMMA32 requires WMMA32 prefill");
-    fast_prefill_rows2_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS2",
+    fast_prefill_rows2_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS2",
         "FAST same-weight FP16-KV two-row prefill attention must be 0 or 1");
-    fast_same_weights_fp16kv_m1_gate_up_pair_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR",
+    fast_same_weights_fp16kv_m1_gate_up_pair_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR",
         "FAST same-weight FP16-KV M1 gate/up pair must be 0 or 1");
     const auto* m1_kv_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
     if(m1_kv_pair && std::strcmp(m1_kv_pair,"0")!=0 &&
        std::strcmp(m1_kv_pair,"1")!=0)
         throw std::invalid_argument(
             "FAST same-weight FP16-KV M1 K/V pair must be 0 or 1");
     fast_same_weights_fp16kv_m1_kv_pair_=m1_kv_pair &&
         std::strcmp(m1_kv_pair,"1")==0;
-    fast_same_weights_fp16kv_m1_kv_wide_pair_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR",
+    fast_same_weights_fp16kv_m1_kv_wide_pair_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR",
         "FAST same-weight FP16-KV M1 wide K/V pair must be 0 or 1");
-    const bool m1_kv_pair_graph = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR_GRAPH",
+    const bool m1_kv_pair_graph = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR_GRAPH",
         "FAST same-weight FP16-KV M1 K/V graph pair must be 0 or 1");
     fast_same_weights_fp16kv_m1_kv_pair_graph_ = fast_same_weights_fp16kv_m1_kv_pair_ && m1_kv_pair_graph;
     if(fast_fused_flash_attention_ && fast_whole_context_fused_attention_)
         throw std::invalid_argument(
             "FAST segmented and whole-context fused attention are mutually exclusive");
     const auto* query_pair_scores=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_QUERY_PAIR_SCORES");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_QUERY_PAIR_SCORES");
     if(query_pair_scores && std::strcmp(query_pair_scores,"0")!=0 &&
        std::strcmp(query_pair_scores,"1")!=0)
         throw std::invalid_argument(
@@ -7610,7 +7610,7 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
     exact_attention_gqa_six_query_pair_scores_=query_pair_scores &&
         std::strcmp(query_pair_scores,"1")==0;
     const auto* score_k_tile64=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORE_K_TILE64");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORE_K_TILE64");
     if(score_k_tile64 && std::strcmp(score_k_tile64,"0")!=0 &&
        std::strcmp(score_k_tile64,"1")!=0)
         throw std::invalid_argument(
@@ -7621,43 +7621,43 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
        exact_attention_gqa_six_query_pair_scores_)
         throw std::invalid_argument(
             "exact attention K-tile64 and query-pair scores are mutually exclusive");
-    exact_attention_gqa_six_softmax_triple_values_v_tile_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
+    exact_attention_gqa_six_softmax_triple_values_v_tile_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
         "exact attention GQA six-softmax triple-values V tile must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_v_tile64_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
+    exact_attention_gqa_six_softmax_triple_values_v_tile64_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
         "exact attention GQA six-softmax triple-values V tile64 must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_full_cta_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
+    exact_attention_gqa_six_softmax_triple_values_full_cta_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
         "exact attention GQA six-softmax triple-values full CTA must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_threads128_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
+    exact_attention_gqa_six_softmax_triple_values_threads128_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
         "exact attention GQA six-softmax triple-values threads128 must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_score_tile_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
+    exact_attention_gqa_six_softmax_triple_values_score_tile_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
         "exact attention GQA six-softmax triple-values score tile must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_key_pair_pipeline_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE",
+    exact_attention_gqa_six_softmax_triple_values_key_pair_pipeline_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE",
         "exact attention GQA triple-values key-pair pipeline must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_warp_score_broadcast_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
+    exact_attention_gqa_six_softmax_triple_values_warp_score_broadcast_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
         "exact attention GQA triple-values warp score broadcast must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_pair_dimensions_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
+    exact_attention_gqa_six_softmax_triple_values_pair_dimensions_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
         "exact attention GQA six-softmax triple-values pair-dimensions must be 0 or 1");
-    exact_attention_gqa_six_softmax_six_values_single_load_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
+    exact_attention_gqa_six_softmax_six_values_single_load_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
         "exact attention GQA six-softmax six-values single-load must be 0 or 1");
-    exact_attention_gqa_six_softmax_six_values_scalar_single_load_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
+    exact_attention_gqa_six_softmax_six_values_scalar_single_load_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
         "exact attention GQA six-softmax six-values scalar single-load must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_scalar_dim_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
+    exact_attention_gqa_six_softmax_triple_values_scalar_dim_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
         "exact attention GQA six-softmax triple-values scalar-dim must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_two_query_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
+    exact_attention_gqa_six_softmax_triple_values_two_query_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
         "exact attention GQA six-softmax triple-values two-query must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_fused_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
+    exact_attention_gqa_six_softmax_triple_values_fused_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
         "exact attention GQA six-softmax triple-values fused must be 0 or 1");
-    exact_attention_gqa_six_softmax_fused_scalar_values_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_FUSED_SCALAR_VALUES",
+    exact_attention_gqa_six_softmax_fused_scalar_values_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_FUSED_SCALAR_VALUES",
         "exact attention GQA six-softmax fused scalar values must be 0 or 1");
     const auto* decode_fused=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_DECODE_FUSED");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_DECODE_FUSED");
     if(decode_fused && std::strcmp(decode_fused,"0")!=0 &&
        std::strcmp(decode_fused,"1")!=0)
         throw std::invalid_argument(
             "exact attention GQA six decode-fused route must be 0 or 1");
     exact_attention_gqa_six_decode_fused_=decode_fused &&
         std::strcmp(decode_fused,"1")==0;
-    exact_attention_gqa_six_softmax_tile512_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TILE512",
+    exact_attention_gqa_six_softmax_tile512_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TILE512",
         "exact attention GQA six softmax tile512 must be 0 or 1");
     if(exact_attention_gqa_six_softmax_tile512_ &&
        (exact_attention_gqa_six_softmax_triple_values_fused_ ||
@@ -7898,14 +7898,14 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         const auto alloc=[](auto*& p,std::size_t bytes) {
             if(exl3_packed_malloc(reinterpret_cast<void**>(&p),bytes)!=cudaSuccess)
                 throw std::runtime_error("L0 OSCAR storage allocation");
-            static const bool trace_alloc=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+            static const bool trace_alloc=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
             if(trace_alloc && bytes>=(256u<<10))std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB FA L0%c",bytes/1048576.0,10);
         };
-        // NINFER_EXL3_L0_GROWABLE (default 1): the INT4 code/meta planes keep
+        // VOIDINFER_EXL3_L0_GROWABLE (default 1): the INT4 code/meta planes keep
         // one max_context address range per layer, physically backed only up
         // to the rows the context occupies (released at request reset).
         static const bool growable=[] {
-            const char* value=std::getenv("NINFER_EXL3_L0_GROWABLE");
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_GROWABLE");
             return !value || std::strcmp(value,"0")!=0;
         }();
         if(growable) {
@@ -7934,14 +7934,14 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         }
         alloc(l.state,2*sizeof(int));
         cudaMemset(l.state,0,2*sizeof(int));
-        // Concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1;
-        // NINFER_EXL3_L0_RING_TIER=0 disables): rounds (<= 32 rows) use a
+        // Concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1;
+        // VOIDINFER_EXL3_L0_RING_TIER=0 disables): rounds (<= 32 rows) use a
         // private ring of the exact window plus one round; prompt passes
         // (exclusive) switch to one 2048-row ring shared per layer, copying
         // the live window rows across on the device (l0_select_ring).
         static const bool tiered_ring=[] {
-            const char* shared=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
-            const char* value=std::getenv("NINFER_EXL3_L0_RING_TIER");
+            const char* shared=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_RING_TIER");
             return shared && std::strcmp(shared,"1")==0 && !(value && std::strcmp(value,"0")==0);
         }();
         const int small_ring_rows=(l0_oscar::recent_rows()+2*l0_oscar::kAlign-1+32+
@@ -7967,12 +7967,12 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             l0_prompt_v_ring_=shared.second;
         }
         alloc(l.k_sink,sink_bytes); alloc(l.v_sink,sink_bytes);
-        // NINFER_EXL3_L0_EXACT (research): 1 = exact history everywhere,
+        // VOIDINFER_EXL3_L0_EXACT (research): 1 = exact history everywhere,
         // prefill / decode = only for prefill chunks / verifier rows.
-        if(const char* exact=std::getenv("NINFER_EXL3_L0_EXACT")) {
+        if(const char* exact=std::getenv("VOIDINFER_EXL3_L0_EXACT")) {
             const std::string_view mode(exact);
             if(mode!="0" && mode!="1" && mode!="prefill" && mode!="decode")
-                throw std::invalid_argument("NINFER_EXL3_L0_EXACT must be 0, 1, prefill or decode");
+                throw std::invalid_argument("VOIDINFER_EXL3_L0_EXACT must be 0, 1, prefill or decode");
             l0_exact_=mode=="1" || mode=="decode";
             l0_exact_prefill_=mode=="1" || mode=="prefill";
         }
@@ -8372,7 +8372,7 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
         !weights_.gate_metadata.mcg && !weights_.up_metadata.mcg &&
         weights_.gate_metadata.mul1 && weights_.up_metadata.mul1 &&
         !weights_.gate_metadata.has_bias && !weights_.up_metadata.has_bias;
-    const auto* graph_diag = std::getenv("NINFER_EXL3_MLP_GRAPH_DIAGNOSTIC");
+    const auto* graph_diag = std::getenv("VOIDINFER_EXL3_MLP_GRAPH_DIAGNOSTIC");
     if (graph_diag && std::strcmp(graph_diag, "1") == 0) {
         std::fprintf(stdout,
             "MLP_GRAPH_DIAG layer=%d rows=%d flag=%d gateK=%d upK=%d gateM=%d upM=%d gateMul1=%d upMul1=%d gateBias=%d upBias=%d pair=%d\n",
@@ -8434,7 +8434,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
 
     // Decode rows: split, Q/K norms and RoPE in one launch (bit-identical).
     static const bool fused_qk_prepare=[] {
-        const char* value=std::getenv("NINFER_EXL3_DECODE_QK_PREPARE");
+        const char* value=std::getenv("VOIDINFER_EXL3_DECODE_QK_PREPARE");
         return !value || std::strcmp(value,"0")!=0;
     }();
     const bool qk_prepared=fused_qk_prepare && rows>=1 && rows<=8 && !wide_prefill &&
@@ -8468,7 +8468,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
     }
 
     const char* attention_core_sample_option=std::getenv(
-        "NINFER_EXL3_TEST_ATTENTION_CORE_SAMPLE");
+        "VOIDINFER_EXL3_TEST_ATTENTION_CORE_SAMPLE");
     static std::atomic<int> attention_core_samples{0};
     const int attention_core_sample_index=rows>=256 && wide_prefill &&
         !capture_active_ && attention_core_sample_option &&
@@ -8633,7 +8633,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
         // while position_device_ supplies the live decode frontier at replay.
         // Do not freeze the prefill-only attention branch into M2..M8 graphs.
         if (ordinary_full_layer_graph_capture_ && rows == 1 && position > 0 &&
-            std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC")) {
+            std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC")) {
             std::fprintf(stderr,
                 "ordinary_full_layer_graph_attention_gate layer=%d capture=%d marker=%d fast_flash=%d direct=%d prefix=%d pages=%d exact_scores=%d score_rows=%d six_scores=%d triple_values=%d scalar_values=%d profile=%d position=%d\\n",
                 model_layer_, capture_active_ ? 1 : 0,
@@ -9209,7 +9209,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 1,std::memory_order_relaxed);
         } else if(fused_flash_eligible) {
             if (ordinary_full_layer_graph_capture_ &&
-                std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
+                std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                 std::fprintf(stderr,
                     "ordinary_full_layer_graph_fused_flash_branch_entered\\n");
             // The scratch allocation is the larger exact score plane.  Keep
@@ -9252,9 +9252,9 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 // The INT4 history chain (rotate, history, merge, rotate) is
                 // independent of the exact-window flash pass until the final
                 // merge: it runs on a side branch of `stream` beside it.
-                // NINFER_EXL3_L0_HISTORY_FORK=0 keeps one stream.
+                // VOIDINFER_EXL3_L0_HISTORY_FORK=0 keeps one stream.
                 static const bool history_fork=[] {
-                    const char* value=std::getenv("NINFER_EXL3_L0_HISTORY_FORK");
+                    const char* value=std::getenv("VOIDINFER_EXL3_L0_HISTORY_FORK");
                     return !value || std::strcmp(value,"0")!=0;
                 }();
                 cudaStream_t hs=stream;
@@ -9367,60 +9367,60 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
         } else if(exact_scores_) {
             if(exact_score_rows_<1) throw std::invalid_argument("exact attention score row capacity");
             const auto* shared_score_value=
-                std::getenv("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE");
+                std::getenv("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE");
             if(shared_score_value && std::strcmp(shared_score_value,"0")!=0 &&
                std::strcmp(shared_score_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE must be 0 or 1");
             const auto* shared_score_rows128_value=
-                std::getenv("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128");
+                std::getenv("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128");
             if(shared_score_rows128_value &&
                std::strcmp(shared_score_rows128_value,"0")!=0 &&
                std::strcmp(shared_score_rows128_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128 must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128 must be 0 or 1");
             const bool shared_score_rows128=shared_score_rows128_value &&
                 std::strcmp(shared_score_rows128_value,"1")==0;
             const auto* shared_score_threads256_value=std::getenv(
-                "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256");
+                "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256");
             if(shared_score_threads256_value &&
                std::strcmp(shared_score_threads256_value,"0")!=0 &&
                std::strcmp(shared_score_threads256_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256 must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256 must be 0 or 1");
             const bool shared_score_threads256=shared_score_threads256_value &&
                 std::strcmp(shared_score_threads256_value,"1")==0;
             const auto* shared_score_parallel_softmax_value=std::getenv(
-                "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX");
+                "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX");
             if(shared_score_parallel_softmax_value &&
                std::strcmp(shared_score_parallel_softmax_value,"0")!=0 &&
                std::strcmp(shared_score_parallel_softmax_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX must be 0 or 1");
             const bool shared_score_parallel_softmax=
                 shared_score_parallel_softmax_value &&
                 std::strcmp(shared_score_parallel_softmax_value,"1")==0;
             const auto* shared_score_head_split256_value=std::getenv(
-                "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256");
+                "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256");
             if(shared_score_head_split256_value &&
                std::strcmp(shared_score_head_split256_value,"0")!=0 &&
                std::strcmp(shared_score_head_split256_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256 must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256 must be 0 or 1");
             const bool shared_score_head_split256=
                 shared_score_head_split256_value &&
                 std::strcmp(shared_score_head_split256_value,"1")==0;
             if(shared_score_head_split256 &&
                (shared_score_threads256 || !shared_score_parallel_softmax))
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256 requires parallel softmax and threads256=0");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256 requires parallel softmax and threads256=0");
             const auto* shared_score_dimension_split256_value=std::getenv(
-                "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256");
+                "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256");
             if(shared_score_dimension_split256_value &&
                std::strcmp(shared_score_dimension_split256_value,"0")!=0 &&
                std::strcmp(shared_score_dimension_split256_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256 must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256 must be 0 or 1");
             const bool shared_score_dimension_split256=
                 shared_score_dimension_split256_value &&
                 std::strcmp(shared_score_dimension_split256_value,"1")==0;
@@ -9428,7 +9428,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                (shared_score_threads256 || shared_score_head_split256 ||
                 !shared_score_parallel_softmax))
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256 requires parallel softmax, threads256=0 and head_split256=0");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256 requires parallel softmax, threads256=0 and head_split256=0");
             const bool shared_score_attention=shared_score_value &&
                 std::strcmp(shared_score_value,"1")==0 &&
                 wide_prefill && !profile &&
@@ -9454,7 +9454,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 !exact_attention_gqa_six_softmax_triple_values_fused_ &&
                 !exact_attention_gqa_six_softmax_tile512_;
             const auto* attention_chain_value=
-                std::getenv("NINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH");
+                std::getenv("VOIDINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH");
             const bool attention_chain=attention_chain_value &&
                 std::strcmp(attention_chain_value,"1")==0 &&
                 preserve_m1_topology && wide_prefill && !profile &&
@@ -9730,7 +9730,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                         score_shards,stream);
                     if(decode_fused) {
                         if (ordinary_full_layer_graph_capture_ &&
-                            std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
+                            std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                             std::fprintf(stderr,
                                 "ordinary_full_layer_graph_decode_fused_branch_entered\\n");
                         attention_cached_gqa_six_decode_fused_kernel<<<
@@ -9972,11 +9972,11 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     require_tier_rows(rows);
     // Side-branch L2 prefetch of upcoming GEMV weights (see the GDN layer).
     static const std::size_t prefetch_bytes=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
+        const char* value=std::getenv("VOIDINFER_EXL3_L2_PREFETCH_MB");
         return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
     }();
     static const int prefetch_sites=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_FULL_SITES");
+        const char* value=std::getenv("VOIDINFER_EXL3_L2_PREFETCH_FULL_SITES");
         return value?std::atoi(value):31;
     }();
     const bool prefetch=exl3_l2_prefetch_enabled() && rows==1 && !wide_prefill && !profile &&
@@ -10059,9 +10059,9 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             workspace->target_initial16_candidate(metadata, rows, Exl3CudaLinearAdmission::target_initial16);
         // Wide passes of 9..32 rows (VeriCache verify blocks) take the coherent
         // M32 projections of batched decode rounds instead of the wide direct
-        // kernels (NINFER_EXL3_WIDE_M32=0 keeps those).
+        // kernels (VOIDINFER_EXL3_WIDE_M32=0 keeps those).
         static const bool wide_m32_enabled = [] {
-            const char* value = std::getenv("NINFER_EXL3_WIDE_M32");
+            const char* value = std::getenv("VOIDINFER_EXL3_WIDE_M32");
             return !value || std::strcmp(value, "0") != 0;
         }();
         const bool wide_m32 = wide_m32_enabled && rowwise && wide_prefill && rows > 8 && rows <= 32 &&
@@ -10126,7 +10126,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             target_o_k7_candidate || target_wide_candidate || target_kv_candidate ||
             target_q_k6_candidate || target_k5_candidate || target_coherent_candidate;
         const char* fast_same_weights_fp16kv_decode = std::getenv(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
         const bool fast_same_weights_fp16kv_decode_candidate =
             reconstruct_gemm_ && rows == 1 && !wide_prefill && !capture_active_ &&
             fast_same_weights_fp16kv_decode &&
@@ -10312,14 +10312,14 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         !projection_observer_ && preserve_m1_topology && wide_prefill &&
         rows>=17 && rows<=1024 && !can_share_target;
     const auto* projection_chain_value=
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
     const auto* projection_chain_full_value=
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL");
+        std::getenv("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL");
     if(projection_chain_full_value &&
        std::strcmp(projection_chain_full_value,"0")!=0 &&
        std::strcmp(projection_chain_full_value,"1")!=0)
         throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL must be 0 or 1");
+            "VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL must be 0 or 1");
     const bool projection_chain=projection_chain_value &&
         std::strcmp(projection_chain_value,"1")==0 &&
         (!projection_chain_full_value ||
@@ -10813,11 +10813,11 @@ void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
     }
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3
 
-namespace ninfer::exl3::l0_oscar {
+namespace voidinfer::exl3::l0_oscar {
 RotationView rotation_view() {
     const auto& a = assets();
     return {a.rk, a.rv, a.mu};
 }
-}  // namespace ninfer::exl3::l0_oscar
+}  // namespace voidinfer::exl3::l0_oscar

@@ -4,9 +4,9 @@
 // No acceptance-survival, serving, publication or cancellation claim.
 void run_native16_qualification(Exl3TextModel& target,
                                 const std::vector<std::int64_t>& source) {
-    using State=ninfer::exl3::Exl3ExactHostState;
+    using State=voidinfer::exl3::Exl3ExactHostState;
     using Clock=std::chrono::steady_clock;
-    const std::filesystem::path directory=env("NINFER_NATIVE16_OUT");
+    const std::filesystem::path directory=env("VOIDINFER_NATIVE16_OUT");
     require(!directory.empty() && !std::filesystem::exists(directory),"native16 new evidence directory");
     std::filesystem::create_directories(directory);
     std::ofstream checks(directory/"correctness.csv"),pairs(directory/"pairs.csv"),projections(directory/"projections.csv");
@@ -16,12 +16,12 @@ void run_native16_qualification(Exl3TextModel& target,
     pairs << "prefix,pair,order,arm,restore_ms,compute_ms,export_ms,wall_ms,exports,h2d_bytes,copy_submissions,persistent_bytes,state_exact\n";
     require(target.max_context()==4352 && source.size()>=4096,"native16 source/context extent");
     const auto configure=[](bool native) {
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-        _putenv_s("NINFER_EXL3_NATIVE_CONTINUATION16",native?"1":"0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7","0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
-        _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+        _putenv_s("VOIDINFER_EXL3_NATIVE_CONTINUATION16",native?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
+        _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
     };
     const auto create=[&](bool native) {
         configure(native);auto ctx=target.create_context(true);ctx->prepare_continuation(native?16:8);return ctx;
@@ -55,7 +55,7 @@ void run_native16_qualification(Exl3TextModel& target,
     const auto row_equal=[](const PayloadRows& a,const PayloadRows& b) {
         return a.logits==b.logits && a.embedding==b.embedding && a.taps==b.taps;
     };
-    _putenv_s("NINFER_EXL3_TARGET_PROJECTION_TIMING","0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING","0");
     for(bool native:{false,true}) {
         configure(native);auto ctx=target.create_context(true);
         bool rejected=false;
@@ -71,7 +71,7 @@ void run_native16_qualification(Exl3TextModel& target,
     for(int stop:{8,9,16}) for(bool mismatch:{false,true}) {
         auto tentative=unique;if(mismatch) tentative[stop-1]=2000+stop;
         const std::array<std::int64_t,1> terminal{unique[stop-1]};
-        const auto decision=ninfer::exl3::decide_exl3_outer_prefix(unique,tentative,terminal);
+        const auto decision=voidinfer::exl3::decide_exl3_outer_prefix(unique,tentative,terminal);
         gate(0,mismatch?"synthetic_mismatch_terminal":"synthetic_terminal",16,stop,
             decision.stopped && decision.rejected==mismatch &&
             decision.accepted==static_cast<std::size_t>(stop-(mismatch?1:0)) &&
@@ -97,7 +97,7 @@ void run_native16_qualification(Exl3TextModel& target,
         for(bool native:{false,true}) {
             auto ctx=create(native);ctx->restore_exact_host_state(*root);PayloadRows rows;
             const int block=native?16:8;
-            ninfer::exl3::Exl3GdnContinuationHistoryView previous_history;
+            voidinfer::exl3::Exl3GdnContinuationHistoryView previous_history;
             for(int first=0;first<16;first+=block) {
                 ctx->continue_rows(std::span<const std::int64_t>(greedy).subspan(first,block));
                 if(previous_history.storage_owner)
@@ -117,7 +117,7 @@ void run_native16_qualification(Exl3TextModel& target,
             gate(prefix,native?"M16_payload":"M8x2_payload",16,0,
                 row_equal(rows,serial_rows) && state->same_payload(*final),ctx->persistent_bytes(),1);
         }
-        ninfer::exl3::Exl3GdnContinuationHistoryView survivor;
+        voidinfer::exl3::Exl3GdnContinuationHistoryView survivor;
         {
             auto ctx=create(true);ctx->restore_exact_host_state(*root);
             ctx->continue_rows(std::span<const std::int64_t>(greedy).first(16));
@@ -163,13 +163,13 @@ void run_native16_qualification(Exl3TextModel& target,
             auto ctx=create(true);
             const bool repeated=test.name.rfind("repeat_",0)==0;
             if(repeated) {
-                const auto previous=ninfer::exl3::verify_exl3_outer_windowed_reference(
+                const auto previous=voidinfer::exl3::verify_exl3_outer_windowed_reference(
                     *ctx,*root,tentative,true,terminal);
                 gate(prefix,"repeat_first_payload",test.width,test.reject,
                     previous.committed_state->same_payload(*expected),ctx->persistent_bytes(),1);
             }
             const auto before=ctx->host_kv_stats();
-            const auto result=ninfer::exl3::verify_exl3_outer_windowed_reference(
+            const auto result=voidinfer::exl3::verify_exl3_outer_windowed_reference(
                 *ctx,*root,tentative,true,terminal);
             const auto after=ctx->host_kv_stats();
             const bool repair=rejected || committed.size()<tentative.size();
@@ -227,7 +227,7 @@ void run_native16_qualification(Exl3TextModel& target,
             auto ctx=create(width==16);const auto before=ctx->host_kv_stats();
             const auto tentative=std::span<const std::int64_t>(greedy).subspan(chosen,2*width);
             const std::array<std::int64_t,1> terminal{greedy[chosen+width-1]};
-            const auto result=ninfer::exl3::verify_exl3_outer_windowed_reference(
+            const auto result=voidinfer::exl3::verify_exl3_outer_windowed_reference(
                 *ctx,*boundary_root,tentative,true,terminal);
             const auto after=ctx->host_kv_stats();
             bool histogram=result.native_batch_hist.size()==17;
@@ -249,8 +249,8 @@ void run_native16_qualification(Exl3TextModel& target,
         }
         // Attribute actual projection dispatch once, separately from unprofiled timing.
         for(bool native:{false,true}) {
-            _putenv_s("NINFER_EXL3_TARGET_PROJECTION_TIMING","1");auto ctx=create(native);
-            _putenv_s("NINFER_EXL3_TARGET_PROJECTION_TIMING","0");
+            _putenv_s("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING","1");auto ctx=create(native);
+            _putenv_s("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING","0");
             ctx->restore_exact_host_state(*root);ctx->prepare_target_projection_timing();
             cuda_check(cudaDeviceSynchronize(),"native16 projection profile start");
             ctx->begin_target_projection_timing_round(0);

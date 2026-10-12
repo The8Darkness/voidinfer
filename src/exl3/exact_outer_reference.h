@@ -3,9 +3,9 @@
 #include <chrono>
 #include <exception>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 inline bool exl3_fast_mia_parity_w1_enabled() {
-    const char* requested=std::getenv("NINFER_EXL3_FAST_MIA_PARITY_W1");
+    const char* requested=std::getenv("VOIDINFER_EXL3_FAST_MIA_PARITY_W1");
     if(requested && std::string_view(requested)!="0" &&
        std::string_view(requested)!="1")
         throw std::invalid_argument("FAST_MIA_PARITY W+1 must be 0 or 1");
@@ -316,14 +316,14 @@ inline bool exl3_outer_device_seed_matches(
 }
 // A rejected round's correction row is deferred to the next round's verifier
 // (row 0) instead of being decoded by a separate M1 pass. Measured default;
-// NINFER_EXL3_FOLD_CORRECTION=0 restores the separate correction pass.
+// VOIDINFER_EXL3_FOLD_CORRECTION=0 restores the separate correction pass.
 inline bool exl3_fold_correction_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_FOLD_CORRECTION");
+        const char* value=std::getenv("VOIDINFER_EXL3_FOLD_CORRECTION");
         if(!value)return true;
         if(std::string_view(value)=="0")return false;
         if(std::string_view(value)=="1")return true;
-        throw std::invalid_argument("NINFER_EXL3_FOLD_CORRECTION must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_FOLD_CORRECTION must be 0 or 1");
     }();
     return enabled;
 }
@@ -361,7 +361,7 @@ inline Exl3OuterReferenceResult verify_exl3_outer_device_resident_reference(
         throw std::invalid_argument("device-resident terminal token extent");
     if(tap_consumer && (!tap_binding || !*tap_binding))
         throw std::invalid_argument("device-resident tap binding");
-    const auto* device_kv=std::getenv("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION");
+    const auto* device_kv=std::getenv("VOIDINFER_EXL3_FAST_DEVICE_KV_TRANSACTION");
     if(!device_kv || std::string_view(device_kv)!="1")
         throw std::invalid_argument("device-resident verifier requires its guarded device-KV policy");
 
@@ -771,4 +771,4 @@ inline Exl3OuterReferenceResult verify_exl3_outer_windowed_reference(
     }
     return result;
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

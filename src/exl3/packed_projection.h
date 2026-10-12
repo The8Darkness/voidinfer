@@ -11,7 +11,7 @@
 #include <array>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Owned, bounded contract identity. Never truncate an overlong identity or keep
 // a view into caller storage: either could admit unrelated physical operations.
 class Exl3ProjectionContract {
@@ -196,4 +196,4 @@ private:
     std::size_t lane_count_=0;
     int rows_=0;
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

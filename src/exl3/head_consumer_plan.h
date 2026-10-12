@@ -1,7 +1,7 @@
 #pragma once
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 enum class Exl3HeadConsumer { root_only, verification, sampled_rows, diagnostic_rows };
 struct Exl3HeadConsumerPlan {
     int first_row=0,rows=0,root_row=0;

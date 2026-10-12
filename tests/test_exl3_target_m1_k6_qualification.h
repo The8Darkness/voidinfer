@@ -6,12 +6,12 @@
 
 
 constexpr std::initializer_list<const char*> kTargetM1K6EnvironmentOptions{
-    "NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A",
-    "NINFER_EXL3_TARGET_M1_K6_N16",
-    "NINFER_EXL3_GENERIC_SPLITS",
-    "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV"};
+    "VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A",
+    "VOIDINFER_EXL3_TARGET_M1_K6_N16",
+    "VOIDINFER_EXL3_GENERIC_SPLITS",
+    "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV"};
 void capture_target_m1_k6_projection(
-    const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+    const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
     void* user) {
     auto& captured = *static_cast<std::vector<TargetK6CapturedProjection>*>(user);
     require(observation.input != nullptr && observation.operation != nullptr &&
@@ -73,7 +73,7 @@ std::vector<TargetK6CapturedProjection> run_target_m1_k6_capture(
     captured.reserve(229);
     context->set_target_projection_observer_for_test(
         capture_target_m1_k6_projection, &captured, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::m1_k6_n32);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::m1_k6_n32);
     struct ObserverReset {
         Exl3TextContext* context = nullptr;
         ~ObserverReset() {
@@ -147,23 +147,23 @@ std::unique_ptr<Exl3CudaLinearWorkspace> make_target_m1_k6_workspace(
     return std::make_unique<Exl3CudaLinearWorkspace>(
         item.metadata.in_features, item.metadata.out_features, 1, false,
         gateup, down, o, z, false, false,
-        ninfer::exl3::Exl3CudaAccumulationView{},
-        ninfer::exl3::Exl3CudaTransformView{}, qkv, kv, q);
+        voidinfer::exl3::Exl3CudaAccumulationView{},
+        voidinfer::exl3::Exl3CudaTransformView{}, qkv, kv, q);
 }
 
 void run_target_m1_k6_qualification(
     Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& prompt, bool oscar, std::ostream& out) {
-    require(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A") == "0",
+    require(env("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A") == "0",
             "target M1 K6 capture requires explicit candidate flag0");
-    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "0");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "0");
     auto captured = run_target_m1_k6_capture(target, draft, prompt, oscar);
 
     const auto& representative = captured.front();
     for (const char* malformed : {"2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", malformed);
+        _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", malformed);
         bool rejected = false;
         try {
             auto invalid = make_target_m1_k6_workspace(representative, true);
@@ -172,9 +172,9 @@ void run_target_m1_k6_qualification(
         }
         require(rejected, "target M1 K6 async-A accepted malformed opt-in");
     }
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "1");
     for (const char* malformed : {"2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", malformed);
+        _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", malformed);
         bool rejected = false;
         try {
             auto invalid = make_target_m1_k6_workspace(representative, true);
@@ -183,9 +183,9 @@ void run_target_m1_k6_qualification(
         }
         require(rejected, "target M1 K6 N16 accepted malformed opt-in");
     }
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "0");
     auto n16_latched_off = make_target_m1_k6_workspace(representative, true);
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "1");
     require(std::string(n16_latched_off->dispatch_name(
                 representative.metadata, 1)) ==
                 "target_m1_k6_n32_async_a",
@@ -195,10 +195,10 @@ void run_target_m1_k6_qualification(
                 representative.metadata, 1)) ==
                 "target_m1_k6_n16_async_a_stream_reduction",
             "target M1 K6 N16 owned dispatch missing");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "0");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "0");
     auto latched_off = make_target_m1_k6_workspace(representative, true);
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "1");
     require(std::string(latched_off->dispatch_name(
                 representative.metadata, 1)) == "generic_mma_split",
             "target M1 K6 workspace did not latch flag0");
@@ -213,7 +213,7 @@ void run_target_m1_k6_qualification(
            "candidate_dispatch,n16_dispatch,repeat_equal,guards_ok,input_unchanged,finite,"
            "bit_mismatches,n16_bit_mismatches,changed_input,changed_bit_mismatches,"
            "changed_n16_bit_mismatches,changed_output\n";
-    const std::string timing_path = env("NINFER_E5A4_TARGET_M1_K6_TIMING_OUT");
+    const std::string timing_path = env("VOIDINFER_E5A4_TARGET_M1_K6_TIMING_OUT");
     require(!timing_path.empty(), "target M1 K6 qualification needs timing output");
     std::ofstream timing(timing_path, std::ios::trunc);
     require(timing.good(), "cannot create target M1 K6 timing CSV");
@@ -247,14 +247,14 @@ void run_target_m1_k6_qualification(
                                   item.input.size() * sizeof(std::uint16_t),
                                   cudaMemcpyHostToDevice),
                        "target M1 K6 input upload");
-            _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "0");
+            _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "0");
             auto control = make_target_m1_k6_workspace(item, true);
-            _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "1");
-            _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "0");
+            _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A", "1");
+            _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "0");
             auto candidate = make_target_m1_k6_workspace(item, true);
-            _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "1");
+            _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "1");
             auto n16 = make_target_m1_k6_workspace(item, true);
-            _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "0");
+            _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "0");
             require(std::string(control->dispatch_name(item.metadata, 1)) ==
                         "generic_mma_split" &&
                     std::string(candidate->dispatch_name(item.metadata, 1)) ==
@@ -469,16 +469,16 @@ void run_target_m1_k6_qualification(
 void run_fast_same_weights_int8_qualification(
     Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& prompt, bool oscar, std::ostream& out) {
-    require(env("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV") == "0",
+    require(env("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV") == "0",
             "FAST_SAME_WEIGHTS INT8 qualification requires explicit flag0 capture");
-    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "0");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "0");
     auto captured = run_target_m1_k6_capture(target, draft, prompt, oscar);
 
     const auto& representative = captured.front();
     for (const char* malformed : {"2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV", malformed);
+        _putenv_s("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV", malformed);
         bool rejected = false;
         try { auto invalid = make_target_m1_k6_workspace(representative, true); }
         catch (const std::invalid_argument&) { rejected = true; }
@@ -524,10 +524,10 @@ void run_fast_same_weights_int8_qualification(
                               guarded_values * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice),
                    "FAST_SAME_WEIGHTS INT8 candidate canary upload");
-        _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16", "1");
-        _putenv_s("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16", "1");
+        _putenv_s("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV", "0");
         auto control = make_target_m1_k6_workspace(item, true);
-        _putenv_s("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV", "1");
+        _putenv_s("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV", "1");
         auto int8 = make_target_m1_k6_workspace(item, true);
         control->forward(item.weights, item.metadata, input_device,
                          reference_device, 1);
@@ -611,11 +611,11 @@ void run_fast_same_weights_int8_qualification(
 void run_target_m1_predecoded_discriminator(
     Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& prompt,bool oscar) {
-    require(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
+    require(env("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
             "predecoded M1 discriminator requires explicit N32 flag0 capture");
-    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS","");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","0");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS","");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16","0");
     auto captured=run_target_m1_k6_capture(target,draft,prompt,oscar);
     const auto selected=std::find_if(captured.begin(),captured.end(),
         [](const TargetK6CapturedProjection& item) {
@@ -649,8 +649,8 @@ void run_target_m1_predecoded_discriminator(
     cuda_check(cudaMemcpy(candidate_base,canary.data(),
         guarded_values*sizeof(std::uint16_t),cudaMemcpyHostToDevice),
         "predecoded M1 candidate canary upload");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A","1");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16","1");
     auto workspace=make_target_m1_k6_workspace(item,true);
     require(std::string(workspace->dispatch_name(item.metadata,1))==
         "target_m1_k6_n16_async_a_stream_reduction",
@@ -664,7 +664,7 @@ void run_target_m1_predecoded_discriminator(
     };
     try {
         cuda_check(cudaEventRecord(begin),"record predecoded M1 setup begin");
-        ninfer::exl3::exl3_reconstruct_native_weights_for_test(
+        voidinfer::exl3::exl3_reconstruct_native_weights_for_test(
             item.weights,item.metadata,decoded_device,decoded_bytes);
         cuda_check(cudaEventRecord(end),"record predecoded M1 setup end");
         cuda_check(cudaEventSynchronize(end),"synchronize predecoded M1 setup");
@@ -770,11 +770,11 @@ void run_target_m1_predecoded_discriminator(
 void run_target_m1_gate_up_pair_discriminator(
     Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& prompt,bool oscar) {
-    require(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
+    require(env("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
         "target M1 gate/up pair discriminator requires flag0 capture");
-    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS","");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","0");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS","");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16","0");
     auto captured=run_target_m1_k6_capture(target,draft,prompt,oscar);
     const auto find_owner=[&](const char* operation) {
         return std::find_if(captured.begin(),captured.end(),[&](const auto& item) {
@@ -787,8 +787,8 @@ void run_target_m1_gate_up_pair_discriminator(
         "target M1 gate/up pair discriminator missed layer-4 owners");
     require(gate->input==up->input,
         "target M1 gate/up pair discriminator inputs differ");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A","1");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16","1");
     auto gate_workspace=make_target_m1_k6_workspace(*gate,true);
     auto up_workspace=make_target_m1_k6_workspace(*up,true);
     require(std::string(gate_workspace->dispatch_name(gate->metadata,1))==
@@ -908,11 +908,11 @@ void run_target_m1_gate_up_pair_discriminator(
 void run_target_m1_fast_decode_discriminator(
     Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& prompt,bool oscar) {
-    require(env("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
+    require(env("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A")=="0",
         "fast-decode M1 discriminator requires flag0 capture");
-    ninfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS","");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","0");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment(kTargetM1K6EnvironmentOptions);
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS","");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16","0");
     auto captured=run_target_m1_k6_capture(target,draft,prompt,oscar);
     const auto selected=std::find_if(captured.begin(),captured.end(),
         [](const auto& item) {
@@ -923,8 +923,8 @@ void run_target_m1_fast_decode_discriminator(
     require(selected!=captured.end(),
         "fast-decode M1 discriminator missed layer-4 gate owner");
     const auto& item=*selected;
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A","1");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K6_N16","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K6_N16","1");
     auto workspace=make_target_m1_k6_workspace(item,true);
     require(std::string(workspace->dispatch_name(item.metadata,1))==
         "target_m1_k6_n16_async_a_stream_reduction",

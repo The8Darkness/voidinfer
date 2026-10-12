@@ -1,7 +1,7 @@
 #pragma once
 
 struct Initial16Qualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit = Admission::target_initial16;
     static constexpr std::size_t guard = 128;
     std::uint64_t total_elements = 0;
@@ -22,10 +22,10 @@ struct Initial16Qualification {
         out.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(T));
         require(out.good(), "initial16 ordered raw output failed");
     }
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x, void* user) {
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x, void* user) {
         static_cast<Initial16Qualification*>(user)->check(x);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         require(x.rows == 16 && x.metadata.K >= 5 && x.metadata.K <= 8, "initial16 ordered observation extent");
         const int in = x.metadata.in_features, out = x.metadata.out_features;
         const std::size_t extent = 16u * out;
@@ -35,19 +35,19 @@ struct Initial16Qualification {
         cuda_check(cudaStreamSynchronize(x.stream), "prefill input ready");
         std::vector<std::uint16_t> input(16u * in);
         cuda_check(cudaMemcpy(input.data(), x.input, input.size()*2, cudaMemcpyDeviceToHost), "prefill input copy");
-        _putenv_s("NINFER_EXL3_TARGET_INITIAL16_ORDERED", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED", "0");
         Exl3CudaLinearWorkspace baseline(in, out, 16, false, false, false, false, false, true);
-        _putenv_s("NINFER_EXL3_TARGET_INITIAL16_ORDERED", "1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED", "1");
         Exl3CudaLinearWorkspace candidate(in, out, 16, false, false, false, false, false, true);
         Exl3CudaLinearWorkspace unowned(in, out, 16);
-        _putenv_s("NINFER_EXL3_TARGET_INITIAL16_ORDERED", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED", "0");
         require(std::string(baseline.dispatch_name(x.metadata,16,admit)) == "generic_tile", "baseline dispatch");
         require(std::string(candidate.dispatch_name(x.metadata,16,admit)) == "target_initial16_ordered", "candidate dispatch");
         require(!unowned.target_initial16_candidate(x.metadata,16,admit) &&
                 !candidate.target_initial16_candidate(x.metadata,16,Admission::ordinary), "ownership admission");
-        _putenv_s("NINFER_EXL3_TARGET_INITIAL16_ORDERED", "1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED", "1");
         Exl3CudaLinearWorkspace short_owner(in,out,15,false,false,false,false,false,true);
-        _putenv_s("NINFER_EXL3_TARGET_INITIAL16_ORDERED", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED", "0");
         require(!short_owner.target_initial16_candidate(x.metadata,16,admit),"workspace extent admission");
         for(int bad=0;bad<6;++bad) {
             auto metadata=x.metadata;
@@ -100,22 +100,22 @@ struct Initial16Qualification {
 };
 
 void run_initial16_qualification(Exl3TextModel& target) {
-    require(env("NINFER_EXL3_TARGET_INITIAL16_ORDERED")=="0", "prefill capture needs flag0 baseline");
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));require(ids.size()>=16,"prefill prompt extent");ids.resize(16);
+    require(env("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED")=="0", "prefill capture needs flag0 baseline");
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));require(ids.size()>=16,"prefill prompt extent");ids.resize(16);
     auto ctx=target.create_context(true);
     require(ctx->try_enable_oscar_from_environment(),"prefill OSCAR required");
-    Initial16Qualification check(env("NINFER_E5A4_OUT"));
+    Initial16Qualification check(env("VOIDINFER_E5A4_OUT"));
     ctx->set_target_projection_observer_for_test(Initial16Qualification::callback,&check,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::initial16_generic);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::initial16_generic);
     ctx->prefill(ids);
     cuda_check(cudaDeviceSynchronize(),"prefill qualification complete");
     ctx->set_target_projection_observer_for_test(nullptr,nullptr);
     require(check.count==276 && ctx->position()==16,"initial16 complete276 operator coverage");
     // Independently constructed flag1 context must preserve the complete native
     // state, all captured tap rows and logits, then later teacher decodes.
-    _putenv_s("NINFER_EXL3_TARGET_INITIAL16_ORDERED","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED","1");
     auto candidate=target.create_context(true);
-    _putenv_s("NINFER_EXL3_TARGET_INITIAL16_ORDERED","0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED","0");
     require(candidate->try_enable_oscar_from_environment(),"candidate prefill OSCAR");
     candidate->prefill(ids);
     const auto compare=[&] {
@@ -126,7 +126,7 @@ void run_initial16_qualification(Exl3TextModel& target) {
         require(candidate->oscar_live_state_host_for_test()==ctx->oscar_live_state_host_for_test(),"prefill OSCAR state");
     };
     compare();
-    auto teacher=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto teacher=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(teacher.size()>=520,"prefill teacher extent");
     for(int i=16;i<520;++i) {
         ctx->decode(teacher[i]);candidate->decode(teacher[i]);

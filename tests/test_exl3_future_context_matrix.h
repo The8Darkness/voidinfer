@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace ninfer::exl3::test {
+namespace voidinfer::exl3::test {
 
 enum class FutureContextEvidence : std::uint8_t {
     native_request,
@@ -119,4 +119,4 @@ inline void check_future_context_qualification_matrix_source() {
     }
 }
 
-} // namespace ninfer::exl3::test
+} // namespace voidinfer::exl3::test

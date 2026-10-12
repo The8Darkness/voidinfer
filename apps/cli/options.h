@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::cli {
+namespace voidinfer::cli {
 
 struct Options {
     bool help_requested = false;
@@ -39,4 +39,4 @@ struct Options {
 [[nodiscard]] Options parse_options(int argc, char** argv);
 [[nodiscard]] std::string usage_text(const char* argv0);
 
-} // namespace ninfer::cli
+} // namespace voidinfer::cli

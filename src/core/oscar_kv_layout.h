@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer {
+namespace voidinfer {
 
 // The byte layout is part of the OSCAR cache contract. Writers, metadata
 // copies, prompt attention, and decode attention must receive the same value;
@@ -16,4 +16,4 @@ enum class OscarKVLayout : std::uint8_t {
     return layout == OscarKVLayout::Contiguous || layout == OscarKVLayout::TransposedQ2;
 }
 
-} // namespace ninfer
+} // namespace voidinfer

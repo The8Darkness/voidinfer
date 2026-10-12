@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
@@ -37,4 +37,4 @@ private:
     bool finished_                   = false;
 };
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

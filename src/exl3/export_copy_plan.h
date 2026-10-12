@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3ExportPrecision : std::uint8_t { fp16,fp32 };
 
@@ -105,4 +105,4 @@ private:
     bool last_contains_padding_=false;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

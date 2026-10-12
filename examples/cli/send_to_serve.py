@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send one NInfer CLI messages file to an already-running ninfer-serve instance."""
+"""Send one VoidInfer CLI messages file to an already-running voidinfer-serve instance."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def endpoint_url(base_url: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("messages", type=Path, help="NInfer CLI --messages JSON file")
+    parser.add_argument("messages", type=Path, help="VoidInfer CLI --messages JSON file")
     parser.add_argument("--base-url", default="http://127.0.0.1:8080/v1")
     parser.add_argument("--model", required=True, help="public model ID configured by the server")
     parser.add_argument("--max-tokens", type=int, default=1024)

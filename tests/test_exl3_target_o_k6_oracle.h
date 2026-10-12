@@ -12,8 +12,8 @@
 // gamma(6144) also bounds the shorter per-split FP32 dot/reduction paths; it does
 // not prescribe the production split order or alter the mathematical center.
 H6OracleStats target_o_k6_check_oracle_groups(
-    const ninfer::exl3::Exl3CudaLinearWeights& weights,
-    const ninfer::exl3::Exl3CudaLinearMetadata& metadata,
+    const voidinfer::exl3::Exl3CudaLinearWeights& weights,
+    const voidinfer::exl3::Exl3CudaLinearMetadata& metadata,
     const std::vector<std::uint16_t>& input,
     const std::vector<std::uint16_t>& actual_with_guards,
     std::size_t guard,

@@ -5,7 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Campaign experiments. Snapshot once per owner before allocation/capture;
 // never read environment or allocate from a captured forward path.
 enum class Gopt : unsigned {
@@ -14,10 +14,10 @@ enum class Gopt : unsigned {
     GreedyWarp, DraftDenseRowPair, GdnControlRowPair, DraftRingNormRope, Count
 };
 inline constexpr std::array<const char*,static_cast<unsigned>(Gopt::Count)> gopt_flags{{
-    "NINFER_GOPT_001", "NINFER_GOPT_002", "NINFER_GOPT_003", "NINFER_GOPT_004",
-    "NINFER_GOPT_005", "NINFER_GOPT_006", "NINFER_GOPT_007", "NINFER_GOPT_008",
-    "NINFER_GOPT_009", "NINFER_GOPT_010", "NINFER_GOPT_011",
-    "NINFER_GOPT_012"
+    "VOIDINFER_GOPT_001", "VOIDINFER_GOPT_002", "VOIDINFER_GOPT_003", "VOIDINFER_GOPT_004",
+    "VOIDINFER_GOPT_005", "VOIDINFER_GOPT_006", "VOIDINFER_GOPT_007", "VOIDINFER_GOPT_008",
+    "VOIDINFER_GOPT_009", "VOIDINFER_GOPT_010", "VOIDINFER_GOPT_011",
+    "VOIDINFER_GOPT_012"
 }};
 using GoptSubmissions = std::array<std::uint64_t,static_cast<unsigned>(Gopt::Count)>;
 struct Exl3GamingOptions {

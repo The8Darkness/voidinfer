@@ -4,7 +4,7 @@
 #include <memory>
 #include <string_view>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Admission descriptor only. Capture setup and all host-facing work remain
 // outside this boundary; the captured body may contain numerical device work.
@@ -87,4 +87,4 @@ private:
     bool fixed_geometry_=false;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

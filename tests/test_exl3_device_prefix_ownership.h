@@ -1,7 +1,7 @@
 #pragma once
 
 void run_device_prefix_metadata_gate(const std::filesystem::path& output){
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     require(Exl3DevicePrefixCache::budget_snapshot()[0]==0,"device prefix initial budget");
     std::ofstream out(output);out<<"case,pass\n";
     const auto gate=[&](const char* name,bool pass){out<<name<<','<<pass<<'\n';out.flush();require(pass,std::string("device prefix ")+name);};
@@ -28,7 +28,7 @@ void run_device_prefix_metadata_gate(const std::filesystem::path& output){
 }
 
 void run_device_prefix_16k_metadata_gate(const std::filesystem::path& output){
-    using namespace ninfer::exl3;std::ofstream out(output);out<<"case,pass\n";
+    using namespace voidinfer::exl3;std::ofstream out(output);out<<"case,pass\n";
     const auto gate=[&](const char* name,bool pass){out<<name<<','<<pass<<'\n';out.flush();require(pass,std::string("device prefix16K ")+name);};
     gate("initial_empty",Exl3DevicePrefixCache::budget_snapshot()[0]==0);
     auto owner=std::make_unique<Exl3DevicePrefixCache>(16384);auto denied=std::make_unique<Exl3DevicePrefixCache>();

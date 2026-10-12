@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::media::decode {
+namespace voidinfer::media::decode {
 
 enum class ErrorKind {
     BudgetExceeded,
@@ -78,4 +78,4 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
                    int min_frames, int max_frames);
 
-} // namespace ninfer::media::decode
+} // namespace voidinfer::media::decode

@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <utility>
 
-namespace ninfer::pdl {
+namespace voidinfer::pdl {
 
 struct LaunchConfig {
     dim3 grid;
@@ -42,4 +42,4 @@ __device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLa
 // Call on every consumer control path before its first access to producer-dependent data.
 __device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
 
-} // namespace ninfer::pdl
+} // namespace voidinfer::pdl

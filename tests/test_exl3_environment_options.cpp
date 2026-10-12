@@ -14,9 +14,9 @@ void set(const char* name, const char* value) {
 }
 
 int main() try {
-    using ninfer::exl3::parse_binary_option;
-    using ninfer::exl3::read_binary_option;
-    using ninfer::test::ScopedEnvironmentRestore;
+    using voidinfer::exl3::parse_binary_option;
+    using voidinfer::exl3::read_binary_option;
+    using voidinfer::test::ScopedEnvironmentRestore;
     constexpr const char* diagnostic = "original option diagnostic";
     need(!parse_binary_option(nullptr, diagnostic), "absent opt-in enabled");
     need(!parse_binary_option("0", diagnostic), "explicit zero enabled");

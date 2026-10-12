@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Fixed metadata for the already-reserved Engine packed input, never a second
 // allocation pool. The caller clears this before any write to that storage.
 // Only a completed gather may install a signature. Owners keep witness objects

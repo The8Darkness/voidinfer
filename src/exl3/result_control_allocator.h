@@ -3,7 +3,7 @@
 #include <memory>
 #include <new>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Ordinary allocation in production. The explicit diagnostic survives allocator
 // rebinding so shared_ptr fails at its actual control-block allocation boundary.
 template<class T> struct ResultControlAllocator {

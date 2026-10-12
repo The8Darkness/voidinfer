@@ -21,7 +21,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace voidinfer::serve;
 using Json = nlohmann::json;
 
 int check(bool condition, const char* message) {
@@ -50,9 +50,9 @@ int main() {
     options.preserve_thinking              = true;
     options.default_thinking_budget        = 512;
     options.sampling_overrides.temperature = 0.6F;
-    options.startup_argv = {"ninfer-serve", "--target", "--api-key", "<redacted>"};
+    options.startup_argv = {"voidinfer-serve", "--target", "--api-key", "<redacted>"};
 
-    ninfer::EngineOptions engine_options;
+    voidinfer::EngineOptions engine_options;
     engine_options.model                                           = options.model;
     engine_options.device                                          = options.device;
     engine_options.max_context                                     = options.max_context;
@@ -68,12 +68,12 @@ int main() {
     engine_options.context_cache.max_long_anchors_per_continuation = 2;
     engine_options.context_cache.max_cache_markers_per_request     = 4;
 
-    const ninfer::ModelSamplingDefaults sampling_defaults{
+    const voidinfer::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
         .non_thinking = {.temperature = 0.7F, .top_k = 20, .top_p = 0.8F, .presence_penalty = 1.5F},
     };
 
-    ninfer::LoadSummary load;
+    voidinfer::LoadSummary load;
     load.target               = "qwen3.8-27b/exl3";
     load.model_id             = "qwen3.8-27b";
     load.weights_id           = "exl3-6bpw";
@@ -83,7 +83,7 @@ int main() {
     load.host_to_device_bytes = 900;
     load.peak_staging_bytes   = 128;
 
-    ninfer::MemorySummary memory;
+    voidinfer::MemorySummary memory;
     memory.max_context                       = 262144;
     memory.weights.capacity_bytes            = 100;
     memory.sequence.capacity_bytes           = 200;
@@ -264,7 +264,7 @@ int main() {
     GenerationOutcome outcome;
     outcome.prompt_tokens                   = 401;
     outcome.completion_tokens               = 1024;
-    outcome.finish_reason                   = ninfer::FinishReason::OutputLimit;
+    outcome.finish_reason                   = voidinfer::FinishReason::OutputLimit;
     outcome.metrics.prepare_seconds         = 0.1234567890123;
     outcome.metrics.ttft_seconds            = 0.3580246791357;
     outcome.metrics.vision_seconds          = 0.0;
@@ -272,7 +272,7 @@ int main() {
     outcome.metrics.decode_seconds          = 5.3456789012345;
     outcome.metrics.total_seconds           = 5.7037035803702;
     outcome.metrics.prefix_cache_hit_tokens = 101;
-    outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::PrivateTurnClosure;
+    outcome.metrics.prefix_reuse_path       = voidinfer::PrefixReusePath::PrivateTurnClosure;
     outcome.metrics.engine_timing           = {
                   .queue_wait_seconds                   = 0.001,
                   .engine_boundary_exposed_seconds      = 0.001,
@@ -313,7 +313,7 @@ int main() {
                           .projection_work               = 31,
                           .planning_elapsed_ns           = 9000,
                           .search_elapsed_ns             = 6000,
-                          .stop_reason                   = ninfer::MaterializationStopReason::ModelOptimal,
+                          .stop_reason                   = voidinfer::MaterializationStopReason::ModelOptimal,
                           .model_optimal                 = true,
                           .budget_exhausted              = false,
                           .best_remaining_lower_bound_ns = 250000,
@@ -322,7 +322,7 @@ int main() {
                           .selected_degradation_units    = 2,
                           .selected_maximal_fallback     = false,
     };
-    outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
+    outcome.thinking = voidinfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
                                                    .injected_tokens       = 19,
                                                    .applied               = true};
@@ -340,7 +340,7 @@ int main() {
                           done.at("result").at("thinking_control_tokens") == 19 &&
                           done.at("result").at("thinking_control_applied") == true,
                       "thinking-control result accounting missing");
-    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::PrivateResponseReplay;
+    outcome.metrics.prefix_reuse_path = voidinfer::PrefixReusePath::PrivateResponseReplay;
     const Json response_restore =
         Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
     failures +=
@@ -446,12 +446,12 @@ int main() {
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);
     failures += check(console_prefix.starts_with('[') &&
-                          console_prefix.ends_with("] [info] ninfer-serve: "),
+                          console_prefix.ends_with("] [info] voidinfer-serve: "),
                       "console log prefix mismatch");
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" +
+        ("voidinfer-request-log-test-" +
 #ifdef _WIN32
          std::to_string(static_cast<long long>(::_getpid())) +
 #else

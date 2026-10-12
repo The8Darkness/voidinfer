@@ -11,7 +11,7 @@
 //   9. draft destroy/recreate
 //  10. DFlash2-disabled target regression (deterministic prompt suite)
 //  11. VRAM accounting (target only / target+draft / +minimal draft state)
-//  12. OSCAR routing proof when NINFER_OSCAR_EXL3=1 is set (16/16, GDN 0).
+//  12. OSCAR routing proof when VOIDINFER_OSCAR_EXL3=1 is set (16/16, GDN 0).
 #include "exl3/text_model.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/safetensors.h"
@@ -37,14 +37,14 @@
 
 namespace {
 
-using ninfer::exl3::Exl3TextModel;
-using ninfer::exl3::Exl3TextContext;
-using ninfer::exl3::Exl3Dflash2DraftModel;
-using ninfer::exl3::Exl3Dflash2TapHistory;
-using ninfer::exl3::TensorPayload;
-using ninfer::exl3::SafetensorsHeader;
-using ninfer::exl3::inspect_file;
-using ninfer::exl3::read_tensor;
+using voidinfer::exl3::Exl3TextModel;
+using voidinfer::exl3::Exl3TextContext;
+using voidinfer::exl3::Exl3Dflash2DraftModel;
+using voidinfer::exl3::Exl3Dflash2TapHistory;
+using voidinfer::exl3::TensorPayload;
+using voidinfer::exl3::SafetensorsHeader;
+using voidinfer::exl3::inspect_file;
+using voidinfer::exl3::read_tensor;
 
 constexpr int kHidden = 5120;
 constexpr int kVocab = 248320;
@@ -322,14 +322,14 @@ CycleResult run_cycles(Exl3TextModel& model, Exl3Dflash2DraftModel* draft,
 } // namespace
 int main() {
     try {
-        const auto target_path = env("NINFER_EXL3_TARGET_PATH");
-        const auto draft_path = env("NINFER_EXL3_DFLASH2_PATH");
+        const auto target_path = env("VOIDINFER_EXL3_TARGET_PATH");
+        const auto draft_path = env("VOIDINFER_EXL3_DFLASH2_PATH");
         if (target_path.empty() || draft_path.empty()) {
-            std::cerr << "E5A2 skipped: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_DFLASH2_PATH\n";
+            std::cerr << "E5A2 skipped: set VOIDINFER_EXL3_TARGET_PATH and VOIDINFER_EXL3_DFLASH2_PATH\n";
             return 77;
         }
-        const auto oracle_path = env("NINFER_EXL3_ORACLE_PATH");
-        const bool oscar_requested = env("NINFER_OSCAR_EXL3") == "1";
+        const auto oracle_path = env("VOIDINFER_EXL3_ORACLE_PATH");
+        const bool oscar_requested = env("VOIDINFER_OSCAR_EXL3") == "1";
         cuda_check(cudaSetDevice(0), "E5A2 set device");
         {
             void* warm = nullptr;
@@ -364,7 +364,7 @@ int main() {
             require(ctx_off->oscar_enabled() && ctx_on->oscar_enabled(), "E5A2 OSCAR contexts not enabled");
             std::cout << "E5A2 oscar_enabled=1\n";
         } else {
-            std::cout << "E5A2 oscar_enabled=0 (set NINFER_OSCAR_EXL3=1 for the routing proof)\n";
+            std::cout << "E5A2 oscar_enabled=0 (set VOIDINFER_OSCAR_EXL3=1 for the routing proof)\n";
         }
 
         // ---- Draft artifact load (measure B: target + loaded DFlash2). ----

@@ -13,7 +13,7 @@
 #include <optional>
 #include "exl3/retained_descriptor_ledger.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class Exl3ResourceReservationExhausted : public std::runtime_error {
 public:
     Exl3ResourceReservationExhausted():std::runtime_error("resource allocation reservation exhausted"){}

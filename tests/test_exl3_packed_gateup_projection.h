@@ -6,10 +6,10 @@
 struct PackedGateupCapture {
     const char* operation="gate";
     int bits=5,layer=-1;
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     std::shared_ptr<DeviceBuffer> input;
-    static void observe(const ninfer::exl3::Exl3TargetProjectionObservation& value,void* user) {
+    static void observe(const voidinfer::exl3::Exl3TargetProjectionObservation& value,void* user) {
         auto& self=*static_cast<PackedGateupCapture*>(user);
         if(self.input || value.rows!=8 || value.metadata.K!=self.bits ||
             std::string(value.operation)!=self.operation || (self.layer>=0 && self.layer!=value.layer))return;
@@ -22,7 +22,7 @@ struct PackedGateupCapture {
 };
 
 inline void run_packed_gateup_projection(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     constexpr auto admission=Exl3CudaLinearAdmission::target_continuation_gate_up;
     require(source.size()>=1040,"held gate/up requires two request inputs");
     for(const char* operation:{"gate","up"})for(int bits:{5,6,7}) {

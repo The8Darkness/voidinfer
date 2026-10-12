@@ -1,12 +1,12 @@
 #pragma once
 void run_media_draft_gate(Exl3TextModel& model,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose){
-    using namespace ninfer::exl3;using Json=nlohmann::ordered_json;
-    const std::filesystem::path dir=env("NINFER_REAL_DFLASH_OUT"),frozen=env("NINFER_TEST_FROZEN_V6_EMBEDDINGS");
+    using namespace voidinfer::exl3;using Json=nlohmann::ordered_json;
+    const std::filesystem::path dir=env("VOIDINFER_REAL_DFLASH_OUT"),frozen=env("VOIDINFER_TEST_FROZEN_V6_EMBEDDINGS");
     require(!dir.empty()&&!std::filesystem::exists(dir),"preserve media draft receipt");std::filesystem::create_directories(dir);
     require(std::filesystem::file_size(frozen)==64ULL*5120*4,"frozen V6 extent");
     std::vector<float> features(64*5120);std::ifstream input(frozen,std::ios::binary);input.read(reinterpret_cast<char*>(features.data()),features.size()*4);require(bool(input),"frozen V6 read");
-    const std::filesystem::path plan_path=env("NINFER_TEST_PREPARED_MEDIA_PLAN");const bool prepared=!plan_path.empty();
+    const std::filesystem::path plan_path=env("VOIDINFER_TEST_PREPARED_MEDIA_PLAN");const bool prepared=!plan_path.empty();
     Json plan;std::vector<std::int64_t> prepared_ids;std::vector<std::int32_t> prepared_positions;int prefix=64;
     if(prepared){std::ifstream file(plan_path);plan=Json::parse(file);prepared_ids=plan.at("token_ids").get<std::vector<std::int64_t>>();prepared_positions=plan.at("positions_axis_major").get<std::vector<std::int32_t>>();
         const auto& items=plan.at("vision_items");require(plan.at("patch_storage")=="fp16"&&items.size()==1&&items[0].at("modality")==1&&items[0].at("grid")==Json::array({1,16,16})&&items[0].at("token_spans").size()==1,"prepared single image geometry");

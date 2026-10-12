@@ -1,11 +1,11 @@
 #pragma once
 
 void run_host_stream_qualification(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==1024 && source.size()>350,"host stream fixture extent");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
     auto resident=target.create_context(true);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto streamed=target.create_context(true);
     resident->prepare_continuation(8);streamed->prepare_continuation(8);
     require(streamed->host_kv_stats().enabled && streamed->host_kv_stats().layer_workspace_bytes==1024*4096,
@@ -27,8 +27,8 @@ void run_host_stream_qualification(Exl3TextModel& target,const std::vector<std::
             auto proposal=std::vector<std::int64_t>(greedy.begin(),greedy.begin()+width);
             if(reject<width) proposal[reject]=(proposal[reject]+1)%kVocab;
             const auto before=streamed->host_kv_stats();
-            const auto a=ninfer::exl3::verify_exl3_outer_batched_reference(*resident,*root,proposal,true);
-            const auto b=ninfer::exl3::verify_exl3_outer_batched_reference(*streamed,*root,proposal,true);
+            const auto a=voidinfer::exl3::verify_exl3_outer_batched_reference(*resident,*root,proposal,true);
+            const auto b=voidinfer::exl3::verify_exl3_outer_batched_reference(*streamed,*root,proposal,true);
             const auto after=streamed->host_kv_stats();
             require(a.accepted==b.accepted && a.committed_tokens==b.committed_tokens &&
                 a.committed_taps==b.committed_taps && a.committed_state->same_payload(*b.committed_state),
@@ -48,7 +48,7 @@ void run_host_stream_qualification(Exl3TextModel& target,const std::vector<std::
             for(int order=0;order<2;++order) {
                 const int arm=(repeat&1)?1-order:order;
                 const auto start=std::chrono::steady_clock::now();
-                const auto result=ninfer::exl3::verify_exl3_outer_batched_reference(
+                const auto result=voidinfer::exl3::verify_exl3_outer_batched_reference(
                     arm?*streamed:*resident,*root,greedy);
                 cuda_check(cudaDeviceSynchronize(),"host stream complete verifier timing");
                 times[arm]=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();

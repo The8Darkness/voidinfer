@@ -1,17 +1,17 @@
 #pragma once
 
 void run_l2_window_experiment(Exl3TextModel& target,Exl3Dflash2DraftModel& draft) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     using Clock=std::chrono::steady_clock;
-    const std::filesystem::path fixtures=env("NINFER_COMPACT_PERF_DIR"),output=env("NINFER_COMPACT_PERF_OUTPUT");
+    const std::filesystem::path fixtures=env("VOIDINFER_COMPACT_PERF_DIR"),output=env("VOIDINFER_COMPACT_PERF_OUTPUT");
     require(!fixtures.empty() && !output.empty() && target.max_context()>=4224 &&
         !std::filesystem::exists(output/"progress.jsonl"),"L2 window evidence/context extent");
     std::ofstream progress(output/"progress.jsonl");require(progress.good(),"L2 window progress file");
     const auto stop=load_ids((fixtures/"stop.ids").string());
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");_putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");_putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
     auto inner=target.create_context(true);require(inner->try_enable_oscar_from_environment(),"L2 window OSCAR");
     inner->prepare_transaction();inner->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     TapStage stage;std::array<std::uint16_t*,5> staging{};
     for(int tap=0;tap<5;++tap) {
@@ -56,12 +56,12 @@ void run_l2_window_experiment(Exl3TextModel& target,Exl3Dflash2DraftModel& draft
                     auto token=produced[i];
                     if(!fault_done && candidate_ordinal==corrupt_at) {token=(token+1)%248320;fault_done=true;result.fault_injected=true;}
                     pending.push_back(token);ready_ms.push_back(elapsed(start));
-                    if(ninfer::exl3::exl3_terminal_token(token,stop)) break;
+                    if(voidinfer::exl3::exl3_terminal_token(token,stop)) break;
                 }
                 result.peak_pending_tokens=std::max(result.peak_pending_tokens,pending.size());
                 result.peak_pending_bytes=std::max(result.peak_pending_bytes,
                     pending.capacity()*sizeof(std::int64_t)+ready_ms.capacity()*sizeof(double));
-                if(std::any_of(pending.begin(),pending.end(),[&](auto token){return ninfer::exl3::exl3_terminal_token(token,stop);})) break;
+                if(std::any_of(pending.begin(),pending.end(),[&](auto token){return voidinfer::exl3::exl3_terminal_token(token,stop);})) break;
                 if(mandatory_flush>0 && pending.size()>=static_cast<std::size_t>(mandatory_flush)) {++result.mandatory_flushes;break;}
             }
             ++result.l2_windows;result.attempted_candidates+=pending.size();
@@ -78,7 +78,7 @@ void run_l2_window_experiment(Exl3TextModel& target,Exl3Dflash2DraftModel& draft
             const double released_at=elapsed(start);std::size_t visible_release=0;
             for(std::size_t i=0;i<verified.committed_tokens.size();++i) {
                 const auto token=verified.committed_tokens[i];
-                if(!ninfer::exl3::exl3_terminal_token(token,stop)) {
+                if(!voidinfer::exl3::exl3_terminal_token(token,stop)) {
                     result.tokens.push_back(token);result.publication_ms.push_back(released_at);++visible_release;
                 }
                 if(i<verified.accepted && i<ready_ms.size()) result.tentative_wait_ms.push_back(released_at-ready_ms[i]);
@@ -132,7 +132,7 @@ void run_l2_window_experiment(Exl3TextModel& target,Exl3Dflash2DraftModel& draft
     };
 
     int pairs=0;
-    if(env("NINFER_L2_WINDOW_GATES_ONLY")!="1") for(int fixture_index=0;fixture_index<2;++fixture_index) {
+    if(env("VOIDINFER_L2_WINDOW_GATES_ONLY")!="1") for(int fixture_index=0;fixture_index<2;++fixture_index) {
         const std::string fixture=fixture_index?"prose":"code";const auto ids=load_ids((fixtures/(fixture+".ids")).string());
         require(ids.size()==4096,"L2 window prompt extent");
         std::array<Result,2> results;std::array<double,2> prefill{},setup{},uncached{};

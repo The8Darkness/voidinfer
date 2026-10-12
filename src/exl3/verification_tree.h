@@ -7,7 +7,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Per-round DFlash2 verification tree: a draft chain prefix plus sibling
 // leaves (sibling_rows.cuh), chosen to maximize the expected accepted length
@@ -111,4 +111,4 @@ inline Exl3VerificationTree exl3_build_verification_tree(
     return best;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

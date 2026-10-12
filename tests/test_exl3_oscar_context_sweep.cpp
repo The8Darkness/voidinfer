@@ -15,7 +15,7 @@
 
 #include <cuda_runtime_api.h>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 
 namespace {
 
@@ -127,12 +127,12 @@ SweepRow run_point(Exl3TextModel& model, int context, bool oscar, int decode_tok
 
 int main() {
     try {
-        const auto target = env("NINFER_EXL3_TARGET_PATH");
+        const auto target = env("VOIDINFER_EXL3_TARGET_PATH");
         if (target.empty()) {
-            std::cerr << "sweep skipped: set NINFER_EXL3_TARGET_PATH\n";
+            std::cerr << "sweep skipped: set VOIDINFER_EXL3_TARGET_PATH\n";
             return 77;
         }
-        const char* only = std::getenv("NINFER_E4C1_SWEEP_ONLY");
+        const char* only = std::getenv("VOIDINFER_E4C1_SWEEP_ONLY");
         const auto model = Exl3TextModel::load(target, 32768);
         std::vector<int> contexts = {512, 2048, 4096, 8192, 16384, 32768};
         if (only != nullptr && only[0] != 0) {
@@ -145,7 +145,7 @@ int main() {
         if (fresh) {
             csv << "context,mode,prefill_ms,prefill_tok_s,decode_ms,tok_s,vram_bytes,split_class,greedy\n";
         }
-        const char* modes = std::getenv("NINFER_E4C1_SWEEP_MODES");
+        const char* modes = std::getenv("VOIDINFER_E4C1_SWEEP_MODES");
         const std::string mode_filter = modes != nullptr ? modes : "both";
         for (int context : contexts) {
             const int decode_tokens = context >= 16384 ? 4 : 8;

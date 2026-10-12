@@ -9,7 +9,7 @@
 // (other callers, graph capture) every copy waits for the call.
 #include <cuda_runtime.h>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct L0HistoryWritten {
     cudaStream_t stream = nullptr;
@@ -62,4 +62,4 @@ private:
     cudaEvent_t event_ = nullptr;
 };
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

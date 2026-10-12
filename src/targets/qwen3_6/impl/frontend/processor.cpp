@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace voidinfer::targets::qwen3_6::frontend_internal {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -1171,4 +1171,4 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     return output;
 }
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace voidinfer::targets::qwen3_6::frontend_internal

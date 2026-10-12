@@ -3,29 +3,29 @@
 void run_exact_host_kv_small_m_fused_gate_up_transform(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096,continuation_rows=8;
     require(target.max_context()==4352 && code.size()>=prefix &&
             prose.size()>=prefix,
         "small-M fused gate/up fixture/context extent");
     configure_exact_host_kv_pinned_d2h();
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BANKED_D2H","1");
-    _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","0");
-    _putenv_s("NINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM","0");
-    _putenv_s("NINFER_EXL3_EAGER_MLP_GATEUP_CONCURRENT","0");
-    _putenv_s("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","1");
-    _putenv_s("NINFER_EXL3_EXTENDED_STREAM_REDUCTION","1");
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M","1");
-    _putenv_s("NINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A","1");
-    _putenv_s("NINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BANKED_D2H","1");
+    _putenv_s("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","0");
+    _putenv_s("VOIDINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM","0");
+    _putenv_s("VOIDINFER_EXL3_EAGER_MLP_GATEUP_CONCURRENT","0");
+    _putenv_s("VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","1");
+    _putenv_s("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A","1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A","1");
     const auto retirement_before=
         Exl3TextContext::retirement_quarantine_witness();
     {
-        _putenv_s("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM","0");
+        _putenv_s("VOIDINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM","0");
         auto control=target.create_context(true);
         control->prepare_continuation(continuation_rows);
-        _putenv_s("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM","1");
+        _putenv_s("VOIDINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM","1");
         auto candidate=target.create_context(true);
         candidate->prepare_continuation(continuation_rows);
         require(candidate->persistent_bytes()==control->persistent_bytes() &&
@@ -34,7 +34,7 @@ void run_exact_host_kv_small_m_fused_gate_up_transform(
             "small-M fused gate/up changed resource inventory");
         struct Result {
             std::vector<std::uint16_t> logits;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
             std::uint64_t calls=0;
         };
         const auto continuation=[&](Exl3TextContext& context,
@@ -66,7 +66,7 @@ void run_exact_host_kv_small_m_fused_gate_up_transform(
         }
         struct DecodeResult {
             std::vector<float> logits;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
             std::uint64_t calls=0;
         };
         const auto decode_one=[&](Exl3TextContext& context) {
@@ -96,13 +96,13 @@ void run_exact_host_kv_small_m_fused_gate_up_transform(
     require(Exl3TextContext::retirement_quarantine_witness()==retirement_before,
         "small-M fused gate/up normal destruction changed retirement quarantine");
     for(const char* malformed:{"2","true","01"}) {
-        _putenv_s("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",malformed);
+        _putenv_s("VOIDINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",malformed);
         bool rejected=false;
         try {auto invalid=target.create_context(true);}
         catch(const std::invalid_argument&) {rejected=true;}
         require(rejected,"small-M fused gate/up accepted malformed flag");
     }
-    _putenv_s("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM","0");
+    _putenv_s("VOIDINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM","0");
     std::cout<<"SMALL_M_FUSED_GATEUP PASS fixtures=2 prefix="<<prefix
         <<" continuation_rows=8 m1_boundary=1 exact_logits_state=1"
         <<" route_counters=1 zero_extra_bytes=1 normal_retirement=1"

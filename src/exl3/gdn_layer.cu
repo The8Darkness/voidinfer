@@ -12,8 +12,8 @@
 #include "exl3/gdn_chunked_recurrence.cuh"
 
 #include "core/arena.h"
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gated_rmsnorm.h"
+#include "voidinfer/ops/gated_delta_net.h"
+#include "voidinfer/ops/gated_rmsnorm.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -30,7 +30,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 namespace {
 
@@ -40,10 +40,10 @@ namespace {
 // recurrence. 0 = sequential control.
 bool gdn_chunked_prefill_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_GDN_CHUNKED_PREFILL");
+        const char* value = std::getenv("VOIDINFER_EXL3_GDN_CHUNKED_PREFILL");
         if (!value || std::strcmp(value, "1") == 0) return true;
         if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_GDN_CHUNKED_PREFILL must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_GDN_CHUNKED_PREFILL must be 0 or 1");
     }();
     return enabled;
 }
@@ -201,14 +201,14 @@ __global__ void rms_norm_f16_kernel(const std::uint16_t* input, const std::uint1
     }
 }
 
-// NINFER_EXL3_RESIDUAL_NORM_FUSED (default 1): the post-attention residual
+// VOIDINFER_EXL3_RESIDUAL_NORM_FUSED (default 1): the post-attention residual
 // add and RMS norm run as rms_norm_f16_kernel<true> (identical half(a+b)
 // residual, materialized, then the same norm); 0 restores two launches.
-// NINFER_EXL3_GDN_O_RESIDUAL_NORM (default 1): the decode O projection's
+// VOIDINFER_EXL3_GDN_O_RESIDUAL_NORM (default 1): the decode O projection's
 // split reduction also applies the residual add and post-attention norm.
 bool gdn_o_residual_norm_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_O_RESIDUAL_NORM");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_O_RESIDUAL_NORM");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -216,10 +216,10 @@ bool gdn_o_residual_norm_enabled() {
 
 bool residual_norm_fused_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_RESIDUAL_NORM_FUSED");
+        const char* value=std::getenv("VOIDINFER_EXL3_RESIDUAL_NORM_FUSED");
         if(!value||std::strcmp(value,"1")==0) return true;
         if(std::strcmp(value,"0")==0) return false;
-        throw std::invalid_argument("NINFER_EXL3_RESIDUAL_NORM_FUSED must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_RESIDUAL_NORM_FUSED must be 0 or 1");
     }();
     return enabled;
 }
@@ -239,14 +239,14 @@ __global__ void transpose_f16_to_bf16_kernel(const std::uint16_t* input, std::ui
 // Prefill GDN control projections (rows >= 16): the 5120 -> 48 a/b
 // projections run as FP16 tensor-core GEMMs with FP32 accumulation and output
 // instead of the CTA-reduced FMA kernel, which re-reads the input per head
-// group and the weights per row group. NINFER_EXL3_GDN_CONTROL_GEMM=0 keeps
+// group and the weights per row group. VOIDINFER_EXL3_GDN_CONTROL_GEMM=0 keeps
 // the tiled kernel.
 bool gdn_control_gemm_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_GDN_CONTROL_GEMM");
+        const char* value = std::getenv("VOIDINFER_EXL3_GDN_CONTROL_GEMM");
         if (!value || std::strcmp(value, "1") == 0) return true;
         if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_GDN_CONTROL_GEMM must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_GDN_CONTROL_GEMM must be 0 or 1");
     }();
     return enabled;
 }
@@ -294,7 +294,7 @@ __global__ void transpose_bf16_to_f16_kernel(const std::uint16_t* input, std::ui
 }
 
 
-// Fused GDN output stage (NINFER_EXL3_GDN_FUSED_GATED_NORM, default 1; 0 = the
+// Fused GDN output stage (VOIDINFER_EXL3_GDN_FUSED_GATED_NORM, default 1; 0 = the
 // three-kernel control): FP16 z is rounded to BF16, the per-head gated RMSNorm
 // is the ops::rmsnorm_warp_bf16x2_kernel<Gated> arithmetic (same reduction
 // order, rsqrtf, x*inv*w*silu(z), BF16 rounding), and the BF16 result is
@@ -337,10 +337,10 @@ __global__ void __launch_bounds__(512) gdn_gated_norm_f16io_kernel(
 
 static bool gdn_fused_gated_norm_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_FUSED_GATED_NORM");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_FUSED_GATED_NORM");
         if(!value || std::strcmp(value,"1")==0) return true;
         if(std::strcmp(value,"0")==0) return false;
-        throw std::invalid_argument("NINFER_EXL3_GDN_FUSED_GATED_NORM must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_GDN_FUSED_GATED_NORM must be 0 or 1");
     }();
     return enabled;
 }
@@ -554,7 +554,7 @@ constexpr int kConvTileChannels=64;
 
 bool gdn_conv_prefill_tiled_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_CONV_TILED");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_CONV_TILED");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -856,7 +856,7 @@ constexpr int kGdnChunkThreads=256;
 
 bool gdn_decode_tiled_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_DECODE_TILED");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_DECODE_TILED");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -1578,10 +1578,10 @@ bool control_aligned(const void* a,const void* b,const void* c) {
 
 bool gdn_control_staged_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_CONTROL_STAGED");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_CONTROL_STAGED");
         if(!value||std::strcmp(value,"1")==0) return true;
         if(std::strcmp(value,"0")==0) return false;
-        throw std::invalid_argument("NINFER_EXL3_GDN_CONTROL_STAGED must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_GDN_CONTROL_STAGED must be 0 or 1");
     }();
     return enabled;
 }
@@ -1593,7 +1593,7 @@ bool gdn_control_staged_enabled() {
 // instead of one, removing the repeated L2 traversal of rows and weights.
 bool gdn_control_tiled_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_CONTROL_TILED");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_CONTROL_TILED");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -1601,7 +1601,7 @@ bool gdn_control_tiled_enabled() {
 
 bool gdn_control_decode_tiled_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_CONTROL_DECODE_TILED");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_CONTROL_DECODE_TILED");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -1829,12 +1829,12 @@ void gopt_gdn_pack_fixture(bool fused,const std::uint16_t* core,
     check(cudaGetLastError(),"GOPT output pack fixture");
 }
 
-// Concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): the
+// Concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): the
 // prompt-scale beta/g traces (float buffers 4/5) come from the shared pool
 // too; each layer keeps a private small-tier copy (enable_small_tier).
 static bool tiered_gdn_traces() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
         return value && std::strcmp(value,"1")==0;
     }();
     return enabled;
@@ -1905,10 +1905,10 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
     if(immutable_coefficients_ &&
        !immutable_coefficients_->same_representation(weights))
         throw std::invalid_argument("GDN immutable coefficient representation mismatch");
-    const char* resident = std::getenv("NINFER_EXL3_PREFILL_GDN_RESIDENT");
-    const char* wide_prefill = std::getenv("NINFER_EXL3_WIDE_PREFILL");
-    const char* staged_prefill = std::getenv("NINFER_EXL3_PREFILL_STAGED_REDUCTION");
-    const char* shared_accum = std::getenv("NINFER_EXL3_SHARED_ACCUM");
+    const char* resident = std::getenv("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT");
+    const char* wide_prefill = std::getenv("VOIDINFER_EXL3_WIDE_PREFILL");
+    const char* staged_prefill = std::getenv("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION");
+    const char* shared_accum = std::getenv("VOIDINFER_EXL3_SHARED_ACCUM");
     const bool qualified_default_group = exl3_prefill_qualified_default_group(
         max_rows_, wide_prefill && std::strcmp(wide_prefill, "1") == 0,
         staged_prefill && std::strcmp(staged_prefill, "1") == 0,
@@ -1917,7 +1917,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
         ? std::string(resident) == "1" :
           (qualified_default_group && scratch.data != nullptr);
     const char* resident_pair_columns=std::getenv(
-        "NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS");
+        "VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS");
     if(resident_pair_columns && std::strcmp(resident_pair_columns,"0")!=0 &&
         std::strcmp(resident_pair_columns,"1")!=0)
         throw std::invalid_argument("GDN resident pair-columns must be 0 or 1");
@@ -1925,14 +1925,14 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
         ? std::strcmp(resident_pair_columns,"1")==0
         : (qualified_default_group && scratch.data!=nullptr));
     const char* resident_pair_vector_io=std::getenv(
-        "NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO");
+        "VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO");
     if(resident_pair_vector_io && std::strcmp(resident_pair_vector_io,"0")!=0 &&
         std::strcmp(resident_pair_vector_io,"1")!=0)
         throw std::invalid_argument("GDN resident pair vector IO must be 0 or 1");
     prefill_resident_pair_vector_io_=prefill_resident_pair_columns_ &&
         resident_pair_vector_io && std::strcmp(resident_pair_vector_io,"1")==0;
     const char* resident_quad_columns=std::getenv(
-        "NINFER_EXL3_PREFILL_GDN_RESIDENT_QUAD_COLUMNS");
+        "VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_QUAD_COLUMNS");
     if(resident_quad_columns && std::strcmp(resident_quad_columns,"0")!=0 &&
         std::strcmp(resident_quad_columns,"1")!=0)
         throw std::invalid_argument("GDN resident quad-columns must be 0 or 1");
@@ -1943,15 +1943,15 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
             "GDN resident quad columns and pair vector IO are separate controls");
     // Validate even if this layer's diagnostic or shape route excludes pairing.
     (void)exl3_equal_transform_reuse_enabled(
-        std::getenv("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS"));
+        std::getenv("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS"));
     const char* dual_input_transform = std::getenv(
-        "NINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM");
+        "VOIDINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM");
     if(dual_input_transform && std::strcmp(dual_input_transform,"0")!=0 &&
        std::strcmp(dual_input_transform,"1")!=0)
         throw std::invalid_argument("GDN fused gate/up transform must be 0 or 1");
     fused_gate_up_transform_=dual_input_transform && std::strcmp(dual_input_transform,"1")==0;
     const char* small_m_fused_gate_up=std::getenv(
-        "NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM");
+        "VOIDINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM");
     if(small_m_fused_gate_up && std::strcmp(small_m_fused_gate_up,"0")!=0 &&
        std::strcmp(small_m_fused_gate_up,"1")!=0)
         throw std::invalid_argument(
@@ -1959,14 +1959,14 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
     small_m_fused_gate_up_transform_=small_m_fused_gate_up &&
         std::strcmp(small_m_fused_gate_up,"1")==0;
     const char* bulk_mlp_fused_down=std::getenv(
-        "NINFER_EXL3_FAST_GDN_BULK_MLP_FUSED_DOWN");
+        "VOIDINFER_EXL3_FAST_GDN_BULK_MLP_FUSED_DOWN");
     if(bulk_mlp_fused_down && std::strcmp(bulk_mlp_fused_down,"0")!=0 &&
        std::strcmp(bulk_mlp_fused_down,"1")!=0)
         throw std::invalid_argument("GDN bulk MLP fused down must be 0 or 1");
     bulk_mlp_fused_down_=bulk_mlp_fused_down &&
         std::strcmp(bulk_mlp_fused_down,"1")==0;
     const char* bulk_mlp_fused_residual=std::getenv(
-        "NINFER_EXL3_FAST_GDN_BULK_MLP_FUSED_RESIDUAL");
+        "VOIDINFER_EXL3_FAST_GDN_BULK_MLP_FUSED_RESIDUAL");
     if(bulk_mlp_fused_residual &&
        std::strcmp(bulk_mlp_fused_residual,"0")!=0 &&
        std::strcmp(bulk_mlp_fused_residual,"1")!=0)
@@ -1974,19 +1974,19 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
     bulk_mlp_fused_residual_=bulk_mlp_fused_residual &&
         std::strcmp(bulk_mlp_fused_residual,"1")==0;
     const char* bulk_mlp_weight_prefetch=std::getenv(
-        "NINFER_EXL3_FAST_GDN_BULK_MLP_WEIGHT_PREFETCH");
+        "VOIDINFER_EXL3_FAST_GDN_BULK_MLP_WEIGHT_PREFETCH");
     if (bulk_mlp_weight_prefetch &&
         std::strcmp(bulk_mlp_weight_prefetch,"0")!=0 &&
         std::strcmp(bulk_mlp_weight_prefetch,"1")!=0)
         throw std::invalid_argument("GDN bulk MLP weight prefetch must be 0 or 1");
     bulk_mlp_weight_prefetch_=bulk_mlp_weight_prefetch &&
         std::strcmp(bulk_mlp_weight_prefetch,"1")==0;
-    const char* fused_residual=std::getenv("NINFER_EXL3_GDN_FUSED_RESIDUAL_NORM");
+    const char* fused_residual=std::getenv("VOIDINFER_EXL3_GDN_FUSED_RESIDUAL_NORM");
     if(fused_residual && std::strcmp(fused_residual,"0")!=0 && std::strcmp(fused_residual,"1")!=0)
         throw std::invalid_argument("GDN fused residual norm must be 0 or 1");
     fused_residual_norm_=fused_residual && std::strcmp(fused_residual,"1")==0;
     const char* fast_decode_conv = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_DECODE_CONV");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_DECODE_CONV");
     if(fast_decode_conv && std::strcmp(fast_decode_conv,"0")!=0 &&
        std::strcmp(fast_decode_conv,"1")!=0)
         throw std::invalid_argument(
@@ -1994,7 +1994,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
     fast_same_weights_fp16kv_gdn_decode_conv_ = fast_decode_conv &&
         std::strcmp(fast_decode_conv,"1")==0;
     const char* fast_gdn_m1_gate_up_pair = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR");
     if(fast_gdn_m1_gate_up_pair &&
        std::strcmp(fast_gdn_m1_gate_up_pair,"0")!=0 &&
        std::strcmp(fast_gdn_m1_gate_up_pair,"1")!=0)
@@ -2029,7 +2029,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
         throw std::invalid_argument(
             "GDN M1 gate/up pair requires a distinct borrowed transform view");
     dual_input_transform = std::getenv(
-        "NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM");
+        "VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM");
     if (dual_input_transform &&
         std::strcmp(dual_input_transform, "0") != 0 &&
         std::strcmp(dual_input_transform, "1") != 0)
@@ -2126,7 +2126,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
             std::optional<Exl3VeriCacheServingCoordinator::ConstructorCredits> credits;
             if(constructor_authority)credits.emplace(constructor_authority->reserve_constructor_credits(
                 bytes,Exl3LayerBufferRetirement::record_bytes()));
-            check(exl3_packed_malloc(pointer,bytes),label);static const bool trace_alloc=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;if(trace_alloc && bytes>=(256u<<10))std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB GDN %s%c",bytes/1048576.0,label,10);
+            check(exl3_packed_malloc(pointer,bytes),label);static const bool trace_alloc=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;if(trace_alloc && bytes>=(256u<<10))std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB GDN %s%c",bytes/1048576.0,label,10);
             buffer_retirements_[slot]->adopt(*pointer,bytes,buffer_device);
             if(credits)buffer_retirements_[slot]->attach(std::move(credits->device),std::move(credits->metadata));
             if(buffer_fault_for_test==1 || buffer_fault_for_test==3) {
@@ -2235,7 +2235,7 @@ void Exl3GdnLayer::require_tier_rows(int rows) const {
 void Exl3GdnLayer::set_skip_state_trace(bool skip) {
     skip_state_trace_ = skip;
     static const bool release=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_RELEASE_STATE_TRACE");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_RELEASE_STATE_TRACE");
         return !value || std::strcmp(value,"0")!=0;
     }();
     if(!skip || !release || !buffer_retirements_[30] || !buffer_retirements_[30]->bytes())return;
@@ -2724,11 +2724,11 @@ void Exl3GdnLayer::enqueue_retained_prefix_reconstruct(
     // The state-before buffer is a trace: the next forward rewrites it before
     // any consumer reads it, so the repair may skip restoring it.
     static const bool skip_trace_restore=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_SKIP_TRACE_RESTORE");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_SKIP_TRACE_RESTORE");
         if(!value)return true;  // measured default; "0" restores the trace copy
         if(std::strcmp(value,"0")==0)return false;
         if(std::strcmp(value,"1")==0)return true;
-        throw std::invalid_argument("NINFER_EXL3_GDN_SKIP_TRACE_RESTORE must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_GDN_SKIP_TRACE_RESTORE must be 0 or 1");
     }();
     if (checkpoint.recurrent_state_device != recurrent_state_before_ && !skip_trace_restore)
         check(cudaMemcpyAsync(recurrent_state_before_,checkpoint.recurrent_state_device,
@@ -2990,7 +2990,7 @@ void Exl3GdnLayer::gdn_middle(const GdnMiddle& m) {
     // route. The synchronizing event result is never used as request timing.
     static std::atomic<int> prefill_recurrence_samples{0};
     const char* recurrence_sample_option=std::getenv(
-        "NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
+        "VOIDINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
     const bool recurrence_sample=rows==1024 && wide_prefill &&
         recurrence_sample_option &&
         std::strcmp(recurrence_sample_option,"1")==0 &&
@@ -3104,7 +3104,7 @@ void Exl3GdnLayer::gdn_middle(const GdnMiddle& m) {
     } else {
     Tensor tz(z_bf16, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tcore(core, DType::BF16, {kHeadDim, kHeads, rows}); Tensor tnorm(gdn_norm, DType::BF16, {kHeadDim, kHeads, rows});
     Tensor nw(const_cast<std::uint16_t*>(weights_.gdn_norm), DType::BF16, {kHeadDim});
-    ninfer::ops::gated_rmsnorm(tcore, nw, tz, kRmsEps, tnorm, stream);
+    voidinfer::ops::gated_rmsnorm(tcore, nw, tz, kRmsEps, tnorm, stream);
     if(gaming_[Gopt::GdnOutputPack]) {
         gopt_gdn_output_pack_kernel<<<(rows*kZ+255)/256,256,0,stream>>>(
             core,gdn_norm,head_trace,o_input,rows*kZ);
@@ -3134,7 +3134,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         deferred_mlp->rows!=rows || !deferred_mlp->post ||
         !deferred_mlp->mlp_input || projection_timing_ ||
         projection_observer_ ||
-        std::getenv("NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE")))
+        std::getenv("VOIDINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE")))
         throw std::invalid_argument("GDN deferred MLP contract");
     // Batched multi-agent rounds: this layer's own agent owns the leading
     // own_rows; peer agents' rows follow (run_peer_segment).
@@ -3155,7 +3155,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             "GDN split storage requires wide prefill for rows above private capacity");
     static std::atomic<int> prefill_stage_samples{0};
     const char* stage_sample_option=std::getenv(
-        "NINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
+        "VOIDINFER_EXL3_TEST_GDN_PREFILL_RECURRENCE_SAMPLE");
     const bool stage_sample=rows==1024 && wide_prefill &&
         stage_sample_option && std::strcmp(stage_sample_option,"1")==0 &&
         prefill_stage_samples.fetch_add(1,std::memory_order_relaxed)<2;
@@ -3251,9 +3251,9 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             workspace->target_initial16_candidate(metadata, rows, Exl3CudaLinearAdmission::target_initial16);
         // Wide passes of 9..32 rows (VeriCache verify blocks) take the coherent
         // M32 projections of batched decode rounds instead of the wide direct
-        // kernels (NINFER_EXL3_WIDE_M32=0 keeps those).
+        // kernels (VOIDINFER_EXL3_WIDE_M32=0 keeps those).
         static const bool wide_m32_enabled = [] {
-            const char* value = std::getenv("NINFER_EXL3_WIDE_M32");
+            const char* value = std::getenv("VOIDINFER_EXL3_WIDE_M32");
             return !value || std::strcmp(value, "0") != 0;
         }();
         const bool wide_m32 = wide_m32_enabled && rowwise && wide_prefill && rows > 8 && rows <= 32 &&
@@ -3316,7 +3316,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
             target_o_k7_candidate || target_z_k6_candidate || target_wide_candidate ||
             target_qkv_k6_candidate || target_k5_candidate || target_coherent_candidate;
         const char* fast_same_weights_fp16kv_decode = std::getenv(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
         const bool fast_same_weights_fp16kv_decode_candidate =
             reconstruct_gemm_ && rows == 1 && !wide_prefill && !capture_active_ &&
             fast_same_weights_fp16kv_decode &&
@@ -3522,14 +3522,14 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         preserve_m1_topology,rows,wide_prefill)==Exl3PairedTransformAdmission::admitted &&
         !wide_prefill && rows<=8;
     const auto* projection_chain_value=
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
     const auto* projection_chain_gdn_value=
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GDN");
+        std::getenv("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GDN");
     if(projection_chain_gdn_value &&
        std::strcmp(projection_chain_gdn_value,"0")!=0 &&
        std::strcmp(projection_chain_gdn_value,"1")!=0)
         throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GDN must be 0 or 1");
+            "VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GDN must be 0 or 1");
     const bool projection_chain=projection_chain_value &&
         std::strcmp(projection_chain_value,"1")==0 &&
         (!projection_chain_gdn_value ||
@@ -3539,15 +3539,15 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
         !dual_transform && !concurrent_qkvz;
     // Side-branch L2 prefetch of the head of each upcoming GEMV's weights,
     // forked before the preceding GEMV so it lands while the intervening
-    // reductions/small kernels leave DRAM idle (NINFER_EXL3_L2_PREFETCH_MB,
-    // default 8; NINFER_EXL3_L2_PREFETCH_SITES bitmask 1=O 2=gate 4=down
+    // reductions/small kernels leave DRAM idle (VOIDINFER_EXL3_L2_PREFETCH_MB,
+    // default 8; VOIDINFER_EXL3_L2_PREFETCH_SITES bitmask 1=O 2=gate 4=down
     // 8=successor qkv). The side stream rejoins at the end of the layer.
     static const std::size_t prefetch_bytes=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
+        const char* value=std::getenv("VOIDINFER_EXL3_L2_PREFETCH_MB");
         return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
     }();
     static const int prefetch_sites=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_SITES");
+        const char* value=std::getenv("VOIDINFER_EXL3_L2_PREFETCH_SITES");
         return value?std::atoi(value):15;
     }();
     // Single-row decode only (multi-row verify measured slower).
@@ -3748,7 +3748,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     }
     begin(9);
     const char* gdn_mgemm_pair = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR");
     const bool gdn_m1_gate_up_pair =
         fast_same_weights_fp16kv_gdn_m1_gate_up_pair_ &&
         gdn_mgemm_pair && std::strcmp(gdn_mgemm_pair,"1")==0 &&
@@ -3767,7 +3767,7 @@ void Exl3GdnLayer::forward(const std::uint16_t* input, std::uint16_t* output, in
     // Fused prefill MLP (quantized route, as in the attention layers): gate/up
     // stay untransformed and the quantized down input is produced in one pass.
     static const bool gdn_fused_mlp=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_FUSED_MLP");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_FUSED_MLP");
         return !value || std::strcmp(value,"0")!=0;
     }();
     const bool fused_prefill_mlp = gdn_fused_mlp && wide_prefill && reconstruct_gemm_ &&
@@ -4249,7 +4249,7 @@ void Exl3GdnLayer::forward_pair_staged_serial_for_test(
         Tensor tnorm(lane.gdn_norm, DType::BF16, {kHeadDim, kHeads, rows});
         Tensor nw(const_cast<std::uint16_t*>(lane.layer->weights_.gdn_norm),
                   DType::BF16, {kHeadDim});
-        ninfer::ops::gated_rmsnorm(tcore, nw, tz, kRmsEps, tnorm, stream);
+        voidinfer::ops::gated_rmsnorm(tcore, nw, tz, kRmsEps, tnorm, stream);
         exl3_launch_small(pack_heads_bf16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,
             lane.core, lane.head_trace, rows);
         exl3_launch_small(transpose_bf16_to_f16_kernel,dim3((rows * kZ + 255) / 256),dim3(256),0,stream,
@@ -4320,4 +4320,4 @@ void Exl3GdnLayer::forward_pair_staged_serial_for_test(
     }
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

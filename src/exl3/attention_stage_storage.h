@@ -11,7 +11,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3AttentionStageStorageProvider {
     cudaError_t (*allocate)(void**,std::size_t) noexcept=
         [](void** p,std::size_t n) noexcept {return cudaMalloc(p,n);};

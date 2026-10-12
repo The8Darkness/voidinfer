@@ -8,6 +8,7 @@
 // exact top logit by more than VERI_DELTA are replaced. VERI_EXACT_PREFILL=1
 // ingests the prompt with exact history too. Writes the generated tokens to
 // VERI_OUT and prints per-stage timings. Not a test.
+#include "exl3/engine_profile.h"
 #include "exl3/text_model.h"
 
 #include <cuda_runtime.h>
@@ -39,11 +40,12 @@ std::int64_t argmax(const std::vector<float>& logits) {
 
 int main() {
     try {
-        using namespace ninfer::exl3;
-        const char* target = std::getenv("NINFER_EXL3_TARGET_PATH");
+        voidinfer::exl3::apply_engine_profile();
+        using namespace voidinfer::exl3;
+        const char* target = std::getenv("VOIDINFER_EXL3_TARGET_PATH");
         const char* ids_path = std::getenv("VERI_IDS");
         const char* out_path = std::getenv("VERI_OUT");
-        if (!target || !ids_path || !out_path) { std::cerr << "set NINFER_EXL3_TARGET_PATH, VERI_IDS, VERI_OUT\n"; return 77; }
+        if (!target || !ids_path || !out_path) { std::cerr << "set VOIDINFER_EXL3_TARGET_PATH, VERI_IDS, VERI_OUT\n"; return 77; }
         const int context = env_int("VERI_CONTEXT", 16000);
         const int tokens = env_int("VERI_TOKENS", 512);
         const int block = env_int("VERI_BLOCK", 32);

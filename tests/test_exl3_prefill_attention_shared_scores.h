@@ -41,38 +41,38 @@ void run_prefill_attention_shared_scores_operator() {
         cuda_check(cudaMemcpy(output->get(),initialized.data(),output->bytes(),
             cudaMemcpyHostToDevice),"shared-score output canary upload");
 
-    ninfer::exl3::exl3_exact_attention_for_test(
+    voidinfer::exl3::exl3_exact_attention_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(reference.get())+1,
         static_cast<float*>(scores.get()),rows,position,capacity,true,nullptr,
         true,true,true,true,true,false,true,false,true,false,false,true);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(candidate.get())+1,
         rows,position,capacity);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(candidate256.get())+1,
         rows,position,capacity,nullptr,true);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(candidate_parallel.get())+1,
         rows,position,capacity,nullptr,false,true);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(candidate_head_split.get())+1,
         rows,position,capacity,nullptr,false,true,true);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
@@ -131,38 +131,38 @@ void run_prefill_attention_shared_scores_operator() {
                       &tail_candidate_dimension_split})
         cuda_check(cudaMemcpy(output->get(),tail_initialized.data(),output->bytes(),
             cudaMemcpyHostToDevice),"shared-score tail output canary upload");
-    ninfer::exl3::exl3_exact_attention_for_test(
+    voidinfer::exl3::exl3_exact_attention_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(tail_reference.get())+1,
         static_cast<float*>(scores.get()),tail_rows,tail_position,capacity,true,nullptr,
         true,true,true,true,true,false,true,false,true,false,false,true);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(tail_candidate.get())+1,
         tail_rows,tail_position,capacity);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(tail_candidate256.get())+1,
         tail_rows,tail_position,capacity,nullptr,true);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(tail_candidate_parallel.get())+1,
         tail_rows,tail_position,capacity,nullptr,false,true);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
         static_cast<std::uint16_t*>(tail_candidate_head_split.get())+1,
         tail_rows,tail_position,capacity,nullptr,false,true,true);
-    ninfer::exl3::exl3_prefill_attention_shared_scores_for_test(
+    voidinfer::exl3::exl3_prefill_attention_shared_scores_for_test(
         static_cast<const std::uint16_t*>(dq.get()),
         static_cast<const std::uint16_t*>(dk.get()),
         static_cast<const std::uint16_t*>(dv.get()),
@@ -218,42 +218,42 @@ void run_prefill_attention_shared_scores_operator() {
 }
 
 void run_prefill_attention_shared_scores_state(
-    ninfer::exl3::Exl3TextModel& target,
+    voidinfer::exl3::Exl3TextModel& target,
     const std::vector<std::int64_t>& fixture) {
-    using ninfer::exl3::exl3_prefill_attention_shared_score_global_snapshot;
+    using voidinfer::exl3::exl3_prefill_attention_shared_score_global_snapshot;
     require(fixture.size()>=4096,"shared-score state fixture extent");
-    const auto saved=env("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE");
+    const auto saved=env("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE");
     const auto saved_rows128=
-        env("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128");
+        env("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128");
     const auto saved_threads256=
-        env("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256");
+        env("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256");
     const auto saved_parallel_softmax=
-        env("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX");
+        env("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX");
     const auto saved_head_split256=
-        env("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256");
+        env("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256");
     const auto saved_dimension_split256=
-        env("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256");
+        env("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256");
     struct Result {
-        std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> request;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+        std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> request;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
         std::vector<float> logits;
-        ninfer::exl3::Exl3PrefillAttentionSharedScoreSnapshot counters;
+        voidinfer::exl3::Exl3PrefillAttentionSharedScoreSnapshot counters;
     };
-    const auto run=[&](ninfer::exl3::Exl3TextContext& context,const char* enabled,
+    const auto run=[&](voidinfer::exl3::Exl3TextContext& context,const char* enabled,
                        const char* rows128,const char* threads256,
                        const char* parallel_softmax,const char* head_split256,
                        const char* dimension_split256) {
-        _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE",enabled);
-        _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128",rows128);
-        _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256",threads256);
-        _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX",
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE",enabled);
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128",rows128);
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256",threads256);
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX",
             parallel_softmax);
-        _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256",
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256",
             head_split256);
-        _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256",
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256",
             dimension_split256);
         const auto before=exl3_prefill_attention_shared_score_global_snapshot();
-        auto request=ninfer::exl3::Exl3VeriCacheRequest::initialize(
+        auto request=voidinfer::exl3::Exl3VeriCacheRequest::initialize(
             context,std::span<const std::int64_t>(fixture.data(),4096),1024);
         cuda_check(cudaDeviceSynchronize(),"shared-score state completion");
         const auto after=exl3_prefill_attention_shared_score_global_snapshot();
@@ -312,16 +312,16 @@ void run_prefill_attention_shared_scores_state(
             second.counters.head_split256_launch_attempts==0 &&
             second.counters.dimension_split256_launch_attempts==160,
         "shared-score reset/reuse dispatch accounting");
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE",saved.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128",
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE",saved.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128",
         saved_rows128.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256",
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256",
         saved_threads256.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX",
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX",
         saved_parallel_softmax.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256",
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256",
         saved_head_split256.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256",
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256",
         saved_dimension_split256.c_str());
     std::cout << "PREFILL_ATTENTION_SHARED_SCORE_STATE PASS "
                  "first_launches=160 reset_launches=160 rows=63488 "

@@ -7,7 +7,7 @@
 #include <optional>
 #include <memory>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class Exl3DraftHostRing;
 enum class Exl3TargetSharedFamily {q,k,v,draft_q,o,gate,up,down,head,draft_k,draft_v,draft_o,draft_down,draft_gate,draft_up,count};
 enum class Exl3TargetSharedScope {target_layer,draft_layer,output_head};

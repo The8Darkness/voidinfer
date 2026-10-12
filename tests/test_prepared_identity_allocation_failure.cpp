@@ -29,7 +29,7 @@ void operator delete[](void* p,std::align_val_t) noexcept {_aligned_free(p);}
 void operator delete(void* p,std::size_t,std::align_val_t) noexcept {_aligned_free(p);}
 void operator delete[](void* p,std::size_t,std::align_val_t) noexcept {_aligned_free(p);}
 
-namespace family=ninfer::targets::qwen3_6;
+namespace family=voidinfer::targets::qwen3_6;
 using family::detail::ResidentPrefixIdentity;
 using family::detail::PrefixShortlistDigests;
 static void need(bool ok,const char* why){if(!ok)throw std::runtime_error(why);}
@@ -51,7 +51,7 @@ int main() {
         }
         need(finished && failures>=4,"identity allocation failure coverage missing");
         PrefixShortlistDigests initial;initial.assign(prompt);
-        const std::array<ninfer::TokenId,32> suffix{};
+        const std::array<voidinfer::TokenId,32> suffix{};
         auto digest_expected=initial;digest_expected.append_generated(suffix,0);
         finished=false;failures=0;
         for(long fail=0;fail<16;++fail) {

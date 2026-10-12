@@ -2,8 +2,8 @@
 #include "test_exl3_host_residency.h"
 
 struct T80Fp16ServingArm {
-    std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> request;
-    ninfer::exl3::Exl3VeriCacheServingPrefixCache::Metrics preparation;
+    std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> request;
+    voidinfer::exl3::Exl3VeriCacheServingPrefixCache::Metrics preparation;
     std::vector<std::int64_t> published;
     std::vector<double> publication_ms;
     double preparation_ms = 0.0;
@@ -34,9 +34,9 @@ void run_t80_fp16_serving(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
     constexpr std::size_t kPrompt = 4096;
     constexpr std::size_t kPrefix = 3968;
     constexpr std::size_t kTail = 128;
@@ -47,8 +47,8 @@ void run_t80_fp16_serving(
     require(!output.empty() && !std::filesystem::exists(output),
             "T80 output must be new");
     std::filesystem::create_directories(output);
-    const auto reserve_gib = std::stoull(env("NINFER_T80_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T80_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T80_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T80_CACHE_MIB"));
     require(reserve_gib >= 4 && cache_mib >= 512,
             "T80 memory policy extent");
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
@@ -66,13 +66,13 @@ void run_t80_fp16_serving(
         return state.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T80_NAMESPACE"), env("NINFER_T80_ARTIFACT_ID"),
-        env("NINFER_T80_TOKENIZER_ID"), env("NINFER_T80_CONFIGURATION_ID"),
-        env("NINFER_T80_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T80_NAMESPACE"), env("VOIDINFER_T80_ARTIFACT_ID"),
+        env("VOIDINFER_T80_TOKENIZER_ID"), env("VOIDINFER_T80_CONFIGURATION_ID"),
+        env("VOIDINFER_T80_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{4, 64, cache_budget, reserve}, identity);
-    ninfer::exl3::Exl3HostResidentSet residency(
+    voidinfer::exl3::Exl3HostResidentSet residency(
         memory.ullTotalPhys - reserve, reserve);
     auto cached_context = target.create_context(true);
     auto fresh_context = target.create_context(true);
@@ -89,14 +89,14 @@ void run_t80_fp16_serving(
             "T80 distinct tails");
 
     struct PinResult {
-        ninfer::exl3::Exl3HostResidentSet::Stats update;
+        voidinfer::exl3::Exl3HostResidentSet::Stats update;
         Exl3HostResidency observed;
     };
     const auto pin = [&](std::shared_ptr<const Request> active,
                          bool observe) {
         auto roots = cache.roots();
         if (active) roots.push_back(std::move(active));
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for (const auto& root : roots) snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,
             [&](const void* data, std::size_t bytes) { snapshot.add(data, bytes); },

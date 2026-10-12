@@ -5,7 +5,7 @@
 #include <optional>
 #include <mutex>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Request-local completion authority for host work which is allowed to run
 // while another lane owns pending numerical state.  The prepared value is
@@ -94,4 +94,4 @@ private:
     mutable std::mutex mutex_;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

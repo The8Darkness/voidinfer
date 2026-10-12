@@ -4,7 +4,7 @@
 
 #include <functional>
 
-namespace ninfer {
+namespace voidinfer {
 
 namespace detail {
 template<class Query,class Drain,class Retire>
@@ -102,4 +102,4 @@ private:
     bool custom_provider_ = false;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

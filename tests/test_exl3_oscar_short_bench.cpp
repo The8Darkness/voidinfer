@@ -13,7 +13,7 @@
 
 #include <cuda_runtime_api.h>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 
 namespace {
 
@@ -58,9 +58,9 @@ double bench_mode(Exl3TextModel& model, bool oscar) {
 
 int main() {
     try {
-        const auto target = env("NINFER_EXL3_TARGET_PATH");
+        const auto target = env("VOIDINFER_EXL3_TARGET_PATH");
         if (target.empty()) {
-            std::cerr << "bench skipped: set NINFER_EXL3_TARGET_PATH\n";
+            std::cerr << "bench skipped: set VOIDINFER_EXL3_TARGET_PATH\n";
             return 77;
         }
         const auto model = Exl3TextModel::load(target, 256);

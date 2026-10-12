@@ -1,5 +1,5 @@
 #pragma once
-// FP8 L2 pages for L0 OSCAR contexts (NINFER_EXL3_L0_L2_FP8=1): parked exact
+// FP8 L2 pages for L0 OSCAR contexts (VOIDINFER_EXL3_L0_L2_FP8=1): parked exact
 // host states keep their K/V history as e4m3 with one FP16 scale per (row, KV
 // head) (absmax / 448). Row-interleaved layout so pages extend in place:
 // row r = 1024 value bytes (4 heads x 256) + 4 FP16 scales = 516 uint16.
@@ -13,7 +13,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace ninfer::exl3::l0_l2_fp8 {
+namespace voidinfer::exl3::l0_l2_fp8 {
 
 constexpr int kRowBytes = 1032;
 constexpr int kRowWords = kRowBytes / 2;   // 516 uint16 per row
@@ -21,9 +21,9 @@ constexpr int kStagingRows = 16384;       // bounded staging window (multiple of
 
 inline bool enabled() {
     static const bool value = [] {
-        const char* v = std::getenv("NINFER_EXL3_L0_L2_FP8");
+        const char* v = std::getenv("VOIDINFER_EXL3_L0_L2_FP8");
         if (!v || !*v || std::strcmp(v, "0") == 0) return false;
-        if (std::strcmp(v, "1") != 0) throw std::invalid_argument("NINFER_EXL3_L0_L2_FP8 must be 0 or 1");
+        if (std::strcmp(v, "1") != 0) throw std::invalid_argument("VOIDINFER_EXL3_L0_L2_FP8 must be 0 or 1");
         return true;
     }();
     return value;
@@ -87,4 +87,4 @@ struct Staging {
 };
 inline Staging& staging() { static Staging value; return value; }
 
-}  // namespace ninfer::exl3::l0_l2_fp8
+}  // namespace voidinfer::exl3::l0_l2_fp8

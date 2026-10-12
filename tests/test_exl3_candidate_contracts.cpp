@@ -13,13 +13,13 @@ template<class F> void refuses(F&& body,const char* message) {
 }
 
 int main() try {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     require_engine_exact_route({"ordinary-host",Exl3NumericalRouteClass::exact,
         "host-kv-fp16","fp16",true,false},"host-kv-fp16","fp16");
-    require_engine_exact_route({"NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",
+    require_engine_exact_route({"VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",
         Exl3NumericalRouteClass::exact,"host-kv-fp16","fp16",true,false},
         "host-kv-fp16","fp16");
-    refuses([]{require_engine_exact_route({"NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",
+    refuses([]{require_engine_exact_route({"VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",
         Exl3NumericalRouteClass::exact,"host-kv-fp16","fp16",false,false},
         "host-kv-fp16","fp16");},"unqualified exact K7 route entered exact profile");
     refuses([]{require_engine_exact_route({"tiled-attention",Exl3NumericalRouteClass::numeric,

@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cuda_runtime_api.h>
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Qualification-only leaves: borrowed device spans, no allocation or environment
 // reads. The fixture owns full extents and synchronizes before reading/freeing.
 void gopt_gdn_conv_fixture(bool fused,const std::uint16_t* input,

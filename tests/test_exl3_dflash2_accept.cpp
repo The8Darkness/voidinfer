@@ -15,7 +15,7 @@
 // DFlash2 ON must reproduce the DFlash2-OFF greedy stream exactly
 // (paired control context, same prefix, same token count).
 //
-// Modes (NINFER_E5A4_MODE) include "accept" (default), "h6sweep", and the
+// Modes (VOIDINFER_E5A4_MODE) include "accept" (default), "h6sweep", and the
 // focused "transactionqual" gate.
 #include "scoped_environment.h"
 #include "exl3/text_model.h"
@@ -91,28 +91,28 @@
 
 namespace {
 
-using ninfer::exl3::Exl3TextModel;
-using ninfer::exl3::Exl3TextContext;
-using ninfer::exl3::Exl3Dflash2DraftModel;
+using voidinfer::exl3::Exl3TextModel;
+using voidinfer::exl3::Exl3TextContext;
+using voidinfer::exl3::Exl3Dflash2DraftModel;
 using DraftPositionConfidence = Exl3Dflash2DraftModel::DraftPositionConfidence;
-using ninfer::exl3::Exl3CudaLinearWorkspace;
-using ninfer::exl3::Exl3TargetProjectionPhase;
-using ninfer::exl3::Exl3TargetProjectionTiming;
-using ninfer::exl3::Exl3TargetProjectionTimingRecord;
-using ninfer::exl3::Exl3TargetProjectionTopology;
-using ninfer::exl3::exl3_fast_fused_flash_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_whole_context_fused_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_prefill_tiled_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_prefill_rows4_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_prefill_rows8_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_prefill_wmma_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_prefill_wmma32_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_prefill_rows2_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_online_decode_attention_calls_for_test;
-using ninfer::exl3::exl3_fast_cublas_attention_calls_for_test;
-using ninfer::exl3::target_projection_operator_name;
-using ninfer::exl3::target_projection_phase_name;
-using ninfer::exl3::target_projection_topology_name;
+using voidinfer::exl3::Exl3CudaLinearWorkspace;
+using voidinfer::exl3::Exl3TargetProjectionPhase;
+using voidinfer::exl3::Exl3TargetProjectionTiming;
+using voidinfer::exl3::Exl3TargetProjectionTimingRecord;
+using voidinfer::exl3::Exl3TargetProjectionTopology;
+using voidinfer::exl3::exl3_fast_fused_flash_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_whole_context_fused_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_prefill_tiled_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_prefill_rows4_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_prefill_rows8_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_prefill_wmma_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_prefill_wmma32_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_prefill_rows2_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_online_decode_attention_calls_for_test;
+using voidinfer::exl3::exl3_fast_cublas_attention_calls_for_test;
+using voidinfer::exl3::target_projection_operator_name;
+using voidinfer::exl3::target_projection_phase_name;
+using voidinfer::exl3::target_projection_topology_name;
 
 constexpr int kHidden = 5120;
 constexpr int kVocab = 248320;
@@ -207,7 +207,7 @@ std::vector<std::int64_t> load_ids(const std::string& path) {
 }
 
 std::int64_t sample_target(Exl3TextContext& ctx, cudaStream_t stream = nullptr) {
-    if (ninfer::exl3::exl3_device_greedy_enabled())
+    if (voidinfer::exl3::exl3_device_greedy_enabled())
         return ctx.greedy_packet(false, stream).decisions[0].token;
     const auto token = static_cast<std::int64_t>(argmax(ctx.logits_host(stream)));
     require(token >= 0 && token < kVocab, "sampled target token outside vocabulary");
@@ -374,9 +374,9 @@ static_assert(layer_major_retained_start(4097)==2048); // crossing call halo
 
 void diagnose_fast_device_prefill(Exl3TextContext& ctx,
     Exl3Dflash2DraftModel& draft,int total,bool fresh_window) {
-    if (env("NINFER_E5A4_MODE") != "fastdevicetxn" ||
-        env("NINFER_EXL3_TEST_FAST_DEVICE_REAL_DFLASH") != "1" ||
-        env("NINFER_EXL3_TEST_FAST_DEVICE_ROUND_STATE") != "1") return;
+    if (env("VOIDINFER_E5A4_MODE") != "fastdevicetxn" ||
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_REAL_DFLASH") != "1" ||
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_ROUND_STATE") != "1") return;
     const auto status=draft.fresh_prefill_status();
     const auto submitted=status.submitted_rows?status.submitted_rows:total;
     const auto encoded=status.submitted_rows?status.encoded_rows:total;
@@ -384,10 +384,10 @@ void diagnose_fast_device_prefill(Exl3TextContext& ctx,
             encoded+status.skipped_rows==submitted,
             "real draft prefill diagnostic coverage");
     const auto digest=draft.ring_digest();
-    const auto width=std::stoi(env("NINFER_EXL3_TEST_FAST_DEVICE_REAL_WIDTH"));
+    const auto width=std::stoi(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_REAL_WIDTH"));
     std::array<std::int64_t,8> block{};
     block.fill(248070);
-    block[0]=ninfer::exl3::exl3_branch_greedy(ctx);
+    block[0]=voidinfer::exl3::exl3_branch_greedy(ctx);
     const auto proposed=draft.propose_cached_view(
         std::span<const std::int64_t>(block).first(width),total,
         ctx.target_embedding(),ctx.target_lm_head_weights(),
@@ -407,7 +407,7 @@ void diagnose_fast_device_prefill(Exl3TextContext& ctx,
     std::cout<<" first_proposal="<<block[0];
     for(const auto token:proposed)std::cout<<','<<token;
     std::cout<<'\n';
-    const auto ring_path=env("NINFER_EXL3_TEST_FAST_DEVICE_PREFILL_RING_OUT");
+    const auto ring_path=env("VOIDINFER_EXL3_TEST_FAST_DEVICE_PREFILL_RING_OUT");
     require(!ring_path.empty(),"real draft prefill ring output path");
     const auto represented=draft.export_host_ring(nullptr,false);
     const auto written=represented->write_represented_payload_for_test(ring_path);
@@ -425,7 +425,7 @@ void diagnose_fast_device_prefill(Exl3TextContext& ctx,
 // captured row to the draft ring in its original absolute order.
 double ingest_prefix(Exl3TextContext& ctx, const std::vector<std::int64_t>& prefix,
                      CommitSink sink) {
-    const auto chunk_setting = env("NINFER_EXL3_PREFILL_CHUNK");
+    const auto chunk_setting = env("VOIDINFER_EXL3_PREFILL_CHUNK");
     require(chunk_setting.empty() || chunk_setting == "1" || chunk_setting == "8" || chunk_setting == "16" || chunk_setting == "32" || chunk_setting == "64" || chunk_setting == "128" || chunk_setting == "256" || chunk_setting == "512" || chunk_setting == "1024",
             "prefill chunk must be empty,1,8,16,32,64 or128,256,512,1024");
     const bool wide = chunk_setting == "16" || chunk_setting == "32" || chunk_setting == "64" || chunk_setting == "128" || chunk_setting == "256" || chunk_setting == "512" || chunk_setting == "1024";
@@ -434,8 +434,8 @@ double ingest_prefix(Exl3TextContext& ctx, const std::vector<std::int64_t>& pref
     const int total = static_cast<int>(prefix.size());
     require(total >= 32, "E5A4 prefix too short for a window plus anchor");
     const auto t0 = std::chrono::steady_clock::now();
-    const bool fresh_window = sink.draft && env("NINFER_DFLASH2_PREFILL_WINDOW") == "1";
-    const bool layer_major = env("NINFER_EXL3_FAST_LAYER_MAJOR_PREFILL") == "1";
+    const bool fresh_window = sink.draft && env("VOIDINFER_DFLASH2_PREFILL_WINDOW") == "1";
+    const bool layer_major = env("VOIDINFER_EXL3_FAST_LAYER_MAJOR_PREFILL") == "1";
     require(!fresh_window || chunked, "fresh draft prefill window requires chunked suffix");
     require(!layer_major || !sink.draft ||
             (sink.stage && fresh_window && wide_rows==1024 &&
@@ -443,9 +443,9 @@ double ingest_prefix(Exl3TextContext& ctx, const std::vector<std::int64_t>& pref
             "layer-major draft bridge requires scoped 4K/16K wide1024");
     if (sink.overlap) {
         require(sink.draft && sink.stage && fresh_window && wide_rows == 1024 &&
-                    total == 4096 && env("NINFER_DFLASH2_PREFILL_BATCH") == "1" &&
-                    env("NINFER_EXL3_WIDE_PREFILL") == "1" &&
-                    env("NINFER_EXL3_PREFILL_WIDE1024") == "1",
+                    total == 4096 && env("VOIDINFER_DFLASH2_PREFILL_BATCH") == "1" &&
+                    env("VOIDINFER_EXL3_WIDE_PREFILL") == "1" &&
+                    env("VOIDINFER_EXL3_PREFILL_WIDE1024") == "1",
                 "route prefill overlap requires qualified eager 4K wide1024 fresh route");
         auto& route = *sink.overlap;
         try {
@@ -883,10 +883,10 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     require(block_len >= 2 && block_len <= draft.block_capacity(), "E5A4 block length outside capacity");
     const int k = block_len - 1;
     ConfigResult out;
-    out.output_budget = env_int("NINFER_E5A4_OUTPUT_BUDGET", 0);
+    out.output_budget = env_int("VOIDINFER_E5A4_OUTPUT_BUDGET", 0);
     require(out.output_budget >= 0,
             "E5A4 output budget must be nonnegative");
-    const std::string verifier = env("NINFER_E5A4_VERIFIER");
+    const std::string verifier = env("VOIDINFER_E5A4_VERIFIER");
     require(verifier.empty() || verifier == "serial" || verifier == "transaction" ||
                 verifier == "transaction_retain",
             "E5A4 VERIFIER must be serial, transaction, or transaction_retain");
@@ -897,31 +897,31 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     require(!out.transaction_route || oscar,
             "transaction verifier requires canonical OSCAR");
     const std::string continuation_graph_value =
-        env("NINFER_E5A4_CONTINUATION_GRAPH_B8");
+        env("VOIDINFER_E5A4_CONTINUATION_GRAPH_B8");
     require(continuation_graph_value.empty() || continuation_graph_value == "0" ||
                 continuation_graph_value == "1",
             "fixed-B8 continuation graph flag must be 0 or 1");
     const std::string continuation_cohort_value =
-        env("NINFER_OSCAR_CONTINUATION_COHORT_B8");
+        env("VOIDINFER_OSCAR_CONTINUATION_COHORT_B8");
     require(continuation_cohort_value.empty() || continuation_cohort_value == "0" ||
                 continuation_cohort_value == "1",
             "OSCAR continuation cohort B8 flag must be 0 or 1");
     const bool continuation_graph = continuation_graph_value == "1";
     const bool continuation_cohort = continuation_cohort_value == "1";
     const std::string adaptive_block_value =
-        env("NINFER_E5A4_ADAPTIVE_BLOCK_LAG1");
+        env("VOIDINFER_E5A4_ADAPTIVE_BLOCK_LAG1");
     require(adaptive_block_value.empty() || adaptive_block_value == "0" ||
                 adaptive_block_value == "1",
             "adaptive block lag1 flag must be 0 or 1");
     const bool adaptive_eager_block = adaptive_block_value == "1";
     const std::string adaptive_graph_value =
-        env("NINFER_E5A4_ADAPTIVE_GRAPH_LAG1");
+        env("VOIDINFER_E5A4_ADAPTIVE_GRAPH_LAG1");
     require(adaptive_graph_value.empty() || adaptive_graph_value == "0" ||
                 adaptive_graph_value == "1",
             "adaptive graph lag1 flag must be 0 or 1");
     const bool adaptive_graph_block = adaptive_graph_value == "1";
     const std::string confidence_forced_graph_value =
-        env("NINFER_E5A4_CONFIDENCE_FORCED_GRAPH_BLOCK");
+        env("VOIDINFER_E5A4_CONFIDENCE_FORCED_GRAPH_BLOCK");
     require(confidence_forced_graph_value.empty() ||
                 confidence_forced_graph_value == "0" ||
                 confidence_forced_graph_value == "4" ||
@@ -935,7 +935,7 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     const bool confidence_cost_calibration =
         confidence_forced_graph_block != 0;
     const std::string confidence_policy_value =
-        env("NINFER_E5A4_CONFIDENCE_POLICY");
+        env("VOIDINFER_E5A4_CONFIDENCE_POLICY");
     require(confidence_policy_value.empty() || confidence_policy_value == "0" ||
                 confidence_policy_value == "1",
             "confidence policy flag must be 0 or 1");
@@ -943,12 +943,12 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     T73ConfidencePolicy confidence_policy;
     if (confidence_policy_active) {
         const std::string policy_path =
-            env("NINFER_E5A4_CONFIDENCE_POLICY_FILE");
+            env("VOIDINFER_E5A4_CONFIDENCE_POLICY_FILE");
         require(!policy_path.empty(), "confidence policy requires a policy file");
         confidence_policy = load_t73_confidence_policy(policy_path);
     }
     const std::string adaptive_graph_min6_value =
-        env("NINFER_E5A4_ADAPTIVE_GRAPH_MIN6");
+        env("VOIDINFER_E5A4_ADAPTIVE_GRAPH_MIN6");
     require(adaptive_graph_min6_value.empty() ||
                 adaptive_graph_min6_value == "0" ||
                 adaptive_graph_min6_value == "1",
@@ -958,30 +958,30 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
             "adaptive eager and graph lag1 flags are mutually exclusive");
     require(!confidence_cost_calibration ||
                 (!adaptive_eager_block && !adaptive_graph_block &&
-                 env("NINFER_DFLASH2_POSITION_CONFIDENCE") == "1"),
+                 env("VOIDINFER_DFLASH2_POSITION_CONFIDENCE") == "1"),
             "confidence forced graph block requires confidence telemetry and no adaptive lag1 policy");
     require(!confidence_policy_active ||
                 (!confidence_cost_calibration && !adaptive_eager_block &&
                  !adaptive_graph_block &&
-                 env("NINFER_DFLASH2_POSITION_CONFIDENCE") == "1"),
+                 env("VOIDINFER_DFLASH2_POSITION_CONFIDENCE") == "1"),
             "confidence policy requires confidence telemetry and excludes forced/adaptive policies");
     require(!adaptive_graph_min6 || adaptive_graph_block,
             "adaptive graph min6 requires adaptive graph lag1");
     const bool adaptive_block = adaptive_eager_block || adaptive_graph_block;
     const std::string final_state_check_value =
-        env("NINFER_E5A4_FINAL_STATE_CHECK");
+        env("VOIDINFER_E5A4_FINAL_STATE_CHECK");
     require(final_state_check_value.empty() || final_state_check_value == "0" ||
                 final_state_check_value == "1",
             "final state check flag must be 0 or 1");
     const bool final_state_check = final_state_check_value == "1";
     const std::string measure_teardown_value =
-        env("NINFER_E5A4_MEASURE_CONTEXT_TEARDOWN");
+        env("VOIDINFER_E5A4_MEASURE_CONTEXT_TEARDOWN");
     require(measure_teardown_value.empty() || measure_teardown_value == "0" ||
                 measure_teardown_value == "1",
             "context teardown measurement flag must be 0 or 1");
     const bool measure_teardown = measure_teardown_value == "1";
     const std::string continuation_gdn_qkvz_value =
-        env("NINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT");
+        env("VOIDINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT");
     require(continuation_gdn_qkvz_value.empty() ||
                 continuation_gdn_qkvz_value == "0" ||
                 continuation_gdn_qkvz_value == "1",
@@ -989,7 +989,7 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     const bool continuation_gdn_qkvz =
         continuation_graph && continuation_gdn_qkvz_value == "1";
     const std::string prefill_overlap_value =
-        env("NINFER_EXL3_DRAFT_PREFILL_OVERLAP");
+        env("VOIDINFER_EXL3_DRAFT_PREFILL_OVERLAP");
     require(prefill_overlap_value.empty() || prefill_overlap_value == "0" ||
                 prefill_overlap_value == "1",
             "draft prefill overlap flag must be 0 or 1");
@@ -997,29 +997,29 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     require(!adaptive_eager_block ||
                 (out.retain_prefix_route && block_len == 8 &&
                  !continuation_graph && !handoff_profile &&
-                 env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
+                 env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
             "adaptive block lag1 requires uninstrumented eager transaction-retain capacity B8");
     require(!adaptive_graph_block ||
                 (out.retain_prefix_route && block_len == 8 &&
                  continuation_graph && continuation_cohort &&
                  !handoff_profile &&
-                 env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
+                 env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
             "adaptive graph lag1 requires uninstrumented transaction-retain graph capacity B8");
     require(!confidence_cost_calibration ||
                 (out.retain_prefix_route && block_len == 8 &&
                  continuation_graph && continuation_cohort &&
                  !handoff_profile &&
-                 env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
+                 env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
             "confidence forced graph block requires uninstrumented transaction-retain graph capacity B8");
     require(!confidence_policy_active ||
                 (out.retain_prefix_route && block_len == 8 &&
                  continuation_graph && continuation_cohort &&
                  !handoff_profile &&
-                 env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
+                 env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
             "confidence policy requires uninstrumented transaction-retain graph capacity B8");
     require(!continuation_graph ||
                 (out.transaction_route && block_len == 8 && oscar && !handoff_profile &&
-                 env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
+                 env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty()),
             "fixed-B8 continuation graph requires uninstrumented OSCAR transaction B8");
     if (continuation_graph)
         out.verification_route += continuation_cohort
@@ -1260,8 +1260,8 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
             round_k = round_block_len - 1;
         }
         rec.attempted_block = round_block_len;
-        if (r == 0 && !env("NINFER_E5A4_TOPK_CHECK_OUT").empty())
-            check_real_topk(draft, draft_k, env("NINFER_E5A4_TOPK_CHECK_OUT"));
+        if (r == 0 && !env("VOIDINFER_E5A4_TOPK_CHECK_OUT").empty())
+            check_real_topk(draft, draft_k, env("VOIDINFER_E5A4_TOPK_CHECK_OUT"));
         {
             std::ostringstream ids;
             for (std::size_t i = 0; i < proposals.size(); ++i) {
@@ -1272,7 +1272,7 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
         }
         // Explicit untimed diagnostic run only. Ordinary performance runs leave
         // this unset; the copy/file write is intentionally outside draft_us.
-        const auto capture_path = env("NINFER_E5A5H_CAPTURE");
+        const auto capture_path = env("VOIDINFER_E5A5H_CAPTURE");
         if (r == 0 && !capture_path.empty()) {
             std::vector<std::uint16_t> head_input(
                 static_cast<std::size_t>(round_k) * kHidden);
@@ -1374,29 +1374,29 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
                             rec.replay_rows,
                     "target projection timing phase count mismatch");
             const bool target_kv_small_m_requested =
-                env("NINFER_EXL3_TARGET_KV_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_KV_SMALL_M") == "1";
             const bool target_gateup_k5_small_m_requested =
-                env("NINFER_EXL3_TARGET_GATEUP_K5_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_GATEUP_K5_SMALL_M") == "1";
             const bool target_k5_small_m_batch_requested =
-                env("NINFER_EXL3_TARGET_K5_SMALL_M_BATCH") == "1";
+                env("VOIDINFER_EXL3_TARGET_K5_SMALL_M_BATCH") == "1";
             const bool target_gateup_small_m_requested =
-                env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1";
             const bool target_gateup_k7_small_m_requested =
-                env("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M") == "1";
             const bool target_down_small_m_requested =
-                env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M") == "1";
             const bool target_down_k7_small_m_requested =
-                env("NINFER_EXL3_TARGET_DOWN_K7_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_DOWN_K7_SMALL_M") == "1";
             const bool target_o_k6_small_m_requested =
-                env("NINFER_EXL3_TARGET_O_K6_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_O_K6_SMALL_M") == "1";
             const bool target_o_k7_small_m_requested =
-                env("NINFER_EXL3_TARGET_O_K7_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M") == "1";
             const bool target_qkv_k6_small_m_requested =
-                env("NINFER_EXL3_TARGET_QKV_K6_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M") == "1";
             const bool target_q_k6_small_m_requested =
-                env("NINFER_EXL3_TARGET_Q_K6_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M") == "1";
             const bool target_z_k6_small_m_requested =
-                env("NINFER_EXL3_TARGET_Z_K6_SMALL_M") == "1";
+                env("VOIDINFER_EXL3_TARGET_Z_K6_SMALL_M") == "1";
             for (const auto& timing : timings) {
                 if (timing.layer < 0) continue;
                 const bool attempt =
@@ -1406,66 +1406,66 @@ ConfigResult run_config(Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
                                 (target_gateup_k7_small_m_requested && timing.K == 7) ||
                                 (target_gateup_k5_small_m_requested && timing.K == 5)) &&
                     (timing.operation ==
-                         ninfer::exl3::Exl3TargetProjectionOperator::gate ||
+                         voidinfer::exl3::Exl3TargetProjectionOperator::gate ||
                      timing.operation ==
-                         ninfer::exl3::Exl3TargetProjectionOperator::up) &&
+                         voidinfer::exl3::Exl3TargetProjectionOperator::up) &&
                     timing.in_features == 5120 && timing.out_features == 17408;
                 const bool down_candidate_eligible =
                     attempt && target_down_small_m_requested &&
                     timing.operation ==
-                        ninfer::exl3::Exl3TargetProjectionOperator::down &&
+                        voidinfer::exl3::Exl3TargetProjectionOperator::down &&
                     timing.K == 6 && timing.in_features == 17408 &&
                     timing.out_features == 5120;
                 const bool o_k7_candidate_eligible =
                     attempt && target_o_k7_small_m_requested &&
                     timing.operation ==
-                        ninfer::exl3::Exl3TargetProjectionOperator::o &&
+                        voidinfer::exl3::Exl3TargetProjectionOperator::o &&
                     timing.K == 7 && timing.in_features == 6144 &&
                     timing.out_features == 5120;
                 const bool o_k6_candidate_eligible =
                     attempt && target_o_k6_small_m_requested &&
                     timing.operation ==
-                        ninfer::exl3::Exl3TargetProjectionOperator::o &&
+                        voidinfer::exl3::Exl3TargetProjectionOperator::o &&
                     timing.K == 6 && timing.in_features == 6144 &&
                     timing.out_features == 5120;
                 const bool down_k7_candidate_eligible =
                     attempt && target_down_k7_small_m_requested &&
                     timing.operation ==
-                        ninfer::exl3::Exl3TargetProjectionOperator::down &&
+                        voidinfer::exl3::Exl3TargetProjectionOperator::down &&
                     timing.K == 7 && timing.in_features == 17408 &&
                     timing.out_features == 5120;
                 const bool z_k6_candidate_eligible =
                     attempt && target_z_k6_small_m_requested &&
-                    timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::z &&
+                    timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::z &&
                     timing.K == 6 && timing.in_features == 5120 &&
                     timing.out_features == 6144;
                 const bool qkv_k6_candidate_eligible =
                     attempt && target_qkv_k6_small_m_requested &&
-                    timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::qkv &&
+                    timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::qkv &&
                     timing.K == 6 && timing.in_features == 5120 &&
                     timing.out_features == 10240 && timing.rows >= 2 && timing.rows <= 8;
                 const bool q_k6_candidate_eligible =
                     attempt && target_q_k6_small_m_requested &&
-                    timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::q &&
+                    timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::q &&
                     timing.K == 6 && timing.in_features == 5120 &&
                     timing.out_features == 12288 && timing.rows >= 2 && timing.rows <= 8;
                 const bool kv_candidate_eligible = attempt && target_kv_small_m_requested &&
-                    (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::k || timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::v) &&
+                    (timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::k || timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::v) &&
                     (timing.K == 7 || timing.K == 8) && timing.in_features == 5120 && timing.out_features == 1024;
                 const bool k5_batch_candidate_eligible = attempt &&
                     target_k5_small_m_batch_requested && timing.K == 5 &&
-                    ((timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::q &&
+                    ((timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::q &&
                       timing.in_features == 5120 && timing.out_features == 12288) ||
-                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::qkv &&
+                     (timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::qkv &&
                       timing.in_features == 5120 && timing.out_features == 10240) ||
-                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::z &&
+                     (timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::z &&
                       timing.in_features == 5120 && timing.out_features == 6144) ||
-                     ((timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::k ||
-                       timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::v) &&
+                     ((timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::k ||
+                       timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::v) &&
                       timing.in_features == 5120 && timing.out_features == 1024) ||
-                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::o &&
+                     (timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::o &&
                       timing.in_features == 6144 && timing.out_features == 5120) ||
-                     (timing.operation == ninfer::exl3::Exl3TargetProjectionOperator::down &&
+                     (timing.operation == voidinfer::exl3::Exl3TargetProjectionOperator::down &&
                       timing.in_features == 17408 && timing.out_features == 5120));
                 const bool candidate_eligible =
                     gateup_candidate_eligible || down_candidate_eligible ||
@@ -2133,7 +2133,7 @@ void write_target_projection_timing(const std::string& family, int ctx,
 #include "test_exl3_media_draft.h"
 #include "test_exl3_recurrent_export_authority.h"
 #include "test_exl3_real_dflash_screens.h"
-#if defined(NINFER_V1_EXPORT) || defined(NINFER_V1_CONSUME)
+#if defined(VOIDINFER_V1_EXPORT) || defined(VOIDINFER_V1_CONSUME)
 #include "test_exl3_v1_oracle_state.h"
 #else
 #include "test_exl3_wide_prefill_state.h"
@@ -2167,20 +2167,20 @@ void write_target_projection_timing(const std::string& family, int ctx,
 int main() {
     const auto entry_stamp = TtftTrace::stamp();
     try {
-        const auto target_path = env("NINFER_EXL3_TARGET_PATH");
-        const auto draft_path = env("NINFER_EXL3_DFLASH2_PATH");
-        const std::string mode = env("NINFER_E5A4_MODE");
-#if defined(NINFER_V1_EXPORT) || defined(NINFER_V1_CONSUME)
+        const auto target_path = env("VOIDINFER_EXL3_TARGET_PATH");
+        const auto draft_path = env("VOIDINFER_EXL3_DFLASH2_PATH");
+        const std::string mode = env("VOIDINFER_E5A4_MODE");
+#if defined(VOIDINFER_V1_EXPORT) || defined(VOIDINFER_V1_CONSUME)
         require(mode == "prefillwidestate", "V1 executable only supports exact state qualification");
 #endif
         if (mode == "graphplanboundary") {
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!out_path.empty(), "graphplanboundary needs OUT");
             run_graph_plan_boundary(out_path);
             return 0;
         }
         if (mode == "oscardefaultconstruction") {
-            run_oscar_default_construction(env("NINFER_E5A4_OUT"));
+            run_oscar_default_construction(env("VOIDINFER_E5A4_OUT"));
             return 0;
         }
         int targetrequest_count = 0, targetrequest_outputs = 0;
@@ -2194,74 +2194,74 @@ int main() {
             targetrequest_rounds_path;
         if (mode == "targetrequest") {
             const bool decode_projection_diagnostic=
-                !env("NINFER_E5A4_TARGETREQUEST_DECODE_PROJECTION_PROFILE").empty();
-            for (const auto* name : {"NINFER_E5A4_TTFT_OUT", "NINFER_E5A4_HANDOFF_PROFILE_PREFIX",
-                 "NINFER_EXL3_TARGET_PROJECTION_TIMING_OUT", "NINFER_E5A4_RING_CHECK_OUT",
-                 "NINFER_E5A5H_CAPTURE"})
+                !env("VOIDINFER_E5A4_TARGETREQUEST_DECODE_PROJECTION_PROFILE").empty();
+            for (const auto* name : {"VOIDINFER_E5A4_TTFT_OUT", "VOIDINFER_E5A4_HANDOFF_PROFILE_PREFIX",
+                 "VOIDINFER_EXL3_TARGET_PROJECTION_TIMING_OUT", "VOIDINFER_E5A4_RING_CHECK_OUT",
+                 "VOIDINFER_E5A5H_CAPTURE"})
                 require(env(name).empty(), "targetrequest forbids profiling outputs");
             require(decode_projection_diagnostic?
-                    env("NINFER_EXL3_TARGET_PROJECTION_TIMING")=="1":
-                    (env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty() ||
-                     env("NINFER_EXL3_TARGET_PROJECTION_TIMING")=="0"),
+                    env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING")=="1":
+                    (env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty() ||
+                     env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING")=="0"),
                 "targetrequest projection timing requires its explicit diagnostic output");
-            for (const auto* name : {"NINFER_E5A4_GRAPH",
-                 "NINFER_EXL3_GRAPH", "NINFER_E5A4_NVTX"})
+            for (const auto* name : {"VOIDINFER_E5A4_GRAPH",
+                 "VOIDINFER_EXL3_GRAPH", "VOIDINFER_E5A4_NVTX"})
                 require(env(name).empty() || env(name) == "0", "targetrequest eager uninstrumented only");
-            const auto ordinary_fp16=env("NINFER_TARGETREQUEST_ORDINARY_FP16");
+            const auto ordinary_fp16=env("VOIDINFER_TARGETREQUEST_ORDINARY_FP16");
             require(ordinary_fp16.empty() || ordinary_fp16=="0" || ordinary_fp16=="1",
                     "targetrequest ordinary FP16 option must be 0 or 1");
             targetrequest_ordinary_fp16=ordinary_fp16=="1";
             targetrequest_exact_host_kv=
                 !targetrequest_ordinary_fp16 &&
-                env("NINFER_EXL3_EXACT_HOST_KV")=="1";
-            require(env("NINFER_EXL3_TARGET_QKV_K6_SMALL_M") == "1" &&
-                    env("NINFER_DFLASH2_PREFILL_WINDOW") == "0",
+                env("VOIDINFER_EXL3_EXACT_HOST_KV")=="1";
+            require(env("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M") == "1" &&
+                    env("VOIDINFER_DFLASH2_PREFILL_WINDOW") == "0",
                     "targetrequest requires P9 QKV1/P10 off");
             if(targetrequest_ordinary_fp16) {
-                require((env("NINFER_OSCAR_EXL3").empty() || env("NINFER_OSCAR_EXL3")=="0") &&
-                        (env("NINFER_EXL3_EXACT_HOST_KV").empty() || env("NINFER_EXL3_EXACT_HOST_KV")=="0"),
+                require((env("VOIDINFER_OSCAR_EXL3").empty() || env("VOIDINFER_OSCAR_EXL3")=="0") &&
+                        (env("VOIDINFER_EXL3_EXACT_HOST_KV").empty() || env("VOIDINFER_EXL3_EXACT_HOST_KV")=="0"),
                         "targetrequest ordinary FP16 requires device KV and OSCAR off");
             } else if(targetrequest_exact_host_kv) {
-                require(env("NINFER_OSCAR_EXL3").empty() || env("NINFER_OSCAR_EXL3")=="0",
+                require(env("VOIDINFER_OSCAR_EXL3").empty() || env("VOIDINFER_OSCAR_EXL3")=="0",
                         "targetrequest exact HostKV requires OSCAR off");
-            } else require(env("NINFER_OSCAR_EXL3") == "1",
+            } else require(env("VOIDINFER_OSCAR_EXL3") == "1",
                     "targetrequest requires exact HostKV, canonical OSCAR, or ordinary FP16 device KV");
             const auto* allow_projection_nvtx =
-                std::getenv("NINFER_EXL3_TARGETREQUEST_ALLOW_PROJECTION_NVTX");
-            require(std::getenv("NINFER_EXL3_PROJECTION_NVTX") == nullptr ||
+                std::getenv("VOIDINFER_EXL3_TARGETREQUEST_ALLOW_PROJECTION_NVTX");
+            require(std::getenv("VOIDINFER_EXL3_PROJECTION_NVTX") == nullptr ||
                     (allow_projection_nvtx &&
                      std::strcmp(allow_projection_nvtx, "1") == 0),
                     "targetrequest forbids projection NVTX unless explicitly diagnostic-gated");
-            const std::string context_count_setting = env("NINFER_TARGETREQUEST_CONTEXT_COUNT");
+            const std::string context_count_setting = env("VOIDINFER_TARGETREQUEST_CONTEXT_COUNT");
             targetrequest_context_mode = !context_count_setting.empty();
             require(!targetrequest_ordinary_fp16 || !targetrequest_context_mode,
                     "targetrequest ordinary FP16 supports physical C1 only");
-            require(targetrequest_context_mode || env("NINFER_TARGETREQUEST_SOURCE_OFFSET").empty(),
+            require(targetrequest_context_mode || env("VOIDINFER_TARGETREQUEST_SOURCE_OFFSET").empty(),
                     "targetrequest source offset requires explicit context count");
             if (targetrequest_context_mode) {
                 require(context_count_setting == "1" || context_count_setting == "2" ||
                             context_count_setting == "4" || context_count_setting == "8",
                         "targetrequest context count must be exactly 1, 2, 4, or 8");
                 targetrequest_context_count = std::stoi(context_count_setting);
-                require(env("NINFER_E5A4_MAXCTX") == "1024",
+                require(env("VOIDINFER_E5A4_MAXCTX") == "1024",
                         "targetrequest context benchmark requires maxctx1024");
-                require(env("NINFER_EXL3_PREFILL_ROWPAIR_K6") == "0",
+                require(env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6") == "0",
                         "targetrequest context benchmark requires rowpair0");
-                const auto prefill_chunk = env("NINFER_EXL3_PREFILL_CHUNK");
+                const auto prefill_chunk = env("VOIDINFER_EXL3_PREFILL_CHUNK");
                 if (prefill_chunk == "128") {
-                    const auto slab = env("NINFER_EXL3_GDN_WIDE_SLAB");
-                    require(env("NINFER_EXL3_WIDE_PREFILL") == "1" &&
-                                env("NINFER_EXL3_PREFILL_WIDE64") == "1" &&
-                                env("NINFER_EXL3_PREFILL_WIDE128") == "1" &&
-                                env("NINFER_EXL3_PREFILL_WIDE256") == "0" &&
-                                env("NINFER_EXL3_PREFILL_WIDE512") == "0" &&
-                                env("NINFER_EXL3_PREFILL_WIDE1024") == "0" &&
-                                env("NINFER_EXL3_PREFILL_STAGED_REDUCTION") == "1" &&
-                                env("NINFER_EXL3_PREFILL_STAGED_SHAPE4") == "1" &&
-                                env("NINFER_EXL3_PREFILL_GDN_RESIDENT") == "1" &&
-                                env("NINFER_EXL3_SHARED_ACCUM") == "1" &&
-                                env("NINFER_EXL3_SHARED_TRANSFORM") == "1" &&
-                                env("NINFER_EXL3_SHARED_LAYER_SCRATCH") == "1" &&
+                    const auto slab = env("VOIDINFER_EXL3_GDN_WIDE_SLAB");
+                    require(env("VOIDINFER_EXL3_WIDE_PREFILL") == "1" &&
+                                env("VOIDINFER_EXL3_PREFILL_WIDE64") == "1" &&
+                                env("VOIDINFER_EXL3_PREFILL_WIDE128") == "1" &&
+                                env("VOIDINFER_EXL3_PREFILL_WIDE256") == "0" &&
+                                env("VOIDINFER_EXL3_PREFILL_WIDE512") == "0" &&
+                                env("VOIDINFER_EXL3_PREFILL_WIDE1024") == "0" &&
+                                env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION") == "1" &&
+                                env("VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4") == "1" &&
+                                env("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT") == "1" &&
+                                env("VOIDINFER_EXL3_SHARED_ACCUM") == "1" &&
+                                env("VOIDINFER_EXL3_SHARED_TRANSFORM") == "1" &&
+                                env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH") == "1" &&
                                 (slab.empty() || slab == "1"),
                             "targetrequest context benchmark requires the P17 wide128 overlay");
                 } else {
@@ -2269,7 +2269,7 @@ int main() {
                             "targetrequest context benchmark allows chunk1024 only for count1");
                 }
             } else {
-                require(env("NINFER_EXL3_PREFILL_CHUNK") == "1024",
+                require(env("VOIDINFER_EXL3_PREFILL_CHUNK") == "1024",
                         "targetrequest qualified chunk1024 only");
             }
             // Explicit output count includes the seed; the final sampled token remains pending.
@@ -2281,11 +2281,11 @@ int main() {
                 require(value >= 1 && value <= std::numeric_limits<int>::max(), "targetrequest integer extent");
                 return static_cast<int>(value);
             };
-            targetrequest_count = strict_count("NINFER_E5A4_CONTEXTS");
-            targetrequest_outputs = strict_count("NINFER_TARGETREQUEST_OUTPUTS");
-            targetrequest_prefix = load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+            targetrequest_count = strict_count("VOIDINFER_E5A4_CONTEXTS");
+            targetrequest_outputs = strict_count("VOIDINFER_TARGETREQUEST_OUTPUTS");
+            targetrequest_prefix = load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
             if (targetrequest_context_mode) {
-                const auto offset_text = env("NINFER_TARGETREQUEST_SOURCE_OFFSET");
+                const auto offset_text = env("VOIDINFER_TARGETREQUEST_SOURCE_OFFSET");
                 require(offset_text.empty() ||
                             offset_text.find_first_not_of("0123456789") == std::string::npos,
                         "targetrequest source offset must be a nonnegative integer");
@@ -2322,14 +2322,14 @@ int main() {
                         "targetrequest context benchmark output extent");
             } else {
                 require(targetrequest_count >= 32 && static_cast<std::size_t>(targetrequest_count) <= targetrequest_prefix.size() &&
-                        static_cast<std::int64_t>(targetrequest_count) + targetrequest_outputs - 1 <= strict_count("NINFER_E5A4_MAXCTX"),
+                        static_cast<std::int64_t>(targetrequest_count) + targetrequest_outputs - 1 <= strict_count("VOIDINFER_E5A4_MAXCTX"),
                         "targetrequest prefix/output extent");
                 targetrequest_prefix.resize(targetrequest_count);
                 for (const auto id : targetrequest_prefix) require(id >= 0 && id < kVocab, "targetrequest prefix token extent");
                 require(targetrequest_prefix.back() != kMaskToken, "targetrequest prefix cannot end in mask");
             }
-            targetrequest_summary_path = env("NINFER_E5A4_OUT");
-            targetrequest_tokens_path = env("NINFER_TARGETREQUEST_TOKENS_OUT");
+            targetrequest_summary_path = env("VOIDINFER_E5A4_OUT");
+            targetrequest_tokens_path = env("VOIDINFER_TARGETREQUEST_TOKENS_OUT");
             require(!targetrequest_summary_path.empty() && !targetrequest_tokens_path.empty() && targetrequest_summary_path != targetrequest_tokens_path &&
                     !std::filesystem::exists(targetrequest_summary_path) && !std::filesystem::exists(targetrequest_tokens_path),
                     "targetrequest outputs must be separate new files");
@@ -2341,18 +2341,18 @@ int main() {
             }
         }
         std::unique_ptr<TtftTrace> ttft;
-        if (!env("NINFER_E5A4_TTFT_OUT").empty()) {
+        if (!env("VOIDINFER_E5A4_TTFT_OUT").empty()) {
             require(mode == "accept" || mode == "ttfttarget", "TTFT requires accept or ttfttarget mode");
-            require(env("NINFER_E5A4_CONTEXTS").find(',') == std::string::npos,
+            require(env("VOIDINFER_E5A4_CONTEXTS").find(',') == std::string::npos,
                     "TTFT requires one context per process");
-            ttft = std::make_unique<TtftTrace>(env("NINFER_E5A4_TTFT_OUT"), entry_stamp);
+            ttft = std::make_unique<TtftTrace>(env("VOIDINFER_E5A4_TTFT_OUT"), entry_stamp);
         }
         if (mode == "topkqual") {
-            run_topk_unit_qualification(env("NINFER_E5A4_OUT"));
+            run_topk_unit_qualification(env("VOIDINFER_E5A4_OUT"));
             return 0;
         }
         if (mode == "ringqual") {
-            run_ring_attention_qualification(env("NINFER_E5A4_OUT"));
+            run_ring_attention_qualification(env("VOIDINFER_E5A4_OUT"));
             return 0;
         }
         if (mode == "dflashdensekmajorqual") {
@@ -2396,33 +2396,33 @@ int main() {
         if (target_path.empty() ||
              (draft_path.empty() && mode != "targetownerretirement" && mode != "packedqprojection" && mode != "hostkvbatchmetadata" && mode != "targettxn" && mode != "targetcontinue" &&
              mode != "prefixretain" && mode != "prefixretainodd" && mode != "verifywidth" && mode != "ttfttarget" && mode != "targetrequest" && mode != "qualitylogits" && mode != "layermajorfailure" && mode != "k5prefilloperator" && mode != "fastdevicetxn" && mode != "hostkvgdngraphoracle" && mode != "hostkvmlptailgraphoracle" && mode != "hostkvrecurrenttraceoracle" && mode != "t79targetc2" && mode != "t80fp16serving" && mode != "t82fp16c2" && mode != "t83fp16c8" && mode != "t84servingcoord" && mode != "t85fp16q4" && mode != "t86coordc8" && mode != "t87batchadmit" && mode != "t88unequaltails" && mode != "t89residentprofile" && mode != "t90allocationchurn" && mode != "t92turnover" && mode != "t95atomicturnover" && mode != "t97concurrentprep" && mode != "t98pipelinedturnover" && mode != "t101multiturn" && mode != "contextisolation" && mode != "graphcurrentstate" && mode != "graphcurrentreplay" && mode != "prefillgateup" && mode != "prefillk6gateupwarpgroup" && mode != "prefillk6gateupn32paircta" && mode != "prefillk7tiles64exact" && mode != "initial16ops" && mode != "projectionorderedc2screen" && mode != "projectionroutematrixscreen" && mode != "gdnstageoracle" && mode != "targetgraphc2screen" && mode != "targetgraphc2lifecycle" && mode != "targetgraphresetreuse" && mode != "prefixindex" && mode != "prefixservingt72" && mode != "prefixservingt72t1" && mode != "t78cachedc2" && mode != "contextreuse" && mode != "contextreuset1")) {
-            std::cerr << "E5A4 skipped: set NINFER_EXL3_TARGET_PATH"
+            std::cerr << "E5A4 skipped: set VOIDINFER_EXL3_TARGET_PATH"
                       << ((mode == "targettxn" || mode == "targetcontinue" ||
                            mode == "prefixretain" || mode == "prefixretainodd")
-                              ? "\n" : " and NINFER_EXL3_DFLASH2_PATH\n");
+                              ? "\n" : " and VOIDINFER_EXL3_DFLASH2_PATH\n");
             return 77;
         }
-        const bool oscar_requested = env("NINFER_OSCAR_EXL3") == "1";
+        const bool oscar_requested = env("VOIDINFER_OSCAR_EXL3") == "1";
         TtftTrace::mark("cuda_begin");
         cuda_check(cudaSetDevice(0), "E5A4 set device");
         cuda_check(cudaDeviceSynchronize(), "E5A4 warmup sync");
         TtftTrace::mark("cuda_complete");
         std::unique_ptr<HandoffProfile> handoff_profile;
         const std::string handoff_profile_prefix =
-            env("NINFER_E5A4_HANDOFF_PROFILE_PREFIX");
+            env("VOIDINFER_E5A4_HANDOFF_PROFILE_PREFIX");
         if (!handoff_profile_prefix.empty()) {
             require(mode.empty() || mode == "accept",
                     "handoff profiling is available only in accept mode");
-            require(env("NINFER_E5A4_VERIFIER") == "transaction_retain",
+            require(env("VOIDINFER_E5A4_VERIFIER") == "transaction_retain",
                     "handoff profiling requires transaction_retain verifier");
             handoff_profile = std::make_unique<HandoffProfile>(handoff_profile_prefix);
             handoff_profile->sample_memory(
                 "cuda_ready", -1, nullptr, nullptr, nullptr);
         }
-        const int max_ctx = env_int("NINFER_E5A4_MAXCTX", 4096);
+        const int max_ctx = env_int("VOIDINFER_E5A4_MAXCTX", 4096);
         TtftTrace::mark("target_load_begin");
-        ninfer::exl3::Exl3LoadOptions load_options;
-        load_options.disable_dual_artifact_loading = env_int("NINFER_E5A4_DISABLE_DUAL_LOAD", 0) != 0;
+        voidinfer::exl3::Exl3LoadOptions load_options;
+        load_options.disable_dual_artifact_loading = env_int("VOIDINFER_E5A4_DISABLE_DUAL_LOAD", 0) != 0;
         auto target = Exl3TextModel::load(target_path, max_ctx, load_options);
         TtftTrace::mark("target_load_complete", -1, -1, true);
         // Diagnostic only: keep the pinned draft resident while the target-only
@@ -2431,7 +2431,7 @@ int main() {
         // changing either oracle path.
         std::shared_ptr<Exl3Dflash2DraftModel> gdn_graph_oracle_resident_draft;
         if (mode == "hostkvgdngraphoracle" &&
-            env("NINFER_E5A4_GDN_GRAPH_WITH_DRAFT") == "1") {
+            env("VOIDINFER_E5A4_GDN_GRAPH_WITH_DRAFT") == "1") {
             require(!draft_path.empty(),
                 "HostKV GDN graph resident-draft oracle requires DFLASH2_PATH");
             gdn_graph_oracle_resident_draft = Exl3Dflash2DraftModel::load(draft_path);
@@ -2450,10 +2450,10 @@ int main() {
                   << " staging_host_bytes=" << load_stats.staging_host_bytes << '\n';
         if (mode == "layermajorfailure") {
             require(!oscar_requested &&
-                    env("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER") == "2" &&
-                    env("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL") == "1",
+                    env("VOIDINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER") == "2" &&
+                    env("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL") == "1",
                     "layer-major failure gate requires ordinary Fast90 and layer2 fault");
-            const auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+            const auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
             require(ids.size()>=2065,"layer-major failure fixture extent");
             auto context=target->create_context(true);
             context->prefill(std::span<const std::int64_t>(ids.data(),16));
@@ -2472,7 +2472,7 @@ int main() {
             }
             require(fault_seen && decode_rejected && context->position()==16,
                     "partial layer-major failure escaped or changed public position");
-            require(_putenv_s("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER","")==0,
+            require(_putenv_s("VOIDINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER","")==0,
                     "clear one-shot layer-major test fault");
             context->reset();
             context->prefill(std::span<const std::int64_t>(ids.data(),16));
@@ -2489,9 +2489,9 @@ int main() {
             return 0;
         }
         if (mode == "t79targetc2") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T79_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T79_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t79targetc2 needs code/prose prompts and output");
             require(oscar_requested, "t79targetc2 requires canonical OSCAR");
@@ -2500,9 +2500,9 @@ int main() {
             return 0;
         }
         if (mode == "t80fp16serving") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T80_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T80_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t80fp16serving needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2512,9 +2512,9 @@ int main() {
             return 0;
         }
         if (mode == "t82fp16c2") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T82_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T82_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t82fp16c2 needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2524,9 +2524,9 @@ int main() {
             return 0;
         }
         if (mode == "t83fp16c8") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T83_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T83_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t83fp16c8 needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2536,9 +2536,9 @@ int main() {
             return 0;
         }
         if (mode == "t85fp16q4") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T85_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T85_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t85fp16q4 needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2548,9 +2548,9 @@ int main() {
             return 0;
         }
         if (mode == "t86coordc8") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T86_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T86_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t86coordc8 needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2560,9 +2560,9 @@ int main() {
             return 0;
         }
         if (mode == "t87batchadmit") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T87_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T87_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t87batchadmit needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2572,9 +2572,9 @@ int main() {
             return 0;
         }
         if (mode == "t89residentprofile") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T89_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T89_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t89residentprofile needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2584,8 +2584,8 @@ int main() {
             return 0;
         }
         if (mode == "t90allocationchurn") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto output = env("NINFER_T90_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto output = env("VOIDINFER_T90_OUT");
             require(!code_file.empty() && !output.empty(),
                     "t90allocationchurn needs code prompt and output");
             require(!oscar_requested,
@@ -2594,9 +2594,9 @@ int main() {
             return 0;
         }
         if (mode == "t92turnover") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T92_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T92_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t92turnover needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2606,9 +2606,9 @@ int main() {
             return 0;
         }
         if (mode == "t95atomicturnover") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T95_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T95_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t95atomicturnover needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2618,9 +2618,9 @@ int main() {
             return 0;
         }
         if (mode == "t97concurrentprep") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T97_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T97_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t97concurrentprep needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2630,9 +2630,9 @@ int main() {
             return 0;
         }
         if (mode == "t98pipelinedturnover") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T98_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T98_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t98pipelinedturnover needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2642,9 +2642,9 @@ int main() {
             return 0;
         }
         if (mode == "t101multiturn") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T101_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T101_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t101multiturn needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2654,9 +2654,9 @@ int main() {
             return 0;
         }
         if (mode == "t88unequaltails") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T88_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T88_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t88unequaltails needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2666,9 +2666,9 @@ int main() {
             return 0;
         }
         if (mode == "t84servingcoord") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T84_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T84_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t84servingcoord needs code/prose prompts and output");
             require(!oscar_requested,
@@ -2678,10 +2678,10 @@ int main() {
             return 0;
         }
         if (mode == "qualitylogits") {
-            const bool coherent_o_k7=env("NINFER_EXL3_COHERENT_O_K7")=="1";
-            const bool coherent_down_k7=env("NINFER_EXL3_COHERENT_DOWN_K7")=="1";
+            const bool coherent_o_k7=env("VOIDINFER_EXL3_COHERENT_O_K7")=="1";
+            const bool coherent_down_k7=env("VOIDINFER_EXL3_COHERENT_DOWN_K7")=="1";
             const bool coherent_wide_k6=
-                env("NINFER_EXL3_TARGET_COHERENT_WIDE_K6")=="1";
+                env("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6")=="1";
             std::uint64_t coherent_wide_calls_before[5]{},
                 coherent_wide_rows_before[5]{};
             for(int operation=0;operation<5;++operation) {
@@ -2698,15 +2698,15 @@ int main() {
                 Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test();
             const auto coherent_o_rows_before=
                 Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test();
-            const auto input_path=env("NINFER_QUALITY_INPUT");
-            const auto csv_path=env("NINFER_QUALITY_OUTPUT");
-            const auto binary_path=env("NINFER_QUALITY_LOGITS_OUTPUT");
+            const auto input_path=env("VOIDINFER_QUALITY_INPUT");
+            const auto csv_path=env("VOIDINFER_QUALITY_OUTPUT");
+            const auto binary_path=env("VOIDINFER_QUALITY_LOGITS_OUTPUT");
             require(!input_path.empty() && !csv_path.empty() && !binary_path.empty() &&
                     !std::filesystem::exists(csv_path) && !std::filesystem::exists(binary_path),
                     "qualitylogits requires new separate output files");
             const auto ids=load_ids(input_path);
-            const int prefix_rows=env_int("NINFER_QUALITY_PREFIX",3072);
-            const int scored_rows=env_int("NINFER_QUALITY_LABELS",128);
+            const int prefix_rows=env_int("VOIDINFER_QUALITY_PREFIX",3072);
+            const int scored_rows=env_int("VOIDINFER_QUALITY_LABELS",128);
             require(prefix_rows>=32 && scored_rows>=1 &&
                     static_cast<std::size_t>(prefix_rows+scored_rows)<=ids.size() &&
                     prefix_rows+scored_rows<=max_ctx,"qualitylogits fixed common-history extent");
@@ -2816,22 +2816,22 @@ int main() {
             const auto& summary_path = targetrequest_summary_path;
             const auto& tokens_path = targetrequest_tokens_path;
             const std::string graph_targetrequest_value =
-                env("NINFER_E5A4_TARGETREQUEST_GRAPH");
+                env("VOIDINFER_E5A4_TARGETREQUEST_GRAPH");
             require(graph_targetrequest_value.empty() ||
                         graph_targetrequest_value == "0" ||
                         graph_targetrequest_value == "1",
                     "targetrequest graph flag must be 0 or 1");
             const bool graph_targetrequest = graph_targetrequest_value == "1";
             const auto decode_projection_profile_path =
-                env("NINFER_E5A4_TARGETREQUEST_DECODE_PROJECTION_PROFILE");
+                env("VOIDINFER_E5A4_TARGETREQUEST_DECODE_PROJECTION_PROFILE");
             require(decode_projection_profile_path.empty() ||
                         (!graph_targetrequest &&
-                         env("NINFER_EXL3_TARGET_PROJECTION_TIMING") == "1"),
+                         env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING") == "1"),
                     "targetrequest decode projection profile requires eager projection timing");
             require(!graph_targetrequest || !targetrequest_exact_host_kv,
                     "targetrequest graph is incompatible with exact HostKV");
             const std::string graph_lifecycle_value =
-                env("NINFER_E5A4_TARGETREQUEST_GRAPH_LIFECYCLE");
+                env("VOIDINFER_E5A4_TARGETREQUEST_GRAPH_LIFECYCLE");
             require(graph_lifecycle_value.empty() ||
                         graph_lifecycle_value == "0" ||
                         graph_lifecycle_value == "1",
@@ -2843,7 +2843,7 @@ int main() {
             const auto fast_native_mia_target_prefill_fp16_before =
                 Exl3CudaLinearWorkspace::process_fast_native_mia_target_prefill_fp16_calls_for_test();
             const auto prefill_shared_score_before =
-                ninfer::exl3::exl3_prefill_attention_shared_score_global_snapshot();
+                voidinfer::exl3::exl3_prefill_attention_shared_score_global_snapshot();
             std::size_t free_before_context=0,device_total=0;
             std::size_t free_after_context=0,free_after_prefill=0;
             cuda_check(cudaMemGetInfo(&free_before_context,&device_total),
@@ -2896,7 +2896,7 @@ int main() {
             // Warm process: one untimed prefill of the same prompt and a context
             // reset, so the timed prefill excludes first-use module loading and
             // allocation growth (as in a running server). Fresh state is timed.
-            if (env("NINFER_E5A4_TARGETREQUEST_WARM") == "1") {
+            if (env("VOIDINFER_E5A4_TARGETREQUEST_WARM") == "1") {
                 ingest_targetrequest_prefix(*ctx);
                 cuda_check(cudaDeviceSynchronize(), "targetrequest warm-up prefill");
                 ctx->reset();
@@ -2917,7 +2917,7 @@ int main() {
                 Exl3CudaLinearWorkspace::process_fast_native_mia_target_prefill_fp16_calls_for_test() -
                 fast_native_mia_target_prefill_fp16_before;
             const auto prefill_shared_score_after =
-                ninfer::exl3::exl3_prefill_attention_shared_score_global_snapshot();
+                voidinfer::exl3::exl3_prefill_attention_shared_score_global_snapshot();
             require(prefill_shared_score_after.launch_attempts >=
                         prefill_shared_score_before.launch_attempts &&
                     prefill_shared_score_after.row_attempts >=
@@ -2971,7 +2971,7 @@ int main() {
             std::unique_ptr<GraphCurrentStreamGuard> graph_stream_guard;
             cudaStream_t graph_stream = nullptr;
             const int graph_class = env_int(
-                "NINFER_E5A4_TARGETREQUEST_GRAPH_CLASS", 32);
+                "VOIDINFER_E5A4_TARGETREQUEST_GRAPH_CLASS", 32);
             if (graph_targetrequest) {
                 require(count >= 1024 && count + outputs - 1 <= 8192,
                         "targetrequest graph requires one stable S32 context class");
@@ -3100,7 +3100,7 @@ int main() {
                 }
             }
             const auto last_output = std::chrono::steady_clock::now();
-            if(env("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR")=="1") {
+            if(env("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR")=="1") {
                 const auto submissions=
                     ctx->fast_same_weights_fp16kv_gdn_m1_gate_up_pair_submissions();
                 std::cout<<"TARGETREQUEST_GDN_M1_GATE_UP_PAIR submissions="<<
@@ -3277,7 +3277,7 @@ int main() {
             }
             token_file.flush(); require(token_file.good(), "targetrequest token output failed");
             const bool skip_graph_export =
-                env("NINFER_E5A4_SKIP_GRAPH_EXPORT") == "1";
+                env("VOIDINFER_E5A4_SKIP_GRAPH_EXPORT") == "1";
             std::string terminal_state_hash;
             if (skip_graph_export) {
                 require(graph_targetrequest && ctx->graph_active(),
@@ -3412,7 +3412,7 @@ int main() {
                       << " cached_weight_capacity_bytes="
                       << numeric_prefill_stats.cached_weight_capacity_bytes << '\n';
             std::cout << "TARGETREQUEST_GDN_PACKED_K5 enabled="
-                      << (env("NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5")=="1")
+                      << (env("VOIDINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5")=="1")
                       << " gate_up_calls="
                       << numeric_prefill_stats.packed_direct_k5_gate_up_calls
                       << " down_calls="
@@ -3485,7 +3485,7 @@ int main() {
                       << " ordinary_full_layer_graph_replays="
                       << ordinary_full_layer_graph_stats.replays
                       << "\nTARGET_REQUEST_DONE\n";
-            const bool coherent_o_k7=env("NINFER_EXL3_COHERENT_O_K7")=="1";
+            const bool coherent_o_k7=env("VOIDINFER_EXL3_COHERENT_O_K7")=="1";
             const auto coherent_o_calls=Exl3CudaLinearWorkspace::
                 process_coherent_o_k7_calls_for_test();
             const auto coherent_o_rows=Exl3CudaLinearWorkspace::
@@ -3496,7 +3496,7 @@ int main() {
             require(!coherent_o_k7 ||
                 (coherent_o_calls>0 && coherent_o_rows>=static_cast<std::uint64_t>(outputs-1)),
                 "coherent K7 O did not dispatch during target-only decode");
-            const bool coherent_down_k7=env("NINFER_EXL3_COHERENT_DOWN_K7")=="1";
+            const bool coherent_down_k7=env("VOIDINFER_EXL3_COHERENT_DOWN_K7")=="1";
             const auto coherent_down_k7_calls=Exl3CudaLinearWorkspace::
                 process_coherent_down_k7_calls_for_test();
             const auto coherent_down_k7_rows=Exl3CudaLinearWorkspace::
@@ -3509,9 +3509,9 @@ int main() {
                     : coherent_down_k7_calls==0 && coherent_down_k7_rows==0,
                 "coherent K7 down target-only dispatch mismatch");
             const bool coherent_wide_k6=
-                env("NINFER_EXL3_TARGET_COHERENT_WIDE_K6")=="1";
+                env("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6")=="1";
             const bool coherent_wide_split10=
-                env("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10")=="1";
+                env("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10")=="1";
             constexpr const char* coherent_wide_names[5]={
                 "q","qkv","z","o","gate_up"};
             for(int operation=0;operation<5;++operation) {
@@ -3538,61 +3538,61 @@ int main() {
             return 0;
         }
         if (mode == "contextisolation") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "c2isolation needs PROMPT_FILE and OUT");
-            require(env("NINFER_E5A4_TTFT_OUT").empty() &&
-                        env("NINFER_E5A4_HANDOFF_PROFILE_PREFIX").empty() &&
-                        env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
-                        env("NINFER_E5A4_RING_CHECK_OUT").empty(),
+            require(env("VOIDINFER_E5A4_TTFT_OUT").empty() &&
+                        env("VOIDINFER_E5A4_HANDOFF_PROFILE_PREFIX").empty() &&
+                        env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
+                        env("VOIDINFER_E5A4_RING_CHECK_OUT").empty(),
                     "c2isolation forbids acceptance profiling outputs");
             run_context_isolation_qualification(*target, load_ids(prompt_file), out_path);
             return 0;
         }
         if (mode == "graphcurrentstate") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "graphcurrentstate needs PROMPT_FILE and OUT");
-            require(env("NINFER_E5A4_TTFT_OUT").empty() &&
-                        env("NINFER_E5A4_HANDOFF_PROFILE_PREFIX").empty() &&
-                        env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
-                        env("NINFER_E5A4_RING_CHECK_OUT").empty(),
+            require(env("VOIDINFER_E5A4_TTFT_OUT").empty() &&
+                        env("VOIDINFER_E5A4_HANDOFF_PROFILE_PREFIX").empty() &&
+                        env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
+                        env("VOIDINFER_E5A4_RING_CHECK_OUT").empty(),
                     "graphcurrentstate forbids acceptance profiling outputs");
             run_graph_current_state(*target, load_ids(prompt_file), out_path, max_ctx);
             return 0;
         }
         if (mode == "graphcurrentreplay") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "graphcurrentreplay needs PROMPT_FILE and OUT");
-            require(env("NINFER_E5A4_TTFT_OUT").empty() &&
-                        env("NINFER_E5A4_HANDOFF_PROFILE_PREFIX").empty() &&
-                        env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
-                        env("NINFER_E5A4_RING_CHECK_OUT").empty(),
+            require(env("VOIDINFER_E5A4_TTFT_OUT").empty() &&
+                        env("VOIDINFER_E5A4_HANDOFF_PROFILE_PREFIX").empty() &&
+                        env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
+                        env("VOIDINFER_E5A4_RING_CHECK_OUT").empty(),
                     "graphcurrentreplay forbids acceptance profiling outputs");
             run_graph_current_replay(*target, load_ids(prompt_file), out_path, max_ctx);
             return 0;
         }
         if (mode == "graphboundaryreplay") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "graphboundaryreplay needs PROMPT_FILE and OUT");
-            require(env("NINFER_E5A4_TTFT_OUT").empty() &&
-                        env("NINFER_E5A4_HANDOFF_PROFILE_PREFIX").empty() &&
-                        env("NINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
-                        env("NINFER_E5A4_RING_CHECK_OUT").empty(),
+            require(env("VOIDINFER_E5A4_TTFT_OUT").empty() &&
+                        env("VOIDINFER_E5A4_HANDOFF_PROFILE_PREFIX").empty() &&
+                        env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING").empty() &&
+                        env("VOIDINFER_E5A4_RING_CHECK_OUT").empty(),
                     "graphboundaryreplay forbids acceptance profiling outputs");
             run_graph_boundary_replay(*target, load_ids(prompt_file), out_path, max_ctx);
             return 0;
         }
         if (mode == "ttfttarget") {
             require(ttft && oscar_requested, "target-only TTFT requires trace and canonical OSCAR");
-            const int count = env_int("NINFER_E5A4_CONTEXTS", 0);
-            auto prefix = load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+            const int count = env_int("VOIDINFER_E5A4_CONTEXTS", 0);
+            auto prefix = load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
             require(count >= 32 && count <= max_ctx && count <= static_cast<int>(prefix.size()), "target-only TTFT prefix extent");
             prefix.resize(count);
             require(prefix.back() != kMaskToken, "target-only TTFT prefix cannot end in mask");
@@ -3614,7 +3614,7 @@ int main() {
         }
         if (mode == "verifywidth") {
             run_verification_width_profile(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")), env("NINFER_E5A4_OUT"));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")), env("VOIDINFER_E5A4_OUT"));
             return 0;
         }
         if (mode == "numericattentiontiledt71") {
@@ -3651,33 +3651,33 @@ int main() {
         }
         if (mode == "branchref") {
             run_branch_reference_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "coalescedcontext") {
-            run_coalesced_context_parity(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_coalesced_context_parity(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exacthost") {
             run_exact_host_state_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "warmtier") {
             run_warm_tier_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "turboanglel1") {
             run_turboangle_l1_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hierarchicalsync") {
             run_hierarchical_sync_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hierarchical4k") {
@@ -3686,116 +3686,116 @@ int main() {
         }
         if (mode == "hierarchicalasync") {
             run_hierarchical_async_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hierarchicaladaptive") {
             run_hierarchical_adaptive_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "residentroot") {
             run_exact_resident_root_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "residentroott3") {
             run_exact_resident_root_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "hostkvbatchsync") {
             run_exact_host_kv_batch_sync_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hostkvbatchsynct3") {
             run_exact_host_kv_batch_sync_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "hostkvbatchcopy") {
             run_exact_host_kv_batch_copy_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hostkvbatchcopyt3") {
             run_exact_host_kv_batch_copy_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "hostkvpinnedchunks") {
             run_exact_host_kv_pinned_chunks_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hostkvpinnedchunksdefault") {
             run_exact_host_kv_pinned_chunks_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")),true);
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")),true);
             return 0;
         }
         if (mode == "hostkvpinnedchunkst3") {
-            run_exact_host_kv_pinned_chunks_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_exact_host_kv_pinned_chunks_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "hostkvpinnedd2h") {
             run_exact_host_kv_pinned_d2h_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hostkvpinnedd2hdefault") {
             run_exact_host_kv_pinned_d2h_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),true);
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),true);
             return 0;
         }
         if (mode == "hostkvpinnedd2ht3") {
             run_exact_host_kv_pinned_d2h_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "hostkvdeferredscatter") {
             run_exact_host_kv_deferred_scatter_screen(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hostkvbankedd2h") {
             run_exact_host_kv_banked_d2h_screen(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "eagermlpgateup") {
             run_exact_host_kv_eager_mlp_gateup_concurrency(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "smallmfusedgateup") {
             run_exact_host_kv_small_m_fused_gate_up_transform(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "prefillk8kvasynca") {
@@ -3804,67 +3804,67 @@ int main() {
         }
         if (mode == "hostkvuniquetailreuse") {
             run_exact_host_kv_unique_tail_reuse_screen(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hostkvuniquetailreuset1") {
             run_exact_host_kv_unique_tail_reuse_t1(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hostkvdeferredscattert3") {
             run_exact_host_kv_pinned_d2h_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")),true);
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")),true);
             return 0;
         }
         if (mode == "exactattentiongqasix") {
             run_exact_attention_gqa_six_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattentiongqasixscores") {
             run_exact_attention_gqa_six_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),true);
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),true);
             return 0;
         }
         if (mode == "exactattentiongqasixscoresdefault") {
             run_exact_attention_gqa_six_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),true,true);
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),true,true);
             return 0;
         }
         if (mode == "exactattentiongqasixvaluessharded") {
             run_exact_attention_gqa_six_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),true,false,true);
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),true,false,true);
             return 0;
         }
         if (mode == "exactattentiongqasixscorest3") {
             run_exact_attention_gqa_six_scores_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "exacthostprefillprofile") {
-            const auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+            const auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
             require(max_ctx==4352 && ids.size()>=4096,
                 "exact host prefill profile requires 4K fixture and 4352 capacity");
-            require(env("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC").empty() &&
-                env("NINFER_EXL3_EXACT_HOST_KV_BATCH_COPY").empty(),
+            require(env("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC").empty() &&
+                env("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_COPY").empty(),
                 "exact host prefill profile requires qualified implicit transfer defaults");
-            _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-            _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+            _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+            _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
             auto context=target->create_context(true);context->prepare_continuation(8);
             cuda_check(cudaProfilerStart(),"exact host prefill profile begin");
             const auto started=std::chrono::steady_clock::now();
-            const auto request=ninfer::exl3::Exl3VeriCacheRequest::initialize(
+            const auto request=voidinfer::exl3::Exl3VeriCacheRequest::initialize(
                 *context,std::span<const std::int64_t>(ids.data(),4096),1024);
             const double wall_ms=std::chrono::duration<double,std::milli>(
                 std::chrono::steady_clock::now()-started).count();
@@ -3885,24 +3885,24 @@ int main() {
             mode == "hostkvrecurrenttraceoracle") {
             const bool mlp_tail_mode=mode=="hostkvmlptailgraphoracle";
             const bool recurrent_trace_mode=mode=="hostkvrecurrenttraceoracle";
-            const auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+            const auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
             require(max_ctx==4352 && ids.size()>=4096,
                 "HostKV GDN graph oracle requires 4K fixture and 4352 capacity");
-            _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-            _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-            _putenv_s("NINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS","0");
-            _putenv_s("NINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS","0");
-            _putenv_s("NINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE","0");
-            _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
-            _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS","0");
-            _putenv_s("NINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+            _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+            _putenv_s("VOIDINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE","0");
+            _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS","0");
             auto eager=target->create_context(true);
             if(recurrent_trace_mode)
-                _putenv_s("NINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE","1");
+                _putenv_s("VOIDINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE","1");
             else if(mlp_tail_mode)
-                _putenv_s("NINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS","1");
+                _putenv_s("VOIDINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS","1");
             else
-                _putenv_s("NINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS","1");
+                _putenv_s("VOIDINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS","1");
             auto graphed=target->create_context(true);
             constexpr std::string_view request_contract=
                 "hostkvgdngraphoracle-v1";
@@ -3910,12 +3910,12 @@ int main() {
             graphed->bind_request_compatibility(std::string(request_contract));
             eager->prepare_transaction();eager->prepare_continuation(8);
             graphed->prepare_transaction();graphed->prepare_continuation(8);
-            const bool cross_request=env("NINFER_E5A4_GDN_GRAPH_CROSS_REQUEST")=="1";
+            const bool cross_request=env("VOIDINFER_E5A4_GDN_GRAPH_CROSS_REQUEST")=="1";
             if(cross_request) {
                 const auto warm_prefix=std::span<const std::int64_t>(ids.data(),128);
-                const auto eager_warm=ninfer::exl3::Exl3VeriCacheRequest::initialize(
+                const auto eager_warm=voidinfer::exl3::Exl3VeriCacheRequest::initialize(
                     *eager,warm_prefix,128);
-                const auto graphed_warm=ninfer::exl3::Exl3VeriCacheRequest::initialize(
+                const auto graphed_warm=voidinfer::exl3::Exl3VeriCacheRequest::initialize(
                     *graphed,warm_prefix,128);
                 require(eager_warm->state()->same_payload(*graphed_warm->state()),
                     "HostKV GDN graph oracle warm root mismatch");
@@ -3943,9 +3943,9 @@ int main() {
                 graphed->reset_for_request(request_contract);
             }
             const auto prefix=std::span<const std::int64_t>(ids.data(),4096);
-            const auto eager_root=ninfer::exl3::Exl3VeriCacheRequest::initialize(
+            const auto eager_root=voidinfer::exl3::Exl3VeriCacheRequest::initialize(
                 *eager,prefix,1024);
-            const auto graphed_root=ninfer::exl3::Exl3VeriCacheRequest::initialize(
+            const auto graphed_root=voidinfer::exl3::Exl3VeriCacheRequest::initialize(
                 *graphed,prefix,1024);
             require(eager_root->state()->same_payload(*graphed_root->state()) &&
                     eager->position()==4096 && graphed->position()==4096,
@@ -3967,7 +3967,7 @@ int main() {
                 if(row+1<8)eager->decode(attempted.back());
             }
             eager->rollback_transaction();
-            if(const auto fixed=env("NINFER_E5A4_GDN_GRAPH_ATTEMPTED");!fixed.empty()) {
+            if(const auto fixed=env("VOIDINFER_E5A4_GDN_GRAPH_ATTEMPTED");!fixed.empty()) {
                 attempted.clear();
                 std::stringstream stream(fixed);
                 std::string field;
@@ -4025,7 +4025,7 @@ int main() {
                 "HostKV MLP-tail graph oracle route not exercised");
             eager->rollback_transaction();graphed->rollback_transaction();
             auto rejected_attempted=attempted;
-            if(env("NINFER_E5A4_GDN_GRAPH_ATTEMPTED").empty())
+            if(env("VOIDINFER_E5A4_GDN_GRAPH_ATTEMPTED").empty())
                 rejected_attempted[3]=(rejected_attempted[3]+1)%kVocab;
             const auto eager_outer=verify_exl3_outer_checkpointed_reference(
                 *eager,*eager_root->state(),rejected_attempted,true,{},nullptr,true);
@@ -4234,305 +4234,305 @@ int main() {
         }
         if (mode == "exactattnqshared") {
             run_exact_attention_q_shared_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattnqsharedt3") {
             run_exact_attention_q_shared_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "exactattnkhalf2") {
             run_exact_attention_k_half2_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattnkhalf2t3") {
-            run_exact_attention_k_half2_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_exact_attention_k_half2_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "exactattnvhalf2") {
-            run_exact_attention_v_half2_screen(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+            run_exact_attention_v_half2_screen(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattnvhalf2t3") {
-            run_exact_attention_v_half2_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_exact_attention_v_half2_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "exactattngqapair") {
             run_exact_attention_gqa_pair_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattngqapairt3") {
-            run_exact_attention_gqa_pair_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_exact_attention_gqa_pair_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "exactattngqatriple") {
             run_exact_attention_gqa_triple_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattngqatriplet3") {
-            run_exact_attention_gqa_triple_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_exact_attention_gqa_triple_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "exactattngqatriplevalues128") {
             run_exact_attention_gqa_triple_values128_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattngqatriplevalues128t3") {
-            run_exact_attention_gqa_triple_values128_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_exact_attention_gqa_triple_values128_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "exactattngqatriplevalues4") {
             run_exact_attention_gqa_triple_values4_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattngqatriplesoftmaxstaged") {
             run_exact_attention_gqa_triple_softmax_staged_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattngqatriplesoftmaxstagedt3") {
-            run_exact_attention_gqa_triple_softmax_staged_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_exact_attention_gqa_triple_softmax_staged_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "prefillasyncall") {
-            run_prefill_async_all_screen(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+            run_prefill_async_all_screen(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "prefillrowpairk7state") {
-            run_rowpair_k7_prefill_state(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+            run_rowpair_k7_prefill_state(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "prefillasyncallt3") {
-            run_prefill_async_all_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_prefill_async_all_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "prefilldirecttiles64") {
-            run_prefill_direct_tiles64_screen(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+            run_prefill_direct_tiles64_screen(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "prefillpersistingl2") {
             run_prefill_persisting_l2(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "prefilldirecttiles64t3") {
-            run_prefill_direct_tiles64_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_prefill_direct_tiles64_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "prefillreduceshfl") {
-            run_prefill_reduce_shfl_screen(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+            run_prefill_reduce_shfl_screen(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "prefillreduceshflt3") {
-            run_prefill_reduce_shfl_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_prefill_reduce_shfl_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "prefillbundle") {
-            run_prefill_bundle_screen(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+            run_prefill_bundle_screen(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "prefillbundledefault") {
-            run_prefill_bundle_screen(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),true);
+            run_prefill_bundle_screen(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),true);
             return 0;
         }
         if (mode == "prefillbundlet3") {
-            run_prefill_bundle_t3(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+            run_prefill_bundle_t3(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "gdnpaircolumns") {
             run_gdn_pair_columns_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "gdnpaircolumnsdefault") {
             run_gdn_pair_columns_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),true);
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),true);
             return 0;
         }
         if (mode == "gdnpaircolumnst3") {
             run_gdn_pair_columns_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "gdnpairvectorio") {
             run_gdn_pair_vector_io_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "gdnpairvectorioperf") {
             run_gdn_pair_vector_io_route_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "gdndualtransform") {
             run_gdn_dual_input_transform_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "gdndualtransformperf") {
             run_gdn_dual_input_transform_route_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "gdnquadcolumns") {
             run_gdn_quad_columns_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "oscarfusedkv") {
             run_oscar_fused_kv_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "oscarfusedkvt3") {
             run_oscar_fused_kv_t3(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),
-                load_ids(env("NINFER_TEST_STRUCTURED_FILE")),
-                load_ids(env("NINFER_TEST_HELDOUT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),
+                load_ids(env("VOIDINFER_TEST_STRUCTURED_FILE")),
+                load_ids(env("VOIDINFER_TEST_HELDOUT_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixsoftmaxtriplevalues") {
             run_exact_attention_gqa_six_softmax_triple_values_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixsoftmaxtriplepairdimensionsstate") {
             run_exact_attention_gqa_six_softmax_triple_pair_dimensions_state(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixsoftmaxsixvaluessingleloadstate") {
             run_exact_attention_gqa_six_softmax_six_values_single_load_state(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixsoftmaxsixvaluesscalarsingleloadstate") {
             run_exact_attention_gqa_six_softmax_six_values_scalar_single_load_state(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixsoftmaxtriplekeypairstate") {
             run_exact_attention_gqa_six_softmax_triple_key_pair_pipeline_state(
-                *target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                *target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixsoftmaxtriplescoretilestate") {
             run_exact_attention_gqa_six_softmax_triple_score_tile_state(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixsoftmaxtriplewarpbroadcaststate") {
             run_exact_attention_gqa_six_softmax_triple_warp_score_broadcast_state(
-                *target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                *target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixpackedtriples") {
             run_exact_attention_gqa_six_packed_triples_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactattngqasixextentshards") {
             run_exact_attention_gqa_six_extent_shards_screen(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "exactcontinue") {
             run_exact_continuation_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "outerbatch") {
             run_outer_batched_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactattentionstate") {
             run_exact_attention_model_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactpaged") {
-            run_exact_paged_qualification(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_exact_paged_qualification(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "native64kprefixswitch") {
             run_native64k_prefix_switch_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "hoststream") {
-            run_host_stream_qualification(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_host_stream_qualification(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "compactl0") {
-            run_compact_l0_qualification(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_compact_l0_qualification(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactwide") {
-            run_exact_wide_qualification(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_exact_wide_qualification(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "hostresidency") {
-            run_host_residency_qualification(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_host_residency_qualification(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "outerstop") {
-            run_outer_stop_qualification(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_outer_stop_qualification(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "exactprofile") {
-            const auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+            const auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
             require(ids.size()>=324,"exactprofile fixture extent");
             auto context=target->create_context(true);
             context->prefill(std::span<const std::int64_t>(ids.data(),16));
@@ -4578,8 +4578,8 @@ int main() {
         }
         if(mode=="prefillk6downrowpairstate") {
             run_prefill_k6_down_rowpair_state(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if(mode=="prefillshape4n64") {
@@ -4624,80 +4624,80 @@ int main() {
         }
         if (mode == "prefillattentionsharedscorestate") {
             run_prefill_attention_shared_scores_state(
-                *target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                *target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "hostkvbatchmetadata") {
-            run_exact_host_kv_batch_copy_screen(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")),true);return 0;
+            run_exact_host_kv_batch_copy_screen(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")),true);return 0;
         }
         if (mode == "packedqprojection") {
-            run_packed_q_projection(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));return 0;
+            run_packed_q_projection(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));return 0;
         }
         if (mode == "targetownerretirement") {
-            run_target_owner_retirement(target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));return 0;
+            run_target_owner_retirement(target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));return 0;
         }
         if (mode == "crossrequestprojectionbatch") {
             run_cross_request_projection_batch_t0(
-                *target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                *target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "firstdivergence") {
-            run_first_divergence(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_first_divergence(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "reconstructedexact") {
-            run_reconstructed_exact_projection(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_reconstructed_exact_projection(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "reconstructedexactk6gateup") {
             run_reconstructed_exact_k6_gate_up(
-                *target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                *target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "reconstructedexactroute") {
-            run_reconstructed_exact_route(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_reconstructed_exact_route(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "native16") {
-            run_native16_qualification(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_native16_qualification(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "reconstructedexactauthority") {
-            run_reconstructed_exact_authority(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_reconstructed_exact_authority(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "projectionreconstructgemm") {
             run_projection_reconstruct_gemm_t69(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "k5prefilloperator") {
             run_k5_prefill_operator(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "k5directbulkoperator") {
             run_k5_direct_bulk_operator(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "projectionreconstructroute") {
             run_projection_reconstruct_route_t69b(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "projectionreconstructroutek7") {
             run_projection_reconstruct_route_t69c(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "numericattentionsplitkroute") {
             run_numeric_attention_splitk_route_t71b(
-                *target, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "targettxn") {
@@ -4705,12 +4705,12 @@ int main() {
             return 0;
         }
         if (mode == "fastdevicetxn") {
-            if(env("NINFER_EXL3_TEST_FAST_DEVICE_REAL_DFLASH")=="1") {
+            if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_REAL_DFLASH")=="1") {
                 require(!draft_path.empty(),
                     "real device DFlash probe requires pinned draft model");
                 auto real_draft=Exl3Dflash2DraftModel::load(draft_path);
-                const auto prompt_ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
-                if(env("NINFER_EXL3_TEST_FAST_DEVICE_WORKER_THREAD")=="1") {
+                const auto prompt_ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
+                if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_WORKER_THREAD")=="1") {
                     std::exception_ptr failure;
                     std::thread worker([&] {
                         try {
@@ -4721,30 +4721,30 @@ int main() {
                     if(failure)std::rethrow_exception(failure);
                 } else run_fast_device_real_dflash(*target,*real_draft,prompt_ids);
             } else run_fast_device_transaction(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "targetcontinue") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(), "targetcontinue needs PROMPT_FILE");
             run_target_continuation_qualification(*target, load_ids(prompt_file));
             return 0;
         }
         if (mode == "prefixretain") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(), "prefixretain needs PROMPT_FILE");
             run_prefix_retention_qualification(*target, load_ids(prompt_file));
             return 0;
         }
         if (mode == "prefixretainodd") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(), "prefixretainodd needs PROMPT_FILE");
             run_prefix_retention_odd_qualification(*target, load_ids(prompt_file));
             return 0;
         }
         if (mode == "projectionorderedc2screen") {
-            const auto prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto output_path = env("NINFER_EXL3_PROJECTION_ORDERED_C2_OUT");
+            const auto prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto output_path = env("VOIDINFER_EXL3_PROJECTION_ORDERED_C2_OUT");
             require(!prompt_file.empty() && !output_path.empty(),
                     "projectionorderedc2screen needs PROMPT_FILE and output");
             require(oscar_requested,
@@ -4754,8 +4754,8 @@ int main() {
             return 0;
         }
         if (mode == "projectionroutematrixscreen") {
-            const auto prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto output_directory = env("NINFER_EXL3_PROJECTION_ROUTE_MATRIX_OUT");
+            const auto prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto output_directory = env("VOIDINFER_EXL3_PROJECTION_ROUTE_MATRIX_OUT");
             require(!prompt_file.empty() && !output_directory.empty(),
                     "projectionroutematrixscreen needs PROMPT_FILE and output directory");
             require(oscar_requested,
@@ -4765,7 +4765,7 @@ int main() {
             return 0;
         }
         if (mode == "gdnstageoracle") {
-            const auto prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const auto prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(), "gdnstageoracle needs PROMPT_FILE");
             require(oscar_requested,
                     "gdnstageoracle requires canonical OSCAR");
@@ -4773,9 +4773,9 @@ int main() {
             return 0;
         }
         if (mode == "targetgraphc2screen") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_EXL3_TARGET_GRAPH_C2_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_EXL3_TARGET_GRAPH_C2_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "targetgraphc2screen needs code/prose prompts and output");
             require(oscar_requested,
@@ -4785,9 +4785,9 @@ int main() {
             return 0;
         }
         if (mode == "targetgraphc2lifecycle") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_EXL3_TARGET_GRAPH_C2_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_EXL3_TARGET_GRAPH_C2_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "targetgraphc2lifecycle needs code/prose prompts and output");
             require(oscar_requested,
@@ -4798,46 +4798,46 @@ int main() {
         }
         if (mode == "targetgraphresetreuse") {
             run_target_graph_reset_reuse_performance(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "prefixindex") {
-            run_prefix_index_qualification(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_prefix_index_qualification(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "prefixservingt72") {
             run_prefix_serving_t72_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "prefixservingt72t1") {
             run_prefix_serving_t72_t1(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "contextreuse") {
             run_context_reuse_qualification(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "contextreuset1") {
             run_context_reuse_performance(*target,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "mediastate") {
-            run_media_state_gate(*target,load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));return 0;
+            run_media_state_gate(*target,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));return 0;
         }
         TtftTrace::mark("draft_load_begin");
         auto draft = Exl3Dflash2DraftModel::load(draft_path);
         TtftTrace::mark("draft_load_complete", -1, -1, true);
         if (mode == "mul1lookupdisc") {
             constexpr std::uint32_t target_multiplier = 2212286765u;
-            const auto result = ninfer::exl3::exl3_mul1_lookup_discriminator_for_test(
+            const auto result = voidinfer::exl3::exl3_mul1_lookup_discriminator_for_test(
                 target_multiplier);
             require(result.mismatches == 0,
                     "MUL1 lookup discriminator differs from exact arithmetic");
@@ -4854,7 +4854,7 @@ int main() {
         }
         if (mode == "triplescorelayoutdisc") {
             const auto result=
-                ninfer::exl3::exl3_triple_score_layout_discriminator_for_test();
+                voidinfer::exl3::exl3_triple_score_layout_discriminator_for_test();
             require(result.mismatches==0,
                     "triple score-layout discriminator differs from selected consumer");
             std::cout << std::fixed << std::setprecision(3)
@@ -4868,7 +4868,7 @@ int main() {
         }
         if (mode == "softmaxvaluefusiondisc") {
             const auto result=
-                ninfer::exl3::exl3_softmax_value_fusion_discriminator_for_test();
+                voidinfer::exl3::exl3_softmax_value_fusion_discriminator_for_test();
             require(result.output_mismatches==0&&result.score_mismatches==0,
                     "softmax/value fusion discriminator differs from selected stage");
             std::cout << std::fixed << std::setprecision(3)
@@ -4883,7 +4883,7 @@ int main() {
         }
         if (mode == "deferrednormalizationdisc") {
             const auto result=
-                ninfer::exl3::exl3_deferred_normalization_discriminator_for_test();
+                voidinfer::exl3::exl3_deferred_normalization_discriminator_for_test();
             require(result.output_mismatches==0&&
                     result.normalized_score_mismatches==0,
                     "deferred normalization differs from selected stage");
@@ -4901,7 +4901,7 @@ int main() {
         }
         if (mode == "splitplaneprefetchdisc") {
             const auto result=
-                ninfer::exl3::exl3_split_plane_prefetch_discriminator_for_test();
+                voidinfer::exl3::exl3_split_plane_prefetch_discriminator_for_test();
             require(result.mismatches==0,
                     "split-plane prefetch differs from selected reduction");
             std::cout << std::fixed << std::setprecision(3)
@@ -4917,7 +4917,7 @@ int main() {
         }
         if (mode == "attentiongatefusiondisc") {
             const auto result=
-                ninfer::exl3::exl3_attention_gate_fusion_discriminator_for_test();
+                voidinfer::exl3::exl3_attention_gate_fusion_discriminator_for_test();
             require(result.mismatches==0,
                     "attention gate fusion differs from selected value plus gate stage");
             std::cout << std::fixed << std::setprecision(3)
@@ -4935,26 +4935,26 @@ int main() {
         }
         if (mode == "hostkvgdnlanoracle" ||
             mode == "hostkvgdnlanecontrolleroracle") {
-            using Lane=ninfer::exl3::Exl3Dflash2Execution;
-            using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
-            using Request=ninfer::exl3::Exl3VeriCacheRequest;
-            using Cache=ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-            using Identity=ninfer::exl3::Exl3VeriCacheServingIdentity;
+            using Lane=voidinfer::exl3::Exl3Dflash2Execution;
+            using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
+            using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+            using Cache=voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+            using Identity=voidinfer::exl3::Exl3VeriCacheServingIdentity;
             auto retained_draft=std::shared_ptr<Exl3Dflash2DraftModel>(
                 std::move(draft));
-            const auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+            const auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
             require(max_ctx==4352 && ids.size()>=4096,
                 "HostKV GDN lane oracle requires 4K fixture and 4352 capacity");
-            _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-            _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-            _putenv_s("NINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS","0");
-            _putenv_s("NINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS","0");
-            _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
-            _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS","0");
-            _putenv_s("NINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+            _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+            _putenv_s("VOIDINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS","0");
+            _putenv_s("VOIDINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS","0");
             auto eager_context=std::shared_ptr<Exl3TextContext>(
                 target->create_context(true));
-            _putenv_s("NINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS","1");
+            _putenv_s("VOIDINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS","1");
             auto graphed_context=std::shared_ptr<Exl3TextContext>(
                 target->create_context(true));
             std::array<std::unique_ptr<DeviceBuffer>,5> stage;
@@ -4973,7 +4973,7 @@ int main() {
                 mode=="hostkvgdnlanecontrolleroracle"?8:1;
             struct LaneResult {
                 std::vector<std::int64_t> proposed,committed;
-                std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+                std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
                 std::array<std::vector<std::uint16_t>,5> taps;
                 std::shared_ptr<const Request> initial_root;
                 std::size_t accepted=0,verification_rows=0,replay_rows=0;
@@ -4987,7 +4987,7 @@ int main() {
                 Coordinator coordinator(cache,Coordinator::Policy{
                     1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
                 coordinator.bind_physical_resources({},
-                    ninfer::exl3::Exl3ResourceInventory::unlimited());
+                    voidinfer::exl3::Exl3ResourceInventory::unlimited());
                 coordinator.reserve_metadata_startup();
                 auto lane=std::make_unique<Lane>(context,retained_draft,
                     identity.contract(),nullptr,
@@ -5042,7 +5042,7 @@ int main() {
                             pending->completion_generation &&
                         pending->verification.committed_tap_ready_event!=0;
                     result.dependency_complete&=
-                        dependency.phase==ninfer::exl3::Exl3ExecutionDependencyGraph::Phase::idle &&
+                        dependency.phase==voidinfer::exl3::Exl3ExecutionDependencyGraph::Phase::idle &&
                         dependency.nodes==0 && dependency.edges==0 &&
                         !dependency.retains_owners && dependency.first_error==0;
                     if(oracle_rounds>1) {
@@ -5150,37 +5150,37 @@ int main() {
         }
         if (mode == "prefillattentionchaingraph") {
             run_prefill_attention_chain_graph(*target,*draft,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "mediadraft") {
-            run_media_draft_gate(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));return 0;
+            run_media_draft_gate(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));return 0;
         }
         if (mode == "deviceprefixownership") {
-            run_device_prefix_metadata_gate(std::filesystem::path(env("NINFER_REAL_DFLASH_OUT")).parent_path()/"device-prefix-metadata.csv");
-            run_draft_execution_ownership(*target,draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
-            require(ninfer::exl3::Exl3DevicePrefixCache::budget_snapshot()[0]==0,"device prefix physical2 retirement");return 0;
+            run_device_prefix_metadata_gate(std::filesystem::path(env("VOIDINFER_REAL_DFLASH_OUT")).parent_path()/"device-prefix-metadata.csv");
+            run_draft_execution_ownership(*target,draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
+            require(voidinfer::exl3::Exl3DevicePrefixCache::budget_snapshot()[0]==0,"device prefix physical2 retirement");return 0;
         }
         if (mode == "historydiagnostic") {
-            run_history_diagnostic(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));return 0;
+            run_history_diagnostic(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));return 0;
         }
         if (mode == "draftc2workload") {
-            run_draft_c2_workload(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));return 0;
+            run_draft_c2_workload(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));return 0;
         }
         if (mode == "draftexecutionownership") {
-            run_draft_execution_ownership(*target,draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));return 0;
+            run_draft_execution_ownership(*target,draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));return 0;
         }
         if (mode == "realdflashscreens") {
-            run_real_dflash_screens(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));return 0;
+            run_real_dflash_screens(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));return 0;
         }
         if (mode == "recurrentexportauthority") {
             run_recurrent_export_authority(*target,*draft,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "realdflashexecution") {
             run_real_dflash_execution(*target,*draft,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "native16authority") {
@@ -5191,11 +5191,11 @@ int main() {
                 pointers[tap]=static_cast<std::uint16_t*>(stage[tap]->get());
             }
             run_native16_authority(*target,*draft,pointers,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")),load_ids(env("NINFER_TEST_PROSE_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "tokenreplay") {
-            run_token_replay_qualification(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_token_replay_qualification(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "capacity") {
@@ -5203,11 +5203,11 @@ int main() {
             return 0;
         }
         if (mode == "drafthost") {
-            run_draft_host_ring_qualification(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_draft_host_ring_qualification(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "compactrequest") {
-            run_compact_request_qualification(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_compact_request_qualification(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "compactperf") {
@@ -5220,14 +5220,14 @@ int main() {
         }
         if (mode == "hierarchicall2windows") {
             run_hierarchical_l2_windows_t70(
-                *target, *draft, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, *draft, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "hierarchicall2windowst1") {
             run_hierarchical_l2_windows_t70_t1(
-                *target, *draft, load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+                *target, *draft, load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "qualityprobe") {
@@ -5235,22 +5235,22 @@ int main() {
             return 0;
         }
         if (mode == "widerequest") {
-            run_wide_request_qualification(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_wide_request_qualification(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "vericachequeue") {
-            run_vericache_queue_qualification(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),
-                load_ids(env("NINFER_TEST_PROSE_FILE")));
+            run_vericache_queue_qualification(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),
+                load_ids(env("VOIDINFER_TEST_PROSE_FILE")));
             return 0;
         }
         if (mode == "vericacherequest") {
             run_vericache_request_qualification(*target,*draft,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "outerref") {
             run_outer_reference_qualification(*target, *draft,
-                load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+                load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "prefillwidestate") {
@@ -5262,11 +5262,11 @@ int main() {
             return 0;
         }
         std::unique_ptr<RingAttentionCapture> ring_capture;
-        if (!env("NINFER_E5A4_RING_CHECK_OUT").empty()) {
+        if (!env("VOIDINFER_E5A4_RING_CHECK_OUT").empty()) {
             require(mode == "accept" && !handoff_profile,
                     "ring capture requires unprofiled accept qualification");
             ring_capture = std::make_unique<RingAttentionCapture>(
-                *draft, env("NINFER_E5A4_RING_CHECK_OUT"));
+                *draft, env("VOIDINFER_E5A4_RING_CHECK_OUT"));
         }
         cuda_check(cudaDeviceSynchronize(), "E5A4 load sync");
         if (handoff_profile)
@@ -5275,7 +5275,7 @@ int main() {
         std::cout << "E5A4 target_model_bytes=" << target->model_bytes()
                   << " draft_weight_bytes=" << draft->weight_bytes() << "\n";
         if (mode == "h6qual") {
-            const auto out_path = env("NINFER_E5A4_OUT");
+            const auto out_path = env("VOIDINFER_E5A4_OUT");
             require(!out_path.empty(), "H6 qualification requires output path");
             std::ofstream out(out_path);
             require(out.good(), "cannot open H6 qualification report");
@@ -5283,8 +5283,8 @@ int main() {
             return 0;
         }
         if (mode == "h6sweep") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(), "E5A4 h6sweep needs PROMPT_FILE and OUT");
             const auto ids = load_ids(prompt_file);
             const std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 64);
@@ -5296,14 +5296,14 @@ int main() {
             return 0;
         }
         if (mode == "draftsmallqual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "draftsmallqual needs PROMPT_FILE and OUT");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512, "draftsmallqual prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
-                    "draftsmallqual requires NINFER_E5A4_BLOCK=8");
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
+                    "draftsmallqual requires VOIDINFER_E5A4_BLOCK=8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
                     "draftsmallqual ctx512 ends in the draft mask token");
@@ -5314,27 +5314,27 @@ int main() {
             return 0;
         }
         if (mode == "pendingqual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(), "pendingqual needs PROMPT_FILE");
             run_pending_qualification(*target, *draft, load_ids(prompt_file));
             return 0;
         }
         if (mode == "transactionqual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(), "transactionqual needs PROMPT_FILE");
             run_transaction_round_qualification(*target, *draft, load_ids(prompt_file));
             return 0;
         }
         if (mode == "targetk6capture") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string output_path = env("NINFER_EXL3_TARGET_K6_CAPTURE_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string output_path = env("VOIDINFER_EXL3_TARGET_K6_CAPTURE_OUT");
             require(!prompt_file.empty() && !output_path.empty(),
                     "targetk6capture needs PROMPT_FILE and TARGET_K6_CAPTURE_OUT");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512,
                     "targetk6capture prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
-                    "targetk6capture requires NINFER_E5A4_BLOCK=8");
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
+                    "targetk6capture requires VOIDINFER_E5A4_BLOCK=8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
                     "targetk6capture ctx512 ends in the draft mask token");
@@ -5343,32 +5343,32 @@ int main() {
             return 0;
         }
         if (mode == "transactionretainqual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(), "transactionretainqual needs PROMPT_FILE");
             run_transaction_retention_qualification(
                 *target, *draft, load_ids(prompt_file));
             return 0;
         }
         if (mode == "transactionretainoddqual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(), "transactionretainoddqual needs PROMPT_FILE");
             run_transaction_retention_odd_qualification(
                 *target, *draft, load_ids(prompt_file));
             return 0;
         }
         if (mode == "targetdownk6capture") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             const std::string output_path =
-                env("NINFER_EXL3_TARGET_DOWN_K6_CAPTURE_OUT");
+                env("VOIDINFER_EXL3_TARGET_DOWN_K6_CAPTURE_OUT");
             require(!prompt_file.empty() && !output_path.empty(),
                     "targetdownk6capture needs PROMPT_FILE and TARGET_DOWN_K6_CAPTURE_OUT");
-            require(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
+            require(env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
                     "targetdownk6capture requires explicit gate/up candidate flag0");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512,
                     "targetdownk6capture prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
-                    "targetdownk6capture requires NINFER_E5A4_BLOCK=8");
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
+                    "targetdownk6capture requires VOIDINFER_E5A4_BLOCK=8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
                     "targetdownk6capture ctx512 ends in the draft mask token");
@@ -5377,19 +5377,19 @@ int main() {
             return 0;
         }
         if (mode == "targetok7capture") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
             const std::string output_path =
-                env("NINFER_EXL3_TARGET_O_K7_CAPTURE_OUT");
+                env("VOIDINFER_EXL3_TARGET_O_K7_CAPTURE_OUT");
             require(!prompt_file.empty() && !output_path.empty(),
                     "targetok7capture needs PROMPT_FILE and TARGET_O_K7_CAPTURE_OUT");
-            require(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
-                        env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
+            require(env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
+                        env("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
                     "targetok7capture requires accepted gate/up and down candidates");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512,
                     "targetok7capture prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
-                    "targetok7capture requires NINFER_E5A4_BLOCK=8");
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
+                    "targetok7capture requires VOIDINFER_E5A4_BLOCK=8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
                     "targetok7capture ctx512 ends in the draft mask token");
@@ -5398,15 +5398,15 @@ int main() {
             return 0;
         }
         if (mode == "freshdraftprefillqual") {
-            run_fresh_draft_prefill_qualification(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")));
+            run_fresh_draft_prefill_qualification(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")));
             return 0;
         }
         if (mode == "freshdraftprefillstate") {
-            run_transaction_retention_qualification(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),false,true);
+            run_transaction_retention_qualification(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),false,true);
             return 0;
         }
         if (mode == "targetqkvk6state") {
-            run_transaction_retention_qualification(*target,*draft,load_ids(env("NINFER_E5A4_PROMPT_FILE")),true);
+            run_transaction_retention_qualification(*target,*draft,load_ids(env("VOIDINFER_E5A4_PROMPT_FILE")),true);
             return 0;
         }
         if (mode == "targetkvqual") {
@@ -5434,9 +5434,9 @@ int main() {
             return 0;
         }
         if (mode == "targetgraphc2verifiert1") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_EXL3_TARGET_GRAPH_C2_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_EXL3_TARGET_GRAPH_C2_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "targetgraphc2verifiert1 needs code/prose prompts and output");
             require(oscar_requested,
@@ -5447,8 +5447,8 @@ int main() {
             return 0;
         }
         if (mode == "t74realc2") {
-            const auto prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto output = env("NINFER_T74_OUT");
+            const auto prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto output = env("VOIDINFER_T74_OUT");
             require(!prompt_file.empty() && !output.empty(),
                     "t74realc2 needs PROMPT_FILE and T74_OUT");
             require(oscar_requested, "t74realc2 requires canonical OSCAR");
@@ -5457,9 +5457,9 @@ int main() {
             return 0;
         }
         if (mode == "t78cachedc2") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T78_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T78_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t78cachedc2 needs code/prose prompts and output");
             require(oscar_requested, "t78cachedc2 requires canonical OSCAR");
@@ -5468,9 +5468,9 @@ int main() {
             return 0;
         }
         if (mode == "t81cachedc4") {
-            const auto code_file = env("NINFER_E5A4_PROMPT_FILE");
-            const auto prose_file = env("NINFER_TEST_PROSE_FILE");
-            const auto output = env("NINFER_T81_OUT");
+            const auto code_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const auto prose_file = env("VOIDINFER_TEST_PROSE_FILE");
+            const auto output = env("VOIDINFER_T81_OUT");
             require(!code_file.empty() && !prose_file.empty() && !output.empty(),
                     "t81cachedc4 needs code/prose prompts and output");
             require(oscar_requested, "t81cachedc4 requires canonical OSCAR");
@@ -5480,14 +5480,14 @@ int main() {
             return 0;
         }
         if (mode == "targetgateupk7qual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "targetgateupk7qual needs PROMPT_FILE and OUT");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512,
                     "targetgateupk7qual prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
                     "targetgateupk7qual requires block8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
@@ -5503,15 +5503,15 @@ int main() {
             return 0;
         }
         if (mode == "targetk6qual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "targetk6qual needs PROMPT_FILE and OUT");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512,
                     "targetk6qual prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
-                    "targetk6qual requires NINFER_E5A4_BLOCK=8");
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
+                    "targetk6qual requires VOIDINFER_E5A4_BLOCK=8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
                     "targetk6qual ctx512 ends in the draft mask token");
@@ -5522,18 +5522,18 @@ int main() {
             return 0;
         }
         if (mode == "targetdownk6qual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "targetdownk6qual needs PROMPT_FILE and OUT");
-            require(env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "0" &&
-                        env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
+            require(env("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M") == "0" &&
+                        env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
                     "targetdownk6qual requires both candidates explicit flag0");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512,
                     "targetdownk6qual prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
-                    "targetdownk6qual requires NINFER_E5A4_BLOCK=8");
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
+                    "targetdownk6qual requires VOIDINFER_E5A4_BLOCK=8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
                     "targetdownk6qual ctx512 ends in the draft mask token");
@@ -5544,18 +5544,18 @@ int main() {
             return 0;
         }
         if (mode == "targetdownk7qual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "targetdownk7qual needs PROMPT_FILE and OUT");
-            require(env("NINFER_EXL3_TARGET_DOWN_K7_SMALL_M") == "0" &&
-                        env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
+            require(env("VOIDINFER_EXL3_TARGET_DOWN_K7_SMALL_M") == "0" &&
+                        env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
                     "targetdownk7qual requires both candidates explicit flag0");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512,
                     "targetdownk7qual prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
-                    "targetdownk7qual requires NINFER_E5A4_BLOCK=8");
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
+                    "targetdownk7qual requires VOIDINFER_E5A4_BLOCK=8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
                     "targetdownk7qual ctx512 ends in the draft mask token");
@@ -5566,8 +5566,8 @@ int main() {
             return 0;
         }
         if (mode == "targetk6smallmasyncqual") {
-            const std::string prompt_file=env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path=env("NINFER_E5A4_OUT");
+            const std::string prompt_file=env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path=env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty()&&!out_path.empty(),
                 "targetk6smallmasyncqual needs PROMPT_FILE and OUT");
             require(oscar_requested,
@@ -5584,8 +5584,8 @@ int main() {
             return 0;
         }
         if (mode == "targetm1k6qual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "targetm1k6qual needs PROMPT_FILE and OUT");
             const auto ids = load_ids(prompt_file);
@@ -5601,8 +5601,8 @@ int main() {
             return 0;
         }
         if (mode == "fastsameweightsint8qual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "fastsameweightsint8qual needs PROMPT_FILE and OUT");
             const auto ids = load_ids(prompt_file);
@@ -5618,7 +5618,7 @@ int main() {
             return 0;
         }
         if (mode == "m1predecodeddisc") {
-            const std::string prompt_file=env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file=env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(),
                     "m1predecodeddisc needs PROMPT_FILE");
             const auto ids=load_ids(prompt_file);
@@ -5632,7 +5632,7 @@ int main() {
             return 0;
         }
         if (mode == "m1gateuppairdisc") {
-            const std::string prompt_file=env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file=env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(),"m1gateuppairdisc needs PROMPT_FILE");
             const auto ids=load_ids(prompt_file);
             require(ids.size()>=512,
@@ -5645,7 +5645,7 @@ int main() {
             return 0;
         }
         if (mode == "m1fastdecodedisc") {
-            const std::string prompt_file=env("NINFER_E5A4_PROMPT_FILE");
+            const std::string prompt_file=env("VOIDINFER_E5A4_PROMPT_FILE");
             require(!prompt_file.empty(),"m1fastdecodedisc needs PROMPT_FILE");
             const auto ids=load_ids(prompt_file);
             require(ids.size()>=512,
@@ -5658,19 +5658,19 @@ int main() {
             return 0;
         }
         if (mode == "targetok7qual") {
-            const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-            const std::string out_path = env("NINFER_E5A4_OUT");
+            const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+            const std::string out_path = env("VOIDINFER_E5A4_OUT");
             require(!prompt_file.empty() && !out_path.empty(),
                     "targetok7qual needs PROMPT_FILE and OUT");
-            require(env("NINFER_EXL3_TARGET_O_K7_SMALL_M") == "0" &&
-                        env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
-                        env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
+            require(env("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M") == "0" &&
+                        env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
+                        env("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
                     "targetok7qual requires O flag0 and accepted K6 flags1");
             const auto ids = load_ids(prompt_file);
             require(ids.size() >= 512,
                     "targetok7qual prompt has fewer than 512 tokens");
-            require(env_int("NINFER_E5A4_BLOCK", 8) == 8,
-                    "targetok7qual requires NINFER_E5A4_BLOCK=8");
+            require(env_int("VOIDINFER_E5A4_BLOCK", 8) == 8,
+                    "targetok7qual requires VOIDINFER_E5A4_BLOCK=8");
             std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
             require(prompt.back() != kMaskToken,
                     "targetok7qual ctx512 ends in the draft mask token");
@@ -5681,23 +5681,23 @@ int main() {
             return 0;
         }
         // accept mode
-        const std::string family = env("NINFER_E5A4_FAMILY");
-        const std::string prompt_file = env("NINFER_E5A4_PROMPT_FILE");
-        const std::string contexts = env("NINFER_E5A4_CONTEXTS");
-        const int block_len = env_int("NINFER_E5A4_BLOCK", 8);
-        const int reads = env_int("NINFER_E5A4_READS", 24);
-        const int warmup = env_int("NINFER_E5A4_WARMUP", 2);
-        const std::string summary_path = env("NINFER_E5A4_OUT");
-        const std::string perread_path = env("NINFER_E5A4_PERREAD_OUT");
-        const std::string hist_path = env("NINFER_E5A4_HIST_OUT");
+        const std::string family = env("VOIDINFER_E5A4_FAMILY");
+        const std::string prompt_file = env("VOIDINFER_E5A4_PROMPT_FILE");
+        const std::string contexts = env("VOIDINFER_E5A4_CONTEXTS");
+        const int block_len = env_int("VOIDINFER_E5A4_BLOCK", 8);
+        const int reads = env_int("VOIDINFER_E5A4_READS", 24);
+        const int warmup = env_int("VOIDINFER_E5A4_WARMUP", 2);
+        const std::string summary_path = env("VOIDINFER_E5A4_OUT");
+        const std::string perread_path = env("VOIDINFER_E5A4_PERREAD_OUT");
+        const std::string hist_path = env("VOIDINFER_E5A4_HIST_OUT");
         const std::string confidence_path =
-            env("NINFER_E5A4_CONFIDENCE_OUT");
+            env("VOIDINFER_E5A4_CONFIDENCE_OUT");
         const std::string confidence_policy_out_path =
-            env("NINFER_E5A4_CONFIDENCE_POLICY_OUT");
+            env("VOIDINFER_E5A4_CONFIDENCE_POLICY_OUT");
         const bool target_projection_timing =
-            env("NINFER_EXL3_TARGET_PROJECTION_TIMING") == "1";
+            env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING") == "1";
         const std::string target_projection_timing_path =
-            env("NINFER_EXL3_TARGET_PROJECTION_TIMING_OUT");
+            env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING_OUT");
         require(!family.empty() && !prompt_file.empty() && !contexts.empty(), "E5A4 accept needs FAMILY/PROMPT_FILE/CONTEXTS");
         require(!summary_path.empty() && !perread_path.empty() && !hist_path.empty(), "E5A4 accept needs OUT/PERREAD_OUT/HIST_OUT");
         const auto all_ids = load_ids(prompt_file);
@@ -5706,7 +5706,7 @@ int main() {
         std::ofstream hist(hist_path);
         std::ofstream confidence_out;
         if (!confidence_path.empty()) {
-            require(env("NINFER_DFLASH2_POSITION_CONFIDENCE") == "1",
+            require(env("VOIDINFER_DFLASH2_POSITION_CONFIDENCE") == "1",
                     "confidence output requires POSITION_CONFIDENCE=1");
             confidence_out.open(confidence_path);
             require(confidence_out.good(),
@@ -5722,7 +5722,7 @@ int main() {
         }
         std::ofstream confidence_policy_out;
         if (!confidence_policy_out_path.empty()) {
-            require(env("NINFER_E5A4_CONFIDENCE_POLICY") == "1",
+            require(env("VOIDINFER_E5A4_CONFIDENCE_POLICY") == "1",
                     "confidence policy output requires active policy");
             confidence_policy_out.open(confidence_policy_out_path);
             require(confidence_policy_out.good(),
@@ -5736,7 +5736,7 @@ int main() {
         }
         std::ofstream target_projection_out;
         if (target_projection_timing) {
-            const std::string timing_verifier = env("NINFER_E5A4_VERIFIER");
+            const std::string timing_verifier = env("VOIDINFER_E5A4_VERIFIER");
             require(timing_verifier == "transaction" ||
                         timing_verifier == "transaction_retain",
                     "target projection timing requires a transaction verifier");
@@ -5782,7 +5782,7 @@ int main() {
             if (confidence_out.is_open()) confidence_out.flush();
             if (confidence_policy_out.is_open()) confidence_policy_out.flush();
             // Optional correctness witness is written only after the measured request and normal result output.
-            const auto exact_tokens_path = env("NINFER_E5A4_EXACT_TOKENS_OUT");
+            const auto exact_tokens_path = env("VOIDINFER_E5A4_EXACT_TOKENS_OUT");
             if (!exact_tokens_path.empty()) {
                 require(contexts.find(',') == std::string::npos && !std::filesystem::exists(exact_tokens_path),
                         "exact token witness requires one context and a new output");

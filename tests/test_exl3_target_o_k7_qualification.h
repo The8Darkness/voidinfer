@@ -12,22 +12,22 @@ void run_target_o_k7_qualification(Exl3TextModel& target,
                                       std::ostream& out) {
     require(prompt.size() == 512, "target O K7 qualification requires ctx512");
     require(oscar, "target O K7 qualification requires canonical OSCAR");
-    require(env("NINFER_EXL3_TARGET_O_K7_SMALL_M") == "0" &&
-                env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
-                env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
+    require(env("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M") == "0" &&
+                env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
+                env("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
             "target O K7 capture requires O flag0 and accepted K6 flags1");
-    ninfer::test::ScopedEnvironmentRestore restore_environment{
-        "NINFER_EXL3_TARGET_O_K7_SMALL_M",
-        "NINFER_EXL3_TARGET_GATEUP_SMALL_M",
-        "NINFER_EXL3_TARGET_DOWN_SMALL_M",
-        "NINFER_EXL3_GENERIC_SPLITS"};
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment{
+        "VOIDINFER_EXL3_TARGET_O_K7_SMALL_M",
+        "VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M",
+        "VOIDINFER_EXL3_TARGET_DOWN_SMALL_M",
+        "VOIDINFER_EXL3_GENERIC_SPLITS"};
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
     auto captured = run_target_o_k7_capture(
         target, draft, prompt, std::filesystem::path{}, oscar);
     require(captured.size() == 32,
             "target O K7 qualification capture count mismatch");
 
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     constexpr Admission admit = Admission::target_continuation_o;
     constexpr int input_features = 6144;
     constexpr int output_features = 5120;
@@ -36,7 +36,7 @@ void run_target_o_k7_qualification(Exl3TextModel& target,
     const std::vector<int> oracle_groups = {0, 3, 4, 19, 20, 39};
     const auto& representative = captured.front();
 
-    _putenv_s("NINFER_EXL3_TARGET_O_K7_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M", "1");
     Exl3CudaLinearWorkspace enabled(
         input_features, output_features, 8, false, false, false, true);
     Exl3CudaLinearWorkspace generic_owner(input_features, output_features, 8);
@@ -54,21 +54,21 @@ void run_target_o_k7_qualification(Exl3TextModel& target,
                     representative.metadata, 8, admit)) == "generic_tile",
             "target O K7 candidate escaped ownership/admission");
     for (const char* disabled : {"", "0", "2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_TARGET_O_K7_SMALL_M", disabled);
+        _putenv_s("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M", disabled);
         Exl3CudaLinearWorkspace off(
             input_features, output_features, 8, false, false, false, true);
         require(std::string(off.dispatch_name(representative.metadata, 8, admit)) ==
                     "generic_tile",
                 "target O K7 accepted a non-exact opt-in value");
     }
-    _putenv_s("NINFER_EXL3_TARGET_O_K7_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M", "0");
     Exl3CudaLinearWorkspace latched_off(
         input_features, output_features, 8, false, false, false, true);
     require(std::string(enabled.dispatch_name(
                 representative.metadata, 8, admit)) ==
                     "target_o_k7_small_m_mma_split",
             "target O K7 enabled workspace did not retain latched flag1");
-    _putenv_s("NINFER_EXL3_TARGET_O_K7_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M", "1");
     require(std::string(latched_off.dispatch_name(
                 representative.metadata, 8, admit)) == "generic_tile" &&
                 std::string(enabled.dispatch_name(
@@ -138,8 +138,8 @@ void run_target_o_k7_qualification(Exl3TextModel& target,
                               item.input.size() * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice),
                    "target O K7 input upload");
-        _putenv_s("NINFER_EXL3_TARGET_O_K7_SMALL_M", "1");
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
+        _putenv_s("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
         Exl3CudaLinearWorkspace candidate(
             input_features, output_features, 8, false, false, false, true);
         Exl3CudaLinearWorkspace reference_ws(input_features, output_features, 1);
@@ -311,7 +311,7 @@ void run_target_o_k7_qualification(Exl3TextModel& target,
 
     // Explicit S1 differential: real GDN layer 2 and full-attention layer 23,
     // each at M2 and M8, with candidate/reference sharing the override.
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "1");
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "1");
     for (const int layer : {2, 23}) {
         const auto found = std::find_if(captured.begin(), captured.end(),
             [layer](const auto& item) { return item.layer == layer; });

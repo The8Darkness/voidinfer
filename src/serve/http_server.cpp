@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 struct StreamingRequest {
@@ -79,8 +79,8 @@ std::string sse_error_event(const ApiError& error) {
     return "data: " + make_error_body(error) + "\n\n";
 }
 
-ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
-                                        const ninfer::RuntimeStats& current,
+ThroughputReport make_throughput_report(const voidinfer::RuntimeStats& previous,
+                                        const voidinfer::RuntimeStats& current,
                                         double interval_seconds) {
     return ThroughputReport{
         .interval_seconds = interval_seconds,
@@ -184,8 +184,8 @@ bool HttpServer::webui_spa_path(const std::string& path) const {
     if (path.size() < 2 || path[0] != '/') { return false; }
     if (path == "/") { return false; }
     if (path.rfind("/v1", 0) == 0 && (path.size() == 3 || path[3] == '/')) { return false; }
-    // llama.cpp server endpoints the webui probes but ninfer does not implement, plus
-    // ninfer's own status endpoints: keep them at their natural 404/405 so the UI
+    // llama.cpp server endpoints the webui probes but voidinfer does not implement, plus
+    // voidinfer's own status endpoints: keep them at their natural 404/405 so the UI
     // degrades exactly as it did against a real llama-server, rather than getting the
     // SPA shell back for an API call.
     if (path == "/props" || path == "/health" || path == "/slots" || path == "/tools" ||
@@ -241,7 +241,7 @@ void HttpServer::log_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    voidinfer::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
 
@@ -251,7 +251,7 @@ void HttpServer::run_stats_reporter() {
             if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
+        const voidinfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -260,7 +260,7 @@ void HttpServer::run_stats_reporter() {
         previous_time = now;
     }
 
-    const ninfer::RuntimeStats current = service_->runtime_stats();
+    const voidinfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -460,7 +460,7 @@ void HttpServer::register_routes() {
 
 // llama.cpp webui dialect: /props is the client's server introspection endpoint
 // (role detection, context size, default params, thinking-capability probe, api
-// key validation). NInfer has no llama.cpp server behind it, so serve a faithful
+// key validation). VoidInfer has no llama.cpp server behind it, so serve a faithful
 // stub derived from the process configuration. Only process-level overrides are
 // reported as parameter values; everything else stays at neutral zeros so client
 // side defaults never swallow a user-set request parameter.
@@ -544,14 +544,14 @@ nlohmann::json make_props_stub(const ServeOptions& options, const std::string& m
     // webui's thinking-support heuristic) need `enable_thinking` to appear; the
     // real template is the model directory's chat_template.jinja.
     props["chat_template"] =
-        "{# ninfer-serve: capability marker; the real chat template is the "
+        "{# voidinfer-serve: capability marker; the real chat template is the "
         "model chat_template.jinja #}\n"
         "{%- if enable_thinking is defined %}\n"
         "  {%- set thinking = enable_thinking %}\n"
         "{% endif %}";
     props["bos_token"] = "";
     props["eos_token"] = "";
-    props["build_info"] = "ninfer-serve";
+    props["build_info"] = "voidinfer-serve";
     return props;
 }
 
@@ -1009,7 +1009,7 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    const ninfer::LoadSummary load = service.load_summary();
+    const voidinfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.engine_options(),
@@ -1038,4 +1038,4 @@ bool HttpServer::listen() {
 
 void HttpServer::stop() { server_.stop(); }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

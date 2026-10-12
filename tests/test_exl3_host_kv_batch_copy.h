@@ -2,23 +2,23 @@
 
 void run_exact_host_kv_batch_copy_screen(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose,bool metadata=false) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     const int prefix=target.max_context()>=4352?4096:96;
     const int forced_rows=metadata?64:0;
     require(code.size()>=prefix && prose.size()>=prefix,
         "host KV batch-copy fixture/context extent");
     require(target.max_context()>=prefix+1+forced_rows,
         "HostKV repeated metadata page-boundary fixture lacks context capacity");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
     if(metadata) {
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_CHUNKS","0");
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_CHUNKS","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","0");
     }
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","0");
     auto control=target.create_context(true);control->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
@@ -43,7 +43,7 @@ void run_exact_host_kv_batch_copy_screen(Exl3TextModel& target,
             const auto after=context.host_kv_stats();
             require(after.batch_metadata_bytes==before.batch_metadata_bytes,
                 "HostKV page-boundary reuse grew prepared descriptor storage");
-            ninfer::exl3::Exl3HostKVStats delta=after;
+            voidinfer::exl3::Exl3HostKVStats delta=after;
             delta.h2d_bytes-=before.h2d_bytes;delta.d2h_bytes-=before.d2h_bytes;
             delta.transfer_calls-=before.transfer_calls;
             delta.copy_submissions-=before.copy_submissions;

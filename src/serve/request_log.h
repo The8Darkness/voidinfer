@@ -15,10 +15,10 @@
 #include <optional>
 #include <string>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 
 inline constexpr int kRequestLogSchemaVersion        = 18;
-inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
+inline constexpr const char* kRequestLogArtifactType = "voidinfer_serve_request_log";
 
 struct RequestLogContext {
     std::uint64_t id = 0;
@@ -37,9 +37,9 @@ struct RequestLogContext {
     std::optional<std::uint32_t> thinking_budget;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
-    ninfer::ResolvedSamplingParameters sampling;
+    voidinfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
-    ninfer::PromptPreparationStats preparation;
+    voidinfer::PromptPreparationStats preparation;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -77,8 +77,8 @@ struct ThroughputReport {
     std::uint64_t computed_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;
     std::uint64_t decode_rounds           = 0;
-    ninfer::RuntimeStats previous;
-    ninfer::RuntimeStats current;
+    voidinfer::RuntimeStats previous;
+    voidinfer::RuntimeStats current;
 };
 
 
@@ -101,9 +101,9 @@ std::string format_throughput(const ThroughputReport& report);
 // object without a trailing newline.
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp_unix_ms,
-    const ServeOptions& options, const ninfer::EngineOptions& engine_options,
-    const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
+    const ServeOptions& options, const voidinfer::EngineOptions& engine_options,
+    const voidinfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
+    const voidinfer::LoadSummary& load, const voidinfer::MemorySummary& memory,
     const ServerLogEnvironment& environment);
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
@@ -139,10 +139,10 @@ public:
     }
 
     void write_server_start(const ServeOptions& options,
-                            const ninfer::EngineOptions& engine_options,
-                            const ninfer::ModelSamplingDefaults& sampling_defaults,
-                            const std::string& public_model_id, const ninfer::LoadSummary& load,
-                            const ninfer::MemorySummary& memory);
+                            const voidinfer::EngineOptions& engine_options,
+                            const voidinfer::ModelSamplingDefaults& sampling_defaults,
+                            const std::string& public_model_id, const voidinfer::LoadSummary& load,
+                            const voidinfer::MemorySummary& memory);
     void write_request_start(const RequestLogContext& context);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
@@ -159,4 +159,4 @@ private:
     bool failed_ = false;
 };
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

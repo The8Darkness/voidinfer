@@ -67,7 +67,7 @@
 #include <utility>
 #include <unordered_set>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Set by the Engine before it builds a single lane that gets an exact
 // VeriCache line: the line shares the prompt-scale workspaces with the
 // drafting context it verifies (never both in a prompt pass at once).
@@ -109,7 +109,7 @@ cudaError_t exl3_h2d_async(void* device,const void* host,std::size_t bytes,cudaS
     const int slot=ring.next;
     ring.next=(ring.next+1)%kSlots;
     if(ring.used[slot])
-        if(const auto error=ninfer::cuda_poll_event(ring.done[slot]);error!=cudaSuccess)return error;
+        if(const auto error=voidinfer::cuda_poll_event(ring.done[slot]);error!=cudaSuccess)return error;
     std::memcpy(ring.host+slot*kSlotBytes,host,bytes);
     if(const auto error=exl3_copy_async(device,ring.device+slot*kSlotBytes,bytes,stream);error!=cudaSuccess)
         return error;
@@ -140,7 +140,7 @@ cudaError_t exl3_d2h_async(void* host,const void* device,std::size_t bytes,cudaS
         bounce.bytes=kKernelReadbackMax;
     }
     if(const auto error=exl3_copy_async(bounce.device,device,bytes,stream);error!=cudaSuccess)return error;
-    if(const auto error=ninfer::cuda_poll_stream(stream);error!=cudaSuccess)return error;
+    if(const auto error=voidinfer::cuda_poll_stream(stream);error!=cudaSuccess)return error;
     if(const auto error=cudaStreamSynchronize(stream);error!=cudaSuccess)return error;
     std::memcpy(host,bounce.host,bytes);
     return cudaSuccess;
@@ -164,7 +164,7 @@ constexpr std::array<int, 5> kTapLayers = {5, 19, 33, 47, 61};
 std::atomic<std::uint64_t> next_exact_residency_id{1};
 
 bool fast_device_kv_transaction_enabled() {
-    const char* value=std::getenv("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION");
+    const char* value=std::getenv("VOIDINFER_EXL3_FAST_DEVICE_KV_TRANSACTION");
     if(value && std::strcmp(value,"0")!=0 && std::strcmp(value,"1")!=0)
         throw std::invalid_argument("fast device-KV transaction must be 0 or 1");
     return value && std::strcmp(value,"1")==0;
@@ -503,7 +503,7 @@ struct DeviceAllocation {
                 cuda_check(cudaHostAlloc(&ptr,bytes,cudaHostAllocMapped|cudaHostAllocPortable),label);
         } else {
             cuda_check(exl3_packed_malloc(&ptr, bytes), label);
-            static const bool trace=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+            static const bool trace=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
             if(trace && bytes>=(256u<<10))
                 std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB %s%c",bytes/1048576.0,label?label:"?",10);
         }
@@ -511,10 +511,10 @@ struct DeviceAllocation {
     // Long-context E4A K/V planes (max_context above 32K) grow with the
     // context; shorter ones stay pinned at construction, which keeps exports
     // as plain CPU copies (growable planes export through GPU DMA, ~2% of C4
-    // throughput at 4K). NINFER_EXL3_L0_GROWABLE_PLANES=0|1 forces either.
+    // throughput at 4K). VOIDINFER_EXL3_L0_GROWABLE_PLANES=0|1 forces either.
     static bool growable_host_planes(const char* label,std::size_t bytes) {
         static const int forced=[] {
-            const char* value=std::getenv("NINFER_EXL3_L0_GROWABLE_PLANES");
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_GROWABLE_PLANES");
             return value ? (std::strcmp(value,"0")!=0 ? 1 : 0) : -1;
         }();
         constexpr std::size_t kPinnedPlaneBytes=32768ull*kKVHeads*kHeadDim*sizeof(std::uint16_t);
@@ -526,15 +526,15 @@ struct DeviceAllocation {
         const bool l0=Exl3NativeContextExtent::l0_oscar_enabled();
         if(l0 && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
                            std::strcmp(label,"allocate E4A V cache")==0))return true;
-        // Concurrent lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1) keep the
+        // Concurrent lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1) keep the
         // VeriCache verified root (GDN state at the verified frontier) in
         // mapped host memory: it is written once per verified block and read
         // only on a correction, so ~154 MiB per lane leave the device for a
-        // few-millisecond PCIe copy per verify. NINFER_EXL3_HOST_VERIFIED_ROOT=0
+        // few-millisecond PCIe copy per verify. VOIDINFER_EXL3_HOST_VERIFIED_ROOT=0
         // keeps it on the device.
         static const bool host_root=[] {
-            const char* shared=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
-            const char* value=std::getenv("NINFER_EXL3_HOST_VERIFIED_ROOT");
+            const char* shared=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            const char* value=std::getenv("VOIDINFER_EXL3_HOST_VERIFIED_ROOT");
             if(value)return std::strcmp(value,"0")!=0;
             return shared && std::strcmp(shared,"1")==0;
         }();
@@ -957,7 +957,7 @@ struct Exl3TextModel::Impl {
     Exl3CudaLinearWeights lm_head{};
     Exl3CudaLinearMetadata lm_head_metadata{};
     const std::uint16_t* embedding = nullptr;
-    // NINFER_EXL3_HOST_EMBEDDING (default 1): the BF16 token embedding
+    // VOIDINFER_EXL3_HOST_EMBEDDING (default 1): the BF16 token embedding
     // (2.5 GB) lives in mapped pinned host memory; lookups read a few rows
     // per step over PCIe, and the device memory serves more Engine lanes.
     struct HostEmbedding {
@@ -971,7 +971,7 @@ struct Exl3TextModel::Impl {
     const std::uint16_t* final_norm = nullptr;
     std::size_t model_bytes = 0;
     // Prompt-scale FP16 reconstruct + GEMM workspace shared by the contexts of
-    // concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): only
+    // concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): only
     // prompt ingestion and VeriCache verifier passes use it, and the Engine
     // runs those one lane at a time.
     mutable std::mutex shared_numeric_mutex;
@@ -1149,10 +1149,10 @@ struct Exl3TextModel::Impl {
         require(full_count == 16, "canonical EXL3 full-attention layer count mismatch");
 
         collection = inspect_indexed_directory(directory);
-        const char* mirror_override = std::getenv("NINFER_EXL3_DUAL_READ_MANIFEST");
-        const char* dual_mode = std::getenv("NINFER_EXL3_DUAL_LOAD");
+        const char* mirror_override = std::getenv("VOIDINFER_EXL3_DUAL_READ_MANIFEST");
+        const char* dual_mode = std::getenv("VOIDINFER_EXL3_DUAL_LOAD");
         require(!dual_mode || !*dual_mode || std::strcmp(dual_mode, "0") == 0 ||
-                std::strcmp(dual_mode, "1") == 0, "NINFER_EXL3_DUAL_LOAD must be0 or1");
+                std::strcmp(dual_mode, "1") == 0, "VOIDINFER_EXL3_DUAL_LOAD must be0 or1");
         const bool disabled = load_options.disable_dual_artifact_loading ||
                               (dual_mode && std::strcmp(dual_mode, "0") == 0);
         std::filesystem::path mirror;
@@ -1163,7 +1163,7 @@ struct Exl3TextModel::Impl {
             require(!(dual_mode && std::strcmp(dual_mode, "1") == 0) || !mirror.empty(),
                     "forced dual loading requires a verified mirror manifest");
         }
-        const char* audit = std::getenv("NINFER_EXL3_DUAL_READ_AUDIT");
+        const char* audit = std::getenv("VOIDINFER_EXL3_DUAL_READ_AUDIT");
         audit_parallel = audit && std::strcmp(audit, "1") == 0;
         require(!audit_parallel || !mirror.empty(), "parallel audit requires a verified mirror manifest");
         if (!mirror.empty()) {
@@ -1176,9 +1176,9 @@ struct Exl3TextModel::Impl {
             load_stats.parallel_staged = true;
         }
         static const bool host_embedding_enabled = [] {
-            const char* value = std::getenv("NINFER_EXL3_HOST_EMBEDDING");
+            const char* value = std::getenv("VOIDINFER_EXL3_HOST_EMBEDDING");
             require(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0,
-                    "NINFER_EXL3_HOST_EMBEDDING must be 0 or 1");
+                    "VOIDINFER_EXL3_HOST_EMBEDDING must be 0 or 1");
             return !value || std::strcmp(value, "1") == 0;
         }();
         if (host_embedding_enabled) {
@@ -1706,7 +1706,7 @@ struct Exl3TextContext::Impl {
     std::unique_ptr<Exl3CudaLinearWorkspace> batched_head_workspace, batched_head_workspace32;
     // Nonzero while a batched multi-agent BatchBinding owns the layers.
     int batch_bound = 0;
-    // GDN live checkpoint (NINFER_EXL3_GDN_LIVE_CHECKPOINT; default with
+    // GDN live checkpoint (VOIDINFER_EXL3_GDN_LIVE_CHECKPOINT; default with
     // concurrent lanes): the transaction keeps no recurrent copy. Attempt
     // forwards read the live state without writing it back (device flag 0)
     // and the retained-prefix repair advances it in place at settlement.
@@ -1766,7 +1766,7 @@ struct Exl3TextContext::Impl {
         for(auto& layer:gdn_layers)if(layer)layer->set_live_transaction(false);
     }
     // Owner-side fork streams for batched peers' stateful cores
-    // (NINFER_EXL3_BATCH_FORK, default on); created on first lead.
+    // (VOIDINFER_EXL3_BATCH_FORK, default on); created on first lead.
     std::array<cudaStream_t,3> batch_fork_streams{};
     cudaEvent_t batch_fork_event = nullptr;
     std::array<cudaEvent_t,3> batch_join_events{};
@@ -2004,7 +2004,7 @@ struct Exl3TextContext::Impl {
     // INT4 codes, exact history only.
     bool exact_line = false;
     // FP8 history mirror the asynchronous line attends (make_exact_line,
-    // NINFER_EXL3_VERICACHE_LINE_FP8; l0_exact.cuh L0LineFp8), owned by the
+    // VOIDINFER_EXL3_VERICACHE_LINE_FP8; l0_exact.cuh L0LineFp8), owned by the
     // drafting context beside its FP16 planes and grown with them.
     std::array<std::unique_ptr<Exl3GrowableDeviceRegion>,kLayers> line_fp8_k,line_fp8_v;
     std::array<std::atomic<int>,kLayers> line_fp8_valid{};
@@ -2084,7 +2084,7 @@ struct Exl3TextContext::Impl {
     Exl3TextContext::SnapshotMetadataReservation request_metadata_reservation;
     Exl3TextContext::RequestHostPayloadReservation request_host_payload_reservation;
     Exl3TextContext::RequestHostPayloadObserver request_host_payload_observer;
-    bool pinned_recurrent_export = []{const auto* p=std::getenv("NINFER_EXL3_PINNED_RECURRENT_EXPORT");return p && std::string_view(p)=="1";}();
+    bool pinned_recurrent_export = []{const auto* p=std::getenv("VOIDINFER_EXL3_PINNED_RECURRENT_EXPORT");return p && std::string_view(p)=="1";}();
     bool batched_recurrent_export = false;
 
     static constexpr std::size_t continuation_graph_role_record_count=3;
@@ -2348,7 +2348,7 @@ struct Exl3TextContext::Impl {
             continuation->additional_graphs[0].lifecycle.pending() ||
             continuation->additional_graphs[1].lifecycle.pending();
         if(!pending)return;
-        const auto* option=std::getenv("NINFER_EXL3_NARROW_GRAPH_DRAIN");
+        const auto* option=std::getenv("VOIDINFER_EXL3_NARROW_GRAPH_DRAIN");
         if(option && std::string_view(option)!="0" &&
            std::string_view(option)!="1")
             throw std::invalid_argument(
@@ -2370,7 +2370,7 @@ struct Exl3TextContext::Impl {
                 "drain owned-stream continuation graph uses before context mutation");
             ++continuation->graph_stats.narrow_final_use_drains;
         } else {
-            cuda_check(ninfer::cuda_device_synchronize_outside_capture(),
+            cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),
                 "drain continuation graph uses before context mutation");
             ++continuation->graph_stats.device_final_use_drains;
         }
@@ -2435,33 +2435,33 @@ struct Exl3TextContext::Impl {
     cudaError_t retire_graph_handles_with(Query&& query,Drain&& drain) noexcept {
         if(graph_retirement_error)return static_cast<cudaError_t>(graph_retirement_error);
         if(!has_graph_handles())return cudaSuccess;
-        const auto error=ninfer::detail::retire_decode_graph_device(graph_owner_device,
+        const auto error=voidinfer::detail::retire_decode_graph_device(graph_owner_device,
             query,drain,
             [&]() noexcept {
-                auto result=ninfer::detail::retire_decode_graph_pair(graph_executable,graph_definition);
+                auto result=voidinfer::detail::retire_decode_graph_pair(graph_executable,graph_definition);
                 if(result!=cudaSuccess)return result;
                 for(auto& graph:host_kv_gdn_segment_graphs) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         graph.executable,graph.definition);
                     if(result!=cudaSuccess)return result;
                 }
                 for(auto& graph:host_kv_full_layer_graphs) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         graph.executable,graph.definition);
                     if(result!=cudaSuccess)return result;
                 }
                 for(auto& graph:ordinary_full_layer_graphs) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         graph.executable,graph.definition);
                     if(result!=cudaSuccess)return result;
                 }
                 for(auto& graph:host_kv_mlp_tail_graphs) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         graph.executable,graph.definition);
                     if(result!=cudaSuccess)return result;
                 }
                 if(transaction) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         transaction->checkpoint_graph_executable,
                         transaction->checkpoint_graph_definition);
                     if(result!=cudaSuccess)return result;
@@ -2495,7 +2495,7 @@ struct Exl3TextContext::Impl {
                         }
                         if(phase!=Exl3BoundedGraphEntry::Phase::empty)
                             lifecycle.invalidate("context graph retirement");
-                        const auto retired=ninfer::detail::retire_decode_graph_pair(
+                        const auto retired=voidinfer::detail::retire_decode_graph_pair(
                             executable,definition);
                         if(retired!=cudaSuccess) {
                             if(had_handles)++continuation->graph_stats.destruction_failures;
@@ -2547,7 +2547,7 @@ struct Exl3TextContext::Impl {
     cudaError_t retire_graph_handles() noexcept {
         return retire_graph_handles_with(
             [](int* device) noexcept {return cudaGetDevice(device);},
-            []() noexcept {return ninfer::cuda_device_synchronize_outside_capture();});
+            []() noexcept {return voidinfer::cuda_device_synchronize_outside_capture();});
     }
     void poison_graph_retirement(cudaError_t error) noexcept {
         if(error==cudaSuccess || graph_retirement_error)return;
@@ -2607,7 +2607,7 @@ struct Exl3TextContext::Impl {
         if(small_tier_storage)(void)cudaFree(small_tier_storage);
         if(gdn_write_flag){(void)cudaFree(gdn_write_flag);gdn_write_flag=nullptr;}
         if(transaction && transaction->live_host_root){
-            (void)ninfer::cuda_device_synchronize_outside_capture();(void)cudaFreeHost(transaction->live_host_root);
+            (void)voidinfer::cuda_device_synchronize_outside_capture();(void)cudaFreeHost(transaction->live_host_root);
             transaction->live_host_root=nullptr;}
         for(auto& s:batch_fork_streams)if(s){(void)cudaStreamSynchronize(s);(void)cudaStreamDestroy(s);s=nullptr;}
         for(auto& e:batch_join_events)if(e){(void)cudaEventDestroy(e);e=nullptr;}
@@ -3355,13 +3355,13 @@ struct Exl3TextContext::Impl {
                 std::chrono::steady_clock::now()-started).count();
     }
 
-    // NINFER_EXL3_ORDINARY_STACK_GRAPH (default 1). Captured after the
+    // VOIDINFER_EXL3_ORDINARY_STACK_GRAPH (default 1). Captured after the
     // per-segment graphs with the same layer arguments: GDN layers as their
     // segment graphs (rows 1), full layers at the capacity frontier with the
     // live position read from position_device_ at replay.
     void capture_ordinary_stack_graph() {
         static const bool enabled=[] {
-            const char* value=std::getenv("NINFER_EXL3_ORDINARY_STACK_GRAPH");
+            const char* value=std::getenv("VOIDINFER_EXL3_ORDINARY_STACK_GRAPH");
             return !value || std::strcmp(value,"0")!=0;
         }();
         if(!enabled || !ordinary_gdn_segment_graphs_enabled || !ordinary_full_layer_graphs_enabled ||
@@ -3639,11 +3639,11 @@ struct Exl3TextContext::Impl {
             for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
                 if(region)region->ensure(mirror);
     }
-    // TEST (NINFER_TEST_L0_FP8_HISTORY=1): this context's own staged exact
+    // TEST (VOIDINFER_TEST_L0_FP8_HISTORY=1): this context's own staged exact
     // passes attend its history through an FP8 mirror (quality measurement
     // of the line's FP8 history on prompt ingestion / NLL scoring).
     void ensure_self_fp8_history() {
-        static const bool requested=std::getenv("NINFER_TEST_L0_FP8_HISTORY")!=nullptr;
+        static const bool requested=std::getenv("VOIDINFER_TEST_L0_FP8_HISTORY")!=nullptr;
         if(!requested || exact_line)return;
         int first=-1;
         for(int layer=0;layer<kLayers;++layer)if(full_layers[layer]){first=layer;break;}
@@ -3940,7 +3940,7 @@ struct Exl3TextContext::Impl {
               continuation_reference && rows>=2 &&
               rows<=host_kv_full_graph_row_shapes &&
               position+rows<=max_context));
-        if (rows==1 && std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
+        if (rows==1 && std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
             std::fprintf(stderr,
                 "ordinary_full_layer_graph_route position=%d max=%d enabled=%d extended=%d use=%d wide=%d graph=%d capture=%d events=%d observer=%d timing=%d projection=%d eager_mlp=%d continuation=%d\\n",
                 position,max_context,ordinary_full_layer_graphs_enabled ? 1 : 0,
@@ -4233,7 +4233,7 @@ struct Exl3TextContext::Impl {
                         full_layers[layer]->arm_captured_retained_prefix(
                             rows,position,stream);
                     if (rows==1 &&
-                        std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
+                        std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                         std::fprintf(stderr,
                             "ordinary_full_layer_graph_replay position=%d layer=%d count=%llu\\n",
                             position,layer,
@@ -4595,13 +4595,13 @@ const Exl3ModelLoadStats& Exl3TextModel::load_stats() const noexcept { return im
 
 std::unique_ptr<Exl3TextModel> Exl3TextModel::load(const std::filesystem::path& model_directory,
                                                    int max_context, const Exl3LoadOptions& options) {
-    const char* extended_context=std::getenv("NINFER_EXL3_EXTENDED_CONTEXT_64K");
+    const char* extended_context=std::getenv("VOIDINFER_EXL3_EXTENDED_CONTEXT_64K");
     require(!extended_context || std::strcmp(extended_context,"0")==0 ||
             std::strcmp(extended_context,"1")==0,
             "extended 64K context must be 0 or 1");
     const bool extended_context_enabled=extended_context &&
         std::strcmp(extended_context,"1")==0;
-    const char* extended_context_128=std::getenv("NINFER_EXL3_EXTENDED_CONTEXT_128K");
+    const char* extended_context_128=std::getenv("VOIDINFER_EXL3_EXTENDED_CONTEXT_128K");
     require(!extended_context_128 || std::strcmp(extended_context_128,"0")==0 ||
             std::strcmp(extended_context_128,"1")==0,
             "extended 128K context must be 0 or 1");
@@ -4702,7 +4702,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     impl->max_context = max_context_;
     impl->capture_taps = capture_taps;
     const char* continuation_graph_b8=
-        std::getenv("NINFER_E5A4_CONTINUATION_GRAPH_B8");
+        std::getenv("VOIDINFER_E5A4_CONTINUATION_GRAPH_B8");
     require(!continuation_graph_b8 ||
                 std::strcmp(continuation_graph_b8,"0")==0 ||
                 std::strcmp(continuation_graph_b8,"1")==0,
@@ -4710,17 +4710,17 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     impl->continuation_graph_b8_enabled=continuation_graph_b8 &&
         std::strcmp(continuation_graph_b8,"1")==0;
     const char* graph_gdn_qkvz =
-        std::getenv("NINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT");
+        std::getenv("VOIDINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT");
     require(!graph_gdn_qkvz || std::strcmp(graph_gdn_qkvz,"0")==0 ||
                 std::strcmp(graph_gdn_qkvz,"1")==0,
             "fixed-B8 graph GDN QKV/Z concurrency must be 0 or 1");
     impl->continuation_graph_gdn_qkvz_concurrent =
         impl->continuation_graph_b8_enabled && graph_gdn_qkvz &&
         std::strcmp(graph_gdn_qkvz,"1")==0;
-    const char* host_kv=std::getenv("NINFER_EXL3_EXACT_HOST_KV");
+    const char* host_kv=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV");
     impl->host_kv.enabled=host_kv && std::strcmp(host_kv,"1")==0;
     const char* host_kv_gdn_segment_graphs=
-        std::getenv("NINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS");
     require(!host_kv_gdn_segment_graphs ||
             std::strcmp(host_kv_gdn_segment_graphs,"0")==0 ||
             std::strcmp(host_kv_gdn_segment_graphs,"1")==0,
@@ -4732,7 +4732,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             !impl->continuation_graph_b8_enabled,
         "HostKV GDN segment graphs exclude OSCAR continuation graphs");
     const char* host_kv_full_layer_graphs=
-        std::getenv("NINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS");
     require(!host_kv_full_layer_graphs ||
             std::strcmp(host_kv_full_layer_graphs,"0")==0 ||
             std::strcmp(host_kv_full_layer_graphs,"1")==0,
@@ -4745,7 +4745,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "HostKV full-layer graphs require compatible GDN segment graphs");
     const char* ordinary_gdn_segment_graphs=
-        std::getenv("NINFER_EXL3_ORDINARY_GDN_SEGMENT_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_ORDINARY_GDN_SEGMENT_GRAPHS");
     require(!ordinary_gdn_segment_graphs ||
             std::strcmp(ordinary_gdn_segment_graphs,"0")==0 ||
             std::strcmp(ordinary_gdn_segment_graphs,"1")==0,
@@ -4758,7 +4758,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "ordinary device-KV GDN segment graphs require physical device KV");
     const char* host_kv_mlp_tail_graphs=
-        std::getenv("NINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS");
     require(!host_kv_mlp_tail_graphs ||
             std::strcmp(host_kv_mlp_tail_graphs,"0")==0 ||
             std::strcmp(host_kv_mlp_tail_graphs,"1")==0,
@@ -4770,7 +4770,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "HostKV MLP-tail graphs require ordinary exact HostKV");
     const char* ordinary_mlp_tail_graphs=
-        std::getenv("NINFER_EXL3_ORDINARY_MLP_TAIL_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_ORDINARY_MLP_TAIL_GRAPHS");
     require(!ordinary_mlp_tail_graphs ||
             std::strcmp(ordinary_mlp_tail_graphs,"0")==0 ||
             std::strcmp(ordinary_mlp_tail_graphs,"1")==0,
@@ -4783,7 +4783,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "ordinary device-KV MLP-tail graphs require physical device KV");
     const char* ordinary_full_layer_graphs=
-        std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPHS");
     require(!ordinary_full_layer_graphs ||
             std::strcmp(ordinary_full_layer_graphs,"0")==0 ||
             std::strcmp(ordinary_full_layer_graphs,"1")==0,
@@ -4797,7 +4797,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "ordinary device-KV full-layer graphs require physical C1 and exclude MLP-tail graphs");
     const char* ordinary_full_layer_graph_extended_replay=std::getenv(
-        "NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_EXTENDED_REPLAY");
+        "VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_EXTENDED_REPLAY");
     require(!ordinary_full_layer_graph_extended_replay ||
             std::strcmp(ordinary_full_layer_graph_extended_replay,"0")==0 ||
             std::strcmp(ordinary_full_layer_graph_extended_replay,"1")==0,
@@ -4809,7 +4809,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->ordinary_full_layer_graphs_enabled,
         "ordinary full-layer graph extended replay requires ordinary full-layer graphs");
     const char* ordinary_full_layer_multirow=std::getenv(
-        "NINFER_EXL3_ORDINARY_FULL_LAYER_MULTIROW_GRAPHS");
+        "VOIDINFER_EXL3_ORDINARY_FULL_LAYER_MULTIROW_GRAPHS");
     require(!ordinary_full_layer_multirow ||
             std::strcmp(ordinary_full_layer_multirow,"0")==0 ||
             std::strcmp(ordinary_full_layer_multirow,"1")==0,
@@ -4821,7 +4821,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (!ordinary_full_layer_multirow ||
          std::strcmp(ordinary_full_layer_multirow,"1")==0);
     const char* host_kv_transaction_checkpoint_graph=std::getenv(
-        "NINFER_EXL3_HOST_KV_TRANSACTION_CHECKPOINT_GRAPH");
+        "VOIDINFER_EXL3_HOST_KV_TRANSACTION_CHECKPOINT_GRAPH");
     require(!host_kv_transaction_checkpoint_graph ||
             std::strcmp(host_kv_transaction_checkpoint_graph,"0")==0 ||
             std::strcmp(host_kv_transaction_checkpoint_graph,"1")==0,
@@ -4833,7 +4833,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             (impl->host_kv.enabled && !impl->continuation_graph_b8_enabled),
         "HostKV transaction checkpoint graph requires exact HostKV ownership");
     const char* device_transaction_checkpoint_graph=std::getenv(
-        "NINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH");
+        "VOIDINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH");
     require(!device_transaction_checkpoint_graph ||
             std::strcmp(device_transaction_checkpoint_graph,"0")==0 ||
             std::strcmp(device_transaction_checkpoint_graph,"1")==0,
@@ -4850,7 +4850,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              fast_device_kv_transaction_enabled()),
         "device-KV transaction checkpoint graph requires guarded device KV");
     const char* host_kv_transaction_recurrent_trace=std::getenv(
-        "NINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE");
+        "VOIDINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE");
     require(!host_kv_transaction_recurrent_trace ||
             std::strcmp(host_kv_transaction_recurrent_trace,"0")==0 ||
             std::strcmp(host_kv_transaction_recurrent_trace,"1")==0,
@@ -4862,7 +4862,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->host_kv.enabled,
         "HostKV transaction recurrent trace requires exact HostKV ownership");
     const char* batched_recurrent_export=std::getenv(
-        "NINFER_EXL3_BATCHED_RECURRENT_EXPORT");
+        "VOIDINFER_EXL3_BATCHED_RECURRENT_EXPORT");
     require(!batched_recurrent_export ||
             std::strcmp(batched_recurrent_export,"0")==0 ||
             std::strcmp(batched_recurrent_export,"1")==0,
@@ -4874,21 +4874,21 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->batched_recurrent_export,
         "batched recurrent export is rejected on this caller: the CUDA batch "
         "faulted at the immutable recurrent-state fence");
-    const char* native16 = std::getenv("NINFER_EXL3_NATIVE_CONTINUATION16");
+    const char* native16 = std::getenv("VOIDINFER_EXL3_NATIVE_CONTINUATION16");
     require(!native16 || std::strcmp(native16,"0")==0 || std::strcmp(native16,"1")==0,
         "native continuation16 must be 0 or 1");
     impl->native_continuation16_enabled = native16 && std::strcmp(native16,"1")==0;
     require(!impl->native_continuation16_enabled ||
         (impl->host_kv.enabled && !impl->oscar_only && !impl->continuation_graph_b8_enabled),
         "native continuation16 requires ordinary eager exact-host ownership");
-    const char* host_kv_cpu_profile=std::getenv("NINFER_EXL3_HOST_KV_CPU_PROFILE");
+    const char* host_kv_cpu_profile=std::getenv("VOIDINFER_EXL3_HOST_KV_CPU_PROFILE");
     require(!host_kv_cpu_profile || std::strcmp(host_kv_cpu_profile,"0")==0 ||
         std::strcmp(host_kv_cpu_profile,"1")==0,
         "exact host KV CPU profile must be 0 or 1");
     impl->host_kv_cpu_profile=impl->host_kv.enabled && host_kv_cpu_profile &&
         std::strcmp(host_kv_cpu_profile,"1")==0;
     const char* host_kv_unique_tail_reuse=
-        std::getenv("NINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE");
+        std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE");
     require(!host_kv_unique_tail_reuse ||
             std::strcmp(host_kv_unique_tail_reuse,"0")==0 ||
             std::strcmp(host_kv_unique_tail_reuse,"1")==0,
@@ -4896,7 +4896,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     impl->host_kv_unique_tail_reuse=impl->host_kv.enabled &&
         host_kv_unique_tail_reuse &&
         std::strcmp(host_kv_unique_tail_reuse,"1")==0;
-    const char* host_kv_batch_sync=std::getenv("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC");
+    const char* host_kv_batch_sync=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC");
     require(!host_kv_batch_sync || std::strcmp(host_kv_batch_sync,"0")==0 ||
         std::strcmp(host_kv_batch_sync,"1")==0,
         "exact host KV batch synchronization must be 0 or 1");
@@ -4906,7 +4906,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (!host_kv_batch_sync || std::strcmp(host_kv_batch_sync,"0")!=0);
     require(!impl->host_kv_batch_sync || impl->host_kv.enabled,
         "batched host KV synchronization requires exact host KV");
-    const char* host_kv_batch_copy=std::getenv("NINFER_EXL3_EXACT_HOST_KV_BATCH_COPY");
+    const char* host_kv_batch_copy=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_COPY");
     require(!host_kv_batch_copy || std::strcmp(host_kv_batch_copy,"0")==0 ||
         std::strcmp(host_kv_batch_copy,"1")==0,
         "exact host KV batch copy must be 0 or 1");
@@ -4916,7 +4916,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (!host_kv_batch_copy || std::strcmp(host_kv_batch_copy,"0")!=0);
     require(!impl->host_kv_batch_copy || (impl->host_kv.enabled && impl->host_kv_batch_sync),
         "exact host KV batch copy requires final-barrier host KV");
-    const char* host_kv_pinned_chunks=std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_CHUNKS");
+    const char* host_kv_pinned_chunks=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_CHUNKS");
     require(!host_kv_pinned_chunks || std::strcmp(host_kv_pinned_chunks,"0")==0 ||
         std::strcmp(host_kv_pinned_chunks,"1")==0,
         "exact host KV pinned chunks must be 0 or 1");
@@ -4925,7 +4925,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     impl->host_kv_pinned_chunks=impl->host_kv_batch_copy &&
         (!host_kv_pinned_chunks || std::strcmp(host_kv_pinned_chunks,"0")!=0);
     const char* host_kv_pinned_h2d_slots=
-        std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
+        std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
     require(!host_kv_pinned_h2d_slots ||
             std::strcmp(host_kv_pinned_h2d_slots,"2")==0 ||
             std::strcmp(host_kv_pinned_h2d_slots,"32")==0,
@@ -4934,7 +4934,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         host_kv_pinned_h2d_slots &&
         std::strcmp(host_kv_pinned_h2d_slots,"32")==0?32:2;
     const char* host_kv_prefill_pinned_batch=
-        std::getenv("NINFER_EXL3_PREFILL_PINNED_BATCH_OVER_REGISTERED");
+        std::getenv("VOIDINFER_EXL3_PREFILL_PINNED_BATCH_OVER_REGISTERED");
     require(!host_kv_prefill_pinned_batch ||
             std::strcmp(host_kv_prefill_pinned_batch,"0")==0 ||
             std::strcmp(host_kv_prefill_pinned_batch,"1")==0,
@@ -4944,7 +4944,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         std::strcmp(host_kv_prefill_pinned_batch,"1")==0;
     require(!impl->host_kv_prefill_pinned_batch || impl->host_kv_pinned_chunks,
         "exact host KV prefill pinned batch requires pinned chunks");
-    const char* host_kv_pinned_d2h=std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H");
+    const char* host_kv_pinned_d2h=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H");
     require(!host_kv_pinned_d2h || std::strcmp(host_kv_pinned_d2h,"0")==0 ||
         std::strcmp(host_kv_pinned_d2h,"1")==0,
         "exact host KV pinned D2H must be 0 or 1");
@@ -4956,7 +4956,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->host_kv_pinned_d2h || impl->host_kv_pinned_chunks,
         "exact host KV pinned D2H requires pinned chunks");
     const char* host_kv_banked_d2h=
-        std::getenv("NINFER_EXL3_EXACT_HOST_KV_BANKED_D2H");
+        std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_BANKED_D2H");
     require(!host_kv_banked_d2h || std::strcmp(host_kv_banked_d2h,"0")==0 ||
             std::strcmp(host_kv_banked_d2h,"1")==0,
         "exact host KV banked D2H must be 0 or 1");
@@ -4965,7 +4965,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->host_kv_banked_d2h || impl->host_kv_pinned_d2h,
         "exact host KV banked D2H requires pinned D2H");
     const char* host_kv_deferred_scatter=
-        std::getenv("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER");
+        std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER");
     require(!host_kv_deferred_scatter ||
             std::strcmp(host_kv_deferred_scatter,"0")==0 ||
             std::strcmp(host_kv_deferred_scatter,"1")==0,
@@ -5043,11 +5043,11 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         }
     }
     };
-    const char* oscar_only=std::getenv("NINFER_EXL3_OSCAR_L0_ONLY");
+    const char* oscar_only=std::getenv("VOIDINFER_EXL3_OSCAR_L0_ONLY");
     impl->oscar_only=oscar_only && std::strcmp(oscar_only,"1")==0;
     require(!impl->host_kv.enabled || !impl->oscar_only,"exact host KV and OSCAR-only modes are separate");
     const char* eager_mlp_gateup=
-        std::getenv("NINFER_EXL3_EAGER_MLP_GATEUP_CONCURRENT");
+        std::getenv("VOIDINFER_EXL3_EAGER_MLP_GATEUP_CONCURRENT");
     require(!eager_mlp_gateup || std::strcmp(eager_mlp_gateup,"0")==0 ||
             std::strcmp(eager_mlp_gateup,"1")==0,
         "eager MLP gate/up concurrency must be 0 or 1");
@@ -5060,10 +5060,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(max_context_<=32768 || impl->host_kv.enabled || impl->oscar_only ||
             Exl3NativeContextExtent::l0_oscar_enabled(),
             "extended context requires exact-host KV or OSCAR-only storage");
-    const char* wide_prefill = std::getenv("NINFER_EXL3_WIDE_PREFILL");
+    const char* wide_prefill = std::getenv("VOIDINFER_EXL3_WIDE_PREFILL");
     impl->wide_prefill_enabled = wide_prefill && std::strcmp(wide_prefill, "1") == 0;
     const char* prefill_qkv=
-        std::getenv("NINFER_EXL3_PREFILL_QKV_CONCURRENT");
+        std::getenv("VOIDINFER_EXL3_PREFILL_QKV_CONCURRENT");
     require(!prefill_qkv || std::strcmp(prefill_qkv,"0")==0 ||
             std::strcmp(prefill_qkv,"1")==0,
         "wide-prefill QKV concurrency must be 0 or 1");
@@ -5073,20 +5073,20 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             (impl->wide_prefill_enabled && impl->host_kv.enabled &&
              !impl->oscar_only && !impl->continuation_graph_b8_enabled),
         "wide-prefill QKV concurrency requires ordinary exact HostKV wide prefill");
-    const char* staged = std::getenv("NINFER_EXL3_PREFILL_STAGED_REDUCTION");
+    const char* staged = std::getenv("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION");
     const bool staged_prefill_enabled = staged && std::strcmp(staged, "1") == 0;
-    const char* shared_accum = std::getenv("NINFER_EXL3_SHARED_ACCUM");
+    const char* shared_accum = std::getenv("VOIDINFER_EXL3_SHARED_ACCUM");
     const bool shared_accumulation_enabled =
         shared_accum && std::strcmp(shared_accum, "1") == 0;
-    const char* wide64 = std::getenv("NINFER_EXL3_PREFILL_WIDE64");
+    const char* wide64 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE64");
     const bool wide64_enabled = wide64 && std::strcmp(wide64, "1") == 0;
-    const char* wide128 = std::getenv("NINFER_EXL3_PREFILL_WIDE128");
+    const char* wide128 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE128");
     const bool wide128_enabled = wide128 && std::strcmp(wide128, "1") == 0;
-    const char* wide256 = std::getenv("NINFER_EXL3_PREFILL_WIDE256");
+    const char* wide256 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE256");
     const bool wide256_enabled = wide256 && std::strcmp(wide256, "1") == 0;
-    const char* wide512 = std::getenv("NINFER_EXL3_PREFILL_WIDE512");
+    const char* wide512 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE512");
     const bool wide512_enabled = wide512 && std::strcmp(wide512, "1") == 0;
-    const char* wide1024 = std::getenv("NINFER_EXL3_PREFILL_WIDE1024");
+    const char* wide1024 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE1024");
     const bool wide1024_enabled = wide1024 && std::strcmp(wide1024, "1") == 0;
     // Resolve the requested width ladder before validating transform/scratch
     // prerequisites so unset optional defaults can be admitted at final 128/1024.
@@ -5103,16 +5103,16 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         requested_prefill_capacity = 512;
     if (requested_prefill_capacity == 512 && wide1024_enabled)
         requested_prefill_capacity = 1024;
-    const char* shared_layer = std::getenv("NINFER_EXL3_SHARED_LAYER_SCRATCH");
+    const char* shared_layer = std::getenv("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH");
     const bool qualified_default_group = exl3_prefill_qualified_default_group(
         requested_prefill_capacity, impl->wide_prefill_enabled,
         staged_prefill_enabled, shared_accumulation_enabled);
     const bool shared_layer_enabled = shared_layer
         ? std::strcmp(shared_layer, "1") == 0 : qualified_default_group;
-    const char* shared_transform = std::getenv("NINFER_EXL3_SHARED_TRANSFORM");
+    const char* shared_transform = std::getenv("VOIDINFER_EXL3_SHARED_TRANSFORM");
     const bool shared_transform_enabled = shared_transform
         ? std::strcmp(shared_transform, "1") == 0 : qualified_default_group;
-    const char* gdn_wide_slab = std::getenv("NINFER_EXL3_GDN_WIDE_SLAB");
+    const char* gdn_wide_slab = std::getenv("VOIDINFER_EXL3_GDN_WIDE_SLAB");
     if (impl->wide_prefill_enabled && staged_prefill_enabled)
         impl->prefill_capacity = 32;
     if (impl->prefill_capacity == 32 && wide64_enabled)
@@ -5132,7 +5132,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     if (impl->prefill_capacity == 512 && wide1024_enabled)
         impl->prefill_capacity=1024;
     const char* numeric_prefill_projection = std::getenv(
-        "NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC");
+        "VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC");
     require(!numeric_prefill_projection ||
             std::strcmp(numeric_prefill_projection, "0") == 0 ||
             std::strcmp(numeric_prefill_projection, "1") == 0,
@@ -5141,14 +5141,14 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         numeric_prefill_projection &&
         std::strcmp(numeric_prefill_projection, "1") == 0;
     const char* numeric_prefill_k7 = std::getenv(
-        "NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC");
+        "VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC");
     require(!numeric_prefill_k7 || std::strcmp(numeric_prefill_k7, "0") == 0 ||
             std::strcmp(numeric_prefill_k7, "1") == 0,
         "numeric K7 reconstruct GEMM prefill must be 0 or 1");
     const bool numeric_prefill_k7_enabled = numeric_prefill_k7 &&
         std::strcmp(numeric_prefill_k7, "1") == 0;
     const char* fast_same_weights_fp16kv_prefill = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
     require(!fast_same_weights_fp16kv_prefill ||
             std::strcmp(fast_same_weights_fp16kv_prefill, "0") == 0 ||
             std::strcmp(fast_same_weights_fp16kv_prefill, "1") == 0,
@@ -5157,7 +5157,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         fast_same_weights_fp16kv_prefill &&
         std::strcmp(fast_same_weights_fp16kv_prefill, "1") == 0;
     const char* fast_same_weights_fp16kv_decode = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
     require(!fast_same_weights_fp16kv_decode ||
             std::strcmp(fast_same_weights_fp16kv_decode, "0") == 0 ||
             std::strcmp(fast_same_weights_fp16kv_decode, "1") == 0,
@@ -5177,7 +5177,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->native_continuation16_enabled ||
         !numeric_prefill_workspace_enabled,
         "native continuation16 excludes numeric projection candidates");
-    const char* oscar_requested = std::getenv("NINFER_OSCAR_EXL3");
+    const char* oscar_requested = std::getenv("VOIDINFER_OSCAR_EXL3");
     const bool fast_same_weights_fp16kv_scope =
         fast_same_weights_fp16kv_prefill_enabled && !impl->host_kv.enabled &&
         !impl->oscar_only && !impl->continuation_graph_b8_enabled &&
@@ -5188,7 +5188,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     // never changes the resident KV representation, so it may share the
     // ordinary device-KV construction path while remaining default-off.
     const char* fast_wide_prefill_gemm = std::getenv(
-        "NINFER_EXL3_FAST_MIA_PARITY_WIDE_PREFILL_GEMM");
+        "VOIDINFER_EXL3_FAST_MIA_PARITY_WIDE_PREFILL_GEMM");
     const bool fast_wide_prefill_gemm_scope =
         fast_wide_prefill_gemm &&
         std::strcmp(fast_wide_prefill_gemm, "1") == 0 &&
@@ -5202,20 +5202,20 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         !impl->oscar_only && !impl->continuation_graph_b8_enabled &&
         (!oscar_requested || std::strcmp(oscar_requested, "0") == 0);
     impl->fast_same_weights_fp16kv_prefill_enabled = fast_same_weights_fp16kv_scope;
-    const char* gdn_bulk=std::getenv("NINFER_EXL3_FAST_GDN_BULK_PREFILL");
+    const char* gdn_bulk=std::getenv("VOIDINFER_EXL3_FAST_GDN_BULK_PREFILL");
     require(!gdn_bulk || std::strcmp(gdn_bulk,"0")==0 ||
             std::strcmp(gdn_bulk,"1")==0,
             "GDN bulk prefill must be 0 or 1");
     impl->gdn_bulk_prefill_enabled=fast_same_weights_fp16kv_scope &&
         gdn_bulk && std::strcmp(gdn_bulk,"1")==0;
-    const char* gdn_bulk_mlp=std::getenv("NINFER_EXL3_FAST_GDN_BULK_MLP");
+    const char* gdn_bulk_mlp=std::getenv("VOIDINFER_EXL3_FAST_GDN_BULK_MLP");
     require(!gdn_bulk_mlp || std::strcmp(gdn_bulk_mlp,"0")==0 ||
             std::strcmp(gdn_bulk_mlp,"1")==0,
             "GDN bulk MLP must be 0 or 1");
     impl->gdn_bulk_mlp_enabled=fast_same_weights_fp16kv_scope &&
         gdn_bulk_mlp && std::strcmp(gdn_bulk_mlp,"1")==0;
     const char* gdn_bulk_mlp_short_k5=std::getenv(
-        "NINFER_EXL3_FAST_GDN_BULK_MLP_SHORT_K5");
+        "VOIDINFER_EXL3_FAST_GDN_BULK_MLP_SHORT_K5");
     require(!gdn_bulk_mlp_short_k5 ||
             std::strcmp(gdn_bulk_mlp_short_k5,"0")==0 ||
             std::strcmp(gdn_bulk_mlp_short_k5,"1")==0,
@@ -5227,17 +5227,17 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(gdn_bulk_mlp_short_k5,"1")!=0 ||
             impl->gdn_bulk_mlp_short_k5_enabled,
             "GDN bulk MLP short K5 requires Fast90 bulk MLP admission");
-    const char* gdn_bulk_mlp_rows=std::getenv("NINFER_EXL3_FAST_GDN_BULK_MLP_ROWS");
+    const char* gdn_bulk_mlp_rows=std::getenv("VOIDINFER_EXL3_FAST_GDN_BULK_MLP_ROWS");
     require(!gdn_bulk_mlp_rows || std::strcmp(gdn_bulk_mlp_rows,"4096")==0 ||
             std::strcmp(gdn_bulk_mlp_rows,"8192")==0,
             "GDN bulk MLP rows must be 4096 or 8192");
-    const char* wmma_split2=std::getenv("NINFER_EXL3_FAST_WMMA32_SPLIT2");
+    const char* wmma_split2=std::getenv("VOIDINFER_EXL3_FAST_WMMA32_SPLIT2");
     require(!wmma_split2 || std::strcmp(wmma_split2,"0")==0 ||
             std::strcmp(wmma_split2,"1")==0,
             "WMMA32 split2 option must be 0 or 1");
     impl->fast_wmma32_split2_enabled=fast_same_weights_fp16kv_scope &&
         wmma_split2 && std::strcmp(wmma_split2,"1")==0;
-    const char* wmma_split4=std::getenv("NINFER_EXL3_FAST_WMMA32_SPLIT4");
+    const char* wmma_split4=std::getenv("VOIDINFER_EXL3_FAST_WMMA32_SPLIT4");
     require(!wmma_split4 || std::strcmp(wmma_split4,"0")==0 ||
             std::strcmp(wmma_split4,"1")==0,
             "WMMA32 split4 option must be 0 or 1");
@@ -5266,21 +5266,21 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             fast_same_weights_fp16kv_decode_scope,
         "numeric reconstruct GEMM requires target-only exact-host wide1024 or an admitted same-weight FP16-KV scope");
     const char* reconstructed_exact = std::getenv(
-        "NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7");
+        "VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7");
     require(!reconstructed_exact || std::strcmp(reconstructed_exact, "0") == 0 ||
             std::strcmp(reconstructed_exact, "1") == 0,
         "exact K7 reconstruction must be 0 or 1");
     const bool reconstructed_exact_enabled = reconstructed_exact &&
         std::strcmp(reconstructed_exact, "1") == 0;
     const int reconstruction_columns=exl3_reconstruction_slice_columns(
-        std::getenv("NINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS"));
+        std::getenv("VOIDINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS"));
     require(reconstructed_exact_enabled || reconstruction_columns==5120,
         "bounded reconstruction slices require exact reconstruction enabled");
-    const char* reconstructed_k6=std::getenv("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_DOWN");
+    const char* reconstructed_k6=std::getenv("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_DOWN");
     const bool reconstructed_k6_enabled=exl3_reconstruction_k6_down_option(
         reconstructed_k6,reconstructed_exact_enabled);
     const char* reconstructed_k6_gate_up=std::getenv(
-        "NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_GATE_UP");
+        "VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_GATE_UP");
     const bool reconstructed_k6_gate_up_enabled=
         exl3_reconstruction_k6_gate_up_option(
             reconstructed_k6_gate_up,reconstructed_exact_enabled);
@@ -5289,7 +5289,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          staged_prefill_enabled && impl->prefill_capacity == 1024 &&
          !numeric_prefill_workspace_enabled) || fast_wide_prefill_gemm_scope,
         "exact K7 reconstruction requires ordinary exact-host wide1024 or the admitted same-weight wide GEMM scope");
-    const char* direct_partials = std::getenv("NINFER_EXL3_PREFILL_DIRECT_PARTIALS");
+    const char* direct_partials = std::getenv("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS");
     require(!reconstructed_exact_enabled ||
         ((!direct_partials && qualified_default_group) ||
          (direct_partials && std::strcmp(direct_partials, "1") == 0)),
@@ -5303,7 +5303,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         require(impl->wide_prefill_enabled && shared_layer_enabled,
                 "GDN wide slab requires wide prefill and shared layer scratch");
     }
-    const char* target_timing = std::getenv("NINFER_EXL3_TARGET_PROJECTION_TIMING");
+    const char* target_timing = std::getenv("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING");
     impl->target_projection_timing_opt_in =
         target_timing != nullptr && std::strcmp(target_timing, "1") == 0;
     // L0 OSCAR contexts prefill in bounded chunks: per-row buffers hold one chunk.
@@ -5320,10 +5320,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     };
     const std::size_t hidden_bytes=checked_extent(kHidden*sizeof(std::uint16_t));
     const auto token_bytes=checked_extent(sizeof(std::int64_t));
-    // Concurrent Engine lanes (NINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): the
+    // Concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): the
     // prompt-only WMMA32 partials come from one model-level allocation.
     static const bool share_prompt_rows=[] {
-        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
         return value && std::strcmp(value,"1")==0;
     }();
     const auto visit_base_allocations=[&](auto&& allocate) {
@@ -5389,9 +5389,9 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     float* exact_scores=nullptr;
     float* numeric_attention_splitk_workspace=nullptr;
     std::size_t numeric_attention_splitk_workspace_bytes=0;
-    const char* parallel_exact=std::getenv("NINFER_EXL3_EXACT_ATTENTION_PARALLEL");
+    const char* parallel_exact=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL");
     const char* numeric_attention_splitk=
-        std::getenv("NINFER_EXL3_NUMERIC_ATTENTION_TILED");
+        std::getenv("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED");
     require(!numeric_attention_splitk || std::strcmp(numeric_attention_splitk,"0")==0 ||
         std::strcmp(numeric_attention_splitk,"1")==0,
         "numeric tiled attention must be 0 or 1");
@@ -5426,8 +5426,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         impl->host_kv.numeric_attention_scratch_bytes=numeric_attention_splitk_workspace_bytes;
       }
     };
-    const char* exact_q_shared=std::getenv("NINFER_EXL3_EXACT_ATTENTION_Q_SHARED");
-    const char* query_pair=std::getenv("NINFER_EXL3_EXACT_ATTENTION_QUERY_PAIR");
+    const char* exact_q_shared=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_Q_SHARED");
+    const char* query_pair=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_QUERY_PAIR");
     const bool query_pair_enabled=exl3_attention_query_pair_option(query_pair,exact_scores_enabled);
     require(!exact_q_shared || std::strcmp(exact_q_shared,"0")==0 ||
         std::strcmp(exact_q_shared,"1")==0,
@@ -5439,7 +5439,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_q_shared && std::strcmp(exact_q_shared,"1")==0));
     require(!exact_q_shared_enabled || exact_scores_enabled,
         "exact attention Q-shared requires parallel exact attention");
-    const char* exact_k_half2=std::getenv("NINFER_EXL3_EXACT_ATTENTION_K_HALF2");
+    const char* exact_k_half2=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_K_HALF2");
     require(!exact_k_half2 || std::strcmp(exact_k_half2,"0")==0 ||
         std::strcmp(exact_k_half2,"1")==0,
         "exact attention K-half2 must be 0 or 1");
@@ -5449,7 +5449,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (!exact_k_half2 || std::strcmp(exact_k_half2,"0")!=0);
     require(!exact_k_half2_enabled || exact_q_shared_enabled,
         "exact attention K-half2 requires Q-shared");
-    const char* exact_v_half2=std::getenv("NINFER_EXL3_EXACT_ATTENTION_V_HALF2");
+    const char* exact_v_half2=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_V_HALF2");
     require(!exact_v_half2 || std::strcmp(exact_v_half2,"0")==0 ||
         std::strcmp(exact_v_half2,"1")==0,
         "exact attention V-half2 must be 0 or 1");
@@ -5461,7 +5461,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_v_half2 && std::strcmp(exact_v_half2,"1")==0));
     require(!exact_v_half2_enabled || exact_k_half2_enabled,
         "exact attention V-half2 requires K-half2");
-    const char* exact_gqa_pair=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_PAIR");
+    const char* exact_gqa_pair=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_PAIR");
     require(!exact_gqa_pair || std::strcmp(exact_gqa_pair,"0")==0 ||
         std::strcmp(exact_gqa_pair,"1")==0,
         "exact attention GQA pair must be 0 or 1");
@@ -5472,7 +5472,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_gqa_pair && std::strcmp(exact_gqa_pair,"1")==0));
     require(!exact_gqa_pair_enabled || exact_v_half2_enabled,
         "exact attention GQA pair requires V-half2");
-    const char* exact_gqa_triple=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE");
+    const char* exact_gqa_triple=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE");
     require(!exact_gqa_triple || std::strcmp(exact_gqa_triple,"0")==0 ||
         std::strcmp(exact_gqa_triple,"1")==0,
         "exact attention GQA triple must be 0 or 1");
@@ -5483,7 +5483,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_gqa_triple && std::strcmp(exact_gqa_triple,"1")==0));
     require(!exact_gqa_triple_enabled || exact_gqa_pair_enabled,
         "exact attention GQA triple requires GQA pair");
-    const char* exact_gqa_triple_values128=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES128");
+    const char* exact_gqa_triple_values128=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES128");
     require(!exact_gqa_triple_values128 || std::strcmp(exact_gqa_triple_values128,"0")==0 ||
         std::strcmp(exact_gqa_triple_values128,"1")==0,
         "exact attention GQA triple values128 must be 0 or 1");
@@ -5491,7 +5491,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         exact_gqa_triple_values128 && std::strcmp(exact_gqa_triple_values128,"1")==0;
     require(!exact_gqa_triple_values128_enabled || exact_gqa_triple_enabled,
         "exact attention GQA triple values128 requires GQA triple");
-    const char* exact_gqa_triple_softmax_staged=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_SOFTMAX_STAGED");
+    const char* exact_gqa_triple_softmax_staged=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_SOFTMAX_STAGED");
     require(!exact_gqa_triple_softmax_staged || std::strcmp(exact_gqa_triple_softmax_staged,"0")==0 ||
         std::strcmp(exact_gqa_triple_softmax_staged,"1")==0,
         "exact attention GQA triple staged softmax must be 0 or 1");
@@ -5501,7 +5501,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         ((impl->host_kv.enabled && (!exact_gqa_triple_softmax_staged ||
             std::strcmp(exact_gqa_triple_softmax_staged,"0")!=0)) ||
          (exact_gqa_triple_softmax_staged && std::strcmp(exact_gqa_triple_softmax_staged,"1")==0));
-    const char* exact_gqa_six=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX");
+    const char* exact_gqa_six=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX");
     require(!exact_gqa_six || std::strcmp(exact_gqa_six,"0")==0 ||
         std::strcmp(exact_gqa_six,"1")==0,
         "exact attention GQA six must be 0 or 1");
@@ -5510,7 +5510,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!exact_gqa_six_enabled || exact_gqa_triple_softmax_staged_enabled,
         "exact attention GQA six requires staged GQA triple");
     const char* exact_gqa_six_scores=
-        std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES");
+        std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES");
     require(!exact_gqa_six_scores || std::strcmp(exact_gqa_six_scores,"0")==0 ||
         std::strcmp(exact_gqa_six_scores,"1")==0,
         "exact attention GQA six scores must be 0 or 1");
@@ -5527,7 +5527,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(exact_gqa_six_scores,"0")!=0)) ||
          (exact_gqa_six_scores && std::strcmp(exact_gqa_six_scores,"1")==0));
     const char* exact_gqa_six_extent_shards=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_EXTENT_SHARDS");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_EXTENT_SHARDS");
     require(!exact_gqa_six_extent_shards ||
         std::strcmp(exact_gqa_six_extent_shards,"0")==0 ||
         std::strcmp(exact_gqa_six_extent_shards,"1")==0,
@@ -5543,7 +5543,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!exact_gqa_six_extent_shards_enabled || exact_gqa_six_scores_enabled,
         "exact attention GQA six extent shards require six-head scores");
     const char* exact_gqa_six_values_sharded=
-        std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED");
+        std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED");
     require(!exact_gqa_six_values_sharded ||
         std::strcmp(exact_gqa_six_values_sharded,"0")==0 ||
         std::strcmp(exact_gqa_six_values_sharded,"1")==0,
@@ -5554,7 +5554,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!(exact_gqa_six_enabled && exact_gqa_six_values_sharded_enabled),
         "full GQA six and sharded-value GQA six are separate controls");
     const char* exact_gqa_six_softmax_triple_values=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES");
     require(!exact_gqa_six_softmax_triple_values ||
         std::strcmp(exact_gqa_six_softmax_triple_values,"0")==0 ||
         std::strcmp(exact_gqa_six_softmax_triple_values,"1")==0,
@@ -5570,7 +5570,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_gqa_six_softmax_triple_values &&
             std::strcmp(exact_gqa_six_softmax_triple_values,"1")==0));
     const char* exact_gqa_six_softmax_triple_values_pair_dimensions=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS");
     require(!exact_gqa_six_softmax_triple_values_pair_dimensions ||
         std::strcmp(exact_gqa_six_softmax_triple_values_pair_dimensions,"0")==0 ||
         std::strcmp(exact_gqa_six_softmax_triple_values_pair_dimensions,"1")==0,
@@ -5582,7 +5582,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         exact_gqa_six_softmax_triple_values_enabled,
         "pair-dimension triple values require selected six-head softmax triple values");
     const char* exact_gqa_six_softmax_six_values_single_load=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD");
     require(!exact_gqa_six_softmax_six_values_single_load ||
         std::strcmp(exact_gqa_six_softmax_six_values_single_load,"0")==0 ||
         std::strcmp(exact_gqa_six_softmax_six_values_single_load,"1")==0,
@@ -5594,7 +5594,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         exact_gqa_six_softmax_triple_values_enabled,
         "single-load six values require selected six-head softmax triple values");
     const char* exact_gqa_six_packed_triples=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES");
     require(!exact_gqa_six_packed_triples ||
         std::strcmp(exact_gqa_six_packed_triples,"0")==0 ||
         std::strcmp(exact_gqa_six_packed_triples,"1")==0,
@@ -5604,7 +5604,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         exact_gqa_six_packed_triples &&
         std::strcmp(exact_gqa_six_packed_triples,"1")==0;
     const char* exact_gqa_triple_values4=
-        std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4");
+        std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4");
     require(!exact_gqa_triple_values4 ||
         std::strcmp(exact_gqa_triple_values4,"0")==0 ||
         std::strcmp(exact_gqa_triple_values4,"1")==0,
@@ -5714,28 +5714,28 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         accumulation.bytes = shared_linear_requirement.accumulation_bytes;
     }
     const auto* prefill_gate_up_pair=std::getenv(
-        "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR");
+        "VOIDINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR");
     require(!prefill_gate_up_pair || std::strcmp(prefill_gate_up_pair,"0")==0 ||
         std::strcmp(prefill_gate_up_pair,"1")==0,
         "target prefill gate/up pair must be 0 or 1");
     const auto* fast_m1_gate_up_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR");
     require(!fast_m1_gate_up_pair || std::strcmp(fast_m1_gate_up_pair,"0")==0 ||
         std::strcmp(fast_m1_gate_up_pair,"1")==0,
         "FAST same-weight FP16-KV M1 gate/up pair must be 0 or 1");
     const auto* fast_gdn_m1_gate_up_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR");
     require(!fast_gdn_m1_gate_up_pair ||
         std::strcmp(fast_gdn_m1_gate_up_pair,"0")==0 ||
         std::strcmp(fast_gdn_m1_gate_up_pair,"1")==0,
         "FAST same-weight FP16-KV GDN M1 gate/up pair must be 0 or 1");
     const auto* fast_m1_kv_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
     require(!fast_m1_kv_pair || std::strcmp(fast_m1_kv_pair,"0")==0 ||
         std::strcmp(fast_m1_kv_pair,"1")==0,
         "FAST same-weight FP16-KV M1 K/V pair must be 0 or 1");
     const auto* fast_m1_kv_wide_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR");
     require(!fast_m1_kv_wide_pair || std::strcmp(fast_m1_kv_wide_pair,"0")==0 ||
         std::strcmp(fast_m1_kv_wide_pair,"1")==0,
         "FAST same-weight FP16-KV M1 wide K/V pair must be 0 or 1");
@@ -5759,7 +5759,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (fast_gdn_m1_gate_up_pair && std::strcmp(fast_gdn_m1_gate_up_pair,"1")==0)))
         paired_up_transformed.bytes=shared_linear_requirement.transformed_bytes;
     Exl3CudaLayerScratchView scratch;
-    const auto* coalesce_scratch=std::getenv("NINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP");
+    const auto* coalesce_scratch=std::getenv("VOIDINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP");
     require(!coalesce_scratch || std::strcmp(coalesce_scratch,"0")==0 || std::strcmp(coalesce_scratch,"1")==0,
         "attention scratch coalescing must be 0 or 1");
     impl->coalesce_attention_input_mlp=coalesce_scratch && std::strcmp(coalesce_scratch,"1")==0;
@@ -5791,7 +5791,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     // An exact VeriCache line (asynchronous / folded verification) never runs
     // a prompt-scale pass while its drafting context does: they share it.
     static const bool share_prompt_pool_env=[] {
-        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
         return value && std::strcmp(value,"1")==0;
     }();
     const bool share_prompt_pool=share_prompt_pool_env || exl3_exact_line_shares_prompt_workspace();
@@ -5842,7 +5842,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     const bool numeric_workspace_transpose =
         fast_same_weights_all_model_shapes || !numeric_prefill_k7_enabled;
     static const bool share_prompt_workspace_env=[] {
-        const char* value=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
         return value && std::strcmp(value,"1")==0;
     }();
     const bool share_prompt_workspace=share_prompt_workspace_env || exl3_exact_line_shares_prompt_workspace();
@@ -5910,7 +5910,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
       }
     };
     const auto head_requirement=Exl3LinearWorkspaceRequirements::derive(kHidden,kVocab,1);
-    const auto* resident_option=std::getenv("NINFER_EXL3_PREFILL_GDN_RESIDENT");
+    const auto* resident_option=std::getenv("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT");
     const bool resident_required=impl->gaming[Gopt::GdnSmallResident] ||
         (resident_option?std::strcmp(resident_option,"1")==0:
         (qualified_default_group && scratch.bytes!=0));
@@ -5928,15 +5928,15 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         if(layer_requirements[layer])required_layer_group=Exl3LinearWorkspaceRequirements::append_owned_bytes(
             required_layer_group,layer_requirements[layer]);
     }
-    const char* media=std::getenv("NINFER_EXL3_MEDIA_EXECUTION_RESEARCH");
+    const char* media=std::getenv("VOIDINFER_EXL3_MEDIA_EXECUTION_RESEARCH");
     require(!media||std::strcmp(media,"0")==0||std::strcmp(media,"1")==0,"media research option must be0 or1");
     const bool media_enabled=enable_qualified_media || (media && std::strcmp(media,"1")==0);
     require(!media_enabled || (impl->host_kv.enabled&&!impl->oscar_only&&!impl->continuation_graph_b8_enabled),
         "media research requires ordinary eager host context");
-    const char* device_prefix=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
-    const char* segmented_prefix=std::getenv("NINFER_EXL3_SEGMENTED_DEVICE_PREFIX");
+    const char* device_prefix=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
+    const char* segmented_prefix=std::getenv("VOIDINFER_EXL3_SEGMENTED_DEVICE_PREFIX");
     const char* forward_publish_prefix=std::getenv(
-        "NINFER_EXL3_HOST_KV_DEVICE_PREFIX_FORWARD_PUBLISH");
+        "VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_FORWARD_PUBLISH");
     require(!segmented_prefix || std::strcmp(segmented_prefix,"0")==0 || std::strcmp(segmented_prefix,"1")==0,
         "segmented device prefix must be0 or1");
     impl->segmented_device_prefix=allocate_device_prefix && segmented_prefix && std::strcmp(segmented_prefix,"1")==0;
@@ -5948,7 +5948,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!device_prefix||std::strcmp(device_prefix,"0")==0||std::strcmp(device_prefix,"1")==0,"device prefix option must be0 or1");
     int cache_rows=0;
     if(allocate_device_prefix && device_prefix && std::strcmp(device_prefix,"1")==0) {
-        const char* row_option=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS");
+        const char* row_option=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS");
         require(!row_option||std::strcmp(row_option,"4096")==0||std::strcmp(row_option,"16384")==0,"device prefix row menu4096/16384");
         cache_rows=row_option?std::atoi(row_option):4096;
         require(!impl->device_prefix_forward_publish ||
@@ -5957,7 +5957,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         require(impl->host_kv.enabled&&impl->host_kv_pinned_chunks&&!impl->oscar_only&&!impl->continuation_graph_b8_enabled&&max_context_>=cache_rows,
             "device prefix requires ordinary eager pinned HostKV context covering reserved rows");
     }
-    const auto* greedy=std::getenv("NINFER_EXL3_DEVICE_GREEDY");
+    const auto* greedy=std::getenv("VOIDINFER_EXL3_DEVICE_GREEDY");
     require(!greedy || std::strcmp(greedy,"0")==0 || std::strcmp(greedy,"1")==0,"device greedy must be0 or1");
     const bool greedy_enabled=!greedy || std::strcmp(greedy,"1")==0;
     // Check the combined delayed groups before creating any of their storage.
@@ -6064,7 +6064,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     // buffers; the closure retains all partial construction in Impl on failure.
     const auto construct=[&]() -> std::unique_ptr<Exl3TextContext> {
     impl->constructor_authority=authority;
-    static const bool memory_trace=std::getenv("NINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    static const bool memory_trace=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
     const auto trace_stage=[&](const char* stage) {
         if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE %s persistent=%.1f MiB\n",stage,
             impl->persistent_bytes/1048576.0);
@@ -6229,10 +6229,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->persistent_bytes=expected_layer_persistent;
             impl->gdn_layers[layer]->set_reconstructed_exact(reconstructed_exact_view);
             impl->gdn_layers[layer]->set_chain_rows_device(impl->position_device+1);
-            // NINFER_EXL3_GDN_STATE_TRACE=1 restores the per-forward state-before
+            // VOIDINFER_EXL3_GDN_STATE_TRACE=1 restores the per-forward state-before
             // copy; the HostKV recurrent-trace checkpoint alias always keeps it.
             static const bool keep_state_trace=[] {
-                const char* value=std::getenv("NINFER_EXL3_GDN_STATE_TRACE");
+                const char* value=std::getenv("VOIDINFER_EXL3_GDN_STATE_TRACE");
                 return value && std::strcmp(value,"1")==0;
             }();
             impl->gdn_layers[layer]->set_skip_state_trace(
@@ -6241,9 +6241,9 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     }
     {
         static const bool gdn_live=[] {
-            const char* value=std::getenv("NINFER_EXL3_GDN_LIVE_CHECKPOINT");
+            const char* value=std::getenv("VOIDINFER_EXL3_GDN_LIVE_CHECKPOINT");
             if(value)return std::strcmp(value,"0")!=0;
-            const char* shared=std::getenv("NINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            const char* shared=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
             return shared && std::strcmp(shared,"1")==0;
         }();
         if(gdn_live && Exl3NativeContextExtent::l0_oscar_enabled() &&
@@ -6766,7 +6766,7 @@ Exl3TextContext::~Exl3TextContext() {
     const auto retired=exl3_retire_reconstruction_device(impl_->reconstruction_backing->device,
         [](int* device) noexcept {return static_cast<int>(cudaGetDevice(device));},
         [](int device) noexcept {return static_cast<int>(cudaSetDevice(device));},
-        []() noexcept {return static_cast<int>(ninfer::cuda_device_synchronize_outside_capture());},
+        []() noexcept {return static_cast<int>(voidinfer::cuda_device_synchronize_outside_capture());},
         [&]() noexcept {impl_.reset();},impl_->reconstruction_retirement_failure_for_test);
     if(retired.released)return;
     static std::atomic<Impl*> quarantine{nullptr};
@@ -6775,10 +6775,10 @@ Exl3TextContext::~Exl3TextContext() {
     auto* head=quarantine.load(std::memory_order_relaxed);
     do {retained->reconstruction_quarantine_next=head;}
     while(!quarantine.compare_exchange_weak(head,retained,std::memory_order_release,std::memory_order_relaxed));
-    ::ninfer::exl3::reconstruction_quarantined_contexts.fetch_add(1,std::memory_order_release);
+    ::voidinfer::exl3::reconstruction_quarantined_contexts.fetch_add(1,std::memory_order_release);
 }
 std::size_t Exl3TextContext::reconstruction_quarantined_contexts() noexcept {
-    return ::ninfer::exl3::reconstruction_quarantined_contexts.load(std::memory_order_acquire);
+    return ::voidinfer::exl3::reconstruction_quarantined_contexts.load(std::memory_order_acquire);
 }
 std::size_t Exl3TextContext::host_kv_quarantined_contexts() noexcept {
     return hostkv_quarantined_contexts.load(std::memory_order_acquire);
@@ -8197,11 +8197,11 @@ void Exl3TextContext::prepare_transaction_impl(
     impl_->transaction = std::move(prepared);
 }
 
-// NINFER_EXL3_CHECKPOINT_OVERLAP (default 1): the device-KV checkpoint graph
+// VOIDINFER_EXL3_CHECKPOINT_OVERLAP (default 1): the device-KV checkpoint graph
 // runs on a side stream; target-state consumers join it (join_repair).
 static bool checkpoint_overlap_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_CHECKPOINT_OVERLAP");
+        const char* value=std::getenv("VOIDINFER_EXL3_CHECKPOINT_OVERLAP");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -8235,7 +8235,7 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                 impl_->last_rows <= impl_->prefill_capacity && impl_->tap_rows == impl_->embedding_rows &&
                 impl_->tap_rows == impl_->last_rows,
             "P2 target transaction captured rows are invalid or inconsistent");
-    if(impl_->tap_rows>16 && std::getenv("NINFER_EXL3_MEMORY_TRACE"))
+    if(impl_->tap_rows>16 && std::getenv("VOIDINFER_EXL3_MEMORY_TRACE"))
         std::fprintf(stderr,"TRANSACTION_TAP_ROWS rows=%d position=%d%c",impl_->tap_rows,position_,10);
     impl_->validate_target_projection_execution(stream);
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
@@ -9035,10 +9035,10 @@ Exl3TextContext::device_transaction_checkpoint_graph_stats() const noexcept {
 
 bool Exl3TextContext::layer_major_from_zero() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_LAYER_MAJOR_FROM_ZERO");
+        const char* value = std::getenv("VOIDINFER_EXL3_LAYER_MAJOR_FROM_ZERO");
         if (!value || std::strcmp(value, "1") == 0) return true;
         if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_LAYER_MAJOR_FROM_ZERO must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_LAYER_MAJOR_FROM_ZERO must be 0 or 1");
     }();
     return enabled;
 }
@@ -9072,14 +9072,14 @@ std::string Exl3TextContext::round_trace(int position) const {
 }
 
 // Free-memory reserve kept beside the layer-major projection cache of L0 OSCAR
-// contexts (NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB, default 1024). Concurrent
+// contexts (VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB, default 1024). Concurrent
 // Engine lanes ingest prompts exclusively, so a smaller reserve is safe there.
 static std::size_t l0_layer_major_reserve_bytes() {
     static const std::size_t bytes=[] {
-        const char* value=std::getenv("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB");
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB");
         const long mib=value?std::atol(value):1024;
         if(mib<64 || mib>8192)
-            throw std::invalid_argument("NINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB must be 64..8192");
+            throw std::invalid_argument("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB must be 64..8192");
         return static_cast<std::size_t>(mib)*1024*1024;
     }();
     return bytes;
@@ -9089,7 +9089,7 @@ bool Exl3TextContext::l0_layer_major_headroom() const {
     // Mirrors the projection-cache admission of the layer-major schedule for
     // L0 OSCAR contexts (1 GiB reserve plus a 256 MiB minimum cache).
     static const bool row_major=[] {
-        const char* value=std::getenv("NINFER_EXL3_L0_ROW_MAJOR_PREFILL");
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_ROW_MAJOR_PREFILL");
         return value && std::strcmp(value,"1")==0;
     }();
     if(row_major)return false;
@@ -9233,14 +9233,14 @@ void Exl3TextContext::append_prefill_layer_major(
     const std::size_t reserve_bytes=Exl3NativeContextExtent::l0_oscar_enabled()?
         l0_layer_major_reserve_bytes():fast_device_kv_transaction_enabled()?
         1536ull*1024*1024:2ull*1024*1024*1024;
-    // NINFER_EXL3_LAYER_MAJOR_CACHE_MIB (256..1536, default 1536): retained
+    // VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB (256..1536, default 1536): retained
     // reconstructed-weight cache; concurrent Engine lanes keep it smaller so
     // decode keeps device headroom (one layer's projections are ~0.75 GiB).
     static const std::size_t cache_limit=[] {
-        const char* value=std::getenv("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB");
+        const char* value=std::getenv("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB");
         const long mib=value?std::atol(value):1536;
         if(mib<256 || mib>1536)
-            throw std::invalid_argument("NINFER_EXL3_LAYER_MAJOR_CACHE_MIB must be 256..1536");
+            throw std::invalid_argument("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB must be 256..1536");
         return static_cast<std::size_t>(mib)*1024*1024;
     }();
     constexpr std::size_t minimum_cache=256ull*1024*1024;
@@ -9270,7 +9270,7 @@ void Exl3TextContext::append_prefill_layer_major(
         cache_budget=std::max(existing_cache,cache_budget-l0_cache_slack);
     require(workspace.stats().cached_weight_capacity_bytes<=cache_budget,
             "retained layer-major cache exceeds current device budget");
-    const char* injected_layer=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
+    const char* injected_layer=std::getenv("VOIDINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
     const int fail_after_layer=injected_layer ? std::atoi(injected_layer) : -1;
     require(!injected_layer ||
             (fail_after_layer>=0 && fail_after_layer<kLayers &&
@@ -9282,7 +9282,7 @@ void Exl3TextContext::append_prefill_layer_major(
             for (auto event : events) if (event) cudaEventDestroy(event);
         }
     } layer_profile;
-    const char* profile_option=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
+    const char* profile_option=std::getenv("VOIDINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
     if (profile_option && std::strcmp(profile_option,"1")==0) {
         layer_profile.events.resize(kLayers+1,nullptr);
         for (auto& event : layer_profile.events)
@@ -10175,7 +10175,7 @@ struct Exl3TextContext::BatchBinding {
         require(!peers.empty() && peers.size()<=Exl3FullAttentionLayer::kMaxBatchPeers &&
                 peers.size()<=Exl3GdnLayer::kMaxBatchPeers,"batched peer count");
         static const bool fork_enabled=[] {
-            const char* value=std::getenv("NINFER_EXL3_BATCH_FORK");
+            const char* value=std::getenv("VOIDINFER_EXL3_BATCH_FORK");
             return !value || std::strcmp(value,"0")!=0;
         }();
         const bool fork=fork_enabled;
@@ -10486,14 +10486,14 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
     // instead of one 8-row pass per agent: the head weights stream once per
     // tile. Each agent's rows are contiguous in the owner's stack output.
     // More than 16 rows: one 32-row coherent pass (the head weights stream
-    // once); NINFER_EXL3_BATCHED_HEAD_TILE=16 keeps 16-row native tiles.
+    // once); VOIDINFER_EXL3_BATCHED_HEAD_TILE=16 keeps 16-row native tiles.
     constexpr int kHeadTile=16;
     static const bool head32=[] {
-        const char* value=std::getenv("NINFER_EXL3_BATCHED_HEAD_TILE");
+        const char* value=std::getenv("VOIDINFER_EXL3_BATCHED_HEAD_TILE");
         return !value || std::atoi(value)!=16;
     }();
     static const bool batched_head=[] {
-        const char* value=std::getenv("NINFER_EXL3_BATCHED_HEAD");
+        const char* value=std::getenv("VOIDINFER_EXL3_BATCHED_HEAD");
         return !value || std::strcmp(value,"0")!=0;
     }();
     if(!batched_head) {
@@ -10617,7 +10617,7 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view c
     // Request reuse composes default-stream target work, optional copy streams
     // and graph/explicit execution streams. T011 narrows only its proven graph
     // mutation subset; this whole-context fallback remains device-wide.
-    cuda_check(ninfer::cuda_device_synchronize_outside_capture(),"drain prior request work before context reuse");
+    cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),"drain prior request work before context reuse");
     if(impl_->host_kv_copy_stream) {
         const auto finish_copies=[&] {
             cuda_check(cudaStreamSynchronize(impl_->host_kv_copy_stream),
@@ -10647,7 +10647,7 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view c
     reset_impl(nullptr,preserve);
     if(std::exchange(impl_->fail_request_reset_completion_for_test,false))
         throw std::runtime_error("injected request reset completion failure");
-    cuda_check(ninfer::cuda_device_synchronize_outside_capture(),"complete request context reset");
+    cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),"complete request context reset");
     // Growable L0 codes and planes return backing beyond the retained
     // frontier; the host planes keep kL0RetainedBackingRows rows so ordinary
     // requests on this lane do not re-create pinned pages (~0.1 s per 4K
@@ -10868,11 +10868,11 @@ void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
         impl_->full_layers[layer]->set_l0_exact_only(true);
         impl_->full_layers[layer]->set_rope_map(drafting.impl_->position_device+4);
     }
-    // FP8 history of the asynchronous line (default; NINFER_EXL3_VERICACHE_LINE_FP8=0
+    // FP8 history of the asynchronous line (default; VOIDINFER_EXL3_VERICACHE_LINE_FP8=0
     // keeps the FP16 planes): half the PCIe bytes per pass, 128K -4%, 254K -6%
     // per round; history past the window rounds to e4m3 (per row/head scale).
     static const bool line_fp8=[] {
-        const char* value=std::getenv("NINFER_EXL3_VERICACHE_LINE_FP8");
+        const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_LINE_FP8");
         return !value || std::strcmp(value,"0")!=0;
     }();
     if(line_fp8) {
@@ -11007,7 +11007,7 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
     }
     std::vector<std::int64_t> greedy(rows);
     std::vector<float> gap(rows);
-    cuda_check(ninfer::cuda_poll_stream(stream),"row scores poll");
+    cuda_check(voidinfer::cuda_poll_stream(stream),"row scores poll");
     cuda_check(exl3_d2h_async(greedy.data(),buffers.greedy,rows*sizeof(std::int64_t),stream),"row score greedy");
     cuda_check(exl3_d2h_async(gap.data(),buffers.gap,rows*sizeof(float),stream),"row score gaps");
     cuda_check(cudaStreamSynchronize(stream),"row scores");
@@ -11138,11 +11138,11 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     if (!host_kv && !device_kv)
         impl_->oscar->restore_checkpoint(transaction.oscar_checkpoint, stream);
     static const bool repair_graph=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_REPAIR_GRAPH");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_REPAIR_GRAPH");
         if(!value)return true;  // measured default; "0" keeps eager per-layer repair
         if(std::strcmp(value,"0")==0)return false;
         if(std::strcmp(value,"1")==0)return true;
-        throw std::invalid_argument("NINFER_EXL3_GDN_REPAIR_GRAPH must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_GDN_REPAIR_GRAPH must be 0 or 1");
     }();
     if (repair_graph && device_kv && fail_after_model_layer < 0 &&
         attempted_rows >= 2 && attempted_rows <= 8) {
@@ -11202,7 +11202,7 @@ void Exl3TextContext::retain_transaction_prefix_impl(
             graph.ready=true;
         }
         static const bool overlap=[] {
-            const char* value=std::getenv("NINFER_EXL3_GDN_REPAIR_OVERLAP");
+            const char* value=std::getenv("VOIDINFER_EXL3_GDN_REPAIR_OVERLAP");
             return !value || std::strcmp(value,"0")!=0;
         }();
         if(overlap && impl_->gdn_repair_overlap) {
@@ -11420,7 +11420,7 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         // Context-owned destination survives exceptions/partial transfers. No
         // stack packet escapes or is reused after a failed completion fence.
-        cuda_check(ninfer::cuda_poll_stream(stream),"greedy packet poll");
+        cuda_check(voidinfer::cuda_poll_stream(stream),"greedy packet poll");
         cuda_check(exl3_d2h_async(impl_->greedy_host_rows.data(),output,rows*sizeof(Exl3GreedyRow),stream),"greedy packet download");
         cuda_check(cudaStreamSynchronize(stream),"greedy packet readiness");
         if(continuation)
@@ -11744,10 +11744,10 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
             numerical_assessment.reason)));
     if (position_ <= 0 || position_ > impl_->max_context - 8)
         return fail("fixed-B8 continuation graph position extent");
-    const int split_class = ninfer::ops::detail::
+    const int split_class = voidinfer::ops::detail::
         oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(position_ + 1);
     for (int row = 1; row < 8; ++row) {
-        if (ninfer::ops::detail::
+        if (voidinfer::ops::detail::
                 oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                     position_ + row + 1) != split_class)
             return fail("fixed-B8 continuation crosses an OSCAR split-class boundary");
@@ -11800,7 +11800,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
         // instantiate() destroys its executable.
         if(continuation.graph_definition.ready() ||
             continuation.graph_executable.ready()) {
-            cuda_check(ninfer::cuda_device_synchronize_outside_capture(),
+            cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),
                 "drain incompatible fixed-B8 graph before recapture");
             if(continuation.graph_lifecycle.pending())
                 require(impl_->complete_continuation_graph_use(
@@ -11812,7 +11812,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
         cuda_check(cudaStreamSynchronize(stream),
                    "synchronize before fixed-B8 continuation capture");
         impl_->bind_graph_device();
-        const auto retired=ninfer::detail::retire_decode_graph_pair(
+        const auto retired=voidinfer::detail::retire_decode_graph_pair(
             continuation.graph_executable,continuation.graph_definition);
         if(retired!=cudaSuccess) {
             continuation.graph_active=false;
@@ -11892,7 +11892,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
         impl_->qkv_trace_valid = saved_qkv_trace_valid;
         continuation.rows = 0;
         if(impl_->graph_retirement_error)throw; // Never retry a failed native destroy.
-        const auto retirement=ninfer::cuda_device_synchronize_outside_capture();
+        const auto retirement=voidinfer::cuda_device_synchronize_outside_capture();
         if(retirement!=cudaSuccess) {
             continuation.graph_active=false;
             continuation.projection_binding.invalidate();
@@ -11906,7 +11906,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
             (void)impl_->complete_continuation_graph_use(
                 8,continuation.graph_origin_stream);
         continuation.graph_lifecycle.invalidate("fixed-B8 capture failed");
-        const auto destroyed=ninfer::detail::retire_decode_graph_pair(
+        const auto destroyed=voidinfer::detail::retire_decode_graph_pair(
             continuation.graph_executable,continuation.graph_definition);
         if(destroyed!=cudaSuccess) {
             continuation.graph_active=false;
@@ -11972,10 +11972,10 @@ bool Exl3TextContext::capture_continuation_graph_rows(
             numerical_assessment.reason)));
     if (position_ <= 0 || position_ > impl_->max_context - rows)
         return fail("multi-depth continuation graph position extent");
-    const int split_class = ninfer::ops::detail::
+    const int split_class = voidinfer::ops::detail::
         oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(position_ + 1);
     for (int row = 1; row < rows; ++row) {
-        if (ninfer::ops::detail::
+        if (voidinfer::ops::detail::
                 oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                     position_ + row + 1) != split_class)
             return fail("multi-depth continuation crosses an OSCAR split-class boundary");
@@ -12018,7 +12018,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
     };
     try {
         if (graph.definition.ready() || graph.executable.ready()) {
-            cuda_check(ninfer::cuda_device_synchronize_outside_capture(),
+            cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),
                        "drain incompatible multi-depth graph before recapture");
             if(graph.lifecycle.pending())
                 require(impl_->complete_continuation_graph_use(
@@ -12029,7 +12029,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         cuda_check(cudaStreamSynchronize(stream),
                    "synchronize before multi-depth continuation capture");
         impl_->bind_graph_device();
-        const auto retired=ninfer::detail::retire_decode_graph_pair(graph.executable,graph.definition);
+        const auto retired=voidinfer::detail::retire_decode_graph_pair(graph.executable,graph.definition);
         if(retired!=cudaSuccess) {
             graph.active=false;
             continuation.graph_active=false;
@@ -12107,7 +12107,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         impl_->qkv_trace_valid = saved_qkv_trace_valid;
         continuation.rows = 0;
         if(impl_->graph_retirement_error)throw; // Preserve uncertain handles without retry.
-        const auto retirement=ninfer::cuda_device_synchronize_outside_capture();
+        const auto retirement=voidinfer::cuda_device_synchronize_outside_capture();
         if(retirement!=cudaSuccess) {
             graph.active=false;
             continuation.graph_active=false;
@@ -12120,7 +12120,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         if(graph.lifecycle.pending())
             (void)impl_->complete_continuation_graph_use(rows,graph.origin_stream);
         graph.lifecycle.invalidate("multi-depth capture failed");
-        const auto destroyed=ninfer::detail::retire_decode_graph_pair(graph.executable,graph.definition);
+        const auto destroyed=voidinfer::detail::retire_decode_graph_pair(graph.executable,graph.definition);
         if(destroyed!=cudaSuccess) {
             graph.active=false;
             continuation.graph_active=false;
@@ -12182,10 +12182,10 @@ void Exl3TextContext::continue_rows_graph(
     require(std::all_of(token_ids.begin(),token_ids.end(),[](std::int64_t token) {
                 return token >= 0 && token < kVocab;
             }),"continuation graph token extent");
-    const int split_class = ninfer::ops::detail::
+    const int split_class = voidinfer::ops::detail::
         oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(position_ + 1);
     for (int row = 1; row < rows; ++row)
-        require(ninfer::ops::detail::
+        require(voidinfer::ops::detail::
                     oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                         position_ + row + 1) == split_class,
                 "continuation graph replay crosses OSCAR split class");
@@ -12296,7 +12296,7 @@ Exl3TextContext::continuation_graph_admission() const noexcept {
         position_ > impl_->max_context - result.capacity)
         return result;
     for (int row = 0; row < result.capacity; ++row) {
-        if (ninfer::ops::detail::
+        if (voidinfer::ops::detail::
                 oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                     position_ + row + 1) != result.oscar_split_class)
             return result;
@@ -12468,7 +12468,7 @@ void Exl3TextContext::decode_graph(std::int64_t token_id, cudaStream_t stream) {
     require(position_ < impl_->max_context, "E4B2 graph context capacity exhausted");
     if (impl_->continuation) impl_->continuation->rows = 0;
     if (impl_->oscar && impl_->oscar->graph_class() != 0) {
-        const int need = ninfer::ops::detail::
+        const int need = voidinfer::ops::detail::
             oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(position_ + 1);
         if (need != impl_->oscar->graph_class()) {
             throw std::invalid_argument("E4C1 OSCAR split-class transition: recapture the graph");
@@ -13114,9 +13114,9 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                 !k.cpu_visible() && !v.cpu_visible();
         }
     // L0 contexts publish lane-backed pages: no KV copy at export, the
-    // planes keep the rows (NINFER_EXL3_L0_DEFERRED_ROOT_KV=0 copies).
+    // planes keep the rows (VOIDINFER_EXL3_L0_DEFERRED_ROOT_KV=0 copies).
     static const bool deferred_root_kv=[] {
-        const char* value=std::getenv("NINFER_EXL3_L0_DEFERRED_ROOT_KV");
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_DEFERRED_ROOT_KV");
         return !value || std::strcmp(value,"0")!=0;
     }();
     const bool defer_kv=deferred_root_kv && !l2_fp8 && (host_planes || staged_planes) &&
@@ -13140,7 +13140,7 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         snapshot_credit.reset();
     }
     const auto& fresh_pages=extension.fresh;
-    const auto* batched_kv_option=std::getenv("NINFER_EXL3_EXACT_KV_EXPORT_BATCHED_FENCE");
+    const auto* batched_kv_option=std::getenv("VOIDINFER_EXL3_EXACT_KV_EXPORT_BATCHED_FENCE");
     if(batched_kv_option && std::string_view(batched_kv_option)!="0" &&
        std::string_view(batched_kv_option)!="1")
         throw std::invalid_argument("exact KV export batched fence must be0 or1");
@@ -13730,7 +13730,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     // The restored pages stay pinned (no pressure spill or foreign re-home of
     // their payload) until the restore has read them.
     const Exl3PagePins restore_pins(state.kv_pages_);
-    // NINFER_EXL3_VERICACHE_STATS: one KV_RESTORE line per restore (phase ms).
+    // VOIDINFER_EXL3_VERICACHE_STATS: one KV_RESTORE line per restore (phase ms).
     using RestoreClock=std::chrono::steady_clock;
     const auto restore_begin=RestoreClock::now();
     auto restore_mark=restore_begin;
@@ -13965,7 +13965,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     // Restored filled lane-backed pages now live in these planes: re-home them.
     if(impl_->kv_source && !adoptable.empty())impl_->kv_source->adopt(adoptable);
     restore_phase(4);
-    if(std::getenv("NINFER_EXL3_VERICACHE_STATS"))
+    if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
         std::fprintf(stderr,"KV_RESTORE rows=%d pages=%zu lane_resident=%zu all_resident=%d exchange_ms=%.1f fill_ms=%.1f "
             "foreign_ms=%.1f layers_ms=%.1f adopt_ms=%.1f total_ms=%.1f\n",state.position_,state.kv_pages_.size(),
             resident_pages.size(),all_lane_resident?1:0,restore_ms[0],restore_ms[1],restore_ms[2],restore_ms[3],
@@ -14157,18 +14157,18 @@ std::vector<std::uint16_t> Exl3TextContext::full_attention_k_host(
 }
 
 bool Exl3TextContext::try_enable_oscar_from_environment() {
-    const char* flag = std::getenv("NINFER_OSCAR_EXL3");
+    const char* flag = std::getenv("VOIDINFER_OSCAR_EXL3");
     if (flag == nullptr || std::string(flag) != "1") return false;
     require(!impl_->host_kv.enabled,"authoritative host KV context cannot enable approximate OSCAR");
     require(!impl_->oscar,"OSCAR context strategy is already enabled");
     require(!impl_->transaction || !impl_->transaction->active,
             "P2 cannot replace OSCAR during an active target transaction");
     if (impl_->continuation) impl_->continuation->rows = 0;
-    const char* asset = std::getenv("NINFER_OSCAR_ROTATION_ASSET_DIR");
+    const char* asset = std::getenv("VOIDINFER_OSCAR_ROTATION_ASSET_DIR");
     if (asset == nullptr || asset[0] == 0) {
-        throw std::invalid_argument("E4C1 OSCAR enabled without NINFER_OSCAR_ROTATION_ASSET_DIR");
+        throw std::invalid_argument("E4C1 OSCAR enabled without VOIDINFER_OSCAR_ROTATION_ASSET_DIR");
     }
-    const char* manifest = std::getenv("NINFER_OSCAR_COMPAT_MANIFEST");
+    const char* manifest = std::getenv("VOIDINFER_OSCAR_COMPAT_MANIFEST");
     const std::string manifest_path = (manifest != nullptr && manifest[0] != 0)
                                         ? manifest
                                         : "results/oscar/E4C1_EXL3_COMPATIBILITY_MANIFEST.json";
@@ -14497,4 +14497,4 @@ std::vector<std::uint16_t> Exl3TextContext::embedding_bits_host_for_test(
 }
 
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

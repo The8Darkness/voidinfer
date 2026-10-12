@@ -12,7 +12,7 @@
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 
 namespace {
 
@@ -34,13 +34,13 @@ int env_int(const char* name, int fallback) {
 
 int main() {
     try {
-        const auto target = env("NINFER_EXL3_TARGET_PATH");
+        const auto target = env("VOIDINFER_EXL3_TARGET_PATH");
         if (target.empty()) {
-            std::cerr << "profile skipped: set NINFER_EXL3_TARGET_PATH\n";
+            std::cerr << "profile skipped: set VOIDINFER_EXL3_TARGET_PATH\n";
             return 77;
         }
-        const int context = env_int("NINFER_E4C1_PROF_CTX", 4096);
-        const int decodes = env_int("NINFER_E4C1_PROF_DECODERS", 10);
+        const int context = env_int("VOIDINFER_E4C1_PROF_CTX", 4096);
+        const int decodes = env_int("VOIDINFER_E4C1_PROF_DECODERS", 10);
         const auto model = Exl3TextModel::load(target, 32768);
         auto ctx = model->create_context(false);
         require(ctx->try_enable_oscar_from_environment(), "profile OSCAR enable failed");

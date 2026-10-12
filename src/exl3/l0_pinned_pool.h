@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3L0PinnedPool {
 public:
@@ -65,4 +65,4 @@ private:
     std::vector<std::uint8_t*> free_;
 };
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

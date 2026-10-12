@@ -14,9 +14,9 @@
 namespace {
 
 constexpr std::size_t kRowValues =
-    static_cast<std::size_t>(ninfer::kOscarMixedKVHeads) * ninfer::kOscarMixedHeadDim;
+    static_cast<std::size_t>(voidinfer::kOscarMixedKVHeads) * voidinfer::kOscarMixedHeadDim;
 constexpr std::size_t kLayerValues =
-    kRowValues * ninfer::kOscarMixedFullAttentionLayers.size();
+    kRowValues * voidinfer::kOscarMixedFullAttentionLayers.size();
 constexpr std::uint32_t kBaseContext = 324;
 
 void require(bool condition, const char* message) {
@@ -58,13 +58,13 @@ void make_rows(std::uint32_t logical_token, std::uint32_t branch_salt,
                std::vector<std::uint16_t>& k_rows, std::vector<std::uint16_t>& v_rows) {
     k_rows.resize(kLayerValues);
     v_rows.resize(kLayerValues);
-    for (std::size_t layer = 0; layer < ninfer::kOscarMixedFullAttentionLayers.size(); ++layer) {
+    for (std::size_t layer = 0; layer < voidinfer::kOscarMixedFullAttentionLayers.size(); ++layer) {
         const std::size_t layer_offset = layer * kRowValues;
-        for (std::uint32_t head = 0; head < ninfer::kOscarMixedKVHeads; ++head) {
-            for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim;
+        for (std::uint32_t head = 0; head < voidinfer::kOscarMixedKVHeads; ++head) {
+            for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim;
                  ++dimension) {
                 const std::size_t offset = layer_offset +
-                    static_cast<std::size_t>(head) * ninfer::kOscarMixedHeadDim + dimension;
+                    static_cast<std::size_t>(head) * voidinfer::kOscarMixedHeadDim + dimension;
                 k_rows[offset] = float_to_bf16(deterministic_value(
                     layer, logical_token, head, dimension, branch_salt, false));
                 v_rows[offset] = float_to_bf16(deterministic_value(
@@ -90,7 +90,7 @@ void write_json_string(std::ofstream& output, const std::string& value) {
 }
 
 void write_page_fingerprint(std::ofstream& output,
-                            const ninfer::OscarMixedPageFingerprint& page) {
+                            const voidinfer::OscarMixedPageFingerprint& page) {
     output << "{\"layer\":" << page.model_layer << ",\"page\":" << page.page_index
            << ",\"sequence_id\":" << page.sequence_id
            << ",\"logical_begin\":" << page.logical_token_begin
@@ -115,7 +115,7 @@ void write_page_fingerprint(std::ofstream& output,
     output << '}';
 }
 
-void write_fingerprint(std::ofstream& output, const ninfer::OscarMixedCacheFingerprint& fingerprint) {
+void write_fingerprint(std::ofstream& output, const voidinfer::OscarMixedCacheFingerprint& fingerprint) {
     output << "{\"sequence_id\":" << fingerprint.sequence_id
            << ",\"context_tokens\":" << fingerprint.context_tokens
            << ",\"full_attention_layers\":" << fingerprint.full_attention_layers
@@ -129,7 +129,7 @@ void write_fingerprint(std::ofstream& output, const ninfer::OscarMixedCacheFinge
     output << "]}";
 }
 
-void write_accounting(std::ofstream& output, const ninfer::OscarMixedCacheAccounting& accounting) {
+void write_accounting(std::ofstream& output, const voidinfer::OscarMixedCacheAccounting& accounting) {
     output << "{\"context_tokens\":" << accounting.context_tokens
            << ",\"prefix_tokens\":" << accounting.prefix_tokens
            << ",\"historical_tokens\":" << accounting.historical_tokens
@@ -152,8 +152,8 @@ int main(int argc, char** argv) {
             if (std::string(argv[index]) == "--report") { report_path = argv[index + 1]; }
         }
 
-        const auto asset = ninfer::OscarMixedAgingAssetContract::c4_cal30k();
-        ninfer::OscarMixedTransitionCache base(1001, asset);
+        const auto asset = voidinfer::OscarMixedAgingAssetContract::c4_cal30k();
+        voidinfer::OscarMixedTransitionCache base(1001, asset);
         std::vector<std::uint16_t> k_rows;
         std::vector<std::uint16_t> v_rows;
         for (std::uint32_t token = 0; token < kBaseContext; ++token) {
@@ -207,10 +207,10 @@ int main(int argc, char** argv) {
         require(parent_branch.has_logical_token(327) && divergent_child.has_logical_token(327),
                 "branch append lost logical positions");
         require(parent_branch.shared_page_count_with(base) >=
-                    ninfer::kOscarMixedFullAttentionLayers.size(),
+                    voidinfer::kOscarMixedFullAttentionLayers.size(),
                 "copy-on-write did not preserve immutable prefix pages");
         require(divergent_child.shared_page_count_with(base) >=
-                    ninfer::kOscarMixedFullAttentionLayers.size(),
+                    voidinfer::kOscarMixedFullAttentionLayers.size(),
                 "child copy-on-write did not preserve immutable prefix pages");
         require(parent_branch.accounting().historical_tokens == 8 &&
                     parent_branch.accounting().recent_tokens == 256,
@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
         const auto state_source_fp = state_source.fingerprint(true);
         const auto state_image = state_source.state_image();
         const auto state_image_hash = state_source.state_image_hash();
-        auto restored = ninfer::OscarMixedTransitionCache::from_state_image(state_image, asset);
+        auto restored = voidinfer::OscarMixedTransitionCache::from_state_image(state_image, asset);
         restored.validate();
         require(restored.fingerprint(true) == state_source_fp,
                 "StateImage restore changed the complete cache fingerprint");
@@ -286,11 +286,11 @@ int main(int argc, char** argv) {
 
         // Full layer coverage is explicit: the transition bundle accepts only the verified 16
         // full-attention layers, so no GDN recurrent state can be interpreted as OSCAR KV.
-        require(base.bundle().layers().size() == ninfer::kOscarMixedFullAttentionLayers.size(),
+        require(base.bundle().layers().size() == voidinfer::kOscarMixedFullAttentionLayers.size(),
                 "transition bundle does not cover all full-attention layers");
         for (std::size_t index = 0; index < base.bundle().layers().size(); ++index) {
             require(base.bundle().layers()[index].model_layer() ==
-                        ninfer::kOscarMixedFullAttentionLayers[index],
+                        voidinfer::kOscarMixedFullAttentionLayers[index],
                     "transition bundle contains a non-full-attention layer");
         }
 
@@ -302,7 +302,7 @@ int main(int argc, char** argv) {
                    << ",\"base_context\":" << kBaseContext
                    << ",\"base_page_count\":" << base.page_count()
                    << ",\"full_attention_layers\":"
-                   << ninfer::kOscarMixedFullAttentionLayers.size()
+                   << voidinfer::kOscarMixedFullAttentionLayers.size()
                    << ",\"gdn_state_in_oscar_cache\":false"
                    << ",\"initial_shared_pages\":" << initial_shared_pages
                    << ",\"fork_page_refcount\":" << initial_page_refcount

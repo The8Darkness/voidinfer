@@ -9,7 +9,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 using Resources = targets::qwen3_6::FrontendResources;
@@ -107,4 +107,4 @@ const char* pinned_weights_id(const std::filesystem::path& target_directory) {
     return revision == 1 ? "SC_5.00bpw_H6_V6" : "SC_6.00bpw_H6_V6";
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

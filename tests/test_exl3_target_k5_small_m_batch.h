@@ -1,7 +1,7 @@
 #pragma once
 
 struct TargetK5SmallMBatchQualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     std::filesystem::path directory;
     std::ofstream csv;
     std::vector<std::string> shapes;
@@ -26,7 +26,7 @@ struct TargetK5SmallMBatchQualification {
         return Admission::ordinary;
     }
 
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,
                          void* user) {
         auto* self = static_cast<TargetK5SmallMBatchQualification*>(user);
         if (x.metadata.K != 5 || admission(x.operation) == Admission::ordinary)
@@ -41,21 +41,21 @@ struct TargetK5SmallMBatchQualification {
         self->shapes.push_back(key);
     }
 
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x,
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x,
                const std::string& key) {
         require(x.rows == 8 && x.metadata.mul1 && !x.metadata.mcg &&
                     !x.metadata.has_bias,
                 "target K5 batch capture contract");
         const auto admit = admission(x.operation);
-        _putenv_s("NINFER_EXL3_TARGET_K5_SMALL_M_BATCH", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_K5_SMALL_M_BATCH", "0");
         Exl3CudaLinearWorkspace baseline(
             x.metadata.in_features, x.metadata.out_features, 8,
             false, true, true, true, true, false, false, {}, {}, true, true, true);
-        _putenv_s("NINFER_EXL3_TARGET_K5_SMALL_M_BATCH", "1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_K5_SMALL_M_BATCH", "1");
         Exl3CudaLinearWorkspace candidate(
             x.metadata.in_features, x.metadata.out_features, 8,
             false, true, true, true, true, false, false, {}, {}, true, true, true);
-        _putenv_s("NINFER_EXL3_TARGET_K5_SMALL_M_BATCH", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_K5_SMALL_M_BATCH", "0");
         require(!candidate.target_k5_small_m_batch_candidate(
                     x.metadata, 1, admit) &&
                     candidate.target_k5_small_m_batch_candidate(
@@ -134,9 +134,9 @@ struct TargetK5SmallMBatchQualification {
 
 void run_target_k5_small_m_batch_qualification(Exl3TextModel& target,
                                                 Exl3Dflash2DraftModel& draft) {
-    require(env("NINFER_EXL3_TARGET_K5_SMALL_M_BATCH") == "0",
+    require(env("VOIDINFER_EXL3_TARGET_K5_SMALL_M_BATCH") == "0",
             "target K5 batch capture requires construction flag0");
-    auto ids = load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids = load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size() >= 512, "target K5 batch prompt extent");
     std::vector<std::int64_t> prompt(ids.begin(), ids.begin() + 512);
     TapStage stage;
@@ -176,12 +176,12 @@ void run_target_k5_small_m_batch_qualification(Exl3TextModel& target,
     block.assign(1, pending);
     block.insert(block.end(), proposals.begin(), proposals.end());
 
-    TargetK5SmallMBatchQualification check(env("NINFER_E5A4_OUT"));
+    TargetK5SmallMBatchQualification check(env("VOIDINFER_E5A4_OUT"));
     context->prepare_transaction();
     context->prepare_continuation(8);
     context->set_target_projection_observer_for_test(
         TargetK5SmallMBatchQualification::callback, &check, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->begin_transaction();
     context->continue_rows(block);
     context->set_target_projection_observer_for_test(nullptr, nullptr);

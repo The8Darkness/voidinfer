@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Recoverable only when the partially constructed slab retired successfully.
 // Carry the original provider status through Engine's nested cleanup exception.
 class Exl3RecurrentEventCreationFailure : public std::runtime_error {

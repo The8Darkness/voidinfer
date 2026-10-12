@@ -10,16 +10,16 @@
 #include <string>
 #include <type_traits>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 constexpr std::uint64_t kBFloat16ValuesPerToken =
     static_cast<std::uint64_t>(kOscarMixedKVHeads) * kOscarMixedHeadDim * 2U;
 constexpr std::uint64_t kInt2PayloadBytesPerToken =
-    static_cast<std::uint64_t>(kOscarMixedKVHeads) * ninfer::ops::kOscarInt2G128CodeBytes * 2U;
+    static_cast<std::uint64_t>(kOscarMixedKVHeads) * voidinfer::ops::kOscarInt2G128CodeBytes * 2U;
 constexpr std::uint64_t kInt2MetadataBytesPerToken =
     static_cast<std::uint64_t>(kOscarMixedKVHeads) *
-    ninfer::ops::kOscarInt2G128MetadataItems * sizeof(float) * 2U;
+    voidinfer::ops::kOscarInt2G128MetadataItems * sizeof(float) * 2U;
 
 bool is_full_attention_layer(std::uint32_t layer) {
     return std::find(kOscarMixedFullAttentionLayers.begin(),
@@ -84,7 +84,7 @@ OscarMixedPage make_page(std::uint32_t model_layer, std::uint64_t sequence_id,
         .occupied_tokens      = static_cast<std::uint16_t>(occupied),
         .capacity_tokens      = static_cast<std::uint16_t>(kOscarMixedPageTokens),
         .layout_version       = kOscarMixedLayoutVersion,
-        .group_size           = ninfer::ops::kOscarInt2G128GroupSize,
+        .group_size           = voidinfer::ops::kOscarInt2G128GroupSize,
         .k_storage            = storage,
         .v_storage            = storage,
         .role                 = role,
@@ -102,7 +102,7 @@ OscarMixedPage make_page(std::uint32_t model_layer, std::uint64_t sequence_id,
             .physical_page_index  = physical_page_index,
             .page_offset          = static_cast<std::uint16_t>(offset),
             .layout_version       = kOscarMixedLayoutVersion,
-            .group_size           = ninfer::ops::kOscarInt2G128GroupSize,
+            .group_size           = voidinfer::ops::kOscarInt2G128GroupSize,
             .k_storage            = storage,
             .v_storage            = storage,
             .role                 = role,
@@ -229,9 +229,9 @@ OscarMixedCacheAccounting accounting_for_pages(
     result.logical_value_count = static_cast<std::uint64_t>(context_tokens) *
                                  kBFloat16ValuesPerToken * full_attention_layers;
     result.raw_int2_bytes_per_value =
-        static_cast<double>(ninfer::ops::kOscarInt2G128CodeBytes +
-                            ninfer::ops::kOscarInt2G128MetadataItems * sizeof(float)) /
-        ninfer::ops::kOscarInt2G128HeadDim;
+        static_cast<double>(voidinfer::ops::kOscarInt2G128CodeBytes +
+                            voidinfer::ops::kOscarInt2G128MetadataItems * sizeof(float)) /
+        voidinfer::ops::kOscarInt2G128HeadDim;
     if (result.historical_tokens != 0) {
         const auto count = static_cast<double>(result.historical_tokens) *
                            kBFloat16ValuesPerToken * full_attention_layers;
@@ -259,13 +259,13 @@ std::size_t OscarMixedBFloat16PageStorage::bytes() const noexcept {
 
 OscarMixedInt2G128PageStorage::OscarMixedInt2G128PageStorage(std::uint32_t capacity_tokens)
     : k_packed(static_cast<std::size_t>(capacity_tokens) * kOscarMixedKVHeads *
-               ninfer::ops::kOscarInt2G128CodeBytes),
+               voidinfer::ops::kOscarInt2G128CodeBytes),
       v_packed(static_cast<std::size_t>(capacity_tokens) * kOscarMixedKVHeads *
-               ninfer::ops::kOscarInt2G128CodeBytes),
+               voidinfer::ops::kOscarInt2G128CodeBytes),
       k_scales_zeros(static_cast<std::size_t>(capacity_tokens) * kOscarMixedKVHeads *
-                     ninfer::ops::kOscarInt2G128MetadataItems),
+                     voidinfer::ops::kOscarInt2G128MetadataItems),
       v_scales_zeros(static_cast<std::size_t>(capacity_tokens) * kOscarMixedKVHeads *
-                     ninfer::ops::kOscarInt2G128MetadataItems) {}
+                     voidinfer::ops::kOscarInt2G128MetadataItems) {}
 
 std::size_t OscarMixedInt2G128PageStorage::bytes() const noexcept {
     return vector_bytes(k_packed) + vector_bytes(v_packed) + vector_bytes(k_scales_zeros) +
@@ -331,7 +331,7 @@ void OscarMixedLayerCache::validate() const {
         const auto& meta = page.metadata;
         if (meta.model_layer != model_layer_ || meta.sequence_id != sequence_id_ ||
             meta.layout_version != kOscarMixedLayoutVersion ||
-            meta.group_size != ninfer::ops::kOscarInt2G128GroupSize ||
+            meta.group_size != voidinfer::ops::kOscarInt2G128GroupSize ||
             meta.k_storage != meta.v_storage || !is_valid_oscar_mixed_storage_type(meta.k_storage) ||
             !is_valid_oscar_mixed_region_role(meta.role) ||
             meta.capacity_tokens != kOscarMixedPageTokens ||
@@ -437,9 +437,9 @@ OscarMixedCacheAccounting OscarMixedLayerCache::accounting() const {
     result.logical_value_count = static_cast<std::uint64_t>(context_tokens_) *
                                  kBFloat16ValuesPerToken;
     result.raw_int2_bytes_per_value =
-        static_cast<double>(ninfer::ops::kOscarInt2G128CodeBytes +
-                            ninfer::ops::kOscarInt2G128MetadataItems * sizeof(float)) /
-        ninfer::ops::kOscarInt2G128HeadDim;
+        static_cast<double>(voidinfer::ops::kOscarInt2G128CodeBytes +
+                            voidinfer::ops::kOscarInt2G128MetadataItems * sizeof(float)) /
+        voidinfer::ops::kOscarInt2G128HeadDim;
     if (result.historical_tokens != 0) {
         const auto count = static_cast<double>(result.historical_tokens) * kBFloat16ValuesPerToken;
         result.historical_bulk_bytes_per_value =
@@ -564,7 +564,7 @@ OscarMixedAgingAssetContract OscarMixedAgingAssetContract::c4_cal30k() {
     result.gqa_ratio = kOscarMixedGqaRatio;
     result.head_dim = kOscarMixedHeadDim;
     result.rotary_dim = kOscarMixedRotaryDim;
-    result.group_size = ninfer::ops::kOscarInt2G128GroupSize;
+    result.group_size = voidinfer::ops::kOscarInt2G128GroupSize;
     result.calibrated = true;
     result.full_attention_layers = kOscarMixedFullAttentionLayers;
     return result;
@@ -584,7 +584,7 @@ OscarMixedAgingAssetContract OscarMixedAgingAssetContract::from_runtime(
     result.gqa_ratio               = kOscarMixedGqaRatio;
     result.head_dim                = kOscarMixedHeadDim;
     result.rotary_dim              = kOscarMixedRotaryDim;
-    result.group_size              = ninfer::ops::kOscarInt2G128GroupSize;
+    result.group_size              = voidinfer::ops::kOscarInt2G128GroupSize;
     result.calibrated              = true;
     result.full_attention_layers   = kOscarMixedFullAttentionLayers;
     result.validate();
@@ -672,9 +672,9 @@ void OscarMixedAgingLayerCache::age_token(std::uint32_t logical_token) {
             k_values[dimension] = bf16_bits_to_float(record.k_bf16[begin + dimension]);
             v_values[dimension] = bf16_bits_to_float(record.v_bf16[begin + dimension]);
         }
-        record.k_int2[head] = ninfer::ops::oscar_int2_g128_encode(
+        record.k_int2[head] = voidinfer::ops::oscar_int2_g128_encode(
             k_values.data(), static_cast<int>(kOscarMixedHeadDim), 0.96F);
-        record.v_int2[head] = ninfer::ops::oscar_int2_g128_encode(
+        record.v_int2[head] = voidinfer::ops::oscar_int2_g128_encode(
             v_values.data(), static_cast<int>(kOscarMixedHeadDim), 0.92F);
     }
     record.k_bf16.fill(0);
@@ -733,11 +733,11 @@ void OscarMixedAgingLayerCache::rebuild_pages() {
                             static_cast<std::size_t>(offset) * kOscarMixedKVHeads + head;
                         std::copy(k_encoded.packed.begin(), k_encoded.packed.end(),
                                   storage.k_packed.begin() + row *
-                                      ninfer::ops::kOscarInt2G128CodeBytes);
+                                      voidinfer::ops::kOscarInt2G128CodeBytes);
                         std::copy(v_encoded.packed.begin(), v_encoded.packed.end(),
                                   storage.v_packed.begin() + row *
-                                      ninfer::ops::kOscarInt2G128CodeBytes);
-                        const std::size_t metadata = row * ninfer::ops::kOscarInt2G128MetadataItems;
+                                      voidinfer::ops::kOscarInt2G128CodeBytes);
+                        const std::size_t metadata = row * voidinfer::ops::kOscarInt2G128MetadataItems;
                         std::copy(k_encoded.scales_zeros.begin(), k_encoded.scales_zeros.end(),
                                   storage.k_scales_zeros.begin() + metadata);
                         std::copy(v_encoded.scales_zeros.begin(), v_encoded.scales_zeros.end(),
@@ -850,12 +850,12 @@ void OscarMixedAgingLayerCache::validate() const {
                     }
                 }
                 for (const std::uint8_t symbol : record.k_int2[head].symbols) {
-                    if (symbol > ninfer::ops::kOscarInt2G128Levels) {
+                    if (symbol > voidinfer::ops::kOscarInt2G128Levels) {
                         throw std::invalid_argument("OSCAR aging K symbol is out of range");
                     }
                 }
                 for (const std::uint8_t symbol : record.v_int2[head].symbols) {
-                    if (symbol > ninfer::ops::kOscarInt2G128Levels) {
+                    if (symbol > voidinfer::ops::kOscarInt2G128Levels) {
                         throw std::invalid_argument("OSCAR aging V symbol is out of range");
                     }
                 }
@@ -912,13 +912,13 @@ void OscarMixedAgingLayerCache::validate() const {
                 const auto& v_encoded = record.v_int2[head];
                 if (!std::equal(k_encoded.packed.begin(), k_encoded.packed.end(),
                                 storage.k_packed.begin() +
-                                    row * ninfer::ops::kOscarInt2G128CodeBytes) ||
+                                    row * voidinfer::ops::kOscarInt2G128CodeBytes) ||
                     !std::equal(v_encoded.packed.begin(), v_encoded.packed.end(),
                                 storage.v_packed.begin() +
-                                    row * ninfer::ops::kOscarInt2G128CodeBytes)) {
+                                    row * voidinfer::ops::kOscarInt2G128CodeBytes)) {
                     throw std::invalid_argument("OSCAR aging packed row mismatch");
                 }
-                const std::size_t metadata = row * ninfer::ops::kOscarInt2G128MetadataItems;
+                const std::size_t metadata = row * voidinfer::ops::kOscarInt2G128MetadataItems;
                 if (!std::equal(k_encoded.scales_zeros.begin(), k_encoded.scales_zeros.end(),
                                 storage.k_scales_zeros.begin() + metadata) ||
                     !std::equal(v_encoded.scales_zeros.begin(), v_encoded.scales_zeros.end(),
@@ -1043,4 +1043,4 @@ OscarMixedCacheAccounting OscarMixedAgingCacheBundle::accounting() const {
     return accounting_for_pages(context_tokens(), layers_.size(), layers_.front().pages());
 }
 
-} // namespace ninfer
+} // namespace voidinfer

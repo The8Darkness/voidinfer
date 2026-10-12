@@ -1,6 +1,6 @@
 #pragma once
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Per-context rotary position map (Exl3TextContext::set_rope_map). Device ints:
 // [0] table rows, [1] delta, [2..3] device pointer to a row-major int [rows][3]
@@ -17,4 +17,4 @@ __device__ __forceinline__ int exl3_rope_position(const int* map, int position, 
     return position + map[1];
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

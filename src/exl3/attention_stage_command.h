@@ -3,7 +3,7 @@
 #include "exl3/registered_kv_upload.h"
 #include "exl3/attention_history_coverage.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Host-orchestrated asynchronous producer with explicit readiness/final-use
 // edges. Waiting is deliberately separate from submission so current-bank
 // compute can be queued while this producer is in flight.

@@ -9,8 +9,8 @@ void run_exact_resident_root_qualification(Exl3TextModel& target,
         code.size()>=static_cast<std::size_t>(prefix) &&
         prose.size()>=static_cast<std::size_t>(prefix),
         "resident-root fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto source=target.create_context(true),forced=target.create_context(true),resident=target.create_context(true);
     source->prepare_continuation(8);forced->prepare_continuation(8);resident->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
@@ -19,12 +19,12 @@ void run_exact_resident_root_qualification(Exl3TextModel& target,
             [](float value){return !std::isfinite(value);}),"resident-root finite logits");
         return static_cast<std::int64_t>(std::max_element(logits.begin(),logits.end())-logits.begin());
     };
-    std::array<std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>,2> roots;
+    std::array<std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>,2> roots;
     for(int fixture=0;fixture<2;++fixture) {
         const auto& input=fixture?prose:code;
         if(t2) {
             const std::vector<std::int64_t> prefix_tokens(input.begin(),input.begin()+prefix);
-            roots[fixture]=ninfer::exl3::Exl3VeriCacheRequest::initialize(
+            roots[fixture]=voidinfer::exl3::Exl3VeriCacheRequest::initialize(
                 *source,prefix_tokens,1024)->state();
         } else {
             source->reset();source->prefill(std::span<const std::int64_t>(input.data(),16));
@@ -49,7 +49,7 @@ void run_exact_resident_root_qualification(Exl3TextModel& target,
             while(tokens.size()<budget) {
                 std::array<std::int64_t,block> tentative{};
                 std::copy_n(reference.begin()+tokens.size(),block,tentative.begin());
-                const auto verified=ninfer::exl3::verify_exl3_outer_batched_reference(
+                const auto verified=voidinfer::exl3::verify_exl3_outer_batched_reference(
                     context,*current,tentative,false,{},nullptr,reuse);
                 restores+=verified.root_restores;
                 tokens.insert(tokens.end(),verified.committed_tokens.begin(),verified.committed_tokens.end());
@@ -78,7 +78,7 @@ void run_exact_resident_root_qualification(Exl3TextModel& target,
     const auto token=greedy(*resident);resident->decode(token);
     require(!resident->exact_host_state_resident(*roots[0]),"resident-root forward invalidation");
     const std::array<std::int64_t,4> prose_tentative={1,2,3,4};
-    const auto switched=ninfer::exl3::verify_exl3_outer_batched_reference(
+    const auto switched=voidinfer::exl3::verify_exl3_outer_batched_reference(
         *resident,*roots[1],prose_tentative,false,{},nullptr,true);
     require(switched.root_restores>=1,"resident-root request switch must restore");
     std::cout << "EXACT_RESIDENT_ROOT PASS fixtures=2 prefix=" << prefix

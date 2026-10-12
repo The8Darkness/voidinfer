@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 inline constexpr int kSegmentCopyMax = 8;
 
@@ -54,11 +54,11 @@ inline cudaError_t exl3_launch_segment_copies(const Exl3SegmentCopies& copies, c
 // A copy on the SMs instead of a copy engine (exl3_d2h_async: decode
 // readbacks must not queue behind the asynchronous VeriCache line's
 // host->device history stream). Both ends must be device-accessible (device
-// memory or mapped pinned host memory). NINFER_EXL3_KERNEL_COPIES=0 keeps
+// memory or mapped pinned host memory). VOIDINFER_EXL3_KERNEL_COPIES=0 keeps
 // cudaMemcpyAsync.
 inline bool exl3_kernel_copies_enabled() {
     static const bool value = [] {
-        const char* v = std::getenv("NINFER_EXL3_KERNEL_COPIES");
+        const char* v = std::getenv("VOIDINFER_EXL3_KERNEL_COPIES");
         return !v || std::string_view(v) != "0";
     }();
     return value;
@@ -73,4 +73,4 @@ inline cudaError_t exl3_copy_async(void* to, const void* from, std::size_t bytes
     return cudaGetLastError();
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ArtifactPath = $env:NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS,
+    [string]$ArtifactPath = $env:VOIDINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS,
     [string]$BuildRoot = (Join-Path $PSScriptRoot '..\..\build'),
     [string]$OutputDirectory = '',
     [string]$PythonExe = 'python'
@@ -8,7 +8,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$captureExe = Join-Path $BuildRoot 'tests\ninfer_qwen3_6_27b_oscar_capture_test.exe'
+$captureExe = Join-Path $BuildRoot 'tests\voidinfer_qwen3_6_27b_oscar_capture_test.exe'
 $validator = Join-Path $repoRoot 'tools\oscar\validate_dump.py'
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repoRoot 'results\oscar\captures\phase-b2-qkv-256'
@@ -47,14 +47,14 @@ $sourceIdentity = $sourceIdentityParts -join ';'
 $modelSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $ArtifactPath).Hash.ToLowerInvariant()
 $executableSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $captureExe).Hash.ToLowerInvariant()
 
-$env:NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS = [System.IO.Path]::GetFullPath($ArtifactPath)
-$env:NINFER_OSCAR_QKV_CAPTURE_DIR = $outputRoot
-$env:NINFER_OSCAR_QKV_MODEL_ID = 'qwen3.8-27b'
-$env:NINFER_OSCAR_QKV_WEIGHTS_ID = 'nvfp4-dflash2'
-$env:NINFER_OSCAR_QKV_MODEL_SHA256 = $modelSha256
-$env:NINFER_OSCAR_QKV_EXECUTABLE_SHA256 = $executableSha256
-$env:NINFER_OSCAR_QKV_SOURCE_ID = $sourceIdentity
-$env:NINFER_OSCAR_QKV_EXPECTED_TOKENS = '256'
+$env:VOIDINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS = [System.IO.Path]::GetFullPath($ArtifactPath)
+$env:VOIDINFER_OSCAR_QKV_CAPTURE_DIR = $outputRoot
+$env:VOIDINFER_OSCAR_QKV_MODEL_ID = 'qwen3.8-27b'
+$env:VOIDINFER_OSCAR_QKV_WEIGHTS_ID = 'nvfp4-dflash2'
+$env:VOIDINFER_OSCAR_QKV_MODEL_SHA256 = $modelSha256
+$env:VOIDINFER_OSCAR_QKV_EXECUTABLE_SHA256 = $executableSha256
+$env:VOIDINFER_OSCAR_QKV_SOURCE_ID = $sourceIdentity
+$env:VOIDINFER_OSCAR_QKV_EXPECTED_TOKENS = '256'
 
 Set-Location $repoRoot
 Write-Output "Capture executable: $captureExe"

@@ -13,7 +13,7 @@
 #include <optional>
 #include <atomic>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 static_assert(Exl3PackedCostPolicy::family_count==
     static_cast<unsigned>(Exl3TargetSharedFamily::count),
     "shared projection families require matching cost policy admission");

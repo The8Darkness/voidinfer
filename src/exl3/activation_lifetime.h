@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Embedded in a retained private layer, never allocated per projection. Odd
 // generations identify one immutable normalized activation; even ones are dead.
 // Readers must retain the owning lane before consulting this witness.

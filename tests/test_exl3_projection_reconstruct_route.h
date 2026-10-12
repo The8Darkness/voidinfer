@@ -23,8 +23,8 @@ T69BMetric t69b_float_metric(const std::vector<float>& actual,
 }
 
 T69BMetric t69b_exact_kv_metric(
-    const std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>& actual,
-    const std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>& reference) {
+    const std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>& actual,
+    const std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>& reference) {
     require(actual && reference && actual->position() == reference->position(),
             "T69B KV state extent");
     struct Segment {
@@ -33,9 +33,9 @@ T69BMetric t69b_exact_kv_metric(
     };
     const auto collect = [](const auto& state) {
         std::vector<Segment> result;
-        const std::array<std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>, 1>
+        const std::array<std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>, 1>
             states{state};
-        ninfer::exl3::Exl3ExactHostState::visit_host_allocations(
+        voidinfer::exl3::Exl3ExactHostState::visit_host_allocations(
             states, [&](const void* data, std::size_t bytes) {
                 require(bytes % sizeof(std::uint16_t) == 0,
                         "T69B KV allocation alignment");
@@ -84,7 +84,7 @@ struct T69BObservedEligible {
     std::uint64_t rows = 0;
 
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+        const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
         void* user) {
         auto& self = *static_cast<T69BObservedEligible*>(user);
         if (observation.rows != 1024 || observation.metadata.mcg ||
@@ -113,8 +113,8 @@ struct T69BRun {
     std::vector<float> logits;
     std::array<std::vector<float>, 64> recurrent;
     std::vector<std::int64_t> tokens;
-    std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
-    ninfer::exl3::Exl3ReconstructGemmStats candidate{};
+    std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
+    voidinfer::exl3::Exl3ReconstructGemmStats candidate{};
     T69BObservedEligible observed{};
 };
 
@@ -143,10 +143,10 @@ T69BRun t69b_run(Exl3TextModel& target,
                  std::span<const std::int64_t> prompt,
                  bool candidate, bool preserve_state,
                  bool k7_only = false) {
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC",
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC",
               candidate && !k7_only ? "1" : "0");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC",
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC",
               candidate && k7_only ? "1" : "0");
     const auto construction_start = std::chrono::steady_clock::now();
     auto context = target.create_context(true);
@@ -155,7 +155,7 @@ T69BRun t69b_run(Exl3TextModel& target,
     T69BObservedEligible observed;
     context->set_target_projection_observer_for_test(
         T69BObservedEligible::callback, &observed, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     const auto prompt_start = std::chrono::steady_clock::now();
     t69b_ingest(*context, prompt);
     cuda_check(cudaDeviceSynchronize(), "T69B prompt complete");
@@ -212,7 +212,7 @@ void run_projection_reconstruct_route_t69b(
     const std::vector<std::int64_t>& prose) {
     require(target.max_context() == 4352 && code.size() >= 4096 &&
             prose.size() >= 4096, "T69B fixture/context extent");
-    const std::filesystem::path directory = env("NINFER_T69B_OUT");
+    const std::filesystem::path directory = env("VOIDINFER_T69B_OUT");
     require(!directory.empty() && !std::filesystem::exists(directory),
             "T69B output directory must be new");
     std::filesystem::create_directories(directory);
@@ -307,8 +307,8 @@ void run_projection_reconstruct_route_t69b(
 
     // Cancel a completed partial prompt, explicitly reset the candidate-owned
     // context, and prove that an unrelated noncandidate-width request is clean.
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC", "1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC", "1");
     auto cancelled = target.create_context(true);
     cancelled->prepare_continuation(8);
     const std::string contract = "t69b;target-only;exact-host;wide1024";
@@ -346,7 +346,7 @@ void run_projection_reconstruct_route_t69c(
     const std::vector<std::int64_t>& prose) {
     require(target.max_context() == 4352 && code.size() >= 4096 &&
             prose.size() >= 4096, "T69C fixture/context extent");
-    const std::filesystem::path directory = env("NINFER_T69C_OUT");
+    const std::filesystem::path directory = env("VOIDINFER_T69C_OUT");
     require(!directory.empty() && !std::filesystem::exists(directory),
             "T69C output directory must be new");
     std::filesystem::create_directories(directory);
@@ -446,9 +446,9 @@ void run_projection_reconstruct_route_t69c(
         }
     }
 
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC", "0");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC", "1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC", "0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC", "1");
     auto cancelled = target.create_context(true);
     cancelled->prepare_continuation(8);
     const std::string contract = "t69c;target-only;exact-host;wide1024;k7-only";

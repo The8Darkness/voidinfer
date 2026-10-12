@@ -38,7 +38,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3::l0_kv_pack {
+namespace voidinfer::exl3::l0_kv_pack {
 
 constexpr int kPageRows = 64;
 constexpr int kDim = 256;
@@ -419,7 +419,7 @@ __global__ void gather_kernel(const Job* jobs, int banks, const std::uint16_t* s
 
 inline bool enabled() {
     static const bool value = [] {
-        const char* v = std::getenv("NINFER_EXL3_KV_PACK");
+        const char* v = std::getenv("VOIDINFER_EXL3_KV_PACK");
         return !v || std::strcmp(v, "0") != 0;
     }();
     return value;
@@ -664,4 +664,4 @@ private:
     std::uint64_t packed_bytes_ = 0;
 };
 
-}  // namespace ninfer::exl3::l0_kv_pack
+}  // namespace voidinfer::exl3::l0_kv_pack

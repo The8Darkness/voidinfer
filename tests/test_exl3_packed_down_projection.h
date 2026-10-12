@@ -6,10 +6,10 @@
 // separate from the Engine terminal-root test; neither has been executed.
 struct PackedDownCapture {
     int bits=6,layer=-1;
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     std::shared_ptr<DeviceBuffer> input;
-    static void observe(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void observe(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         auto& self=*static_cast<PackedDownCapture*>(user);
         if(self.input || x.rows!=8 || x.metadata.K!=self.bits ||
            x.metadata.in_features!=17408 || x.metadata.out_features!=5120 ||
@@ -22,7 +22,7 @@ struct PackedDownCapture {
     }
 };
 inline void run_packed_down_projection(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     require(source.size()>=1040,"held down needs two actual requests");
     for(int bits:{6,7}) {
         std::array<PackedDownCapture,2> captures;

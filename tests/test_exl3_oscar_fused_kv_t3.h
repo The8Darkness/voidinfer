@@ -5,12 +5,12 @@ void run_oscar_fused_kv_t3(Exl3TextModel& target,
                             const std::vector<std::int64_t>& prose,
                             const std::vector<std::int64_t>& structured,
                             const std::vector<std::int64_t>& heldout) {
-    require(target.max_context() >= 4224 && env("NINFER_OSCAR_EXL3") == "1" &&
-                env("NINFER_EXL3_PREFILL_BATCH_ROTATIONS") == "1",
+    require(target.max_context() >= 4224 && env("VOIDINFER_OSCAR_EXL3") == "1" &&
+                env("VOIDINFER_EXL3_PREFILL_BATCH_ROTATIONS") == "1",
             "fused KV T3 prerequisites");
     constexpr int prefix = 4096, decode_rows = 128;
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
     const std::array fixtures{
         std::pair{"code", &code}, std::pair{"prose", &prose},
         std::pair{"structured", &structured}, std::pair{"heldout", &heldout}};
@@ -19,13 +19,13 @@ void run_oscar_fused_kv_t3(Exl3TextModel& target,
         std::vector<double> control_prefill, candidate_prefill;
         std::vector<double> control_decode, candidate_decode;
         for (int rep = 0; rep < 3; ++rep) {
-            _putenv_s("NINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "0");
+            _putenv_s("VOIDINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "0");
             auto control = target.create_context(true);
             require(control->try_enable_oscar_from_environment(), "fused KV T3 control OSCAR");
-            _putenv_s("NINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "1");
+            _putenv_s("VOIDINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "1");
             auto candidate = target.create_context(true);
             require(candidate->try_enable_oscar_from_environment(), "fused KV T3 candidate OSCAR");
-            _putenv_s("NINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "0");
+            _putenv_s("VOIDINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "0");
             struct Timing { double prefill_ms = 0.0, decode_ms = 0.0; };
             const auto run = [&](Exl3TextContext& context) {
                 const std::span<const std::int64_t> input(fixture.second->data(), prefix);

@@ -6,7 +6,7 @@
 #include <memory>
 #include <stdexcept>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 namespace {
 void need(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 template<class F> bool refuses(F&& call){try{call();}catch(...){return true;}return false;}
@@ -14,7 +14,7 @@ struct Distributions {std::array<float,6> q{.5F,.3F,.2F,.2F,.3F,.5F},p=q;};
 }
 
 int main() {
-    ninfer::runtime::ResolvedSamplingParameters values;
+    voidinfer::runtime::ResolvedSamplingParameters values;
     auto greedy=Exl3SamplingPolicy::normalize(values,3);
     auto request=Exl3SampledAdmissionRequest{
         greedy,Exl3DraftDistributionAvailability::current_dflash2()};

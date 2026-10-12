@@ -14,12 +14,12 @@
 
 namespace {
 
-using ninfer::exl3::Exl3OscarContext;
-using ninfer::exl3::Exl3OscarCheckpoint;
-using ninfer::exl3::Exl3OscarLayerCache;
-using ninfer::exl3::Exl3OscarRotations;
-using ninfer::exl3::Exl3OscarTelemetry;
-using ninfer::exl3::exl3_oscar_load_rotations;
+using voidinfer::exl3::Exl3OscarContext;
+using voidinfer::exl3::Exl3OscarCheckpoint;
+using voidinfer::exl3::Exl3OscarLayerCache;
+using voidinfer::exl3::Exl3OscarRotations;
+using voidinfer::exl3::Exl3OscarTelemetry;
+using voidinfer::exl3::exl3_oscar_load_rotations;
 
 void require(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error(message);
@@ -183,9 +183,9 @@ std::vector<float> host_prefix_decode(const std::vector<std::uint16_t>& q_f16,
 }
 
 int run() {
-    const std::string asset_dir = env("NINFER_OSCAR_ROTATION_ASSET_DIR");
+    const std::string asset_dir = env("VOIDINFER_OSCAR_ROTATION_ASSET_DIR");
     if (asset_dir.empty()) {
-        std::cout << "E4C1 adapter test skipped: set NINFER_OSCAR_ROTATION_ASSET_DIR\n";
+        std::cout << "E4C1 adapter test skipped: set VOIDINFER_OSCAR_ROTATION_ASSET_DIR\n";
         return 77;
     }
     const Exl3OscarRotations rotations = exl3_oscar_load_rotations(
@@ -472,7 +472,7 @@ int run() {
     // chronological OSCAR cohort. This deliberately stops below model
     // integration: it compares eight true sequential decode operations with
     // one cohort at every state/split boundary that can change addressing.
-    if (env("NINFER_OSCAR_CONTINUATION_COHORT_B8") == "1") {
+    if (env("VOIDINFER_OSCAR_CONTINUATION_COHORT_B8") == "1") {
         constexpr int kCohortRows = 8;
         // The eager route gate also probes the upper adaptive boundary at
         // 8191/8192. Keep the fixture one cohort wider than the selected

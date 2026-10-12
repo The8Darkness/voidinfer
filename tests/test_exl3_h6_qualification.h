@@ -105,7 +105,7 @@ struct H6OracleStats {
 // seven-stage butterfly plus product/normalization operations; gamma(5120)
 // covers the full dot. A separately propagated FP64 evaluation bound is added.
 H6OracleStats h6_check_oracle_groups(
-    const ninfer::exl3::Exl3CudaLinearWeights& weights,
+    const voidinfer::exl3::Exl3CudaLinearWeights& weights,
     const std::vector<std::uint16_t>& input,
     const std::vector<std::uint16_t>& actual_with_guards,
     std::size_t guard,
@@ -288,16 +288,16 @@ void run_h6qualification(Exl3TextModel& target, std::ostream& out) {
     auto* base = static_cast<std::uint16_t*>(output.get());
     auto* dst = base + guard;
     auto* ref_dst = static_cast<std::uint16_t*>(reference.get());
-    ninfer::test::ScopedEnvironmentRestore restore_environment{
-        "NINFER_EXL3_H6_SMALL_M"};
-    _putenv_s("NINFER_EXL3_H6_SMALL_M", "1");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment{
+        "VOIDINFER_EXL3_H6_SMALL_M"};
+    _putenv_s("VOIDINFER_EXL3_H6_SMALL_M", "1");
     Exl3CudaLinearWorkspace ws(kHidden, kVocab, 8);
     require(std::string(ws.dispatch_name(metadata, 1)) == "h6_single_split",
             "H6 candidate changed M1 dispatch");
     for (int m = 2; m <= 8; ++m)
         require(std::string(ws.dispatch_name(metadata, m)) == "h6_small_m_single_split",
                 "H6 candidate did not dispatch M2..8");
-    _putenv_s("NINFER_EXL3_H6_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_H6_SMALL_M", "0");
     Exl3CudaLinearWorkspace generic_ws(kHidden, kVocab, 8);
     for (int m = 2; m <= 8; ++m) {
         require(std::string(generic_ws.dispatch_name(metadata, m)) == "generic_tile",
@@ -305,14 +305,14 @@ void run_h6qualification(Exl3TextModel& target, std::ostream& out) {
         require(std::string(ws.dispatch_name(metadata, m)) == "h6_small_m_single_split",
                 "H6 candidate workspace did not latch construction-time flag");
     }
-    _putenv_s("NINFER_EXL3_H6_SMALL_M", "");
+    _putenv_s("VOIDINFER_EXL3_H6_SMALL_M", "");
     {
         Exl3CudaLinearWorkspace default_ws(kHidden, kVocab, 8);
         for (int m = 2; m <= 8; ++m)
             require(std::string(default_ws.dispatch_name(metadata, m)) == "h6_small_m_single_split",
                     "H6 unset environment did not select default candidate M2..8");
     }
-    _putenv_s("NINFER_EXL3_H6_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_H6_SMALL_M", "1");
     for (int m = 2; m <= 8; ++m)
         require(std::string(generic_ws.dispatch_name(metadata, m)) == "generic_tile",
                 "H6 generic workspace observed a post-construction env flip");
@@ -343,7 +343,7 @@ void run_h6qualification(Exl3TextModel& target, std::ostream& out) {
     auto& tail = add("last_column_impulse");
     for (int r = 0; r < 8; ++r)
         tail[static_cast<std::size_t>(r + 1) * kHidden - 1] = (r & 1) ? 0xd400 : 0x5400;
-    std::stringstream paths(env("NINFER_E5A5H_INPUT_FILES"));
+    std::stringstream paths(env("VOIDINFER_E5A5H_INPUT_FILES"));
     std::string path;
     while (std::getline(paths, path, ';')) {
         require(!path.empty(), "empty H6 capture path");
@@ -470,7 +470,7 @@ void run_h6qualification(Exl3TextModel& target, std::ostream& out) {
     // against the same predeclared packed-code oracle used above, while reporting
     // the complete-vocabulary M1 discrepancy without relaxing either route's gate.
     int generic_real_profiles = 0;
-    _putenv_s("NINFER_EXL3_H6_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_H6_SMALL_M", "0");
     for (const auto& test : cases) {
         const bool prose = test.name.rfind("prose", 0) == 0;
         const bool code = test.name.rfind("code", 0) == 0;
@@ -549,7 +549,7 @@ void run_h6qualification(Exl3TextModel& target, std::ostream& out) {
         require(oracle.within_bound,
                 "H6 explicit env=0 generic M8 exceeded the independent oracle bound");
     }
-    if (!env("NINFER_E5A5H_INPUT_FILES").empty())
+    if (!env("VOIDINFER_E5A5H_INPUT_FILES").empty())
         require(generic_real_profiles == 2,
                 "H6 generic oracle requires unique prose and code real profiles");
 
@@ -559,7 +559,7 @@ void run_h6qualification(Exl3TextModel& target, std::ostream& out) {
     cudaStream_t graph_stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&graph_stream, cudaStreamNonBlocking), "H6 graph stream create");
     std::array<H6Graph, 2> graphs{};
-    _putenv_s("NINFER_EXL3_H6_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_H6_SMALL_M", "1");
     Exl3CudaLinearWorkspace graph_reference_ws(kHidden, kVocab, 8);
     DeviceBuffer graph_reference_output(8u * kVocab * sizeof(std::uint16_t));
     auto* graph_reference_dst =
@@ -581,7 +581,7 @@ void run_h6qualification(Exl3TextModel& target, std::ostream& out) {
                                         graphs[static_cast<std::size_t>(index)].graph,
                                         nullptr, nullptr, 0), "H6 graph instantiate");
     }
-    _putenv_s("NINFER_EXL3_H6_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_H6_SMALL_M", "0");
     for (int index = 0; index < 2; ++index) {
         const int m = 7 + index;
         std::vector<std::uint16_t> changed = cases[1].input;

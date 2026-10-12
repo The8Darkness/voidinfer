@@ -1,5 +1,5 @@
 {
-  "schema": "ninfer.exl3.gdn-recurrent-oracle.v1",
+  "schema": "voidinfer.exl3.gdn-recurrent-oracle.v1",
   "status": "future_external_artifact_required_not_generated",
   "case": "basis2",
   "rows": 2,

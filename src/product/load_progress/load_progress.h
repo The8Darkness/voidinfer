@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 
 #include <chrono>
 #include <cstddef>
@@ -10,7 +10,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::product {
+namespace voidinfer::product {
 
 enum class LoadProgressOutputMode : std::uint8_t {
     Interactive,
@@ -61,4 +61,4 @@ private:
     Clock::time_point last_rendered_;
 };
 
-} // namespace ninfer::product
+} // namespace voidinfer::product

@@ -12,7 +12,7 @@
 #include <string_view>
 #include <tuple>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace voidinfer::targets::qwen3_6::frontend_internal {
 namespace {
 
 using OrderedJson = nlohmann::ordered_json;
@@ -546,4 +546,4 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                         .cache_boundaries             = std::move(cache_boundaries)};
 }
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace voidinfer::targets::qwen3_6::frontend_internal

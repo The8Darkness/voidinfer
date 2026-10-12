@@ -1,17 +1,17 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 
 #include <cstdint>
 
-namespace ninfer::runtime {
+namespace voidinfer::runtime {
 
-using ::ninfer::FinishReason;
-using ::ninfer::OutputChannel;
-using ::ninfer::ResolvedSamplingParameters;
-using ::ninfer::StopPolicy;
-using ::ninfer::StopString;
-using ::ninfer::TokenId;
+using ::voidinfer::FinishReason;
+using ::voidinfer::OutputChannel;
+using ::voidinfer::ResolvedSamplingParameters;
+using ::voidinfer::StopPolicy;
+using ::voidinfer::StopString;
+using ::voidinfer::TokenId;
 
 // Engine has already selected the model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
@@ -49,4 +49,4 @@ enum class RetentionClass : std::uint8_t {
     Disposable,
 };
 
-} // namespace ninfer::runtime
+} // namespace voidinfer::runtime

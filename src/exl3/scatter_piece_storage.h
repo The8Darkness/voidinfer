@@ -5,7 +5,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Inline in the credited context owner. Clearing releases retained page owners;
 // merely resetting the logical size would retain pages across slot reuse.
 template<class T,std::size_t Capacity> class Exl3ScatterPieceStorage {

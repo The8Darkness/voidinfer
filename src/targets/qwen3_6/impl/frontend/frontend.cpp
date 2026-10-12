@@ -1,7 +1,7 @@
-#include <ninfer/targets/qwen3_6/frontend.h>
+#include <voidinfer/targets/qwen3_6/frontend.h>
 
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/frontend_resources.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6 {
+namespace voidinfer::targets::qwen3_6 {
 namespace {
 
 using Json   = nlohmann::json;
@@ -380,7 +380,7 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
     result.strings.reserve(caller.strings.size());
     for (const StopString& stop : caller.strings) {
         if (stop.text.empty()) { throw std::invalid_argument("stop string must not be empty"); }
-        (void)ninfer::text::unicode_internal::utf8_codepoints(stop.text, "stop string");
+        (void)voidinfer::text::unicode_internal::utf8_codepoints(stop.text, "stop string");
         const auto duplicate = std::find_if(
             result.strings.begin(), result.strings.end(), [&](const StopString& existing) {
                 return existing.text == stop.text && existing.channel == stop.channel &&
@@ -1042,8 +1042,8 @@ public:
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
-          capture_only(std::getenv("NINFER_OSCAR_QKV_CAPTURE_ONLY") != nullptr &&
-                       std::string_view(std::getenv("NINFER_OSCAR_QKV_CAPTURE_ONLY")) == "1") {
+          capture_only(std::getenv("VOIDINFER_OSCAR_QKV_CAPTURE_ONLY") != nullptr &&
+                       std::string_view(std::getenv("VOIDINFER_OSCAR_QKV_CAPTURE_ONLY")) == "1") {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -1840,4 +1840,4 @@ std::size_t Frontend::output_text_byte_bound(std::uint32_t token_allowance) cons
     return width*token_allowance+repair_bytes;
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace voidinfer::targets::qwen3_6

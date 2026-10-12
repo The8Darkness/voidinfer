@@ -2,11 +2,11 @@
 
 void run_hierarchical_async_qualification(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using ninfer::exl3::Exl3HierarchyFrontiers;
-    using ninfer::exl3::Exl3HierarchyRunAhead;
-    using ninfer::exl3::Exl3OuterReferenceResult;
-    using ninfer::exl3::Exl3TextContext;
-    using ninfer::exl3::Exl3TurboAngleL1Context;
+    using voidinfer::exl3::Exl3HierarchyFrontiers;
+    using voidinfer::exl3::Exl3HierarchyRunAhead;
+    using voidinfer::exl3::Exl3OuterReferenceResult;
+    using voidinfer::exl3::Exl3TextContext;
+    using voidinfer::exl3::Exl3TurboAngleL1Context;
     constexpr int block=4;
     const bool t2=target.max_context()==4352;
     const int prefix=t2?4096:96,budget=t2?32:16;
@@ -16,25 +16,25 @@ void run_hierarchical_async_qualification(Exl3TextModel& target,
         "hierarchical async fixture/context extent");
     run_hierarchical_frontier_logic();
     if(!t2) {
-        _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
-        _putenv_s("NINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
-        _putenv_s("NINFER_EXL3_SHARED_ACCUM","0");
-        _putenv_s("NINFER_EXL3_SHARED_TRANSFORM","0");
-        _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH","0");
-        _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB","0");
+        _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
+        _putenv_s("VOIDINFER_EXL3_SHARED_ACCUM","0");
+        _putenv_s("VOIDINFER_EXL3_SHARED_TRANSFORM","0");
+        _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","0");
+        _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB","0");
     }
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
-    _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
-    _putenv_s("NINFER_EXL3_SHARED_ACCUM","0");
-    _putenv_s("NINFER_EXL3_SHARED_TRANSFORM","0");
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH","0");
-    _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_ACCUM","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_TRANSFORM","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","0");
+    _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB","0");
     auto l0=target.create_context(true),l1_native=target.create_context(true);
     require(l0->try_enable_oscar_from_environment() && l1_native->try_enable_oscar_from_environment(),
         "hierarchical async OSCAR contexts");
@@ -57,7 +57,7 @@ void run_hierarchical_async_qualification(Exl3TextModel& target,
     };
     struct Metrics {
         std::vector<std::int64_t> tokens;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
         std::size_t l0_rows=0,l1_rows=0,l2_rows=0,l2_replay=0,l2_rejections=0,events=0;
         std::size_t submissions=0,adopted=0,discarded=0,max_in_flight=0;
         double wall_ms=0,setup_construct_ms=0,setup_restore_ms=0,l2_ms=0;
@@ -77,17 +77,17 @@ void run_hierarchical_async_qualification(Exl3TextModel& target,
     for(const auto& fixture:std::array<std::pair<const char*,const std::vector<std::int64_t>*>,2>{
             std::pair{"code",&code},std::pair{"prose",&prose}}) {
         const auto& source=*fixture.second;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> root;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> root;
         if(t2) {
             const std::vector<std::int64_t> input(source.begin(),source.begin()+prefix);
-            root=ninfer::exl3::Exl3VeriCacheRequest::initialize(*exact,input,1024)->state();
+            root=voidinfer::exl3::Exl3VeriCacheRequest::initialize(*exact,input,1024)->state();
         } else {
             exact->reset();exact->prefill(std::span<const std::int64_t>(source.data(),16));
             for(int row=16;row<prefix;++row) exact->decode(source[row]);
             root=exact->export_exact_host_state();
         }
         std::vector<std::int64_t> reference;reference.reserve(budget);
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> reference8,reference_final;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> reference8,reference_final;
         exact->restore_exact_host_state(*root);
         for(int row=0;row<budget;++row) {
             const auto token=greedy(*exact);exact->decode(token);reference.push_back(token);
@@ -113,7 +113,7 @@ void run_hierarchical_async_qualification(Exl3TextModel& target,
             while(metrics.tokens.size()<static_cast<std::size_t>(output_budget)) {
                 const int rows=std::min<int>(block,output_budget-static_cast<int>(metrics.tokens.size()));
                 std::vector<std::int64_t> candidates;
-                ninfer::exl3::Exl3HierarchyCompletion l0_completion;
+                voidinfer::exl3::Exl3HierarchyCompletion l0_completion;
                 if(buffered.valid) {
                     require(static_cast<int>(buffered.tokens.size())==rows &&
                         buffered.identity.first==prefix+static_cast<int>(metrics.tokens.size()),
@@ -170,9 +170,9 @@ void run_hierarchical_async_qualification(Exl3TextModel& target,
                             const auto begin=std::chrono::steady_clock::now();
                             TimedL2 timed;
                             timed.result=owned_candidates.size()==1
-                                ? ninfer::exl3::verify_exl3_outer_reference(
+                                ? voidinfer::exl3::verify_exl3_outer_reference(
                                     *exact,*root_owner,owned_candidates,false,{},exact_stream.value,true)
-                                : ninfer::exl3::verify_exl3_outer_batched_reference(
+                                : voidinfer::exl3::verify_exl3_outer_batched_reference(
                                     *exact,*root_owner,owned_candidates,false,{},exact_stream.value,true);
                             timed.wall_ms=std::chrono::duration<double,std::milli>(
                                 std::chrono::steady_clock::now()-begin).count();
@@ -198,8 +198,8 @@ void run_hierarchical_async_qualification(Exl3TextModel& target,
                 } else {
                     const auto begin=std::chrono::steady_clock::now();
                     verified.result=screened.size()==1
-                        ? ninfer::exl3::verify_exl3_outer_reference(*exact,*current,screened,false,{},nullptr,true)
-                        : ninfer::exl3::verify_exl3_outer_batched_reference(*exact,*current,screened,false,{},nullptr,true);
+                        ? voidinfer::exl3::verify_exl3_outer_reference(*exact,*current,screened,false,{},nullptr,true)
+                        : voidinfer::exl3::verify_exl3_outer_batched_reference(*exact,*current,screened,false,{},nullptr,true);
                     verified.wall_ms=std::chrono::duration<double,std::milli>(
                         std::chrono::steady_clock::now()-begin).count();
                     metrics.l2_ms+=verified.wall_ms;
@@ -258,8 +258,8 @@ void run_hierarchical_async_qualification(Exl3TextModel& target,
                 const auto l2_completion=frontiers.begin_l2();
                 const auto begin=std::chrono::steady_clock::now();
                 auto result=rows==1
-                    ? ninfer::exl3::verify_exl3_outer_reference(*exact,*current,candidates,false,{},nullptr,true)
-                    : ninfer::exl3::verify_exl3_outer_batched_reference(*exact,*current,candidates,false,{},nullptr,true);
+                    ? voidinfer::exl3::verify_exl3_outer_reference(*exact,*current,candidates,false,{},nullptr,true)
+                    : voidinfer::exl3::verify_exl3_outer_batched_reference(*exact,*current,candidates,false,{},nullptr,true);
                 metrics.l2_ms+=std::chrono::duration<double,std::milli>(
                     std::chrono::steady_clock::now()-begin).count();
                 metrics.l2_rows+=result.verification_rows;metrics.l2_replay+=result.replay_rows;

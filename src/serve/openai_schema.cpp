@@ -9,7 +9,7 @@
 #include <random>
 #include <string>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -109,7 +109,7 @@ bool has_tool_named(const GenerationRequest& req, const std::string& name) {
     return false;
 }
 
-ninfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field) {
+voidinfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
     }
@@ -124,12 +124,12 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
                     "messages");
     }
     if (url.empty()) { bad_request(std::string(field) + " URL must not be empty", "messages"); }
-    ninfer::product::media_acquire::Source source;
+    voidinfer::product::media_acquire::Source source;
     source.value = std::move(url);
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind = voidinfer::product::media_acquire::SourceKind::Data;
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
+        source.kind = voidinfer::product::media_acquire::SourceKind::Url;
     } else {
         bad_request(std::string(field) + " must use HTTP(S) or a data URI", "messages");
     }
@@ -748,7 +748,7 @@ std::string make_models_list(const std::string& model_id, std::uint32_t max_cont
                            Json::array({Json{{"id", model_id},
                                              {"object", "model"},
                                              {"created", created},
-                                             {"owned_by", "ninfer"},
+                                             {"owned_by", "voidinfer"},
                                              {"status", Json{{"value", "loaded"}}},
                                              {"meta", Json{{"n_ctx", max_context}}}}})}};
     return payload.dump();
@@ -759,7 +759,7 @@ std::string make_model_object(const std::string& model_id, std::uint32_t max_con
     const Json payload = {{"id", model_id},
                           {"object", "model"},
                           {"created", created},
-                          {"owned_by", "ninfer"},
+                          {"owned_by", "voidinfer"},
                           {"status", Json{{"value", "loaded"}}},
                           {"meta", Json{{"n_ctx", max_context}}}};
     return payload.dump();
@@ -786,4 +786,4 @@ std::int64_t unix_time_now() {
         .count();
 }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

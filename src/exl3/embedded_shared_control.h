@@ -4,7 +4,7 @@
 #include <new>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct EmbeddedSharedControl {
     static constexpr std::size_t bytes=256;
     alignas(std::max_align_t) std::byte storage[bytes];

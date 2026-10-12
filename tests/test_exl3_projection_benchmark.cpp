@@ -15,7 +15,7 @@
 #include <vector>
 
 namespace {
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 
 void check(cudaError_t e, const char* op) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(op) + ": " + cudaGetErrorString(e));
@@ -64,8 +64,8 @@ Linear make_linear(const IndexedSafetensors& c, const std::string& prefix) {
 
 double benchmark(Exl3CudaLinearWorkspace& workspace, const Linear& linear,
                  const std::uint16_t* input, std::uint16_t* output) {
-    const int warmup = env("NINFER_EXL3_WARMUP")[0] ? std::stoi(env("NINFER_EXL3_WARMUP")) : 15;
-    const int iterations = env("NINFER_EXL3_ITERATIONS")[0] ? std::stoi(env("NINFER_EXL3_ITERATIONS")) : 60;
+    const int warmup = env("VOIDINFER_EXL3_WARMUP")[0] ? std::stoi(env("VOIDINFER_EXL3_WARMUP")) : 15;
+    const int iterations = env("VOIDINFER_EXL3_ITERATIONS")[0] ? std::stoi(env("VOIDINFER_EXL3_ITERATIONS")) : 60;
     for (int i = 0; i < warmup; ++i) workspace.forward(linear.view, linear.metadata, input, output, 1);
     check(cudaDeviceSynchronize(), "benchmark warmup synchronize");
     cudaEvent_t start{}, stop{}; check(cudaEventCreate(&start), "create start event"); check(cudaEventCreate(&stop), "create stop event");
@@ -79,8 +79,8 @@ double benchmark(Exl3CudaLinearWorkspace& workspace, const Linear& linear,
 
 int main() {
     try {
-        const std::string target = env("NINFER_EXL3_TARGET_PATH");
-        if (target.empty()) { std::cerr << "SKIP: set NINFER_EXL3_TARGET_PATH\n"; return 77; }
+        const std::string target = env("VOIDINFER_EXL3_TARGET_PATH");
+        if (target.empty()) { std::cerr << "SKIP: set VOIDINFER_EXL3_TARGET_PATH\n"; return 77; }
         const auto collection = inspect_indexed_directory(std::filesystem::path(target));
         const std::vector<std::pair<std::string, std::string>> modules = {
             {"h6_lm_head", "lm_head"},
@@ -107,7 +107,7 @@ int main() {
             {"gdn_down_k7", "model.language_model.layers.23.mlp.down_proj"},
             {"gdn_down", "model.language_model.layers.5.mlp.down_proj"}};
         for (const auto& [label, prefix] : modules) {
-            const std::string only = env("NINFER_EXL3_BENCH_ONLY");
+            const std::string only = env("VOIDINFER_EXL3_BENCH_ONLY");
             if (!only.empty() && only != label) continue;
             auto linear = make_linear(collection, prefix);
             Buffer input, output;

@@ -4,6 +4,7 @@
 // OVL_ROWS rows (+ row scores) from a saved root on a low-priority stream.
 // OVL_MODE 0 = D alone, 1 = V alone, 2 = both concurrently (V loops until D
 // finishes). Prints D ms/token and V ms/pass. Not a test.
+#include "exl3/engine_profile.h"
 #include "exl3/text_model.h"
 
 #include <cuda.h>
@@ -37,10 +38,11 @@ void check(cudaError_t e, const char* what) {
 
 int main() {
     try {
-        using namespace ninfer::exl3;
-        const char* target = std::getenv("NINFER_EXL3_TARGET_PATH");
+        voidinfer::exl3::apply_engine_profile();
+        using namespace voidinfer::exl3;
+        const char* target = std::getenv("VOIDINFER_EXL3_TARGET_PATH");
         const char* ids_path = std::getenv("VERI_IDS");
-        if (!target || !ids_path) { std::cerr << "set NINFER_EXL3_TARGET_PATH, VERI_IDS\n"; return 77; }
+        if (!target || !ids_path) { std::cerr << "set VOIDINFER_EXL3_TARGET_PATH, VERI_IDS\n"; return 77; }
         const int context = env_int("OVL_CONTEXT", 16000);
         const int tokens = env_int("OVL_TOKENS", 256);
         const int rows = env_int("OVL_ROWS", 1024);

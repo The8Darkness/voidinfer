@@ -14,7 +14,7 @@
 namespace {
 
 constexpr std::size_t kRowValues =
-    static_cast<std::size_t>(ninfer::kOscarMixedKVHeads) * ninfer::kOscarMixedHeadDim;
+    static_cast<std::size_t>(voidinfer::kOscarMixedKVHeads) * voidinfer::kOscarMixedHeadDim;
 constexpr std::size_t kLayerValues = kRowValues;
 
 void require(bool condition, const char* message) {
@@ -63,9 +63,9 @@ void make_rows(std::size_t layer_index, std::uint32_t logical_token,
                std::vector<std::uint16_t>& k_rows, std::vector<std::uint16_t>& v_rows) {
     k_rows.resize(kLayerValues);
     v_rows.resize(kLayerValues);
-    for (std::uint32_t head = 0; head < ninfer::kOscarMixedKVHeads; ++head) {
-        for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim; ++dimension) {
-            const std::size_t offset = static_cast<std::size_t>(head) * ninfer::kOscarMixedHeadDim +
+    for (std::uint32_t head = 0; head < voidinfer::kOscarMixedKVHeads; ++head) {
+        for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim; ++dimension) {
+            const std::size_t offset = static_cast<std::size_t>(head) * voidinfer::kOscarMixedHeadDim +
                                         dimension;
             k_rows[offset] = float_to_bf16(
                 deterministic_value(layer_index, logical_token, head, dimension, false));
@@ -76,28 +76,28 @@ void make_rows(std::size_t layer_index, std::uint32_t logical_token,
 }
 
 std::uint32_t recent_begin(std::uint32_t context_tokens) noexcept {
-    if (context_tokens <= ninfer::kOscarMixedPrefixTokens) { return context_tokens; }
-    return std::max(ninfer::kOscarMixedPrefixTokens,
-                    context_tokens > ninfer::kOscarMixedRecentTokens
-                        ? context_tokens - ninfer::kOscarMixedRecentTokens
+    if (context_tokens <= voidinfer::kOscarMixedPrefixTokens) { return context_tokens; }
+    return std::max(voidinfer::kOscarMixedPrefixTokens,
+                    context_tokens > voidinfer::kOscarMixedRecentTokens
+                        ? context_tokens - voidinfer::kOscarMixedRecentTokens
                         : 0U);
 }
 
-void check_roles(const ninfer::OscarMixedAgingCacheBundle& bundle,
+void check_roles(const voidinfer::OscarMixedAgingCacheBundle& bundle,
                  std::uint32_t expected_context) {
     require(bundle.context_tokens() == expected_context, "bundle context length mismatch");
     const std::uint32_t oldest_recent = recent_begin(expected_context);
     const std::uint32_t expected_aged =
-        expected_context > ninfer::kOscarMixedPrefixTokens + ninfer::kOscarMixedRecentTokens
+        expected_context > voidinfer::kOscarMixedPrefixTokens + voidinfer::kOscarMixedRecentTokens
             ? expected_context -
-                  (ninfer::kOscarMixedPrefixTokens + ninfer::kOscarMixedRecentTokens)
+                  (voidinfer::kOscarMixedPrefixTokens + voidinfer::kOscarMixedRecentTokens)
             : 0U;
     for (const auto& layer : bundle.layers()) {
         require(layer.context_tokens() == expected_context, "layer context length mismatch");
         require(layer.aging_conversion_count() == expected_aged,
                 "aging conversion count is not the policy count");
         for (std::uint32_t token = 0; token < expected_context; ++token) {
-            const bool historical = token >= ninfer::kOscarMixedPrefixTokens &&
+            const bool historical = token >= voidinfer::kOscarMixedPrefixTokens &&
                                     token < oldest_recent;
             const auto resolved = layer.resolve(token);
             const auto& metadata = resolved.metadata;
@@ -107,42 +107,42 @@ void check_roles(const ninfer::OscarMixedAgingCacheBundle& bundle,
                     "logical token is present in the wrong tier");
             require(layer.was_aged_once(token) == historical,
                     "aging marker disagrees with the logical tier");
-            if (token < ninfer::kOscarMixedPrefixTokens) {
-                require(metadata.role == ninfer::OscarMixedRegionRole::ProtectedPrefix,
+            if (token < voidinfer::kOscarMixedPrefixTokens) {
+                require(metadata.role == voidinfer::OscarMixedRegionRole::ProtectedPrefix,
                         "protected prefix changed role");
                 require(!layer.was_aged_once(token), "protected prefix was aged");
             } else if (historical) {
-                require(metadata.role == ninfer::OscarMixedRegionRole::HistoricalBulk &&
-                            metadata.k_storage == ninfer::OscarMixedStorageType::OscarInt2G128,
+                require(metadata.role == voidinfer::OscarMixedRegionRole::HistoricalBulk &&
+                            metadata.k_storage == voidinfer::OscarMixedStorageType::OscarInt2G128,
                         "historical token is not official OSCAR INT2");
             } else {
-                require(metadata.role == ninfer::OscarMixedRegionRole::RecentWindow &&
-                            metadata.k_storage == ninfer::OscarMixedStorageType::BFloat16,
+                require(metadata.role == voidinfer::OscarMixedRegionRole::RecentWindow &&
+                            metadata.k_storage == voidinfer::OscarMixedStorageType::BFloat16,
                         "recent token is not BF16");
             }
         }
     }
 }
 
-void check_parity(const ninfer::OscarMixedAgingCacheBundle& bundle, std::size_t layer_index,
+void check_parity(const voidinfer::OscarMixedAgingCacheBundle& bundle, std::size_t layer_index,
                   std::uint32_t logical_token) {
-    const std::uint32_t layer_number = ninfer::kOscarMixedFullAttentionLayers[layer_index];
+    const std::uint32_t layer_number = voidinfer::kOscarMixedFullAttentionLayers[layer_index];
     const auto& layer = bundle.layer(layer_number);
     std::vector<std::uint16_t> k_row;
     std::vector<std::uint16_t> v_row;
     make_rows(layer_index, logical_token, k_row, v_row);
-    for (std::uint32_t head = 0; head < ninfer::kOscarMixedKVHeads; ++head) {
-        std::array<float, ninfer::kOscarMixedHeadDim> k_values{};
-        std::array<float, ninfer::kOscarMixedHeadDim> v_values{};
-        const std::size_t begin = static_cast<std::size_t>(head) * ninfer::kOscarMixedHeadDim;
-        for (std::uint32_t dimension = 0; dimension < ninfer::kOscarMixedHeadDim; ++dimension) {
+    for (std::uint32_t head = 0; head < voidinfer::kOscarMixedKVHeads; ++head) {
+        std::array<float, voidinfer::kOscarMixedHeadDim> k_values{};
+        std::array<float, voidinfer::kOscarMixedHeadDim> v_values{};
+        const std::size_t begin = static_cast<std::size_t>(head) * voidinfer::kOscarMixedHeadDim;
+        for (std::uint32_t dimension = 0; dimension < voidinfer::kOscarMixedHeadDim; ++dimension) {
             k_values[dimension] = bf16_to_float(k_row[begin + dimension]);
             v_values[dimension] = bf16_to_float(v_row[begin + dimension]);
         }
-        const auto expected_k = ninfer::ops::oscar_int2_g128_encode(
-            k_values.data(), static_cast<int>(ninfer::kOscarMixedHeadDim), 0.96F);
-        const auto expected_v = ninfer::ops::oscar_int2_g128_encode(
-            v_values.data(), static_cast<int>(ninfer::kOscarMixedHeadDim), 0.92F);
+        const auto expected_k = voidinfer::ops::oscar_int2_g128_encode(
+            k_values.data(), static_cast<int>(voidinfer::kOscarMixedHeadDim), 0.96F);
+        const auto expected_v = voidinfer::ops::oscar_int2_g128_encode(
+            v_values.data(), static_cast<int>(voidinfer::kOscarMixedHeadDim), 0.92F);
         const auto& actual_k = layer.historical_k(logical_token, head);
         const auto& actual_v = layer.historical_v(logical_token, head);
         require(actual_k.clipped == expected_k.clipped, "K clipped values differ from reference");
@@ -158,8 +158,8 @@ void check_parity(const ninfer::OscarMixedAgingCacheBundle& bundle, std::size_t 
     }
 }
 
-std::uint64_t region_storage_bytes(const ninfer::OscarMixedAgingCacheBundle& bundle,
-                                   ninfer::OscarMixedRegionRole role) {
+std::uint64_t region_storage_bytes(const voidinfer::OscarMixedAgingCacheBundle& bundle,
+                                   voidinfer::OscarMixedRegionRole role) {
     std::uint64_t total = 0;
     for (const auto& layer : bundle.layers()) {
         for (const auto& page : layer.pages()) {
@@ -172,12 +172,12 @@ std::uint64_t region_storage_bytes(const ninfer::OscarMixedAgingCacheBundle& bun
 struct AgingTransition {
     std::uint32_t append_token = 0;
     std::uint32_t aged_token = 0;
-    ninfer::OscarMixedCacheAccounting accounting;
+    voidinfer::OscarMixedCacheAccounting accounting;
     std::uint64_t bf16_prefix_bytes = 0;
     std::uint64_t bf16_recent_bytes = 0;
 };
 
-void write_accounting(std::ofstream& report, const ninfer::OscarMixedCacheAccounting& accounting,
+void write_accounting(std::ofstream& report, const voidinfer::OscarMixedCacheAccounting& accounting,
                       std::uint32_t conversion_count, std::uint64_t bf16_prefix_bytes,
                       std::uint64_t bf16_recent_bytes) {
     report << "{\"context_tokens\":" << accounting.context_tokens
@@ -202,18 +202,18 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::string(argv[1]) == "--report") {
             report_path = argv[2];
         } else if (argc != 1) {
-            std::cerr << "usage: ninfer_oscar_mixed_cache_aging_test [--report <path>]\n";
+            std::cerr << "usage: voidinfer_oscar_mixed_cache_aging_test [--report <path>]\n";
             return 2;
         }
 
-        const auto asset = ninfer::OscarMixedAgingAssetContract::c4_cal30k();
+        const auto asset = voidinfer::OscarMixedAgingAssetContract::c4_cal30k();
         asset.validate();
         auto bad_asset = asset;
         bad_asset.asset_identity = "legacy-fixed-hadamard-q2";
         bool rejected_bad_asset = false;
         try {
-            ninfer::OscarMixedAgingCacheBundle rejected(42, bad_asset,
-                                                        ninfer::kOscarMixedFullAttentionLayers);
+            voidinfer::OscarMixedAgingCacheBundle rejected(42, bad_asset,
+                                                        voidinfer::kOscarMixedFullAttentionLayers);
         } catch (const std::invalid_argument&) {
             rejected_bad_asset = true;
         }
@@ -222,23 +222,23 @@ int main(int argc, char** argv) {
         std::array<std::uint32_t, 1> gdn_layer = {0};
         bool rejected_gdn = false;
         try {
-            ninfer::OscarMixedAgingCacheBundle rejected(42, asset, gdn_layer);
+            voidinfer::OscarMixedAgingCacheBundle rejected(42, asset, gdn_layer);
         } catch (const std::invalid_argument&) {
             rejected_gdn = true;
         }
         require(rejected_gdn, "GDN layer was accepted into aging bundle");
 
-        ninfer::OscarMixedAgingCacheBundle bundle(
-            42, asset, ninfer::kOscarMixedFullAttentionLayers);
+        voidinfer::OscarMixedAgingCacheBundle bundle(
+            42, asset, voidinfer::kOscarMixedFullAttentionLayers);
         std::vector<std::uint16_t> k_rows;
         std::vector<std::uint16_t> v_rows;
         std::vector<AgingTransition> transitions;
 
         for (std::uint32_t token = 0; token < 324; ++token) {
-            k_rows.assign(ninfer::kOscarMixedFullAttentionLayers.size() * kLayerValues, 0);
-            v_rows.assign(ninfer::kOscarMixedFullAttentionLayers.size() * kLayerValues, 0);
+            k_rows.assign(voidinfer::kOscarMixedFullAttentionLayers.size() * kLayerValues, 0);
+            v_rows.assign(voidinfer::kOscarMixedFullAttentionLayers.size() * kLayerValues, 0);
             for (std::size_t layer_index = 0;
-                 layer_index < ninfer::kOscarMixedFullAttentionLayers.size(); ++layer_index) {
+                 layer_index < voidinfer::kOscarMixedFullAttentionLayers.size(); ++layer_index) {
                 std::vector<std::uint16_t> k_row;
                 std::vector<std::uint16_t> v_row;
                 make_rows(layer_index, token, k_row, v_row);
@@ -257,9 +257,9 @@ int main(int argc, char** argv) {
                 if (aged_token <= 67U) {
                     transitions.push_back({token, aged_token, bundle.accounting(),
                                            region_storage_bytes(
-                                               bundle, ninfer::OscarMixedRegionRole::ProtectedPrefix),
+                                               bundle, voidinfer::OscarMixedRegionRole::ProtectedPrefix),
                                            region_storage_bytes(
-                                               bundle, ninfer::OscarMixedRegionRole::RecentWindow)});
+                                               bundle, voidinfer::OscarMixedRegionRole::RecentWindow)});
                     for (const std::size_t layer_index : {std::size_t{0}, std::size_t{8},
                                                            std::size_t{15}}) {
                         check_parity(bundle, layer_index, aged_token);
@@ -269,13 +269,13 @@ int main(int argc, char** argv) {
         }
 
         require(bundle.layer(3).resolve(63).metadata.role ==
-                    ninfer::OscarMixedRegionRole::ProtectedPrefix,
+                    voidinfer::OscarMixedRegionRole::ProtectedPrefix,
                 "token 63 is not protected after aging");
         require(bundle.layer(3).has_bf16_payload(63), "protected prefix lost BF16 payload");
         require(!bundle.layer(3).has_bf16_payload(64),
                 "historical token 64 still has BF16 payload");
         require(bundle.layer(3).resolve(64).metadata.k_storage ==
-                    ninfer::OscarMixedStorageType::OscarInt2G128,
+                    voidinfer::OscarMixedStorageType::OscarInt2G128,
                 "historical token 64 is not INT2");
         bool rejected_double_conversion = false;
         try {
@@ -316,9 +316,9 @@ int main(int argc, char** argv) {
                   << " historical=" << final_accounting.historical_tokens
                   << " recent=" << final_accounting.recent_tokens << "\n"
                   << "  final bytes: bf16_prefix="
-                  << region_storage_bytes(bundle, ninfer::OscarMixedRegionRole::ProtectedPrefix)
+                  << region_storage_bytes(bundle, voidinfer::OscarMixedRegionRole::ProtectedPrefix)
                   << " bf16_recent="
-                  << region_storage_bytes(bundle, ninfer::OscarMixedRegionRole::RecentWindow)
+                  << region_storage_bytes(bundle, voidinfer::OscarMixedRegionRole::RecentWindow)
                   << " int2_payload=" << final_accounting.physical_int2_payload_bytes
                   << " int2_metadata=" << final_accounting.physical_int2_metadata_bytes << '\n';
 
@@ -352,8 +352,8 @@ int main(int argc, char** argv) {
             report << "  ],\n  \"final_accounting\":";
             write_accounting(
                 report, final_accounting, 4,
-                region_storage_bytes(bundle, ninfer::OscarMixedRegionRole::ProtectedPrefix),
-                region_storage_bytes(bundle, ninfer::OscarMixedRegionRole::RecentWindow));
+                region_storage_bytes(bundle, voidinfer::OscarMixedRegionRole::ProtectedPrefix),
+                region_storage_bytes(bundle, voidinfer::OscarMixedRegionRole::RecentWindow));
             report << ",\n  \"guards\":{\"bad_asset_rejected\":true,\"gdn_rejected\":true,\n"
                       "    \"double_conversion_rejected\":true,\"prefix_aging_rejected\":true,\n"
                       "    \"no_bf16_historical_overlap\":true,\"no_holes_or_overlap\":true}\n}\n";

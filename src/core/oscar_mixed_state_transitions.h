@@ -8,7 +8,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer {
+namespace voidinfer {
 
 // A page-level identity used by the D2.2c diagnostic. It includes both logical slot identity and
 // content hashes, so a successful comparison cannot hide a page/slot remap behind equal bytes.
@@ -127,4 +127,4 @@ private:
         bool include_sequence_id) const;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

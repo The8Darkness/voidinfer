@@ -66,7 +66,7 @@ void run_exact_attention_gqa_six_score_k_tile64_operator() {
                 "K-tile64 score canary");
         const auto run=[&](DeviceBuffer& output,DeviceBuffer& scores,
                            bool candidate) {
-            ninfer::exl3::exl3_exact_attention_for_test(
+            voidinfer::exl3::exl3_exact_attention_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(dk.get()),
                 static_cast<const std::uint16_t*>(dv.get()),
@@ -109,7 +109,7 @@ void run_exact_attention_gqa_six_score_k_tile64_operator() {
                     std::to_string(case_index));
         output_values+=output_elements;score_values+=score_elements;
     }
-    require(ninfer::exl3::Exl3FullAttentionLayer::
+    require(voidinfer::exl3::Exl3FullAttentionLayer::
                 gqa_six_score_k_tile64_shared_bytes()==38912,
             "K-tile64 shared-memory accounting");
     std::cout << "EXACT_ATTENTION_GQA_SIX_SCORE_K_TILE64 PASS cases="

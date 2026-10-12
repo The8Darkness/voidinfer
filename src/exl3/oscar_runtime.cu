@@ -24,7 +24,7 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 void cuda_check(cudaError_t error, const char* operation) {
@@ -413,7 +413,7 @@ Exl3OscarLayerCache::Exl3OscarLayerCache(int model_layer, int bank_index, int ma
     recent_k_ = device_alloc(256ULL * 4 * 256 * 2, "E4C1 OSCAR recent K");
     recent_v_ = device_alloc(256ULL * 4 * 256 * 2, "E4C1 OSCAR recent V");
     workspace_ = device_alloc(
-        ninfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes, "E4C1 OSCAR workspace");
+        voidinfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes, "E4C1 OSCAR workspace");
 }
 
 Exl3OscarLayerCache::~Exl3OscarLayerCache() {
@@ -466,7 +466,7 @@ std::uint32_t Exl3OscarLayerCache::append(const float* rotated_k, const float* r
     const std::uint32_t new_hist_begin = std::max(logical_start, 64U);
     const std::uint32_t new_hist_end = std::min(append_end, final_begin);
     const std::uint32_t new_hist = new_hist_end > new_hist_begin ? new_hist_end - new_hist_begin : 0U;
-    ninfer::ops::detail::OscarInt2G128ResidentCacheView view{};
+    voidinfer::ops::detail::OscarInt2G128ResidentCacheView view{};
     view.prefix_k_bf16 = static_cast<std::uint16_t*>(prefix_k_);
     view.prefix_v_bf16 = static_cast<std::uint16_t*>(prefix_v_);
     view.historical_k_packed = static_cast<std::uint8_t*>(hist_k_);
@@ -478,11 +478,11 @@ std::uint32_t Exl3OscarLayerCache::append(const float* rotated_k, const float* r
     view.max_context = static_cast<std::int32_t>(max_context_);
     // Encode aged rows BEFORE publishing new recent rows sharing ring slots.
     if (new_hist != 0 || old_aging != 0) {
-        ninfer::ops::detail::oscar_int2_g128_cache_encode_launch(
+        voidinfer::ops::detail::oscar_int2_g128_cache_encode_launch(
             rotated_k, rotated_v, token_count, logical_start, old_context, old_begin,
             recent_head_, final_begin, new_hist, old_aging, view, stream);
     }
-    ninfer::ops::detail::oscar_int2_g128_cache_write_bf16_launch(
+    voidinfer::ops::detail::oscar_int2_g128_cache_write_bf16_launch(
         rotated_k, rotated_v, token_count, logical_start, final_begin, final_head, view, stream);
     context_ = final_context;
     recent_head_ = final_head;
@@ -518,7 +518,7 @@ std::uint64_t Exl3OscarLayerCache::cache_bytes() const noexcept {
 }
 
 std::uint64_t Exl3OscarLayerCache::workspace_bytes() const noexcept {
-    return ninfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes;
+    return voidinfer::ops::detail::kOscarMixedFusedDecodeWorkspaceBytes;
 }
 
 void Exl3OscarLayerCache::save_checkpoint(void* destination, cudaStream_t stream) const {
@@ -579,35 +579,35 @@ Exl3OscarContext::Exl3OscarContext(const Exl3OscarRotations& rotations, int max_
     : max_context_(max_context), telemetry_(telemetry) {
     if (!telemetry) throw std::invalid_argument("E4C1 OSCAR telemetry is null");
     if (max_context <= 0) throw std::invalid_argument("E4C1 OSCAR bad max_context");
-    const char* parallel_scores=std::getenv("NINFER_OSCAR_PREFILL_PARALLEL_SCORES");
+    const char* parallel_scores=std::getenv("VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES");
     prefill_parallel_scores_=parallel_scores == nullptr || std::strcmp(parallel_scores,"1")==0;
-    const char* parallel_merge=std::getenv("NINFER_OSCAR_PREFILL_PARALLEL_MERGE");
+    const char* parallel_merge=std::getenv("VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE");
     prefill_parallel_merge_=parallel_merge == nullptr || std::strcmp(parallel_merge,"1")==0;
-    const char* batch_rotations = std::getenv("NINFER_EXL3_PREFILL_BATCH_ROTATIONS");
+    const char* batch_rotations = std::getenv("VOIDINFER_EXL3_PREFILL_BATCH_ROTATIONS");
     batch_rotations_ = batch_rotations != nullptr && std::string(batch_rotations) == "1";
-    const char* coalesced=std::getenv("NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS");
+    const char* coalesced=std::getenv("VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS");
     prefill_coalesced_rotations_=batch_rotations_ &&
         (coalesced == nullptr || std::strcmp(coalesced,"1")==0);
-    const char* decode_coalesced = std::getenv("NINFER_OSCAR_DECODE_COALESCED_ROTATIONS");
+    const char* decode_coalesced = std::getenv("VOIDINFER_OSCAR_DECODE_COALESCED_ROTATIONS");
     decode_coalesced_rotations_ = prefill_coalesced_rotations_ &&
         decode_coalesced && std::strcmp(decode_coalesced, "1") == 0;
-    const char* fused_kv=std::getenv("NINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS");
+    const char* fused_kv=std::getenv("VOIDINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS");
     if(fused_kv&&std::strcmp(fused_kv,"0")!=0&&std::strcmp(fused_kv,"1")!=0)
-        throw std::invalid_argument("NINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS must be 0 or 1");
     decode_fused_kv_rotations_=fused_kv&&std::strcmp(fused_kv,"1")==0;
     const char* continuation_cohort =
-        std::getenv("NINFER_OSCAR_CONTINUATION_COHORT_B8");
+        std::getenv("VOIDINFER_OSCAR_CONTINUATION_COHORT_B8");
     if (continuation_cohort && std::strcmp(continuation_cohort,"0") != 0 &&
         std::strcmp(continuation_cohort,"1") != 0)
         throw std::invalid_argument(
-            "NINFER_OSCAR_CONTINUATION_COHORT_B8 must be 0 or 1");
+            "VOIDINFER_OSCAR_CONTINUATION_COHORT_B8 must be 0 or 1");
     continuation_cohort_b8_ = continuation_cohort &&
         std::strcmp(continuation_cohort,"1") == 0;
-    const char* query_parallel = std::getenv("NINFER_OSCAR_PREFILL_QUERY_PARALLEL");
+    const char* query_parallel = std::getenv("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL");
     prefill_query_parallel_ = query_parallel == nullptr
         ? (batch_rotations_ && prefill_parallel_merge_ && prefill_parallel_scores_)
         : std::strcmp(query_parallel,"1") == 0;
-    const char* packed_byte4 = std::getenv("NINFER_OSCAR_PREFILL_PACKED_BYTE4");
+    const char* packed_byte4 = std::getenv("VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4");
     prefill_packed_byte4_ = packed_byte4 == nullptr
         ? prefill_query_parallel_ : std::strcmp(packed_byte4,"1") == 0;
     if (prefill_packed_byte4_ && !prefill_query_parallel_)
@@ -622,17 +622,17 @@ Exl3OscarContext::Exl3OscarContext(const Exl3OscarRotations& rotations, int max_
             device_alloc(snapshot_bytes,"OSCAR prefill old recent snapshot"),
             [](void* p){cudaFree(p);});
         prefill_query_workspace_ = std::shared_ptr<void>(
-            device_alloc(ninfer::ops::detail::kOscarChronologicalWorkspaceBytes,
+            device_alloc(voidinfer::ops::detail::kOscarChronologicalWorkspaceBytes,
                          "OSCAR query cohort partials"), [](void* p){cudaFree(p);});
-        telemetry_->workspace_bytes += snapshot_bytes + ninfer::ops::detail::kOscarChronologicalWorkspaceBytes;
+        telemetry_->workspace_bytes += snapshot_bytes + voidinfer::ops::detail::kOscarChronologicalWorkspaceBytes;
     }
-    const char* wide128 = std::getenv("NINFER_EXL3_PREFILL_WIDE128");
+    const char* wide128 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE128");
     if (batch_rotations_ && wide128 && std::strcmp(wide128, "1") == 0) batch_staging_rows_ = 128;
-    const char* wide256 = std::getenv("NINFER_EXL3_PREFILL_WIDE256");
+    const char* wide256 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE256");
     if (batch_staging_rows_ == 128 && wide256 && std::strcmp(wide256, "1") == 0) batch_staging_rows_ = 256;
-    const char* wide512=std::getenv("NINFER_EXL3_PREFILL_WIDE512");
+    const char* wide512=std::getenv("VOIDINFER_EXL3_PREFILL_WIDE512");
     if(batch_staging_rows_==256 && wide512 && std::strcmp(wide512,"1")==0) batch_staging_rows_=512;
-    const char* wide1024=std::getenv("NINFER_EXL3_PREFILL_WIDE1024");
+    const char* wide1024=std::getenv("VOIDINFER_EXL3_PREFILL_WIDE1024");
     if(batch_staging_rows_==512 && wide1024 && std::strcmp(wide1024,"1")==0) batch_staging_rows_=1024;
     const auto mc = static_cast<std::size_t>(max_context);
     (void)mc;
@@ -779,7 +779,7 @@ void Exl3OscarContext::decode_rotated_layer(int model_layer, const float* rotate
     if (total <= 0 || query_token >= static_cast<std::uint32_t>(total)) {
         throw std::invalid_argument("E4C1 OSCAR decode query outside cache");
     }
-    ninfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
+    voidinfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
     resident.prefix_k_bf16 = view.prefix_k;
     resident.prefix_v_bf16 = view.prefix_v;
     resident.historical_k_packed = view.hist_k;
@@ -792,11 +792,11 @@ void Exl3OscarContext::decode_rotated_layer(int model_layer, const float* rotate
     const int visible = std::min<std::int32_t>(total, static_cast<std::int32_t>(query_token) + 1);
     const int selected = split_count != 0
                              ? split_count
-                             : ninfer::ops::detail::
+                             : voidinfer::ops::detail::
                                    oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                                        visible);
     telemetry_->last_split_class = selected;
-    ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
+    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
         rotated_q, resident.prefix_k_bf16,
         resident.prefix_v_bf16, prefix, resident.historical_k_packed,
         resident.historical_k_metadata, resident.historical_v_packed,
@@ -830,7 +830,7 @@ void Exl3OscarContext::decode_layer(int model_layer, const std::uint16_t* q_row_
                                                      static_cast<float*>(staging_rq_), 24);
     }
     cuda_check(cudaGetLastError(), "E4C1 OSCAR rotate decode Q");
-    ninfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
+    voidinfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
     resident.prefix_k_bf16 = view.prefix_k;
     resident.prefix_v_bf16 = view.prefix_v;
     resident.historical_k_packed = view.hist_k;
@@ -843,11 +843,11 @@ void Exl3OscarContext::decode_layer(int model_layer, const std::uint16_t* q_row_
     const int visible = std::min<std::int32_t>(total, static_cast<std::int32_t>(query_token) + 1);
     const int selected = split_count != 0
                              ? split_count
-                             : ninfer::ops::detail::
+                             : voidinfer::ops::detail::
                                    oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                                        visible);
     telemetry_->last_split_class = selected;
-    ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
+    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_ring(
         static_cast<const float*>(staging_rq_), resident.prefix_k_bf16,
         resident.prefix_v_bf16, prefix, resident.historical_k_packed,
         resident.historical_k_metadata, resident.historical_v_packed,
@@ -904,7 +904,7 @@ void Exl3OscarContext::prefill_chronological_layer(
                                   cudaMemcpyDeviceToDevice, stream), "OSCAR snapshot recent K");
         cuda_check(cudaMemcpyAsync(old_v, view.recent_v, ring_bytes,
                                   cudaMemcpyDeviceToDevice, stream), "OSCAR snapshot recent V");
-        ninfer::ops::detail::OscarChronologicalPrefillView logical{};
+        voidinfer::ops::detail::OscarChronologicalPrefillView logical{};
         logical.cache = {view.prefix_k, view.prefix_v, view.hist_k, view.hist_v,
                          view.hist_k_meta, view.hist_v_meta, view.recent_k, view.recent_v,
                          max_context_};
@@ -927,13 +927,13 @@ void Exl3OscarContext::prefill_chronological_layer(
             telemetry_->aging_events += cache->append(logical.rotated_k + consumed*4*256,
                 logical.rotated_v + consumed*4*256, rows-consumed, logical_start+consumed, stream);
         }
-        ninfer::ops::detail::oscar_chronological_prefill_launch(logical,
+        voidinfer::ops::detail::oscar_chronological_prefill_launch(logical,
             static_cast<const float*>(staging_bq_), static_cast<int>(logical_start), rows,
             static_cast<float*>(prefill_query_workspace_.get()),
             static_cast<float*>(staging_bav_), stream, prefill_packed_byte4_);
         telemetry_->append_calls += rows;
         telemetry_->oscar_dispatches[model_layer] += rows;
-        telemetry_->last_split_class = ninfer::ops::detail::
+        telemetry_->last_split_class = voidinfer::ops::detail::
             oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(logical_start+rows);
     } else {
     for (int row = 0; row < rows; ++row) {
@@ -989,7 +989,7 @@ void Exl3OscarContext::prefill_layer(int model_layer, const std::uint16_t* q_rop
     const auto view = cache->view();
     std::int32_t prefix = 0, historical = 0, recent = 0, ring_head = 0;
     cache->prefix_extent(prefix, historical, recent, ring_head);
-    ninfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
+    voidinfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
     resident.prefix_k_bf16 = view.prefix_k;
     resident.prefix_v_bf16 = view.prefix_v;
     resident.historical_k_packed = view.hist_k;
@@ -1006,7 +1006,7 @@ void Exl3OscarContext::prefill_layer(int model_layer, const std::uint16_t* q_rop
             q_rope_f16 + static_cast<std::size_t>(done) * 24 * 256,
             view.r_k, static_cast<float*>(staging_bq_), block, 24);
         cuda_check(cudaGetLastError(), "E4C1 OSCAR rotate prefill Q");
-        ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_batch_ring(
+        voidinfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_batch_ring(
             static_cast<const float*>(staging_bq_), resident.prefix_k_bf16,
             resident.prefix_v_bf16, prefix, resident.historical_k_packed,
             resident.historical_k_metadata, resident.historical_v_packed,
@@ -1123,7 +1123,7 @@ void Exl3OscarLayerCache::append_device(const float* rotated_k, const float* rot
         throw std::invalid_argument("E4C1 OSCAR device append null");
     }
     ensure_device_state();
-    ninfer::ops::detail::OscarInt2G128ResidentCacheView view{};
+    voidinfer::ops::detail::OscarInt2G128ResidentCacheView view{};
     view.prefix_k_bf16 = static_cast<std::uint16_t*>(prefix_k_);
     view.prefix_v_bf16 = static_cast<std::uint16_t*>(prefix_v_);
     view.historical_k_packed = static_cast<std::uint8_t*>(hist_k_);
@@ -1137,9 +1137,9 @@ void Exl3OscarLayerCache::append_device(const float* rotated_k, const float* rot
                                                static_cast<std::uint32_t*>(dev_plan_),
                                                static_cast<int*>(dev_counts_));
     cuda_check(cudaGetLastError(), "E4C1 OSCAR plan kernel");
-    ninfer::ops::detail::oscar_int2_g128_cache_encode_plan_launch(
+    voidinfer::ops::detail::oscar_int2_g128_cache_encode_plan_launch(
         rotated_k, rotated_v, static_cast<const std::uint32_t*>(dev_plan_), view, stream);
-    ninfer::ops::detail::oscar_int2_g128_cache_write_bf16_plan_launch(
+    voidinfer::ops::detail::oscar_int2_g128_cache_write_bf16_plan_launch(
         rotated_k, rotated_v, static_cast<const std::uint32_t*>(dev_plan_), view, stream);
 }
 
@@ -1208,7 +1208,7 @@ void Exl3OscarContext::forward_decode_device(int model_layer, const std::uint16_
     rotate_q_decode_kernel<<<grid_q, 256, 0, stream>>>(q_row_f16, view.r_k,
                                                      static_cast<float*>(staging_rq_), 24);
     cuda_check(cudaGetLastError(), "E4C1 OSCAR device rotate Q");
-    ninfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
+    voidinfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
     resident.prefix_k_bf16 = view.prefix_k;
     resident.prefix_v_bf16 = view.prefix_v;
     resident.historical_k_packed = view.hist_k;
@@ -1218,7 +1218,7 @@ void Exl3OscarContext::forward_decode_device(int model_layer, const std::uint16_
     resident.recent_k_bf16 = view.recent_k;
     resident.recent_v_bf16 = view.recent_v;
     resident.max_context = max_context_;
-    ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_counts(
+    voidinfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_counts(
         static_cast<const float*>(staging_rq_), resident.prefix_k_bf16,
         resident.prefix_v_bf16, 0, resident.historical_k_packed,
         resident.historical_k_metadata, resident.historical_v_packed,
@@ -1243,7 +1243,7 @@ void Exl3OscarContext::forward_continuation_device(
         throw std::invalid_argument("B8 OSCAR continuation split class");
     auto& cache = layers_[bank_index(model_layer)];
     const auto view = cache->view();
-    ninfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
+    voidinfer::ops::detail::OscarInt2G128ResidentCacheView resident{};
     resident.prefix_k_bf16 = view.prefix_k;
     resident.prefix_v_bf16 = view.prefix_v;
     resident.historical_k_packed = view.hist_k;
@@ -1280,7 +1280,7 @@ void Exl3OscarContext::forward_continuation_device(
                 static_cast<float*>(staging_rq_),24);
         }
         cuda_check(cudaGetLastError(),"B8 OSCAR device rotate Q");
-        ninfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_counts(
+        voidinfer::ops::detail::oscar_int2_g128_mixed_attention_launch_fused_decode_split_counts(
             static_cast<const float*>(staging_rq_),resident.prefix_k_bf16,
             resident.prefix_v_bf16,0,resident.historical_k_packed,
             resident.historical_k_metadata,resident.historical_v_packed,
@@ -1369,7 +1369,7 @@ void Exl3OscarContext::forward_continuation_device_cohort(
             position_device,row,stream);
     }
 
-    ninfer::ops::detail::OscarChronologicalPrefillView chronological{};
+    voidinfer::ops::detail::OscarChronologicalPrefillView chronological{};
     chronological.cache = {
         view.prefix_k,view.prefix_v,view.hist_k,view.hist_v,
         view.hist_k_meta,view.hist_v_meta,view.recent_k,view.recent_v,max_context_};
@@ -1378,7 +1378,7 @@ void Exl3OscarContext::forward_continuation_device_cohort(
     chronological.rotated_k = static_cast<const float*>(staging_rk_);
     chronological.rotated_v = static_cast<const float*>(staging_rv_);
     chronological.position_device = position_device;
-    ninfer::ops::detail::oscar_chronological_device_launch(
+    voidinfer::ops::detail::oscar_chronological_device_launch(
         chronological,static_cast<const float*>(staging_bq_),rows,split_class,
         static_cast<float*>(prefill_query_workspace_.get()),
         static_cast<float*>(staging_bav_),stream);
@@ -1419,10 +1419,10 @@ bool Exl3OscarContext::try_forward_continuation_device_cohort_eager(
     // position word. Keep the eager cohort exact by admitting only cohorts
     // whose first and last visible query use the same adaptive class. A
     // boundary-crossing cohort remains on the existing row-ordered path.
-    const int first_class = ninfer::ops::detail::
+    const int first_class = voidinfer::ops::detail::
         oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
             logical_start + 1);
-    const int last_class = ninfer::ops::detail::
+    const int last_class = voidinfer::ops::detail::
         oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
             logical_start + rows);
     if (first_class != last_class) {
@@ -1489,7 +1489,7 @@ void Exl3OscarContext::note_graph_execution(int rows,int split_class) noexcept {
 }
 
 void Exl3OscarContext::ensure_device_attributes() {
-    ninfer::ops::detail::oscar_int2_g128_ensure_graph_attributes();
+    voidinfer::ops::detail::oscar_int2_g128_ensure_graph_attributes();
     for (auto& layer : layers_) {
         if (layer) layer->ensure_device_state();
     }
@@ -1812,4 +1812,4 @@ Exl3OscarGraphStateObservation Exl3OscarContext::graph_live_state_host_for_test(
     return result;
 }
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

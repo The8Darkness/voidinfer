@@ -13,8 +13,8 @@ budget, and its prepared-prompt token count.
 Run from the repository root because media paths in the JSON files are repository-relative:
 
 ```bash
-CLI=./build/apps/ninfer
-MODEL=models/qwen3_6_27b.ninfer
+CLI=./build/apps/voidinfer
+MODEL=models/qwen3_6_27b.voidinfer
 
 $CLI "$MODEL" \
   --messages examples/cli/messages/text_smoke_zh.json \
@@ -95,7 +95,7 @@ the generated prose is not required to be byte-identical.
 ## Long context
 
 These prompt lengths include the chat template with thinking disabled. The inputs freeze meaningful
-NInfer documentation and source excerpts, with four unique records placed across the packet.
+VoidInfer documentation and source excerpts, with four unique records placed across the packet.
 
 ```bash
 $CLI "$MODEL" --messages examples/cli/messages/long_8k.json \

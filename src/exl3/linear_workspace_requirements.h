@@ -2,7 +2,7 @@
 #include "exl3/resource_inventory.h"
 #include <cstddef>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3LinearWorkspaceRequirements {
     static constexpr unsigned accumulation_splits=5;
     static constexpr std::size_t transformed_alignment=16;

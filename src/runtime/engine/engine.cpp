@@ -1,6 +1,6 @@
 #include <cstdlib>
 #include <string_view>
-#include "ninfer/engine.h"
+#include "voidinfer/engine.h"
 
 #include "core/device.h"
 #include "exl3/exl3_engine_core.h"
@@ -13,7 +13,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 EngineOptions normalize_engine_options(EngineOptions options) {
@@ -23,7 +23,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
     // L0 OSCAR (INT4 history codes on the device, FP16 history in host memory) admits 262144.
-    const char* l0_oscar=std::getenv("NINFER_EXL3_L0_OSCAR");
+    const char* l0_oscar=std::getenv("VOIDINFER_EXL3_L0_OSCAR");
     const std::uint32_t context_limit=!l0_oscar || std::string_view(l0_oscar)!="0"?262144:32768;
     if(options.max_context<2048 || options.max_context>context_limit)
         throw std::invalid_argument("Engine max_context must be in [2048,262144] (32768 without L0 OSCAR)");
@@ -391,4 +391,4 @@ void Engine::reset_memory_peaks() noexcept {
     if (impl_ != nullptr) impl_->core->reset_memory_peaks();
 }
 
-} // namespace ninfer
+} // namespace voidinfer

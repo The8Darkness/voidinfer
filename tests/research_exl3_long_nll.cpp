@@ -6,6 +6,7 @@
 // gives paired long-context quality. LONG_NLL_ROWS=k (2..8) feeds k teacher
 // rows per step through the multi-row verifier route instead and scores the
 // token after each step. Not a test.
+#include "exl3/engine_profile.h"
 #include "exl3/text_model.h"
 
 #include <cuda_runtime.h>
@@ -22,11 +23,12 @@
 
 int main() {
     try {
-        using namespace ninfer::exl3;
-        const char* target = std::getenv("NINFER_EXL3_TARGET_PATH");
+        voidinfer::exl3::apply_engine_profile();
+        using namespace voidinfer::exl3;
+        const char* target = std::getenv("VOIDINFER_EXL3_TARGET_PATH");
         const char* ids_path = std::getenv("LONG_NLL_IDS");
         const char* out_path = std::getenv("LONG_NLL_OUT");
-        if (!target || !ids_path || !out_path) { std::cerr << "set NINFER_EXL3_TARGET_PATH, LONG_NLL_IDS, LONG_NLL_OUT\n"; return 77; }
+        if (!target || !ids_path || !out_path) { std::cerr << "set VOIDINFER_EXL3_TARGET_PATH, LONG_NLL_IDS, LONG_NLL_OUT\n"; return 77; }
         const int context = std::atoi(std::getenv("LONG_NLL_CONTEXT") ? std::getenv("LONG_NLL_CONTEXT") : "32768");
         const int continuation = std::atoi(std::getenv("LONG_NLL_CONTINUATION") ? std::getenv("LONG_NLL_CONTINUATION") : "256");
         std::vector<std::int64_t> ids;
@@ -38,7 +40,7 @@ int main() {
         const std::span<const std::int64_t> all(ids.data(), ids.size());
         // LONG_NLL_LAYER_MAJOR=1 ingests the context like a served fresh prompt
         // (layer-major chunks with the prefill numerical policy, e.g.
-        // NINFER_EXL3_PREFILL_NVFP4); otherwise full-precision wide chunks.
+        // VOIDINFER_EXL3_PREFILL_NVFP4); otherwise full-precision wide chunks.
         const bool layer_major = std::getenv("LONG_NLL_LAYER_MAJOR") != nullptr;
         if (layer_major) {
             const int initial = Exl3TextContext::layer_major_initial_rows();

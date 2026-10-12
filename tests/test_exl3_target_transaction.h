@@ -1,8 +1,8 @@
 #pragma once
 
 void run_target_transaction(Exl3TextModel& target) {
-    const std::string prompt_path = env("NINFER_E5A4_PROMPT_FILE");
-    require(!prompt_path.empty(), "targettxn requires NINFER_E5A4_PROMPT_FILE");
+    const std::string prompt_path = env("VOIDINFER_E5A4_PROMPT_FILE");
+    require(!prompt_path.empty(), "targettxn requires VOIDINFER_E5A4_PROMPT_FILE");
     const auto ids = load_ids(prompt_path);
     constexpr int bounded_prefix_rows = 16;
     constexpr int history_rows = 512;

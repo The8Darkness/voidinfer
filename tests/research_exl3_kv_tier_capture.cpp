@@ -3,10 +3,11 @@
 // (post-RoPE) and V rows for every position plus the query rows and the
 // engine's attention output for the last `queries` positions. Not a test.
 //
-//   NINFER_EXL3_TARGET_PATH   model directory
+//   VOIDINFER_EXL3_TARGET_PATH   model directory
 //   KV_CAPTURE_IDS            whitespace-separated token-id files, concatenated
 //   KV_CAPTURE_QUERIES        number of trailing query rows (default 32)
 //   KV_CAPTURE_OUT            output directory
+#include "exl3/engine_profile.h"
 #include "exl3/text_model.h"
 
 #include <cuda_runtime.h>
@@ -23,7 +24,7 @@
 #include <vector>
 
 namespace {
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 constexpr int kKV = 4 * 256, kQ = 24 * 256;
 
 void require(bool ok, const std::string& message) { if (!ok) throw std::runtime_error(message); }
@@ -77,10 +78,11 @@ void write(const std::filesystem::path& path, const std::vector<std::uint16_t>& 
 
 int main() {
     try {
-        const char* target = std::getenv("NINFER_EXL3_TARGET_PATH");
+        voidinfer::exl3::apply_engine_profile();
+        const char* target = std::getenv("VOIDINFER_EXL3_TARGET_PATH");
         const char* ids = std::getenv("KV_CAPTURE_IDS");
         const char* out = std::getenv("KV_CAPTURE_OUT");
-        if (!target || !ids || !out) { std::cerr << "set NINFER_EXL3_TARGET_PATH, KV_CAPTURE_IDS, KV_CAPTURE_OUT\n"; return 77; }
+        if (!target || !ids || !out) { std::cerr << "set VOIDINFER_EXL3_TARGET_PATH, KV_CAPTURE_IDS, KV_CAPTURE_OUT\n"; return 77; }
         std::vector<std::int64_t> tokens;
         std::stringstream files(ids);
         for (std::string file; std::getline(files, file, ';');) {
@@ -99,7 +101,7 @@ int main() {
         const std::span<const std::int64_t> all(tokens.data(), tokens.size());
         context->prefill(all.first(16));
         // KV_CAPTURE_WIDE=N uses the wide-prefill route (context built with
-        // NINFER_EXL3_WIDE_PREFILL=1 and the width ladder flags) in N-row calls.
+        // VOIDINFER_EXL3_WIDE_PREFILL=1 and the width ladder flags) in N-row calls.
         const std::size_t wide = std::getenv("KV_CAPTURE_WIDE") ? std::atoi(std::getenv("KV_CAPTURE_WIDE")) : 0;
         for (std::size_t at = 16; at < all.size();) {
             const std::size_t rows = std::min<std::size_t>(wide ? wide : 8, all.size() - at);

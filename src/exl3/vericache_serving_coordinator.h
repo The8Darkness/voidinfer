@@ -18,7 +18,7 @@
 #include <vector>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class Exl3Dflash2Execution;
 
 // Explicit in-process admission/publication owner for already-authoritative
@@ -1514,4 +1514,4 @@ private:
     bool closing_started_ = false;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

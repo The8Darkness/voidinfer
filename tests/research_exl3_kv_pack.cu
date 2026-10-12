@@ -4,8 +4,8 @@
 // packed against them, decoded into a second plane set and compared bit for
 // bit; a corrupted blob must be rejected.
 //
-// NINFER_KV_PACK_DATA: directory with L{3+4b}_{k,v}.bin ([tokens][4][256]
-// FP16, b = 0..15) and NINFER_EXL3_L0_OSCAR_ROT: the rotation assets.
+// VOIDINFER_KV_PACK_DATA: directory with L{3+4b}_{k,v}.bin ([tokens][4][256]
+// FP16, b = 0..15) and VOIDINFER_EXL3_L0_OSCAR_ROT: the rotation assets.
 // Exit 77 (skip) without them.
 #include "exl3/l0_kv_pack.cuh"
 #include "exl3/l0_oscar.cuh"
@@ -15,12 +15,12 @@
 #include <filesystem>
 #include <fstream>
 
-namespace pack = ninfer::exl3::l0_kv_pack;
-namespace oscar = ninfer::exl3::l0_oscar;
+namespace pack = voidinfer::exl3::l0_kv_pack;
+namespace oscar = voidinfer::exl3::l0_oscar;
 
 // The packer reads the rotations through rotation_view() (defined by the
 // engine's L0 attention unit; this test links no engine library).
-ninfer::exl3::l0_oscar::RotationView ninfer::exl3::l0_oscar::rotation_view() {
+voidinfer::exl3::l0_oscar::RotationView voidinfer::exl3::l0_oscar::rotation_view() {
     const auto& a = assets();
     return {a.rk, a.rv, a.mu};
 }
@@ -33,13 +33,13 @@ static void check(cudaError_t error, const char* what) {
 }
 
 int main() {
-    const char* data = std::getenv("NINFER_KV_PACK_DATA");
-    const char* rot = std::getenv("NINFER_EXL3_L0_OSCAR_ROT");
+    const char* data = std::getenv("VOIDINFER_KV_PACK_DATA");
+    const char* rot = std::getenv("VOIDINFER_EXL3_L0_OSCAR_ROT");
     if (!data || !rot || !std::filesystem::exists(std::filesystem::path(data) / "L3_k.bin")) {
-        std::printf("SKIP: set NINFER_KV_PACK_DATA and NINFER_EXL3_L0_OSCAR_ROT\n");
+        std::printf("SKIP: set VOIDINFER_KV_PACK_DATA and VOIDINFER_EXL3_L0_OSCAR_ROT\n");
         return 77;
     }
-    const int rows_env = std::getenv("NINFER_KV_PACK_ROWS") ? std::atoi(std::getenv("NINFER_KV_PACK_ROWS")) : 8256;
+    const int rows_env = std::getenv("VOIDINFER_KV_PACK_ROWS") ? std::atoi(std::getenv("VOIDINFER_KV_PACK_ROWS")) : 8256;
     const int rows = rows_env / 64 * 64;
     constexpr int banks = 16, row_words = 1024;
     const std::size_t plane_words = static_cast<std::size_t>(rows) * row_words;

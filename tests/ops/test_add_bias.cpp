@@ -1,12 +1,12 @@
-#include "ninfer/ops/add_bias.h"
+#include "voidinfer/ops/add_bias.h"
 #include "ops/op_tester.h"
 
 #include <cstdint>
 #include <iostream>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace voidinfer;
+using namespace voidinfer::test;
 
 namespace {
 

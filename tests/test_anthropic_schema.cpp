@@ -21,7 +21,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using namespace ninfer::serve;
+using namespace voidinfer::serve;
 
 int fail(const std::string& message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -56,42 +56,42 @@ RequestLimits default_limits() {
 
 ServeOptions default_server() { return ServeOptions{}; }
 
-ninfer::PromptCapabilities effort_capabilities() {
-    ninfer::PromptCapabilities capabilities;
+voidinfer::PromptCapabilities effort_capabilities() {
+    voidinfer::PromptCapabilities capabilities;
     capabilities.enable_thinking                 = true;
     capabilities.reasoning_effort.low            = true;
     capabilities.reasoning_effort.medium         = true;
     capabilities.reasoning_effort.xhigh          = true;
-    capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
+    capabilities.reasoning_effort.default_effort = voidinfer::ReasoningEffort::XHigh;
     return capabilities;
 }
 
-ninfer::OwnedMedia fake_media(const ContentPart& part) {
-    ninfer::OwnedMedia media;
+voidinfer::OwnedMedia fake_media(const ContentPart& part) {
+    voidinfer::OwnedMedia media;
     media.kind =
-        part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
+        part.kind == ContentKind::Image ? voidinfer::MediaKind::Image : voidinfer::MediaKind::Video;
     media.bytes.push_back(0);
     media.media_type = part.source.media_type;
     return media;
 }
 
-ninfer::PromptInput translate(const GenerationRequest& req) {
+voidinfer::PromptInput translate(const GenerationRequest& req) {
     const ServeOptions server = default_server();
     return to_prompt_input(req, resolve_prompt_semantics(req, server, effort_capabilities()),
                            fake_media);
 }
 
-ninfer::RequestOptions translate_options(const GenerationRequest& req) {
+voidinfer::RequestOptions translate_options(const GenerationRequest& req) {
     const ServeOptions server = default_server();
     return to_request_options(req, server,
                               resolve_prompt_semantics(req, server, effort_capabilities()),
                               server.allow_prefix_reuse);
 }
 
-std::string joined_text(const ninfer::ChatMessage& message) {
+std::string joined_text(const voidinfer::ChatMessage& message) {
     std::string text;
-    for (const ninfer::MessagePart& part : message.parts) {
-        if (part.kind == ninfer::MessagePartKind::Text) { text += part.text; }
+    for (const voidinfer::MessagePart& part : message.parts) {
+        if (part.kind == voidinfer::MessagePartKind::Text) { text += part.text; }
     }
     return text;
 }
@@ -125,9 +125,9 @@ int test_parse_basic_and_system() {
     failures += check(req.model == "claude-sonnet-4-5", "model echoed verbatim");
     failures += check(req.max_tokens == 256 && req.max_tokens_set, "max_tokens parsed");
     failures += check(req.messages.size() == 2, "system + user turns");
-    failures += check(req.messages[0].role == ninfer::ChatRole::System, "system turn is first");
+    failures += check(req.messages[0].role == voidinfer::ChatRole::System, "system turn is first");
     failures += check(req.messages[0].content[0].text == "be terse", "system text carried");
-    failures += check(req.messages[1].role == ninfer::ChatRole::User, "user turn follows system");
+    failures += check(req.messages[1].role == voidinfer::ChatRole::User, "user turn follows system");
     failures += check(req.messages[1].content[0].text == "hello", "user text carried");
     failures += check(!req.stream, "stream defaults false");
     return failures;
@@ -145,9 +145,9 @@ int test_parse_system_array_and_blocks() {
                            {"content", Json::array({Json{{"type", "text"}, {"text", "x"}},
                                                     Json{{"type", "text"}, {"text", "y"}}})}}})}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
-    failures += check(req.messages[0].role == ninfer::ChatRole::System, "system first");
+    failures += check(req.messages[0].role == voidinfer::ChatRole::System, "system first");
     failures += check(req.messages[0].content[0].text == "a\nb", "system blocks joined");
-    const ninfer::PromptInput prompt = translate(req);
+    const voidinfer::PromptInput prompt = translate(req);
     failures += check(prompt.messages.size() == 2, "flattened system + user");
     failures += check(joined_text(prompt.messages[1]) == "x\ny", "user blocks joined");
     return failures;
@@ -168,7 +168,7 @@ int test_cache_control_boundaries() {
         {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
     };
     const GenerationRequest request  = parse_messages_request(body, default_limits());
-    const ninfer::PromptInput prompt = translate(request);
+    const voidinfer::PromptInput prompt = translate(request);
     int failures = check(request.messages[0].shared_cache_boundaries_after_text_bytes.size() == 1 &&
                              request.messages[0].shared_cache_boundaries_after_text_bytes[0] ==
                                  std::string("stable system").size(),
@@ -177,18 +177,18 @@ int test_cache_control_boundaries() {
                       "Anthropic tool cache_control boundary was discarded");
     failures += check(prompt.context_cache.markers.size() == 1 &&
                           prompt.context_cache.markers[0].location ==
-                              ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary &&
+                              voidinfer::PromptCacheMarkerLocation::LeadingInstructionBoundary &&
                           prompt.context_cache.markers[0].leading_instruction_bytes ==
                               std::string("stable system").size(),
                       "latest Anthropic cache_control boundary did not reach PromptInput");
 
     Json tool_only      = body;
     tool_only["system"] = "dynamic system";
-    const ninfer::PromptInput tool_prompt =
+    const voidinfer::PromptInput tool_prompt =
         translate(parse_messages_request(tool_only, default_limits()));
     failures += check(tool_prompt.context_cache.markers.size() == 1 &&
                           tool_prompt.context_cache.markers[0].location ==
-                              ninfer::PromptCacheMarkerLocation::ToolBoundary &&
+                              voidinfer::PromptCacheMarkerLocation::ToolBoundary &&
                           tool_prompt.context_cache.markers[0].after_tool_count == 1,
                       "Anthropic tool cache_control boundary did not reach PromptInput");
 
@@ -208,7 +208,7 @@ int test_cache_control_boundaries() {
     };
     const GenerationRequest message_request =
         parse_messages_request(message_cached, default_limits());
-    const ninfer::PromptInput message_prompt = translate(message_request);
+    const voidinfer::PromptInput message_prompt = translate(message_request);
     failures += check(message_request.messages.size() == 3 &&
                           message_request.messages[0].private_cache_boundary_after &&
                           message_request.messages[1].private_cache_boundary_after &&
@@ -217,14 +217,14 @@ int test_cache_control_boundaries() {
     failures +=
         check(message_prompt.context_cache.markers.size() == 2 &&
                   message_prompt.context_cache.markers[0].kind ==
-                      ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                      voidinfer::PromptCacheMarkerKind::PrivateLongAnchor &&
                   message_prompt.context_cache.markers[0].location ==
-                      ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                      voidinfer::PromptCacheMarkerLocation::MessageBoundary &&
                   message_prompt.context_cache.markers[0].after_message_count == 1 &&
                   message_prompt.context_cache.markers[1].kind ==
-                      ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                      voidinfer::PromptCacheMarkerKind::PrivateLongAnchor &&
                   message_prompt.context_cache.markers[1].location ==
-                      ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                      voidinfer::PromptCacheMarkerLocation::MessageBoundary &&
                   message_prompt.context_cache.markers[1].after_message_count == 2,
               "Anthropic conversation cache_control did not become private message anchors");
 
@@ -254,20 +254,20 @@ int test_ordered_system_messages() {
                      })}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
     failures += check(req.messages.size() == 3, "top-level, user, and dynamic system kept");
-    failures += check(req.messages[0].role == ninfer::ChatRole::System &&
+    failures += check(req.messages[0].role == voidinfer::ChatRole::System &&
                           req.messages[0].content[0].text == "top-level system",
                       "top-level system was not preserved independently");
-    failures += check(req.messages[1].role == ninfer::ChatRole::User &&
+    failures += check(req.messages[1].role == voidinfer::ChatRole::User &&
                           req.messages[1].content[0].text == "hello",
                       "user turn moved around dynamic system");
-    failures += check(req.messages[2].role == ninfer::ChatRole::System &&
+    failures += check(req.messages[2].role == voidinfer::ChatRole::System &&
                           req.messages[2].content[0].text == "reminder from messages",
                       "dynamic system was not preserved at its message-array position");
-    const ninfer::PromptInput prompt = translate(req);
+    const voidinfer::PromptInput prompt = translate(req);
     failures +=
-        check(prompt.messages.size() == 3 && prompt.messages[0].role == ninfer::ChatRole::System &&
-                  prompt.messages[1].role == ninfer::ChatRole::User &&
-                  prompt.messages[2].role == ninfer::ChatRole::System,
+        check(prompt.messages.size() == 3 && prompt.messages[0].role == voidinfer::ChatRole::System &&
+                  prompt.messages[1].role == voidinfer::ChatRole::User &&
+                  prompt.messages[2].role == voidinfer::ChatRole::System,
               "translation reordered or lowered Anthropic system turns");
 
     const Json blocks_body = {
@@ -280,8 +280,8 @@ int test_ordered_system_messages() {
                      })}};
     const GenerationRequest breq = parse_messages_request(blocks_body, default_limits());
     failures +=
-        check(breq.messages.size() == 2 && breq.messages[0].role == ninfer::ChatRole::User &&
-                  breq.messages[1].role == ninfer::ChatRole::System &&
+        check(breq.messages.size() == 2 && breq.messages[0].role == voidinfer::ChatRole::User &&
+                  breq.messages[1].role == voidinfer::ChatRole::System &&
                   breq.messages[1].content[0].text == "r",
               "array-valued dynamic system did not retain its position");
 
@@ -294,9 +294,9 @@ int test_ordered_system_messages() {
                                   Json{{"role", "assistant"}, {"content", "answer"}}})}};
     const GenerationRequest creq = parse_messages_request(consecutive, default_limits());
     failures +=
-        check(creq.messages.size() == 4 && creq.messages[1].role == ninfer::ChatRole::System &&
+        check(creq.messages.size() == 4 && creq.messages[1].role == voidinfer::ChatRole::System &&
                   creq.messages[1].content[0].text == "first" &&
-                  creq.messages[2].role == ninfer::ChatRole::System &&
+                  creq.messages[2].role == voidinfer::ChatRole::System &&
                   creq.messages[2].content[0].text == "second",
               "consecutive dynamic system turns were merged or reordered");
 
@@ -336,10 +336,10 @@ int test_ordered_system_messages() {
                       Json{{"role", "system"}, {"content", "diagnostics"}}})}};
     const GenerationRequest tool_req = parse_messages_request(after_tool_result, default_limits());
     failures += check(tool_req.messages.size() == 4 &&
-                          tool_req.messages[0].role == ninfer::ChatRole::User &&
-                          tool_req.messages[1].role == ninfer::ChatRole::Assistant &&
-                          tool_req.messages[2].role == ninfer::ChatRole::Tool &&
-                          tool_req.messages[3].role == ninfer::ChatRole::System,
+                          tool_req.messages[0].role == voidinfer::ChatRole::User &&
+                          tool_req.messages[1].role == voidinfer::ChatRole::Assistant &&
+                          tool_req.messages[2].role == voidinfer::ChatRole::Tool &&
+                          tool_req.messages[3].role == voidinfer::ChatRole::System,
                       "system after tool_result did not retain the expected semantic position");
 
     const Json interrupted_tool_pair = {
@@ -367,11 +367,11 @@ int test_user_content_block_order() {
                                                   Json{{"type", "text"}, {"text", "after"}}})}}})}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
     int failures = check(req.messages.size() == 3, "mixed user content did not expand in place");
-    failures += check(req.messages[0].role == ninfer::ChatRole::User &&
+    failures += check(req.messages[0].role == voidinfer::ChatRole::User &&
                           req.messages[0].content[0].text == "before" &&
-                          req.messages[1].role == ninfer::ChatRole::Tool &&
+                          req.messages[1].role == voidinfer::ChatRole::Tool &&
                           req.messages[1].content[0].text == "result" &&
-                          req.messages[2].role == ninfer::ChatRole::User &&
+                          req.messages[2].role == voidinfer::ChatRole::User &&
                           req.messages[2].content[0].text == "after",
                       "tool_result expansion reordered surrounding user blocks");
     return failures;
@@ -421,14 +421,14 @@ int test_parse_image() {
                                                                        {"media_type", "image/png"},
                                                                        {"data", "AA=="}}}}})}}})}};
     const GenerationRequest req      = parse_messages_request(body, default_limits());
-    const ninfer::PromptInput prompt = translate(req);
+    const voidinfer::PromptInput prompt = translate(req);
     int failures                     = 0;
     failures += check(req.messages[0].content[0].kind == ContentKind::Image,
                       "Anthropic image kind preserved");
     failures += check(req.messages[0].content[0].source.value == "data:image/png;base64,AA==",
                       "Anthropic base64 converted to data URI");
-    failures += check(prompt.messages[0].parts[0].kind == ninfer::MessagePartKind::Media &&
-                          prompt.messages[0].parts[0].media.kind == ninfer::MediaKind::Image,
+    failures += check(prompt.messages[0].parts[0].kind == voidinfer::MessagePartKind::Media &&
+                          prompt.messages[0].parts[0].media.kind == voidinfer::MediaKind::Image,
                       "Anthropic image translated to structured chat part");
     return failures;
 }
@@ -543,23 +543,23 @@ int test_tool_use_result_roundtrip() {
     const GenerationRequest req = parse_messages_request(body, default_limits());
     // user, assistant, tool
     failures += check(req.messages.size() == 3, "user + assistant + tool turns");
-    failures += check(req.messages[1].role == ninfer::ChatRole::Assistant, "assistant turn");
+    failures += check(req.messages[1].role == voidinfer::ChatRole::Assistant, "assistant turn");
     failures += check(req.messages[1].tool_calls.size() == 1, "assistant tool_call parsed");
     failures += check(req.messages[1].tool_calls[0].id == "toolu_1", "tool_use id carried");
     failures += check(req.messages[1].tool_calls[0].name == "get_weather", "tool_use name carried");
     const Json args = Json::parse(req.messages[1].tool_calls[0].arguments_json);
     failures += check(args.at("city") == "Paris", "tool_use input stringified to arguments");
     failures += check(req.messages[1].content[0].text == "let me check", "assistant text carried");
-    failures += check(req.messages[2].role == ninfer::ChatRole::Tool, "tool_result -> tool turn");
+    failures += check(req.messages[2].role == voidinfer::ChatRole::Tool, "tool_result -> tool turn");
     failures += check(req.messages[2].tool_call_id == "toolu_1", "tool_result tool_use_id carried");
     failures += check(req.messages[2].content[0].text == "sunny", "tool_result text carried");
     failures += check(req.messages[2].content.size() == 2 &&
                           req.messages[2].content[1].kind == ContentKind::Image,
                       "tool_result image carried");
-    const ninfer::PromptInput prompt = translate(req);
+    const voidinfer::PromptInput prompt = translate(req);
     failures += check(prompt.messages[2].parts.size() == 2 &&
-                          prompt.messages[2].parts[1].kind == ninfer::MessagePartKind::Media &&
-                          prompt.messages[2].parts[1].media.kind == ninfer::MediaKind::Image,
+                          prompt.messages[2].parts[1].kind == voidinfer::MessagePartKind::Media &&
+                          prompt.messages[2].parts[1].media.kind == voidinfer::MediaKind::Image,
                       "tool_result image translated to structured chat");
     failures += check(req.has_tool_history(), "tool history detected");
     return failures;
@@ -585,7 +585,7 @@ int test_thinking_and_sampling() {
     failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
     failures += check(!req.preserve_thinking.has_value(),
                       "Anthropic thinking.type unexpectedly enabled history preservation");
-    const ninfer::RequestOptions options = translate_options(req);
+    const voidinfer::RequestOptions options = translate_options(req);
     failures +=
         check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
     failures += check(!options.execution.thinking.budget,
@@ -659,9 +659,9 @@ int test_reasoning_effort() {
     Json low                             = base;
     low["output_config"]                 = Json{{"effort", "low"}};
     const GenerationRequest low_request  = parse_messages_request(low, default_limits());
-    const ninfer::PromptInput low_prompt = translate(low_request);
+    const voidinfer::PromptInput low_prompt = translate(low_request);
     failures += check(low_prompt.options.enable_thinking &&
-                          low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+                          low_prompt.options.reasoning_effort == voidinfer::ReasoningEffort::Low,
                       "Anthropic low effort did not reach PromptInput");
 
     Json high                            = base;
@@ -698,16 +698,16 @@ int test_reasoning_effort() {
 
 int test_stop_reason_mapping() {
     int failures = 0;
-    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::OutputLimit, false)) ==
+    failures += check(std::string(messages_stop_reason(voidinfer::FinishReason::OutputLimit, false)) ==
                           "max_tokens",
                       "output limit -> max_tokens");
-    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::StopToken, false)) ==
+    failures += check(std::string(messages_stop_reason(voidinfer::FinishReason::StopToken, false)) ==
                           "end_turn",
                       "stop token -> end_turn");
-    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::Cancelled, false)) ==
+    failures += check(std::string(messages_stop_reason(voidinfer::FinishReason::Cancelled, false)) ==
                           "end_turn",
                       "cancelled -> end_turn");
-    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::StopString, true)) ==
+    failures += check(std::string(messages_stop_reason(voidinfer::FinishReason::StopString, true)) ==
                           "tool_use",
                       "tool calls -> tool_use");
     return failures;

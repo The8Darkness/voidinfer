@@ -4,7 +4,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3SampledAcceptanceMethod : std::uint8_t {
     unspecified,
@@ -75,4 +75,4 @@ struct Exl3DraftDistributionAuthority {
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

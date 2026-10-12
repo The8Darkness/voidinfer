@@ -1,7 +1,7 @@
 #pragma once
 
 struct PrefillK6DownRowpairQualification {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit=Admission::target_wide_prefill;
     static constexpr int max_rows=1024;
     static constexpr std::size_t guard=128;
@@ -9,32 +9,32 @@ struct PrefillK6DownRowpairQualification {
     std::uint64_t values=0;
 
     PrefillK6DownRowpairQualification() {
-        for(const char* name:{"NINFER_EXL3_WIDE_PREFILL",
-            "NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-            "NINFER_EXL3_PREFILL_DIRECT_PARTIALS",
-            "NINFER_EXL3_PREFILL_DIRECT_ASYNC_A",
-            "NINFER_EXL3_PREFILL_WIDE64","NINFER_EXL3_PREFILL_WIDE128",
-            "NINFER_EXL3_PREFILL_WIDE256","NINFER_EXL3_PREFILL_WIDE512",
-            "NINFER_EXL3_PREFILL_WIDE1024"})_putenv_s(name,"1");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_DOWN","0");
-        _putenv_s("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR","0");
+        for(const char* name:{"VOIDINFER_EXL3_WIDE_PREFILL",
+            "VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+            "VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",
+            "VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A",
+            "VOIDINFER_EXL3_PREFILL_WIDE64","VOIDINFER_EXL3_PREFILL_WIDE128",
+            "VOIDINFER_EXL3_PREFILL_WIDE256","VOIDINFER_EXL3_PREFILL_WIDE512",
+            "VOIDINFER_EXL3_PREFILL_WIDE1024"})_putenv_s(name,"1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_DOWN","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR","0");
     }
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+        const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         static_cast<PrefillK6DownRowpairQualification*>(user)->check(x);
     }
     static std::unique_ptr<Exl3CudaLinearWorkspace> workspace(bool candidate) {
-        _putenv_s("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR",candidate?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR",candidate?"1":"0");
         return std::make_unique<Exl3CudaLinearWorkspace>(
             17408,5120,max_rows,false,false,true,false,false,true,false);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         if(cases||x.rows<max_rows||x.metadata.K!=6||
            x.metadata.in_features!=17408||x.metadata.out_features!=5120||
            std::string(x.operation)!="down")return;
         cuda_check(cudaStreamSynchronize(x.stream),"K6 Down rowpair input ready");
         auto control=workspace(false),candidate=workspace(true);
-        _putenv_s("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR","0");
         require(!candidate->target_k6_down_rowpair_candidate(x.metadata,31,admit)&&
                 candidate->target_k6_down_rowpair_candidate(x.metadata,32,admit)&&
                 candidate->target_k6_down_rowpair_candidate(x.metadata,max_rows,admit)&&
@@ -90,7 +90,7 @@ struct PrefillK6DownRowpairQualification {
 
 void run_prefill_k6_down_rowpair_qualification(Exl3TextModel& target) {
     for(const char* malformed:{"2","true","01"}) {
-        _putenv_s("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR",malformed);
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR",malformed);
         bool rejected=false;
         try {
             Exl3CudaLinearWorkspace invalid(17408,5120,
@@ -100,14 +100,14 @@ void run_prefill_k6_down_rowpair_qualification(Exl3TextModel& target) {
         require(rejected,"K6 Down rowpair accepted malformed opt-in");
     }
     PrefillK6DownRowpairQualification qualification;
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size()>=16+PrefillK6DownRowpairQualification::max_rows,
         "K6 Down rowpair prompt extent");
     auto context=target.create_context(true);
     context->prefill(std::span<const std::int64_t>(ids.data(),16));
     context->set_target_projection_observer_for_test(
         PrefillK6DownRowpairQualification::callback,&qualification,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_exact_prefill_wide(std::span<const std::int64_t>(
         ids.data()+16,PrefillK6DownRowpairQualification::max_rows));
     context->finish_exact_prefill();
@@ -122,13 +122,13 @@ void run_prefill_k6_down_rowpair_qualification(Exl3TextModel& target) {
 void run_prefill_k6_down_rowpair_state(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     constexpr int decode_rows=8;
     require(target.max_context()>=4352&&code.size()>=prefix&&prose.size()>=prefix,
         "K6 Down rowpair state fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
         require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
@@ -140,9 +140,9 @@ void run_prefill_k6_down_rowpair_state(
     for(const auto& fixture:std::array<
         std::pair<const char*,const std::vector<std::int64_t>*>,2>{
             std::pair{"code",&code},std::pair{"prose",&prose}}) {
-        _putenv_s("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR","0");
         auto control=target.create_context(true);control->prepare_continuation(decode_rows);
-        _putenv_s("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(decode_rows);
         const std::vector<std::int64_t> input(
             fixture.second->begin(),fixture.second->begin()+prefix);

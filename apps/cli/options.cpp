@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace ninfer::cli {
+namespace voidinfer::cli {
 namespace {
 
 std::uint64_t parse_u64(const char* text, std::string_view label) {
@@ -177,4 +177,4 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-} // namespace ninfer::cli
+} // namespace voidinfer::cli

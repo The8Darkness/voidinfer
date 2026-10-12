@@ -21,7 +21,7 @@
 // deferred, now `spilled`), and filled or packed pages of every source are
 // spilled before the planes grow. A restore decodes packed and spilled rows
 // straight into its planes and re-homes the pages; other readers bring them
-// back into RAM as FP16. NINFER_EXL3_KV_PACK=0 fills FP16 rows.
+// back into RAM as FP16. VOIDINFER_EXL3_KV_PACK=0 fills FP16 rows.
 //
 // Plane sets: a source over growable planes owns them (`backing`), so an
 // agent's history stays where its last lane wrote it. A context binds one
@@ -62,7 +62,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 inline std::shared_mutex& exl3_page_payload_mutex() {
     static std::shared_mutex mutex;
@@ -355,7 +355,7 @@ public:
                 valid = pairs[index].in->source && !pairs[index].in->payload_deferred() &&
                     pairs[index].in->pins.load() <= 1 && sized(*pairs[index].in) && holds(*pairs[index].out);
             if (valid) {
-                // NINFER_EXL3_TEST_LANE_EXCHANGE=1 checks every run against copies.
+                // VOIDINFER_EXL3_TEST_LANE_EXCHANGE=1 checks every run against copies.
                 std::vector<std::uint16_t> before_planes, before_pages;
                 if (exchange_test()) {
                     before_planes = read_rows(lo, hi);
@@ -606,7 +606,7 @@ private:
             }
             raw += page_bytes(*pages[index]);
             packed += blobs[index].size();
-            // NINFER_EXL3_TEST_KV_PACK=1 decodes every packed page and compares.
+            // VOIDINFER_EXL3_TEST_KV_PACK=1 decodes every packed page and compares.
             if (pack_test()) {
                 const std::size_t words = static_cast<std::size_t>(pages[index]->rows) * kRowWords;
                 std::vector<std::uint16_t> decoded(words * planes_.banks * 2);
@@ -620,7 +620,7 @@ private:
             pages[index]->packed = std::move(blobs[index]);
             pages[index]->packed_ram.store(true);
         }
-        if (std::getenv("NINFER_EXL3_VERICACHE_STATS"))
+        if (std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
             std::fprintf(stderr, "KV_PACK pages=%zu raw_mib=%.1f packed_mib=%.1f ratio=%.3f ms=%.1f\n", pages.size(),
                 raw / 1048576.0, packed / 1048576.0, packed ? static_cast<double>(raw) / packed : 0.0,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
@@ -742,14 +742,14 @@ private:
 
     static bool pack_test() {
         static const bool enabled = [] {
-            const char* value = std::getenv("NINFER_EXL3_TEST_KV_PACK");
+            const char* value = std::getenv("VOIDINFER_EXL3_TEST_KV_PACK");
             return value && std::strcmp(value, "1") == 0;
         }();
         return enabled;
     }
     static bool exchange_test() {
         static const bool enabled = [] {
-            const char* value = std::getenv("NINFER_EXL3_TEST_LANE_EXCHANGE");
+            const char* value = std::getenv("VOIDINFER_EXL3_TEST_LANE_EXCHANGE");
             return value && std::strcmp(value, "1") == 0;
         }();
         return enabled;
@@ -1039,4 +1039,4 @@ inline void exl3_require_kv_payload(const Exl3ExactKVPage& page) {
     }
 }
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

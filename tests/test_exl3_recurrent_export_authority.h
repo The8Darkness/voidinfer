@@ -1,19 +1,19 @@
 #pragma once
 void run_recurrent_export_authority(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose){
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     using Root=std::shared_ptr<const Exl3VeriCacheRequest>;
     using Lane=Exl3Dflash2Execution;
     using Clock=std::chrono::steady_clock;
     const auto ms=[](auto t){return std::chrono::duration<double,std::milli>(Clock::now()-t).count();};
-    const int prefix=std::stoi(env("NINFER_REAL_DFLASH_PREFIX")),outputs=std::stoi(env("NINFER_REAL_DFLASH_OUTPUTS")),pairs=std::stoi(env("NINFER_REAL_DFLASH_PAIRS"));
-    const bool batched_candidate=env("NINFER_TEST_BATCHED_RECURRENT_EXPORT")=="1";
+    const int prefix=std::stoi(env("VOIDINFER_REAL_DFLASH_PREFIX")),outputs=std::stoi(env("VOIDINFER_REAL_DFLASH_OUTPUTS")),pairs=std::stoi(env("VOIDINFER_REAL_DFLASH_PAIRS"));
+    const bool batched_candidate=env("VOIDINFER_TEST_BATCHED_RECURRENT_EXPORT")=="1";
     const auto configure_export=[&](bool pinned) {
-        _putenv_s("NINFER_EXL3_PINNED_RECURRENT_EXPORT",pinned?"1":"0");
-        _putenv_s("NINFER_EXL3_BATCHED_RECURRENT_EXPORT",
+        _putenv_s("VOIDINFER_EXL3_PINNED_RECURRENT_EXPORT",pinned?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_BATCHED_RECURRENT_EXPORT",
                   pinned && batched_candidate?"1":"0");
     };
-    const std::filesystem::path dir=env("NINFER_REAL_DFLASH_OUT");require(!std::filesystem::exists(dir),"preserve export receipt");std::filesystem::create_directories(dir);
+    const std::filesystem::path dir=env("VOIDINFER_REAL_DFLASH_OUT");require(!std::filesystem::exists(dir),"preserve export receipt");std::filesystem::create_directories(dir);
     std::ofstream checks(dir/"checks.csv"),timings(dir/"workloads.csv"),phases(dir/"phases.csv");
     checks<<"fixture,case,pass\n";
     timings<<"fixture,pair,arm,requests,useful,wall_ms,first_release_ms,proposal_calls,verified,replayed,pinned_exports,fallbacks,exact\n";

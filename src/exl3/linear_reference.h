@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3LinearMetadata {
     int in_features = 0;
@@ -41,4 +41,4 @@ Exl3ReferenceOutput exl3_linear_reference(const TensorPayload& input,
                                           const Exl3LinearTensors& tensors,
                                           const Exl3LinearMetadata& metadata);
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

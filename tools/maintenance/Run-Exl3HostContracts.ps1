@@ -23,7 +23,7 @@ $env:_CL_ = ''
 $env:LINK = ''
 $env:_LINK_ = ''
 # Closed allowlist: these sources and their transitive project headers contain
-# only standard-library host contracts. No ninfer_core or CUDA linkage.
+# only standard-library host contracts. No voidinfer_core or CUDA linkage.
 foreach ($test in @('test_exl3_environment_options', 'test_exl3_candidate_contracts')) {
     $executable = Join-Path $output "$test.exe"
     & $compiler /nologo /std:c++20 /EHsc /MD /Od /MP1 /cgthreads1 /W4 `

@@ -1,4 +1,4 @@
-#include <ninfer/engine.h>
+#include <voidinfer/engine.h>
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -8,8 +8,8 @@
 #include "exl3/branch_reference.h"
 #include "exl3/linear_cuda.h"
 #include "exl3/text_model.h"
-#include <ninfer/targets/qwen3_6/frontend.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/frontend.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 #include <cuda_runtime.h>
 #include <array>
 #include <algorithm>
@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
+using namespace voidinfer;
 
 static void verify_engine_linked_graph_launch() {
     DeviceContext device(0);
@@ -64,19 +64,19 @@ static void direct_target_only_probe(const char* path,const char* target,
     while(input>>id)ids.push_back(id);
     if(ids.size()<2048 || ids.size()>static_cast<std::size_t>(max_context-128))
         throw std::runtime_error("direct target-only probe prompt extent");
-    auto model=ninfer::exl3::Exl3TextModel::load(target,max_context);
+    auto model=voidinfer::exl3::Exl3TextModel::load(target,max_context);
     auto context=model->create_context(true);
     const auto initial=static_cast<std::size_t>(
-        ninfer::exl3::Exl3TextContext::layer_major_initial_rows());
+        voidinfer::exl3::Exl3TextContext::layer_major_initial_rows());
     if(initial)context->prefill(std::span<const std::int64_t>(ids).first(initial));
     context->append_prefill_layer_major(
         std::span<const std::int64_t>(ids).subspan(initial));
     if(cudaStreamSynchronize(nullptr)!=cudaSuccess)
         throw std::runtime_error("direct target-only prefill completion");
     const auto root=context->export_exact_host_state();
-    const auto first=ninfer::exl3::exl3_branch_greedy(*context);
+    const auto first=voidinfer::exl3::exl3_branch_greedy(*context);
     context->decode(first);
-    const auto second=ninfer::exl3::exl3_branch_greedy(*context);
+    const auto second=voidinfer::exl3::exl3_branch_greedy(*context);
     std::cout<<"COHERENT_DEVICE_DIRECT_TARGET_ONLY hash="
              <<root->represented_payload_hash_for_test()
              <<" pair="<<first<<','<<second<<'\n';
@@ -90,9 +90,9 @@ static void direct_binary_probe(const char* path,const char* target,
     while(input>>id)ids.push_back(id);
     if(ids.size()<2048 || ids.size()>static_cast<std::size_t>(max_context-128))
         throw std::runtime_error("direct Engine-binary probe prompt extent");
-    auto direct_target=ninfer::exl3::Exl3TextModel::load(target,max_context);
-    auto direct_draft=ninfer::exl3::Exl3Dflash2DraftModel::load(draft);
-    std::shared_ptr<ninfer::exl3::Exl3TextContext> context(
+    auto direct_target=voidinfer::exl3::Exl3TextModel::load(target,max_context);
+    auto direct_draft=voidinfer::exl3::Exl3Dflash2DraftModel::load(draft);
+    std::shared_ptr<voidinfer::exl3::Exl3TextContext> context(
         direct_target->create_context(true,false,true));
     context->prepare_continuation(8);
     context->prepare_transaction();
@@ -106,13 +106,13 @@ static void direct_binary_probe(const char* path,const char* target,
         if(cudaMalloc(reinterpret_cast<void**>(&plane),16ULL*5120*2)!=
             cudaSuccess)
             throw std::runtime_error("direct Engine-binary staging allocation");
-    ninfer::exl3::Exl3FastDeviceRound round(context,*direct_draft,
+    voidinfer::exl3::Exl3FastDeviceRound round(context,*direct_draft,
         stage.planes,1,context->request_generation());
     round.begin_fresh(ids,true);
     const auto direct_root=context->export_exact_host_state();
-    const auto direct_first=ninfer::exl3::exl3_branch_greedy(*context);
+    const auto direct_first=voidinfer::exl3::exl3_branch_greedy(*context);
     context->decode(direct_first);
-    const auto direct_second=ninfer::exl3::exl3_branch_greedy(*context);
+    const auto direct_second=voidinfer::exl3::exl3_branch_greedy(*context);
     const auto logits=context->logits_host();
     const auto host_second=static_cast<std::int64_t>(
         std::max_element(logits.begin(),logits.end())-logits.begin());
@@ -123,12 +123,12 @@ static void direct_binary_probe(const char* path,const char* target,
 
 int main() {
     try {
-        const auto* target=std::getenv("NINFER_EXL3_TARGET_PATH");
-        const auto* draft=std::getenv("NINFER_EXL3_DFLASH2_PATH");
-        const auto* prefix_text=std::getenv("NINFER_TEST_ENGINE_DEVICE_PREFIX");
+        const auto* target=std::getenv("VOIDINFER_EXL3_TARGET_PATH");
+        const auto* draft=std::getenv("VOIDINFER_EXL3_DFLASH2_PATH");
+        const auto* prefix_text=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_PREFIX");
         if(!target || !draft || !prefix_text)return 77;
         const int prefix=std::stoi(prefix_text);
-        const char* l0_flag=std::getenv("NINFER_EXL3_L0_OSCAR");
+        const char* l0_flag=std::getenv("VOIDINFER_EXL3_L0_OSCAR");
         const bool l0_long=(!l0_flag || std::string_view(l0_flag)!="0") && prefix>16384 && prefix<=260000;
         // Ordinary FP16 device KV admits 2048..32768 total context; longer prompts need L0 OSCAR.
         if((prefix<2048 || prefix>32768) && !l0_long)
@@ -138,7 +138,7 @@ int main() {
         options.model.draft_directory=draft;
         int long_outputs=128;
         if(const auto* output_option=std::getenv(
-               "NINFER_TEST_ENGINE_DEVICE_OUTPUT_TOKENS")) {
+               "VOIDINFER_TEST_ENGINE_DEVICE_OUTPUT_TOKENS")) {
             long_outputs=std::stoi(output_option);
             if(long_outputs<128 || long_outputs>4096)
                 throw std::invalid_argument(
@@ -154,14 +154,14 @@ int main() {
             static_cast<std::size_t>(options.max_context)*65536);
         options.max_pending_requests=2;
         verify_engine_linked_graph_launch();
-        if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_PRE_MODEL_IDS")) {
+        if(const auto* path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_PRE_MODEL_IDS")) {
             direct_target_only_probe(path,target,options.max_context);
             direct_binary_probe(path,target,draft,options.max_context,
                 "COHERENT_DEVICE_DIRECT_BINARY_PRE");
         }
         // Dispatches recorded while the Engine constructs its context include
         // ordinary graph capture; replay bypasses host-side dispatch counters.
-        using Linear=ninfer::exl3::Exl3CudaLinearWorkspace;
+        using Linear=voidinfer::exl3::Exl3CudaLinearWorkspace;
         const auto dispatch_snapshot=[] {
             std::array<std::uint64_t,7> value{Linear::process_coherent_down_k7_calls_for_test(),
                 Linear::process_coherent_o_k7_calls_for_test()};
@@ -209,9 +209,9 @@ int main() {
             throw std::runtime_error("device Engine witness exceeded prompt headroom");
         RequestOptions request;
         request.execution.sampling.temperature=0;
-        // NINFER_TEST_ENGINE_DEVICE_SAMPLING=T[,top_p[,top_k[,seed]]]: coupled
+        // VOIDINFER_TEST_ENGINE_DEVICE_SAMPLING=T[,top_p[,top_k[,seed]]]: coupled
         // sampled decoding instead of greedy.
-        if(const auto* sampled=std::getenv("NINFER_TEST_ENGINE_DEVICE_SAMPLING"); sampled && *sampled) {
+        if(const auto* sampled=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_SAMPLING"); sampled && *sampled) {
             float temperature=0,top_p=1;int top_k=0;unsigned long long seed=0;
             std::sscanf(sampled,"%f,%f,%d,%llu",&temperature,&top_p,&top_k,&seed);
             request.execution.sampling.temperature=temperature;
@@ -221,7 +221,7 @@ int main() {
         }
         request.execution.requested_output_tokens=16;
         request.execution.allow_prefix_reuse=false;
-        if(const auto* failure=std::getenv("NINFER_TEST_ENGINE_DEVICE_FAILURE");
+        if(const auto* failure=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_FAILURE");
            failure && std::string_view(failure)=="1") {
             bool reached=false;
             try {(void)engine->generate(engine->prepare(prompt),request);}
@@ -231,9 +231,9 @@ int main() {
                     std::string_view::npos;
             }
 #ifdef _WIN32
-            _putenv_s("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER","");
+            _putenv_s("VOIDINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER","");
 #else
-            unsetenv("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
+            unsetenv("VOIDINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
 #endif
             if(!reached)throw std::runtime_error(
                 "device Engine partial prefill failure was not observed");
@@ -248,12 +248,12 @@ int main() {
             engine=std::make_unique<Engine>(options);
             std::cout<<"COHERENT_DEVICE_ENGINE_PREFILL_FAILURE_RECOVERED\n";
         }
-        if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_FIRST_IDS_OUT")) {
-            auto frontend=ninfer::targets::qwen3_6::make_frontend(
-                ninfer::exl3::load_pinned_frontend_resources(target),
+        if(const auto* path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_FIRST_IDS_OUT")) {
+            auto frontend=voidinfer::targets::qwen3_6::make_frontend(
+                voidinfer::exl3::load_pinned_frontend_resources(target),
                 {.vision_enabled=false,.max_context=options.max_context});
             const auto encoded=frontend.prepare(prompt);
-            const auto& ids=ninfer::targets::qwen3_6::PreparedPromptAccess::
+            const auto& ids=voidinfer::targets::qwen3_6::PreparedPromptAccess::
                 view(encoded).token_ids;
             if(ids.size()!=count)
                 throw std::runtime_error("first Engine prompt ID extent changed");
@@ -262,7 +262,7 @@ int main() {
             if(!out)throw std::runtime_error("first Engine prompt ID export failed");
         }
         const auto first=engine->generate(engine->prepare(prompt),request);
-        if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_FIRST_TOKENS_OUT")) {
+        if(const auto* path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_FIRST_TOKENS_OUT")) {
             std::ofstream out(path,std::ios::binary);
             for(const auto id:first.generated_token_ids)out<<id<<'\n';
             if(!out)throw std::runtime_error("first Engine token ID export failed");
@@ -285,7 +285,7 @@ int main() {
         // kernel at the measured shape; the repeat and ring-edge gates run in
         // the dedicated gate invocation instead of every timing arm.
         const bool warm_only=[] {
-            const auto* option=std::getenv("NINFER_TEST_ENGINE_DEVICE_WARM_ONLY");
+            const auto* option=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_WARM_ONLY");
             return option && std::string_view(option)=="1";
         }();
         if(warm_only)
@@ -335,15 +335,15 @@ int main() {
                      <<" output="<<edge_first.generated_token_ids.size()
                      <<" repeats_equal=1\n";
         }
-        if(const auto* long_option=std::getenv("NINFER_TEST_ENGINE_DEVICE_LONG");
+        if(const auto* long_option=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_LONG");
            long_option && std::string_view(long_option)=="1") {
-            const auto* fixture_option=std::getenv("NINFER_TEST_ENGINE_DEVICE_FIXTURE");
+            const auto* fixture_option=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_FIXTURE");
             if(!fixture_option ||
                (std::string_view(fixture_option)!="code" &&
                 std::string_view(fixture_option)!="prose"))
                 throw std::invalid_argument("device Engine long fixture must be code or prose");
             const bool prose=std::string_view(fixture_option)=="prose";
-            const auto* source_path=std::getenv("NINFER_TEST_ENGINE_DEVICE_SOURCE");
+            const auto* source_path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_SOURCE");
             if(!source_path)throw std::invalid_argument(
                 "device Engine long witness needs an explicit source file");
             std::ifstream source_file(source_path,std::ios::binary);
@@ -355,7 +355,7 @@ int main() {
                 "device Engine long source file is empty");
             if(prose) {
                 const auto* second_path=
-                    std::getenv("NINFER_TEST_ENGINE_DEVICE_SOURCE_2");
+                    std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_SOURCE_2");
                 if(!second_path)throw std::invalid_argument(
                     "device Engine prose witness needs a second source file");
                 std::ifstream second_file(second_path,std::ios::binary);
@@ -366,9 +366,9 @@ int main() {
                     std::istreambuf_iterator<char>{});
             }
             auto long_prompt=prompt;
-            // NINFER_TEST_ENGINE_DEVICE_MESSAGES: an explicit system/user chat
+            // VOIDINFER_TEST_ENGINE_DEVICE_MESSAGES: an explicit system/user chat
             // (system text, 0x1E, user text) replaces the source-sized prompt.
-            if(const auto* messages_path=std::getenv("NINFER_TEST_ENGINE_DEVICE_MESSAGES")) {
+            if(const auto* messages_path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_MESSAGES")) {
                 std::ifstream messages_file(messages_path,std::ios::binary);
                 std::string messages(std::istreambuf_iterator<char>{messages_file},
                     std::istreambuf_iterator<char>{});
@@ -428,7 +428,7 @@ int main() {
             const auto long_count=explicit_messages?engine->count_tokens(long_prompt):count_for(low);
             if(long_count>static_cast<std::uint32_t>(prefix+128))
                 throw std::runtime_error("device Engine long prompt exceeded headroom");
-            if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_PROMPT_OUT")) {
+            if(const auto* path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_PROMPT_OUT")) {
                 std::ofstream out(path,std::ios::binary);
                 out<<long_prompt.messages.back().parts.front().text;
                 if(!out)throw std::runtime_error(
@@ -436,12 +436,12 @@ int main() {
             }
             request.execution.requested_output_tokens=long_outputs;
             auto long_prepared=engine->prepare(long_prompt);
-            if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_IDS_OUT")) {
-                auto frontend=ninfer::targets::qwen3_6::make_frontend(
-                    ninfer::exl3::load_pinned_frontend_resources(target),
+            if(const auto* path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_IDS_OUT")) {
+                auto frontend=voidinfer::targets::qwen3_6::make_frontend(
+                    voidinfer::exl3::load_pinned_frontend_resources(target),
                     {.vision_enabled=false,.max_context=options.max_context});
                 const auto encoded=frontend.prepare(long_prompt);
-                const auto& ids=ninfer::targets::qwen3_6::PreparedPromptAccess::
+                const auto& ids=voidinfer::targets::qwen3_6::PreparedPromptAccess::
                     view(encoded).token_ids;
                 if(ids.size()!=long_count)
                     throw std::runtime_error("device Engine HTTP token export count changed");
@@ -451,42 +451,42 @@ int main() {
                     "device Engine HTTP token export failed");
             }
             const bool coherent_o_k7=[] {
-                const auto* option=std::getenv("NINFER_EXL3_COHERENT_O_K7");
+                const auto* option=std::getenv("VOIDINFER_EXL3_COHERENT_O_K7");
                 return option && std::string_view(option)=="1";
             }();
-            const auto o_k7_calls_before=ninfer::exl3::Exl3CudaLinearWorkspace::
+            const auto o_k7_calls_before=voidinfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_o_k7_calls_for_test();
-            const auto o_k7_rows_before=ninfer::exl3::Exl3CudaLinearWorkspace::
+            const auto o_k7_rows_before=voidinfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_o_k7_rows_for_test();
             const bool coherent_down_k7=[] {
-                const auto* option=std::getenv("NINFER_EXL3_COHERENT_DOWN_K7");
+                const auto* option=std::getenv("VOIDINFER_EXL3_COHERENT_DOWN_K7");
                 return option && std::string_view(option)=="1";
             }();
-            const auto down_k7_calls_before=ninfer::exl3::Exl3CudaLinearWorkspace::
+            const auto down_k7_calls_before=voidinfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_down_k7_calls_for_test();
-            const auto down_k7_rows_before=ninfer::exl3::Exl3CudaLinearWorkspace::
+            const auto down_k7_rows_before=voidinfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_down_k7_rows_for_test();
             const bool coherent_wide_k6=[] {
-                const auto* option=std::getenv("NINFER_EXL3_TARGET_COHERENT_WIDE_K6");
+                const auto* option=std::getenv("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6");
                 return option && std::string_view(option)=="1";
             }();
             std::uint64_t wide_calls_before[5]{},wide_rows_before[5]{};
             for(int operation=0;operation<5;++operation) {
                 wide_calls_before[operation]=
-                    ninfer::exl3::Exl3CudaLinearWorkspace::
+                    voidinfer::exl3::Exl3CudaLinearWorkspace::
                         coherent_wide_k6_calls_for_test(operation);
                 wide_rows_before[operation]=
-                    ninfer::exl3::Exl3CudaLinearWorkspace::
+                    voidinfer::exl3::Exl3CudaLinearWorkspace::
                         coherent_wide_k6_rows_for_test(operation);
             }
             const bool coherent_ordinary_graphs=[] {
-                const auto* option=std::getenv("NINFER_EXL3_COHERENT_ORDINARY_GRAPHS");
+                const auto* option=std::getenv("VOIDINFER_EXL3_COHERENT_ORDINARY_GRAPHS");
                 return !option || std::string_view(option)=="1";
             }();
-            const auto graphs_before=ninfer::exl3::Exl3TextContext::
+            const auto graphs_before=voidinfer::exl3::Exl3TextContext::
                 ordinary_graph_process_stats_for_test();
             const auto long_result=engine->generate(std::move(long_prepared),request);
-            const auto graphs_after=ninfer::exl3::Exl3TextContext::
+            const auto graphs_after=voidinfer::exl3::Exl3TextContext::
                 ordinary_graph_process_stats_for_test();
             const auto gdn_replays=graphs_after.gdn_segment_replays-graphs_before.gdn_segment_replays;
             const auto full_replays=graphs_after.full_layer_replays-graphs_before.full_layer_replays;
@@ -506,9 +506,9 @@ int main() {
             const auto captured_only=[&](std::uint64_t request_calls,std::size_t index) {
                 return graphs_replayed && request_calls==0 && construction_dispatch[index]>0;
             };
-            const auto down_k7_calls=ninfer::exl3::Exl3CudaLinearWorkspace::
+            const auto down_k7_calls=voidinfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_down_k7_calls_for_test()-down_k7_calls_before;
-            const auto down_k7_rows=ninfer::exl3::Exl3CudaLinearWorkspace::
+            const auto down_k7_rows=voidinfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_down_k7_rows_for_test()-down_k7_rows_before;
             std::cout<<"COHERENT_DEVICE_ENGINE_DOWN_K7 enabled="<<coherent_down_k7
                      <<" calls="<<down_k7_calls<<" rows="<<down_k7_rows<<'\n';
@@ -516,9 +516,9 @@ int main() {
             // batched route, asynchronous ones share the routes with the exact
             // line: the per-route row counts no longer cover the output.
             const bool fold_rounds=[] {
-                const char* fold=std::getenv("NINFER_EXL3_VERICACHE_FOLD");
-                const char* async=std::getenv("NINFER_EXL3_VERICACHE_ASYNC");
-                const char* vericache=std::getenv("NINFER_EXL3_VERICACHE");
+                const char* fold=std::getenv("VOIDINFER_EXL3_VERICACHE_FOLD");
+                const char* async=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC");
+                const char* vericache=std::getenv("VOIDINFER_EXL3_VERICACHE");
                 const bool exact_line=!(vericache && (std::string_view(vericache)=="0" ||
                     std::string_view(vericache)=="tolerance"));
                 return exact_line && ((fold && std::string_view(fold)=="1") ||
@@ -528,9 +528,9 @@ int main() {
                     down_k7_rows<static_cast<std::uint64_t>(long_outputs))) ||
                (!coherent_down_k7 && (down_k7_calls!=0 || down_k7_rows!=0))))
                 throw std::runtime_error("device Engine K7 down dispatch mismatch");
-            const auto o_k7_calls=ninfer::exl3::Exl3CudaLinearWorkspace::
+            const auto o_k7_calls=voidinfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_o_k7_calls_for_test()-o_k7_calls_before;
-            const auto o_k7_rows=ninfer::exl3::Exl3CudaLinearWorkspace::
+            const auto o_k7_rows=voidinfer::exl3::Exl3CudaLinearWorkspace::
                 process_coherent_o_k7_rows_for_test()-o_k7_rows_before;
             std::cout<<"COHERENT_DEVICE_ENGINE_O_K7 enabled="<<coherent_o_k7
                      <<" calls="<<o_k7_calls<<" rows="<<o_k7_rows<<'\n';
@@ -540,10 +540,10 @@ int main() {
                 throw std::runtime_error("device Engine K7 O dispatch mismatch");
             constexpr const char* wide_names[5]={"q","qkv","z","o","gate_up"};
             for(int operation=0;operation<5;++operation) {
-                const auto calls=ninfer::exl3::Exl3CudaLinearWorkspace::
+                const auto calls=voidinfer::exl3::Exl3CudaLinearWorkspace::
                     coherent_wide_k6_calls_for_test(operation)-
                     wide_calls_before[operation];
-                const auto rows=ninfer::exl3::Exl3CudaLinearWorkspace::
+                const auto rows=voidinfer::exl3::Exl3CudaLinearWorkspace::
                     coherent_wide_k6_rows_for_test(operation)-
                     wide_rows_before[operation];
                 std::cout<<"COHERENT_DEVICE_ENGINE_WIDE_K6 op="
@@ -556,13 +556,13 @@ int main() {
                     throw std::runtime_error(
                         "device Engine coherent wide K6 dispatch mismatch");
             }
-            if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_TOKEN_IDS_OUT")) {
+            if(const auto* path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_TOKEN_IDS_OUT")) {
                 std::ofstream out(path,std::ios::binary);
                 for(const auto id:long_result.generated_token_ids)out<<id<<'\n';
                 if(!out)throw std::runtime_error(
                     "device Engine output token export failed");
             }
-            if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_OUTPUT_OUT")) {
+            if(const auto* path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_OUTPUT_OUT")) {
                 std::ofstream out(path,std::ios::binary);
                 out<<long_result.content;
                 if(!out)throw std::runtime_error(
@@ -599,7 +599,7 @@ int main() {
                 throw std::runtime_error(
                     "device Engine long output witness too short or inconsistent: "+
                     long_result.content.substr(0,160));
-            if(const auto* cancel=std::getenv("NINFER_TEST_ENGINE_DEVICE_CANCEL");
+            if(const auto* cancel=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_CANCEL");
                cancel && std::string_view(cancel)=="1") {
                 struct CancellingSink final:OutputSink {
                     bool published=false;
@@ -640,7 +640,7 @@ int main() {
                  <<" prefill_seconds="<<first.timings.prefill_seconds
                  <<" decode_seconds="<<first.timings.decode_seconds
                  <<" repeats_equal="<<(warm_only?"skipped":"1")<<'\n';
-        if(const auto* path=std::getenv("NINFER_TEST_ENGINE_DEVICE_FIRST_IDS_OUT")) {
+        if(const auto* path=std::getenv("VOIDINFER_TEST_ENGINE_DEVICE_FIRST_IDS_OUT")) {
             engine.reset();
             direct_binary_probe(path,target,draft,options.max_context,
                 "COHERENT_DEVICE_DIRECT_BINARY_POST");

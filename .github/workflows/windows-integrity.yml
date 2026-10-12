@@ -71,7 +71,7 @@ jobs:
       - name: Reject local and generated artifacts
         shell: pwsh
         run: |
-          $pattern = '(?i)(^|/)(\.codex|\.agents|sessions|memory|results)(/|$)|(^|/)\.mcp\.json$|(^|/)(auth|credentials|tokens|oauth)\.json$|(^|/)\.env($|\.)|\.(exe|dll|pdb|ncu-rep|nsys-rep|dmp|trace|sqlite|db|ninfer|ckpt|onnx|pt|pth|npy|npz|safetensors|gguf)$'
+          $pattern = '(?i)(^|/)(\.codex|\.agents|sessions|memory|results)(/|$)|(^|/)\.mcp\.json$|(^|/)(auth|credentials|tokens|oauth)\.json$|(^|/)\.env($|\.)|\.(exe|dll|pdb|ncu-rep|nsys-rep|dmp|trace|sqlite|db|voidinfer|ckpt|onnx|pt|pth|npy|npz|safetensors|gguf)$'
           $blocked = @(git ls-files | Where-Object { $_ -match $pattern })
           if ($blocked.Count -ne 0) {
             $blocked | Write-Error

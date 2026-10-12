@@ -5,7 +5,7 @@
 // of byte b) and FP16 (scale, zero) per 128-dim group.
 #include <cstddef>
 
-namespace ninfer::exl3::l0_oscar_format {
+namespace voidinfer::exl3::l0_oscar_format {
 
 constexpr int kCodeBits = 4;
 constexpr int kCodeLevels = (1 << kCodeBits) - 1;
@@ -15,4 +15,4 @@ constexpr int kMetaHalves = 4;                     // scale0, zero0, scale1, zer
 constexpr std::size_t kRowCodeBytes = static_cast<std::size_t>(2) * 4 * kCodeBytes;
 constexpr std::size_t kRowMetaBytes = static_cast<std::size_t>(2) * 4 * kMetaHalves * 2;
 
-} // namespace ninfer::exl3::l0_oscar_format
+} // namespace voidinfer::exl3::l0_oscar_format

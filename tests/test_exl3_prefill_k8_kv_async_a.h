@@ -5,26 +5,26 @@
 // the measured-checkout owner can include it and add the prepared mode without
 // changing the candidate implementation.
 struct PrefillK8KvAsyncAQualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit = Admission::target_wide_prefill;
     static constexpr int max_rows = 1024;
     static constexpr std::size_t guard = 128;
 
     struct EnvironmentRestore {
         std::array<std::pair<const char*,std::string>,9> values{{
-            {"NINFER_EXL3_PREFILL_K8_KV_ASYNC_A",env("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A")},
-            {"NINFER_EXL3_WIDE_PREFILL",env("NINFER_EXL3_WIDE_PREFILL")},
-            {"NINFER_EXL3_PREFILL_STAGED_REDUCTION",env("NINFER_EXL3_PREFILL_STAGED_REDUCTION")},
-            {"NINFER_EXL3_PREFILL_DIRECT_PARTIALS",env("NINFER_EXL3_PREFILL_DIRECT_PARTIALS")},
-            {"NINFER_EXL3_PREFILL_DIRECT_ASYNC_A",env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A")},
-            {"NINFER_EXL3_PREFILL_WIDE64",env("NINFER_EXL3_PREFILL_WIDE64")},
-            {"NINFER_EXL3_PREFILL_WIDE128",env("NINFER_EXL3_PREFILL_WIDE128")},
-            {"NINFER_EXL3_PREFILL_WIDE256",env("NINFER_EXL3_PREFILL_WIDE256")},
-            {"NINFER_EXL3_PREFILL_WIDE512",env("NINFER_EXL3_PREFILL_WIDE512")}}};
-        std::string wide1024 = env("NINFER_EXL3_PREFILL_WIDE1024");
+            {"VOIDINFER_EXL3_PREFILL_K8_KV_ASYNC_A",env("VOIDINFER_EXL3_PREFILL_K8_KV_ASYNC_A")},
+            {"VOIDINFER_EXL3_WIDE_PREFILL",env("VOIDINFER_EXL3_WIDE_PREFILL")},
+            {"VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION")},
+            {"VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",env("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS")},
+            {"VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A",env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A")},
+            {"VOIDINFER_EXL3_PREFILL_WIDE64",env("VOIDINFER_EXL3_PREFILL_WIDE64")},
+            {"VOIDINFER_EXL3_PREFILL_WIDE128",env("VOIDINFER_EXL3_PREFILL_WIDE128")},
+            {"VOIDINFER_EXL3_PREFILL_WIDE256",env("VOIDINFER_EXL3_PREFILL_WIDE256")},
+            {"VOIDINFER_EXL3_PREFILL_WIDE512",env("VOIDINFER_EXL3_PREFILL_WIDE512")}}};
+        std::string wide1024 = env("VOIDINFER_EXL3_PREFILL_WIDE1024");
         ~EnvironmentRestore() {
             for (const auto& value : values) _putenv_s(value.first,value.second.c_str());
-            _putenv_s("NINFER_EXL3_PREFILL_WIDE1024",wide1024.c_str());
+            _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE1024",wide1024.c_str());
         }
     } restore;
 
@@ -33,33 +33,33 @@ struct PrefillK8KvAsyncAQualification {
     std::uint64_t values = 0;
 
     PrefillK8KvAsyncAQualification() {
-        for (const char* name : {"NINFER_EXL3_WIDE_PREFILL",
-                                 "NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-                                 "NINFER_EXL3_PREFILL_DIRECT_PARTIALS",
-                                 "NINFER_EXL3_PREFILL_DIRECT_ASYNC_A",
-                                 "NINFER_EXL3_PREFILL_WIDE64",
-                                 "NINFER_EXL3_PREFILL_WIDE128",
-                                 "NINFER_EXL3_PREFILL_WIDE256",
-                                 "NINFER_EXL3_PREFILL_WIDE512",
-                                 "NINFER_EXL3_PREFILL_WIDE1024"})
+        for (const char* name : {"VOIDINFER_EXL3_WIDE_PREFILL",
+                                 "VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+                                 "VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",
+                                 "VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A",
+                                 "VOIDINFER_EXL3_PREFILL_WIDE64",
+                                 "VOIDINFER_EXL3_PREFILL_WIDE128",
+                                 "VOIDINFER_EXL3_PREFILL_WIDE256",
+                                 "VOIDINFER_EXL3_PREFILL_WIDE512",
+                                 "VOIDINFER_EXL3_PREFILL_WIDE1024"})
             _putenv_s(name,"1");
-        _putenv_s("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K8_KV_ASYNC_A","0");
     }
 
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& x, void* user) {
+        const voidinfer::exl3::Exl3TargetProjectionObservation& x, void* user) {
         static_cast<PrefillK8KvAsyncAQualification*>(user)->check(x);
     }
 
     static std::unique_ptr<Exl3CudaLinearWorkspace> workspace(bool candidate) {
-        _putenv_s("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A",candidate ? "1" : "0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K8_KV_ASYNC_A",candidate ? "1" : "0");
         return std::make_unique<Exl3CudaLinearWorkspace>(
             5120,1024,max_rows,false,false,false,false,false,true,false,
-            ninfer::exl3::Exl3CudaAccumulationView{},
-            ninfer::exl3::Exl3CudaTransformView{},false,true,false);
+            voidinfer::exl3::Exl3CudaAccumulationView{},
+            voidinfer::exl3::Exl3CudaTransformView{},false,true,false);
     }
 
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         if (x.rows < max_rows || x.metadata.K != 8 ||
             x.metadata.in_features != 5120 || x.metadata.out_features != 1024 ||
             (std::string(x.operation) != "k" && std::string(x.operation) != "v") ||
@@ -68,7 +68,7 @@ struct PrefillK8KvAsyncAQualification {
 
         auto control = workspace(false);
         auto candidate = workspace(true);
-        _putenv_s("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K8_KV_ASYNC_A","0");
         require(!candidate->target_k8_kv_prefill_async_a_candidate(x.metadata,16,admit) &&
                 candidate->target_k8_kv_prefill_async_a_candidate(x.metadata,17,admit) &&
                 candidate->target_k8_kv_prefill_async_a_candidate(x.metadata,max_rows,admit) &&
@@ -117,27 +117,27 @@ struct PrefillK8KvAsyncAQualification {
 
 void run_prefill_k8_kv_async_a_qualification(Exl3TextModel& target) {
     for (const char* malformed : {"2","true","01"}) {
-        _putenv_s("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A",malformed);
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K8_KV_ASYNC_A",malformed);
         bool rejected=false;
         try {
             Exl3CudaLinearWorkspace invalid(
                 5120,1024,PrefillK8KvAsyncAQualification::max_rows,
                 false,false,false,false,false,true,false,
-                ninfer::exl3::Exl3CudaAccumulationView{},
-                ninfer::exl3::Exl3CudaTransformView{},false,true,false);
+                voidinfer::exl3::Exl3CudaAccumulationView{},
+                voidinfer::exl3::Exl3CudaTransformView{},false,true,false);
         }
         catch (const std::invalid_argument&) { rejected=true; }
         require(rejected,"K8 K/V async-A accepted malformed opt-in");
     }
     PrefillK8KvAsyncAQualification qualification;
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size()>=16+PrefillK8KvAsyncAQualification::max_rows,
             "K8 K/V async-A prompt extent");
     auto context=target.create_context(true);
     context->prefill(std::span<const std::int64_t>(ids.data(),16));
     context->set_target_projection_observer_for_test(
         PrefillK8KvAsyncAQualification::callback,&qualification,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_exact_prefill_wide(std::span<const std::int64_t>(
         ids.data()+16,PrefillK8KvAsyncAQualification::max_rows));
     context->finish_exact_prefill();

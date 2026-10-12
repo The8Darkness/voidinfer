@@ -26,15 +26,15 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
-// VeriCache (NINFER_EXL3_VERICACHE): L0 OSCAR drafts blocks of tokens that
+// VeriCache (VOIDINFER_EXL3_VERICACHE): L0 OSCAR drafts blocks of tokens that
 // are re-run in one pass against the exact FP16-L2 history before
 // publication; the first drafted token the exact model would not have
 // produced is replaced and the rest of the block is redrafted. The block
 // length is chosen per request (engine DraftHorizon, VeriCache paper) up to
-// NINFER_EXL3_VERICACHE_BLOCK. A drafted token is kept when its exact logit
-// trails the exact choice by at most NINFER_EXL3_VERICACHE_DELTA (sampled
+// VOIDINFER_EXL3_VERICACHE_BLOCK. A drafted token is kept when its exact logit
+// trails the exact choice by at most VOIDINFER_EXL3_VERICACHE_DELTA (sampled
 // requests: the coupled perturbed values, sampled_select.cuh). "1"/"exact"
 // (default): 0.0625, twice the arithmetic floor measured between the decode
 // and verifier kernels on identical exact history (max 0.03 over 2K
@@ -48,18 +48,18 @@ struct Exl3VeriCacheConfig {
         static const Exl3VeriCacheConfig value=[] {
             Exl3VeriCacheConfig c;
             // Exact verification of L0 OSCAR output is the default whenever L0
-            // is (NINFER_EXL3_VERICACHE=0 opts out, =tolerance relaxes it).
-            const char* mode=std::getenv("NINFER_EXL3_VERICACHE");
+            // is (VOIDINFER_EXL3_VERICACHE=0 opts out, =tolerance relaxes it).
+            const char* mode=std::getenv("VOIDINFER_EXL3_VERICACHE");
             const std::string m=mode?mode:(exl3_l0_oscar_enabled()?"1":"0");
             if(m=="0"||m.empty()) return c;
             if(m!="1" && m!="tolerance" && m!="exact")
-                throw std::invalid_argument("NINFER_EXL3_VERICACHE must be 0, 1, tolerance or exact");
+                throw std::invalid_argument("VOIDINFER_EXL3_VERICACHE must be 0, 1, tolerance or exact");
             c.enabled=true;
             if(m!="tolerance") c.delta=0.0625f;
-            if(const char* d=std::getenv("NINFER_EXL3_VERICACHE_DELTA")) c.delta=std::strtof(d,nullptr);
-            if(const char* b=std::getenv("NINFER_EXL3_VERICACHE_BLOCK")) c.block=std::atoi(b);
+            if(const char* d=std::getenv("VOIDINFER_EXL3_VERICACHE_DELTA")) c.delta=std::strtof(d,nullptr);
+            if(const char* b=std::getenv("VOIDINFER_EXL3_VERICACHE_BLOCK")) c.block=std::atoi(b);
             if(c.block<1 || c.block>1024 || !(c.delta>=0.0f))
-                throw std::invalid_argument("NINFER_EXL3_VERICACHE_BLOCK must be 1..1024 and DELTA >= 0");
+                throw std::invalid_argument("VOIDINFER_EXL3_VERICACHE_BLOCK must be 1..1024 and DELTA >= 0");
             return c;
         }();
         return value;
@@ -120,7 +120,7 @@ public:
         double target_seed_ms=0,draft_api_ms=0;
         std::uint64_t verified_blocks=0,corrected_blocks=0;
         std::uint64_t accepted_checked=0,accepted_off_greedy=0;
-        // NINFER_EXL3_VERICACHE_STATS: synchronized step wall times.
+        // VOIDINFER_EXL3_VERICACHE_STATS: synchronized step wall times.
         double restore_ms=0,forward_ms=0,scores_ms=0,fix_ms=0,commit_ms=0;
         double verify_ms=0,accepted_gap_sum=0;
         float max_accepted_gap=0;
@@ -621,7 +621,7 @@ public:
         phase_=Phase::executing;
         try {
             const auto start=Clock::now();
-            static const bool timed=std::getenv("NINFER_EXL3_VERICACHE_STATS")!=nullptr;
+            static const bool timed=std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")!=nullptr;
             auto mark=start;
             const auto step=[&](double& total) {
                 if(!timed)return;
@@ -945,7 +945,7 @@ public:
             context_->save_verified_root(stream_);
             draft_.save_ring_checkpoint(verify_rows_,stream_);
             verified_frontier_=frontier_;
-            if(std::getenv("NINFER_EXL3_VERICACHE_STATS")) {
+            if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")) {
                 check(poll_then_sync(stream_),"vericache commit timing");
                 totals_.commit_ms+=elapsed(commit_start);
             }
@@ -1043,7 +1043,7 @@ private:
         phase_=Phase::executing;
         try {
             const auto start=Clock::now();
-            static const bool timed=std::getenv("NINFER_EXL3_VERICACHE_STATS")!=nullptr;
+            static const bool timed=std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")!=nullptr;
             auto mark=start;
             const auto step=[&](double& total) {
                 if(!timed)return;
@@ -1219,7 +1219,7 @@ private:
         context_->set_l0_exact_history(false);
     }
     static cudaError_t poll_then_sync(cudaStream_t stream) {
-        const auto error=ninfer::cuda_poll_stream(stream);
+        const auto error=voidinfer::cuda_poll_stream(stream);
         return error!=cudaSuccess?error:cudaStreamSynchronize(stream);
     }
     static void check(cudaError_t error,const char* operation) {
@@ -1350,7 +1350,7 @@ private:
             context_->begin_transaction(stream_);
         // Verification tree (verification_tree.h): the draft proposes the
         // full chain, then the round keeps a chain prefix and fills the
-        // remaining verifier rows with up to NINFER_DFLASH2_SIBLINGS sibling
+        // remaining verifier rows with up to VOIDINFER_DFLASH2_SIBLINGS sibling
         // leaves at the depths where they add the most expected acceptance.
         const bool tree=deferred && sibling_count()>0;
         draft_.set_proposal_candidates(tree);
@@ -1420,7 +1420,7 @@ private:
         value.verifier_ms=elapsed(verifier_start);
         if(after_verify)after_verify(*context_);
         value.committed_tokens=value.verification.committed_tokens;
-        if(const char* log_path=std::getenv("NINFER_DFLASH2_ROUND_LOG")) {
+        if(const char* log_path=std::getenv("VOIDINFER_DFLASH2_ROUND_LOG")) {
             // Diagnostic-only round record: root position, proposal chain,
             // committed tokens, the draft's per-position top-16 candidates and
             // their unary scores (all drafted positions).
@@ -1471,14 +1471,14 @@ private:
         value.terminal=value.verification.stopped;
     }
 
-    // NINFER_DFLASH2_SIBLINGS: maximum sibling leaves per verification tree
+    // VOIDINFER_DFLASH2_SIBLINGS: maximum sibling leaves per verification tree
     // (0: plain chain verification).
     static int sibling_count() {
         static const int count=[] {
-            const char* value=std::getenv("NINFER_DFLASH2_SIBLINGS");
+            const char* value=std::getenv("VOIDINFER_DFLASH2_SIBLINGS");
             const int parsed=value?std::atoi(value):6;
             if(parsed<0 || parsed>6)
-                throw std::invalid_argument("NINFER_DFLASH2_SIBLINGS must be 0..6");
+                throw std::invalid_argument("VOIDINFER_DFLASH2_SIBLINGS must be 0..6");
             return parsed;
         }();
         return count;
@@ -1501,10 +1501,10 @@ private:
             check(cudaGetDevice(&device_),"asynchronous verification device");
             // Lowest priority: the pass is bound by the PCIe history stream, so
             // its kernels fill SMs the decode lane leaves idle.
-            // NINFER_EXL3_VERICACHE_ASYNC_PRIORITY=1: highest instead.
+            // VOIDINFER_EXL3_VERICACHE_ASYNC_PRIORITY=1: highest instead.
             int least=0,greatest=0;
             check(cudaDeviceGetStreamPriorityRange(&least,&greatest),"asynchronous verification priority");
-            const char* priority=std::getenv("NINFER_EXL3_VERICACHE_ASYNC_PRIORITY");
+            const char* priority=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC_PRIORITY");
             check(cudaStreamCreateWithPriority(&stream_,cudaStreamNonBlocking,
                 priority && std::string_view(priority)=="1"?greatest:least),"asynchronous verification stream");
             check(cudaEventCreateWithFlags(&fork_,cudaEventDisableTiming),"asynchronous verification event");
@@ -1613,8 +1613,8 @@ private:
     std::vector<std::int64_t> device_pending_terminal_;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3
 
-static_assert(ninfer::exl3::Exl3FastDeviceRound::retained_start_for(4096)==2048);
-static_assert(ninfer::exl3::Exl3FastDeviceRound::retained_start_for(16384)==14336);
-static_assert(ninfer::exl3::Exl3FastDeviceRound::retained_start_for(4097)==2048);
+static_assert(voidinfer::exl3::Exl3FastDeviceRound::retained_start_for(4096)==2048);
+static_assert(voidinfer::exl3::Exl3FastDeviceRound::retained_start_for(16384)==14336);
+static_assert(voidinfer::exl3::Exl3FastDeviceRound::retained_start_for(4097)==2048);

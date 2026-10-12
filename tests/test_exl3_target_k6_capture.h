@@ -1,8 +1,8 @@
 #pragma once
 
 struct TargetK6CapturedProjection {
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     std::vector<std::uint16_t> input;
     int layer = -1;
     std::string operation;
@@ -10,7 +10,7 @@ struct TargetK6CapturedProjection {
 };
 
 void capture_target_k6_projection(
-    const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+    const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
     void* user) {
     auto& captured = *static_cast<std::vector<TargetK6CapturedProjection>*>(user);
     require(observation.input != nullptr && observation.operation != nullptr &&
@@ -56,20 +56,20 @@ std::vector<TargetK6CapturedProjection> run_target_k6_capture_selected(
     Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& prompt,
     const std::filesystem::path& output_directory, bool oscar,
-    ninfer::exl3::Exl3TargetProjectionObserverSelection selection) {
+    voidinfer::exl3::Exl3TargetProjectionObserverSelection selection) {
     require(prompt.size() == 512, "target K6 capture requires ctx512");
     require(target.max_context() >= 520,
             "target K6 capture requires context capacity at least 520");
     require(oscar, "target K6 capture requires canonical OSCAR");
     const bool write_capture = !output_directory.empty();
     const bool capture_down_k7 = selection ==
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::down_k7;
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::down_k7;
     const bool capture_gateup_k7 = selection ==
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k7;
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k7;
     const bool capture_down = capture_down_k7 || selection ==
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::down_k6;
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::down_k6;
     require(capture_down || capture_gateup_k7 || selection ==
-                ninfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k6,
+                voidinfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k6,
             "unsupported target projection capture selection");
     const int expected_k = (capture_down_k7 || capture_gateup_k7) ? 7 : 6;
     const int expected_records = capture_gateup_k7 ? 4 :
@@ -285,7 +285,7 @@ std::vector<TargetK6CapturedProjection> run_target_k6_capture(
     const std::filesystem::path& output_directory, bool oscar) {
     return run_target_k6_capture_selected(
         target, draft, prompt, output_directory, oscar,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k6);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k6);
 }
 
 std::vector<TargetK6CapturedProjection> run_target_down_k6_capture(
@@ -294,7 +294,7 @@ std::vector<TargetK6CapturedProjection> run_target_down_k6_capture(
     const std::filesystem::path& output_directory, bool oscar) {
     return run_target_k6_capture_selected(
         target, draft, prompt, output_directory, oscar,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::down_k6);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::down_k6);
 }
 
 std::vector<TargetK6CapturedProjection> run_target_down_k7_capture(
@@ -303,7 +303,7 @@ std::vector<TargetK6CapturedProjection> run_target_down_k7_capture(
     const std::filesystem::path& output_directory, bool oscar) {
     return run_target_k6_capture_selected(
         target, draft, prompt, output_directory, oscar,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::down_k7);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::down_k7);
 }
 
 std::vector<TargetK6CapturedProjection> run_target_gateup_k7_capture(
@@ -311,5 +311,5 @@ std::vector<TargetK6CapturedProjection> run_target_gateup_k7_capture(
     const std::vector<std::int64_t>& prompt, bool oscar) {
     return run_target_k6_capture_selected(
         target, draft, prompt, std::filesystem::path{}, oscar,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k7);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k7);
 }

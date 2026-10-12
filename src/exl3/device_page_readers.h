@@ -3,7 +3,7 @@
 #include "exl3/device_page_attention.h"
 #include <array>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Fixed Engine reader pool: admit every physical lane before constructing any
 // reader. Cache storage and request callback installation are separate owners.
 template<std::size_t Capacity> struct Exl3DevicePageReaders {

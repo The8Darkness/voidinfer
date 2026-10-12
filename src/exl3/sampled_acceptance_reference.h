@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3SampledAcceptanceOutcome {
     bool accepted=false;
@@ -88,4 +88,4 @@ public:
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

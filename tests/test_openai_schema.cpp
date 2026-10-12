@@ -20,7 +20,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using namespace ninfer::serve;
+using namespace voidinfer::serve;
 
 int fail(const std::string& message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -58,42 +58,42 @@ const char* webui_model() { return "qwen3.6-27b"; }
 
 ServeOptions default_server() { return ServeOptions{}; }
 
-ninfer::PromptCapabilities effort_capabilities() {
-    ninfer::PromptCapabilities capabilities;
+voidinfer::PromptCapabilities effort_capabilities() {
+    voidinfer::PromptCapabilities capabilities;
     capabilities.enable_thinking                 = true;
     capabilities.reasoning_effort.low            = true;
     capabilities.reasoning_effort.medium         = true;
     capabilities.reasoning_effort.xhigh          = true;
-    capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
+    capabilities.reasoning_effort.default_effort = voidinfer::ReasoningEffort::XHigh;
     return capabilities;
 }
 
-ninfer::OwnedMedia fake_media(const ContentPart& part) {
-    ninfer::OwnedMedia media;
+voidinfer::OwnedMedia fake_media(const ContentPart& part) {
+    voidinfer::OwnedMedia media;
     media.kind =
-        part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
+        part.kind == ContentKind::Image ? voidinfer::MediaKind::Image : voidinfer::MediaKind::Video;
     media.bytes.push_back(0);
     media.media_type = part.source.media_type;
     return media;
 }
 
-ninfer::PromptInput translate(const GenerationRequest& req) {
+voidinfer::PromptInput translate(const GenerationRequest& req) {
     const ServeOptions server = default_server();
     return to_prompt_input(req, resolve_prompt_semantics(req, server, effort_capabilities()),
                            fake_media);
 }
 
-ninfer::RequestOptions translate_options(const GenerationRequest& req) {
+voidinfer::RequestOptions translate_options(const GenerationRequest& req) {
     const ServeOptions server = default_server();
     return to_request_options(req, server,
                               resolve_prompt_semantics(req, server, effort_capabilities()),
                               server.allow_prefix_reuse);
 }
 
-std::string joined_text(const ninfer::ChatMessage& message) {
+std::string joined_text(const voidinfer::ChatMessage& message) {
     std::string text;
-    for (const ninfer::MessagePart& part : message.parts) {
-        if (part.kind == ninfer::MessagePartKind::Text) { text += part.text; }
+    for (const voidinfer::MessagePart& part : message.parts) {
+        if (part.kind == voidinfer::MessagePartKind::Text) { text += part.text; }
     }
     return text;
 }
@@ -118,7 +118,7 @@ int test_parse_string_content() {
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
     failures += check(req.model == "qwen3.6-27b", "model parsed");
     failures += check(req.messages.size() == 1, "one message parsed");
-    failures += check(req.messages[0].role == ninfer::ChatRole::User, "role parsed");
+    failures += check(req.messages[0].role == voidinfer::ChatRole::User, "role parsed");
     failures += check(req.messages[0].content.size() == 1, "one content part");
     failures += check(req.messages[0].content[0].kind == ContentKind::Text, "text part kind");
     failures += check(req.messages[0].content[0].text == "hello", "text part content");
@@ -199,14 +199,14 @@ int test_reasoning_effort() {
     const GenerationRequest low_request = parse_chat_completion_request(low, default_limits());
     failures += check(low_request.reasoning_effort == RequestedReasoningEffort::Low,
                       "Chat Completions reasoning_effort was not parsed");
-    const ninfer::PromptInput low_prompt = translate(low_request);
+    const voidinfer::PromptInput low_prompt = translate(low_request);
     failures += check(low_prompt.options.enable_thinking &&
-                          low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+                          low_prompt.options.reasoning_effort == voidinfer::ReasoningEffort::Low,
                       "Chat Completions low effort did not reach PromptInput");
 
     Json none                = base;
     none["reasoning_effort"] = "none";
-    const ninfer::PromptInput none_prompt =
+    const voidinfer::PromptInput none_prompt =
         translate(parse_chat_completion_request(none, default_limits()));
     failures += check(!none_prompt.options.enable_thinking && !none_prompt.options.reasoning_effort,
                       "Chat Completions none effort did not disable thinking");
@@ -235,7 +235,7 @@ int test_reasoning_effort() {
                       }) == "reasoning_effort_not_supported",
                       "protocol-valid high effort was not rejected by template capability");
 
-    ninfer::PromptCapabilities toggle_capabilities;
+    voidinfer::PromptCapabilities toggle_capabilities;
     toggle_capabilities.enable_thinking = true;
     failures += check(api_code([&] {
                           (void)resolve_prompt_semantics(low_request, default_server(),
@@ -272,7 +272,7 @@ int test_parse_parts_and_flatten() {
                                                     Json{{"type", "text"}, {"text", "b"}}})}}})}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
     failures += check(req.messages[0].content.size() == 2, "two content parts");
-    const ninfer::PromptInput prompt = translate(req);
+    const voidinfer::PromptInput prompt = translate(req);
     failures += check(prompt.messages.size() == 1, "flattened to one message");
     failures += check(joined_text(prompt.messages[0]) == "a\nb", "text parts joined");
     return failures;
@@ -291,23 +291,23 @@ int test_parse_media_in_translate() {
                    Json{{"type", "video_url"},
                         {"video_url", Json{{"url", "https://example.test/clip.mp4"}}}}})}}})}};
     const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
-    const ninfer::PromptInput prompt = translate(req);
+    const voidinfer::PromptInput prompt = translate(req);
     int failures                     = 0;
     failures += check(req.messages[0].content[0].kind == ContentKind::Image,
                       "image content kind preserved");
     failures += check(req.messages[0].content[0].source.kind ==
-                          ninfer::product::media_acquire::SourceKind::Data,
+                          voidinfer::product::media_acquire::SourceKind::Data,
                       "image data URI source preserved");
-    failures += check(prompt.messages[0].parts[0].kind == ninfer::MessagePartKind::Media &&
-                          prompt.messages[0].parts[0].media.kind == ninfer::MediaKind::Image,
+    failures += check(prompt.messages[0].parts[0].kind == voidinfer::MessagePartKind::Media &&
+                          prompt.messages[0].parts[0].media.kind == voidinfer::MediaKind::Image,
                       "image translated to structured chat part");
     failures += check(req.messages[0].content[1].kind == ContentKind::Video,
                       "video content kind preserved");
     failures += check(req.messages[0].content[1].source.kind ==
-                          ninfer::product::media_acquire::SourceKind::Url,
+                          voidinfer::product::media_acquire::SourceKind::Url,
                       "video URL source preserved");
-    failures += check(prompt.messages[0].parts[1].kind == ninfer::MessagePartKind::Media &&
-                          prompt.messages[0].parts[1].media.kind == ninfer::MediaKind::Video,
+    failures += check(prompt.messages[0].parts[1].kind == voidinfer::MessagePartKind::Media &&
+                          prompt.messages[0].parts[1].media.kind == voidinfer::MediaKind::Video,
                       "video translated to structured chat part");
     return failures;
 }
@@ -319,17 +319,17 @@ int test_instruction_roles_preserved() {
                                   Json{{"role", "user"}, {"content", "hi"}},
                                   Json{{"role", "system"}, {"content", "new context"}}})}};
     const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
-    const ninfer::PromptInput prompt = translate(req);
+    const voidinfer::PromptInput prompt = translate(req);
     int failures                     = 0;
     failures +=
-        check(req.messages.size() == 3 && req.messages[0].role == ninfer::ChatRole::Developer &&
-                  req.messages[1].role == ninfer::ChatRole::User &&
-                  req.messages[2].role == ninfer::ChatRole::System,
+        check(req.messages.size() == 3 && req.messages[0].role == voidinfer::ChatRole::Developer &&
+                  req.messages[1].role == voidinfer::ChatRole::User &&
+                  req.messages[2].role == voidinfer::ChatRole::System,
               "schema did not preserve ordered developer/system roles");
     failures += check(prompt.messages.size() == 3 &&
-                          prompt.messages[0].role == ninfer::ChatRole::Developer &&
-                          prompt.messages[1].role == ninfer::ChatRole::User &&
-                          prompt.messages[2].role == ninfer::ChatRole::System,
+                          prompt.messages[0].role == voidinfer::ChatRole::Developer &&
+                          prompt.messages[1].role == voidinfer::ChatRole::User &&
+                          prompt.messages[2].role == voidinfer::ChatRole::System,
                       "translation changed roles before target-specific lowering");
     return failures;
 }
@@ -478,7 +478,7 @@ int test_parse_tool_history_messages() {
     failures += check(req.messages[1].tool_calls[0].name == "get_weather", "tool call name parsed");
     failures += check(req.messages[1].tool_calls[0].arguments_json == R"({"city":"Paris"})",
                       "tool call arguments parsed");
-    failures += check(req.messages[2].role == ninfer::ChatRole::Tool, "tool role parsed");
+    failures += check(req.messages[2].role == voidinfer::ChatRole::Tool, "tool role parsed");
     failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
     failures +=
         check(req.messages[2].content.at(0).text == R"({"temp":20})", "tool content parsed");
@@ -503,7 +503,7 @@ int test_parse_stop_and_max_tokens() {
     failures += check(req.stop_strings.size() == 2, "two stop strings");
     failures += check(req.stop_strings[0] == "</s>", "stop string 0");
     failures += check(req.max_tokens == 42 && req.max_tokens_set, "max_completion_tokens alias");
-    const ninfer::RequestOptions options = translate_options(req);
+    const voidinfer::RequestOptions options = translate_options(req);
     failures += check(options.execution.requested_output_tokens == 42,
                       "max_completion_tokens reaches Engine options");
     failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "</s>" &&
@@ -536,7 +536,7 @@ int test_parse_sampling_carried() {
     failures +=
         check(req.sampling.logit_bias.count(5) == 1 && req.sampling.logit_bias.at(5) == -1.5,
               "logit_bias carried");
-    const ninfer::RequestOptions options = translate_options(req);
+    const voidinfer::RequestOptions options = translate_options(req);
     failures += check(options.execution.sampling.temperature == 0.7F,
                       "temperature reaches Engine overrides");
     failures += check(options.execution.sampling.top_p == 0.9F, "top_p reaches Engine overrides");
@@ -698,8 +698,8 @@ const Json list = Json::parse(make_models_list("qwen3.6-27b", 32768, 1));
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
-    failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
-    failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
+    failures += check(list.at("data").at(0).at("owned_by") == "voidinfer", "models list owner");
+    failures += check(list.at("data").at(0).at("owned_by") == "voidinfer", "models list owner");
     failures += check(list.at("data").at(0).at("meta").at("n_ctx") == 32768,
                       "models list entry reports served n_ctx");
 
@@ -707,8 +707,8 @@ const Json list = Json::parse(make_models_list("qwen3.6-27b", 32768, 1));
                       "models list entry reports loaded status");
 const Json one = Json::parse(make_model_object("qwen3.6-27b", 32768, 1));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
-    failures += check(one.at("owned_by") == "ninfer", "model owner");
-    failures += check(one.at("owned_by") == "ninfer", "model owner");
+    failures += check(one.at("owned_by") == "voidinfer", "model owner");
+    failures += check(one.at("owned_by") == "voidinfer", "model owner");
     failures += check(one.at("meta").at("n_ctx") == 32768,
                       "model object reports served n_ctx");
     failures += check(one.at("status").at("value") == "loaded",
@@ -729,12 +729,12 @@ const Json one = Json::parse(make_model_object("qwen3.6-27b", 32768, 1));
 
 int test_finish_reason_wire() {
     int failures = 0;
-    failures += check(std::string(finish_reason_wire(ninfer::FinishReason::StopToken)) == "stop",
+    failures += check(std::string(finish_reason_wire(voidinfer::FinishReason::StopToken)) == "stop",
                       "stop token wire");
     failures +=
-        check(std::string(finish_reason_wire(ninfer::FinishReason::OutputLimit)) == "length",
+        check(std::string(finish_reason_wire(voidinfer::FinishReason::OutputLimit)) == "length",
               "output limit wire");
-    failures += check(std::string(finish_reason_wire(ninfer::FinishReason::Cancelled)) == "stop",
+    failures += check(std::string(finish_reason_wire(voidinfer::FinishReason::Cancelled)) == "stop",
                       "cancelled maps to stop");
     return failures;
 }
@@ -793,10 +793,10 @@ int test_llama_webui_dialect() {
         parse_chat_completion_request(low, default_limits(), webui_model());
     failures += check(low_request.reasoning_effort == RequestedReasoningEffort::Low,
                       "webui reasoning_effort=low accepted");
-    const ninfer::PromptInput low_prompt =
+    const voidinfer::PromptInput low_prompt =
         translate(parse_chat_completion_request(low, default_limits(), webui_model()));
     failures += check(low_prompt.options.enable_thinking &&
-                          low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+                          low_prompt.options.reasoning_effort == voidinfer::ReasoningEffort::Low,
                       "webui low effort reached prompt");
 
     // conflicting enable_thinking=false vs effort low rejected at parse time

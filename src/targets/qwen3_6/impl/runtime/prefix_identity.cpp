@@ -5,7 +5,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace voidinfer::targets::qwen3_6::detail {
 namespace {
 
 bool same_grid(const VisionGrid& left, const VisionGrid& right) {
@@ -410,4 +410,4 @@ bool prefix_matches(const PreparedPromptData& prompt, std::span<const TokenId> r
            resident_identity.matches(prompt, count);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace voidinfer::targets::qwen3_6::detail

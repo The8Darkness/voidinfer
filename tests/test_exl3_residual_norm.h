@@ -23,7 +23,7 @@ inline void run_residual_norm_operator_comparison() {
         for(bool fused:{false,true}) {
             cuda_check(cudaMemset(r.get(),0x5a,got.size()*2),"residual fixture guard");
             cuda_check(cudaMemset(n.get(),0x5a,got.size()*2),"norm fixture guard");
-            ninfer::exl3::exl3_gdn_residual_norm(static_cast<const std::uint16_t*>(a.get()),
+            voidinfer::exl3::exl3_gdn_residual_norm(static_cast<const std::uint16_t*>(a.get()),
                 static_cast<const std::uint16_t*>(b.get()),static_cast<const std::uint16_t*>(w.get()),
                 static_cast<std::uint16_t*>(r.get())+guard,static_cast<std::uint16_t*>(n.get())+guard,rows,fused);
             for(bool normalized:{false,true}) {
@@ -50,7 +50,7 @@ inline void run_residual_norm_operator_comparison() {
                 cuda_check(cudaMemset(r.get(),0x5a,got.size()*2),"residual refusal guard");
                 cuda_check(cudaMemset(n.get(),0x5a,got.size()*2),"norm refusal guard");
                 bool refused=false;
-                try{ninfer::exl3::exl3_gdn_residual_norm(static_cast<const std::uint16_t*>(a.get()),
+                try{voidinfer::exl3::exl3_gdn_residual_norm(static_cast<const std::uint16_t*>(a.get()),
                     static_cast<const std::uint16_t*>(b.get()),static_cast<const std::uint16_t*>(w.get()),
                     residual,normalized,rows,fused);}
                 catch(const std::invalid_argument&){refused=true;}

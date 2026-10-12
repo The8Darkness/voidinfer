@@ -1,7 +1,7 @@
 #pragma once
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Synchronous borrow only. The containing model must remain alive and its
 // collection must not move/mutate. This is not an asynchronous retention token.
 template<class Descriptor> class Exl3BorrowedDescriptor {
@@ -18,4 +18,4 @@ public:
         return *descriptor_;
     }
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

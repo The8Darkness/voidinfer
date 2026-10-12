@@ -7,10 +7,10 @@ void run_t89_resident_profile(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
-    using Coordinator = ninfer::exl3::Exl3VeriCacheServingCoordinator;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
+    using Coordinator = voidinfer::exl3::Exl3VeriCacheServingCoordinator;
     constexpr std::size_t kPrompt = 4096;
     constexpr std::size_t kPrefix = 3968;
     constexpr std::size_t kTail = 128;
@@ -21,8 +21,8 @@ void run_t89_resident_profile(
     require(!output.empty() && !std::filesystem::exists(output),
             "T89 output must be new");
     std::filesystem::create_directories(output);
-    const auto reserve_gib = std::stoull(env("NINFER_T89_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T89_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T89_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T89_CACHE_MIB"));
     require(reserve_gib >= 8 && cache_mib >= 1024, "T89 memory policy extent");
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
     const std::uint64_t cache_budget = cache_mib * (1ULL << 20);
@@ -37,11 +37,11 @@ void run_t89_resident_profile(
         return state.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T89_NAMESPACE"), env("NINFER_T89_ARTIFACT_ID"),
-        env("NINFER_T89_TOKENIZER_ID"), env("NINFER_T89_CONFIGURATION_ID"),
-        env("NINFER_T89_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T89_NAMESPACE"), env("VOIDINFER_T89_ARTIFACT_ID"),
+        env("VOIDINFER_T89_TOKENIZER_ID"), env("VOIDINFER_T89_CONFIGURATION_ID"),
+        env("VOIDINFER_T89_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{16, 64, cache_budget, reserve}, identity);
     auto context_a = target.create_context(true);
     auto context_b = target.create_context(true);
@@ -120,7 +120,7 @@ void run_t89_resident_profile(
     std::array<std::vector<std::int64_t>,2> published_tokens;
     for (int ordinal = 0; ordinal < kOutputs; ++ordinal) {
         std::array<std::shared_ptr<const Request>,2> updated;
-        std::array<ninfer::exl3::Exl3OuterReferenceResult,2> verified;
+        std::array<voidinfer::exl3::Exl3OuterReferenceResult,2> verified;
         std::array<std::exception_ptr,2> errors;
         std::thread workers[2];
         for (int lane = 0; lane < 2; ++lane)

@@ -16,7 +16,7 @@ void run_outer_reference_qualification(Exl3TextModel& target,
         stage.row_ptrs.push_back(static_cast<std::uint16_t*>(stage.rows.back()->get()));
     }
     std::array<std::vector<std::int64_t>, 2> histories;
-    std::array<std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>, 2> l2;
+    std::array<std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>, 2> l2;
     const auto exact_ingest = [&](const std::vector<std::int64_t>& ids) {
         exact->reset(); exact->prefill(std::span<const std::int64_t>(ids.data(), 16));
         for (std::size_t i = 16; i < ids.size(); ++i) exact->decode(ids[i]);
@@ -38,7 +38,7 @@ void run_outer_reference_qualification(Exl3TextModel& target,
     // both with and without host diagnostics, and require a device consumer to
     // present its strong source binding before the context is touched.
     const auto artifact_route=[&](std::span<const std::int64_t> tentative,bool taps,
-                                  const ninfer::exl3::Exl3CommittedTapConsumer* consumer=nullptr) {
+                                  const voidinfer::exl3::Exl3CommittedTapConsumer* consumer=nullptr) {
         if(tentative.size()==1)
             return verify_exl3_outer_reference(*exact,*l2[0],tentative,taps,{},nullptr,false,nullptr,consumer);
         if(tentative.size()<=8)
@@ -64,8 +64,8 @@ void run_outer_reference_qualification(Exl3TextModel& target,
                 "outerref requested diagnostic missing");
         exact->restore_exact_host_state(*l2[0]);
         const auto before=exact->export_exact_host_state();
-        ninfer::exl3::Exl3CommittedTapConsumer missing_binding=[](
-            const ninfer::exl3::Exl3CommittedTapSegment&,cudaStream_t){};
+        voidinfer::exl3::Exl3CommittedTapConsumer missing_binding=[](
+            const voidinfer::exl3::Exl3CommittedTapSegment&,cudaStream_t){};
         bool refused=false;
         try{(void)artifact_route(tentative,false,&missing_binding);}
         catch(const std::invalid_argument&){refused=true;}
@@ -95,7 +95,7 @@ void run_outer_reference_qualification(Exl3TextModel& target,
                 tentative[0] = (sample_target(*exact) + 1) % kVocab;
             }
             outer_proposed += tentative.size();
-            const auto result = ninfer::exl3::verify_exl3_outer_reference(*exact, *l2[request], tentative);
+            const auto result = voidinfer::exl3::verify_exl3_outer_reference(*exact, *l2[request], tentative);
             outer_accepted += result.accepted;
             rejects += result.rejected;
             committed += result.committed_tokens.size();

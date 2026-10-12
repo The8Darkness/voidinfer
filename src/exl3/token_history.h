@@ -11,7 +11,7 @@
 #include <vector>
 #include "exl3/bounded_shared_owner.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Immutable authoritative token record pages. Equal strings do not deduplicate.
 // Explicit forks share both token pages and the bounded-depth index. Appending
 // copies only a partial tail and its radix path; destruction is bounded-depth too.
@@ -218,4 +218,4 @@ public:
         return result;
     }
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

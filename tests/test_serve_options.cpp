@@ -1,6 +1,6 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
-#include "ninfer/engine.h"
+#include "voidinfer/engine.h"
 
 #include <iostream>
 #include <string>
@@ -9,7 +9,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace voidinfer::serve;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -34,7 +34,7 @@ template <class Function> bool rejects(Function&& function) {
 }
 
 std::vector<std::string> package(std::vector<std::string> extra = {}) {
-    std::vector<std::string> arguments{"ninfer-serve", "--target", "target", "--draft", "draft"};
+    std::vector<std::string> arguments{"voidinfer-serve", "--target", "target", "--draft", "draft"};
     arguments.insert(arguments.end(), extra.begin(), extra.end());
     return arguments;
 }
@@ -49,22 +49,22 @@ int main() {
                           defaults.model.draft_directory == "draft" &&
                           defaults.model.vision_directory.empty() && !defaults.vision_enabled(),
                       "--target/--draft did not select the model package");
-    failures += check(rejects([] { (void)parse({"ninfer-serve"}); }),
+    failures += check(rejects([] { (void)parse({"voidinfer-serve"}); }),
                       "a server without --target/--draft was accepted");
-    failures += check(rejects([] { (void)parse({"ninfer-serve", "--target", "target"}); }),
+    failures += check(rejects([] { (void)parse({"voidinfer-serve", "--target", "target"}); }),
                       "a server without --draft was accepted");
-    failures += check(rejects([] { (void)parse({"ninfer-serve", "model.ninfer"}); }),
-                      "a positional .ninfer artifact was accepted");
+    failures += check(rejects([] { (void)parse({"voidinfer-serve", "model-dir"}); }),
+                      "a positional model path was accepted");
     failures += check(defaults.max_context == 32768, "--max-context does not default to 32768");
     failures += check(defaults.context_cache.host_kv_capacity_bytes ==
-                          ninfer::kDefaultHostKvCapacityBytes,
+                          voidinfer::kDefaultHostKvCapacityBytes,
                       "host KV does not default to 8 GiB at 32K");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures += check(!defaults.preserve_thinking, "thinking history preserved by default");
     failures += check(defaults.request_log_jsonl.empty(), "request log enabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000, "stats interval default changed");
-    failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
-                          defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes,
+    failures += check(defaults.media_cache_bytes == voidinfer::kDefaultMediaCacheBytes &&
+                          defaults.media_live_bytes == voidinfer::kDefaultMediaLiveBytes,
                       "media cache defaults changed");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
@@ -91,7 +91,7 @@ int main() {
     for (const char* removed : {"--kv-dtype", "--spec", "--exl3-round", "--kv-capacity",
                                 "--hierarchical-vericache", "--no-cuda-graph"})
         failures += check(rejects([&] { (void)parse(package({removed, "x"})); }),
-                          "a removed .ninfer-route option was accepted");
+                          "a removed inherited-route option was accepted");
 
     const ServeOptions configured =
         parse(package({"--max-concurrency", "4", "--max-context", "4096", "--max-pending-requests",
@@ -134,7 +134,7 @@ int main() {
 
     GenerationRequest request;
     request.max_tokens = 1;
-    ninfer::PromptCapabilities prompt_capabilities;
+    voidinfer::PromptCapabilities prompt_capabilities;
     prompt_capabilities.enable_thinking = true;
     const auto semantics = resolve_prompt_semantics(request, defaults, prompt_capabilities);
     failures +=
@@ -143,7 +143,7 @@ int main() {
     failures +=
         check(!to_request_options(request, defaults, semantics, false).execution.allow_prefix_reuse,
               "resolved disabled cache policy inherited external enablement");
-    const ninfer::RequestOptions inherited_sampling =
+    const voidinfer::RequestOptions inherited_sampling =
         to_request_options(request, sampling, semantics, sampling.allow_prefix_reuse);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
                           inherited_sampling.execution.sampling.top_p == 0.9F &&
@@ -173,15 +173,15 @@ int main() {
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "request preserve-thinking override did not win");
 
-    const std::string usage = serve_usage_text("ninfer-serve");
+    const std::string usage = serve_usage_text("voidinfer-serve");
     for (const char* flag : {"--target", "--draft", "--vision", "--host-kv-mib", "--no-prefix-reuse",
                              "--preserve-thinking", "--default-thinking-budget",
                              "--log-stats-interval-ms", "--media-preprocess-threads",
                              "--response-store-max-mib", "--request-log-jsonl"})
         failures += check(usage.find(flag) != std::string::npos, "serve help omits a flag");
-    failures += check(usage.find(".ninfer") == std::string::npos &&
-                          usage.find("--kv-dtype") == std::string::npos,
-                      "serve help still documents the .ninfer route");
+    failures += check(usage.find("--kv-dtype") == std::string::npos &&
+                          usage.find("--exl3-") == std::string::npos,
+                      "serve help still documents removed options");
 
     const ServeOptions logged =
         parse(package({"--request-log-jsonl", "requests.jsonl", "--api-key", "do-not-log"}));

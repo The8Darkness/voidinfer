@@ -3,7 +3,7 @@
 #include "exl3/bounded_shared_owner.h"
 #include <mutex>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3DevicePageWeakComponents {
     // One fill, immutable View and storage block for each of 64 ready entries.
     std::array<std::weak_ptr<const void>,192> owners;

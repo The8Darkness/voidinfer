@@ -7,26 +7,26 @@
 
 void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using Lane=ninfer::exl3::Exl3Dflash2Execution;
-    using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Lane=voidinfer::exl3::Exl3Dflash2Execution;
+    using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     using Root=std::shared_ptr<const Request>;
-    using Cache=ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity=ninfer::exl3::Exl3VeriCacheServingIdentity;
-    using ninfer::exl3::Exl3GreedyBatchSource;
-    using ninfer::exl3::Exl3GreedyPacket;
-    using ninfer::exl3::Exl3GreedyRow;
+    using Cache=voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity=voidinfer::exl3::Exl3VeriCacheServingIdentity;
+    using voidinfer::exl3::Exl3GreedyBatchSource;
+    using voidinfer::exl3::Exl3GreedyPacket;
+    using voidinfer::exl3::Exl3GreedyRow;
     using Clock=std::chrono::steady_clock;
     {
-        ninfer::exl3::RetainedDescriptorLedger ledger;
+        voidinfer::exl3::RetainedDescriptorLedger ledger;
         Lane::Pending source;source.verification.committed_tokens.reserve(16);
         source.verification.committed_tokens={1,2,3};
         source.verification.committed_taps[0].reserve(32);
         source.verification.committed_taps[0]={4,5};
-        const auto blocks=ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>();
+        const auto blocks=voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>();
         bool refused=false;
-        try{(void)Lane::copy_pending_reserved(source,[&](std::uint64_t)->ninfer::exl3::RetainedDescriptorLedger::Ticket {
-            require(ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks,
+        try{(void)Lane::copy_pending_reserved(source,[&](std::uint64_t)->voidinfer::exl3::RetainedDescriptorLedger::Ticket {
+            require(voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks,
                 "Pending copy allocated before reservation");throw std::bad_alloc();
         });}catch(const std::bad_alloc&){refused=true;}
         require(refused && ledger.bytes()==0,"Pending copy refusal leaked credit");
@@ -37,21 +37,21 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             return ledger.acquire(bytes);
         });}catch(const std::invalid_argument&){refused=true;}
         require(refused && ledger.bytes()==0 &&
-            ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks,
+            voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks,
             "Pending source growth during reservation reached copy allocation");
         source.verification.committed_tokens.swap(larger_tokens);
         refused=false;
         try{(void)Lane::copy_pending_reserved(source,[&](std::uint64_t bytes){return ledger.acquire(bytes-1);});}
         catch(const std::invalid_argument&){refused=true;}
         require(refused && ledger.bytes()==0 &&
-            ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks,
+            voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks,
             "underfunded Pending copy allocated or retained ownership");
         auto copied=Lane::copy_pending_reserved(source,[&](std::uint64_t bytes){return ledger.acquire(bytes);});
-        const auto actual=copied->payload_extent(ninfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>());
+        const auto actual=copied->payload_extent(voidinfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>());
         require(actual && ledger.bytes()==*actual && copied->verification.committed_tokens==source.verification.committed_tokens,
             "Pending copy actual capacity charge");
         auto independent=Lane::copy_pending_reserved(*copied,[&](std::uint64_t bytes){return ledger.acquire(bytes);});
-        const auto independent_bytes=independent->payload_extent(ninfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>());
+        const auto independent_bytes=independent->payload_extent(voidinfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>());
         require(independent_bytes && ledger.bytes()==*actual+*independent_bytes &&
             independent->verification.committed_tokens.data()!=copied->verification.committed_tokens.data(),
             "independent Pending copy reused payload allocation or credit");
@@ -60,16 +60,16 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             "Pending owner move changed allocation charge");
         moved.reset();require(ledger.bytes()==*actual,"independent Pending retirement changed source charge");
         std::weak_ptr<Lane::Pending> weak=copied;copied.reset();
-        require(ledger.bytes()==ninfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>(),
+        require(ledger.bytes()==voidinfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>(),
             "Pending copy weak lifetime lost control credit or retained payload credit");
         weak.reset();require(ledger.bytes()==0,"Pending copy final weak credit leak");
     }
     const auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
-    const int prefix=env("NINFER_REAL_DFLASH_PREFIX").empty()?512:std::stoi(env("NINFER_REAL_DFLASH_PREFIX"));
-    const int outputs=env("NINFER_REAL_DFLASH_OUTPUTS").empty()?32:std::stoi(env("NINFER_REAL_DFLASH_OUTPUTS"));
-    const int pairs=env("NINFER_REAL_DFLASH_PAIRS").empty()?1:std::stoi(env("NINFER_REAL_DFLASH_PAIRS"));
-    const std::filesystem::path output=env("NINFER_REAL_DFLASH_OUT");
-    const auto decode_nvtx=env("NINFER_REAL_DFLASH_NVTX");
+    const int prefix=env("VOIDINFER_REAL_DFLASH_PREFIX").empty()?512:std::stoi(env("VOIDINFER_REAL_DFLASH_PREFIX"));
+    const int outputs=env("VOIDINFER_REAL_DFLASH_OUTPUTS").empty()?32:std::stoi(env("VOIDINFER_REAL_DFLASH_OUTPUTS"));
+    const int pairs=env("VOIDINFER_REAL_DFLASH_PAIRS").empty()?1:std::stoi(env("VOIDINFER_REAL_DFLASH_PAIRS"));
+    const std::filesystem::path output=env("VOIDINFER_REAL_DFLASH_OUT");
+    const auto decode_nvtx=env("VOIDINFER_REAL_DFLASH_NVTX");
     require(decode_nvtx.empty() || decode_nvtx=="0" || decode_nvtx=="1",
         "real DFlash NVTX must be 0 or 1");
     const bool decode_nvtx_enabled=decode_nvtx=="1";
@@ -89,15 +89,15 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
     Identity identity{"solo-real-dflash","SC_6.00bpw_H6_V6","pinned-token-ids","exact-B8-greedy","text"};
     Cache cache(Cache::Policy{2,64,2ULL<<30,8ULL<<30},identity);
     Coordinator coordinator(cache,Coordinator::Policy{1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
-    const bool conditional_credit_fixture=env("NINFER_TEST_CONDITIONAL_RETENTION_CREDIT")=="1";
-    const bool conditional_credit_refusal=env("NINFER_TEST_CONDITIONAL_RETENTION_REFUSAL")=="1";
+    const bool conditional_credit_fixture=env("VOIDINFER_TEST_CONDITIONAL_RETENTION_CREDIT")=="1";
+    const bool conditional_credit_refusal=env("VOIDINFER_TEST_CONDITIONAL_RETENTION_REFUSAL")=="1";
     require(!conditional_credit_refusal || conditional_credit_fixture,"conditional refusal requires credit fixture");
     if(conditional_credit_fixture) {
-        require(env("NINFER_TEST_CONDITIONAL_B8")=="1","conditional retention credit fixture requires conditional mode");
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        require(env("VOIDINFER_TEST_CONDITIONAL_B8")=="1","conditional retention credit fixture requires conditional mode");
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         auto limits=Inventory::unlimited();
         limits[static_cast<unsigned>(Inventory::Domain::host_metadata)]=
-            ninfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>()+
+            voidinfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>()+
             8*sizeof(std::int64_t)+5ULL*8*5120*sizeof(std::uint16_t);
         if(conditional_credit_refusal)--limits[static_cast<unsigned>(Inventory::Domain::host_metadata)];
         // Component credit fixture only; other physical owners are not claimed
@@ -108,13 +108,13 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
     std::array<std::uint16_t*,5> staging{};
     for(int tap=0;tap<5;++tap){stage[tap]=std::make_unique<DeviceBuffer>(16ULL*kHidden*2);staging[tap]=static_cast<std::uint16_t*>(stage[tap]->get());}
     const auto make_lane=[&]{return std::make_unique<Lane>(target.create_context(true),draft,identity.contract());};
-    if(env("NINFER_TEST_COMPACT_HOST_PAYLOAD_ADMISSION")=="1") {
-        require(!conditional_credit_fixture && env("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING")!="1",
+    if(env("VOIDINFER_TEST_COMPACT_HOST_PAYLOAD_ADMISSION")=="1") {
+        require(!conditional_credit_fixture && env("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING")!="1",
             "compact host payload fixture requires copied taps and independent accounting");
         require(code.size()>=16,"compact host payload fixture prompt extent");
         // Component fixture: bind admission authority, without claiming the
         // empty inventory accounts for model/device allocations in this test.
-        coordinator.bind_physical_resources({},ninfer::exl3::Exl3ResourceInventory::unlimited());
+        coordinator.bind_physical_resources({},voidinfer::exl3::Exl3ResourceInventory::unlimited());
         Root root;
         {
             auto context=target.create_context(true);context->prepare_continuation(8);
@@ -134,7 +134,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         } clear_hooks{lane->context()};
         lane->context().set_request_host_payload_reservation([&](std::uint64_t bytes) {
             ++reservations;
-            if(reject)throw ninfer::exl3::Exl3HostResidentBudgetExhausted{};
+            if(reject)throw voidinfer::exl3::Exl3HostResidentBudgetExhausted{};
             return coordinator.reserve_snapshot_payload(lane->lease(),bytes);
         });
         lane->context().set_request_host_payload_observer([&](const std::shared_ptr<const void>& owner,
@@ -147,7 +147,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         gate("host_payload","actual_compact_callbacks",reservations==1 && observations==5);
         lane->abort();reject=true;
         bool refused=false;
-        try{(void)lane->verify(tokens);}catch(const ninfer::exl3::Exl3HostResidentBudgetExhausted&){refused=true;}
+        try{(void)lane->verify(tokens);}catch(const voidinfer::exl3::Exl3HostResidentBudgetExhausted&){refused=true;}
         gate("host_payload","refusal_before_tap_publication",refused && reservations==2 && observations==5 &&
             lane->context().export_exact_host_state(nullptr,true)->same_payload(*root->state()));
         reject=false;
@@ -161,8 +161,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         lane->context().set_request_host_payload_observer({});
         return;
     }
-    if(env("NINFER_TEST_HOST_KV_OWNED_STREAM")=="1") {
-        const bool quarantine=env("NINFER_TEST_HOST_KV_OWNED_STREAM_RETIREMENT")=="1";
+    if(env("VOIDINFER_TEST_HOST_KV_OWNED_STREAM")=="1") {
+        const bool quarantine=env("VOIDINFER_TEST_HOST_KV_OWNED_STREAM_RETIREMENT")=="1";
         require(code.size()>=16,"owned HostKV stream prompt extent");
         struct OwnedStream {
             cudaStream_t stream=nullptr;
@@ -216,9 +216,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         gate("owned_stream","stream_owner_lifetime_matches_retirement",witness.expired()!=quarantine);
         return;
     }
-    if(env("NINFER_TEST_HOST_KV_STREAM_SWITCH_CONTROL")=="1") {
+    if(env("VOIDINFER_TEST_HOST_KV_STREAM_SWITCH_CONTROL")=="1") {
         require(code.size()>=18,"HostKV stream switch control prompt extent");
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> expected;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> expected;
         {
             auto reference=target.create_context(true,false,false);
             reference->prefill(std::span<const std::int64_t>(code.data(),16));
@@ -241,7 +241,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             workspace.expired() && Exl3TextContext::host_kv_quarantined_contexts()==quarantines);
         return;
     }
-    if(env("NINFER_TEST_HOST_KV_STREAM_SWITCH_FAILURE")=="1") {
+    if(env("VOIDINFER_TEST_HOST_KV_STREAM_SWITCH_FAILURE")=="1") {
         require(code.size()>=17,"HostKV stream switch prompt extent");
         auto context=target.create_context(true,false,false);
         context->prefill(std::span<const std::int64_t>(code.data(),16));
@@ -273,9 +273,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             retained.forward_stream_retained && retained.forward_stream_identity==0 && retained.forward_device>=0);
         return;
     }
-    if(env("NINFER_TEST_HOST_KV_PREFILL_BOUNDARY_FAILURE")=="1") {
-        const bool compute_failure=env("NINFER_TEST_HOST_KV_COMPUTE_RETIREMENT")=="1";
-        const bool compute_only=env("NINFER_TEST_HOST_KV_COMPUTE_ONLY")=="1";
+    if(env("VOIDINFER_TEST_HOST_KV_PREFILL_BOUNDARY_FAILURE")=="1") {
+        const bool compute_failure=env("VOIDINFER_TEST_HOST_KV_COMPUTE_RETIREMENT")=="1";
+        const bool compute_only=env("VOIDINFER_TEST_HOST_KV_COMPUTE_ONLY")=="1";
         require(!compute_only || compute_failure,"compute-only retirement requires compute failure variant");
         require(code.size()>=16,"HostKV prefill boundary prompt extent");
         for(unsigned fault:{1u,2u}) {
@@ -317,9 +317,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         }
         return;
     }
-    if(env("NINFER_TEST_DFLASH_QUARANTINE_PUBLICATION")=="1") {
-        const bool hostkv=env("NINFER_TEST_DFLASH_HOSTKV_QUARANTINE")=="1";
-        const bool generic=env("NINFER_TEST_DFLASH_GENERIC_QUARANTINE")=="1";
+    if(env("VOIDINFER_TEST_DFLASH_QUARANTINE_PUBLICATION")=="1") {
+        const bool hostkv=env("VOIDINFER_TEST_DFLASH_HOSTKV_QUARANTINE")=="1";
+        const bool generic=env("VOIDINFER_TEST_DFLASH_GENERIC_QUARANTINE")=="1";
         require(!hostkv || !generic,"publication quarantine domains are exclusive");
         require(code.size()>=16,"quarantine publication prompt extent");
         Root root;
@@ -464,8 +464,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         coordinator.cancel(lease->ticket,true);
         return;
     }
-    if(env("NINFER_TEST_HOST_KV_ACQUIRE_RESTORE_FAILURE")=="1") {
-        const bool quarantine=env("NINFER_TEST_HOST_KV_ACQUIRE_RETIREMENT")=="1";
+    if(env("VOIDINFER_TEST_HOST_KV_ACQUIRE_RESTORE_FAILURE")=="1") {
+        const bool quarantine=env("VOIDINFER_TEST_HOST_KV_ACQUIRE_RETIREMENT")=="1";
         require(code.size()>=16,"HostKV acquire failure prompt extent");
         Root root;
         {
@@ -527,23 +527,23 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         coordinator.cancel(lease->ticket,true);
         return;
     }
-    if(env("NINFER_TEST_HOST_KV_RESTORE_FAILURE")=="1") {
-        const bool fail_retirement=env("NINFER_TEST_HOST_KV_RESTORE_RETIREMENT")=="1";
-        const auto expected_storage=env("NINFER_TEST_HOST_KV_RESTORE_STORAGE");
+    if(env("VOIDINFER_TEST_HOST_KV_RESTORE_FAILURE")=="1") {
+        const bool fail_retirement=env("VOIDINFER_TEST_HOST_KV_RESTORE_RETIREMENT")=="1";
+        const auto expected_storage=env("VOIDINFER_TEST_HOST_KV_RESTORE_STORAGE");
         require(expected_storage.empty() || expected_storage=="registered" || expected_storage=="ordinary",
             "HostKV restore storage expectation must be registered or ordinary");
         require(code.size()>=17,"HostKV restore failure prompt extent");
         auto candidate=target.create_context(true,false,false);
         candidate->prefill(std::span<const std::int64_t>(code.data(),16));
         auto state=candidate->export_exact_host_state();
-        const std::weak_ptr<const ninfer::exl3::Exl3ExactHostState> source_witness=state;
+        const std::weak_ptr<const voidinfer::exl3::Exl3ExactHostState> source_witness=state;
         const auto source_metadata=state->owner_metadata_bytes();
         const auto source_registered=state->recurrent_registered_bytes();
         if(!expected_storage.empty())gate("hostkv_restore","requested_storage_route_exercised",
             expected_storage=="registered"?source_registered>0:source_registered==0);
         std::uint64_t source_payload=0;
-        ninfer::exl3::Exl3ExactHostState::visit_host_allocations(
-            std::span<const std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>>(&state,1),
+        voidinfer::exl3::Exl3ExactHostState::visit_host_allocations(
+            std::span<const std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>>(&state,1),
             [&](const void*,std::size_t bytes){source_payload+=bytes;},true);
         const auto expected_logits=candidate->logits_host();
         candidate->restore_exact_host_state(*state);
@@ -608,15 +608,15 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             const auto retained=Exl3TextContext::host_kv_retirement_snapshot();
             gate("hostkv_restore","retained_source_inventory",
                 retained.restore_source_payload_capacity_bytes==source_payload &&
-                retained.restore_source_object_bytes==sizeof(ninfer::exl3::Exl3ExactHostState) &&
+                retained.restore_source_object_bytes==sizeof(voidinfer::exl3::Exl3ExactHostState) &&
                 retained.restore_source_owner_metadata_bytes==source_metadata &&
                 retained.restore_source_registered_bytes==source_registered);
         }
         return;
     }
-    if(env("NINFER_TEST_HOST_KV_ACTIVE_RETIREMENT")=="1") {
-        const bool batch=env("NINFER_TEST_HOST_KV_BATCH_RETIREMENT")=="1";
-        const bool multiple_pages=env("NINFER_TEST_HOST_KV_MULTIPAGE_RETIREMENT")=="1";
+    if(env("VOIDINFER_TEST_HOST_KV_ACTIVE_RETIREMENT")=="1") {
+        const bool batch=env("VOIDINFER_TEST_HOST_KV_BATCH_RETIREMENT")=="1";
+        const bool multiple_pages=env("VOIDINFER_TEST_HOST_KV_MULTIPAGE_RETIREMENT")=="1";
         gate("hostkv_active","clean_initial_quarantine",Exl3TextContext::host_kv_quarantined_contexts()==0);
         require(code.size()>=16,"HostKV active retirement prompt extent");
         auto candidate=target.create_context(true,false,false);
@@ -624,7 +624,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             candidate->host_kv_stats().pinned_staging_bytes==0 && candidate->host_kv_stats().batch_metadata_bytes>0:
             candidate->host_kv_stats().pinned_staging_bytes>0);
         const auto owner=candidate->host_kv_workspace_owner_for_test();
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> completed_prefix;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> completed_prefix;
         if(multiple_pages) {
             require(code.size()>=65,"HostKV multipage retirement prompt extent");
             candidate->prefill(std::span<const std::int64_t>(code.data(),16));
@@ -725,7 +725,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         // Count each physical page once, including the completed prefix in the
         // later-page fault variant and repeated pending plane references.
         gate("hostkv_active","pending_page_metadata_deduplicated",
-            snapshot.page_owner_metadata_bytes==(multiple_pages?2:1)*sizeof(ninfer::exl3::Exl3ExactKVPage));
+            snapshot.page_owner_metadata_bytes==(multiple_pages?2:1)*sizeof(voidinfer::exl3::Exl3ExactKVPage));
         gate("hostkv_active","retained_page_capacity_matches_actual_storage",
             (multiple_pages?snapshot.page_payload_capacity_bytes>=expected_page_capacity+16ULL*2*64*1024*sizeof(std::uint16_t):
                 snapshot.page_payload_capacity_bytes==expected_page_capacity) &&
@@ -736,8 +736,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             snapshot.drain_error==static_cast<int>(cudaErrorUnknown) && !owner.expired());
         return; // Isolated process: queued-transfer owners remain quarantined.
     }
-    if(env("NINFER_TEST_CONTINUATION_CLEANUP_RETIREMENT")=="1") {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_CONTINUATION_CLEANUP_RETIREMENT")=="1") {
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         auto context=target.create_context(true,false,true);
         const auto before_bytes=context->persistent_bytes();
         const auto required=context->continuation_bytes_required(8);
@@ -777,8 +777,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         context.reset();authority.close();
         return; // Isolated process: continuation normalized-row allocation retained.
     }
-    if(env("NINFER_TEST_GENERIC_UPLOAD_RETIREMENT")=="1") {
-        const auto name=env("NINFER_TEST_GENERIC_RETIREMENT_FAULT");
+    if(env("VOIDINFER_TEST_GENERIC_UPLOAD_RETIREMENT")=="1") {
+        const auto name=env("VOIDINFER_TEST_GENERIC_RETIREMENT_FAULT");
         require(name.empty() || name=="free" || name=="query" || name=="device",
             "generic upload retirement fault must be free/query/device");
         const unsigned failure=name=="query"?3u:(name=="device"?4u:2u);
@@ -808,10 +808,10 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         gate("generic_upload","later_upload_refused",refused);
         return; // Isolated process: failed upload cleanup retains its allocation.
     }
-    if(env("NINFER_TEST_GENERIC_WEAK_CONTROL_LIFETIME")=="1") {
+    if(env("VOIDINFER_TEST_GENERIC_WEAK_CONTROL_LIFETIME")=="1") {
         for(bool reserved:{false,true}) {
         Coordinator authority(cache,Coordinator::Policy{1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
-        authority.bind_physical_resources({},ninfer::exl3::Exl3ResourceInventory::unlimited());
+        authority.bind_physical_resources({},voidinfer::exl3::Exl3ResourceInventory::unlimited());
         const auto baseline=Exl3TextContext::live_shared_control_metadata_bytes();
         std::shared_ptr<Exl3TextContext> context=reserved?target.create_context_reserved(authority):
             std::shared_ptr<Exl3TextContext>(target.create_context(true,false,true));
@@ -831,8 +831,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         }
         return;
     }
-    if(env("NINFER_TEST_GENERIC_CONTROL_RETIREMENT")=="1") {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_GENERIC_CONTROL_RETIREMENT")=="1") {
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         std::uint64_t plane_bytes=0;
         for(unsigned fault:{14u,15u}) {
             const auto control_bytes=Exl3TextContext::live_shared_control_metadata_bytes();
@@ -870,9 +870,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         }
         return; // Isolated process: final control-allocation arm retains workspace.
     }
-    if(env("NINFER_TEST_GENERIC_STARTUP_RETIREMENT")=="1") {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
-        const auto fault_name=env("NINFER_TEST_GENERIC_RETIREMENT_FAULT");
+    if(env("VOIDINFER_TEST_GENERIC_STARTUP_RETIREMENT")=="1") {
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
+        const auto fault_name=env("VOIDINFER_TEST_GENERIC_RETIREMENT_FAULT");
         require(fault_name.empty() || fault_name=="free" || fault_name=="query" || fault_name=="device",
             "generic retirement fault must be free/query/device");
         const unsigned fault=fault_name=="query"?12u:(fault_name=="device"?13u:11u);
@@ -913,10 +913,10 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         authority.close();authority.close();
         return; // Isolated process: generic allocation remains retained.
     }
-    if(env("NINFER_TEST_HOST_KV_STARTUP_RETIREMENT")=="1") {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
-        const bool mismatch=env("NINFER_TEST_HOST_KV_MISMATCH_RETIREMENT")=="1";
-        const bool wrapped=mismatch || env("NINFER_TEST_HOST_KV_WRAPPED_STARTUP_RETIREMENT")=="1";
+    if(env("VOIDINFER_TEST_HOST_KV_STARTUP_RETIREMENT")=="1") {
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
+        const bool mismatch=env("VOIDINFER_TEST_HOST_KV_MISMATCH_RETIREMENT")=="1";
+        const bool wrapped=mismatch || env("VOIDINFER_TEST_HOST_KV_WRAPPED_STARTUP_RETIREMENT")=="1";
         gate("hostkv_unwind","clean_initial_quarantine",Exl3TextContext::host_kv_quarantined_contexts()==0);
         std::size_t expected_partial_device=0,expected_partial_pinned=0;
         std::uint64_t expected_partial_owner_metadata=0;
@@ -937,7 +937,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                     Exl3TextContext::retirement_quarantine_witness()==quarantine_before);
                 auto retry=target.create_context_reserved(authority);
                 const auto workspace=retry->host_kv_workspace_owner_for_test();
-                const auto later_packet=!wrapped && ninfer::exl3::exl3_device_greedy_enabled()?
+                const auto later_packet=!wrapped && voidinfer::exl3::exl3_device_greedy_enabled()?
                     Exl3TextContext::greedy_packet_bytes_required():0;
                 gate("hostkv_unwind","control_device_extent",retry->persistent_bytes()>later_packet);
                 expected_partial_device=retry->persistent_bytes()-later_packet;
@@ -992,9 +992,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         }
         return; // Isolated process: stage7/9/10 intentionally retains its Impl.
     }
-    if(env("NINFER_TEST_HOST_KV_CONTEXT_RETIREMENT")=="1") {
-        const bool device_mismatch=env("NINFER_TEST_HOST_KV_DEVICE_MISMATCH")=="1";
-        const bool query_failure=env("NINFER_TEST_HOST_KV_DEVICE_QUERY_FAILURE")=="1";
+    if(env("VOIDINFER_TEST_HOST_KV_CONTEXT_RETIREMENT")=="1") {
+        const bool device_mismatch=env("VOIDINFER_TEST_HOST_KV_DEVICE_MISMATCH")=="1";
+        const bool query_failure=env("VOIDINFER_TEST_HOST_KV_DEVICE_QUERY_FAILURE")=="1";
         require(!device_mismatch || !query_failure,"HostKV retirement fault variants are exclusive");
         // Isolated process: failed-drain quarantine intentionally survives exit.
         const auto before=Exl3TextContext::host_kv_quarantined_contexts();
@@ -1047,12 +1047,12 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         gate("hostkv_retirement","replacement_context_refused",refused);
         return;
     }
-    if(env("NINFER_TEST_LEGACY_PREFIX_INVENTORY")=="1") {
-        using Prefix=ninfer::exl3::Exl3DevicePrefixCache;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
-        require(env("NINFER_EXL3_HOST_KV_DEVICE_PREFIX")=="1" &&
-            (env("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS").empty() ||
-             env("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS")=="4096"),
+    if(env("VOIDINFER_TEST_LEGACY_PREFIX_INVENTORY")=="1") {
+        using Prefix=voidinfer::exl3::Exl3DevicePrefixCache;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
+        require(env("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX")=="1" &&
+            (env("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS").empty() ||
+             env("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS")=="4096"),
             "legacy prefix inventory fixture requires4096-row enabled prefix");
         const auto budget=Prefix::budget_snapshot();
         auto first=target.create_context(true,true,true);
@@ -1100,7 +1100,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 first->allocation_owner_metadata_bytes()==first_metadata &&
                 peer->allocation_owner_metadata_bytes()==peer_metadata);
         }
-        if(env("NINFER_TEST_LEGACY_PREFIX_CLEANUP_FAILURE")=="1") {
+        if(env("VOIDINFER_TEST_LEGACY_PREFIX_CLEANUP_FAILURE")=="1") {
             const auto before=Prefix::budget_snapshot();
             peer->fail_device_prefix_cleanup_for_test();
             bool refused=false;
@@ -1150,13 +1150,13 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             witness.expired() && Prefix::budget_snapshot()==budget);
         return;
     }
-    if(env("NINFER_TEST_PRIVATE_PREFIX_QUARANTINE_FALLBACK")=="1") {
-        using Prefix=ninfer::exl3::Exl3DevicePrefixCache;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
-        const bool shared=env("NINFER_TEST_PREFIX_FALLBACK_SHARED")=="1";
-        const bool segmented=env("NINFER_TEST_PREFIX_FALLBACK_SEGMENTED")=="1";
+    if(env("VOIDINFER_TEST_PRIVATE_PREFIX_QUARANTINE_FALLBACK")=="1") {
+        using Prefix=voidinfer::exl3::Exl3DevicePrefixCache;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
+        const bool shared=env("VOIDINFER_TEST_PREFIX_FALLBACK_SHARED")=="1";
+        const bool segmented=env("VOIDINFER_TEST_PREFIX_FALLBACK_SEGMENTED")=="1";
         require(code.size()>=67,"private prefix fallback requires67 prompt tokens");
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> expected;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> expected;
         {
             auto reference=target.create_context(true,false,true);
             reference->prefill(std::span<const std::int64_t>(code.data(),16));
@@ -1219,10 +1219,10 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         peer.reset();context.reset();owner.close();failing.close();
         return; // Isolated process: separate failed prefix allocation is retained.
     }
-    if(env("NINFER_TEST_PREFIX_STARTUP_ROLLBACK")=="1") {
-        using Prefix=ninfer::exl3::Exl3DevicePrefixCache;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
-        const auto retirement=env("NINFER_TEST_PREFIX_RETIREMENT_FAULT");
+    if(env("VOIDINFER_TEST_PREFIX_STARTUP_ROLLBACK")=="1") {
+        using Prefix=voidinfer::exl3::Exl3DevicePrefixCache;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
+        const auto retirement=env("VOIDINFER_TEST_PREFIX_RETIREMENT_FAULT");
         require(retirement.empty() || retirement=="free" || retirement=="query" || retirement=="device",
             "prefix retirement fault must be free/query/device");
         const unsigned final_fault=retirement=="query"?4u:(retirement=="device"?5u:3u);
@@ -1230,8 +1230,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             Coordinator authority(cache,Coordinator::Policy{1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
             authority.bind_physical_resources({},Inventory::unlimited());
             std::shared_ptr<Prefix> survivor;
-            std::vector<std::shared_ptr<const ninfer::exl3::Exl3ExactKVPage>> tagged_pages;
-            std::weak_ptr<const ninfer::exl3::Exl3ExactKVPage> tagged_owner;
+            std::vector<std::shared_ptr<const voidinfer::exl3::Exl3ExactKVPage>> tagged_pages;
+            std::weak_ptr<const voidinfer::exl3::Exl3ExactKVPage> tagged_owner;
             if(fault>=3) {
                 survivor=std::make_shared<Prefix>(4096);
                 gate("prefix_rollback","survivor_admitted",survivor->admitted());
@@ -1239,7 +1239,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 auto use=survivor->try_use();
                 gate("prefix_rollback","survivor_initial_use",static_cast<bool>(use));
                 // Metadata-only tag fixture: no cache contents are consumed.
-                auto page=std::make_shared<ninfer::exl3::Exl3ExactKVPage>();
+                auto page=std::make_shared<voidinfer::exl3::Exl3ExactKVPage>();
                 page->first=0;page->rows=64;tagged_owner=page;
                 tagged_pages.push_back(std::move(page));
                 survivor->publish_tags(tagged_pages,64);
@@ -1309,8 +1309,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         }
         return; // Isolated process: final arm deliberately retains device storage.
     }
-    if(env("NINFER_TEST_CONTEXT_SHARED_PREFIX_STARTUP")=="1") {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_CONTEXT_SHARED_PREFIX_STARTUP")=="1") {
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         auto first=target.create_context(true,false,true);
         auto peer=target.create_context(true,false,true);
         const auto first_bytes=first->persistent_bytes(),peer_bytes=peer->persistent_bytes();
@@ -1418,8 +1418,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         gate("shared_prefix_startup","last_peer_releases_unused_cache",retained.expired());
         return;
     }
-    if(env("NINFER_TEST_LANE_RESERVED_STARTUP")=="1") {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_LANE_RESERVED_STARTUP")=="1") {
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         auto context=std::shared_ptr<Exl3TextContext>(target.create_context(true,false,true));
         context->prepare_continuation(8);
         const auto context_bytes=context->persistent_bytes();
@@ -1430,12 +1430,12 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             Coordinator limited(cache,Coordinator::Policy{1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
             auto limits=Inventory::unlimited();
             const auto metadata=sizeof(Lane)+Lane::retirement_metadata_bytes()+
-                (env("NINFER_EXL3_SUFFIX_PROPOSALS")=="1"?sizeof(ninfer::exl3::Exl3SuffixProposer):0);
+                (env("VOIDINFER_EXL3_SUFFIX_PROPOSALS")=="1"?sizeof(voidinfer::exl3::Exl3SuffixProposer):0);
             limits[static_cast<unsigned>(domain)]=(domain==Inventory::Domain::device?5ULL*16*5120*2:metadata)-1;
             limited.bind_physical_resources({},limits);
             bool refused=false;
             try{(void)Lane::create_reserved(limited,context,borrowed_draft,identity.contract(),nullptr,{});}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             gate("lane_startup",domain==Inventory::Domain::device?"device_one_byte_short":"metadata_one_byte_short",refused);
             gate("lane_startup","refusal_preserves_context",context->persistent_bytes()==context_bytes);
             limited.close();
@@ -1462,7 +1462,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             startup.close();
             gate("lane_startup","close_releases_lane",retained.expired());
         }
-        if(env("NINFER_TEST_LANE_STARTUP_RETIREMENT")=="1") {
+        if(env("VOIDINFER_TEST_LANE_STARTUP_RETIREMENT")=="1") {
             Coordinator startup(cache,Coordinator::Policy{1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
             startup.bind_physical_resources({},Inventory::unlimited());
             const auto before=Lane::quarantined_execution_count();
@@ -1488,8 +1488,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         }
         return;
     }
-    if(env("NINFER_TEST_CONTEXT_RESERVED_STARTUP")=="1") {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_CONTEXT_RESERVED_STARTUP")=="1") {
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         {
             Coordinator authority(cache,Coordinator::Policy{1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
             auto limits=Inventory::unlimited();
@@ -1577,7 +1577,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 // Invalid stage5 is a callback-entry sentinel: if planning is
                 // entered, its stage guard throws a different error before Impl.
                 try{(void)target.create_context_reserved(limited,true,5);}
-                catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+                catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
                 gate("context_startup","initial_metadata_refused_before_planning",refused);
             }
             limited.close();
@@ -1591,7 +1591,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             candidate->prepare_greedy_packet();
             const auto after_device=candidate->persistent_bytes();
             const auto after_metadata=candidate->allocation_owner_metadata_bytes();
-            if(ninfer::exl3::exl3_device_greedy_enabled()) {
+            if(voidinfer::exl3::exl3_device_greedy_enabled()) {
                 gate("context_startup","startup_packet_already_accounted",
                     after_device==before_device && after_metadata==before_metadata);
             } else {
@@ -1606,7 +1606,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 candidate->persistent_bytes()==after_device &&
                 candidate->allocation_owner_metadata_bytes()==after_metadata);
         }
-        if(env("NINFER_EXL3_MEDIA_EXECUTION_RESEARCH")!="1") {
+        if(env("VOIDINFER_EXL3_MEDIA_EXECUTION_RESEARCH")!="1") {
             // Release each context before constructing the next; compare the
             // optional five layer taps plus embedding trace, not peak overlap.
             auto captured=target.create_context(true,false,true);
@@ -1629,7 +1629,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             limited.bind_physical_resources({},limits);
             bool refused=false;
             try{candidate->prepare_continuation_reserved(limited,8);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             gate("continuation_startup","owner_metadata_one_byte_short",refused);
             gate("continuation_startup","metadata_refusal_before_attachment",
                 candidate->persistent_bytes()==base && candidate->continuation_bytes_required(8)>0);
@@ -1690,7 +1690,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             limited.bind_physical_resources({},limits);
             bool refused=false;
             try{(void)target.create_context_reserved(limited);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             gate("context_startup",domain==Inventory::Domain::device?"device_one_byte_short":
                 domain==Inventory::Domain::host_metadata?"metadata_one_byte_short":"pinned_one_byte_short",refused);
             limited.close();
@@ -1731,7 +1731,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             insufficient.bind_physical_resources({},limits);
             bool refused=false;
             try{unprepared->prepare_continuation_reserved(insufficient,8);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             gate("context_startup","continuation_credit_refusal",refused);
             gate("context_startup","continuation_refusal_no_attachment",
                 unprepared->persistent_bytes()==base_bytes && unprepared->continuation_bytes_required(8)==required);
@@ -1792,7 +1792,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             limited.bind_physical_resources({},limits);
             bool refused=false;
             try{candidate->prepare_transaction_reserved(limited);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             gate("repair_checkpoint_startup","device_one_byte_short",refused);
             gate("repair_checkpoint_startup","refusal_precedes_allocation",
                 candidate->persistent_bytes()==base && !candidate->transaction_prepared());
@@ -1816,9 +1816,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             gate("context_startup","continuation_planning_does_not_allocate",
                 owned_context->persistent_bytes()==base_context_bytes);
             std::weak_ptr<Exl3TextContext> witness=owned_context;
-            for(const auto* option:{"NINFER_EXL3_SUFFIX_PROPOSALS","NINFER_EXL3_BOUNDED_VERIFIER_HORIZON",
-                                    "NINFER_EXL3_NATIVE_VERIFIER_HORIZON","NINFER_EXL3_REPAIR_CHECKPOINT",
-                                    "NINFER_EXL3_DEVICE_SEED_HANDOFF"}) {
+            for(const auto* option:{"VOIDINFER_EXL3_SUFFIX_PROPOSALS","VOIDINFER_EXL3_BOUNDED_VERIFIER_HORIZON",
+                                    "VOIDINFER_EXL3_NATIVE_VERIFIER_HORIZON","VOIDINFER_EXL3_REPAIR_CHECKPOINT",
+                                    "VOIDINFER_EXL3_DEVICE_SEED_HANDOFF"}) {
                 struct RestoreLaneOption {
                     const char* key;std::string saved;
                     ~RestoreLaneOption(){_putenv_s(key,saved.c_str());}
@@ -1827,13 +1827,13 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 bool refused=false;
                 try{auto invalid=std::make_unique<Lane>(owned_context,draft,identity.contract());}
                 catch(const std::invalid_argument& error){refused=std::string(error.what())==
-                    (std::string_view(option)=="NINFER_EXL3_SUFFIX_PROPOSALS"?
+                    (std::string_view(option)=="VOIDINFER_EXL3_SUFFIX_PROPOSALS"?
                      "suffix proposals must be0 or1":
-                     std::string_view(option)=="NINFER_EXL3_BOUNDED_VERIFIER_HORIZON"?
+                     std::string_view(option)=="VOIDINFER_EXL3_BOUNDED_VERIFIER_HORIZON"?
                      "bounded verifier horizon must be0 or1":
-                     std::string_view(option)=="NINFER_EXL3_NATIVE_VERIFIER_HORIZON"?
+                     std::string_view(option)=="VOIDINFER_EXL3_NATIVE_VERIFIER_HORIZON"?
                      "native verifier horizon must be0 or1":
-                     std::string_view(option)=="NINFER_EXL3_REPAIR_CHECKPOINT"?
+                     std::string_view(option)=="VOIDINFER_EXL3_REPAIR_CHECKPOINT"?
                      "repair checkpoint must be0 or1":"device seed handoff must be0 or1");}
                 gate("context_startup","invalid_lane_option_refused",refused);
                 gate("context_startup","invalid_lane_option_no_context_growth",
@@ -1842,15 +1842,15 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             }
             {
                 struct RestoreDeviceSeedOptions {
-                    std::string greedy=env("NINFER_EXL3_DEVICE_GREEDY");
-                    std::string seed=env("NINFER_EXL3_DEVICE_SEED_HANDOFF");
+                    std::string greedy=env("VOIDINFER_EXL3_DEVICE_GREEDY");
+                    std::string seed=env("VOIDINFER_EXL3_DEVICE_SEED_HANDOFF");
                     ~RestoreDeviceSeedOptions(){
-                        _putenv_s("NINFER_EXL3_DEVICE_GREEDY",greedy.c_str());
-                        _putenv_s("NINFER_EXL3_DEVICE_SEED_HANDOFF",seed.c_str());
+                        _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY",greedy.c_str());
+                        _putenv_s("VOIDINFER_EXL3_DEVICE_SEED_HANDOFF",seed.c_str());
                     }
                 } restore;
-                _putenv_s("NINFER_EXL3_DEVICE_GREEDY","0");
-                _putenv_s("NINFER_EXL3_DEVICE_SEED_HANDOFF","1");
+                _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","0");
+                _putenv_s("VOIDINFER_EXL3_DEVICE_SEED_HANDOFF","1");
                 bool refused=false;
                 try{auto invalid=std::make_unique<Lane>(
                     owned_context,draft,identity.contract());}
@@ -1898,7 +1898,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         }
         return;
     }
-    if(env("NINFER_TEST_GREEDY_PENDING_FAILURE")=="1") {
+    if(env("VOIDINFER_TEST_GREEDY_PENDING_FAILURE")=="1") {
         auto context=target.create_context(false,false,true);
         context->prefill(std::span<const std::int64_t>(code.data(),16));
         const auto before=Exl3TextContext::quarantined_greedy_packet_transfers();
@@ -1912,21 +1912,21 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             Exl3TextContext::quarantined_greedy_packet_transfers()==before+1);
         return; // Deliberate retained transfer: fresh process only.
     }
-    if(env("NINFER_TEST_GREEDY_ALLOCATION")=="1") {
+    if(env("VOIDINFER_TEST_GREEDY_ALLOCATION")=="1") {
         struct RestoreGreedyOption {
             std::string saved;
-            ~RestoreGreedyOption(){_putenv_s("NINFER_EXL3_DEVICE_GREEDY",saved.c_str());}
-        } restore{env("NINFER_EXL3_DEVICE_GREEDY")};
+            ~RestoreGreedyOption(){_putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY",saved.c_str());}
+        } restore{env("VOIDINFER_EXL3_DEVICE_GREEDY")};
         std::size_t without_packet=0;
         {
-            _putenv_s("NINFER_EXL3_DEVICE_GREEDY","0");
+            _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","0");
             auto context=target.create_context(false,false,true);
             without_packet=context->persistent_bytes();
             const auto pool_bytes=Exl3TextContext::greedy_packet_bytes_required();
             gate("allocation","greedy_fixed_packet_requirement",
-                pool_bytes==3*16*sizeof(ninfer::exl3::Exl3GreedyRow) &&
+                pool_bytes==3*16*sizeof(voidinfer::exl3::Exl3GreedyRow) &&
                 context->greedy_transfer_pool_registered_bytes_required()==
-                    2*16*sizeof(ninfer::exl3::Exl3GreedyRow) &&
+                    2*16*sizeof(voidinfer::exl3::Exl3GreedyRow) &&
                 context->greedy_transfer_pool_capacity()==2);
             context->prepare_greedy_packet();
             gate("allocation","greedy_first_prepare_delta",context->persistent_bytes()==without_packet+pool_bytes);
@@ -1936,7 +1936,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             gate("allocation","greedy_reset_keeps_storage",context->persistent_bytes()==without_packet+pool_bytes);
         }
         {
-            _putenv_s("NINFER_EXL3_DEVICE_GREEDY","1");
+            _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","1");
             auto context=target.create_context(false,false,true);
             gate("allocation","greedy_startup_delta",context->persistent_bytes()==
                 without_packet+Exl3TextContext::greedy_packet_bytes_required());
@@ -1945,7 +1945,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 without_packet+Exl3TextContext::greedy_packet_bytes_required());
         }
         {
-            _putenv_s("NINFER_EXL3_DEVICE_GREEDY","1");
+            _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","1");
             auto context=target.create_context(false,false,true);
             context->prefill(std::span<const std::int64_t>(code.data(),16));
             gate("allocation","greedy_transfer_pool_initially_available",
@@ -1964,7 +1964,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             (void)context->finish_greedy_packet(std::move(second),81,91);
             bool exhausted=false;
             try{(void)context->submit_greedy_packet(false,81,91);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){exhausted=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){exhausted=true;}
             gate("allocation","all_retained_readers_refuse_pool_overcommit",
                 exhausted && second_id && second_id!=first_id &&
                 context->greedy_transfer_pool_available_for_test()==0);
@@ -2049,8 +2049,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         }
         return;
     }
-    if(env("NINFER_TEST_GREEDY_BATCH")=="1") {
-        using Batch=ninfer::exl3::Exl3EngineGreedyPacketBatch;
+    if(env("VOIDINFER_TEST_GREEDY_BATCH")=="1") {
+        using Batch=voidinfer::exl3::Exl3EngineGreedyPacketBatch;
         Batch batch;batch.set_timeout_for_test(std::chrono::milliseconds(5));
         std::array<std::shared_ptr<Exl3TextContext>,3> contexts{
             target.create_context(false,false,true),target.create_context(false,false,true),
@@ -2282,12 +2282,12 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 [](const auto& result){return result.has_value();}));
         return;
     }
-    if(env("NINFER_TEST_TAP_SEGMENT_DESCRIPTOR")=="1") {
+    if(env("VOIDINFER_TEST_TAP_SEGMENT_DESCRIPTOR")=="1") {
         auto context=std::shared_ptr<Exl3TextContext>(target.create_context(true,false,true));
         context->prefill(std::span<const std::int64_t>(code.data(),24));
         const int logical=context->position()-1;
         auto root_revision=std::make_shared<const int>(7);
-        ninfer::exl3::Exl3CommittedTapBinding binding{context,root_revision,logical,401,501};
+        voidinfer::exl3::Exl3CommittedTapBinding binding{context,root_revision,logical,401,501};
         auto segment=context->committed_tap_segment(binding,0,1,logical,0,
             logical,1,logical,1,false,false);
         segment.validate();
@@ -2319,7 +2319,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         gate("tap_segment","last_descriptor_owner_releases_source",retained.expired());
         return;
     }
-    if(env("NINFER_TEST_DFLASH_DESTRUCTOR_RETIREMENT")=="1") {
+    if(env("VOIDINFER_TEST_DFLASH_DESTRUCTOR_RETIREMENT")=="1") {
         // Deliberate quarantine: separate future process; no subsequent work.
         std::shared_ptr<Exl3Dflash2DraftModel> owned(draft.create_execution());
         auto stream_backing=std::make_shared<int>(1);
@@ -2340,7 +2340,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             quarantined->context_device_bytes==context_bytes &&
             quarantined->staging_device_bytes==5ULL*16*5120*2);
         gate("retirement","failed_destructor_records_drain_outcome",quarantined &&
-            quarantined->retirement.phase==ninfer::exl3::Exl3RetirementPhase::quarantined &&
+            quarantined->retirement.phase==voidinfer::exl3::Exl3RetirementPhase::quarantined &&
             quarantined->retirement.first_drain_error==static_cast<int>(cudaErrorUnknown) &&
             !quarantined->retirement.reusable() &&
             quarantined->completion_authority_generation!=0 &&
@@ -2354,7 +2354,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         return;
     }
     struct Result {
-        ninfer::exl3::GoptSubmissions gaming_target{},gaming_draft{};
+        voidinfer::exl3::GoptSubmissions gaming_target{},gaming_draft{};
         Root root;std::vector<std::int64_t> tokens;std::vector<int> partitions;
         std::array<std::vector<std::uint16_t>,5> taps;
         double wall=0,construct=0,acquire=0,decode=0,release=0,teardown=0,first=0,registry=0;
@@ -2363,7 +2363,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         std::uint64_t gdn_graph_replays=0,gdn_graph_launch_cpu_ns=0;
         std::uint64_t full_layer_graph_replays=0,full_layer_graph_launch_cpu_ns=0;
         std::size_t bytes=0;
-        ninfer::exl3::Exl3VerifierHorizonPolicy::Counters policy;
+        voidinfer::exl3::Exl3VerifierHorizonPolicy::Counters policy;
         unsigned horizon=8;
     };
     // Two requests on the same physical lane, with an unrelated fixture in
@@ -2371,7 +2371,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
     std::unique_ptr<Lane> warm;
     for(const auto& fixture:std::array<std::pair<const char*,const std::vector<std::int64_t>*>,2>{std::pair{"code",&code},std::pair{"prose",&prose}}) {
         const auto name=fixture.first;require(fixture.second->size()>=prefix,"real DFlash fixture size");
-        Root initial;std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> oracle;
+        Root initial;std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> oracle;
         std::vector<std::int64_t> expected;std::array<std::vector<std::uint16_t>,5> taps;
         const auto prep=Clock::now();
         {
@@ -2390,7 +2390,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 reference->restore_draft(draft,staging);const auto ring=draft.export_host_ring(nullptr,false);
                 Root compact;
                 {
-                    using History=ninfer::exl3::Exl3TokenHistory;
+                    using History=voidinfer::exl3::Exl3TokenHistory;
                     struct Disarm {~Disarm(){History::fail_allocation_for_test(0);}} disarm;
                     unsigned failures=0;
                     const auto initial_fingerprint=initial->token_fingerprint();
@@ -2486,8 +2486,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         const auto run=[&](bool reuse,bool correct,int pair){
             const auto gopt_draft_before=draft.gaming_submissions();
             Result r;std::unique_ptr<Lane> cold;const auto begin=Clock::now();
-            std::unique_ptr<ninfer::NvtxRange> request_range;
-            if(decode_nvtx_enabled && !correct)request_range=std::make_unique<ninfer::NvtxRange>(
+            std::unique_ptr<voidinfer::NvtxRange> request_range;
+            if(decode_nvtx_enabled && !correct)request_range=std::make_unique<voidinfer::NvtxRange>(
                 std::string("realdflash.timed.request.")+name+(reuse?".reused.":".cold.")+
                 std::to_string(pair));
             if(reuse){if(!warm)warm=make_lane();}else cold=make_lane();
@@ -2500,15 +2500,15 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             const auto gdn_graph0=lane.context().host_kv_gdn_segment_graph_stats();
             const auto full_graph0=lane.context().host_kv_full_layer_graph_stats();
             if(correct)gate(name,"horizon_request_reset",lane.verifier_horizon_policy().counters().published_rounds==0);
-            const auto supplied_costs=env("NINFER_TEST_HORIZON_SUPPLIED_COSTS");
+            const auto supplied_costs=env("VOIDINFER_TEST_HORIZON_SUPPLIED_COSTS");
             require(supplied_costs.empty() || (supplied_costs=="1" &&
-                env("NINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1"),"supplied test costs require explicit horizon policy");
-            const bool native_horizon=env("NINFER_EXL3_NATIVE_VERIFIER_HORIZON")=="1";
+                env("VOIDINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1"),"supplied test costs require explicit horizon policy");
+            const bool native_horizon=env("VOIDINFER_EXL3_NATIVE_VERIFIER_HORIZON")=="1";
             if(correct)gate(name,"horizon_cost_menu_request_reset",!lane.verifier_horizon_policy().has_cost_menu());
-            std::optional<ninfer::exl3::Exl3VerifierHorizonPolicy::CostMenu> test_menu;
+            std::optional<voidinfer::exl3::Exl3VerifierHorizonPolicy::CostMenu> test_menu;
             if(supplied_costs=="1") {
                 // Synthetic decision fixture, never a timing receipt/calibration.
-                ninfer::exl3::Exl3VerifierHorizonPolicy::CostMenu menu;
+                voidinfer::exl3::Exl3VerifierHorizonPolicy::CostMenu menu;
                 menu.fixed_neural_ms=1;menu.minimum_samples=1;
                 menu.estimates={decltype(menu)::Estimate{2,2,1,true},
                     decltype(menu)::Estimate{4,8,1,true},decltype(menu)::Estimate{8,32,1,true}};
@@ -2529,8 +2529,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                     "same-frontier cost menu update bypassed hold interval");
             }
             unsigned previous_full_horizon=0;
-            const auto suffix_selection=env("NINFER_TEST_SUFFIX_OUTCOME_SELECTION");
-            require(suffix_selection.empty() || (suffix_selection=="1" && env("NINFER_EXL3_SUFFIX_PROPOSALS")=="1"),
+            const auto suffix_selection=env("VOIDINFER_TEST_SUFFIX_OUTCOME_SELECTION");
+            require(suffix_selection.empty() || (suffix_selection=="1" && env("VOIDINFER_EXL3_SUFFIX_PROPOSALS")=="1"),
                 "suffix outcome fixture requires explicit suffix proposals");
             if(suffix_selection=="1") {
                 lane.set_suffix_selection_limits({1,2,7,0},lane.execution_epoch(),lane.lease().acquisition);
@@ -2552,9 +2552,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 const auto expected_horizon=lane.verifier_horizon_policy().horizon(
                     static_cast<unsigned>(std::min<std::size_t>(8,outputs-r.tokens.size())));
                 auto proposed=[&]{
-                    std::unique_ptr<ninfer::NvtxRange> range;
+                    std::unique_ptr<voidinfer::NvtxRange> range;
                     if(decode_nvtx_enabled && !correct)
-                        range=std::make_unique<ninfer::NvtxRange>("realdflash.timed.propose");
+                        range=std::make_unique<voidinfer::NvtxRange>("realdflash.timed.propose");
                     return lane.propose(static_cast<int>(std::min<std::size_t>(8,outputs-r.tokens.size())));
                 }();
                 const bool neural_executed=lane.stats().proposal_calls>proposal_calls_before;
@@ -2586,17 +2586,17 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 };
                 refuse_outstanding_update();
                 auto pending=[&]{
-                    std::unique_ptr<ninfer::NvtxRange> range;
+                    std::unique_ptr<voidinfer::NvtxRange> range;
                     if(decode_nvtx_enabled && !correct)
-                        range=std::make_unique<ninfer::NvtxRange>("realdflash.timed.verify");
+                        range=std::make_unique<voidinfer::NvtxRange>("realdflash.timed.verify");
                     return lane.verify(proposed);
                 }();
                 refuse_outstanding_update();
                 const auto suffix_before=lane.stats();
                 auto published=[&]{
-                    std::unique_ptr<ninfer::NvtxRange> range;
+                    std::unique_ptr<voidinfer::NvtxRange> range;
                     if(decode_nvtx_enabled && !correct)
-                        range=std::make_unique<ninfer::NvtxRange>("realdflash.timed.publish");
+                        range=std::make_unique<voidinfer::NvtxRange>("realdflash.timed.publish");
                     return lane.publish(coordinator,pending);
                 }();
                 if(correct) {
@@ -2631,11 +2631,11 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                         std::isfinite(*pending.costs.verification_ms) && *pending.costs.verification_ms>=0);
                     gate(name,"unmeasured_costs_remain_unknown",!pending.costs.repair_ms &&
                         !pending.costs.complete_ms && !pending.costs.publication_ms);
-                    if(env("NINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1")
+                    if(env("VOIDINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1")
                         gate(name,"published_cost_matches_pending",lane.verifier_horizon_policy().last_costs().verification_ms==
                             pending.costs.verification_ms);
                 }
-                if(correct && env("NINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1")
+                if(correct && env("VOIDINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1")
                     gate(name,"horizon_publication_only",lane.verifier_horizon_policy().counters().published_rounds==r.partitions.size()+1);
                 r.verified+=pending.verification.verification_rows;r.replayed+=pending.verification.replay_rows;r.accepted+=pending.verification.accepted;
                 r.tokens.insert(r.tokens.end(),published.tokens.begin(),published.tokens.end());r.partitions.push_back(static_cast<int>(published.tokens.size()));
@@ -2721,7 +2721,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 coordinator.cancel_retired(current,current_retirement);
             }
         }
-        if(env("NINFER_TEST_CONDITIONAL_B8")=="1") {
+        if(env("VOIDINFER_TEST_CONDITIONAL_B8")=="1") {
             require(prefix+16<=target.max_context() && outputs>=16,"conditional B8 fixture capacity");
             for(bool constrained:{true,false}) {
                 coordinator.admit(initial);warm->acquire(*coordinator.acquire());
@@ -2759,13 +2759,13 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 coordinator.admit(initial);warm->acquire(*coordinator.acquire());
                 auto credit_first=warm->verify(std::span<const std::int64_t>(expected.data(),8));
                 const auto before=warm->stats();bool refused=false;
-                const auto pending_blocks=ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>();
+                const auto pending_blocks=voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>();
                 try{(void)warm->propose_conditional_second(credit_first,16,&coordinator);}
-                catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+                catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
                 gate(name,"conditional_credit_refusal_before_factory",refused &&
                     warm->stats().conditional_retention_factories==before.conditional_retention_factories &&
                     warm->stats().proposal_calls==before.proposal_calls &&
-                    ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==pending_blocks);
+                    voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==pending_blocks);
                 const auto fallback=warm->try_propose_conditional_second(credit_first,16,coordinator);
                 gate(name,"conditional_credit_engine_fallback_preserves_first",!fallback &&
                     !warm->has_conditional_retention() &&
@@ -2778,7 +2778,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             if(conditional_credit_fixture && !conditional_credit_refusal)for(int action:{0,1,2}) {
                 coordinator.admit(initial);warm->acquire(*coordinator.acquire());
                 auto credit_first=warm->verify(std::span<const std::int64_t>(expected.data(),8));
-                const auto blocks=ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>();
+                const auto blocks=voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>();
                 const auto credit_second=warm->propose_conditional_second(credit_first,16,&coordinator);
                 auto retained_control=warm->conditional_predecessor_owner_for_test();
                 bool premature=false;try{warm->collect_conditional_retention(coordinator);}
@@ -2793,12 +2793,12 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 gate(name,"conditional_credit_collection_precedes_release",release_refused);
                 gate(name,"conditional_credit_matching_owner_collected",warm->collect_conditional_retention(coordinator));
                 gate(name,"conditional_pending_weak_control_survives_collection",retained_control.expired() &&
-                    ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks+1);
+                    voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks+1);
                 if(action==0) {
                     auto retry_first=warm->verify(std::span<const std::int64_t>(expected.data(),8));
                     const auto before=warm->stats();bool refused=false;
                     try{(void)warm->propose_conditional_second(retry_first,16,&coordinator);}
-                    catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+                    catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
                     gate(name,"conditional_weak_control_blocks_exact_cap",refused &&
                         warm->stats().conditional_retention_factories==before.conditional_retention_factories &&
                         warm->stats().proposal_calls==before.proposal_calls);
@@ -2811,11 +2811,11 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 }
                 retained_control.reset();
                 gate(name,"conditional_pending_final_weak_releases_control",
-                    ninfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks);
+                    voidinfer::exl3::bounded_shared_live_blocks_for_test<Lane::Pending>()==blocks);
                 auto lease=warm->lease();warm->release();
                 if(action)coordinator.complete(lease);else coordinator.cancel(lease.ticket,true);
             }
-            if(env("NINFER_EXL3_SUFFIX_PROPOSALS")!="1") {
+            if(env("VOIDINFER_EXL3_SUFFIX_PROPOSALS")!="1") {
                 struct ConditioningObservation {
                     Lane* lane=nullptr;
                     Root expected;
@@ -2830,7 +2830,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                     std::shared_ptr<ConditioningObservation> state;
                     ~ExpireObservation(){state->lane=nullptr;state->expected.reset();}
                 } expire_observation{observation};
-                draft.set_shared_q_executor([observation](const ninfer::exl3::Exl3DraftSharedQContinuation& offer) {
+                draft.set_shared_q_executor([observation](const voidinfer::exl3::Exl3DraftSharedQContinuation& offer) {
                     if(!observation->lane)return false;
                     const auto root=observation->lane->shared_proposal_root();
                     require(root && root==observation->expected &&
@@ -2840,7 +2840,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                         "conditional callback lost active predecessor conditioning");
                     ++observation->calls;
                     const auto family=static_cast<unsigned>(offer.projection.family);
-                    require(family<static_cast<unsigned>(ninfer::exl3::Exl3TargetSharedFamily::count),
+                    require(family<static_cast<unsigned>(voidinfer::exl3::Exl3TargetSharedFamily::count),
                         "draft callback emitted an unknown projection family");
                     observation->families|=std::uint32_t{1}<<family;
                     return false; // Observe the real offer; retain serial arithmetic.
@@ -2848,10 +2848,10 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 coordinator.admit(initial);warm->acquire(*coordinator.acquire());
                 const auto calls_before=warm->stats().proposal_calls;
                 const auto first_tokens=warm->propose(8);
-                for(const auto family:{ninfer::exl3::Exl3TargetSharedFamily::draft_q,
-                    ninfer::exl3::Exl3TargetSharedFamily::draft_k,ninfer::exl3::Exl3TargetSharedFamily::draft_v,
-                    ninfer::exl3::Exl3TargetSharedFamily::draft_o,ninfer::exl3::Exl3TargetSharedFamily::draft_down,
-                    ninfer::exl3::Exl3TargetSharedFamily::draft_gate,ninfer::exl3::Exl3TargetSharedFamily::draft_up})
+                for(const auto family:{voidinfer::exl3::Exl3TargetSharedFamily::draft_q,
+                    voidinfer::exl3::Exl3TargetSharedFamily::draft_k,voidinfer::exl3::Exl3TargetSharedFamily::draft_v,
+                    voidinfer::exl3::Exl3TargetSharedFamily::draft_o,voidinfer::exl3::Exl3TargetSharedFamily::draft_down,
+                    voidinfer::exl3::Exl3TargetSharedFamily::draft_gate,voidinfer::exl3::Exl3TargetSharedFamily::draft_up})
                     gate(name,"private_draft_family_offer_NOT_EXERCISED",
                         (observation->families&(std::uint32_t{1}<<static_cast<unsigned>(family)))!=0);
                 gate(name,"conditional_first_proposal_scope_expired",!warm->shared_proposal_active_for_test());
@@ -2861,13 +2861,13 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 const Root foreign_control(acquired.get(),[](const Request*){});
                 const Root unowned(std::shared_ptr<const Request>{},acquired.get());
                 gate(name,"conditional_dispatch_conditioning_scope",
-                    ninfer::exl3::shared_conditioning_scope_valid(neural_first.root,acquired,true,position) &&
-                    ninfer::exl3::shared_conditioning_scope_valid(acquired,acquired,true,acquired->state()->position()) &&
-                    !ninfer::exl3::shared_conditioning_scope_valid(acquired,neural_first.root,true,acquired->state()->position()) &&
-                    !ninfer::exl3::shared_conditioning_scope_valid(foreign_control,acquired,true,acquired->state()->position()) &&
-                    !ninfer::exl3::shared_conditioning_scope_valid(unowned,acquired,true,acquired->state()->position()) &&
-                    !ninfer::exl3::shared_conditioning_scope_valid(neural_first.root,acquired,false,position) &&
-                    !ninfer::exl3::shared_conditioning_scope_valid(neural_first.root,acquired,true,position+1));
+                    voidinfer::exl3::shared_conditioning_scope_valid(neural_first.root,acquired,true,position) &&
+                    voidinfer::exl3::shared_conditioning_scope_valid(acquired,acquired,true,acquired->state()->position()) &&
+                    !voidinfer::exl3::shared_conditioning_scope_valid(acquired,neural_first.root,true,acquired->state()->position()) &&
+                    !voidinfer::exl3::shared_conditioning_scope_valid(foreign_control,acquired,true,acquired->state()->position()) &&
+                    !voidinfer::exl3::shared_conditioning_scope_valid(unowned,acquired,true,acquired->state()->position()) &&
+                    !voidinfer::exl3::shared_conditioning_scope_valid(neural_first.root,acquired,false,position) &&
+                    !voidinfer::exl3::shared_conditioning_scope_valid(neural_first.root,acquired,true,position+1));
                 gate(name,"conditional_real_first_neural_work",warm->stats().proposal_calls==calls_before+1 &&
                     neural_first.costs.neural_rows==8);
                 const bool eligible=neural_first.proposed_rows==8 && neural_first.verification.accepted==8 &&
@@ -2906,14 +2906,14 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 std::cout<<"CONDITIONAL_REAL fixture="<<name<<" second_reached="<<eligible<<'\n';
             }
             coordinator.admit(initial);warm->acquire(*coordinator.acquire());
-            if(env("NINFER_TEST_CONDITIONAL_ROLLBACK_RETIREMENT")=="1") {
+            if(env("VOIDINFER_TEST_CONDITIONAL_ROLLBACK_RETIREMENT")=="1") {
                 auto first=warm->verify(std::span<const std::int64_t>(expected.data(),8));
                 const auto second=warm->propose_conditional_second(first,16);
                 auto retained=warm->conditional_predecessor_owner_for_test();
                 gate(name,"rollback_retirement_owner_present",!retained.expired());
                 const auto lease=warm->lease();
                 warm->fail_next_rollback_for_test();
-                const bool preserve_first=env("NINFER_TEST_CONDITIONAL_FIRST_FAILURE")=="1";
+                const bool preserve_first=env("VOIDINFER_TEST_CONDITIONAL_FIRST_FAILURE")=="1";
                 if(preserve_first)warm->fail_next_conditional_verified_completion_for_test();
                 bool failed=false;
                 try{if(preserve_first)(void)warm->verify_conditional_second(first,second);else warm->abort();}
@@ -2986,7 +2986,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                     warm->stats().suffix_published_rounds==suffix_before);
                 if(retry_publication) {
                     const auto published=warm->publish(coordinator,resident_combined);
-                    const bool policy_enabled=env("NINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1";
+                    const bool policy_enabled=env("VOIDINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1";
                     gate(name,"conditional_residency_retry_publishes_once",
                         published.tokens==resident_combined.verification.committed_tokens &&
                         warm->verifier_horizon_policy().counters().published_rounds==policy_before+(policy_enabled?2:0));
@@ -3109,7 +3109,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 const auto resets_before=warm->stats();
                 warm->acquire(*reacquired,&coordinator);
                 const auto resets_after=warm->stats();
-                const auto* preserve_option=std::getenv("NINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
+                const auto* preserve_option=std::getenv("VOIDINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
                 const bool preserve=preserve_option && std::string_view(preserve_option)=="1";
                 gate(name,"partial_control_abort_reacquire_exact_root",
                     reacquired->acquisition!=old_acquisition.acquisition && warm->lease().root==committed &&
@@ -3135,20 +3135,20 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             {
                 auto saved=warm->context().request_metadata_reservation();
                 struct RestoreControlReservation {
-                    ninfer::exl3::Exl3TextContext& context;
-                    ninfer::exl3::Exl3TextContext::SnapshotMetadataReservation saved;
+                    voidinfer::exl3::Exl3TextContext& context;
+                    voidinfer::exl3::Exl3TextContext::SnapshotMetadataReservation saved;
                     ~RestoreControlReservation(){context.set_request_metadata_reservation(std::move(saved));}
                 } restore{warm->context(),std::move(saved)};
                 unsigned calls=0;std::uint64_t requested=0;
-                warm->context().set_request_metadata_reservation([&](std::uint64_t bytes)->ninfer::exl3::RetainedDescriptorLedger::Ticket {
-                    ++calls;requested=bytes;throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+                warm->context().set_request_metadata_reservation([&](std::uint64_t bytes)->voidinfer::exl3::RetainedDescriptorLedger::Ticket {
+                    ++calls;requested=bytes;throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
                 });
                 const auto epoch=warm->execution_epoch();const auto position=warm->context().position();
                 bool refused=false;
                 try{(void)warm->apply_control_owned(std::span<const std::int64_t>(expected.data(),1));}
-                catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+                catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
                 gate(name,"owned_control_refusal_before_append",refused && calls==1 &&
-                    requested==ninfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>()+sizeof(std::int64_t) &&
+                    requested==voidinfer::exl3::bounded_shared_allocation_bytes<Lane::Pending>()+sizeof(std::int64_t) &&
                     warm->execution_epoch()==epoch && warm->context().position()==position &&
                     warm->lease().root==current_control_lease[0].root &&
                     coordinator.compute_leases_current(current_control_lease));
@@ -3225,17 +3225,17 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 {
                     auto saved=warm->context().request_metadata_reservation();
                     struct RestoreReservation {
-                        ninfer::exl3::Exl3TextContext& context;
-                        ninfer::exl3::Exl3TextContext::SnapshotMetadataReservation saved;
+                        voidinfer::exl3::Exl3TextContext& context;
+                        voidinfer::exl3::Exl3TextContext::SnapshotMetadataReservation saved;
                         ~RestoreReservation(){context.set_request_metadata_reservation(std::move(saved));}
                     } restore{warm->context(),std::move(saved)};
                     unsigned reservations=0;
-                    warm->context().set_request_metadata_reservation([&](std::uint64_t)->ninfer::exl3::RetainedDescriptorLedger::Ticket {
-                        ++reservations;throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+                    warm->context().set_request_metadata_reservation([&](std::uint64_t)->voidinfer::exl3::RetainedDescriptorLedger::Ticket {
+                        ++reservations;throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
                     });
                     bool refused=false;const auto epoch=warm->execution_epoch();
                     try{(void)warm->repair_verified_prefix_owned(original,kept);}
-                    catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+                    catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
                     gate(name,"owned_repair_peak_refusal_preserves_pending",refused && reservations==1 &&
                         warm->execution_epoch()==epoch &&
                         warm->stats().completed_native_verifier_calls==native_before_repair);
@@ -3283,7 +3283,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 gate(name,"conditional_exact_second_repair_boundary",repaired.verification.rejected &&
                     repaired.verification.accepted==8+static_cast<std::size_t>(mismatch) &&
                     repaired.verification.committed_tokens.size()==rows &&
-                    repaired.verification.replay_rows==(env("NINFER_EXL3_REPAIR_CHECKPOINT")=="1"?
+                    repaired.verification.replay_rows==(env("VOIDINFER_EXL3_REPAIR_CHECKPOINT")=="1"?
                         1:static_cast<std::size_t>(mismatch+1)) &&
                     std::equal(repaired.verification.committed_tokens.begin(),repaired.verification.committed_tokens.end(),expected.begin()) &&
                     repaired.conditional_observations && !(*repaired.conditional_observations)[1].costs.neural_rows);
@@ -3351,7 +3351,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 warm->abort();lease=warm->lease();warm->release();coordinator.cancel(lease.ticket,true);
             }
         }
-        if(env("NINFER_EXL3_DEVICE_SEED_HANDOFF")=="1") {
+        if(env("VOIDINFER_EXL3_DEVICE_SEED_HANDOFF")=="1") {
             coordinator.admit(initial);warm->acquire(*coordinator.acquire());
             const auto before=warm->stats();
             const auto proposed=warm->propose(8);
@@ -3448,7 +3448,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             const auto after=warm->stats();
             const bool neural=after.proposal_calls!=before.proposal_calls;
             const auto physical_neural_rows=neural?static_cast<unsigned>(
-                env("NINFER_EXL3_NATIVE_VERIFIER_HORIZON")=="1"?proposed.size():8u):0u;
+                env("VOIDINFER_EXL3_NATIVE_VERIFIER_HORIZON")=="1"?proposed.size():8u):0u;
             gate(name,"caller_budget_caps_proposal",!proposed.empty() &&
                 proposed.size()<=static_cast<std::size_t>(budget) && proposed.front()==expected.front());
             gate(name,"caller_budget_accounts_physical_neural_block",
@@ -3458,8 +3458,8 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                     (neural?physical_neural_rows-proposed.size():0u));
             if(budget==1)gate(name,"one_row_budget_skips_all_proposers",!neural &&
                 after.suffix_calls==before.suffix_calls && after.suffix_misses==before.suffix_misses);
-            if(budget==1 && env("NINFER_EXL3_DEVICE_SEED_HANDOFF")=="1" &&
-               env("NINFER_EXL3_SUFFIX_PROPOSALS")!="1")
+            if(budget==1 && env("VOIDINFER_EXL3_DEVICE_SEED_HANDOFF")=="1" &&
+               env("VOIDINFER_EXL3_SUFFIX_PROPOSALS")!="1")
                 gate(name,"device_seed_scalar_remainder_uses_host_authority",
                     after.device_seed_handoffs==before.device_seed_handoffs &&
                     after.device_seed_host_fallbacks==before.device_seed_host_fallbacks+1);
@@ -3471,11 +3471,11 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         // Exercise the neural caller, not merely the read-only predicate.
         // A suffix hit legitimately skips neural conditioning admission, so
         // run this matrix only on the existing neural-only configuration.
-        if(env("NINFER_EXL3_SUFFIX_PROPOSALS")!="1")for(int fault=0;fault<3;++fault) {
+        if(env("VOIDINFER_EXL3_SUFFIX_PROPOSALS")!="1")for(int fault=0;fault<3;++fault) {
             coordinator.admit(initial);warm->acquire(*coordinator.acquire());
             const auto acquisition=warm->lease().acquisition;
             const auto epoch=warm->execution_epoch();
-            std::shared_ptr<const ninfer::exl3::Exl3DraftHostRing> changed_parent;
+            std::shared_ptr<const voidinfer::exl3::Exl3DraftHostRing> changed_parent;
             if(fault==0)draft.bind_ring_scope(acquisition,epoch); // missing completion witness
             if(fault==1)draft.bind_ring_scope(acquisition,epoch+1); // foreign execution
             if(fault==2)changed_parent=draft.export_host_ring(nullptr,false); // same values, new owner
@@ -3545,12 +3545,12 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
         // boundaries, every rejection point, host control versus device route.
         // Independent controls remain the scalar oracle above and full ring
         // export, never a packet compared only with itself.
-        const auto saved_greedy=env("NINFER_EXL3_DEVICE_GREEDY");
-        const auto saved_d2d=env("NINFER_EXL3_COMMITTED_TAP_D2D");
-        const auto saved_device_taps_only=env("NINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
+        const auto saved_greedy=env("VOIDINFER_EXL3_DEVICE_GREEDY");
+        const auto saved_d2d=env("VOIDINFER_EXL3_COMMITTED_TAP_D2D");
+        const auto saved_device_taps_only=env("VOIDINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
         const bool device_taps_only_matrix=
-            env("NINFER_TEST_DEVICE_TAPS_ONLY_MATRIX")=="1";
-        const auto valid_tap_segments=[](const ninfer::exl3::Exl3OuterReferenceResult& value) {
+            env("VOIDINFER_TEST_DEVICE_TAPS_ONLY_MATRIX")=="1";
+        const auto valid_tap_segments=[](const voidinfer::exl3::Exl3OuterReferenceResult& value) {
             int destination=0;
             const int logical_base=value.committed_state->position()-
                 static_cast<int>(value.committed_tokens.size());
@@ -3573,12 +3573,12 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             std::vector<std::int64_t> terminals;
             if(stop>=0) terminals.push_back(expected[stop]);
             std::array<Lane::Pending,2> results;
-            std::array<std::shared_ptr<const ninfer::exl3::Exl3DraftHostRing>,2> rings;
+            std::array<std::shared_ptr<const voidinfer::exl3::Exl3DraftHostRing>,2> rings;
             for(int arm=0;arm<4;++arm) {
                 const int slot=arm?1:0;
-                _putenv_s("NINFER_EXL3_DEVICE_GREEDY",(arm&1)?"1":"0");
-                _putenv_s("NINFER_EXL3_COMMITTED_TAP_D2D",(arm&2)?"1":"0");
-                _putenv_s("NINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY",
+                _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY",(arm&1)?"1":"0");
+                _putenv_s("VOIDINFER_EXL3_COMMITTED_TAP_D2D",(arm&2)?"1":"0");
+                _putenv_s("VOIDINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY",
                     device_taps_only_matrix && (arm&2)?"1":"0");
                 coordinator.admit(initial);warm->acquire(*coordinator.acquire());
                 const auto acquisition=warm->lease().acquisition;
@@ -3590,7 +3590,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                     !initial->draft_lineage_ready(draft,acquisition,execution,prefix) &&
                     results[slot].root->draft_lineage_ready(draft,acquisition,execution,
                         results[slot].root->state()->position()));
-                if(env("NINFER_EXL3_DEVICE_SEED_HANDOFF")=="1" && (arm&2))
+                if(env("VOIDINFER_EXL3_DEVICE_SEED_HANDOFF")=="1" && (arm&2))
                     gate(name,"device_seed_then_d2d_taps_publish_one_current_ring_witness",
                         results[slot].verification.committed_tap_d2d_bytes==
                             results[slot].verification.committed_tokens.size()*5*5120*2 &&
@@ -3612,7 +3612,7 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                             results[slot].completion_generation);
                 }
                 rings[slot]=draft.export_host_ring(nullptr,false);
-                if(env("NINFER_EXL3_REPAIR_CHECKPOINT")=="1") {
+                if(env("VOIDINFER_EXL3_REPAIR_CHECKPOINT")=="1") {
                     const auto& checkpointed=results[slot].verification;
                     const std::size_t committed=checkpointed.committed_tokens.size();
                     gate(name,"checkpoint_attempt_captures_complete_arena",
@@ -3677,9 +3677,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                 }
             }
         }
-        if(env("NINFER_TEST_COMPACT_TRANSPORT_FAILURE")=="1") {
-            _putenv_s("NINFER_EXL3_DEVICE_GREEDY","1");
-            _putenv_s("NINFER_EXL3_COMMITTED_TAP_D2D","1");
+        if(env("VOIDINFER_TEST_COMPACT_TRANSPORT_FAILURE")=="1") {
+            _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","1");
+            _putenv_s("VOIDINFER_EXL3_COMMITTED_TAP_D2D","1");
             coordinator.admit(initial);warm->acquire(*coordinator.acquire());
             const auto failed_lease=warm->lease();
             warm->fail_next_tap_copy_for_test(2); // one plane submitted, next fails
@@ -3706,9 +3706,9 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
             warm->abort();const auto recovered_lease=warm->lease();warm->release();
             coordinator.cancel(recovered_lease.ticket,true);
         }
-        _putenv_s("NINFER_EXL3_DEVICE_GREEDY",saved_greedy.c_str());
-        _putenv_s("NINFER_EXL3_COMMITTED_TAP_D2D",saved_d2d.c_str());
-        _putenv_s("NINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY",saved_device_taps_only.c_str());
+        _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY",saved_greedy.c_str());
+        _putenv_s("VOIDINFER_EXL3_COMMITTED_TAP_D2D",saved_d2d.c_str());
+        _putenv_s("VOIDINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY",saved_device_taps_only.c_str());
         for(int pair=0;pair<pairs;++pair)for(int order=0;order<2;++order){
             const bool reuse=(pair%2)?order==0:order==1;
             warm.reset();cuda_check(cudaDeviceSynchronize(),"real DFlash workload starts without physical contexts");
@@ -3730,23 +3730,23 @@ void run_real_dflash_execution(Exl3TextModel& target,Exl3Dflash2DraftModel& draf
                     <<r.gaming_target[i]<<','<<r.gaming_draft[i]<<'\n';
             gopt.flush();
             const bool candidate_telemetry_exact=
-                (env("NINFER_DFLASH2_FUSED_SELECTOR")=="1" ?
+                (env("VOIDINFER_DFLASH2_FUSED_SELECTOR")=="1" ?
                     r.selector_batched_anchor_chain_calls==0 :
-                    (env("NINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN")=="1" ?
+                    (env("VOIDINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN")=="1" ?
                         r.selector_batched_anchor_chain_calls>0 :
                         r.selector_batched_anchor_chain_calls==0)) &&
-                (env("NINFER_EXL3_FAST_MIA_PARITY_W1")=="1" ?
+                (env("VOIDINFER_EXL3_FAST_MIA_PARITY_W1")=="1" ?
                     r.fast_mia_parity_w1_settlements>0 :
                     r.fast_mia_parity_w1_settlements==0) &&
-                (env("NINFER_EXL3_HOST_KV_CPU_PROFILE")!="1" ||
+                (env("VOIDINFER_EXL3_HOST_KV_CPU_PROFILE")!="1" ||
                     (r.gdn_graph_replays>0 && r.gdn_graph_launch_cpu_ns>0 &&
-                     (env("NINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS")!="1" ||
+                     (env("VOIDINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS")!="1" ||
                       (r.full_layer_graph_replays>0 && r.full_layer_graph_launch_cpu_ns>0))));
             const bool exact_with_candidate_telemetry=exact && candidate_telemetry_exact;
-            runs<<name<<','<<pair<<','<<(reuse?"reused":"cold")<<','<<r.wall<<','<<r.construct<<','<<r.acquire<<','<<r.decode<<','<<r.release<<','<<r.teardown<<','<<r.stats.proposal_calls<<','<<r.stats.proposed_rows<<','<<r.verified<<','<<r.replayed<<','<<r.accepted<<','<<r.tokens.size()<<','<<r.partitions.size()<<','<<r.first<<','<<r.stats.proposal_ms<<','<<r.stats.verification_ms<<','<<r.registry<<','<<r.bytes<<','<<r.h2d<<','<<r.d2h<<','<<r.stats.suffix_calls<<','<<r.stats.suffix_rows<<','<<r.stats.suffix_misses<<','<<r.stats.suffix_metadata_bytes<<','<<(env("NINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1")<<','<<r.horizon<<','<<r.policy.accepted_suffix<<','<<r.policy.rejected_suffix<<','<<r.policy.censored_suffix<<','<<r.selector_batched_anchor_chain_calls<<','<<r.fast_mia_parity_w1_settlements<<','<<r.gdn_graph_replays<<','<<r.gdn_graph_launch_cpu_ns<<','<<r.full_layer_graph_replays<<','<<r.full_layer_graph_launch_cpu_ns<<','<<exact_with_candidate_telemetry<<'\n';runs.flush();gaps.flush();gate(name,"timed_exact",exact_with_candidate_telemetry);
+            runs<<name<<','<<pair<<','<<(reuse?"reused":"cold")<<','<<r.wall<<','<<r.construct<<','<<r.acquire<<','<<r.decode<<','<<r.release<<','<<r.teardown<<','<<r.stats.proposal_calls<<','<<r.stats.proposed_rows<<','<<r.verified<<','<<r.replayed<<','<<r.accepted<<','<<r.tokens.size()<<','<<r.partitions.size()<<','<<r.first<<','<<r.stats.proposal_ms<<','<<r.stats.verification_ms<<','<<r.registry<<','<<r.bytes<<','<<r.h2d<<','<<r.d2h<<','<<r.stats.suffix_calls<<','<<r.stats.suffix_rows<<','<<r.stats.suffix_misses<<','<<r.stats.suffix_metadata_bytes<<','<<(env("VOIDINFER_EXL3_BOUNDED_VERIFIER_HORIZON")=="1")<<','<<r.horizon<<','<<r.policy.accepted_suffix<<','<<r.policy.rejected_suffix<<','<<r.policy.censored_suffix<<','<<r.selector_batched_anchor_chain_calls<<','<<r.fast_mia_parity_w1_settlements<<','<<r.gdn_graph_replays<<','<<r.gdn_graph_launch_cpu_ns<<','<<r.full_layer_graph_replays<<','<<r.full_layer_graph_launch_cpu_ns<<','<<exact_with_candidate_telemetry<<'\n';runs.flush();gaps.flush();gate(name,"timed_exact",exact_with_candidate_telemetry);
             }
         }
     }
     warm.reset();coordinator.close();std::cout<<"REAL_DFLASH_EXECUTION PASS exact_L2=1 persistent_C1=1 greedy_only=1 suffix_enabled="
-        <<(env("NINFER_EXL3_SUFFIX_PROPOSALS")=="1")<<'\n';
+        <<(env("VOIDINFER_EXL3_SUFFIX_PROPOSALS")=="1")<<'\n';
 }

@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 constexpr std::size_t kMatrixValues =
@@ -137,7 +137,7 @@ void OscarMixedAttentionReader::read_row(std::uint32_t logical_token, std::uint3
 OscarMixedAttentionTrace OscarMixedAttentionReader::read(std::uint32_t query_token) const {
     using Clock = std::chrono::steady_clock;
     const bool profiling = [] {
-        const char* value = std::getenv("NINFER_OSCAR_D4_1_PROFILE");
+        const char* value = std::getenv("VOIDINFER_OSCAR_D4_1_PROFILE");
         return value != nullptr && value[0] == '1';
     }();
     const auto total_start = profiling ? Clock::now() : Clock::time_point{};
@@ -290,4 +290,4 @@ OscarMixedAttentionTrace OscarMixedAttentionReader::read(std::uint32_t query_tok
     return result;
 }
 
-} // namespace ninfer
+} // namespace voidinfer

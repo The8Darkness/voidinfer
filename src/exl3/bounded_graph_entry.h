@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3GraphBoundResource {
     std::shared_ptr<const void> owner;
     const void* address=nullptr;

@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 constexpr float kHadamardScale = 0.088388347648f;
@@ -315,4 +315,4 @@ Exl3ReferenceOutput exl3_linear_reference(const TensorPayload& input,
     return output;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

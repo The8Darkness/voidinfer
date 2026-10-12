@@ -10,7 +10,7 @@
 #include <atomic>
 #include "exl3/bounded_shared_owner.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class Exl3LaneKvSource;
 // Copyable atomic flag (pages are cloned by value).
 struct Exl3CopyableFlag {

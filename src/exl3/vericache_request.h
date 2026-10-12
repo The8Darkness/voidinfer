@@ -9,7 +9,7 @@
 #include "exl3/reserved_host_payload_union.h"
 #include "exl3/pending_payload_extent.h"
 #include "exl3/encoded_media_cache.h"
-#include <ninfer/targets/qwen3_6/vision_control.h>
+#include <voidinfer/targets/qwen3_6/vision_control.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -30,7 +30,7 @@
 #include <condition_variable>
 #include <thread>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class Exl3VeriCacheReplay;
 class Exl3PreparedMediaReplay;
 class Exl3VeriCachePrefixIndex;
@@ -1312,15 +1312,15 @@ public:
         unsigned tap_copy_fault_for_test=0) const {
         if(!projected_ || exact.model_identity()!=state_->model_identity())
             throw std::invalid_argument("compact verification reference mismatch");
-        const char* direct_requested=std::getenv("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING");
+        const char* direct_requested=std::getenv("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING");
         if(direct_requested && std::string_view(direct_requested)!="0" &&
             std::string_view(direct_requested)!="1")
             throw std::invalid_argument("compact direct tap staging must be 0 or 1");
         const bool direct_staging=direct_requested && std::string_view(direct_requested)=="1";
-        const auto* device_requested=std::getenv("NINFER_EXL3_COMMITTED_TAP_D2D");
+        const auto* device_requested=std::getenv("VOIDINFER_EXL3_COMMITTED_TAP_D2D");
         if(device_requested && std::string_view(device_requested)!="0" && std::string_view(device_requested)!="1")
             throw std::invalid_argument("committed tap D2D must be 0 or 1");
-        const auto* device_only_requested=std::getenv("NINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
+        const auto* device_only_requested=std::getenv("VOIDINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
         if(device_only_requested && std::string_view(device_only_requested)!="0" &&
             std::string_view(device_only_requested)!="1")
             throw std::invalid_argument("compact device taps only must be 0 or 1");
@@ -1339,7 +1339,7 @@ public:
         if(tap_copy_fault_for_test && (!device_staging || tap_copy_fault_for_test>80))
             throw std::invalid_argument("tap copy fault requires active D2D copy1..80");
         for(auto pointer:staging) if(!pointer) throw std::invalid_argument("compact draft staging missing");
-        const auto* witness=std::getenv("NINFER_EXL3_RESIDENT_DRAFT_RING");
+        const auto* witness=std::getenv("VOIDINFER_EXL3_RESIDENT_DRAFT_RING");
         if(witness && std::string_view(witness)!="0" && std::string_view(witness)!="1")
             throw std::invalid_argument("resident draft ring must be 0 or 1");
         auto result=Exl3VeriCacheRequest::create_planned(this,tentative.size(),false,exact.request_metadata_reservation(),exact.request_metadata_reservation());
@@ -2021,7 +2021,7 @@ struct Exl3VeriCacheServingIdentity {
     std::string process_namespace,artifact_identity,tokenizer_identity,
         configuration_identity,modality_identity;
     std::string contract() const {
-        std::string result="ninfer-exl3-serving-prefix-v1";
+        std::string result="voidinfer-exl3-serving-prefix-v1";
         const auto append=[&](std::string_view name,const std::string& value) {
             if(value.empty() || value.size()>(1U<<20))
                 throw std::invalid_argument("serving prefix identity component extent");
@@ -2698,4 +2698,4 @@ inline Exl3VeriCacheReplay Exl3VeriCacheRequest::replay_plan(
     result.partitions_=partitions_;
     result.anchor_=std::move(anchor);return result;
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

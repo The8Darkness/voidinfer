@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 
 // Protocol default when the client omits max_tokens. Engine independently
 // clamps the request to its effective context capacity.
@@ -68,4 +68,4 @@ std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view loaded_model_id);
 std::string serve_usage_text(const char* argv0);
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

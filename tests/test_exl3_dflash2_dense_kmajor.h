@@ -40,11 +40,11 @@ void run_dflash2_dense_kmajor_qualification() {
             "draft dense candidate guards");
         auto* control=static_cast<std::uint16_t*>(control_device.get())+guard;
         auto* candidate=static_cast<std::uint16_t*>(candidate_device.get())+guard;
-        ninfer::exl3::dflash2_dense_t_for_test(
+        voidinfer::exl3::dflash2_dense_t_for_test(
             static_cast<const std::uint16_t*>(input_device.get()),
             static_cast<const std::uint16_t*>(output_major_device.get()),control,
             shape.rows,shape.k,shape.n,false);
-        ninfer::exl3::dflash2_dense_t_for_test(
+        voidinfer::exl3::dflash2_dense_t_for_test(
             static_cast<const std::uint16_t*>(input_device.get()),
             static_cast<const std::uint16_t*>(kmajor_device.get()),candidate,
             shape.rows,shape.k,shape.n,true);

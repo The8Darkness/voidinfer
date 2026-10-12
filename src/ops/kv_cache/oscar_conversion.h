@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace voidinfer::ops {
 
 // Re-quantize one complete [padded_capacity, kv_heads] OSCAR slot image on the GPU. The source
 // and destination are independent affine OSCAR representations; conversion is used only at the
@@ -25,4 +25,4 @@ void cyclic_oscar_requantize_launch(const std::uint8_t* source_k,
                                     OscarKVLayout source_layout = OscarKVLayout::Contiguous,
                                     OscarKVLayout destination_layout = OscarKVLayout::Contiguous);
 
-} // namespace ninfer::ops
+} // namespace voidinfer::ops

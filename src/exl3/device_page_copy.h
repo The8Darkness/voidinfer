@@ -2,7 +2,7 @@
 #include "exl3/device_page_reader.h"
 #include "exl3/registered_kv_upload.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Consumer bridge to the existing private contiguous attention destination.
 // It retains the shared page only through D2D completion; attention subsequently
 // reads lane-owned storage. This does not claim direct paged attention.

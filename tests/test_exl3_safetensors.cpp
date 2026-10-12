@@ -18,7 +18,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using ninfer::exl3::SafetensorsError;
+using voidinfer::exl3::SafetensorsError;
 
 void write_u64_le(std::ofstream& file, std::uint64_t value) {
     std::array<char, 8> bytes{};
@@ -31,7 +31,7 @@ void write_u64_le(std::ofstream& file, std::uint64_t value) {
 std::filesystem::path write_fixture(const Json& header, std::uint64_t payload_bytes) {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto path = std::filesystem::temp_directory_path() /
-                      ("ninfer-exl3-safetensors-" + std::to_string(stamp) + ".safetensors");
+                      ("voidinfer-exl3-safetensors-" + std::to_string(stamp) + ".safetensors");
     const auto encoded = header.dump();
     std::ofstream file(path, std::ios::binary);
     if (!file) { throw std::runtime_error("cannot create safetensors fixture"); }
@@ -68,10 +68,10 @@ Json valid_header() {
 }
 
 void inspect_external_artifact_if_requested() {
-    const char* root_value = std::getenv("NINFER_EXL3_TARGET_PATH");
+    const char* root_value = std::getenv("VOIDINFER_EXL3_TARGET_PATH");
     if (root_value == nullptr || *root_value == '\0') { return; }
     const std::filesystem::path root(root_value);
-    const auto collection = ninfer::exl3::inspect_indexed_directory(root);
+    const auto collection = voidinfer::exl3::inspect_indexed_directory(root);
     if (collection.shards.size() != 3 || collection.indexed_tensor_count != 3080 ||
         collection.header_tensor_count != 3080) {
         throw std::runtime_error("external EXL3 target index/shard summary mismatch");
@@ -79,10 +79,10 @@ void inspect_external_artifact_if_requested() {
     std::cout << "external_target_shards=" << collection.shards.size()
               << " external_target_tensors=" << collection.header_tensor_count << '\n';
 
-    const char* drafter_value = std::getenv("NINFER_EXL3_DRAFTER_PATH");
+    const char* drafter_value = std::getenv("VOIDINFER_EXL3_DRAFTER_PATH");
     if (drafter_value == nullptr || *drafter_value == '\0') { return; }
     const auto drafter_header =
-        ninfer::exl3::inspect_file(std::filesystem::path(drafter_value) / "model.safetensors");
+        voidinfer::exl3::inspect_file(std::filesystem::path(drafter_value) / "model.safetensors");
     if (drafter_header.file_bytes == 0 || drafter_header.tensors.empty()) {
         throw std::runtime_error("invalid external EXL3 drafter");
     }
@@ -92,7 +92,7 @@ void inspect_external_artifact_if_requested() {
 void inspect_index_fixture() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto directory = std::filesystem::temp_directory_path() /
-                           ("ninfer-exl3-index-" + std::to_string(stamp));
+                           ("voidinfer-exl3-index-" + std::to_string(stamp));
     std::filesystem::create_directory(directory);
     try {
         const auto shard = directory / "model-00001-of-00001.safetensors";
@@ -113,7 +113,7 @@ void inspect_index_fixture() {
         std::ofstream index_file(directory / "model.safetensors.index.json", std::ios::binary);
         index_file << index.dump();
         index_file.close();
-        const auto collection = ninfer::exl3::inspect_indexed_directory(directory);
+        const auto collection = voidinfer::exl3::inspect_indexed_directory(directory);
         if (collection.shards.size() != 1 || collection.indexed_tensor_count != 3 ||
             collection.header_tensor_count != 3 || !collection.has_index_total_size ||
             collection.index_total_size != 16) {
@@ -124,7 +124,7 @@ void inspect_index_fixture() {
         std::ofstream bad_index(directory / "model.safetensors.index.json", std::ios::binary);
         bad_index << index.dump();
         bad_index.close();
-        expect_error([&] { (void)ninfer::exl3::inspect_indexed_directory(directory); },
+        expect_error([&] { (void)voidinfer::exl3::inspect_indexed_directory(directory); },
                      "missing indexed shard");
     } catch (...) {
         std::filesystem::remove_all(directory);
@@ -136,31 +136,31 @@ void inspect_index_fixture() {
 } // namespace
 
 void inspect_dual_fixture_if_requested() {
-    const char* root = std::getenv("NINFER_EXL3_MIRROR_UNIT_DIR");
+    const char* root = std::getenv("VOIDINFER_EXL3_MIRROR_UNIT_DIR");
     if (!root || !*root) return;
     const auto directory = std::filesystem::path(root);
     const auto manifest_path = directory / "manifest.json";
     Json manifest;
     { std::ifstream f(manifest_path); f >> manifest; }
     const auto primary = std::filesystem::path(manifest.at(0).at("c").get<std::string>());
-    const auto collection = ninfer::exl3::inspect_indexed_directory(primary.parent_path());
-    const auto sidecar = directory / ".ninfer" / "dual-load.json";
+    const auto collection = voidinfer::exl3::inspect_indexed_directory(primary.parent_path());
+    const auto sidecar = directory / ".voidinfer" / "dual-load.json";
     std::filesystem::create_directories(sidecar.parent_path());
     std::filesystem::copy_file(manifest_path, sidecar, std::filesystem::copy_options::overwrite_existing);
-    if (ninfer::exl3::find_verified_dual_manifest(directory) != sidecar)
+    if (voidinfer::exl3::find_verified_dual_manifest(directory) != sidecar)
         throw std::runtime_error("local default mirror discovery failed");
 #ifdef _WIN32
     auto counterpart = directory.wstring(); counterpart[0] = L'C';
-    if (ninfer::exl3::find_verified_dual_manifest(counterpart) != sidecar)
+    if (voidinfer::exl3::find_verified_dual_manifest(counterpart) != sidecar)
         throw std::runtime_error("absolute C/D default mirror discovery failed");
 #endif
-    if (!ninfer::exl3::find_verified_dual_manifest(directory / "missing-default").empty())
+    if (!voidinfer::exl3::find_verified_dual_manifest(directory / "missing-default").empty())
         throw std::runtime_error("unverified default mirror discovered");
     {
-        ninfer::exl3::VerifiedDualTensorFiles reader(collection, manifest_path);
+        voidinfer::exl3::VerifiedDualTensorFiles reader(collection, manifest_path);
         std::uint64_t bytes = 0;
         for (const auto& shard : collection.shards) for (const auto& tensor : shard.header.tensors) {
-            const auto ordinary = ninfer::exl3::read_tensor(shard.path, shard.header, tensor.name);
+            const auto ordinary = voidinfer::exl3::read_tensor(shard.path, shard.header, tensor.name);
             std::vector<std::byte> guarded(ordinary.bytes().size() + 32, std::byte{0x5a});
             const auto output = std::span<std::byte>(guarded).subspan(16, ordinary.bytes().size());
             const auto half = output.size() / 2;
@@ -191,11 +191,11 @@ void inspect_dual_fixture_if_requested() {
       if (!allowed) throw std::runtime_error("mirror retained lock after destruction"); }
     auto bad_collection = collection;
     bad_collection.shards[0].header.tensors[0].shape[0] += 1;
-    expect_error([&] { ninfer::exl3::VerifiedDualTensorFiles bad_reader(bad_collection, manifest_path); }, "mismatched tensor metadata");
+    expect_error([&] { voidinfer::exl3::VerifiedDualTensorFiles bad_reader(bad_collection, manifest_path); }, "mismatched tensor metadata");
     const auto bad_path = directory / "bad-manifest.json";
     auto reject = [&](Json bad, std::string_view label) {
         { std::ofstream f(bad_path); f << bad.dump(); }
-        expect_error([&] { ninfer::exl3::VerifiedDualTensorFiles bad_reader(collection, bad_path); }, label);
+        expect_error([&] { voidinfer::exl3::VerifiedDualTensorFiles bad_reader(collection, bad_path); }, label);
     };
     auto bad = manifest; bad[0]["bytes"] = bad[0]["bytes"].get<std::uint64_t>() + 1; reject(bad, "changed file size");
     bad = manifest; bad[0]["d_mtime_ns"] = bad[0]["d_mtime_ns"].get<std::uint64_t>() + 100; reject(bad, "changed mirror time");
@@ -210,7 +210,7 @@ void inspect_dual_fixture_if_requested() {
 int main() {
     const auto fixture = write_fixture(valid_header(), 16);
     try {
-        const auto header = ninfer::exl3::inspect_file(fixture);
+        const auto header = voidinfer::exl3::inspect_file(fixture);
         if (header.tensors.size() != 3 || header.metadata_keys.size() != 1 ||
             header.payload_bytes != 16) {
             throw std::runtime_error("valid safetensors fixture summary mismatch");
@@ -222,19 +222,19 @@ int main() {
 
         auto bad_truncated = valid_header();
         const auto truncated = write_fixture(bad_truncated, 8);
-        expect_error([&] { (void)ninfer::exl3::inspect_file(truncated); }, "truncated tensor range");
+        expect_error([&] { (void)voidinfer::exl3::inspect_file(truncated); }, "truncated tensor range");
         std::filesystem::remove(truncated);
 
         auto bad_overlap = valid_header();
         bad_overlap["model.layers.0.self_attn.q_proj.weight.suh"]["data_offsets"] = {4, 8};
         const auto overlap = write_fixture(bad_overlap, 16);
-        expect_error([&] { (void)ninfer::exl3::inspect_file(overlap); }, "overlapping tensors");
+        expect_error([&] { (void)voidinfer::exl3::inspect_file(overlap); }, "overlapping tensors");
         std::filesystem::remove(overlap);
 
         auto bad_dtype_size = valid_header();
         bad_dtype_size["model.layers.0.self_attn.q_proj.weight.mul1"]["dtype"] = "I16";
         const auto dtype_size = write_fixture(bad_dtype_size, 16);
-        expect_error([&] { (void)ninfer::exl3::inspect_file(dtype_size); }, "dtype size mismatch");
+        expect_error([&] { (void)voidinfer::exl3::inspect_file(dtype_size); }, "dtype size mismatch");
         std::filesystem::remove(dtype_size);
 
         inspect_index_fixture();

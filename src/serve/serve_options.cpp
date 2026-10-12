@@ -9,7 +9,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 int parse_nonnegative_int(const char* text, const char* label) {
@@ -116,6 +116,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.model.draft_directory = require_value("--draft");
         } else if (arg == "--vision") {
             options.model.vision_directory = require_value("--vision");
+        } else if (arg == "--dual-manifest") {
+            options.model.verified_dual_manifest = require_value("--dual-manifest");
         } else if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -315,4 +317,4 @@ std::string resolve_public_model_id(const ServeOptions& options,
     return std::string(loaded_model_id);
 }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

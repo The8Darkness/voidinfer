@@ -2,7 +2,7 @@
 #include "exl3/device_horizon_cost_policy.h"
 #include <iostream>
 #include <limits>
-using Policy=ninfer::exl3::Exl3VerifierHorizonPolicy;
+using Policy=voidinfer::exl3::Exl3VerifierHorizonPolicy;
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 int main(){try{
     {
@@ -168,7 +168,7 @@ int main(){try{
     require(refused && p.counters().published_rounds==1,"invalid observation changed policy");
     p.reset();require(p.counters().published_rounds==0 && p.horizon(8)==8,"request reset leaked policy");
     {
-        ninfer::exl3::Exl3DeviceHorizonCostPolicy cost;
+        voidinfer::exl3::Exl3DeviceHorizonCostPolicy cost;
         require(cost.select(8)==8 && cost.select(3)==3,
             "device policy initial B8/tail admission");
         for(int i=0;i<4;++i)cost.observe(8,3,200.0);
@@ -185,7 +185,7 @@ int main(){try{
         try{cost.observe(8,9,1.0);}catch(const std::invalid_argument&){invalid=true;}
         require(invalid && cost.observed()==13,
             "invalid device cost observation mutated request history");
-        ninfer::exl3::Exl3DeviceHorizonCostPolicy fresh;
+        voidinfer::exl3::Exl3DeviceHorizonCostPolicy fresh;
         require(fresh.select(8)==8 && fresh.observed()==0,
             "device horizon history crossed requests");
     }

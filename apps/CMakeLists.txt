@@ -1,21 +1,21 @@
-add_executable(ninfer
+add_executable(voidinfer
   cli/main.cpp
   cli/options.cpp)
-target_include_directories(ninfer PRIVATE
+target_include_directories(voidinfer PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party)
-target_link_libraries(ninfer PRIVATE
-  ninfer_engine
-  ninfer_product_load_progress
-  ninfer_product_prompt_input)
-ninfer_copy_runtime_dlls(ninfer)
+target_link_libraries(voidinfer PRIVATE
+  voidinfer_engine
+  voidinfer_product_load_progress
+  voidinfer_product_prompt_input)
+voidinfer_copy_runtime_dlls(voidinfer)
 
-add_executable(ninfer-serve serve/main.cpp)
-target_include_directories(ninfer-serve PRIVATE
+add_executable(voidinfer-serve serve/main.cpp)
+target_include_directories(voidinfer-serve PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
-target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_load_progress)
-ninfer_copy_runtime_dlls(ninfer-serve)
+target_link_libraries(voidinfer-serve PRIVATE voidinfer_serve voidinfer_product_load_progress)
+voidinfer_copy_runtime_dlls(voidinfer-serve)

@@ -12,20 +12,20 @@ void run_target_k6_qualification(Exl3TextModel& target,
                                  std::ostream& out) {
     require(prompt.size() == 512, "target K6 qualification requires ctx512");
     require(oscar, "target K6 qualification requires canonical OSCAR");
-    require(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
+    require(env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0",
             "target K6 real capture must start from explicit flag0 baseline");
-    ninfer::test::ScopedEnvironmentRestore restore_environment{
-        "NINFER_EXL3_TARGET_GATEUP_SMALL_M",
-        "NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A",
-        "NINFER_EXL3_TARGET_GATEUP_K6_N16",
-        "NINFER_EXL3_GENERIC_SPLITS"};
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment{
+        "VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M",
+        "VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A",
+        "VOIDINFER_EXL3_TARGET_GATEUP_K6_N16",
+        "VOIDINFER_EXL3_GENERIC_SPLITS"};
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
 
     auto captured = run_target_k6_capture(
         target, draft, prompt, std::filesystem::path{}, oscar);
     require(captured.size() == 94, "target K6 qualification capture count mismatch");
 
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     constexpr Admission admit = Admission::target_continuation_gate_up;
     constexpr std::size_t guard = 128;
     constexpr std::uint16_t sentinel = 0x3555;
@@ -39,14 +39,14 @@ void run_target_k6_qualification(Exl3TextModel& target,
     // async-A sub-route is the exact 0/1 flag being qualified here.
     const auto& representative = captured.front();
     const std::string requested_n16 =
-        env("NINFER_EXL3_TARGET_GATEUP_K6_N16");
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
+        env("VOIDINFER_EXL3_TARGET_GATEUP_K6_N16");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
     Exl3CudaLinearWorkspace enabled(kHidden, out_features, 8, false, true);
     Exl3CudaLinearWorkspace generic_owner(kHidden, out_features, 8);
     const std::string expected_dispatch =
-        env("NINFER_EXL3_TARGET_GATEUP_K6_N16") == "1"
+        env("VOIDINFER_EXL3_TARGET_GATEUP_K6_N16") == "1"
             ? "target_gateup_k6_n16_async_a_stream_reduction"
-        : env("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A") == "1"
+        : env("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A") == "1"
             ? "target_gateup_k6_small_m_async_a"
             : "target_gateup_small_m_mma_split";
     require(std::string(enabled.dispatch_name(representative.metadata, 8, admit)) ==
@@ -71,21 +71,21 @@ void run_target_k6_qualification(Exl3TextModel& target,
     require(!enabled.target_gateup_small_m_candidate(
                 mismatched_dimensions, 8, admit),
             "target K6 candidate admitted mismatched metadata dimensions");
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "0");
     Exl3CudaLinearWorkspace off(kHidden, out_features, 8, false, true);
     require(std::string(off.dispatch_name(representative.metadata, 8, admit)) ==
                 "generic_tile",
             "target K6 parent route ignored explicit flag0");
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_N16", "0");
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_N16", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "0");
     Exl3CudaLinearWorkspace synchronous(kHidden, out_features, 8, false, true);
     require(std::string(synchronous.dispatch_name(
                 representative.metadata, 8, admit)) ==
                 "target_gateup_small_m_mma_split",
             "target K6 async-A flag0 changed the parent route");
     for (const char* malformed : {"2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", malformed);
+        _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", malformed);
         bool rejected = false;
         try {
             Exl3CudaLinearWorkspace invalid(kHidden, out_features, 8, false, true);
@@ -94,9 +94,9 @@ void run_target_k6_qualification(Exl3TextModel& target,
         }
         require(rejected, "target K6 async-A accepted malformed opt-in value");
     }
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "1");
     for (const char* malformed : {"2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_N16", malformed);
+        _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_N16", malformed);
         bool rejected = false;
         try {
             Exl3CudaLinearWorkspace invalid(kHidden, out_features, 8, false, true);
@@ -105,11 +105,11 @@ void run_target_k6_qualification(Exl3TextModel& target,
         }
         require(rejected, "target K6 N16 accepted malformed opt-in value");
     }
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_N16", requested_n16.c_str());
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "1");
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_N16", requested_n16.c_str());
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "0");
     Exl3CudaLinearWorkspace latched_off(kHidden, out_features, 8, false, true);
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
     require(std::string(latched_off.dispatch_name(
                 representative.metadata, 8, admit)) == "generic_tile" &&
                 std::string(enabled.dispatch_name(
@@ -154,7 +154,7 @@ void run_target_k6_qualification(Exl3TextModel& target,
                               item.input.size() * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice),
                    "target K6 qualification input upload");
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
         Exl3CudaLinearWorkspace candidate(kHidden, out_features, 8, false, true);
         Exl3CudaLinearWorkspace m1_reference(kHidden, out_features, 1);
         std::vector<std::uint16_t> initial(guarded_elements, sentinel);
@@ -333,7 +333,7 @@ void run_target_k6_qualification(Exl3TextModel& target,
     // captures and weights as the exactness proof, but directly times the
     // preserved synchronous-A route against async-A with CUDA events on one
     // stream.  Each M2..8 cell alternates AB/BA to limit order drift.
-    const std::string timing_path = env("NINFER_E5A4_TARGET_K6_ASYNC_A_TIMING_OUT");
+    const std::string timing_path = env("VOIDINFER_E5A4_TARGET_K6_ASYNC_A_TIMING_OUT");
     if (!timing_path.empty()) {
         std::ofstream timing(timing_path, std::ios::trunc);
         require(timing.good(), "cannot create target K6 async-A timing CSV");
@@ -356,10 +356,10 @@ void run_target_k6_qualification(Exl3TextModel& target,
                                       item.input.size() * sizeof(std::uint16_t),
                                       cudaMemcpyHostToDevice),
                            "target K6 timing input upload");
-                _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
-                _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "0");
+                _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
+                _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "0");
                 Exl3CudaLinearWorkspace control(kHidden, out_features, 8, false, true);
-                _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "1");
+                _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", "1");
                 Exl3CudaLinearWorkspace candidate(kHidden, out_features, 8, false, true);
                 for (int m = 2; m <= 8; ++m) {
                     require(std::string(control.dispatch_name(
@@ -427,7 +427,7 @@ void run_target_k6_qualification(Exl3TextModel& target,
     // at identical boundaries.  The candidate changes dynamic shared bytes
     // only; no endpoint may lose more than the existing 1 MiB gate.
     const std::string lifecycle_path =
-        env("NINFER_E5A4_TARGET_K6_ASYNC_A_LIFECYCLE_OUT");
+        env("VOIDINFER_E5A4_TARGET_K6_ASYNC_A_LIFECYCLE_OUT");
     if (!lifecycle_path.empty()) {
         std::ofstream lifecycle(lifecycle_path, std::ios::trunc);
         require(lifecycle.good(),
@@ -453,8 +453,8 @@ void run_target_k6_qualification(Exl3TextModel& target,
                                       item.input.size() * sizeof(std::uint16_t),
                                       cudaMemcpyHostToDevice),
                            "target K6 lifecycle input upload");
-                _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
-                _putenv_s("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", async_value);
+                _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "1");
+                _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A", async_value);
                 Exl3CudaLinearWorkspace workspace(
                     kHidden, out_features, 8, false, true);
                 workspace.forward(item.weights, item.metadata, input_device,

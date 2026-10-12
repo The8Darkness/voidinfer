@@ -71,11 +71,11 @@ void check_topk_case(const std::vector<std::uint16_t>& input, int rows, int voca
         cuda_check(cudaMemcpy(value_base, value_initial.data(), values.bytes(), cudaMemcpyHostToDevice), "top-K value guards");
         std::vector<std::int64_t> got_ids(count + 2 * guard), repeat_ids(count + 2 * guard);
         std::vector<std::uint32_t> got_values(count + 2 * guard), repeat_values(count + 2 * guard);
-        ninfer::exl3::dflash2_topk16_for_test(
+        voidinfer::exl3::dflash2_topk16_for_test(
             ip, rows, vocab, idp, vp, parallel, local_merge);
         cuda_check(cudaMemcpy(got_ids.data(), id_base, ids.bytes(), cudaMemcpyDeviceToHost), "top-K IDs download");
         cuda_check(cudaMemcpy(got_values.data(), value_base, values.bytes(), cudaMemcpyDeviceToHost), "top-K values download");
-        ninfer::exl3::dflash2_topk16_for_test(
+        voidinfer::exl3::dflash2_topk16_for_test(
             ip, rows, vocab, idp, vp, parallel, local_merge);
         cuda_check(cudaMemcpy(repeat_ids.data(), id_base, ids.bytes(), cudaMemcpyDeviceToHost), "top-K repeat IDs");
         cuda_check(cudaMemcpy(repeat_values.data(), value_base, values.bytes(), cudaMemcpyDeviceToHost), "top-K repeat values");
@@ -104,7 +104,7 @@ void check_topk_case(const std::vector<std::uint16_t>& input, int rows, int voca
     DeviceBuffer nonfinite_flag(sizeof(unsigned int));
     cuda_check(cudaMemset(nonfinite_flag.get(), 0, sizeof(unsigned int)),
                "fused top-K liveness flag zero");
-    ninfer::exl3::dflash2_topk16_for_test(ip, rows, vocab, idp, vp,
+    voidinfer::exl3::dflash2_topk16_for_test(ip, rows, vocab, idp, vp,
         true, true, nullptr, static_cast<unsigned int*>(nonfinite_flag.get()));
     unsigned int observed_nonfinite = 0;
     cuda_check(cudaMemcpy(&observed_nonfinite, nonfinite_flag.get(),
@@ -137,7 +137,7 @@ void check_topk_case(const std::vector<std::uint16_t>& input, int rows, int voca
                 const bool parallel = mode == 1;
                 const bool local_merge = mode == 2;
                 cuda_check(cudaEventRecord(a), "top-K timer begin");
-                ninfer::exl3::dflash2_topk16_for_test(
+                voidinfer::exl3::dflash2_topk16_for_test(
                     ip, rows, vocab, idp, vp, parallel, local_merge);
                 cuda_check(cudaEventRecord(b), "top-K timer end");
                 cuda_check(cudaEventSynchronize(b), "top-K timer sync");
@@ -154,12 +154,12 @@ void check_topk_case(const std::vector<std::uint16_t>& input, int rows, int voca
         const bool local_merge = mode == 2;
         cuda_check(cudaMemcpy(id_base, id_initial.data(), ids.bytes(), cudaMemcpyHostToDevice), "top-K invalid ID guards");
         cuda_check(cudaMemcpy(value_base, value_initial.data(), values.bytes(), cudaMemcpyHostToDevice), "top-K invalid value guards");
-        ninfer::exl3::dflash2_topk16_for_test(
+        voidinfer::exl3::dflash2_topk16_for_test(
             nullptr, 0, vocab, idp, vp, parallel, local_merge);
         for (const int bad_rows : {-1, 8}) {
             bool rejected = false;
             try {
-                ninfer::exl3::dflash2_topk16_for_test(
+                voidinfer::exl3::dflash2_topk16_for_test(
                     ip, bad_rows, vocab, idp, vp, parallel, local_merge);
             }
             catch (const std::exception&) { rejected = true; }
@@ -167,7 +167,7 @@ void check_topk_case(const std::vector<std::uint16_t>& input, int rows, int voca
         }
         bool rejected = false;
         try {
-            ninfer::exl3::dflash2_topk16_for_test(
+            voidinfer::exl3::dflash2_topk16_for_test(
                 ip, 1, 15, idp, vp, parallel, local_merge);
         }
         catch (const std::exception&) { rejected = true; }

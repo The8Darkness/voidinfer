@@ -7,7 +7,7 @@
 #include <span>
 #include <mutex>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Producer supplies exclusively owned contiguous device storage under physical
 // credit. This protocol never allocates device memory or publishes partial data.
 class Exl3DevicePageFill {

@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Replays the shared-memory pairwise tree
 //     for(stride=B/2; stride>=1; stride>>=1) s[l]+=s[l+stride] (l<stride)
@@ -33,4 +33,4 @@ __device__ __forceinline__ float block_tree_sum_exact(float sum, float* shared, 
     return shared[0];
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

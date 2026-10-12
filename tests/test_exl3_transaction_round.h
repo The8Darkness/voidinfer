@@ -361,7 +361,7 @@ void run_transaction_round_qualification(Exl3TextModel& target,
                                          Exl3Dflash2DraftModel& draft,
                                          const std::vector<std::int64_t>& source_ids) {
     require(target.max_context() >= 4096, "transactionqual requires max context at least 4096");
-    require(env("NINFER_OSCAR_EXL3") == "1", "transactionqual requires canonical OSCAR");
+    require(env("VOIDINFER_OSCAR_EXL3") == "1", "transactionqual requires canonical OSCAR");
     require(source_ids.size() >= 32, "transactionqual prompt fixture is too short");
     std::vector<std::uint16_t> injected_logits(
         static_cast<std::size_t>(2) * kVocab, 0);
@@ -394,12 +394,12 @@ void run_transaction_round_qualification(Exl3TextModel& target,
     int cases = 0;
     bool graph_failure_injected = false;
     const bool graph_flag_enabled =
-        env("NINFER_E5A4_CONTINUATION_GRAPH_B8") == "1";
+        env("VOIDINFER_E5A4_CONTINUATION_GRAPH_B8") == "1";
     const bool cohort_flag_enabled =
-        env("NINFER_OSCAR_CONTINUATION_COHORT_B8") == "1";
+        env("VOIDINFER_OSCAR_CONTINUATION_COHORT_B8") == "1";
     const bool graph_cohort_enabled = graph_flag_enabled && cohort_flag_enabled;
     const bool gdn_qkvz_flag_enabled =
-        env("NINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT") == "1";
+        env("VOIDINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT") == "1";
     const bool graph_gdn_qkvz_enabled =
         graph_flag_enabled && gdn_qkvz_flag_enabled;
     auto run_case = [&](const std::vector<std::int64_t>& prefix, int block_len,

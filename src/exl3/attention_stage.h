@@ -6,7 +6,7 @@
 #include <atomic>
 #include <limits>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Two precredited staging records. The backing owner supplied to begin must own
 // the destination and both CUDA events. This schedule invokes no CUDA operations;
 // caller event witnesses are required before exposing or recycling a stage.

@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer {
+namespace voidinfer {
 
 enum class CyclicKVCacheQuantization : std::uint8_t {
     Auto = 0,
@@ -185,4 +185,4 @@ private:
     std::vector<Tensor> protected_v_;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

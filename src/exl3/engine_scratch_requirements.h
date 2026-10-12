@@ -1,7 +1,7 @@
 #pragma once
 #include "exl3/resource_inventory.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // The pinned Engine tap allocation menu. Used by both admission and allocation;
 // it describes these five private destinations, not context/draft workspaces.
 struct Exl3EngineTapRequirements {
@@ -9,7 +9,7 @@ struct Exl3EngineTapRequirements {
     static constexpr std::uint64_t plane_bytes=std::uint64_t(rows)*columns*sizeof(std::uint16_t);
     static Exl3ResourceInventory::Requirement for_lanes(unsigned lanes,std::uint64_t owner_metadata_bytes=0) {
         if(lanes<1 || lanes>8)
-            throw std::invalid_argument("Engine tap requirement supports physical C1/C2");
+            throw std::invalid_argument("Engine tap requirement supports C1..C8");
         Exl3ResourceInventory::Requirement result;
         result.configuration=lanes;
         result.add(Exl3ResourceInventory::Domain::device,lanes,layers*plane_bytes);

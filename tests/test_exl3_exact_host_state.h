@@ -11,26 +11,26 @@ void run_exact_host_state_qualification(Exl3TextModel& target,
         for (int i = 16; i < rows; ++i) context.decode(source[offset + i]);
     };
     ingest(*lane, 0, 20);
-    if(const auto* mode=std::getenv("NINFER_TEST_EXACT_EXPORT_PLANNING_FAILURE");mode && std::string_view(mode)=="1") {
-        ninfer::exl3::RetainedDescriptorLedger snapshot_ledger;
+    if(const auto* mode=std::getenv("VOIDINFER_TEST_EXACT_EXPORT_PLANNING_FAILURE");mode && std::string_view(mode)=="1") {
+        voidinfer::exl3::RetainedDescriptorLedger snapshot_ledger;
         for(unsigned refusal=0;refusal<3;++refusal) {
-            const auto blocks=ninfer::exl3::bounded_shared_live_blocks_for_test<ninfer::exl3::Exl3ExactHostState>();
+            const auto blocks=voidinfer::exl3::bounded_shared_live_blocks_for_test<voidinfer::exl3::Exl3ExactHostState>();
             const auto prior=lane->recurrent_export_stats();
             lane->set_snapshot_metadata_reservation([&](std::uint64_t bytes) {
-                if(refusal==0)throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+                if(refusal==0)throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
                 return snapshot_ledger.acquire(refusal==1?bytes-1:bytes+1);
             });
             bool rejected=false;
             try{(void)lane->export_exact_host_state();}
             catch(const std::runtime_error& error) {
-                rejected=refusal==0?dynamic_cast<const ninfer::exl3::Exl3ResourceReservationExhausted*>(&error)!=nullptr:
+                rejected=refusal==0?dynamic_cast<const voidinfer::exl3::Exl3ResourceReservationExhausted*>(&error)!=nullptr:
                     std::string_view(error.what())=="snapshot metadata reservation extent changed";
             }
             const auto after=lane->recurrent_export_stats();
             require(rejected && snapshot_ledger.bytes()==0 && lane->position()==20 &&
                 after.allocations==prior.allocations && after.pool_hits==prior.pool_hits &&
                 after.pinned_exports==prior.pinned_exports &&
-                ninfer::exl3::bounded_shared_live_blocks_for_test<ninfer::exl3::Exl3ExactHostState>()==blocks,
+                voidinfer::exl3::bounded_shared_live_blocks_for_test<voidinfer::exl3::Exl3ExactHostState>()==blocks,
                 "snapshot reservation refusal allocated state or reached recurrent export");
         }
         unsigned reservations=0;
@@ -51,7 +51,7 @@ void run_exact_host_state_qualification(Exl3TextModel& target,
             "actual export planning fault submitted or poisoned recurrent state");
         const auto retry=lane->export_exact_host_state();
         require(reservations==2 && snapshot_ledger.bytes()==retry->snapshot_metadata_bytes() &&
-            ninfer::exl3::Exl3ExactHostState::snapshot_metadata_credit_belongs_to(retry,snapshot_ledger),
+            voidinfer::exl3::Exl3ExactHostState::snapshot_metadata_credit_belongs_to(retry,snapshot_ledger),
             "actual export failed to attach reserved snapshot metadata");
         const auto retried=lane->recurrent_export_stats();
         require(retried.allocations==abandoned.allocations && retried.pool_hits==abandoned.pool_hits+1 &&
@@ -62,10 +62,10 @@ void run_exact_host_state_qualification(Exl3TextModel& target,
             "actual export planning retry changed authoritative state");
         lane->set_snapshot_metadata_reservation({});
     }
-    if(const auto* mode=std::getenv("NINFER_TEST_EXACT_EXPORT_COPY_FAILURE");
+    if(const auto* mode=std::getenv("VOIDINFER_TEST_EXACT_EXPORT_COPY_FAILURE");
        mode && std::string_view(mode)=="1") {
-        const auto blocks=ninfer::exl3::bounded_shared_live_blocks_for_test<
-            ninfer::exl3::Exl3ExactHostState>();
+        const auto blocks=voidinfer::exl3::bounded_shared_live_blocks_for_test<
+            voidinfer::exl3::Exl3ExactHostState>();
         const auto before=lane->recurrent_export_stats();
         lane->fail_export_copy_for_test(2);
         bool failed=false;
@@ -74,8 +74,8 @@ void run_exact_host_state_qualification(Exl3TextModel& target,
         const auto after=lane->recurrent_export_stats();
         require(failed && lane->position()==20 &&
                 after.copy_submissions==before.copy_submissions+2 &&
-                ninfer::exl3::bounded_shared_live_blocks_for_test<
-                    ninfer::exl3::Exl3ExactHostState>()==blocks,
+                voidinfer::exl3::bounded_shared_live_blocks_for_test<
+                    voidinfer::exl3::Exl3ExactHostState>()==blocks,
             "partial export copy failure published state or lost submission boundary");
         const auto retry=lane->export_exact_host_state();
         ingest(*oracle,0,20);
@@ -87,7 +87,7 @@ void run_exact_host_state_qualification(Exl3TextModel& target,
     const auto request_a_prefix = shared, request_b_prefix = shared;
     require(request_a_prefix.get() == request_b_prefix.get(), "exacthost prefix sharing");
     const auto start = std::chrono::steady_clock::now();
-    std::array<std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>, 2> histories;
+    std::array<std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>, 2> histories;
     for (int request = 0; request < 2; ++request) {
         lane->reset(); lane->restore_exact_host_state(*shared);
         require(lane->export_exact_host_state()->same_payload(*shared), "exacthost root restore");

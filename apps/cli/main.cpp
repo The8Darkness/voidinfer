@@ -2,7 +2,7 @@
 #include "product/load_progress/load_progress.h"
 #include "product/prompt_input/prompt_input.h"
 
-#include "ninfer/engine.h"
+#include "voidinfer/engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -57,15 +57,15 @@ std::string format_bytes(std::uint64_t bytes) {
     return output.str();
 }
 
-std::string format_arena_used(const ninfer::ArenaMemorySummary& arena) {
+std::string format_arena_used(const voidinfer::ArenaMemorySummary& arena) {
     return format_bytes(arena.used_bytes) + " / " + format_bytes(arena.capacity_bytes);
 }
 
-std::string format_arena_peak(const ninfer::ArenaMemorySummary& arena) {
+std::string format_arena_peak(const voidinfer::ArenaMemorySummary& arena) {
     return format_bytes(arena.peak_used_bytes) + " / " + format_bytes(arena.capacity_bytes);
 }
 
-std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) {
+std::string format_sampling(const voidinfer::ResolvedSamplingParameters& sampling) {
     if (sampling.temperature <= 0.0F) { return "greedy (temperature 0)"; }
     std::ostringstream output;
     output << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
@@ -75,19 +75,19 @@ std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) 
     return output.str();
 }
 
-std::string format_finish(ninfer::FinishReason reason) {
+std::string format_finish(voidinfer::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::None:
+    case voidinfer::FinishReason::None:
         return "none";
-    case ninfer::FinishReason::OutputLimit:
+    case voidinfer::FinishReason::OutputLimit:
         return "output-limit";
-    case ninfer::FinishReason::ContextCapacity:
+    case voidinfer::FinishReason::ContextCapacity:
         return "context-capacity";
-    case ninfer::FinishReason::StopToken:
+    case voidinfer::FinishReason::StopToken:
         return "stop-token";
-    case ninfer::FinishReason::StopString:
+    case voidinfer::FinishReason::StopString:
         return "stop-string";
-    case ninfer::FinishReason::Cancelled:
+    case voidinfer::FinishReason::Cancelled:
         return "cancelled";
     }
     return "unknown";
@@ -102,14 +102,14 @@ void print_metric(std::string_view label, std::string_view value) {
     std::cerr << std::left << std::setw(12) << "summary" << std::setw(26) << label << value << '\n';
 }
 
-class StreamingSink final : public ninfer::OutputSink {
+class StreamingSink final : public voidinfer::OutputSink {
 public:
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(voidinfer::OutputDelta delta) override {
         std::ostream& output =
-            delta.channel == ninfer::OutputChannel::Reasoning ? std::cerr : std::cout;
+            delta.channel == voidinfer::OutputChannel::Reasoning ? std::cerr : std::cout;
         output << delta.text;
         output.flush();
-        if (delta.channel == ninfer::OutputChannel::Reasoning) {
+        if (delta.channel == voidinfer::OutputChannel::Reasoning) {
             reasoning_seen_ = reasoning_seen_ || !delta.text.empty();
             if (!delta.text.empty()) { reasoning_ends_in_newline_ = delta.text.back() == '\n'; }
         } else {
@@ -131,7 +131,7 @@ private:
     bool reasoning_ends_in_newline_ = false;
 };
 
-void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
+void print_load_summary(const voidinfer::LoadSummary& load, double wall_seconds) {
     print_stage("load", "wall", wall_seconds);
     print_stage("load", "model load", load.load_seconds);
     print_metric("model", load.target);
@@ -140,9 +140,9 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
 }
 
-void print_generation_summary(const ninfer::GenerationResult& result,
-                              const ninfer::ResolvedSamplingParameters& sampling,
-                              const ninfer::MemorySummary& memory) {
+void print_generation_summary(const voidinfer::GenerationResult& result,
+                              const voidinfer::ResolvedSamplingParameters& sampling,
+                              const voidinfer::MemorySummary& memory) {
     print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
@@ -188,7 +188,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
     print_metric("planned device total", format_bytes(reserved));
 
-    const ninfer::SpeculativeStats& speculative = result.speculative;
+    const voidinfer::SpeculativeStats& speculative = result.speculative;
     if (speculative.enabled) {
         const std::string backend = "dflash2";
         print_metric(backend + " draft window", std::to_string(speculative.draft_window));
@@ -221,20 +221,20 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 
 int main(int argc, char** argv) {
     try {
-        const ninfer::cli::Options cli = ninfer::cli::parse_options(argc, argv);
+        const voidinfer::cli::Options cli = voidinfer::cli::parse_options(argc, argv);
         if (cli.help_requested) {
-            std::cout << ninfer::cli::usage_text(argv[0]);
+            std::cout << voidinfer::cli::usage_text(argv[0]);
             return 0;
         }
 
-        ninfer::PromptInput input =
+        voidinfer::PromptInput input =
             cli.messages_path.empty()
-                ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
-                : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
+                ? voidinfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
+                : voidinfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
                                                         !cli.model.vision_directory.empty());
         input.options.reasoning_effort = cli.reasoning_effort;
 
-        ninfer::RequestOptions request;
+        voidinfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
@@ -243,9 +243,9 @@ int main(int argc, char** argv) {
         request.output.raw                        = cli.raw_output;
 
         std::cerr << "phase       detail                      elapsed/progress\n";
-        ninfer::product::LoadProgressRenderer load_progress(
-            std::cerr, ninfer::product::stderr_load_progress_options());
-        ninfer::EngineOptions engine_options;
+        voidinfer::product::LoadProgressRenderer load_progress(
+            std::cerr, voidinfer::product::stderr_load_progress_options());
+        voidinfer::EngineOptions engine_options;
         engine_options.model         = cli.model;
         engine_options.device        = cli.device;
         engine_options.max_context   = cli.max_context;
@@ -256,18 +256,18 @@ int main(int argc, char** argv) {
         engine_options.load_progress                        = load_progress.callback();
 
         const auto load_started = Clock::now();
-        ninfer::Engine engine(std::move(engine_options));
+        voidinfer::Engine engine(std::move(engine_options));
         const double load_wall = std::chrono::duration<double>(Clock::now() - load_started).count();
         print_load_summary(engine.load_summary(), load_wall);
         engine.reset_memory_peaks();
 
-        ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
+        voidinfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
-        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
-                                                            ninfer::OutputConsumerMode::Streaming);
-        const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
-        const ninfer::GenerationResult result             = generation.wait(&sink);
+        voidinfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
+                                                            voidinfer::OutputConsumerMode::Streaming);
+        const voidinfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
+        const voidinfer::GenerationResult result             = generation.wait(&sink);
         sink.finish_streams();
 
         if (cli.print_token_ids) {
@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
-        std::cerr << ninfer::cli::usage_text(argv[0]);
+        std::cerr << voidinfer::cli::usage_text(argv[0]);
         return 1;
     }
 }

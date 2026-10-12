@@ -24,7 +24,7 @@
 #include <windows.h>
 #endif
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 using Json = nlohmann::json;
@@ -354,14 +354,14 @@ struct VerifiedDualTensorFiles::Impl {
 
 std::filesystem::path find_verified_dual_manifest(const std::filesystem::path& directory) {
     auto primary = std::filesystem::absolute(directory).lexically_normal();
-    const auto local = primary / ".ninfer" / "dual-load.json";
+    const auto local = primary / ".voidinfer" / "dual-load.json";
     if (std::filesystem::exists(local)) return local;
 #ifdef _WIN32
     const auto drive = primary.root_name().wstring();
     if (drive.size() == 2 && (std::towupper(drive[0]) == L'C' || std::towupper(drive[0]) == L'D')) {
         auto counterpart = primary.wstring();
         counterpart[0] = std::towupper(drive[0]) == L'C' ? L'D' : L'C';
-        const auto other = std::filesystem::path(counterpart) / ".ninfer" / "dual-load.json";
+        const auto other = std::filesystem::path(counterpart) / ".voidinfer" / "dual-load.json";
         if (std::filesystem::exists(other)) return other;
     }
 #endif
@@ -494,4 +494,4 @@ std::uint64_t VerifiedDualTensorFiles::source_bytes(int source) const {
     return impl_->bytes[source].load(std::memory_order_relaxed);
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

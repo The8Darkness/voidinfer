@@ -4,7 +4,7 @@
 #include <iostream>
 #include <limits>
 #include <vector>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 static void check(cudaError_t e) {if(e!=cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));}
 // Independent mathematical conversion of represented binary16, no production
 // converter or reduction tree. Fixtures below are authored bit patterns.

@@ -30,7 +30,7 @@
 #include <vector>
 #include <functional>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3TextContext;
 // The Engine's single-lane exact VeriCache line shares the prompt-scale
@@ -41,7 +41,7 @@ void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept;
 // and a decode readback queued behind one of its pieces waits ~0.5 ms). A
 // pinned destination is written by a kernel, stream-ordered; a pageable one
 // goes through a pinned bounce buffer and returns after the stream drains,
-// like cudaMemcpyAsync to pageable memory. NINFER_EXL3_KERNEL_COPIES=0 keeps
+// like cudaMemcpyAsync to pageable memory. VOIDINFER_EXL3_KERNEL_COPIES=0 keeps
 // cudaMemcpyAsync.
 cudaError_t exl3_d2h_async(void* host, const void* device, std::size_t bytes, cudaStream_t stream);
 // Small host->device upload without a copy engine (same rationale): a pinned
@@ -291,7 +291,7 @@ struct Exl3HostKVStats {
     std::uint64_t banked_d2h_rows = 0, banked_d2h_bytes = 0;
     std::uint64_t banked_d2h_drains = 0;
     // Opt-in T24 attribution. Times are host steady-clock nanoseconds and are
-    // collected only when NINFER_EXL3_HOST_KV_CPU_PROFILE=1.
+    // collected only when VOIDINFER_EXL3_HOST_KV_CPU_PROFILE=1.
     std::uint64_t page_extension_calls = 0, page_prefix_refs = 0;
     std::uint64_t page_clone_bytes = 0, page_extension_cpu_ns = 0;
     std::uint64_t page_unique_tail_reuses = 0, page_unique_tail_reuse_bytes = 0;
@@ -867,7 +867,7 @@ public:
     // or128 with PREFILL_WIDE128=1 and shared accumulation;256 additionally
     // requires PREFILL_WIDE256=1 and shared input transforms.
     //512/1024 additionally require their exact flags and shared layer scratch.
-    // Requires a context constructed with NINFER_EXL3_WIDE_PREFILL=1.
+    // Requires a context constructed with VOIDINFER_EXL3_WIDE_PREFILL=1.
     void append_prefill_wide(std::span<const std::int64_t> token_ids,
                              cudaStream_t stream = nullptr);
     // Experimental ordinary device-KV suffix schedule: process each layer's
@@ -887,7 +887,7 @@ public:
     void append_prefill_layer_major(std::span<const std::int64_t> token_ids,
                                     cudaStream_t stream = nullptr,
                                     const RetainedTapTail* retained_taps = nullptr);
-    // Fresh-prompt layer-major policy (NINFER_EXL3_LAYER_MAJOR_FROM_ZERO, default
+    // Fresh-prompt layer-major policy (VOIDINFER_EXL3_LAYER_MAJOR_FROM_ZERO, default
     // 1, process latched; 0 = initial16 control): a reset context admits
     // layer-major prefill at position 0, so the
     // whole prompt runs as 1024-row layer-major chunks instead of an ordered
@@ -1140,7 +1140,7 @@ public:
     std::vector<std::uint16_t> full_attention_k_host(int layer, int position,
                                                       cudaStream_t stream = nullptr) const;
     // E4C1: attach resident OSCAR to the 16 full-attention layers using
-    // environment configuration (NINFER_OSCAR_EXL3=1 plus asset paths).
+    // environment configuration (VOIDINFER_OSCAR_EXL3=1 plus asset paths).
     // Returns false when OSCAR is not requested. Throws fail-closed on bad
     // assets. Ordinary F16 attention stays the path until this succeeds.
     bool try_enable_oscar_from_environment();
@@ -1372,4 +1372,4 @@ private:
     friend class Exl3TextModel;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

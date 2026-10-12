@@ -6,14 +6,14 @@
 // cohort remains functional evidence, not eligible performance evidence.
 void run_reconstructed_exact_authority(Exl3TextModel& target,
                                        const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache=ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity=ninfer::exl3::Exl3VeriCacheServingIdentity;
-    using Registry=ninfer::exl3::Exl3HostResidentSet;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache=voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity=voidinfer::exl3::Exl3VeriCacheServingIdentity;
+    using Registry=voidinfer::exl3::Exl3HostResidentSet;
     using Clock=std::chrono::steady_clock;
     using Root=std::shared_ptr<const Request>;
     const auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
-    const std::filesystem::path directory=env("NINFER_RECON_EXACT_AUTHORITY_OUT");
+    const std::filesystem::path directory=env("VOIDINFER_RECON_EXACT_AUTHORITY_OUT");
     require(!directory.empty() && !std::filesystem::exists(directory),"exact authority new output directory");
     std::filesystem::create_directories(directory);
     std::ofstream checks(directory/"correctness.csv"),runs(directory/"runs.csv"),gaps(directory/"releases.csv");
@@ -27,22 +27,22 @@ void run_reconstructed_exact_authority(Exl3TextModel& target,
         checks.flush();require(checks.good(),"exact authority evidence flush");require(pass,"exact authority gate: "+name);
     };
     require(target.max_context()==4352 && source.size()>=4096,"exact authority fixture extent");
-    for(const char* key:{"NINFER_EXL3_WIDE_PREFILL","NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-            "NINFER_EXL3_PREFILL_WIDE1024","NINFER_EXL3_PREFILL_DIRECT_PARTIALS","NINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
+    for(const char* key:{"VOIDINFER_EXL3_WIDE_PREFILL","VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+            "VOIDINFER_EXL3_PREFILL_WIDE1024","VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS","VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
         require(env(key)=="1",std::string("exact authority direct flag ")+key);
     const auto configure=[](bool candidate) {
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");_putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-        _putenv_s("NINFER_EXL3_NATIVE_CONTINUATION16","0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
-        _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",candidate?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");_putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+        _putenv_s("VOIDINFER_EXL3_NATIVE_CONTINUATION16","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
+        _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",candidate?"1":"0");
     };
     const auto create=[&](bool candidate) {configure(candidate);auto ctx=target.create_context(true);ctx->prepare_continuation(8);return ctx;};
     const auto memory=[] {MEMORYSTATUSEX m{};m.dwLength=sizeof(m);require(GlobalMemoryStatusEx(&m)!=0,"exact authority memory query");return m;};
     // Launcher should set these explicitly; bounded standalone defaults are 8 GiB/1024 MiB.
-    const auto reserve_setting=env("NINFER_RECON_EXACT_AUTHORITY_RESERVE_GIB");
-    const auto cache_setting=env("NINFER_RECON_EXACT_AUTHORITY_CACHE_MIB");
+    const auto reserve_setting=env("VOIDINFER_RECON_EXACT_AUTHORITY_RESERVE_GIB");
+    const auto cache_setting=env("VOIDINFER_RECON_EXACT_AUTHORITY_CACHE_MIB");
     const std::uint64_t reserve=std::stoull(reserve_setting.empty()?"8":reserve_setting)*(1ULL<<30);
     const std::uint64_t cache_budget=std::stoull(cache_setting.empty()?"1024":cache_setting)*(1ULL<<20);
     require(reserve>=(8ULL<<30) && cache_budget>0,"exact authority memory policy");
@@ -85,13 +85,13 @@ void run_reconstructed_exact_authority(Exl3TextModel& target,
     {
         auto ctx=create(false);
         ctx->set_target_projection_observer_for_test(
-            [](const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+            [](const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
                 if((x.rows!=256 && x.rows!=512 && x.rows!=1024) || x.metadata.K!=7 ||
                     x.metadata.in_features!=17408 || x.metadata.out_features!=5120 ||
                     x.metadata.mcg || !x.metadata.mul1 || x.metadata.has_bias ||
                     !x.operation || std::string(x.operation)!="down") return;
                 auto& o=*static_cast<Observed*>(user);++o.calls;o.rows+=x.rows;
-            },&observed,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+            },&observed,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
         auto current=Request::initialize(*ctx,prompt,1024);
         ctx->set_target_projection_observer_for_test(nullptr);
         canonical.push_back(current);pin({current});parent_persistent=ctx->persistent_bytes();
@@ -174,9 +174,9 @@ void run_reconstructed_exact_authority(Exl3TextModel& target,
     // No arbitrary generated suffix is admitted as a completed conversational turn.
     {
         auto ctx=create(true);
-        const Identity identity{env("NINFER_RECON_EXACT_AUTHORITY_NAMESPACE"),
-            env("NINFER_RECON_EXACT_AUTHORITY_ARTIFACT_ID"),env("NINFER_RECON_EXACT_AUTHORITY_TOKENIZER_ID"),
-            env("NINFER_RECON_EXACT_AUTHORITY_CONFIGURATION_ID"),env("NINFER_RECON_EXACT_AUTHORITY_MODALITY_ID")};
+        const Identity identity{env("VOIDINFER_RECON_EXACT_AUTHORITY_NAMESPACE"),
+            env("VOIDINFER_RECON_EXACT_AUTHORITY_ARTIFACT_ID"),env("VOIDINFER_RECON_EXACT_AUTHORITY_TOKENIZER_ID"),
+            env("VOIDINFER_RECON_EXACT_AUTHORITY_CONFIGURATION_ID"),env("VOIDINFER_RECON_EXACT_AUTHORITY_MODALITY_ID")};
         Cache cache(Cache::Policy{1,64,cache_budget,reserve},identity);
         int reached=0;bool cancelled=false;std::shared_ptr<const Request> partial;
         try {partial=Request::initialize(*ctx,prompt,1024,[&](int position) {

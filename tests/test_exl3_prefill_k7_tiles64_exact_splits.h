@@ -1,23 +1,23 @@
 #pragma once
 
 struct PrefillK7Tiles64ExactSplitsQualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit = Admission::target_wide_prefill;
     static constexpr int max_rows = 128;
     static constexpr std::size_t guard = 128;
 
     struct EnvironmentRestore {
-        std::string candidate = env("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS");
-        std::string rowpair = env("NINFER_EXL3_PREFILL_ROWPAIR_K7");
-        std::string direct_a = env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A");
-        std::string direct_all = env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL");
-        std::string partials = env("NINFER_EXL3_PREFILL_DIRECT_PARTIALS");
+        std::string candidate = env("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS");
+        std::string rowpair = env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7");
+        std::string direct_a = env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A");
+        std::string direct_all = env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL");
+        std::string partials = env("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS");
         ~EnvironmentRestore() {
-            _putenv_s("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS", candidate.c_str());
-            _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K7", rowpair.c_str());
-            _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A", direct_a.c_str());
-            _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL", direct_all.c_str());
-            _putenv_s("NINFER_EXL3_PREFILL_DIRECT_PARTIALS", partials.c_str());
+            _putenv_s("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS", candidate.c_str());
+            _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7", rowpair.c_str());
+            _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A", direct_a.c_str());
+            _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL", direct_all.c_str());
+            _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS", partials.c_str());
         }
     } restore;
 
@@ -37,15 +37,15 @@ struct PrefillK7Tiles64ExactSplitsQualification {
         csv.open(path / "differential.csv");
         csv << "input,output,operation,rows,values,control_route,candidate_route,"
                "exact,repeat,guards,input_unchanged,candidate_calls\n";
-        _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K7", "1");
-        _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A", "1");
-        _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL", "1");
-        _putenv_s("NINFER_EXL3_PREFILL_DIRECT_PARTIALS", "1");
-        _putenv_s("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS", "0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7", "1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A", "1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL", "1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS", "1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS", "0");
     }
 
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+        const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
         void* user) {
         static_cast<PrefillK7Tiles64ExactSplitsQualification*>(user)->check(
             observation);
@@ -58,21 +58,21 @@ struct PrefillK7Tiles64ExactSplitsQualification {
     }
 
     static std::unique_ptr<Exl3CudaLinearWorkspace> make_workspace(
-        const ninfer::exl3::Exl3TargetProjectionObservation& x,
+        const voidinfer::exl3::Exl3TargetProjectionObservation& x,
         bool candidate) {
         const std::string operation = x.operation;
-        _putenv_s("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS",
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS",
                   candidate ? "1" : "0");
         return std::make_unique<Exl3CudaLinearWorkspace>(
             x.metadata.in_features, x.metadata.out_features, max_rows, false,
             operation == "gate" || operation == "up", operation == "down",
             operation == "o", operation == "z", true, false,
-            ninfer::exl3::Exl3CudaAccumulationView{},
-            ninfer::exl3::Exl3CudaTransformView{}, operation == "qkv",
+            voidinfer::exl3::Exl3CudaAccumulationView{},
+            voidinfer::exl3::Exl3CudaTransformView{}, operation == "qkv",
             operation == "k" || operation == "v", operation == "q");
     }
 
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         ++observations;
         const int input_width = x.metadata.in_features;
         const int output_width = x.metadata.out_features;
@@ -85,11 +85,11 @@ struct PrefillK7Tiles64ExactSplitsQualification {
 
         auto control = make_workspace(x, false);
         auto candidate = make_workspace(x, true);
-        _putenv_s("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS", "0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS", "0");
 
         if (!strict_checked) {
             for (const char* malformed : {"2", "true", "01"}) {
-                _putenv_s("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS",
+                _putenv_s("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS",
                           malformed);
                 bool rejected = false;
                 try {
@@ -100,8 +100,8 @@ struct PrefillK7Tiles64ExactSplitsQualification {
                         operation == "gate" || operation == "up",
                         operation == "down", operation == "o",
                         operation == "z", true, false,
-                        ninfer::exl3::Exl3CudaAccumulationView{},
-                        ninfer::exl3::Exl3CudaTransformView{},
+                        voidinfer::exl3::Exl3CudaAccumulationView{},
+                        voidinfer::exl3::Exl3CudaTransformView{},
                         operation == "qkv",
                         operation == "k" || operation == "v",
                         operation == "q");
@@ -112,7 +112,7 @@ struct PrefillK7Tiles64ExactSplitsQualification {
                         "K7 tiles64 exact-splits accepted malformed opt-in");
             }
             strict_checked = true;
-            _putenv_s("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS", "0");
+            _putenv_s("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS", "0");
         }
 
         require(!candidate->target_k7_tiles64_exact_splits_candidate(
@@ -221,24 +221,24 @@ struct PrefillK7Tiles64ExactSplitsQualification {
 };
 
 void run_prefill_k7_tiles64_exact_splits_qualification(Exl3TextModel& target) {
-    require(env("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS") == "0" &&
-                env("NINFER_EXL3_PREFILL_ROWPAIR_K7") == "1" &&
-                env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A") == "1" &&
-                env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL") == "1" &&
-                env("NINFER_EXL3_PREFILL_DIRECT_PARTIALS") == "1",
+    require(env("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS") == "0" &&
+                env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7") == "1" &&
+                env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A") == "1" &&
+                env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL") == "1" &&
+                env("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS") == "1",
             "K7 tiles64 exact-splits qualification flags");
-    auto ids = load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids = load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size() >= 16 +
                 PrefillK7Tiles64ExactSplitsQualification::max_rows,
             "K7 tiles64 exact-splits prompt extent");
     auto context = target.create_context(true);
     PrefillK7Tiles64ExactSplitsQualification qualification(
-        env("NINFER_E5A4_OUT"));
+        env("VOIDINFER_E5A4_OUT"));
     context->prefill(std::span<const std::int64_t>(ids.data(), 16));
     context->set_target_projection_observer_for_test(
         PrefillK7Tiles64ExactSplitsQualification::callback, &qualification,
         nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_exact_prefill_wide(std::span<const std::int64_t>(
         ids.data() + 16,
         PrefillK7Tiles64ExactSplitsQualification::max_rows));

@@ -23,12 +23,12 @@
 namespace {
 
 using Json = nlohmann::json;
-using ninfer::exl3::Exl3LinearMetadata;
-using ninfer::exl3::Exl3LinearTensors;
-using ninfer::exl3::Exl3ReferenceOutput;
-using ninfer::exl3::SafetensorsError;
-using ninfer::exl3::SafetensorsHeader;
-using ninfer::exl3::TensorPayload;
+using voidinfer::exl3::Exl3LinearMetadata;
+using voidinfer::exl3::Exl3LinearTensors;
+using voidinfer::exl3::Exl3ReferenceOutput;
+using voidinfer::exl3::SafetensorsError;
+using voidinfer::exl3::SafetensorsHeader;
+using voidinfer::exl3::TensorPayload;
 
 constexpr const char* kPrefix = "model.language_model.layers.5.mlp.gate_proj.";
 constexpr const char* kTrellisName = "model.language_model.layers.5.mlp.gate_proj.trellis";
@@ -156,11 +156,11 @@ Json read_json(const std::filesystem::path& path) {
     }
 }
 
-TensorPayload load_indexed_tensor(const ninfer::exl3::IndexedSafetensors& collection,
+TensorPayload load_indexed_tensor(const voidinfer::exl3::IndexedSafetensors& collection,
                                   std::string_view name) {
     for (const auto& shard : collection.shards) {
         if (shard.header.find(name) != nullptr) {
-            return ninfer::exl3::read_tensor(shard.path, shard.header, name);
+            return voidinfer::exl3::read_tensor(shard.path, shard.header, name);
         }
     }
     throw std::runtime_error("indexed tensor is absent: " + std::string(name));
@@ -190,7 +190,7 @@ void verify_model_config(const std::filesystem::path& model_dir) {
 
 Exl3LinearTensors load_module(const std::filesystem::path& model_dir,
                               std::vector<TensorPayload>& keep_alive) {
-    const auto collection = ninfer::exl3::inspect_indexed_directory(model_dir);
+    const auto collection = voidinfer::exl3::inspect_indexed_directory(model_dir);
     const auto load = [&](const char* name) {
         keep_alive.push_back(load_indexed_tensor(collection, name));
         return &keep_alive.back();
@@ -221,13 +221,13 @@ void run_negative_tests(const Exl3LinearTensors& original,
                      const TensorPayload* candidate_input) {
         expect_failure(label, [&] {
             if (std::string(label) == "payload outside shard bounds") {
-                SafetensorsHeader header = ninfer::exl3::inspect_file(
-                    env_or_empty("NINFER_EXL3_ORACLE_PATH"));
+                SafetensorsHeader header = voidinfer::exl3::inspect_file(
+                    env_or_empty("VOIDINFER_EXL3_ORACLE_PATH"));
                 header.tensors.front().data_end = header.payload_bytes + 1;
-                (void)ninfer::exl3::read_tensor(env_or_empty("NINFER_EXL3_ORACLE_PATH"),
+                (void)voidinfer::exl3::read_tensor(env_or_empty("VOIDINFER_EXL3_ORACLE_PATH"),
                                                 header, header.tensors.front().name);
             } else {
-                (void)ninfer::exl3::exl3_linear_reference(*candidate_input, candidate,
+                (void)voidinfer::exl3::exl3_linear_reference(*candidate_input, candidate,
                                                           candidate_metadata);
             }
         });
@@ -273,8 +273,8 @@ void run_negative_tests(const Exl3LinearTensors& original,
 std::optional<Metrics> compare_optional(const std::filesystem::path& path,
                                         const Exl3ReferenceOutput& actual) {
     if (path.empty() || !std::filesystem::exists(path)) { return std::nullopt; }
-    const auto header = ninfer::exl3::inspect_file(path);
-    const auto expected = ninfer::exl3::read_tensor(path, header, "linear_output");
+    const auto header = voidinfer::exl3::inspect_file(path);
+    const auto expected = voidinfer::exl3::read_tensor(path, header, "linear_output");
     const auto bits = expected.typed<std::uint16_t>("F16");
     return compare(actual.fp16_bits, bits);
 }
@@ -283,10 +283,10 @@ std::optional<Metrics> compare_optional(const std::filesystem::path& path,
 
 int main() {
     try {
-        const auto model_text = env_or_empty("NINFER_EXL3_TARGET_PATH");
-        const auto oracle_text = env_or_empty("NINFER_EXL3_ORACLE_PATH");
+        const auto model_text = env_or_empty("VOIDINFER_EXL3_TARGET_PATH");
+        const auto oracle_text = env_or_empty("VOIDINFER_EXL3_ORACLE_PATH");
         if (model_text.empty() || oracle_text.empty()) {
-            std::cerr << "SKIP: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_ORACLE_PATH\n";
+            std::cerr << "SKIP: set VOIDINFER_EXL3_TARGET_PATH and VOIDINFER_EXL3_ORACLE_PATH\n";
             return 77;
         }
         const std::filesystem::path model_dir(model_text);
@@ -300,9 +300,9 @@ int main() {
         const auto tensors = load_module(model_dir, keep_alive);
         const auto mul1_value = tensors.mul1->typed<std::int32_t>("I32").front();
         std::cout << "module mul1 scalar=" << mul1_value << '\n';
-        const auto oracle_header = ninfer::exl3::inspect_file(oracle_path);
-        const auto input = ninfer::exl3::read_tensor(oracle_path, oracle_header, "linear_input");
-        const auto expected = ninfer::exl3::read_tensor(oracle_path, oracle_header, "linear_output");
+        const auto oracle_header = voidinfer::exl3::inspect_file(oracle_path);
+        const auto input = voidinfer::exl3::read_tensor(oracle_path, oracle_header, "linear_input");
+        const auto expected = voidinfer::exl3::read_tensor(oracle_path, oracle_header, "linear_output");
         require(input.info.shape == std::vector<std::uint64_t>{1, 14, 5120},
                 "oracle linear_input shape mismatch");
         require(input.info.dtype == "F16", "oracle linear_input dtype mismatch");
@@ -311,8 +311,8 @@ int main() {
         require(expected.info.dtype == "F16", "oracle linear_output dtype mismatch");
 
         const Exl3LinearMetadata metadata{5120, 17408, 5, false, true, false, "mul1"};
-        ninfer::exl3::validate_linear_tensors(tensors, metadata);
-        const auto actual = ninfer::exl3::exl3_linear_reference(input, tensors, metadata);
+        voidinfer::exl3::validate_linear_tensors(tensors, metadata);
+        const auto actual = voidinfer::exl3::exl3_linear_reference(input, tensors, metadata);
         require(actual.shape == std::vector<std::uint64_t>{1, 14, 17408},
                 "native reference output shape mismatch");
         const auto expected_bits = expected.typed<std::uint16_t>("F16");
@@ -320,9 +320,9 @@ int main() {
         print_metrics("canonical linear_output", metrics);
 
         const auto run2 = compare_optional(
-            env_or_empty("NINFER_EXL3_ORACLE_RUN2_PATH"), actual);
+            env_or_empty("VOIDINFER_EXL3_ORACLE_RUN2_PATH"), actual);
         const auto run3 = compare_optional(
-            env_or_empty("NINFER_EXL3_ORACLE_RUN3_PATH"), actual);
+            env_or_empty("VOIDINFER_EXL3_ORACLE_RUN3_PATH"), actual);
         if (run2) { print_metrics("run2 linear_output", *run2); }
         if (run3) { print_metrics("run3 linear_output", *run3); }
 

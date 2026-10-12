@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Bounded manifest for options introduced by the EXL3 campaign. It is consumed
 // once by actual Engine construction after textual option validation and before

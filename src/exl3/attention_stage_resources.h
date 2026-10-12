@@ -3,7 +3,7 @@
 #include "exl3/attention_stage.h"
 #include "exl3/attention_stage_history.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Suballocations consume an already accepted whole-transition reservation.
 // This adapter cannot consult availability or increase that reservation.
 template<class Coordinator>

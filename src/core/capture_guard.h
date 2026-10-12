@@ -11,7 +11,7 @@
 #include <mutex>
 #include <shared_mutex>
 
-namespace ninfer {
+namespace voidinfer {
 
 inline std::shared_mutex& cuda_capture_guard() {
     static std::shared_mutex mutex;
@@ -31,4 +31,4 @@ inline cudaError_t cuda_device_synchronize_outside_capture() {
     return cudaDeviceSynchronize();
 }
 
-}  // namespace ninfer
+}  // namespace voidinfer

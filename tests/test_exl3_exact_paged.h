@@ -1,8 +1,8 @@
 #pragma once
 
 void run_exact_paged_qualification(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using State=ninfer::exl3::Exl3ExactHostState;
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using State=voidinfer::exl3::Exl3ExactHostState;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(source.size()>350 && target.max_context()==1024,"paged fixture extent");
     auto exact=target.create_context(true);
     exact->prepare_continuation(8);

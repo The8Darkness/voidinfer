@@ -2,7 +2,7 @@
 #include "exl3/device_page_storage.h"
 #include "exl3/registered_kv_upload.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Exact ordinary host-page fill. The initial command waits for readiness before
 // returning; lookup peers can use host fallback while this producer is active.
 inline void exl3_fill_device_page(const Exl3DevicePageStorage::Prepared& prepared,

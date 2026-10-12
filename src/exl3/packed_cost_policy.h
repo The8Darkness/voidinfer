@@ -6,7 +6,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Supplied estimates only; no calibration or performance claim. Units are us,
 // including packing/scatter in shared_us. A bad estimate can only choose a
 // slower already-admitted route, never relax ownership or arithmetic checks.

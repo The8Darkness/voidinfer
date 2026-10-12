@@ -5,10 +5,10 @@ void run_transaction_retention_qualification(
     const std::vector<std::int64_t>& source_ids, bool qkv_focused = false, bool fresh_prefill = false) {
     require(target.max_context() == (fresh_prefill ? 8192 : 4096) && source_ids.size() >= (fresh_prefill ? 4097u : 4096u),
             "transactionretainqual requires maxctx4096 and real prompt IDs");
-    require(env("NINFER_OSCAR_EXL3") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1",
             "transactionretainqual requires canonical OSCAR");
     if(qkv_focused){
-        const char* qkv_k6 = std::getenv("NINFER_EXL3_TARGET_QKV_K6_SMALL_M");
+        const char* qkv_k6 = std::getenv("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M");
         require(qkv_k6 == nullptr || std::string(qkv_k6) == "1",
             "targetqkvk6state requires flag unset or 1");
     }
@@ -20,7 +20,7 @@ void run_transaction_retention_qualification(
         }
         ~ScopedQkvEnvironment(){for(auto i=saved.rbegin();i!=saved.rend();++i)_putenv_s(i->first.c_str(),i->second.c_str());}
     };
-    if(fresh_prefill)require(env("NINFER_DFLASH2_PREFILL_WINDOW")=="1" && env("NINFER_EXL3_TARGET_QKV_K6_SMALL_M")=="1","fresh state requires P9 and fresh scope flags");
+    if(fresh_prefill)require(env("VOIDINFER_DFLASH2_PREFILL_WINDOW")=="1" && env("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M")=="1","fresh state requires P9 and fresh scope flags");
     const bool reduced_reference = qkv_focused || fresh_prefill;
     auto snapshot=[&](Exl3TextContext& ctx){return prefix_retention_snapshot(ctx,fresh_prefill?8192:4096);};
     int cases = 0, retain_cases = 0, default_cases = 0, failures = 0;
@@ -32,23 +32,23 @@ void run_transaction_retention_qualification(
         auto candidate = target.create_context(true);
         auto reference = [&] {
             if(!reduced_reference){
-                ScopedQkvEnvironment restore{{"NINFER_EXL3_GDN_WIDE_SLAB","0"}};
+                ScopedQkvEnvironment restore{{"VOIDINFER_EXL3_GDN_WIDE_SLAB","0"}};
                 return target.create_context(true);
             }
             // Established exact32 serial oracle: two expanded1024 contexts do not fit.
-            ScopedQkvEnvironment restore{{"NINFER_EXL3_PREFILL_WIDE64","0"},
-                {"NINFER_EXL3_PREFILL_ROWPAIR_K6","0"},{"NINFER_EXL3_SHARED_LAYER_SCRATCH","0"},{"NINFER_EXL3_PREFILL_DIRECT_ASYNC_A","0"},
-                {"NINFER_EXL3_PREFILL_DIRECT_PARTIALS","0"},{"NINFER_EXL3_PREFILL_STAGED_SHAPE4","0"},
-                {"NINFER_EXL3_TARGET_QKV_K6_SMALL_M",fresh_prefill?"1":"0"},
-                {"NINFER_EXL3_GDN_WIDE_SLAB","0"}};
+            ScopedQkvEnvironment restore{{"VOIDINFER_EXL3_PREFILL_WIDE64","0"},
+                {"VOIDINFER_EXL3_PREFILL_ROWPAIR_K6","0"},{"VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","0"},{"VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A","0"},
+                {"VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS","0"},{"VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4","0"},
+                {"VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M",fresh_prefill?"1":"0"},
+                {"VOIDINFER_EXL3_GDN_WIDE_SLAB","0"}};
             return target.create_context(true);
         }();
         if(reduced_reference){
             require(candidate->try_enable_oscar_from_environment(),label+" candidate OSCAR enable");
-            ScopedQkvEnvironment restore{{"NINFER_OSCAR_PREFILL_PACKED_BYTE4","0"},
-                {"NINFER_OSCAR_PREFILL_QUERY_PARALLEL","0"},
-                {"NINFER_OSCAR_PREFILL_PARALLEL_MERGE","0"},{"NINFER_OSCAR_PREFILL_PARALLEL_SCORES","0"},
-                {"NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS","0"}};
+            ScopedQkvEnvironment restore{{"VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4","0"},
+                {"VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL","0"},
+                {"VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE","0"},{"VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES","0"},
+                {"VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS","0"}};
             require(reference->try_enable_oscar_from_environment(),label+" serial OSCAR enable");
         }else{
             require(candidate->try_enable_oscar_from_environment() &&
@@ -60,7 +60,7 @@ void run_transaction_retention_qualification(
         auto staging = make_transaction_round_stage();
         ingest_prefix(*candidate, prefix, CommitSink{&draft, &staging});
         if(reduced_reference){
-            {ScopedQkvEnvironment restore{{"NINFER_EXL3_PREFILL_CHUNK","32"}};
+            {ScopedQkvEnvironment restore{{"VOIDINFER_EXL3_PREFILL_CHUNK","32"}};
              ingest_prefix(*reference,prefix,CommitSink{});}
             require_prefix_retention_semantic(snapshot(*candidate),snapshot(*reference),label+" exact32 base state");
             for(const auto layer:kTapLayers){
@@ -239,7 +239,7 @@ void run_transaction_retention_qualification(
         auto rebuild = target.create_context(true);
         require(rebuild->try_enable_oscar_from_environment(), label + " rebuild OSCAR");
         auto rebuild_staging = make_transaction_round_stage();
-        {ScopedQkvEnvironment original{{"NINFER_DFLASH2_PREFILL_WINDOW","0"}};
+        {ScopedQkvEnvironment original{{"VOIDINFER_DFLASH2_PREFILL_WINDOW","0"}};
          ingest_prefix(*rebuild, prefix, CommitSink{&draft, &rebuild_staging});}
         int cut = 0;
         for (std::size_t index = 0; index < processed.size(); ++index) {

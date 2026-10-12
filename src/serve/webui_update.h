@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 
 // Resolves the webui directory for --webui auto mode: --webui-dir if set,
 // otherwise <directory of the artifact path>/webui.
@@ -22,4 +22,4 @@ std::string resolve_webui_dir(const ServeOptions& options);
 // on an unrecoverable download failure. No-op when the local copy is current.
 std::string ensure_webui_available(const std::string& webui_dir);
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

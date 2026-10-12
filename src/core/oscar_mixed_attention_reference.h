@@ -6,7 +6,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer {
+namespace voidinfer {
 
 enum class OscarMixedReadTier : std::uint8_t {
     ProtectedPrefixBFloat16 = 0,
@@ -27,7 +27,7 @@ struct OscarMixedAttentionTrace {
     std::vector<float> softmax;
     std::vector<float> rotated_av;
     std::vector<float> recovered_output;
-    // Populated only when NINFER_OSCAR_D4_1_PROFILE=1. Values are wall-clock microseconds for
+    // Populated only when VOIDINFER_OSCAR_D4_1_PROFILE=1. Values are wall-clock microseconds for
     // this scalar reference call and are intentionally diagnostic rather than a performance API.
     double q_rotation_us = 0.0;
     double int2_k_decode_us = 0.0;
@@ -62,4 +62,4 @@ private:
                   float* output) const;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

@@ -32,15 +32,15 @@
 
 #pragma comment(lib, "winhttp.lib")
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 namespace fs = std::filesystem;
 
 constexpr const char* kBucketApi    = "https://huggingface.co/api/buckets/ggml-org/llama-ui/tree/latest";
 constexpr const char* kBucketBase   = "https://huggingface.co/buckets/ggml-org/llama-ui/resolve/latest/";
-constexpr const char* kUserAgent    = "ninfer-serve";
-constexpr const char* kMarkerFile   = ".ninfer-webui-version";
+constexpr const char* kUserAgent    = "voidinfer-serve";
+constexpr const char* kMarkerFile   = ".voidinfer-webui-version";
 constexpr const char* kVersionPath  = "_app/version.json";
 constexpr int kMaxAttempts          = 3;
 constexpr DWORD kReadChunkBytes     = 1 << 20;
@@ -275,11 +275,11 @@ bool local_copy_is_current(const fs::path& webui_dir, const std::string& version
 }
 
 std::vector<fs::path> staged_stale_dirs(const fs::path& webui_dir) {
-    // Staging dirs from a previously interrupted run: .ninfer-webui.<pid>.tmp
+    // Staging dirs from a previously interrupted run: .voidinfer-webui.<pid>.tmp
     std::vector<fs::path> stale;
     std::error_code ec;
     const fs::path parent = webui_dir.parent_path();
-    const std::string prefix = ".ninfer-webui.";
+    const std::string prefix = ".voidinfer-webui.";
     if (!directory_exists(parent)) { return stale; }
     for (const auto& entry : fs::directory_iterator(parent, ec)) {
         const std::string name = entry.path().filename().string();
@@ -327,7 +327,7 @@ std::string ensure_webui_available(const std::string& webui_dir) {
     // Stage in a sibling directory, then swap atomically: the served directory is
     // never half-written, and an interrupted run leaves the previous copy intact.
     const fs::path staging =
-        target.parent_path() / (".ninfer-webui." + std::to_string(::GetCurrentProcessId()) + ".tmp");
+        target.parent_path() / (".voidinfer-webui." + std::to_string(::GetCurrentProcessId()) + ".tmp");
     {
         std::error_code ec;
         fs::remove_all(staging, ec);
@@ -353,7 +353,7 @@ std::string ensure_webui_available(const std::string& webui_dir) {
 
     // Atomic swap: rename target aside, move staging in, drop the old copy.
     const fs::path old =
-        target.parent_path() / (".ninfer-webui.old." + std::to_string(::GetCurrentProcessId()));
+        target.parent_path() / (".voidinfer-webui.old." + std::to_string(::GetCurrentProcessId()));
     std::error_code ec;
     fs::remove_all(old, ec);
     if (directory_exists(target)) {
@@ -381,4 +381,4 @@ std::string ensure_webui_available(const std::string& webui_dir) {
     return webui_dir;
 }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

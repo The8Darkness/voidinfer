@@ -1,24 +1,24 @@
 #pragma once
 
 void run_capacity_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& draft) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using State=ninfer::exl3::Exl3ExactHostState;
-    using Queue=ninfer::exl3::Exl3VeriCacheQueue;
-    const int lanes=std::stoi(env("NINFER_CAPACITY_C")),length=std::stoi(env("NINFER_CAPACITY_TOKENS"));
-    const int shared=std::stoi(env("NINFER_CAPACITY_SHARED"));
-    const bool compact=env("NINFER_CAPACITY_COMPACT_DRAFT")=="1";
-    const bool cold_oracle=env("NINFER_CAPACITY_COLD_ORACLE")=="1";
-    const bool lock_resident=env("NINFER_CAPACITY_LOCK_RESIDENT")=="1";
-    const bool trim_resident=env("NINFER_CAPACITY_TRIM_RESIDENT")=="1";
-    const bool defer_post_restore=env("NINFER_COMPACT_DEFER_POST_RESTORE")=="1";
-    const bool force_outer_rejection=env("NINFER_CAPACITY_FORCE_OUTER_REJECTION_ONCE")=="1";
-    const auto setting=env("NINFER_CAPACITY_RESERVE_GIB");
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using State=voidinfer::exl3::Exl3ExactHostState;
+    using Queue=voidinfer::exl3::Exl3VeriCacheQueue;
+    const int lanes=std::stoi(env("VOIDINFER_CAPACITY_C")),length=std::stoi(env("VOIDINFER_CAPACITY_TOKENS"));
+    const int shared=std::stoi(env("VOIDINFER_CAPACITY_SHARED"));
+    const bool compact=env("VOIDINFER_CAPACITY_COMPACT_DRAFT")=="1";
+    const bool cold_oracle=env("VOIDINFER_CAPACITY_COLD_ORACLE")=="1";
+    const bool lock_resident=env("VOIDINFER_CAPACITY_LOCK_RESIDENT")=="1";
+    const bool trim_resident=env("VOIDINFER_CAPACITY_TRIM_RESIDENT")=="1";
+    const bool defer_post_restore=env("VOIDINFER_COMPACT_DEFER_POST_RESTORE")=="1";
+    const bool force_outer_rejection=env("VOIDINFER_CAPACITY_FORCE_OUTER_REJECTION_ONCE")=="1";
+    const auto setting=env("VOIDINFER_CAPACITY_RESERVE_GIB");
     const std::uint64_t reserve=(setting.empty()?8:std::stoull(setting))*(1ULL<<30);
     require(lanes>=1 && lanes<=32 && (lanes&(lanes-1))==0 && length>0 && length+64<=target.max_context() &&
         (shared==0 || shared==1) && reserve>=(4ULL<<30),"capacity cohort/budget extent");
     require(!cold_oracle || lanes==1,"cold full-prefix oracle is bounded to C1");
     require(!trim_resident || lock_resident,"adversarial trim requires explicit resident ownership");
-    const std::filesystem::path fixtures=env("NINFER_CAPACITY_DIR"),output=env("NINFER_CAPACITY_OUTPUT");
+    const std::filesystem::path fixtures=env("VOIDINFER_CAPACITY_DIR"),output=env("VOIDINFER_CAPACITY_OUTPUT");
     require(!fixtures.empty() && !output.empty() && !std::filesystem::exists(output/"progress.jsonl"),"capacity evidence paths");
     std::ofstream progress(output/"progress.jsonl");require(progress.good(),"capacity progress file");
     const auto now=[] {return std::chrono::steady_clock::now();};
@@ -32,10 +32,10 @@ void run_capacity_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& dra
         const auto free=available();
         require(free>=reserve && incremental<=free-reserve,"capacity physical DRAM reserve exhausted");
     };
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");_putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");_putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
     auto inner=target.create_context(true);require(inner->try_enable_oscar_from_environment(),"capacity original OSCAR");
     inner->prepare_transaction();inner->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     TapStage stage;std::array<std::uint16_t*,5> staging{};
     for(int tap=0;tap<5;++tap) {
@@ -51,11 +51,11 @@ void run_capacity_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& dra
         require(!std::filesystem::exists(output/("request-"+std::to_string(id)+".generated.ids")),"preserve capacity output");
     }
     Queue queue(lanes);std::shared_ptr<const Request> common;
-    std::unique_ptr<ninfer::exl3::Exl3HostResidentSet> residency;
+    std::unique_ptr<voidinfer::exl3::Exl3HostResidentSet> residency;
     if(lock_resident) {
         MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
         require(GlobalMemoryStatusEx(&memory)!=0 && memory.ullTotalPhys>reserve,"resident physical capacity");
-        residency=std::make_unique<ninfer::exl3::Exl3HostResidentSet>(memory.ullTotalPhys-reserve,reserve);
+        residency=std::make_unique<voidinfer::exl3::Exl3HostResidentSet>(memory.ullTotalPhys-reserve,reserve);
     }
     double resident_update_ms=0,resident_close_ms=0;
     std::uint64_t resident_new_bytes=0,resident_unlocked_bytes=0;
@@ -64,7 +64,7 @@ void run_capacity_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& dra
         std::vector<std::shared_ptr<const Request>> roots;
         for(std::size_t id=0;id<queue.size();++id) roots.push_back(queue.state(id));
         if(common) roots.push_back(common);if(incoming) roots.push_back(std::move(incoming));
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for(const auto& root:roots) snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,[&](const void* data,std::size_t bytes){snapshot.add(data,bytes);},false);
         const auto stats=residency->replace(std::move(snapshot));
@@ -128,7 +128,7 @@ void run_capacity_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& dra
         generated[id].insert(generated[id].end(),result.committed_tokens.begin(),result.committed_tokens.end());
         committed+=result.committed_tokens.size();outer_attempted+=result.executed_rows;
         outer_matched+=result.accepted;outer_rejections+=result.rejected;
-        for(auto token:result.committed_tokens) if(!ninfer::exl3::exl3_terminal_token(token,terminal)) ++visible;
+        for(auto token:result.committed_tokens) if(!voidinfer::exl3::exl3_terminal_token(token,terminal)) ++visible;
         const auto released=now();serving_ms+=ms(start,released);eligible[id]=released;
         const auto transferred=exact->host_kv_stats();
         kv_h2d+=transferred.h2d_bytes-transfers.h2d_bytes;kv_d2h+=transferred.d2h_bytes-transfers.d2h_bytes;
@@ -138,7 +138,7 @@ void run_capacity_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& dra
             << ",\"round_ms\":" << ms(start,released) << "}\n" << std::flush;
         if(differential && !oracle_done[id]) {
             const auto audit=now();
-            const auto scalar=ninfer::exl3::verify_exl3_outer_reference(*exact,*lease.root->state(),tentative,true,terminal);
+            const auto scalar=voidinfer::exl3::verify_exl3_outer_reference(*exact,*lease.root->state(),tentative,true,terminal);
             require(scalar.committed_tokens==result.committed_tokens && scalar.committed_taps==result.committed_taps &&
                 scalar.committed_state->same_payload(*result.committed_state),"capacity packed/scalar full-state oracle");
             oracle_ms+=ms(audit,now());oracle_done[id]=true;

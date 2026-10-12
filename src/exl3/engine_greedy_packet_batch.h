@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // C2 transport-only rendezvous. Target reductions remain independent; this
 // owner gathers two completed, explicitly sized decision ranges and performs
@@ -258,4 +258,4 @@ public:
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -14,7 +14,7 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-void write_accounting_json(std::ofstream& out, const ninfer::OscarMixedCacheAccounting& value) {
+void write_accounting_json(std::ofstream& out, const voidinfer::OscarMixedCacheAccounting& value) {
     out << "{\n"
         << "    \"context_tokens\": " << value.context_tokens << ",\n"
         << "    \"full_attention_layers\": " << value.full_attention_layers << ",\n"
@@ -44,7 +44,7 @@ void write_accounting_json(std::ofstream& out, const ninfer::OscarMixedCacheAcco
         << "  }";
 }
 
-void print_accounting(const ninfer::OscarMixedCacheAccounting& value) {
+void print_accounting(const voidinfer::OscarMixedCacheAccounting& value) {
     std::cout << "context=" << value.context_tokens << " layers=" << value.full_attention_layers
               << " prefix=" << value.prefix_tokens << " bulk=" << value.historical_tokens
               << " recent=" << value.recent_tokens << " pages=" << value.page_count
@@ -72,30 +72,30 @@ int main(int argc, char** argv) {
         std::string report_path;
         if (argc == 3 && std::string(argv[1]) == "--report") { report_path = argv[2]; }
         else if (argc != 1) {
-            std::cerr << "usage: ninfer_oscar_mixed_cache_layout_test [--report <path>]\n";
+            std::cerr << "usage: voidinfer_oscar_mixed_cache_layout_test [--report <path>]\n";
             return 2;
         }
 
         const std::uint64_t sequence_id = 42;
         constexpr std::uint32_t context_tokens = 500;
-        ninfer::OscarMixedCacheBundle bundle(
-            sequence_id, context_tokens, ninfer::kOscarMixedFullAttentionLayers);
+        voidinfer::OscarMixedCacheBundle bundle(
+            sequence_id, context_tokens, voidinfer::kOscarMixedFullAttentionLayers);
         bundle.validate();
         require(bundle.layers().size() == 16, "full-attention layer count mismatch");
 
         const auto& layer3 = bundle.layer(3);
         require(layer3.pages().size() == 8, "layer 3 page count mismatch");
-        require(layer3.resolve(63).metadata.role == ninfer::OscarMixedRegionRole::ProtectedPrefix,
+        require(layer3.resolve(63).metadata.role == voidinfer::OscarMixedRegionRole::ProtectedPrefix,
                 "position 63 is not protected BF16");
-        require(layer3.resolve(64).metadata.role == ninfer::OscarMixedRegionRole::HistoricalBulk &&
-                    layer3.resolve(64).metadata.k_storage == ninfer::OscarMixedStorageType::OscarInt2G128,
+        require(layer3.resolve(64).metadata.role == voidinfer::OscarMixedRegionRole::HistoricalBulk &&
+                    layer3.resolve(64).metadata.k_storage == voidinfer::OscarMixedStorageType::OscarInt2G128,
                 "position 64 is not INT2 historical bulk");
-        require(layer3.resolve(243).metadata.role == ninfer::OscarMixedRegionRole::HistoricalBulk,
+        require(layer3.resolve(243).metadata.role == voidinfer::OscarMixedRegionRole::HistoricalBulk,
                 "position 243 is not historical bulk");
-        require(layer3.resolve(244).metadata.role == ninfer::OscarMixedRegionRole::RecentWindow &&
-                    layer3.resolve(244).metadata.k_storage == ninfer::OscarMixedStorageType::BFloat16,
+        require(layer3.resolve(244).metadata.role == voidinfer::OscarMixedRegionRole::RecentWindow &&
+                    layer3.resolve(244).metadata.k_storage == voidinfer::OscarMixedStorageType::BFloat16,
                 "position 244 is not recent BF16");
-        require(layer3.resolve(499).metadata.role == ninfer::OscarMixedRegionRole::RecentWindow,
+        require(layer3.resolve(499).metadata.role == voidinfer::OscarMixedRegionRole::RecentWindow,
                 "final position is not recent BF16");
 
         std::vector<bool> seen(context_tokens, false);
@@ -130,26 +130,26 @@ int main(int argc, char** argv) {
                 "mixed page type counts are incorrect");
         require(accounting.raw_int2_bytes_per_value == 0.3125,
                 "raw INT2 record accounting is incorrect");
-        require(sizeof(ninfer::OscarMixedPageMetadata) == 56,
+        require(sizeof(voidinfer::OscarMixedPageMetadata) == 56,
                 "unexpected page metadata size");
-        require(sizeof(ninfer::OscarMixedSlotMetadata) == 48,
+        require(sizeof(voidinfer::OscarMixedSlotMetadata) == 48,
                 "unexpected slot metadata size");
 
         std::cout << "OscarMixedCache static construction: PASS\n"
                   << "  logical positions: 0..499 exactly once; boundaries 63/64 and 243/244 pass\n"
                   << "  K/V type agreement: pass; all 16 full-attention layers share policy\n"
                   << "  GDN state: absent from typed KV bundle\n"
-                  << "  metadata sizes: page=" << sizeof(ninfer::OscarMixedPageMetadata)
-                  << " slot=" << sizeof(ninfer::OscarMixedSlotMetadata) << " bytes\n";
+                  << "  metadata sizes: page=" << sizeof(voidinfer::OscarMixedPageMetadata)
+                  << " slot=" << sizeof(voidinfer::OscarMixedSlotMetadata) << " bytes\n";
         print_accounting(accounting);
 
         const std::vector<std::uint32_t> accounting_contexts = {
             64U, 65U, 320U, 321U, 384U, 500U, 512U, 1024U, 4096U};
-        std::vector<ninfer::OscarMixedCacheAccounting> accounting_cases;
+        std::vector<voidinfer::OscarMixedCacheAccounting> accounting_cases;
         accounting_cases.reserve(accounting_contexts.size());
         for (const std::uint32_t tokens : accounting_contexts) {
-            const ninfer::OscarMixedCacheBundle case_bundle(
-                sequence_id, tokens, ninfer::kOscarMixedFullAttentionLayers);
+            const voidinfer::OscarMixedCacheBundle case_bundle(
+                sequence_id, tokens, voidinfer::kOscarMixedFullAttentionLayers);
             const auto case_accounting = case_bundle.accounting();
             accounting_cases.push_back(case_accounting);
             print_accounting(case_accounting);

@@ -1,10 +1,10 @@
 #pragma once
 // Research instrument for the KV-tier (VeriCache) fidelity study. With
-// NINFER_EXL3_KV_FAKEQUANT=int2|turbo|fp8 the ordinary FP16 K/V cache rows
+// VOIDINFER_EXL3_KV_FAKEQUANT=int2|turbo|fp8 the ordinary FP16 K/V cache rows
 // that leave the exact window (positions >= prefix and older than `recent`
 // rows before the committed base) are replaced in place by their codec
 // reconstruction: OSCAR INT2 g128 in the calibrated rotation basis
-// (NINFER_EXL3_KV_FAKEQUANT_ROT), TurboAngle K7+8/V6+4, or FP8 E4M3 row
+// (VOIDINFER_EXL3_KV_FAKEQUANT_ROT), TurboAngle K7+8/V6+4, or FP8 E4M3 row
 // scale. Attention then runs unchanged over the represented values. Not a
 // production storage format.
 #include <cuda_fp16.h>
@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3::kv_fakequant {
+namespace voidinfer::exl3::kv_fakequant {
 
 struct Config {
     int mode = 0;  // 0 off, 1 OSCAR INT2, 2 TurboAngle, 3 FP8, 4 OSCAR INT4, 5 OSCAR INT3, 6 OScaR,
@@ -38,7 +38,7 @@ struct Config {
 inline const Config& config() {
     static const Config value = [] {
         Config c;
-        const char* mode = std::getenv("NINFER_EXL3_KV_FAKEQUANT");
+        const char* mode = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT");
         if (!mode || !*mode || std::strcmp(mode, "0") == 0) return c;
         if (std::strcmp(mode, "int2") == 0) c.mode = 1;
         else if (std::strcmp(mode, "turbo") == 0) c.mode = 2;
@@ -49,13 +49,13 @@ inline const Config& config() {
         else if (std::strcmp(mode, "int2lm") == 0) { c.mode = 1; c.lloyd_max = true; }
         else if (std::strcmp(mode, "kvarn2") == 0) c.mode = 7;
         else if (std::strcmp(mode, "kvarn42") == 0) c.mode = 8;
-        else throw std::invalid_argument("NINFER_EXL3_KV_FAKEQUANT must be int2, int2lm, int3, int4, oscar, turbo, fp8, kvarn2 or kvarn42");
-        if (const char* r = std::getenv("NINFER_EXL3_KV_FAKEQUANT_RECENT")) c.recent = std::atoi(r);
-        if (const char* p = std::getenv("NINFER_EXL3_KV_FAKEQUANT_PREFIX")) c.prefix = std::atoi(p);
+        else throw std::invalid_argument("VOIDINFER_EXL3_KV_FAKEQUANT must be int2, int2lm, int3, int4, oscar, turbo, fp8, kvarn2 or kvarn42");
+        if (const char* r = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_RECENT")) c.recent = std::atoi(r);
+        if (const char* p = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_PREFIX")) c.prefix = std::atoi(p);
         std::vector<float> rot(2ull * 16 * 256 * 256);
-        if ((c.mode == 1 || c.mode == 4 || c.mode == 5) && !std::getenv("NINFER_EXL3_KV_FAKEQUANT_PERHEAD")) {
-            const char* dir = std::getenv("NINFER_EXL3_KV_FAKEQUANT_ROT");
-            if (!dir) throw std::invalid_argument("int2 fake-quant requires NINFER_EXL3_KV_FAKEQUANT_ROT or _PERHEAD");
+        if ((c.mode == 1 || c.mode == 4 || c.mode == 5) && !std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_PERHEAD")) {
+            const char* dir = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_ROT");
+            if (!dir) throw std::invalid_argument("int2 fake-quant requires VOIDINFER_EXL3_KV_FAKEQUANT_ROT or _PERHEAD");
             const char* names[2] = {"/runtime/k_rotation_fp32.bin", "/runtime/v_rotation_fp32.bin"};
             for (int kind = 0; kind < 2; ++kind) {
                 std::ifstream f(std::string(dir) + names[kind], std::ios::binary);
@@ -78,7 +78,7 @@ inline const Config& config() {
         cudaMemcpy(device + rot.size(), signs.data(), 256 * 4, cudaMemcpyHostToDevice);
         c.rotations = device;
         c.signs = device + rot.size();
-        if (const char* dir = std::getenv("NINFER_EXL3_KV_FAKEQUANT_PERHEAD")) {
+        if (const char* dir = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_PERHEAD")) {
             // Per-KV-head rotations (x' = x R per head) and key means, FutureMLS OSCAR-2 "center".
             std::vector<float> ph(2ull * 16 * 4 * 65536), mean(16ull * 4 * 256);
             const char* names[2] = {"/k_rot_perhead.bin", "/v_rot_perhead.bin"};
@@ -539,4 +539,4 @@ inline void age(std::uint16_t* k_cache, std::uint16_t* v_cache, int capacity,
     advance_kernel<<<1, 1, 0, stream>>>(position_device, position, watermark, c, capacity);
 }
 
-} // namespace ninfer::exl3::kv_fakequant
+} // namespace voidinfer::exl3::kv_fakequant

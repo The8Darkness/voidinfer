@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 using ResidentRange=std::pair<std::uintptr_t,std::uintptr_t>;
 inline std::size_t resident_lock_chunk_count(std::span<const ResidentRange> ranges,
     std::uint64_t chunk_bytes) {

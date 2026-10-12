@@ -8,7 +8,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // One logical request extent. This contract is deliberately independent from
 // aggregate queue/admission tokens: a native64K configuration means that one
@@ -24,16 +24,16 @@ struct Exl3NativeContextExtent {
     static constexpr std::uint32_t l0_oscar_tokens = 262144;
     // L0 OSCAR per-row buffers (hidden states, taps) hold one layer-major prefill block.
     static constexpr int l0_prefill_block_rows_max = 8192;
-    // Rows of one layer-major L0 prompt block (NINFER_EXL3_L0_PREFILL_BLOCK_ROWS,
+    // Rows of one layer-major L0 prompt block (VOIDINFER_EXL3_L0_PREFILL_BLOCK_ROWS,
     // 2048..8192 in steps of 1024, default 8192). Per-context row buffers (hidden,
     // taps, embedding trace) are sized by it; concurrent lanes trade a little
     // prefill speed for that memory.
     static int l0_prefill_block_rows() {
         static const int rows=[] {
-            const char* value=std::getenv("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS");
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_PREFILL_BLOCK_ROWS");
             const int parsed=value?std::atoi(value):l0_prefill_block_rows_max;
             if(parsed<2048 || parsed>l0_prefill_block_rows_max || parsed%1024)
-                throw std::invalid_argument("NINFER_EXL3_L0_PREFILL_BLOCK_ROWS must be 2048..8192 in steps of 1024");
+                throw std::invalid_argument("VOIDINFER_EXL3_L0_PREFILL_BLOCK_ROWS must be 2048..8192 in steps of 1024");
             return parsed;
         }();
         return rows;
@@ -148,4 +148,4 @@ static_assert(Exl3NativeContextExtent::candidate128k_tokens-1<=
 static_assert(Exl3NativeContextExtent::candidate128k_tokens%
     Exl3NativeContextExtent::exact_kv_page_tokens==0);
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3
