@@ -2641,16 +2641,17 @@ void Exl3GdnLayer::restore_host_state(std::span<const float> recurrent,
     current_checkpoint_stream_ = nullptr;
     current_checkpoint_recurrent_ = nullptr;
     current_checkpoint_conv_ = nullptr;
+    // Stream-ordered: the callers keep the host planes alive and fence the
+    // whole restore once (the trace copy stays on the device).
     check(cudaMemcpyAsync(recurrent_state_, recurrent.data(), kStateBytes,
                           cudaMemcpyHostToDevice, stream), "restore host recurrent state");
-    check(cudaMemcpyAsync(recurrent_state_before_, recurrent.data(), kStateBytes,
-                          cudaMemcpyHostToDevice, stream), "restore host recurrent trace");
+    check(cudaMemcpyAsync(recurrent_state_before_, recurrent_state_, kStateBytes,
+                          cudaMemcpyDeviceToDevice, stream), "restore host recurrent trace");
     check(cudaMemcpyAsync(conv_state_, convolution.data(), kConvStateStorageBytes,
                           cudaMemcpyHostToDevice, stream), "restore host convolution");
     exl3_launch_small(copy_conv_state_trace_kernel,dim3((kConvStateElements + 255) / 256),dim3(256),0,stream,
         conv_state_, conv_state_trace_);
     check(cudaGetLastError(), "refresh host convolution trace");
-    check(cudaStreamSynchronize(stream), "complete GDN host restore");
     trace_.state_before = recurrent_state_before_;
     trace_.state_after = recurrent_state_;
 }
