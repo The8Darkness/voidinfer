@@ -25,13 +25,13 @@ void run_draft_host_ring_qualification(Exl3TextModel& target,Exl3Dflash2DraftMod
             try{draft.export_host_ring(nullptr,false,[&](std::uint64_t bytes){return metadata.acquire(bytes);},true);}
             catch(const std::exception&){failed=true;}
             require(failed && Ring::uncertain_transfer_count()==before+1 && metadata.bytes()>0 &&
-                draft.uncertain_source_allocations_for_test()==1 && !draft.host_ring_resident(parent),
+                draft.uncertain_source_allocations_for_test()==10 && !draft.host_ring_resident(parent),
                 "submitted draft export failure lost destination credit/source marking");
             bool reset_refused=false,digest_refused=false;
             try{draft.reset();}catch(const std::exception&){reset_refused=true;}
             try{draft.ring_digest();}catch(const std::exception&){digest_refused=true;}
             require(reset_refused && digest_refused,"uncertain draft export permitted reset or diagnostic submission");
-            std::cout<<"DRAFT_EXPORT_UNCERTAIN_COMPLETE retained=1 source_marked=1\n";
+            std::cout<<"DRAFT_EXPORT_UNCERTAIN_COMPLETE retained=1 source_marked=10\n";
             return; // Isolated mode intentionally leaves quarantine for teardown.
         }
         const auto before=draft.ring_restore_stats();

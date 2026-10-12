@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <execution>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -3176,6 +3177,12 @@ struct Exl3Dflash2DraftModel::Impl {
     std::shared_ptr<const int> host_ring_identity=std::make_shared<const int>(0);
     std::shared_ptr<const Exl3DraftHostRing> host_ring_parent;
     bool host_ring_failed=false;
+    // Pinned window of one host ring export: every (layer, plane) ring range
+    // lands here under one stream fence before the page scatter.
+    struct PinnedStage {
+        std::uint16_t* host=nullptr; std::size_t bytes=0;
+        ~PinnedStage(){if(host)cudaFreeHost(host);}
+    } ring_export_stage;
     bool fail_next_host_export_completion=false;
     std::uint64_t ring_revision=0,witness_revision=0;
     std::uint64_t ring_acquisition=0,ring_execution=0;
@@ -3851,11 +3858,6 @@ std::shared_ptr<const Exl3DraftHostRing> Exl3Dflash2DraftModel::export_host_ring
         } else page->first=cursor;
         const int rows=static_cast<int>(std::min<long long>(end-cursor,64-cursor%64));
         const int previous=page->rows;page->rows+=rows;
-        for(int layer=0;layer<kLayers;++layer) {
-            page->k[layer].reserve(64*1024);page->v[layer].reserve(64*1024);
-            page->k[layer].resize(static_cast<std::size_t>(page->rows)*1024);
-            page->v[layer].resize(static_cast<std::size_t>(page->rows)*1024);
-        }
         require(download_count<downloads.size(),"draft ring download plan capacity");
         downloads[download_count++]={page,cursor,previous,rows};
         require(result->pages_.size()<result->pages_.capacity(),"draft ring export exceeds planned descriptors");
@@ -3863,34 +3865,81 @@ std::shared_ptr<const Exl3DraftHostRing> Exl3Dflash2DraftModel::export_host_ring
     }
     // All metadata and payload storage is prepared before the first download.
     // No partial preparation can publish a new parent or submit an earlier page.
-    for(std::size_t index=0;index<download_count;++index) {
-        const auto& planned=downloads[index];const auto& page=planned.page;
-        for(int layer=0;layer<kLayers;++layer) {
-            const auto download=[&](auto& plane,const std::uint16_t* source) {
-                const auto retain_uncertain=[&] {
-                    // Keep source allocations out of cudaFree as well as keeping
-                    // destination storage alive; retirement records are preallocated.
-                    for(const auto& allocation:m.scratch)
-                        if(allocation->ptr==source)allocation->uncertain_transfer_use=true;
-                    m.host_ring_failed=true;Exl3DraftHostRing::retain_uncertain_transfer(result);
-                };
-                const auto submitted=exl3_d2h_async(plane.data()+static_cast<std::size_t>(planned.previous)*1024,
-                    source+static_cast<std::size_t>(planned.cursor&kRingMask)*1024,static_cast<std::size_t>(planned.rows)*2048,stream);
-                if(submitted!=cudaSuccess) {
-                    retain_uncertain();
-                    cuda_check(submitted,"draft host page suffix download");
-                }
-                const bool fail_completion=std::exchange(fail_completion_for_test,false) |
-                    std::exchange(m.fail_next_host_export_completion,false);
-                const auto completed=fail_completion?cudaErrorUnknown:cudaStreamSynchronize(stream);
-                if(completed!=cudaSuccess) {
-                    retain_uncertain();
-                    cuda_check(completed,"draft host suffix complete");
-                }
-                result->exported_bytes_+=static_cast<std::size_t>(planned.rows)*2048;
-            };
-            download(page->k[layer],m.ring_k[layer]);download(page->v[layer],m.ring_v[layer]);
+    // The page suffixes cover one ring range [first, end): per (layer, plane)
+    // at most two DMA segments (ring wrap) into the pinned stage, one stream
+    // fence, then the page scatter (previously a fenced copy per page,
+    // layer and plane: ~16 ms at a 2K ring).
+    // Fresh payload storage is first-touch (page fault) bound: size the pages
+    // in parallel (an allocation failure is rethrown here, not terminated).
+    std::atomic<bool> sizing_failed{false};
+    std::for_each(std::execution::par,downloads.begin(),downloads.begin()+download_count,[&](const DownloadPage& planned) {
+        try {
+            auto& page=*planned.page;
+            for(int layer=0;layer<kLayers;++layer) {
+                page.k[layer].reserve(64*1024);page.v[layer].reserve(64*1024);
+                page.k[layer].resize(static_cast<std::size_t>(page.rows)*1024);
+                page.v[layer].resize(static_cast<std::size_t>(page.rows)*1024);
+            }
+        } catch(...) {sizing_failed.store(true,std::memory_order_relaxed);}
+    });
+    if(sizing_failed.load(std::memory_order_relaxed))throw std::bad_alloc();
+    if(download_count) {
+        const long long first=downloads[0].cursor;
+        const auto total=static_cast<std::size_t>(end-first);
+        const std::size_t plane_elements=total*1024;
+        const std::size_t stage_bytes=static_cast<std::size_t>(2*kLayers)*plane_elements*sizeof(std::uint16_t);
+        auto& stage=m.ring_export_stage;
+        if(stage.bytes<stage_bytes) {
+            if(stage.host){cuda_check(cudaFreeHost(stage.host),"draft ring export stage release");stage.host=nullptr;stage.bytes=0;}
+            const std::size_t capacity=static_cast<std::size_t>(2*kLayers)*kRingCap*1024*sizeof(std::uint16_t);
+            void* host=nullptr;
+            cuda_check(cudaHostAlloc(&host,capacity,cudaHostAllocDefault),"draft ring export stage");
+            stage.host=static_cast<std::uint16_t*>(host);stage.bytes=capacity;
         }
+        const auto retain_uncertain=[&] {
+            // Keep source allocations out of cudaFree; the stage outlives the transfer.
+            for(int layer=0;layer<kLayers;++layer)
+                for(const auto& allocation:m.scratch)
+                    if(allocation->ptr==m.ring_k[layer] || allocation->ptr==m.ring_v[layer])
+                        allocation->uncertain_transfer_use=true;
+            m.host_ring_failed=true;Exl3DraftHostRing::retain_uncertain_transfer(result);
+        };
+        for(int layer=0;layer<kLayers;++layer)
+            for(int plane=0;plane<2;++plane) {
+                const std::uint16_t* source=plane?m.ring_v[layer]:m.ring_k[layer];
+                std::uint16_t* destination=stage.host+static_cast<std::size_t>(2*layer+plane)*plane_elements;
+                for(long long cursor=first;cursor<end;) {
+                    const long long slot=cursor&kRingMask;
+                    const long long rows=std::min<long long>(end-cursor,kRingCap-slot);
+                    const auto submitted=cudaMemcpyAsync(destination+static_cast<std::size_t>(cursor-first)*1024,
+                        source+static_cast<std::size_t>(slot)*1024,static_cast<std::size_t>(rows)*2048,
+                        cudaMemcpyDeviceToHost,stream);
+                    if(submitted!=cudaSuccess) {
+                        retain_uncertain();
+                        cuda_check(submitted,"draft host ring range download");
+                    }
+                    cursor+=rows;
+                }
+            }
+        const bool fail_completion=std::exchange(fail_completion_for_test,false) |
+            std::exchange(m.fail_next_host_export_completion,false);
+        const auto completed=fail_completion?cudaErrorUnknown:cudaStreamSynchronize(stream);
+        if(completed!=cudaSuccess) {
+            retain_uncertain();
+            cuda_check(completed,"draft host ring range complete");
+        }
+        std::for_each(std::execution::par,downloads.begin(),downloads.begin()+download_count,[&](const DownloadPage& planned) {
+            auto& page=*planned.page;
+            const std::size_t offset=static_cast<std::size_t>(planned.cursor-first)*1024;
+            const std::size_t bytes=static_cast<std::size_t>(planned.rows)*2048;
+            for(int layer=0;layer<kLayers;++layer) {
+                std::memcpy(page.k[layer].data()+static_cast<std::size_t>(planned.previous)*1024,
+                    stage.host+static_cast<std::size_t>(2*layer)*plane_elements+offset,bytes);
+                std::memcpy(page.v[layer].data()+static_cast<std::size_t>(planned.previous)*1024,
+                    stage.host+static_cast<std::size_t>(2*layer+1)*plane_elements+offset,bytes);
+            }
+        });
+        result->exported_bytes_+=static_cast<std::size_t>(2*kLayers)*static_cast<std::size_t>(total)*2048;
     }
     m.host_ring_parent=result;m.witness_revision=m.ring_revision;m.ring_witness_ready=true;
     m.witness_acquisition=m.ring_acquisition;m.witness_execution=m.ring_execution;
