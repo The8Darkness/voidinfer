@@ -22,14 +22,8 @@ add_library(voidinfer_core STATIC
   core/device.cu
   core/dtype.cpp
   core/host_worker_pool.cpp
-  core/gdn_replay_records.cpp
-  core/cyclic_kv_cache.cpp
   core/host_kv_arena.cpp
   core/paged_kv_cache.cpp
-  core/oscar_mixed_cache_layout.cpp
-  core/oscar_mixed_state_transitions.cpp
-  core/oscar_mixed_attention_reference.cpp
-  core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp

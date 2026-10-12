@@ -156,35 +156,12 @@ voidinfer_add_test(voidinfer_media_client_loopback_test
 target_include_directories(voidinfer_media_client_loopback_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 set_tests_properties(voidinfer_media_client_loopback_test PROPERTIES DISABLED TRUE)
-voidinfer_add_test(voidinfer_oscar_mixed_cache_layout_test
-  SOURCES test_oscar_mixed_cache_layout.cpp
-  LIBRARIES voidinfer_core voidinfer_ops)
-voidinfer_add_test(voidinfer_oscar_mixed_cache_aging_test
-  SOURCES test_oscar_mixed_cache_aging.cpp
-  LIBRARIES voidinfer_core voidinfer_ops)
-voidinfer_add_test(voidinfer_oscar_mixed_state_transitions_test
-  SOURCES test_oscar_mixed_state_transitions.cpp
-  LIBRARIES voidinfer_core voidinfer_ops)
-voidinfer_add_test(voidinfer_oscar_mixed_attention_reference_test
-  SOURCES test_oscar_mixed_attention_reference.cpp
-  LIBRARIES voidinfer_core voidinfer_ops)
-set_tests_properties(voidinfer_oscar_mixed_attention_reference_test PROPERTIES SKIP_RETURN_CODE 77)
 voidinfer_add_test(voidinfer_oscar_history_attention_test
   SOURCES test_oscar_history_attention.cpp
   LIBRARIES voidinfer_core voidinfer_ops)
 set_tests_properties(voidinfer_oscar_history_attention_test PROPERTIES SKIP_RETURN_CODE 77)
-voidinfer_add_test(voidinfer_oscar_mixed_gpu_attention_test
-  SOURCES test_oscar_mixed_gpu_attention.cpp
-  LIBRARIES voidinfer_core voidinfer_ops)
-set_tests_properties(voidinfer_oscar_mixed_gpu_attention_test PROPERTIES SKIP_RETURN_CODE 77)
 voidinfer_add_test(voidinfer_kv_cache_test
   SOURCES test_kv_cache.cpp
-  LIBRARIES voidinfer_core)
-voidinfer_add_test(voidinfer_state_store_test
-  SOURCES test_state_store.cpp
-  LIBRARIES voidinfer_core)
-voidinfer_add_test(voidinfer_gdn_replay_records_test
-  SOURCES test_gdn_replay_records.cpp
   LIBRARIES voidinfer_core)
 # Family frontend.
 voidinfer_add_test(voidinfer_qwen3_6_frontend_test
