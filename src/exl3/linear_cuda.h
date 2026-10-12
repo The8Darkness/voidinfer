@@ -89,14 +89,6 @@ enum class Exl3CudaLinearAdmission {
     target_continuation_o,
     target_continuation_z,
     target_wide_prefill,
-    // Explicit native Qwen3.8 MTP owner.  This is intentionally separate
-    // from target_wide_prefill so ordinary/default callers cannot select the
-    // K4 wide route merely by changing workspace flags.
-    native_mtp_wide_prefill,
-    // One-row native MTP bridge.  This is a separate admission so the
-    // qualified wide-row bound above remains intact while the first real
-    // DFlash2 -> MTP step can use the same production K4 operator.
-    native_mtp_one_step,
     target_initial16,
     draft_prefill_fc,
     target_continuation_qkv,
@@ -678,23 +670,6 @@ public:
         const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
         std::uint16_t* output,int rows,cudaStream_t stream=nullptr);
 
-    // Test-only native-MTP prefill discriminator. K4 remains globally
-    // unadmitted for wide production callers; this reuses each decoded tile
-    // across sixteen rows while preserving generic_tile's per-output FP32
-    // accumulation order and the existing input/output transforms.
-    void forward_k4_prefill_for_test(
-        const Exl3CudaLinearWeights& weights,
-        const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
-        std::uint16_t* output,int rows,cudaStream_t stream=nullptr);
-
-    // Test-only draft-model discriminator for K4 wide prefill. This path is
-    // unreachable from production admissions: its represented dequantization,
-    // determinism, numerical error and economics must be qualified first.
-    void forward_k4_prefill_mma_for_test(
-        const Exl3CudaLinearWeights& weights,
-        const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
-        std::uint16_t* output,int rows,cudaStream_t stream=nullptr);
-
     // Test-only wide-prefill discriminator. It retains the rejected row-pair
     // ownership but decodes each staged K6 B fragment once per CTA.
     void forward_k6_rowpair_shared_decode_for_test(
@@ -1094,12 +1069,6 @@ public:
         const Exl3CudaLinearMetadata& metadata, int rows,
         Exl3CudaLinearAdmission admission) const noexcept;
     bool fast_wide_prefill_gemm_candidate(
-        const Exl3CudaLinearMetadata& metadata, int rows,
-        Exl3CudaLinearAdmission admission) const noexcept;
-    bool native_mtp_wide_prefill_candidate(
-        const Exl3CudaLinearMetadata& metadata, int rows,
-        Exl3CudaLinearAdmission admission) const noexcept;
-    bool native_mtp_one_step_candidate(
         const Exl3CudaLinearMetadata& metadata, int rows,
         Exl3CudaLinearAdmission admission) const noexcept;
 

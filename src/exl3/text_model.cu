@@ -1975,27 +1975,6 @@ struct Exl3TextContext::Impl {
     std::uint16_t* gdn_mlp_up = nullptr;
     float* fast_wmma32_split2_output = nullptr;
     float* fast_wmma32_split2_stats = nullptr;
-    // Source of the most recent target final-normalized hidden row(s), before
-    // the H6 head. It is only a transient source; native MTP callers must use
-    // target_hidden_handoff(), which copies it into owned storage. The row
-    // metadata is separate from last_rows because root-only head consumers
-    // retain only the final row's normalized hidden.
-    const std::uint16_t* last_hidden_source = nullptr;
-    int last_hidden_source_rows = 0;
-    int last_hidden_source_first_row = 0;
-    int last_hidden_source_position = 0;
-    std::uint64_t last_hidden_generation = 0;
-    // Optional native-MTP source prepared before inference.  Unlike
-    // last_hidden_source, this storage is position-indexed and survives
-    // ping-pong reuse across ordinary chunked forwards.  It is intentionally
-    // separate from target KV/authority and is only populated when the
-    // caller explicitly arms the capture.
-    std::unique_ptr<DeviceAllocation> native_mtp_hidden_capture;
-    std::shared_ptr<const void> native_mtp_hidden_capture_model_identity;
-    int native_mtp_hidden_capture_capacity = 0;
-    int native_mtp_hidden_capture_first_position = -1;
-    int native_mtp_hidden_capture_valid_rows = 0;
-    std::uint64_t native_mtp_hidden_capture_generation = 0;
     std::uint16_t* final_norm = nullptr;
     std::uint16_t* logits = nullptr;
     // Per-context cross-CTA slices of the split greedy argmax (concurrent
@@ -3098,75 +3077,6 @@ struct Exl3TextContext::Impl {
             [&]{return make_private_allocation(bytes,label);});
     }
 
-    bool native_mtp_hidden_capture_active() const noexcept {
-        return native_mtp_hidden_capture &&
-            native_mtp_hidden_capture->ptr != nullptr &&
-            native_mtp_hidden_capture_capacity > 0 &&
-            native_mtp_hidden_capture_model_identity != nullptr;
-    }
-
-    void invalidate_native_mtp_hidden_capture() {
-        native_mtp_hidden_capture_first_position = -1;
-        native_mtp_hidden_capture_valid_rows = 0;
-        if (++native_mtp_hidden_capture_generation == 0)
-            throw std::overflow_error("native MTP hidden capture generation exhausted");
-    }
-
-    void validate_native_mtp_hidden_capture_extent(int position, int rows) const {
-        if (!native_mtp_hidden_capture_active()) return;
-        require(!graph_capture_active && !graph_active,
-            "native MTP hidden capture is unavailable during graph execution");
-        require(position >= 0 && rows > 0 &&
-                    position <= std::numeric_limits<int>::max() - rows,
-                "native MTP hidden capture position extent is invalid");
-        if (native_mtp_hidden_capture_valid_rows == 0) {
-            require(native_mtp_hidden_capture_first_position == -1,
-                "native MTP hidden capture empty-range metadata is invalid");
-        } else {
-            require(native_mtp_hidden_capture_first_position >= 0 &&
-                        position == native_mtp_hidden_capture_first_position +
-                            native_mtp_hidden_capture_valid_rows,
-                    "native MTP hidden capture requires a contiguous forward range");
-        }
-        require(rows <= native_mtp_hidden_capture_capacity -
-                    native_mtp_hidden_capture_valid_rows,
-            "native MTP hidden capture capacity exhausted");
-    }
-
-    void note_native_mtp_hidden_capture_rows(int position, int rows) {
-        require(native_mtp_hidden_capture_active(),
-            "native MTP hidden capture is not prepared");
-        require(position >= 0 && rows > 0 &&
-                    rows <= native_mtp_hidden_capture_capacity -
-                        native_mtp_hidden_capture_valid_rows,
-            "native MTP hidden capture publication extent is invalid");
-        if (native_mtp_hidden_capture_valid_rows == 0)
-            native_mtp_hidden_capture_first_position = position;
-        else require(position == native_mtp_hidden_capture_first_position +
-                          native_mtp_hidden_capture_valid_rows,
-                      "native MTP hidden capture publication is not contiguous");
-        native_mtp_hidden_capture_valid_rows += rows;
-        if (++native_mtp_hidden_capture_generation == 0)
-            throw std::overflow_error("native MTP hidden capture generation exhausted");
-    }
-
-    void copy_native_mtp_hidden_capture_rows(const std::uint16_t* source,
-                                             int position, int rows,
-                                             cudaStream_t stream) {
-        require(source != nullptr, "native MTP hidden capture source is null");
-        validate_native_mtp_hidden_capture_extent(position, rows);
-        const std::size_t row_bytes = static_cast<std::size_t>(kHidden) *
-            sizeof(std::uint16_t);
-        auto* destination = static_cast<std::uint16_t*>(
-            native_mtp_hidden_capture->ptr) +
-            static_cast<std::size_t>(native_mtp_hidden_capture_valid_rows) * kHidden;
-        cuda_check(cudaMemcpyAsync(destination, source,
-            static_cast<std::size_t>(rows) * row_bytes,
-            cudaMemcpyDeviceToDevice, stream),
-            "capture native MTP target hidden rows");
-        note_native_mtp_hidden_capture_rows(position, rows);
-    }
-
     int tap_index(int layer) const {
         for (std::size_t i = 0; i < kTapLayers.size(); ++i) if (kTapLayers[i] == layer) return static_cast<int>(i);
         return -1;
@@ -3848,12 +3758,6 @@ struct Exl3TextContext::Impl {
                 hidden+static_cast<std::size_t>(row)*kHidden,model->final_norm,
                 norm+static_cast<std::size_t>(row)*kHidden);
         cuda_check(cudaGetLastError(),"launch batched continuation final RMSNorm");
-        last_hidden_source=norm;
-        last_hidden_source_rows=rows;
-        last_hidden_source_first_row=0;
-        last_hidden_source_position=position;
-        if(++last_hidden_generation==0)
-            throw std::overflow_error("native MTP hidden generation exhausted");
         if(precomputed_logits) {}
         else if(std::strcmp(scratch.head_workspace->dispatch_name(model->lm_head_metadata,rows),
                        "h6_small_m_single_split")==0)
@@ -3918,10 +3822,6 @@ struct Exl3TextContext::Impl {
             fast_same_weights_telemetry.owner.fast_same_weights_fp16kv_prefill_stats.wide_prefill_rows+=
                 static_cast<std::uint64_t>(rows);
         const bool all_head_rows=continuation_reference && !final_row_only;
-        const bool capture_native_mtp_rows =
-            native_mtp_hidden_capture_active() && !graph_capture_active && !graph_active;
-        if (capture_native_mtp_rows)
-            validate_native_mtp_hidden_capture_extent(position, rows);
         const auto head_plan=Exl3HeadConsumerPlan::make(rows,
             all_head_rows?Exl3HeadConsumer::verification:Exl3HeadConsumer::root_only,!all_head_rows);
         require(!all_head_rows || skip_head ||
@@ -4031,7 +3931,7 @@ struct Exl3TextContext::Impl {
             !oscar_only && !graph_active && !graph_capture_active && !events &&
             !layer_observer && !target_projection_timing &&
             !target_projection_observer && !wide_prefill && !positions_xyz &&
-            !eager_mlp_gateup_concurrent && !native_mtp_hidden_capture_active() &&
+            !eager_mlp_gateup_concurrent &&
             ((!continuation_reference && rows==1 &&
               (position<=ordinary_full_layer_graph_capture_position ||
                (ordinary_full_layer_graph_extended_replay &&
@@ -4042,14 +3942,14 @@ struct Exl3TextContext::Impl {
               position+rows<=max_context));
         if (rows==1 && std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
             std::fprintf(stderr,
-                "ordinary_full_layer_graph_route position=%d max=%d enabled=%d extended=%d use=%d wide=%d graph=%d capture=%d events=%d observer=%d timing=%d projection=%d eager_mlp=%d continuation=%d native_mtp=%d\\n",
+                "ordinary_full_layer_graph_route position=%d max=%d enabled=%d extended=%d use=%d wide=%d graph=%d capture=%d events=%d observer=%d timing=%d projection=%d eager_mlp=%d continuation=%d\\n",
                 position,max_context,ordinary_full_layer_graphs_enabled ? 1 : 0,
                 ordinary_full_layer_graph_extended_replay ? 1 : 0,
                 use_ordinary_full_layer_graphs ? 1 : 0,wide_prefill ? 1 : 0,
                 graph_active ? 1 : 0,graph_capture_active ? 1 : 0,events ? 1 : 0,
                 layer_observer ? 1 : 0,target_projection_timing ? 1 : 0,
                 target_projection_observer ? 1 : 0,eager_mlp_gateup_concurrent ? 1 : 0,
-                continuation_reference ? 1 : 0,native_mtp_hidden_capture_active() ? 1 : 0);
+                continuation_reference ? 1 : 0);
         const bool use_host_kv_mlp_tail_graphs=
             ((host_kv_mlp_tail_graphs_enabled && host_kv.enabled) ||
              (ordinary_mlp_tail_graphs_enabled && !host_kv.enabled)) && !oscar && !batch_bound &&
@@ -4561,52 +4461,11 @@ struct Exl3TextContext::Impl {
                         static_cast<std::size_t>(row) * kHidden);
                 cuda_check(cudaGetLastError(), "launch P2 continuation final RMSNorm");
             }
-            if (capture_native_mtp_rows)
-                copy_native_mtp_hidden_capture_rows(
-                    static_cast<const std::uint16_t*>(scratch.final_norm->ptr),
-                    position, rows, stream);
-        } else if (capture_native_mtp_rows) {
-            auto* captured = static_cast<std::uint16_t*>(
-                native_mtp_hidden_capture->ptr) +
-                static_cast<std::size_t>(native_mtp_hidden_capture_valid_rows) * kHidden;
-            for (int row = 0; row < rows; ++row) {
-                final_rms_norm_kernel<<<1, 512, 0, stream>>>(
-                    current + static_cast<std::size_t>(row) * kHidden,
-                    model->final_norm,
-                    captured + static_cast<std::size_t>(row) * kHidden);
-                cuda_check(cudaGetLastError(), "launch native MTP capture final RMSNorm");
-            }
-            cuda_check(cudaMemcpyAsync(
-                           final_norm,
-                           captured + static_cast<std::size_t>(head_plan.first_row) * kHidden,
-                           static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t),
-                           cudaMemcpyDeviceToDevice, stream),
-                       "retain native MTP capture root final norm");
-            note_native_mtp_hidden_capture_rows(position, rows);
         } else {
             final_rms_norm_kernel<<<1, 512, 0, stream>>>(
                 current + static_cast<std::size_t>(head_plan.first_row) * kHidden,
                 model->final_norm, final_norm);
             cuda_check(cudaGetLastError(), "launch E4A final RMSNorm");
-        }
-        // Native MTP consumes the target's final-normalized hidden h_t, not
-        // the residual immediately before the target final norm. Keep only a
-        // transient source identity here; target_hidden_handoff() copies the
-        // row(s) into independently owned storage before publishing them.
-        if (!graph_capture_active) {
-            if (all_head_rows) {
-                last_hidden_source = static_cast<const std::uint16_t*>(
-                    continuation->final_norm->ptr);
-                last_hidden_source_rows = rows;
-                last_hidden_source_first_row = 0;
-            } else {
-                last_hidden_source = final_norm;
-                last_hidden_source_rows = 1;
-                last_hidden_source_first_row = head_plan.first_row;
-            }
-            last_hidden_source_position = position;
-            if (++last_hidden_generation == 0)
-                throw std::overflow_error("native MTP hidden generation exhausted");
         }
         if (events) record(events->final_norm_end, stream, "record E4B1 final norm end");
         if (events) record(events->lm_head_start, stream, "record E4B1 LM head start");
@@ -8109,18 +7968,8 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     impl_->tap_rows = 0;
     impl_->embedding_rows = 0;
     impl_->last_rows = 0;
-    impl_->last_hidden_source = nullptr;
-    impl_->last_hidden_source_rows = 0;
-    impl_->last_hidden_source_first_row = 0;
-    impl_->last_hidden_source_position = 0;
-    if (++impl_->last_hidden_generation == 0)
-        throw std::overflow_error("native MTP hidden generation exhausted");
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     }
-    // A request/context reset revokes every previously captured hidden range,
-    // including a preserved exact HostKV root.  The prepared allocation stays
-    // owned for reuse, but no row from the prior request may be exposed.
-    impl_->invalidate_native_mtp_hidden_capture();
     last_decode_h2d_ = 0;
     impl_->qkv_trace_valid = false;
     if (impl_->transaction) impl_->transaction->rollback_required = false;
@@ -8663,7 +8512,6 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
     }
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     impl_->qkv_trace_valid = false;
-    impl_->invalidate_native_mtp_hidden_capture();
     // Live checkpoint: an unrepaired attempt left the root in place; a
     // state-writing forward saved it to host memory first.
     impl_->live_restore_host_root(stream);
@@ -9339,7 +9187,6 @@ void Exl3TextContext::append_prefill_layer_major(
             !impl_->graph_active && !impl_->graph_capture_active &&
             !impl_->layer_observer && !impl_->target_projection_timing &&
             !impl_->target_projection_observer &&
-            !impl_->native_mtp_hidden_capture_active() &&
             (!impl_->transaction ||
              (!impl_->transaction->active && !impl_->transaction->rollback_required)),
             "layer-major prefill requires an idle Fast90 ordinary device-KV context");
@@ -9723,7 +9570,6 @@ void Exl3TextContext::append_prefill_layer_major(
         impl_->tap_rows=0;
         impl_->embedding_rows=0;
         impl_->qkv_trace_valid=false;
-        impl_->last_hidden_source=nullptr;
         impl_->graph_active=false;
         throw;
     }
@@ -10993,7 +10839,6 @@ void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
     if(impl_->continuation) impl_->continuation->rows=0;
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     impl_->qkv_trace_valid=false;
-    impl_->invalidate_native_mtp_hidden_capture();
 }
 
 int Exl3TextContext::verified_root_position() const noexcept {
@@ -11091,7 +10936,6 @@ void Exl3TextContext::sync_exact_line_from(Exl3TextContext& source,cudaStream_t 
     if(impl_->continuation)impl_->continuation->rows=0;
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     impl_->qkv_trace_valid=false;
-    impl_->invalidate_native_mtp_hidden_capture();
 }
 
 void Exl3TextContext::set_fold_peer(Exl3TextContext* line,std::span<const std::int64_t> tokens,
@@ -11442,7 +11286,6 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     impl_->last_rows = retained_rows;
     impl_->continuation->rows = retained_rows;
     impl_->qkv_trace_valid = false;
-    impl_->invalidate_native_mtp_hidden_capture();
     impl_->live_release(stream);
     transaction.rollback_required = false;
 }
@@ -13841,13 +13684,6 @@ void Exl3TextContext::rebase_oscar_host_state_delta(const Exl3ExactHostState& ol
     impl_->kv_rows_rewritten_from(0);
     position_=new_root.position_;impl_->tap_rows=new_root.tap_rows_;
     impl_->embedding_rows=new_root.embedding_rows_;impl_->last_rows=new_root.last_rows_;
-    impl_->last_hidden_source=nullptr;
-    impl_->last_hidden_source_rows=0;
-    impl_->last_hidden_source_first_row=0;
-    impl_->last_hidden_source_position=0;
-    if(++impl_->last_hidden_generation==0)
-        throw std::overflow_error("native MTP hidden generation exhausted");
-    impl_->invalidate_native_mtp_hidden_capture();
     impl_->qkv_trace_valid=false;if(impl_->continuation) impl_->continuation->rows=0;
 }
 
@@ -14147,13 +13983,6 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     impl_->tap_rows = state.tap_rows_;
     impl_->embedding_rows = state.embedding_rows_;
     impl_->last_rows = state.last_rows_;
-    impl_->last_hidden_source = nullptr;
-    impl_->last_hidden_source_rows = 0;
-    impl_->last_hidden_source_first_row = 0;
-    impl_->last_hidden_source_position = 0;
-    if (++impl_->last_hidden_generation == 0)
-        throw std::overflow_error("native MTP hidden generation exhausted");
-    impl_->invalidate_native_mtp_hidden_capture();
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     impl_->rope_offset=state.rope_offset_;
     impl_->qkv_trace_valid = false;
@@ -14639,228 +14468,6 @@ const Exl3CudaLinearMetadata& Exl3TextContext::target_lm_head_metadata() const n
 
 const std::uint16_t* Exl3TextContext::target_embedding() const noexcept {
     return impl_->model == nullptr ? nullptr : impl_->model->embedding;
-}
-
-void Exl3TextContext::prepare_native_mtp_hidden_capture(int capacity) {
-    require(impl_->model != nullptr && impl_->model->final_norm != nullptr,
-        "native MTP hidden capture needs a loaded target model");
-    require(capacity > 0 && capacity <= impl_->max_context,
-        "native MTP hidden capture capacity is outside the target context");
-    require(position_ == 0 && impl_->last_rows == 0,
-        "native MTP hidden capture must be prepared before target inference");
-    require(!impl_->graph_active && !impl_->graph_capture_active &&
-                (!impl_->transaction || !impl_->transaction->active),
-        "native MTP hidden capture setup requires a pristine eager context");
-    if (impl_->native_mtp_hidden_capture) {
-        require(impl_->native_mtp_hidden_capture_capacity == capacity,
-            "native MTP hidden capture capacity cannot change after preparation");
-        require(impl_->native_mtp_hidden_capture_valid_rows == 0,
-            "native MTP hidden capture already contains rows");
-        return;
-    }
-    const std::size_t bytes = static_cast<std::size_t>(capacity) * kHidden *
-        sizeof(std::uint16_t);
-    const auto next_impl = Exl3LinearWorkspaceRequirements::append_owned_bytes(
-        impl_->persistent_bytes, bytes);
-    const auto next_public = Exl3LinearWorkspaceRequirements::append_owned_bytes(
-        persistent_bytes_, bytes);
-    auto capture = impl_->make_private_allocation(bytes,
-        "allocate native MTP target hidden capture");
-    require(capture && capture->ptr && capture->bytes == bytes,
-        "native MTP hidden capture allocation extent mismatch");
-    impl_->native_mtp_hidden_capture = std::move(capture);
-    impl_->native_mtp_hidden_capture_model_identity =
-        impl_->model->host_state_identity;
-    impl_->native_mtp_hidden_capture_capacity = capacity;
-    impl_->native_mtp_hidden_capture_first_position = -1;
-    impl_->native_mtp_hidden_capture_valid_rows = 0;
-    if (++impl_->native_mtp_hidden_capture_generation == 0)
-        throw std::overflow_error("native MTP hidden capture generation exhausted");
-    impl_->persistent_bytes = next_impl;
-    persistent_bytes_ = next_public;
-}
-
-bool Exl3TextContext::native_mtp_hidden_capture_prepared() const noexcept {
-    return impl_->native_mtp_hidden_capture_active();
-}
-
-int Exl3TextContext::native_mtp_hidden_capture_capacity() const noexcept {
-    return impl_->native_mtp_hidden_capture_active()
-        ? impl_->native_mtp_hidden_capture_capacity : 0;
-}
-
-int Exl3TextContext::native_mtp_hidden_capture_rows() const noexcept {
-    return impl_->native_mtp_hidden_capture_active()
-        ? impl_->native_mtp_hidden_capture_valid_rows : 0;
-}
-
-int Exl3TextContext::native_mtp_hidden_capture_first_position() const noexcept {
-    return impl_->native_mtp_hidden_capture_active()
-        ? impl_->native_mtp_hidden_capture_first_position : -1;
-}
-
-std::uint64_t Exl3TextContext::native_mtp_hidden_capture_generation() const noexcept {
-    return impl_->native_mtp_hidden_capture_active()
-        ? impl_->native_mtp_hidden_capture_generation : 0;
-}
-
-Exl3MtpTargetHiddenHandoff Exl3TextContext::target_hidden_handoff(
-    int row, cudaStream_t stream) const {
-    const bool use_capture = impl_->native_mtp_hidden_capture_active() &&
-        row >= 0 && row < impl_->native_mtp_hidden_capture_valid_rows;
-    const std::uint16_t* source = nullptr;
-    int source_position = 0;
-    std::uint64_t source_generation = 0;
-    std::shared_ptr<const void> source_identity;
-    if (use_capture) {
-        source = static_cast<const std::uint16_t*>(
-            impl_->native_mtp_hidden_capture->ptr) +
-            static_cast<std::size_t>(row) * kHidden;
-        source_position = impl_->native_mtp_hidden_capture_first_position + row;
-        source_generation = impl_->native_mtp_hidden_capture_generation;
-        source_identity = impl_->native_mtp_hidden_capture_model_identity;
-    } else {
-        require(impl_->model != nullptr && impl_->last_hidden_source != nullptr &&
-                    impl_->last_hidden_source_rows > 0 &&
-                    row >= 0 && row < impl_->last_hidden_source_rows &&
-                    impl_->last_hidden_generation != 0,
-                "native MTP target hidden is unavailable until a target forward completes");
-        require(impl_->last_hidden_source_position >= 0 &&
-                    impl_->last_hidden_source_position + impl_->last_hidden_source_first_row + row >= 0 &&
-                    impl_->last_hidden_source_position + impl_->last_hidden_source_first_row + row <
-                        impl_->last_hidden_source_position + impl_->last_rows,
-                "native MTP target hidden position is invalid");
-        source = impl_->last_hidden_source + static_cast<std::size_t>(row) * kHidden;
-        source_position = impl_->last_hidden_source_position +
-            impl_->last_hidden_source_first_row + row;
-        source_generation = impl_->last_hidden_generation;
-        source_identity = model_identity();
-    }
-
-    // Do not expose hidden_a/hidden_b directly: the next target forward is
-    // allowed to reuse either ping-pong buffer. The copied allocation is
-    // independently owned until every stream-ordered MTP consumer releases
-    // its handoff owner.
-    auto* mutable_impl = const_cast<Impl*>(impl_.get());
-    const std::size_t bytes = static_cast<std::size_t>(kHidden) *
-                              sizeof(std::uint16_t);
-    auto allocation = std::shared_ptr<DeviceAllocation>(
-        mutable_impl->make_private_allocation(bytes,
-                                              "allocate native MTP target hidden")
-            .release(),
-        [](DeviceAllocation* value) noexcept { delete value; });
-    cuda_check(cudaMemcpyAsync(
-                   allocation->ptr,
-                   source,
-                   bytes, cudaMemcpyDeviceToDevice, stream),
-               "copy native MTP target hidden handoff");
-
-    Exl3MtpTargetHiddenHandoff result;
-    result.owner = std::shared_ptr<const void>(allocation,
-                                               static_cast<const void*>(allocation.get()));
-    result.model_identity = std::move(source_identity);
-    result.hidden = {reinterpret_cast<std::uintptr_t>(allocation->ptr), bytes,
-                     kExl3MtpHiddenWidth, 1};
-    result.hidden_generation = source_generation;
-    result.position = static_cast<std::int64_t>(source_position);
-    return result;
-}
-
-std::vector<Exl3MtpTargetHiddenHandoff> Exl3TextContext::target_hidden_handoffs(
-    int first_row, int rows, cudaStream_t stream) const {
-    const bool use_capture = impl_->native_mtp_hidden_capture_active() &&
-        rows > 0 && first_row >= 0 &&
-        first_row <= impl_->native_mtp_hidden_capture_valid_rows - rows;
-    const std::uint16_t* source = nullptr;
-    int source_position = 0;
-    std::uint64_t source_generation = 0;
-    std::shared_ptr<const void> source_identity;
-    if (use_capture) {
-        source = static_cast<const std::uint16_t*>(
-            impl_->native_mtp_hidden_capture->ptr) +
-            static_cast<std::size_t>(first_row) * kHidden;
-        source_position = impl_->native_mtp_hidden_capture_first_position + first_row;
-        source_generation = impl_->native_mtp_hidden_capture_generation;
-        source_identity = impl_->native_mtp_hidden_capture_model_identity;
-    } else {
-        require(impl_->model != nullptr && impl_->last_hidden_source != nullptr &&
-                    impl_->last_hidden_source_rows > 0 && rows > 0 && first_row >= 0 &&
-                    first_row + rows <= impl_->last_hidden_source_rows &&
-                    impl_->last_hidden_generation != 0,
-                "native MTP target hidden range is unavailable until a target forward completes");
-        require(impl_->last_hidden_source_position >= 0 &&
-                    impl_->last_hidden_source_position + impl_->last_hidden_source_first_row +
-                            first_row >= 0 &&
-                    impl_->last_hidden_source_position + impl_->last_hidden_source_first_row +
-                            first_row + rows <= impl_->last_hidden_source_position + impl_->last_rows,
-                "native MTP target hidden range position is invalid");
-        source = impl_->last_hidden_source + static_cast<std::size_t>(first_row) * kHidden;
-        source_position = impl_->last_hidden_source_position +
-            impl_->last_hidden_source_first_row + first_row;
-        source_generation = impl_->last_hidden_generation;
-        source_identity = model_identity();
-    }
-
-    auto* mutable_impl = const_cast<Impl*>(impl_.get());
-    const std::size_t row_bytes = static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t);
-    const std::size_t bytes = static_cast<std::size_t>(rows) * row_bytes;
-    auto allocation = std::shared_ptr<DeviceAllocation>(
-        mutable_impl->make_private_allocation(bytes, "allocate native MTP target hidden rows")
-            .release(),
-        [](DeviceAllocation* value) noexcept { delete value; });
-    cuda_check(cudaMemcpyAsync(
-                   allocation->ptr,
-                   source,
-                   bytes, cudaMemcpyDeviceToDevice, stream),
-               "copy native MTP target hidden rows");
-    const auto owner = std::shared_ptr<const void>(
-        allocation, static_cast<const void*>(allocation.get()));
-    const auto target_identity = std::move(source_identity);
-    std::vector<Exl3MtpTargetHiddenHandoff> result;
-    result.reserve(static_cast<std::size_t>(rows));
-    for (int row = 0; row < rows; ++row) {
-        auto* data = static_cast<std::uint16_t*>(allocation->ptr) +
-                     static_cast<std::size_t>(row) * kHidden;
-        result.push_back({
-            owner,
-            target_identity,
-            {reinterpret_cast<std::uintptr_t>(data), row_bytes,
-             kExl3MtpHiddenWidth, 1},
-            source_generation,
-            static_cast<std::int64_t>(source_position + row)});
-    }
-    return result;
-}
-
-std::shared_ptr<Exl3MtpPrefixState> Exl3TextContext::create_native_mtp_prefix_state(
-    std::uint32_t kv_capacity) const {
-    require(impl_->model != nullptr && impl_->model->embedding != nullptr &&
-                impl_->model->lm_head.trellis != nullptr,
-            "native MTP target shared weights are unavailable");
-    const auto target_owner = model_identity();
-    require(target_owner != nullptr, "native MTP target model identity is unavailable");
-    const auto model_owner = std::shared_ptr<const void>(
-        impl_->model, static_cast<const void*>(impl_->model.get()));
-    Exl3MtpSharedTargetBinding shared_target;
-    shared_target.token_embedding = {
-        reinterpret_cast<std::uintptr_t>(impl_->model->embedding),
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kHidden) *
-            sizeof(std::uint16_t),
-        kVocab, kHidden};
-    // The descriptor is a lifetime witness; the actual H6 payload is bound by
-    // lm_head_weights below because EXL3 stores trellis/scales in four planes.
-    shared_target.lm_head = {
-        reinterpret_cast<std::uintptr_t>(impl_->model->lm_head.trellis), sizeof(std::uint16_t),
-        1, 1};
-    shared_target.owner = model_owner;
-    shared_target.model_identity = target_owner;
-    shared_target.lm_head_weights = impl_->model->lm_head;
-    shared_target.lm_head_metadata = impl_->model->lm_head_metadata;
-    const auto numeric_identity = static_cast<std::uint64_t>(
-        reinterpret_cast<std::uintptr_t>(target_owner.get()));
-    return Exl3MtpPrefixState::materialize(impl_->model->collection,
-                                            std::move(shared_target), numeric_identity,
-                                            kv_capacity);
 }
 
 std::vector<float> Exl3TextContext::embedding_host(cudaStream_t stream) const {

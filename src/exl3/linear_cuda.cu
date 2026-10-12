@@ -10255,62 +10255,6 @@ void Exl3CudaLinearWorkspace::transform_input(const Exl3CudaLinearWeights& weigh
     cuda_check(cudaGetLastError(), "launch EXL3 input Hadamard");
 }
 
-void Exl3CudaLinearWorkspace::forward_k4_prefill_for_test(
-    const Exl3CudaLinearWeights& weights,
-    const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
-    std::uint16_t* output,int rows,cudaStream_t stream) {
-    if(metadata.K!=4 || metadata.in_features!=in_features_ ||
-       metadata.out_features!=out_features_ || metadata.mcg || !metadata.mul1 ||
-       metadata.has_bias || rows<=16 || rows>max_rows_ ||
-       !weights.trellis || !weights.suh || !weights.svh || !weights.mul1 ||
-       !input || !output || out_features_%kHadamard!=0)
-        throw std::invalid_argument("K4 prefill discriminator contract");
-    transform_input(weights,metadata,input,rows,stream);
-    const int full_groups=rows/16;
-    for(int group=0;group<full_groups;++group) {
-        const auto input_offset=static_cast<std::size_t>(group)*16u*in_features_;
-        const auto output_offset=static_cast<std::size_t>(group)*16u*out_features_;
-        exl3_initial16_ordered_kernel<4><<<out_features_/16,256,0,stream>>>(
-            transformed_+input_offset,weights.trellis,weights.mul1,
-            accum_+output_offset,in_features_,out_features_);
-    }
-    const int tail=rows-full_groups*16;
-    if(tail) {
-        const auto input_offset=static_cast<std::size_t>(full_groups)*16u*in_features_;
-        const auto output_offset=static_cast<std::size_t>(full_groups)*16u*out_features_;
-        exl3_generic_tile_kernel<<<dim3(out_features_/16,tail),dim3(kThreads),0,stream>>>(
-            transformed_+input_offset,weights.trellis,weights.mul1,
-            accum_+output_offset,tail,in_features_,out_features_,4);
-    }
-    cuda_check(cudaGetLastError(),"launch K4 prefill discriminator projection");
-    launch_output_hadamard(stream,accum_,weights.svh,output,rows,out_features_);
-    cuda_check(cudaGetLastError(),"launch K4 prefill discriminator output");
-}
-
-void Exl3CudaLinearWorkspace::forward_k4_prefill_mma_for_test(
-    const Exl3CudaLinearWeights& weights,
-    const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
-    std::uint16_t* output,int rows,cudaStream_t stream) {
-    if(metadata.K!=4 || metadata.in_features!=in_features_ ||
-       metadata.out_features!=out_features_ || metadata.mcg || !metadata.mul1 ||
-       metadata.has_bias || rows<=16 || rows>max_rows_ ||
-       !weights.trellis || !weights.suh || !weights.svh || !weights.mul1 ||
-       !input || !output || out_features_%1024!=0)
-        throw std::invalid_argument("K4 MMA prefill discriminator contract");
-    transform_input(weights,metadata,input,rows,stream);
-    constexpr int tiles=64,splits=5;
-    const int blocks=out_features_/(16*tiles);
-    constexpr std::size_t shared_bytes=512u*sizeof(half)+
-        2u*tiles*16u*4u*sizeof(std::uint16_t);
-    exl3_prefill_direct_async_a_kernel<4,tiles,2><<<
-        dim3(blocks*splits,(rows+15)/16),kThreads,shared_bytes,stream>>>(
-            transformed_,weights.trellis,weights.mul1,accum_,rows,
-            in_features_,out_features_,splits);
-    cuda_check(cudaGetLastError(),"launch K4 MMA prefill discriminator projection");
-    launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,splits);
-    cuda_check(cudaGetLastError(),"launch K4 MMA prefill discriminator output");
-}
-
 bool Exl3CudaLinearWorkspace::forward_target_prefill_gate_up_pair(
     Exl3CudaLinearWorkspace& up_workspace,
     const Exl3CudaLinearWeights& gate_weights,
@@ -11770,53 +11714,6 @@ bool Exl3CudaLinearWorkspace::fast_wide_prefill_gemm_candidate(
     return reconstructed_exact_.bytes == elements * sizeof(std::uint16_t);
 }
 
-bool Exl3CudaLinearWorkspace::native_mtp_wide_prefill_candidate(
-    const Exl3CudaLinearMetadata& metadata, int rows,
-    Exl3CudaLinearAdmission admission) const noexcept {
-    if (admission != Exl3CudaLinearAdmission::native_mtp_wide_prefill ||
-        rows <= 16 || rows > max_rows_ || metadata.K != 4 ||
-        metadata.mcg || !metadata.mul1 || metadata.has_bias ||
-        metadata.in_features != in_features_ ||
-        metadata.out_features != out_features_)
-        return false;
-
-    // These are the eight closed native-MTP EXL3 projection geometries.  The
-    // explicit list prevents an arbitrary K4 module from inheriting the MTP
-    // route, while the multiples document the <4,64,2> kernel contract.
-    const bool native_shape =
-        (in_features_ == 10240 && out_features_ == 5120) ||
-        (in_features_ == 5120 &&
-            (out_features_ == 12288 || out_features_ == 1024 ||
-             out_features_ == 17408)) ||
-        (in_features_ == 6144 && out_features_ == 5120) ||
-        (in_features_ == 17408 && out_features_ == 5120);
-    const bool direct_geometry =
-        in_features_ >= 16 && (in_features_ % 16) == 0 &&
-        out_features_ >= 16 * 64 && (out_features_ % (16 * 64)) == 0;
-    return native_shape && direct_geometry;
-}
-
-bool Exl3CudaLinearWorkspace::native_mtp_one_step_candidate(
-    const Exl3CudaLinearMetadata& metadata, int rows,
-    Exl3CudaLinearAdmission admission) const noexcept {
-    if (admission != Exl3CudaLinearAdmission::native_mtp_one_step || rows != 1 ||
-        rows > max_rows_ || metadata.K != 4 || metadata.mcg || !metadata.mul1 ||
-        metadata.has_bias || metadata.in_features != in_features_ ||
-        metadata.out_features != out_features_)
-        return false;
-    const bool native_shape =
-        (in_features_ == 10240 && out_features_ == 5120) ||
-        (in_features_ == 5120 &&
-            (out_features_ == 12288 || out_features_ == 1024 ||
-             out_features_ == 17408)) ||
-        (in_features_ == 6144 && out_features_ == 5120) ||
-        (in_features_ == 17408 && out_features_ == 5120);
-    const bool direct_geometry =
-        in_features_ >= 16 && (in_features_ % 16) == 0 &&
-        out_features_ >= 16 * 64 && (out_features_ % (16 * 64)) == 0;
-    return native_shape && direct_geometry;
-}
-
 bool Exl3CudaLinearWorkspace::extended_stream_reduction_candidate(
     const Exl3CudaLinearMetadata& metadata,int rows,Exl3CudaLinearAdmission admission) const noexcept {
     if(rows<1||rows>8||(metadata.K!=6&&metadata.K!=7))return false;
@@ -11938,10 +11835,6 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
             return split10_names[coherent_wide_k6_operation_];
         return names[coherent_wide_k6_operation_];
     }
-    if (native_mtp_one_step_candidate(metadata, rows, admission))
-        return "native_mtp_one_step_mma64";
-    if (native_mtp_wide_prefill_candidate(metadata, rows, admission))
-        return "native_mtp_wide_prefill_mma64";
     if (native_k6_critical_path_candidate(metadata, rows, admission)) {
         const int output_blocks = metadata.out_features / (16 * 32);
         if (metadata.K == 6 && rows == 1 &&
@@ -12943,55 +12836,6 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                 }
             }
         }
-        return;
-    }
-
-    if (native_mtp_one_step_candidate(metadata, rows, admission)) {
-        // The one-row bridge uses the same qualified K4 N64 body as the
-        // closed wide-MTP route.  Keeping this admission separate prevents a
-        // one-row caller from widening ordinary K4 dispatch.
-        constexpr int output_tiles_per_block = 64;
-        constexpr int split_count = 5;
-        const int blocks = out_features_ / (16 * output_tiles_per_block);
-        constexpr std::size_t shared_bytes =
-            512u * sizeof(half) +
-            2u * output_tiles_per_block * 16u * 4u * sizeof(std::uint16_t);
-        exl3_prefill_direct_async_a_kernel<4, output_tiles_per_block, 2><<<
-            dim3(blocks * split_count, 1), kThreads, shared_bytes, stream>>>(
-            transformed_input, weights.trellis, weights.mul1, accum_,
-            rows, in_features_, out_features_, split_count);
-        cuda_check(cudaGetLastError(),
-                   "launch native MTP one-step K4 N64 async-A");
-        launch_prefill_reduce_output<false>(stream,
-            accum_, weights.svh, output, rows, out_features_, split_count);
-        cuda_check(cudaGetLastError(),
-                   "launch native MTP one-step K4 reduction/output");
-        return;
-    }
-
-    if (native_mtp_wide_prefill_candidate(metadata, rows, admission)) {
-        // Native MTP owns this K4 route explicitly.  Keep the exact qualified
-        // N64 async-A body from the discriminator and reduce its five split
-        // planes in ascending order before the unchanged output Hadamard.
-        constexpr int output_tiles_per_block = 64;
-        constexpr int split_count = 5;
-        const int blocks = out_features_ / (16 * output_tiles_per_block);
-        constexpr std::size_t shared_bytes =
-            512u * sizeof(half) +
-            2u * output_tiles_per_block * 16u * 4u * sizeof(std::uint16_t);
-        exl3_prefill_direct_async_a_kernel<4, output_tiles_per_block, 2><<<
-            dim3(blocks * split_count, (rows + 15) / 16), kThreads,
-            shared_bytes, stream>>>(
-                transformed_input, weights.trellis, weights.mul1, accum_,
-                rows, in_features_, out_features_, split_count);
-        cuda_check(cudaGetLastError(),
-                   "launch native MTP K4 N64 async-A prefill");
-        // prefill_reduce_output_kernel's non-shuffle path visits split planes
-        // 0,1,...,4, preserving the qualified ascending reduction order.
-        launch_prefill_reduce_output<false>(stream,
-                accum_, weights.svh, output, rows, out_features_, split_count);
-        cuda_check(cudaGetLastError(),
-                   "launch native MTP K4 N64 reduction/output");
         return;
     }
 

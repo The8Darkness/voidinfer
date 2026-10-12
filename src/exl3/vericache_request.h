@@ -34,7 +34,6 @@ namespace ninfer::exl3 {
 class Exl3VeriCacheReplay;
 class Exl3PreparedMediaReplay;
 class Exl3VeriCachePrefixIndex;
-class Exl3VisionContext;
 
 struct Exl3MediaTapOrigin {
     std::shared_ptr<const Exl3PreparedIdentity> prepared_identity;
@@ -139,12 +138,6 @@ class Exl3VeriCacheRequest {
             std::move(*credit),dynamic))throw std::logic_error("media tap origin metadata attachment");
         media_tap_origin_=std::move(origin);
     }
-    static std::shared_ptr<const Exl3VeriCacheRequest> initialize_prepared_numeric_data(
-        Exl3TextContext&,Exl3VisionContext&,
-        const targets::qwen3_6::PreparedPromptData&,
-        const targets::qwen3_6::VisionControl*,
-        std::shared_ptr<const Exl3VeriCacheRequest>,const std::function<bool()>&,
-        const Exl3EncodedMediaRetentionReserve&);
 
     static std::size_t planned_descriptor_count(std::size_t existing,std::size_t incoming_rows) {
         const auto limit=static_cast<std::size_t>(Exl3Dflash2DraftModel::ring_capacity())+1;
@@ -941,18 +934,6 @@ public:
             prepared_identity_->equals(*other.prepared_identity_) :
             !prepared_identity_ && !other.prepared_identity_;
     }
-    // Research-only native encoder -> exact represented-media L2 execution.
-    // No constructor accepts arbitrary embeddings beside caller-supplied identity.
-    static std::shared_ptr<const Exl3VeriCacheRequest> initialize_prepared_numeric(
-        Exl3TextContext& exact,Exl3VisionContext& vision,
-        const targets::qwen3_6::PreparedPrompt& prompt,
-        const std::function<bool()>& cancelled={},
-        const Exl3EncodedMediaRetentionReserve& reserve={});
-    static std::shared_ptr<const Exl3VeriCacheRequest> replay_prepared_numeric(
-        Exl3TextContext& exact,Exl3VisionContext& vision,
-        const Exl3PreparedMediaReplay& replay,
-        const std::function<bool()>& cancelled={},
-        const Exl3EncodedMediaRetentionReserve& reserve={});
     bool is_child_of(const Exl3VeriCacheRequest& root) const noexcept {
         return parent_revision_==root.revision_;
     }
@@ -2150,11 +2131,6 @@ public:
         if(!metrics.cache_storage.entries) metrics.cache_storage=index_.storage_stats();
         return output;
     }
-
-    Result prepare_media(Exl3TextContext& exact,Exl3VisionContext& vision,
-        const targets::qwen3_6::PreparedPrompt& prompt,bool cacheable_input,
-        std::uint64_t available_physical_bytes,const std::function<bool()>& cancelled={},
-        const Exl3EncodedMediaRetentionReserve& reserve={});
 
     // Explicit independent-context preparation path. Cache lookup and the
     // numerical suffix remain outside the service lock; reload identity is

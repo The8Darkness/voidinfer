@@ -6,44 +6,22 @@
 #include "exl3/exl3_engine_core.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
-#include "runtime/engine/engine_core.h"
-#include "runtime/engine/hierarchical_vericache.h"
-#include "targets/registry.h"
 
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <utility>
-#include <variant>
 
 namespace ninfer {
 namespace {
 
-std::filesystem::path discover_dual_artifact(const std::filesystem::path& primary) {
-    std::wstring primary_text = primary.wstring();
-    if (primary_text.size() < 3 || primary_text[1] != L':' ||
-        (primary_text[2] != L'\\' && primary_text[2] != L'/') ||
-        (primary_text[0] != L'C' && primary_text[0] != L'c' && primary_text[0] != L'D' &&
-         primary_text[0] != L'd')) {
-        return {};
-    }
-    const wchar_t alternate_drive =
-        primary_text[0] == L'C' || primary_text[0] == L'c' ? L'D' : L'C';
-    primary_text[0] = alternate_drive;
-    const std::filesystem::path candidate(primary_text);
-    std::error_code error;
-    return std::filesystem::is_regular_file(candidate, error) && !error ? candidate
-                                                                          : std::filesystem::path{};
-}
-
 EngineOptions normalize_engine_options(EngineOptions options) {
-    if(options.exl3_package) {
-        if(!options.artifact_path.empty() || !options.secondary_artifact_path.empty() ||
-            options.artifact_read_mode!=ArtifactReadMode::Single ||
-            options.exl3_package->target_directory.empty() || options.exl3_package->draft_directory.empty())
-            throw std::invalid_argument("explicit EXL3 package cannot mix .ninfer artifact selection");
+    if(!options.exl3_package)
+        throw std::invalid_argument("Engine requires an EXL3 target/draft package");
+    {
+        if(options.exl3_package->target_directory.empty() || options.exl3_package->draft_directory.empty())
+            throw std::invalid_argument("Engine requires EXL3 target and draft directories");
         switch(options.exl3_package->round_implementation) {
         case Exl3RoundImplementation::Established:
             options.kv_cache=KvCacheStorage::Float16Host;
@@ -59,24 +37,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
-    if (options.disable_dual_artifact_loading) {
-        if (options.artifact_read_mode != ArtifactReadMode::Single) {
-            throw std::invalid_argument(
-                "dual artifact loading cannot be enabled while the dual-source opt-out is set");
-        }
-        options.secondary_artifact_path.clear();
-    } else {
-        if (options.secondary_artifact_path.empty()) {
-            options.secondary_artifact_path = discover_dual_artifact(options.artifact_path);
-        }
-        if (!options.secondary_artifact_path.empty() &&
-            options.artifact_read_mode == ArtifactReadMode::Single) {
-            options.artifact_read_mode = ArtifactReadMode::DualDynamic;
-        }
-    }
-
-    options.hierarchical_vericache = runtime::normalize_hierarchical_vericache_options(
-        std::move(options.hierarchical_vericache));
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
     if (!cache.enabled) {
@@ -295,66 +255,25 @@ GenerationPollResult GenerationHandle::poll(OutputSink* sink,
 
 class Engine::Impl {
 public:
-    using Core27 = runtime::EngineCore<targets::Qwen3_6_27BInstance>;
-    using Core35 = runtime::EngineCore<targets::Qwen3_6_35BA3BInstance>;
-    using CoreExl3 = exl3::Exl3EngineCore;
-    using Core   = std::variant<std::monostate, std::unique_ptr<Core27>, std::unique_ptr<Core35>,std::unique_ptr<CoreExl3>>;
+    using Core = exl3::Exl3EngineCore;
     static EngineOptions checked_options(EngineOptions supplied) {
         auto normalized=normalize_engine_options(std::move(supplied));
-        if(normalized.exl3_package)CoreExl3::require_startup_retirement_available(normalized);
+        Core::require_startup_retirement_available(normalized);
         return normalized;
     }
 
     explicit Impl(EngineOptions engine_options)
-        : options(checked_options(std::move(engine_options))) {
-        if(options.exl3_package) {
-            auto exl3=std::make_unique<CoreExl3>(options);
-            load=exl3->load_summary();sampling_defaults=exl3->sampling_defaults();
-            core=std::move(exl3);return;
-        }
-        device.emplace(options.device);
-        auto constructed  = targets::construct_target(options, *device);
-        active            = std::move(constructed.active);
-        load              = std::move(constructed.load);
-        sampling_defaults = constructed.sampling_defaults;
-        core              = std::visit(
-            [&](auto& target_ptr) -> Core {
-                using Instance =
-                    typename std::remove_reference_t<decltype(target_ptr)>::element_type;
-                if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    return std::make_unique<Core27>(*target_ptr, *device, options,
-                                                                 std::move(constructed.context_cost));
-                } else {
-                    return std::make_unique<Core35>(*target_ptr, *device, options,
-                                                                 std::move(constructed.context_cost));
-                }
-            },
-            active);
-    }
-
-    ~Impl() noexcept {
-        // EXL3 owns its device/stream retirement. Do not create native streams
-        // for that backend or retry its failed drain in this adapter.
-        if(!device){core.emplace<std::monostate>();return;}
-        device->bind_to_current_thread_noexcept();
-        core.emplace<std::monostate>();
-        try {
-            device->synchronize();
-        } catch (...) {}
+        : options(checked_options(std::move(engine_options))),core(std::make_unique<Core>(options)) {
+        load=core->load_summary();
+        sampling_defaults=core->sampling_defaults();
     }
 
     EngineOptions options;
-    std::optional<DeviceContext> device;
-    targets::ActiveTarget active;
+    std::unique_ptr<Core> core;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
-    Core core;
     template<class Function> decltype(auto) with_frontend(Function&& function) const {
-        if(const auto* exl3=std::get_if<std::unique_ptr<CoreExl3>>(&core))return function((*exl3)->frontend());
-        return std::visit([&](const auto& target)->decltype(auto){
-            if(!target)throw std::logic_error("Engine target unavailable");
-            return function(target->loaded->frontend);
-        },active);
+        return function(core->frontend());
     }
 };
 
@@ -474,20 +393,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             impl_, std::move(immediate), resolved_sampling));
     }
 
-    return std::visit(
-        [&](auto& core) -> GenerationHandle {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                throw std::logic_error("Engine core is unavailable");
-            } else {
-                auto submission =
-                    core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
-                                 std::move(resolved_options), consumer_mode, pending_deadline);
-                return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                    impl_, std::move(submission), resolved_sampling));
-            }
-        },
-        impl_->core);
+    auto submission=impl_->core->submit(std::move(prompt.impl_->value),prompt_summary,prepare_seconds,
+        std::move(resolved_options),consumer_mode,pending_deadline);
+    return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+        impl_,std::move(submission),resolved_sampling));
 }
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
@@ -509,16 +418,7 @@ LoadSummary Engine::load_summary() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& core) -> MemorySummary {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                throw std::logic_error("Engine core is unavailable");
-            } else {
-                return core->memory_summary();
-            }
-        },
-        impl_->core);
+    return impl_->core->memory_summary();
 }
 
 MediaCacheSummary Engine::media_cache_summary() const {
@@ -528,28 +428,11 @@ MediaCacheSummary Engine::media_cache_summary() const {
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
-        [](const auto& core) -> RuntimeStats {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (std::is_same_v<CoreState, std::monostate>) {
-                throw std::logic_error("Engine core is unavailable");
-            } else {
-                return core->runtime_stats();
-            }
-        },
-        impl_->core);
+    return impl_->core->runtime_stats();
 }
 
 void Engine::reset_memory_peaks() noexcept {
-    if (impl_ == nullptr) { return; }
-    std::visit(
-        [](auto& core) {
-            using CoreState = std::remove_cvref_t<decltype(core)>;
-            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
-                core->reset_memory_peaks();
-            }
-        },
-        impl_->core);
+    if (impl_ != nullptr) impl_->core->reset_memory_peaks();
 }
 
 } // namespace ninfer

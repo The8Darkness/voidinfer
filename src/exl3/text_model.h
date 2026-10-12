@@ -16,7 +16,6 @@
 #include "exl3/recurrent_export_pool.h"
 #include "exl3/greedy_packet.h"
 #include "exl3/sampled_select.h"
-#include "exl3/mtp_runner.h"
 #include "exl3/l0_pinned_pool.h"
 
 #include <cstddef>
@@ -1252,39 +1251,6 @@ public:
     const Exl3CudaLinearWeights& target_lm_head_weights() const noexcept;
     const Exl3CudaLinearMetadata& target_lm_head_metadata() const noexcept;
     const std::uint16_t* target_embedding() const noexcept;
-    // Explicit, default-off capture for a native MTP bridge.  Preparation
-    // must happen on a pristine context, before the first target forward.
-    // Once prepared, ordinary eager prefill/decode forwards copy their exact
-    // final-normalized hidden rows into a separate position-indexed device
-    // allocation.  The capture never changes target authority or target head
-    // selection; callers still obtain independent handoff copies below.
-    void prepare_native_mtp_hidden_capture(int capacity);
-    bool native_mtp_hidden_capture_prepared() const noexcept;
-    int native_mtp_hidden_capture_capacity() const noexcept;
-    int native_mtp_hidden_capture_rows() const noexcept;
-    int native_mtp_hidden_capture_first_position() const noexcept;
-    std::uint64_t native_mtp_hidden_capture_generation() const noexcept;
-    // Copies the exact final-normalized target hidden row into an owned device
-    // allocation for a native MTP bridge. The source final-norm/ping-pong
-    // buffers are never borrowed by the caller and may be reused immediately
-    // after the stream-ordered copy is enqueued.
-    Exl3MtpTargetHiddenHandoff target_hidden_handoff(
-        int row = 0, cudaStream_t stream = nullptr) const;
-    // Bounded batch copy of exact final-normalized target rows.  When the
-    // explicit native-MTP capture is prepared and covers the requested range,
-    // first_row/rows address that position-indexed capture; otherwise they
-    // retain the legacy most-recent-forward meaning.  All returned row views
-    // alias one separately owned allocation, so the transient hidden
-    // ping-pong/capture buffers may be reused after the producer stream reaches
-    // the MTP consumer.  Rows retain absolute positions and one generation.
-    std::vector<Exl3MtpTargetHiddenHandoff> target_hidden_handoffs(
-        int first_row, int rows, cudaStream_t stream = nullptr) const;
-    // Explicit default-off native MTP materialization.  This validates and
-    // uploads the closed 39-tensor manifest, binds the resident target
-    // embedding/H6 head, and allocates a separate bounded MTP KV frontier.
-    // It never changes target authority or enables MTP for ordinary requests.
-    std::shared_ptr<Exl3MtpPrefixState> create_native_mtp_prefix_state(
-        std::uint32_t kv_capacity = 4'096) const;
     std::size_t persistent_bytes() const noexcept { return persistent_bytes_; }
     // Represented context allocation records and fixed layer/workspace/staging
     // objects. Excludes separately reserved reconstruction/prefix owners, graph

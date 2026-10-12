@@ -33,39 +33,23 @@ add_library(ninfer_core STATIC
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
-  runtime/engine/admission_policy.cpp
-  runtime/engine/context_cost.cpp
-  runtime/engine/context_cost_defaults.cpp
-  runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads)
-
-# Generic .ninfer framing, binding, and direct final materialization.
-add_library(ninfer_artifact STATIC
-  artifact/reader.cpp
-  artifact/storage_layouts.cpp
-  artifact/binder.cpp
-  artifact/materializer.cpp
-  artifact/typed_binding.cpp)
-ninfer_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 
 # Read-only native safetensors framing inspection for the isolated EXL3 bring-up.
 # This library deliberately has no model registration, tensor materialization, or CUDA
 # EXL3 compute path; the qualified .ninfer route remains the production boundary.
 add_library(ninfer_exl3_format STATIC
   exl3/safetensors.cpp
-  exl3/linear_reference.cpp
-  exl3/mtp_manifest.cpp)
+  exl3/linear_reference.cpp)
 ninfer_internal_includes(ninfer_exl3_format)
 
 # Isolated E2B native CUDA leaf. This target is intentionally separate from both the
 # qualified NVFP4/OSCAR route and the E2 CPU/reference implementation.
 add_library(ninfer_exl3_cuda STATIC
   exl3/linear_cuda.cu
-  exl3/mtp_runner.cu
   exl3/prefill_attention_chain_graph.cu
   exl3/prefill_projection_chain_graph.cu
   exl3/target_projection_timing.cu
@@ -336,8 +320,8 @@ ninfer_cuda_archive(ninfer_exl3_text_model)
 target_include_directories(ninfer_exl3_text_model PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_exl3_text_model PUBLIC ninfer_exl3_gdn ninfer_exl3_format ninfer_ops)
 
-# V6 numerical bring-up (research) and the serving BF16 Vision tower.
-add_library(ninfer_exl3_vision STATIC exl3/vision_model.cu exl3/vision_dense.cu)
+# The BF16 Vision tower (weights streamed from pinned host memory).
+add_library(ninfer_exl3_vision STATIC exl3/vision_dense.cu)
 ninfer_internal_includes(ninfer_exl3_vision)
 ninfer_cuda_archive(ninfer_exl3_vision)
 target_include_directories(ninfer_exl3_vision PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
@@ -394,24 +378,20 @@ endif()
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
 # directories contribute their sources directly to this single compile owner below.
 add_library(ninfer_engine STATIC
-  exl3/prepared_request.cpp
+
   exl3/exl3_frontend_resources.cpp
   exl3/exl3_engine_core.cpp
-  targets/registry.cpp
   runtime/contract/sampling.cpp
   runtime/engine/engine.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
 add_subdirectory(targets/qwen3_6)
-add_subdirectory(targets/qwen3_6_27b)
-add_subdirectory(targets/qwen3_6_35b_a3b)
 
 target_link_libraries(ninfer_engine
   PRIVATE
     ninfer_exl3_dflash2
     ninfer_exl3_vision
-    ninfer_artifact
     ninfer_core
     ninfer_ops
     ninfer_text
