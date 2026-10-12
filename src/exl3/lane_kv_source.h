@@ -208,6 +208,7 @@ public:
             if (auto page = weak.lock())
                 if (holds(*page) && !std::binary_search(kept.begin(), kept.end(), page.get()))
                     outgoing.push_back(std::move(page));
+        unique_pages(outgoing);
         if (outgoing.empty()) return;
         const auto by_rows = [](const auto& a, const auto& b) {
             return a->first != b->first ? a->first < b->first : a->rows < b->rows;
@@ -554,6 +555,7 @@ private:
             if (auto page = weak.lock())
                 if (page->source_id.load() == this && (!page->payload_deferred() || packed_here(*page)))
                     filled.push_back(std::move(page));
+        unique_pages(filled);
         constexpr std::size_t kBatch = 32;
         for (std::size_t begin = 0; begin < filled.size(); begin += kBatch) {
             if (!Exl3KvSpillStore::under_pressure(extra)) return;
@@ -701,15 +703,26 @@ private:
         page.spill.reset();
         page.spill_packed_bytes = 0;
     }
+    // A page re-homed onto planes that tracked it before (defer, then adopt
+    // after a lane swap) is tracked twice: collections over pages_ drop the
+    // duplicates, or two pool threads would spill (and free) one packed blob.
+    static void unique_pages(std::vector<std::shared_ptr<Exl3ExactKVPage>>& pages) {
+        std::sort(pages.begin(), pages.end(), [](const auto& a, const auto& b) { return a.get() < b.get(); });
+        pages.erase(std::unique(pages.begin(), pages.end(),
+            [](const auto& a, const auto& b) { return a.get() == b.get(); }), pages.end());
+    }
     void track_locked(const std::shared_ptr<Exl3ExactKVPage>& page) {
         if (pages_.size() >= 2 * live_hint_ + 256) prune_locked();
         pages_.push_back(page);
     }
     void prune_locked() {
-        pages_.erase(std::remove_if(pages_.begin(), pages_.end(), [&](const auto& weak) {
-            const auto page = weak.lock();
-            return !page || page->source_id.load() != this;
-        }), pages_.end());
+        std::vector<std::shared_ptr<Exl3ExactKVPage>> live;
+        live.reserve(pages_.size());
+        for (const auto& weak : pages_)
+            if (auto page = weak.lock())
+                if (page->source_id.load() == this) live.push_back(std::move(page));
+        unique_pages(live);
+        pages_.assign(live.begin(), live.end());
         live_hint_ = pages_.size();
     }
 
@@ -724,6 +737,8 @@ private:
                     pages.push_back(page.get());
                     owners.push_back(std::move(page));
                 }
+        std::sort(pages.begin(), pages.end());
+        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
         fill_locked(pages);
         prune_locked();
     }
