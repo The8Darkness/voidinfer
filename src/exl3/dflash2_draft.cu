@@ -4006,18 +4006,63 @@ void Exl3Dflash2DraftModel::restore_host_ring(std::shared_ptr<const Exl3DraftHos
     require(capture==cudaStreamCaptureStatusNone,"draft host restore requires eager stream");
     m.host_ring_parent.reset();m.host_ring_failed=true;
     try {
+        // The pages' rows of [base, position) gather into the pinned stage
+        // (export_host_ring's layout) in parallel; each contiguous run of
+        // pages then uploads with at most two DMA segments (ring wrap) per
+        // layer and plane, under one stream fence (previously a fenced copy
+        // per page, layer and plane).
+        struct Span { const Exl3DraftHostRing::Page* page; long long first,end; };
+        std::vector<Span> spans;
         for(const auto& page:state->pages_) {
             const auto first=std::max(state->base_,page->first);
             const auto end=std::min(state->position(),page->first+page->rows);
-            if(end<=first) continue;
-            for(int layer=0;layer<kLayers;++layer) {
-                const auto upload=[&](std::uint16_t* destination,const auto& plane) {
-                    cuda_check(exl3_h2d_async(destination+static_cast<std::size_t>(first&kRingMask)*1024,
-                        plane.data()+static_cast<std::size_t>(first-page->first)*1024,static_cast<std::size_t>(end-first)*2048,stream),"draft host page restore");
-                    cuda_check(cudaStreamSynchronize(stream),"draft host restore complete");
-                };
-                upload(m.ring_k[layer],page->k[layer]);upload(m.ring_v[layer],page->v[layer]);
+            if(end>first) spans.push_back({page.get(),first,end});
+        }
+        if(!spans.empty()) {
+            const long long lo=state->base_;
+            const std::size_t plane_elements=static_cast<std::size_t>(state->position()-lo)*1024;
+            auto& stage=m.ring_export_stage;
+            const std::size_t capacity=static_cast<std::size_t>(2*kLayers)*kRingCap*1024*sizeof(std::uint16_t);
+            if(stage.bytes<capacity) {
+                if(stage.host){cuda_check(cudaFreeHost(stage.host),"draft ring stage release");stage.host=nullptr;stage.bytes=0;}
+                void* host=nullptr;
+                cuda_check(cudaHostAlloc(&host,capacity,cudaHostAllocDefault),"draft ring stage");
+                stage.host=static_cast<std::uint16_t*>(host);stage.bytes=capacity;
             }
+            std::for_each(std::execution::par,spans.begin(),spans.end(),[&](const Span& span) {
+                const std::size_t offset=static_cast<std::size_t>(span.first-lo)*1024;
+                const std::size_t source=static_cast<std::size_t>(span.first-span.page->first)*1024;
+                const std::size_t bytes=static_cast<std::size_t>(span.end-span.first)*2048;
+                for(int layer=0;layer<kLayers;++layer) {
+                    std::memcpy(stage.host+static_cast<std::size_t>(2*layer)*plane_elements+offset,
+                        span.page->k[layer].data()+source,bytes);
+                    std::memcpy(stage.host+static_cast<std::size_t>(2*layer+1)*plane_elements+offset,
+                        span.page->v[layer].data()+source,bytes);
+                }
+            });
+            const auto upload_run=[&](long long first,long long end) {
+                for(int layer=0;layer<kLayers;++layer)
+                    for(int plane=0;plane<2;++plane) {
+                        std::uint16_t* ring=plane?m.ring_v[layer]:m.ring_k[layer];
+                        const std::uint16_t* source=stage.host+static_cast<std::size_t>(2*layer+plane)*plane_elements;
+                        for(long long cursor=first;cursor<end;) {
+                            const long long slot=cursor&kRingMask;
+                            const long long rows=std::min<long long>(end-cursor,kRingCap-slot);
+                            cuda_check(cudaMemcpyAsync(ring+static_cast<std::size_t>(slot)*1024,
+                                source+static_cast<std::size_t>(cursor-lo)*1024,static_cast<std::size_t>(rows)*2048,
+                                cudaMemcpyHostToDevice,stream),"draft host ring restore");
+                            cursor+=rows;
+                        }
+                    }
+            };
+            long long run_first=spans.front().first,run_end=spans.front().end;
+            for(std::size_t i=1;i<spans.size();++i) {
+                if(spans[i].first==run_end) {run_end=spans[i].end;continue;}
+                upload_run(run_first,run_end);
+                run_first=spans[i].first;run_end=spans[i].end;
+            }
+            upload_run(run_first,run_end);
+            cuda_check(cudaStreamSynchronize(stream),"draft host restore complete");
         }
         m.ring_base_abs=state->base_;m.ring_count=state->count_;m.host_ring_parent=std::move(state);m.host_ring_failed=false;
         m.witness_revision=m.ring_revision;m.ring_witness_ready=true;
