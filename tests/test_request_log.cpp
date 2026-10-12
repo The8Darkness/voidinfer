@@ -273,20 +273,6 @@ int main() {
     outcome.metrics.total_seconds           = 5.7037035803702;
     outcome.metrics.prefix_cache_hit_tokens = 101;
     outcome.metrics.prefix_reuse_path       = voidinfer::PrefixReusePath::PrivateTurnClosure;
-    outcome.metrics.engine_timing           = {
-                  .queue_wait_seconds                   = 0.001,
-                  .engine_boundary_exposed_seconds      = 0.001,
-                  .program_submit_exposed_seconds       = 0.002,
-                  .program_post_exposed_seconds         = 0.003,
-                  .engine_commit_output_exposed_seconds = 0.004,
-                  .engine_maintenance_exposed_seconds   = 0.005,
-                  .device_wait_exposed_seconds          = 0.3,
-                  .decode_host_exposed_seconds          = 0.01,
-                  .decode_device_wait_exposed_seconds   = 0.2,
-                  .prefill_units                        = 4,
-                  .decode_rounds                        = 2,
-                  .control_units                        = 1,
-    };
     outcome.metrics.speculative_enabled               = true;
     outcome.metrics.speculative_draft_window          = 3;
     outcome.metrics.speculative_rounds                = 300;
@@ -305,23 +291,6 @@ int main() {
     outcome.metrics.speculative_hidden_terminal_rows=1;
     outcome.metrics.speculative_diagnostic_rows=17;
     outcome.metrics.speculative_shared_projection_rows=std::nullopt;
-    outcome.metrics.materialization                   = {
-                          .predicted_now_ns              = 200000,
-                          .predicted_future_loss_ns      = 50000,
-                          .predicted_total_ns            = 250000,
-                          .targets_evaluated             = 7,
-                          .projection_work               = 31,
-                          .planning_elapsed_ns           = 9000,
-                          .search_elapsed_ns             = 6000,
-                          .stop_reason                   = voidinfer::MaterializationStopReason::ModelOptimal,
-                          .model_optimal                 = true,
-                          .budget_exhausted              = false,
-                          .best_remaining_lower_bound_ns = 250000,
-                          .absolute_bound_gap_ns         = 0,
-                          .relative_bound_gap            = 0.0,
-                          .selected_degradation_units    = 2,
-                          .selected_maximal_fallback     = false,
-    };
     outcome.thinking = voidinfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
                                                    .injected_tokens       = 19,
@@ -374,18 +343,6 @@ int main() {
                           done.at("speculative").at("diagnostic_rows")==17 &&
                           done.at("speculative").at("shared_projection_rows").is_null(),
                       "complete-route speculative accounting collapsed or fabricated sharing");
-    failures += check(done.at("materialization").at("predicted_total_ns") == 250000 &&
-                          done.at("materialization").at("targets_evaluated") == 7 &&
-                          done.at("materialization").at("stop_reason") == "model_optimal" &&
-                          done.at("materialization").at("model_optimal") == true,
-                      "request-owned materialization diagnostics missing");
-    failures += check(
-        done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
-            std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -
-                     0.015) < 1.0e-15 &&
-            done.at("engine_timing").at("decode").at("rounds") == 2 &&
-            done.at("engine_timing").at("units").at("prefill") == 4,
-        "request Engine timing exposure is incomplete");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
@@ -403,11 +360,6 @@ int main() {
     failures += check(format_request_done(context, outcome).find("reuse=private_response_replay") !=
                           std::string::npos,
                       "human request log omits response checkpoint reuse path");
-    failures +=
-        check(format_request_done(context, outcome).find("host=15.00ms") != std::string::npos &&
-                  format_request_done(context, outcome).find("decode-host=5000.0us/round") !=
-                      std::string::npos,
-              "human request log omits Engine Host exposure");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
 

@@ -268,65 +268,6 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"shared_projection_rows",std::move(shared_projection_rows)}};
 }
 
-Json materialization_json(const voidinfer::MaterializationDiagnostics& diagnostics) {
-    return Json{
-        {"predicted_now_ns", diagnostics.predicted_now_ns},
-        {"predicted_future_loss_ns", diagnostics.predicted_future_loss_ns},
-        {"predicted_total_ns", diagnostics.predicted_total_ns},
-        {"targets_evaluated", diagnostics.targets_evaluated},
-        {"projection_work", diagnostics.projection_work},
-        {"planning_elapsed_ns", diagnostics.planning_elapsed_ns},
-        {"search_elapsed_ns", diagnostics.search_elapsed_ns},
-        {"stop_reason", voidinfer::materialization_stop_reason_name(diagnostics.stop_reason)},
-        {"model_optimal", diagnostics.model_optimal},
-        {"budget_exhausted", diagnostics.budget_exhausted},
-        {"best_remaining_lower_bound_ns", diagnostics.best_remaining_lower_bound_ns},
-        {"absolute_bound_gap_ns", diagnostics.absolute_bound_gap_ns},
-        {"relative_bound_gap", diagnostics.relative_bound_gap},
-        {"selected_degradation_units", diagnostics.selected_degradation_units},
-        {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
-    };
-}
-
-double nanoseconds_to_seconds(std::uint64_t value) noexcept {
-    return static_cast<double>(value) * 1.0e-9;
-}
-
-double nanoseconds_to_microseconds(std::uint64_t value) noexcept {
-    return static_cast<double>(value) * 1.0e-3;
-}
-
-double request_host_exposed_seconds(const voidinfer::GenerationEngineTiming& timing) noexcept {
-    return timing.engine_boundary_exposed_seconds + timing.program_submit_exposed_seconds +
-           timing.program_post_exposed_seconds + timing.engine_commit_output_exposed_seconds +
-           timing.engine_maintenance_exposed_seconds;
-}
-
-Json request_engine_timing_json(const voidinfer::GenerationEngineTiming& timing) {
-    return Json{
-        {"queue_wait_seconds", timing.queue_wait_seconds},
-        {"host_exposed_seconds",
-         Json{{"engine_boundary", timing.engine_boundary_exposed_seconds},
-              {"program_submit", timing.program_submit_exposed_seconds},
-              {"program_post", timing.program_post_exposed_seconds},
-              {"engine_commit_output", timing.engine_commit_output_exposed_seconds},
-              {"engine_maintenance", timing.engine_maintenance_exposed_seconds},
-              {"total", request_host_exposed_seconds(timing)}}},
-        {"device_wait_exposed_seconds", timing.device_wait_exposed_seconds},
-        {"decode", Json{{"host_exposed_seconds", timing.decode_host_exposed_seconds},
-                        {"device_wait_exposed_seconds", timing.decode_device_wait_exposed_seconds},
-                        {"rounds", timing.decode_rounds}}},
-        {"units", Json{{"prefill", timing.prefill_units}, {"control", timing.control_units}}},
-    };
-}
-
-
-
-Json microseconds_per(std::uint64_t nanoseconds, std::uint64_t count) {
-    if (count == 0) { return nullptr; }
-    return nanoseconds_to_microseconds(nanoseconds) / static_cast<double>(count);
-}
-
 // Tokens/second with fixed precision, or "n/a" when the interval is degenerate.
 std::string rate(double tokens, double seconds) {
     std::ostringstream out;
@@ -484,18 +425,7 @@ std::string format_request_done(const RequestLogContext& context,
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
-        << " wall=" << seconds_str(metrics.total_seconds) << " host=" << std::setprecision(2)
-        << request_host_exposed_seconds(metrics.engine_timing) * 1000.0 << "ms";
-    if (metrics.engine_timing.decode_rounds == 0) {
-        out << " decode-host=n/a wait=n/a";
-    } else {
-        const double rounds = static_cast<double>(metrics.engine_timing.decode_rounds);
-        out << " decode-host=" << std::setprecision(1)
-            << metrics.engine_timing.decode_host_exposed_seconds * 1.0e6 / rounds
-            << "us/round wait="
-            << metrics.engine_timing.decode_device_wait_exposed_seconds * 1.0e6 / rounds
-            << "us/round";
-    }
+        << " wall=" << seconds_str(metrics.total_seconds);
     out << " speculative=" << speculative_str(metrics);
     if (outcome.thinking.configured_budget) {
         out << " thinking_budget=" << *outcome.thinking.configured_budget
@@ -673,9 +603,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
     record["speculative"]     = speculative_json(outcome.metrics);
-    record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();
 }
 

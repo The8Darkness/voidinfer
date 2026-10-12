@@ -869,7 +869,7 @@ int test_props_stub() {
     failures += check(params.at("presence_penalty") == 0, "unreported param stays neutral zero");
     failures += check(params.at("dry_base") == 0, "dry params stay neutral zero");
     failures += check(settings.at("speculative") == true,
-                      "props speculative follows --spec");
+                      "props speculative is always on");
     failures += check(settings.at("is_processing") == false,
                       "props is_processing false");
     failures += check(props.at("chat_template").get<std::string>().find("enable_thinking") !=

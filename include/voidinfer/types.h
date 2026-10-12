@@ -424,25 +424,6 @@ struct GenerationTimings {
     double total_seconds       = 0.0;
 };
 
-// Wall elapsed time directly observed in Engine-owned regions. "Exposed" values are latency
-// exposure: every active request delayed by one compact-batch unit observes that unit's full
-// elapsed time, so values from concurrent requests must not be summed. Device wait is reported
-// separately from Host-active work.
-struct GenerationEngineTiming {
-    double queue_wait_seconds                   = 0.0;
-    double engine_boundary_exposed_seconds      = 0.0;
-    double program_submit_exposed_seconds       = 0.0;
-    double program_post_exposed_seconds         = 0.0;
-    double engine_commit_output_exposed_seconds = 0.0;
-    double engine_maintenance_exposed_seconds   = 0.0;
-    double device_wait_exposed_seconds          = 0.0;
-    double decode_host_exposed_seconds          = 0.0;
-    double decode_device_wait_exposed_seconds   = 0.0;
-    std::uint64_t prefill_units                 = 0;
-    std::uint64_t decode_rounds                 = 0;
-    std::uint64_t control_units                 = 0;
-};
-
 struct SpeculativeStats {
     bool enabled                  = false;
     std::uint32_t draft_window    = 0;
@@ -552,62 +533,6 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
-// Why pressure planning stopped for the materialization decision committed to one request.
-// "ModelOptimal" is relative to the configured target graph, canonical transaction order, and
-// numerical cost model; it is not a claim about globally optimal observed TTFT.
-enum class MaterializationStopReason : std::uint8_t {
-    NoPressure,
-    ModelOptimal,
-    QueueExhausted,
-    TargetBudget,
-    ExpansionCapacity,
-    TimeBudget,
-    ValueOfNextExpansion,
-};
-
-[[nodiscard]] inline constexpr const char*
-materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
-    switch (reason) {
-    case MaterializationStopReason::NoPressure:
-        return "no_pressure";
-    case MaterializationStopReason::ModelOptimal:
-        return "model_optimal";
-    case MaterializationStopReason::QueueExhausted:
-        return "queue_exhausted";
-    case MaterializationStopReason::TargetBudget:
-        return "target_budget";
-    case MaterializationStopReason::ExpansionCapacity:
-        return "expansion_capacity";
-    case MaterializationStopReason::TimeBudget:
-        return "time_budget";
-    case MaterializationStopReason::ValueOfNextExpansion:
-        return "value_of_next_expansion";
-    }
-    return "no_pressure";
-}
-
-struct MaterializationDiagnostics {
-    std::uint64_t predicted_now_ns              = 0;
-    std::uint64_t predicted_future_loss_ns      = 0;
-    std::uint64_t predicted_total_ns            = 0;
-    std::uint32_t targets_evaluated             = 0;
-    std::uint64_t projection_work               = 0;
-    std::uint64_t planning_elapsed_ns           = 0;
-    std::uint64_t search_elapsed_ns             = 0;
-    MaterializationStopReason stop_reason       = MaterializationStopReason::NoPressure;
-    bool model_optimal                          = true;
-    bool budget_exhausted                       = false;
-    std::uint64_t best_remaining_lower_bound_ns = 0;
-    std::uint64_t absolute_bound_gap_ns         = 0;
-    double relative_bound_gap                   = 0.0;
-    std::uint32_t selected_degradation_units    = 0;
-    bool selected_maximal_fallback              = false;
-
-    [[nodiscard]] friend constexpr bool
-    operator==(const MaterializationDiagnostics&,
-               const MaterializationDiagnostics&) noexcept = default;
-};
-
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -617,9 +542,7 @@ struct GenerationResult {
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
-    MaterializationDiagnostics materialization;
     GenerationTimings timings;
-    GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
     GenerationTokenAccounting token_accounting;

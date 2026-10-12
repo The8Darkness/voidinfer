@@ -29,7 +29,6 @@ struct GenerationMetrics {
     double prefill_seconds = 0.0;
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
-    voidinfer::GenerationEngineTiming engine_timing;
 
     bool speculative_enabled                  = false;
     std::uint32_t speculative_draft_window    = 0;
@@ -51,7 +50,6 @@ struct GenerationMetrics {
     std::optional<std::uint64_t> speculative_shared_projection_rows;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     voidinfer::PrefixReusePath prefix_reuse_path = voidinfer::PrefixReusePath::Root;
-    voidinfer::MaterializationDiagnostics materialization;
 };
 
 struct GenerationOutcome {
