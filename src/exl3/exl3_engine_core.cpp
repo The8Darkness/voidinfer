@@ -10,7 +10,6 @@
 #include "exl3/bounded_shared_owner.h"
 #include "exl3/embedded_shared_control.h"
 #include "exl3/request_option_storage.h"
-#include "exl3/candidate_option_compatibility.h"
 #include "exl3/candidate_route_contract.h"
 #include "exl3/complete_route_counters.h"
 #include "exl3/reconstruction_config.h"
@@ -149,14 +148,7 @@ std::uint64_t resident_budget(const EngineOptions& options) {
     constexpr std::uint64_t reserve=8ULL<<30;
     const auto total=total_memory();
     if(total<=reserve)throw std::invalid_argument("EXL3 physical memory is below the resident reserve");
-    auto result=total-reserve;
-    // For the genuine native64K configuration, the declared HostKV capacity is
-    // also a hard resident ceiling. Smaller configurations preserve their
-    // established policy while the wider configuration fails closed.
-    if(options.max_context==Exl3NativeContextExtent::native64k_tokens &&
-        options.context_cache.host_kv_capacity_bytes)
-        result=std::min<std::uint64_t>(result,options.context_cache.host_kv_capacity_bytes);
-    return result;
+    return total-reserve;
 }
 std::uint64_t host_plan_fingerprint(std::span<const std::int64_t> tokens) noexcept {
     std::uint64_t value=1469598103934665603ULL;
@@ -684,17 +676,7 @@ struct Exl3EngineCore::Impl {
                 throw std::invalid_argument(std::string(name)+" must be0 or1");
             return value && std::string_view(value)=="1";
         };
-        const bool native64k=flag("VOIDINFER_EXL3_EXTENDED_CONTEXT_64K");
-        const bool candidate128k=flag("VOIDINFER_EXL3_EXTENDED_CONTEXT_128K");
-        const bool exact_host=flag("VOIDINFER_EXL3_EXACT_HOST_KV");
-        const bool oscar_only=flag("VOIDINFER_EXL3_OSCAR_L0_ONLY");
         const bool device_prefix=flag("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
-        Exl3NativeContextExtent::refuse_candidate128k_execution(value.max_context,
-            native64k,candidate128k,exact_host,oscar_only,value.max_concurrency,
-            value.context_cache.host_kv_capacity_bytes,device_prefix);
-        Exl3NativeContextExtent::require_native64k_engine(value.max_context,
-            native64k,candidate128k,exact_host,oscar_only,
-            value.max_concurrency,value.context_cache.host_kv_capacity_bytes);
         conditional_b8 = read_binary_option("VOIDINFER_EXL3_ENGINE_CONDITIONAL_B8",
             "VOIDINFER_EXL3_ENGINE_CONDITIONAL_B8 must be 0 or 1");
         const bool device_taps_only=flag("VOIDINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
@@ -860,8 +842,7 @@ struct Exl3EngineCore::Impl {
         const auto selected=[](const char* name) {
             const auto* value=std::getenv(name);return value && std::string_view(value)=="1";
         };
-        if(native64k || candidate128k ||
-           selected("VOIDINFER_EXL3_NATIVE_CONTINUATION16") || device_prefix ||
+        if(selected("VOIDINFER_EXL3_NATIVE_CONTINUATION16") || device_prefix ||
            share_prefix || registered_upload || share_pages || share_attention ||
            attention_staging || share_projection_owner || share_kv || share_o ||
            share_gateup || share_down || share_head || share_gather ||
@@ -2293,7 +2274,7 @@ struct Exl3EngineCore::Impl {
            request.options.execution.sampling.presence_penalty!=0 ||
            request.options.execution.sampling.frequency_penalty!=0)
             throw std::invalid_argument(
-                "coherent-device EXL3 requires a prompt without penalties, stop strings or a thinking budget (media needs --exl3-vision)");
+                "coherent-device EXL3 requires a prompt without penalties, stop strings or a thinking budget (media needs --vision)");
         if(request.cancelled) {result.finish_reason=FinishReason::Cancelled;return;}
         if(Clock::now()>=request.deadline)
             throw RequestError(RequestErrorKind::QueueTimeout,

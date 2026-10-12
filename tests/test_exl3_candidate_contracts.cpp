@@ -1,4 +1,3 @@
-#include "exl3/candidate_option_compatibility.h"
 #include "exl3/candidate_route_contract.h"
 #include "exl3/complete_route_counters.h"
 #include <iostream>
@@ -31,24 +30,6 @@ int main() try {
     refuses([]{require_engine_exact_route({"composed",Exl3NumericalRouteClass::numeric,
         "host-kv-fp16","fp16",false,true},"host-kv-fp16","fp16");},
         "numeric/exact composition was relabelled exact");
-
-    Exl3CandidateOptionCompatibility base;
-    base.physical_lanes=2;base.max_context=32768;base.exact_host_kv=true;
-    require_candidate_option_compatibility(base);
-    auto target=base;target.shared_target_q=true;target.shared_target_kv=true;
-    require_candidate_option_compatibility(target);
-    auto missing_target=target;missing_target.shared_target_q=false;
-    refuses([&]{require_candidate_option_compatibility(missing_target);},
-        "dependent target family lacked Q owner");
-    auto mixed=base;mixed.device_prefix=true;mixed.shared_prefix=true;mixed.shared_pages=true;
-    refuses([&]{require_candidate_option_compatibility(mixed);},
-        "mutually exclusive prefix/page routes composed");
-    auto native=base;native.native64k=true;native.max_context=65536;
-    refuses([&]{require_candidate_option_compatibility(native);},
-        "native64K admitted physical C2");
-    auto packets=base;packets.batched_greedy=true;
-    refuses([&]{require_candidate_option_compatibility(packets);},
-        "batched greedy admitted without device packet owner");
 
     Exl3CompleteRouteCounters counters;
     counters.record_attempt(8,8,0);counters.record_target_work(3,3);

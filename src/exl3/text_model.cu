@@ -4595,27 +4595,10 @@ const Exl3ModelLoadStats& Exl3TextModel::load_stats() const noexcept { return im
 
 std::unique_ptr<Exl3TextModel> Exl3TextModel::load(const std::filesystem::path& model_directory,
                                                    int max_context, const Exl3LoadOptions& options) {
-    const char* extended_context=std::getenv("VOIDINFER_EXL3_EXTENDED_CONTEXT_64K");
-    require(!extended_context || std::strcmp(extended_context,"0")==0 ||
-            std::strcmp(extended_context,"1")==0,
-            "extended 64K context must be 0 or 1");
-    const bool extended_context_enabled=extended_context &&
-        std::strcmp(extended_context,"1")==0;
-    const char* extended_context_128=std::getenv("VOIDINFER_EXL3_EXTENDED_CONTEXT_128K");
-    require(!extended_context_128 || std::strcmp(extended_context_128,"0")==0 ||
-            std::strcmp(extended_context_128,"1")==0,
-            "extended 128K context must be 0 or 1");
-    const bool extended_context_128_enabled=extended_context_128 &&
-        std::strcmp(extended_context_128,"1")==0;
-    const int context_limit=static_cast<int>(Exl3NativeContextExtent::configuration_limit(
-        extended_context_enabled,extended_context_128_enabled));
+    const int context_limit=static_cast<int>(Exl3NativeContextExtent::configuration_limit());
     require(max_context > 0 && max_context <= context_limit,
-            extended_context_128_enabled ? "E4C1 extended max_context must be 1..131072" :
-            (extended_context_enabled ? "E4C1 extended max_context must be 1..65536" :
-             (Exl3NativeContextExtent::l0_oscar_enabled() ? "E4C1 L0 OSCAR max_context must be 1..262144" :
-                                        "E4C1 max_context must be 1..32768")));
-    require(!extended_context_128_enabled,
-        "128K is a static configuration candidate only; model execution is unsupported");
+            Exl3NativeContextExtent::l0_oscar_enabled() ? "E4C1 L0 OSCAR max_context must be 1..262144" :
+                                                          "E4C1 max_context must be 1..32768");
     auto impl = std::make_unique<Impl>();
     impl->directory = model_directory;
     if(std::filesystem::is_directory(model_directory/"l0_oscar"))
@@ -4624,8 +4607,7 @@ std::unique_ptr<Exl3TextModel> Exl3TextModel::load(const std::filesystem::path& 
     impl->load_from_disk();
     auto result = std::unique_ptr<Exl3TextModel>(new Exl3TextModel(std::move(impl)));
     result->max_context_ = Exl3NativeContextExtent::checked_max_context(
-        static_cast<std::uint64_t>(max_context),extended_context_enabled,
-        extended_context_128_enabled);
+        static_cast<std::uint64_t>(max_context));
     result->model_bytes_ = result->impl_->model_bytes;
     return result;
 }
