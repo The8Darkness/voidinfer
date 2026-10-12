@@ -12,11 +12,16 @@ Full head-to-head against NInfer `a0cf1c17` (upstream `81c8ce0`) on 2026-10-12:
 | Scenarios (12 NInfer prompts, geomean) | 212 tok/s | 247 tok/s |
 | Base decode 4K / prefill 4K | 76 tok/s / 7.8K tok/s | 94 tok/s (groupwise) / 14.1K tok/s (NVFP4) |
 | Concurrency 4K C2 / C4 / C8 | 258 / 365 / 396 tok/s | 340 / 526 / does not start (per-slot FP8 KV) |
-| 8 agents x 99K-113K tokens, 4 lanes | first turn 223 s, resume 52 s | first turn 310 s, resume 11 s (groupwise) |
-| Vision | none (EXL3 route text-only) | image and video |
+| 8 agents x 99K-113K tokens, 4 lanes | first turn 223 s, resume 52 s (24-25 s after `a45ce283`, plane sets) | first turn 310 s, resume 11 s (groupwise) |
+| Vision | none in the comparison run; since `7c0b09fa` images and video (`--exl3-vision`), 1.6-1.8 s per image request | image and video, 1.0-1.3 s per image request |
 
 Fixed during the run: `98f10860` asynchronous VeriCache blocks settle on a round closed by the terminal
 token (every C1 request that ended at EOS before its budget failed with "asynchronous verification settle").
+
+After the run: `7c0b09fa` adds image/video input (BF16 vision tower streamed from host, M-RoPE rotary map
+per lane) and serves prompts under 2,048 tokens (virtually saturated DFlash2 ring); `a45ce283` keeps
+each agent's history in its own plane set and resumes agents by remapping it (restore 3.4-6.0 s -> 0.1-0.7 s).
+Details: [update section](ninfer-comparison-2026-10-12.md#update-vision-and-agent-resume).
 
 ## Status 2026-10-08
 
@@ -48,7 +53,7 @@ documentation and portability edits.
 | Native `.ninfer` CLI/server | Implemented | `apps/`, `src/serve/`, `src/runtime/` | Windows implementation and unit/integration tests; model artifact required | Clean hardware smoke on the publication commit |
 | EXL3 greedy text serving, physical C1 | Qualified slice/default route | `src/exl3/`, `docs/exl3-serving.md` | Exact route tests and dated serving evidence; ordinary FP16 host L2 and FP32 recurrent state | Repeat clean serving smoke and client-visible TTFT |
 | EXL3 physical C2 | Explicit bounded configuration | `src/exl3/` | Profile-specific C2 receipts; not a blanket concurrency claim | Held-out load/soak and memory-pressure qualification |
-| EXL3 media/vision | Unsupported in public slice | frontend rejects unsupported combinations | No broad media qualification | Separate semantic and lifecycle campaign |
+| EXL3 media/vision | Supported with `--exl3-vision DIR` (BF16 tower) | `src/exl3/vision_dense.*`, `exl3_engine_core.cpp` | Merged embeddings vs FP32 reference cosine 0.9998-0.9999; image, two-image, video, long-prompt and C4 requests served (`bench/engine-compare/vision_suite.py`); media prompts are not reused as prefix roots | Media-aware prefix reuse |
 | Positive-temperature EXL3 sampling | Not broadly qualified | sampling policy/transaction tests | Greedy authority does not establish distribution preservation | Distribution and stop-semantics panel |
 | Native same-weight DFlash2 C1 harness | Qualified research baseline; not server default | `tests/test_exl3_real_dflash_execution.h`, `tests/test_exl3_dflash2_accept.cpp` | R608: 2,822 checks, 12 exact rows, grouped workload wall | Reproduce from publication commit; separate server integration gate |
 | Device-working-state route | Retained/default in its harness profile | `src/exl3/text_model.*` | R599 liveness and R597/R600 matched AB evidence | Broader quality panel before product promotion |

@@ -296,6 +296,46 @@ attention layers were scanned: 6.98 × 10⁹ values, max |K| = 23.1, max |V| = 1
 2¹⁵ (FP16's largest finite value is 65,504), 0.005–0.006% in FP16's subnormal range. FP16 KV storage
 has more than 500× range headroom on this model and 3 more mantissa bits than BF16.
 
+## Update: vision and agent resume
+
+Measured later on 2026-10-12, same machine and harness, after two changes to VoidInfer (commits
+`7c0b09fa`, `a45ce283`). NInfer was not re-run; its columns are the numbers above.
+
+**Vision.** The EXL3 route now takes images and video (`--exl3-vision <BF16 checkpoint dir>`): the
+vision tower runs in BF16 from the checkpoint's own weights (streamed from pinned host memory, no
+resident VRAM), and image embeddings plus M-RoPE positions feed the usual verified DFlash2 decode.
+Prompts shorter than 2,048 tokens, which the route refused before, are served too.
+
+| Server | Image | Prompt tokens | Latency, warm (s) | Decode (tok/s) | Answer (first 100 chars) |
+|---|---|---:|---:|---:|---|
+| ours.exl3-vision | natural_scene | 404 | 1.71–1.81 | 178–182 | This is a cheerful, stylized digital illustration titled **“A SUNNY HOUSE BY THE MOUNTAINS”**, disp |
+| ours.exl3-vision | visual_chart | 411 | 1.61–1.78 | 185–188 | This chart, titled **"NIFER VISION 731"**, appears to be a simple visual test or demonstration of ba |
+| ninfer.nv (above) | natural_scene / visual_chart | 404 / 411 | 1.21 / 1.01 | — | (see the vision table above) |
+
+The encoder takes 19 ms per 1,536-patch image (first request after startup 2.1 s; the tower is warmed
+at startup). Against an FP32 Hugging Face reference of the same tower on the same images, the merged
+embeddings have mean cosine 0.99981 / 0.99992 and relative L2 error 0.042 / 0.020 (Hugging Face's own
+BF16 run: 0.99990 / 0.99994, 0.025 / 0.026). Two images in one turn, an image inside a 3,506-token
+prompt, a 1,164-token video, text after media, and four concurrent image requests on four lanes
+(275 tok/s aggregate) were all served (`vision_suite.py`).
+
+**Agent resume.** A lane used to own one fixed set of FP16 history planes, so resuming an agent
+packed the previous agent's ~6.6 GB history and unpacked the incoming one through the CPU (3.4–6.0 s
+per agent). Each agent's history now stays in its own plane set; a lane maps the set of the agent it
+serves behind a fixed address range (CUDA VMM alias, 44 ms map / 44–138 ms unmap per 4 GiB), so a
+resume is a remap. Sets are packed and spilled only under host memory pressure, by a background pass.
+
+| 8 agents × 99K–113K tokens, 4 lanes, 256 outputs | First turn (s) | Resumed turn (s) | Restore per agent |
+|---|---:|---:|---|
+| VoidInfer, comparison run | 223 | 52 | — |
+| VoidInfer, same build re-measured before the change | 222 | 48.3 | 3.4–6.0 s |
+| VoidInfer, plane sets (3 runs) | 223–229 | **24.2 / 24.6 / 25.1** | 0.11–0.66 s; 2.0–5.2 s for the 1–2 agents packed under memory pressure |
+| NInfer groupwise (above) | 310 | 11 | — |
+
+Each resumed answer cites only identifiers from its own agent's code slice
+(`agents_identity_check.py`). The resumed turn is now dominated by decode: only two of the four
+lanes fit 108K-token agents' INT4 codes in VRAM, so the eight agents decode in four waves.
+
 ## Limits of this comparison
 
 * Weight formats differ by design (EXL3 6 bpw vs NInfer's official NVFP4 and groupwise artifacts).

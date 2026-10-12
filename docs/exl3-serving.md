@@ -2,7 +2,7 @@
 
 VoidInfer's existing `ninfer-serve`, `GenerationService` and public `Engine` now accept a typed EXL3 target/draft package. The qualified slice is greedy text with one persistent physical execution lane by default, or two with explicit `--max-concurrency 2`, actual five-layer DFlash2 B8 proposals, ordinary FP16 host-backed L2 KV and FP32 recurrent state. The coordinator authorizes and establishes resident/VirtualLocked ownership before any generated window becomes visible.
 
-This is an explicit route. The existing T23 default and separately retained FD2/native16 options have not been promoted or composed into this serving profile. V6 is still required in the pinned target package; media requests fail explicitly while the encoder's full numerical and downstream attachment gates remain open. Positive-temperature sampling is also explicitly unsupported on this route.
+This is an explicit route. The existing T23 default and separately retained FD2/native16 options have not been promoted or composed into this serving profile. V6 is still required in the pinned target package, but the V6 (EXL3-quantized) encoder stays unused: on the coherent-device route, `--exl3-vision DIR` runs the vision tower in BF16 from the checkpoint's `model.visual.*` tensors (src/exl3/vision_dense.cu), and without it media requests fail explicitly. Positive-temperature sampling is also explicitly unsupported on this route.
 
 ## Package and launch contract
 

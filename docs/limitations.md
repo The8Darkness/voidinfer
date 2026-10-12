@@ -6,8 +6,9 @@
   revisions, not just a source commit.
 - R608 is a research-harness measurement, not HTTP throughput, pure-kernel decode, startup latency,
   or client-visible TTFT.
-- EXL3 support is a narrow greedy-text slice. Media, positive-temperature sampling, broad C2+, and
-  long-context behavior require separate evidence.
+- EXL3 serving is greedy-first. Images and video run on the coherent-device route with
+  `--exl3-vision` (BF16 tower), but media prompts are not reused as prefix roots; positive-temperature
+  sampling is not broadly qualified.
 - The held-out quality panel, Mia parity, Engine/client TTFT parity, and the 70/200/3000 performance
   goals are incomplete.
 - WMMA32 prefill and native MTP remain default-off and unqualified. R49 and segmented-prefix R612

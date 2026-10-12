@@ -31,8 +31,12 @@ table and the raw data: [docs/ninfer-comparison-2026-10-12.md](docs/ninfer-compa
 | Prefill, 4K / 128K | 7.8K / 4.9K tok/s | 14.1K / 6.6K tok/s (NVFP4) | NInfer +34–81% |
 | Concurrent requests, 4K, C1 / C2 / C4 aggregate | 161 / 258 / 365 tok/s | 189 / 340 / 526 tok/s | NInfer +18–44% |
 | C8 at 4K, C4 / C8 at 31K | **396 / 214 / 180 tok/s** | does not start (per-slot FP8 KV exceeds VRAM) | VoidInfer only |
-| 8 agents × 99K–113K tokens (865K live context), 4 lanes | all served: **223 s** first turn, 52 s resumed turn | all served (groupwise; NVFP4 does not start): 310 s, **11 s** resumed | first turn −28%, resume 4.6× slower |
-| Vision (image input) | not supported by the EXL3 engine | supported (≈1.0–1.3 s per image request) | NInfer |
+| 8 agents × 99K–113K tokens (865K live context), 4 lanes | all served: **223 s** first turn, 24–25 s resumed turn (52 s in the comparison run)¹ | all served (groupwise; NVFP4 does not start): 310 s, **11 s** resumed | first turn −28%, resume 2.2× slower |
+| Vision: image + question, 404 prompt + 256 output tokens | 1.6–1.8 s (BF16 vision tower, every token verified)¹ | 1.0–1.3 s | NInfer |
+
+¹ Measured after the comparison run, same day and machine: agents resume by rebinding their plane
+sets instead of copying their history, and the EXL3 route gained image/video input
+([update](docs/ninfer-comparison-2026-10-12.md#update-vision-and-agent-resume)).
 
 What the numbers say:
 
@@ -43,7 +47,7 @@ What the numbers say:
   agents with 865K tokens of live context run on one 32 GiB card, with a 28% faster first turn.
   NInfer's fastest artifact cannot reserve FP8 KV for those sizes.
 * **Raw speed is NInfer's.** Its smaller weights read fewer bytes per token, so base decode, prefill
-  and batched concurrency are faster, and it resumes parked agents 4.6× faster (host checkpoints).
+  and batched concurrency are faster, and it resumes parked agents 2.2× faster (host checkpoints).
   VoidInfer's DFlash2 commits 21–25% more tokens per round, which keeps single-request decode within
   4% at 4K and at the largest context, but verifying every token costs 10–30% at 16K–64K and on
   short, high-acceptance prompts.
@@ -63,13 +67,17 @@ speed.
 2. **6-bit weights.** EXL3 6 bpw keeps the model close to BF16 (KL 0.014). The bandwidth cost
    (21 GiB read per token vs 16–19 GiB) is partly paid back by higher DFlash2 acceptance.
 3. **Many long agents per GPU.** Coherent-device lanes batch up to eight requests into one round,
-   admit a lane only when its INT4 codes fit in free VRAM, park idle agents' exact history in host
-   RAM (losslessly packed) and spill to disk, so total live context can exceed 1M tokens
-   (8 × 125K measured on 2026-10-10).
-4. **Next.** The measured gaps are prefill (layer-major GEMMs on 6-bit weights, exact-history
-   ingestion), batched concurrency rounds, the exact line's GPU share at 16K–64K, agent resume
-   (GPU-side packing instead of moving packed FP16 history through the CPU on every swap), and vision
-   input on the EXL3 route.
+   admit a lane only when its INT4 codes fit in free VRAM, and keep every agent's exact history in
+   its own plane set in host RAM: a lane maps the set of the agent it serves behind a fixed address
+   range, so resuming an agent is a remap (0.1–0.7 s at 110K tokens), not a copy. Only under host
+   memory pressure are idle sets losslessly packed and spilled to disk, so total live context can
+   exceed 1M tokens (8 × 125K measured on 2026-10-10).
+4. **Images and video, at the same quality bar.** The vision tower runs in BF16 from the checkpoint
+   (streamed from host RAM per request, no resident VRAM); its embeddings and M-RoPE positions feed
+   the same verified decode.
+5. **Next.** The measured gaps are prefill (layer-major GEMMs on 6-bit weights, exact-history
+   ingestion), batched concurrency rounds, the exact line's GPU share at 16K–64K, and lanes admitted
+   per VRAM for long agents (two of four lanes fit 108K-token agents' INT4 codes).
 
 The 2026-10-08 comparison (older configuration: FP16 device KV at short context, no VeriCache) is kept
 at [docs/ninfer-comparison-2026-10-08.md](docs/ninfer-comparison-2026-10-08.md).
@@ -107,6 +115,15 @@ teacher-forced rows) this cuts the paired NLL loss against FP16 KV from +0.024 t
 nats/token and raises top-1 agreement from 95.1% to 96.8%. It costs 0.2–0.4 ms per speculative
 round (1–2%). Rounds take 18.3 ms at 4K and 18.5–20.3 ms from 16K to 128K; parked agent contexts
 resume in 0.3–1.9 s.
+
+**Vision.** `--exl3-vision DIR` (a directory with the BF16 `model.visual.*` tensors, e.g. the BF16
+checkpoint) enables image and video input. The 27-block tower runs in BF16 with FP32-accumulated
+cuBLAS GEMMs; its 0.88 GB of weights stay in pinned host memory and stream through a two-slot device
+buffer (19 ms per 1,536-patch image). Merged embeddings replace the placeholder tokens in prefill, and
+a per-lane device rotary map gives prompt rows their M-RoPE positions and later rows `row + delta`,
+read by every Q/K RoPE launch (captured graphs included). Against the FP32 reference tower, merged
+embeddings have cosine 0.9998–0.9999 (Hugging Face BF16: 0.9999). Media prompts do not reuse or
+publish prefix roots.
 
 **VeriCache (default with L0, exact).** Block-parallel verification of L0 output against the exact
 FP16 history, after VeriCache (arXiv 2605.17613). The prompt is ingested with exact FP16 history
@@ -166,9 +183,10 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
 
 ## Current state and limitations
 
-* Greedy text generation through the coherent-device Engine, one to eight concurrent requests
-  (`--max-concurrency 1..8`). Positive-temperature sampling is not broadly qualified, and the EXL3
-  engine has no image or video input.
+* Greedy generation through the coherent-device Engine, one to eight concurrent requests
+  (`--max-concurrency 1..8`), text of any length and, with `--exl3-vision`, images and video.
+  Positive-temperature sampling is not broadly qualified. Media prompts are not reused as prefix
+  roots.
 * L0 OSCAR (INT4 history codes, exact sink, recent window and 512 hot rows per KV head) with exact
   VeriCache is the default at every context length; L2 history stays in host RAM (FP16 planes, losslessly
   packed when parked, spilled to disk under memory pressure). `NINFER_EXL3_VERICACHE=tolerance`
@@ -178,7 +196,7 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
   window through an FP8 e4m3 mirror (KL 0.005 against FP16 history); `NINFER_EXL3_VERICACHE_LINE_FP8=0`
   keeps FP16. With several lanes, verification passes are exclusive and use FP16 history.
 * Speed gaps to NInfer (2026-10-12): prefill 1.3–1.8×, base decode 1.2×, batched concurrency 1.3–1.4×,
-  single-request DFlash2 at 16K–64K 1.1–1.3×, agent resume 4.6×.
+  single-request DFlash2 at 16K–64K 1.1–1.3×, agent resume 2.2×, image requests 1.4–1.6×.
 * The public Engine route is DFlash2-only; base decode is measured on the target-only route.
 * Research routes and default-off kernels keep explicit dispositions in
   [docs/current-status.md](docs/current-status.md) and are not presented as supported defaults.
@@ -199,7 +217,8 @@ cmake --build build --target ninfer-serve
 ```
 
 Model weights are not included. The EXL3 serving route and its options are described in
-[docs/exl3-serving.md](docs/exl3-serving.md).
+[docs/exl3-serving.md](docs/exl3-serving.md); add `--exl3-vision <BF16 checkpoint directory>` for
+image and video input.
 
 ## Reading paths
 

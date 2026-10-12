@@ -73,6 +73,7 @@ def main():
                "completion_tokens": sum(r["completion_tokens"] for r in ok),
                "per_request_s": [round(r["s"], 1) for r in results], "peak_gpu_mib": peak[0]}
         print(json.dumps(rec), flush=True)
+        rec["texts"] = [r.get("text", "") for r in results]
         turns.append(rec)
         for i, r in enumerate(results):
             if "text" in r:

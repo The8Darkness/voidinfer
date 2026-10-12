@@ -51,3 +51,16 @@ are in the same directory (scripts suffixed `_20261012`) and `data/2026-10-12/`.
 | `quality/kl_compare.py _l0_d12x`, `quality_report.py "ours_exact=.ours_l0_d12x.tok:ours exact (served)" --out=...` | KL against BF16 and paired NLL against NInfer's recorded quality data |
 | `make_tables_20261012.py` | All tables of the report (`data/2026-10-12/tables.md`) |
 | `data/2026-10-12/logs/` | Queue log and excerpts of server logs (startup failures, capacity lines, request summaries) |
+
+### 2026-10-12 update: vision and agent resume
+
+Tooling and data behind the [update section](../../docs/ninfer-comparison-2026-10-12.md#update-vision-and-agent-resume)
+(`data/2026-10-12/update/`).
+
+| Path | Purpose |
+|---|---|
+| `ours_vision.ps1` | VoidInfer server with `--exl3-vision` (BF16 checkpoint): short text prompts, then `vision_client.py` or (`-Suite`) `vision_suite.py`; `-Env 'NINFER_EXL3_VISION_DUMP=DIR'` dumps the merged image rows |
+| `vision_suite.py` | Images, two images in one turn, an image inside a 3.5K-token prompt, a video, text after media, `--concurrent N` simultaneous image requests |
+| `vision_ref.py <dump dir> <images...>` | Hugging Face Qwen3.5 vision tower (BF16 and FP32) on the same images against the dumped rows (cosine, relative L2) |
+| `ours_agents.ps1 -Env 'NINFER_EXL3_VERICACHE_STATS=1'` | 8-agent run with one `KV_RESTORE` phase line per restore (`*.restore.log`) |
+| `agents_identity_check.py <result.json>` | Every answer's backticked identifiers checked against the agent's own code slice |
