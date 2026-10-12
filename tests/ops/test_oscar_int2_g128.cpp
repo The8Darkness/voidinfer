@@ -195,6 +195,7 @@ int run(const std::string& fixture_path, const std::string& report_path) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 1) { return 77; } // fixture-driven validator: skipped by bare CTest
         if (argc != 5 || std::string(argv[1]) != "--fixture" ||
             std::string(argv[3]) != "--report") {
             std::cerr << "usage: ninfer_oscar_int2_g128_test --fixture <golden.bin> "

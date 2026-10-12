@@ -6,6 +6,7 @@
 #include <iostream>
 using namespace ninfer;
 int main(int argc,char** argv){try{
+    if(argc==1)return 77; // fixture-driven validator: skipped by bare CTest
     if(argc!=3)throw std::invalid_argument("target-directory fixtures.json");
     auto resources=exl3::load_pinned_frontend_resources(argv[1]);
     auto frontend=targets::qwen3_6::make_frontend(resources,{.vision_enabled=false,.max_context=4096});

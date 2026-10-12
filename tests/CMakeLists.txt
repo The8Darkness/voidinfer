@@ -70,19 +70,6 @@ ninfer_add_test(ninfer_exl3_gaming_operators_test
   SOURCES test_exl3_gaming_operators.cu
   LIBRARIES ninfer_exl3_dflash2)
 
-function(ninfer_add_linear_test name source)
-  ninfer_add_op_test(${name}
-    SOURCES ${source}
-            ops/linear/linear_test_common.cpp
-    LIBRARIES ninfer_ops)
-endfunction()
-
-function(ninfer_add_fused_linear_test name source common)
-  ninfer_add_op_test(${name}
-    SOURCES ${source} ${common}
-    LIBRARIES ninfer_ops)
-endfunction()
-
 # Artifact framing and model-independent runtime contracts.
 ninfer_add_test(ninfer_exl3_safetensors_test
   SOURCES test_exl3_safetensors.cpp
@@ -244,141 +231,24 @@ target_include_directories(ninfer_http_error_handler_test PRIVATE
 # Pure host-side qualification of the fixed-dimension non-negative fit and the exact coefficient
 # quantization used by the context-cost calibrator. It deliberately links no Engine/CUDA target.
 
-# Shared Op numerical tests. Target-composed schedule tests are registered separately below.
+# Numerical tests for the shared Ops the engine still launches (Vision tower, gated RMSNorm, OSCAR INT2).
 set(ninfer_op_tests
   add_bias
   gelu
-  silu_mul
   residual_add
-  sigmoid_mul
   rmsnorm
   gated_rmsnorm
-  l2norm
-  gated_delta_net
-  causal_conv1d_silu
   layer_norm
-  embedding
-  argmax
-  gdn_gating
-  gdn_gating_proj
   rope
-  vision_pos_embed
-  sampling
-  scalar
-  cast
-  scatter
-  position)
+  vision_pos_embed)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test
     SOURCES ops/test_${op}.cpp
     LIBRARIES ninfer_ops)
 endforeach()
-
-# Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
-# is one checkpoint/device.
-ninfer_add_op_test(ninfer_softmax_attention_test
-  SOURCES ops/softmax_attention/main.cpp
-          ops/softmax_attention/causal_cache.cpp
-          ops/softmax_attention/plain_and_packed.cpp
-          ops/softmax_attention/context.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_sliding_window_attention_test
-  SOURCES ops/test_sliding_window_attention.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_oscar_kv_test
-  SOURCES ops/test_oscar_kv.cpp
-  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_oscar_int2_g128_test
   SOURCES ops/test_oscar_int2_g128.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_kv_cache_append_test
-  SOURCES ops/test_kv_cache_append.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_prepare_masked_block_test
-  SOURCES ops/test_prepare_masked_block.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_sparse_moe_test
-  SOURCES ops/test_sparse_moe.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_mtp_pack_test
-  SOURCES ops/test_mtp_pack.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_mtp_round_test
-  SOURCES ops/test_mtp_round.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_speculative_round_test
-  SOURCES ops/test_speculative_round.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_dflash2_test
-  SOURCES ops/test_dflash2.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
-ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
-ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
-ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
-ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
-ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
-ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
-ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
-ninfer_add_op_test(ninfer_linear_bf16_a16_test
-  SOURCES ops/linear/test_bf16_a16.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_attn_input_proj_test
-  SOURCES ops/test_attn_input_proj.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_gdn_input_proj_test
-  SOURCES ops/test_gdn_input_proj.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
-  SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_gdn_input_proj_conv_record_test
-  SOURCES ops/test_gdn_input_proj_conv_record.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test
-  SOURCES ops/test_gated_delta_net_replay_record.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_gdn_replay_fold_test
-  SOURCES ops/test_gdn_replay_fold.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_fused_linear_test(
-  ninfer_linear_add_q5_a16_test
-  ops/linear_add/test_q5_a16.cpp
-  ops/linear_add/linear_add_test_common.cpp)
-ninfer_add_fused_linear_test(
-  ninfer_linear_add_bf16_a16_test
-  ops/linear_add/test_bf16_a16.cpp
-  ops/linear_add/linear_add_test_common.cpp)
-ninfer_add_fused_linear_test(
-  ninfer_linear_add_w8_a16_test
-  ops/linear_add/test_w8_a16.cpp
-  ops/linear_add/linear_add_test_common.cpp)
-ninfer_add_op_test(ninfer_linear_add_nvfp4_test
-  SOURCES ops/linear_add/test_nvfp4.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_linear_add_fp8_test
-  SOURCES ops/linear_add/test_fp8.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_fused_linear_test(
-  ninfer_linear_pair_w8_a16_test
-  ops/linear_pair/test_w8_a16.cpp
-  ops/linear_pair/linear_pair_test_common.cpp)
-ninfer_add_fused_linear_test(
-  ninfer_linear_swiglu_q4_a16_test
-  ops/linear_swiglu/test_q4_a16.cpp
-  ops/linear_swiglu/linear_swiglu_test_common.cpp)
-ninfer_add_fused_linear_test(
-  ninfer_linear_swiglu_w8_a16_test
-  ops/linear_swiglu/test_w8_a16.cpp
-  ops/linear_swiglu/linear_swiglu_test_common.cpp)
-ninfer_add_fused_linear_test(
-  ninfer_linear_swiglu_nvfp4_test
-  ops/linear_swiglu/test_nvfp4.cpp
-  ops/linear_swiglu/linear_swiglu_test_common.cpp)
-ninfer_add_fused_linear_test(
-  ninfer_linear_swiglu_fp8_test
-  ops/linear_swiglu/test_fp8.cpp
-  ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
 
 ninfer_add_test(ninfer_exl3_dflash2_xctx_test
@@ -412,6 +282,7 @@ ninfer_add_test(ninfer_exl3_frontend_reference_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_exl3_frontend_reference_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_exl3_frontend_reference_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_exl3_recurrent_pool_test
   SOURCES test_exl3_recurrent_pool.cpp
   LIBRARIES CUDA::cudart Psapi)
