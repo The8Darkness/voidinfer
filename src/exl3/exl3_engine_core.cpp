@@ -175,12 +175,11 @@ std::optional<std::uint64_t> measured_microseconds(double milliseconds) noexcept
     return static_cast<std::uint64_t>(milliseconds*1000.0);
 }
 void require_coherent_device_profile(const EngineOptions& options) {
-    if(options.max_concurrency<1 || options.max_concurrency>kMaxLanes || options.use_cuda_graph ||
-       (options.enable_vision && (!options.exl3_package || options.exl3_package->vision_directory.empty())) ||
+    if(options.max_concurrency<1 || options.max_concurrency>kMaxLanes ||
        options.max_context<2048 || options.max_context>(Exl3NativeContextExtent::l0_oscar_enabled()?
            static_cast<int>(Exl3NativeContextExtent::l0_oscar_tokens):32768))
         throw std::invalid_argument(
-            "coherent-device EXL3 requires C1..C8, vision only with a BF16 tower, and context 2048..32768 (262144 with L0 OSCAR)");
+            "Engine requires C1..C8 and context 2048..32768 (262144 with L0 OSCAR)");
     const auto equals=[](const char* name,std::string_view expected) {
         const auto* actual=std::getenv(name);
         if(!actual || std::string_view(actual)!=expected)
@@ -633,13 +632,12 @@ struct Exl3EngineCore::Impl {
                 throw std::invalid_argument("coherent ordinary graphs must be 0 or 1");
             return !value || std::string_view(value)=="1";
         }()),options(value),
-        dense_vision_enabled(value.enable_vision &&
-            !value.exl3_package->vision_directory.empty()),
-        resources(load_pinned_frontend_resources(value.exl3_package->target_directory)),
+        dense_vision_enabled(value.vision_enabled()),
+        resources(load_pinned_frontend_resources(value.model.target_directory)),
         frontend(targets::qwen3_6::make_frontend(resources,targets::qwen3_6::FrontendOptions{
             .vision_enabled=dense_vision_enabled,.max_context=value.max_context,
             .max_cache_markers_per_request=value.context_cache.max_cache_markers_per_request.value_or(4)})),
-        identity{"exl3-engine-epoch-1",pinned_weights_id(value.exl3_package->target_directory),"0997f410-c3cf9e34",
+        identity{"exl3-engine-epoch-1",pinned_weights_id(value.model.target_directory),"0997f410-c3cf9e34",
             "coherent-device-P1-K6-B8-greedy",dense_vision_enabled?"text+bf16-vision":"text"},
         cache(Exl3VeriCacheServingPrefixCache::Policy{std::max(1U,value.context_cache.max_shared_prefixes.value_or(1)),64,std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30},identity),
         coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
@@ -876,10 +874,8 @@ struct Exl3EngineCore::Impl {
         if(!share_pages && prefix_rows&&std::string(prefix_rows)=="16384"&&value.max_concurrency!=1)
             throw std::invalid_argument("EXL3 Engine device prefix rows16384 require physicalC1");
         if(value.max_concurrency<1 || value.max_concurrency>kMaxLanes ||
-            (value.enable_vision && !dense_vision_enabled) || value.use_cuda_graph || value.hierarchical_vericache.enabled ||
-            !value.max_pending_requests || !value.pending_timeout_ms || value.max_context<16 ||
-            value.speculative.backend!=SpeculativeBackend::DFlash2 || value.speculative.draft_tokens!=7)
-            throw std::invalid_argument("EXL3 Engine requires C1..C8 eager DFlash2-K7 (vision only with --exl3-vision)");
+            !value.max_pending_requests || !value.pending_timeout_ms || value.max_context<16)
+            throw std::invalid_argument("Engine requires C1..C8 lanes and a bounded pending queue");
         const auto* private_prefix_option=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
         // Attention staging has independent reserved storage.  The staged
         // producer may seed that storage from this lane-private prefix and
@@ -958,7 +954,7 @@ struct Exl3EngineCore::Impl {
         SamplingPreset preset;
         preset.temperature=cfg.value("temperature",1.0F);preset.top_k=cfg.value("top_k",20);preset.top_p=cfg.value("top_p",0.95F);
         defaults={preset,preset};
-        Exl3LoadOptions loading;loading.verified_dual_manifest=value.exl3_package->verified_dual_manifest;
+        Exl3LoadOptions loading;loading.verified_dual_manifest=value.model.verified_dual_manifest;
         // Deliberate pre-authority construction boundary: target/draft immutable
         // weights (and qualified vision weights) are allocated by their artifact
         // loaders before an Engine coordinator exists. Their authoritative byte
@@ -974,7 +970,7 @@ struct Exl3EngineCore::Impl {
             std::fprintf(stderr,"STARTUP_MEMORY before_target used=%.1f MiB",(t-f)/1048576.0);
             std::fputc(10,stderr);
         }
-        target=Exl3TextModel::load(value.exl3_package->target_directory,value.max_context,loading);
+        target=Exl3TextModel::load(value.model.target_directory,value.max_context,loading);
         const auto trace_free=[](const char* stage) {
             if(!std::getenv("NINFER_EXL3_MEMORY_TRACE"))return;
             std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);
@@ -984,7 +980,7 @@ struct Exl3EngineCore::Impl {
         trace_free("after_target");
         if(dense_vision_enabled) {
             const auto vision_begin=Clock::now();
-            dense_vision=std::make_unique<Exl3DenseVision>(value.exl3_package->vision_directory);
+            dense_vision=std::make_unique<Exl3DenseVision>(value.model.vision_directory);
             {
                 cudaStream_t warm=nullptr;
                 check(cudaStreamCreateWithFlags(&warm,cudaStreamNonBlocking));
@@ -994,7 +990,7 @@ struct Exl3EngineCore::Impl {
             std::fprintf(stderr,"EXL3 vision: BF16 tower %.1f MiB pinned host (streamed per request), ready in %.1f s\n",
                 dense_vision->host_bytes()/1048576.0,seconds(vision_begin));
         }
-        drafts[0]=Exl3Dflash2DraftModel::load_impl(value.exl3_package->draft_directory,true);
+        drafts[0]=Exl3Dflash2DraftModel::load_impl(value.model.draft_directory,true);
         trace_free("after_draft");
         // Contexts and optional caches join after the single initial bind.
         std::size_t scratch=0;
@@ -1003,9 +999,8 @@ struct Exl3EngineCore::Impl {
         }
         load.target="qwen3.8-27b/exl3";load.model_id=identity.artifact_identity;load.weights_id=identity.artifact_identity;
         load.load_seconds=seconds(begin);const auto& transfer=target->load_stats();
-        load.artifact_bytes_read=transfer.source_bytes[0]+transfer.source_bytes[1];load.peak_staging_bytes=transfer.staging_host_bytes;
+        load.model_bytes_read=transfer.source_bytes[0]+transfer.source_bytes[1];load.peak_staging_bytes=transfer.staging_host_bytes;
         memory.device=value.device;memory.max_context=value.max_context;
-        memory.kv_cache=value.kv_cache;
         const auto shared_weight_bytes=target->model_bytes()+drafts[0]->weight_bytes();
         memory.weights={shared_weight_bytes,shared_weight_bytes,shared_weight_bytes};
         memory.workspace={scratch,scratch,scratch};memory.runtime_reservation_bytes=scratch;
@@ -2570,7 +2565,6 @@ struct Exl3EngineCore::Impl {
             host_lease.reset();
             if(acquired_root_observer)acquired_root_observer(root);
             result.speculative.enabled=true;
-            result.speculative.backend=SpeculativeBackend::DFlash2;
             result.speculative.draft_window=7;
             const auto decode=Clock::now();
             std::uint32_t remaining=allowance;

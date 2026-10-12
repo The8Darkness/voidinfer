@@ -401,14 +401,6 @@ target_compile_options(ninfer_exl3_dflash2_accept_test PRIVATE
 set_tests_properties(ninfer_exl3_dflash2_accept_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # Explicitly invoked, test-only oracle tools. Not part of default build/CTest.
-ninfer_add_test(ninfer_exl3_engine_lifecycle_test
-  SOURCES test_exl3_engine_lifecycle.cpp
-  LIBRARIES ninfer_engine CUDA::cudart)
-target_include_directories(ninfer_exl3_engine_lifecycle_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-target_link_options(ninfer_exl3_engine_lifecycle_test PRIVATE
-  $<$<CXX_COMPILER_ID:MSVC>:/STACK:8388608>)
-set_tests_properties(ninfer_exl3_engine_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_exl3_engine_device_test
   SOURCES test_exl3_engine_device.cpp
   LIBRARIES ninfer_engine CUDA::cudart)

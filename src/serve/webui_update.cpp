@@ -296,8 +296,7 @@ std::vector<fs::path> staged_stale_dirs(const fs::path& webui_dir) {
 std::string resolve_webui_dir(const ServeOptions& options) {
     if (!options.webui_dir.empty()) { return options.webui_dir; }
     std::error_code ec;
-    fs::path artifact(options.artifact_path);
-    fs::path dir = artifact.parent_path();
+    fs::path dir = options.model.target_directory;
     if (dir.empty()) { dir = fs::path("."); }
     return to_utf8((dir / "webui").lexically_normal());
 }

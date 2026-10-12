@@ -1,9 +1,6 @@
 #include "serve/serve_options.h"
-#include "serve/request_log.h"
 #include "serve/translate.h"
 #include "ninfer/engine.h"
-
-#include <nlohmann/json.hpp>
 
 #include <iostream>
 #include <string>
@@ -27,383 +24,111 @@ ServeOptions parse(std::vector<std::string> arguments) {
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
 }
 
+template <class Function> bool rejects(Function&& function) {
+    try {
+        function();
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
+
+std::vector<std::string> package(std::vector<std::string> extra = {}) {
+    std::vector<std::string> arguments{"ninfer-serve", "--target", "target", "--draft", "draft"};
+    arguments.insert(arguments.end(), extra.begin(), extra.end());
+    return arguments;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
 
-    const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
-    failures += check(!defaults.exl3_package.has_value(),
-                      "ordinary artifact unexpectedly selected an EXL3 package");
-    ninfer::PinnedExl3PackageOptions default_exl3_package;
-    failures += check(default_exl3_package.round_implementation ==
-                          ninfer::Exl3RoundImplementation::Established,
-                      "EXL3 round implementation is not established by default");
-    const ServeOptions exl3_established =
-        parse({"ninfer-serve", "--exl3-target", "target", "--exl3-draft", "draft"});
-    failures += check(exl3_established.exl3_package &&
-                          exl3_established.exl3_package->round_implementation ==
-                              ninfer::Exl3RoundImplementation::Established,
-                      "EXL3 package changed its default round implementation");
-    const ServeOptions exl3_coherent = parse({"ninfer-serve", "--exl3-target", "target",
-                                               "--exl3-draft", "draft", "--exl3-round",
-                                               "coherent-device", "--greedy"});
-    failures += check(exl3_coherent.exl3_package &&
-                          exl3_coherent.exl3_package->round_implementation ==
-                              ninfer::Exl3RoundImplementation::CoherentDevice &&
-                          exl3_coherent.kv_cache==ninfer::KvCacheStorage::Float16Device,
-                      "--exl3-round coherent-device did not select the typed round identity");
-    bool coherent_c2_rejected = false;
-    try {
-        ninfer::EngineOptions selected;
-        selected.exl3_package = exl3_coherent.exl3_package;
-        selected.max_concurrency=2;
-        ninfer::Engine engine(selected);
-    } catch (const std::invalid_argument& error) {
-        coherent_c2_rejected = std::string_view(error.what()).find(
-            "coherent-device EXL3 requires") != std::string_view::npos;
-    }
-    failures += check(coherent_c2_rejected,
-                      "Engine accepted unsupported coherent-device C2 admission");
-    for (const std::vector<std::string>& rejected : {
-             std::vector<std::string>{"--max-concurrency", "2"},
-             std::vector<std::string>{"--vision"},
-             std::vector<std::string>{"--temperature", "0.5"},
-             std::vector<std::string>{"--top-p", "0.8"},
-             std::vector<std::string>{"--max-context", "1024"},
-             std::vector<std::string>{"--kv-capacity", "auto"},
-             std::vector<std::string>{"--host-kv-mib", "0"},
-             std::vector<std::string>{"--no-prefix-reuse"},
-             std::vector<std::string>{"--lm-head-draft"}}) {
-        auto arguments=std::vector<std::string>{"ninfer-serve", "--exl3-target", "target",
-            "--exl3-draft", "draft", "--exl3-round", "coherent-device", "--greedy"};
-        arguments.insert(arguments.end(),rejected.begin(),rejected.end());
-        bool rejected_option=false;
-        try {(void)parse(std::move(arguments));}
-        catch(const std::invalid_argument&) {rejected_option=true;}
-        failures += check(rejected_option,
-                          "unsupported coherent-device serve combination was accepted");
-    }
-    const ServeOptions exl3_explicit_established =
-        parse({"ninfer-serve", "--exl3-target", "target", "--exl3-draft", "draft",
-               "--exl3-round", "established"});
-    failures += check(exl3_explicit_established.exl3_package &&
-                          exl3_explicit_established.exl3_package->round_implementation ==
-                              ninfer::Exl3RoundImplementation::Established,
-                      "--exl3-round established did not retain the baseline");
-    for (const std::vector<std::string>& rejected : {
-             std::vector<std::string>{"ninfer-serve", "model.ninfer", "--exl3-round",
-                                      "coherent-device"},
-             std::vector<std::string>{"ninfer-serve", "--exl3-target", "target",
-                                      "--exl3-draft", "draft", "--exl3-round", "unknown"},
-             std::vector<std::string>{"ninfer-serve", "--exl3-target", "target",
-                                      "--exl3-draft", "draft", "--exl3-round"}}) {
-        bool rejected_round = false;
-        try { (void)parse(rejected); }
-        catch (const std::invalid_argument&) { rejected_round = true; }
-        failures += check(rejected_round, "invalid EXL3 round selection was accepted");
-    }
-    ninfer::EngineOptions effective_exl3;
-    effective_exl3.exl3_package = exl3_coherent.exl3_package;
-    effective_exl3.kv_cache=exl3_coherent.kv_cache;
-    effective_exl3.context_cache.device_state_slots = 0;
-    effective_exl3.context_cache.max_private_continuations = 0;
-    effective_exl3.context_cache.max_shared_prefixes = 0;
-    effective_exl3.context_cache.max_long_anchors_per_continuation = 0;
-    effective_exl3.context_cache.max_cache_markers_per_request = 0;
-    const auto round_server_json = nlohmann::json::parse(format_server_start_json(
-        "serve-test", 0, exl3_coherent, effective_exl3, ninfer::ModelSamplingDefaults{},
-        "exl3-test", ninfer::LoadSummary{}, ninfer::MemorySummary{}, ServerLogEnvironment{},
-        std::nullopt));
-    failures += check(round_server_json.at("engine").at("selected_exl3_round") ==
-                          "coherent-device" &&
-                          round_server_json.at("engine").at("kv_cache")=="fp16-device",
-                      "server log omitted selected EXL3 round or device KV identity");
-    const GenerationRequest round_request;
-    const PreparedRequest round_prepared;
-    const RequestLogContext round_log_context =
-        make_request_log_context(1, "openai_chat_completions", round_request, round_prepared,
-                                 selected_exl3_round(effective_exl3));
-    const auto round_request_json = nlohmann::json::parse(
-        format_request_start_json("serve-test", 1, round_log_context));
-    failures += check(round_request_json.at("request").at("selected_exl3_round") ==
-                          "coherent-device" &&
-                          !selected_exl3_round(ninfer::EngineOptions{}),
-                      "request log omitted selected effective EXL3 round identity");
-    ApiError round_rejection_error;
-    const auto round_rejection_json = nlohmann::json::parse(format_request_rejected_json(
-        "serve-test", 2,
-        make_request_rejection_log_context(2, "openai_chat_completions", round_request,
-                                           round_rejection_error,
-                                           selected_exl3_round(effective_exl3))));
-    failures += check(round_rejection_json.at("request").at("selected_exl3_round") ==
-                          "coherent-device",
-                      "rejected request log omitted selected EXL3 round identity");
-    failures += check(serve_usage_text("ninfer-serve").find("--exl3-round") !=
-                          std::string::npos,
-                      "serve help omits EXL3 round selection");
+    const ServeOptions defaults = parse(package());
+    failures += check(defaults.model.target_directory == "target" &&
+                          defaults.model.draft_directory == "draft" &&
+                          defaults.model.vision_directory.empty() && !defaults.vision_enabled(),
+                      "--target/--draft did not select the model package");
+    failures += check(rejects([] { (void)parse({"ninfer-serve"}); }),
+                      "a server without --target/--draft was accepted");
+    failures += check(rejects([] { (void)parse({"ninfer-serve", "--target", "target"}); }),
+                      "a server without --draft was accepted");
+    failures += check(rejects([] { (void)parse({"ninfer-serve", "model.ninfer"}); }),
+                      "a positional .ninfer artifact was accepted");
+    failures += check(defaults.max_context == 32768, "--max-context does not default to 32768");
+    failures += check(defaults.context_cache.host_kv_capacity_bytes ==
+                          ninfer::kDefaultHostKvCapacityBytes,
+                      "host KV does not default to 8 GiB at 32K");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
-    failures +=
-        check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
-    failures += check(!defaults.enable_vision, "Vision is not disabled by default");
-    failures += check(defaults.request_log_jsonl.empty(),
-                      "request JSONL logging is not disabled by default");
-    failures += check(defaults.context_cost_presets.empty(),
-                      "external context-cost presets are unexpectedly configured by default");
-    failures += check(defaults.log_stats_interval_ms == 5000,
-                      "periodic throughput interval default mismatch");
+    failures += check(!defaults.preserve_thinking, "thinking history preserved by default");
+    failures += check(defaults.request_log_jsonl.empty(), "request log enabled by default");
+    failures += check(defaults.log_stats_interval_ms == 5000, "stats interval default changed");
     failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
-                          defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
-                          defaults.media_preprocess_threads == 0,
-                      "media preparation resource defaults mismatch");
-    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          defaults.kv_capacity.explicit_tokens == defaults.max_context,
-                      "default KV capacity does not follow max context");
-    failures += check(defaults.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
-                          defaults.context_cache.host_kv_capacity_bytes ==
-                              ninfer::kDefaultHostKvCapacityBytes,
-                      "Host context-cache defaults mismatch");
-    failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
-                          defaults.speculative.draft_tokens == 7 &&
-                          defaults.speculative.proposal_head == ninfer::ProposalHead::Optimized &&
-                          defaults.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4,
-                      "DFlash2 VeriCache serving profile is not the default");
-    failures += check(defaults.hierarchical_vericache.enabled &&
-                          defaults.hierarchical_vericache.enable_host_tier_snapshots &&
-                          defaults.hierarchical_vericache.host_snapshot_horizon == 2048,
-                      "hierarchical VeriCache is not enabled by default");
+                          defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes,
+                      "media cache defaults changed");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
-                      "Responses store defaults mismatch");
-    failures += check(!defaults.model_id_override.has_value(),
-                      "model id override is unexpectedly configured by default");
-    failures += check(!defaults.default_thinking_budget,
-                      "thinking budget is unexpectedly limited by default");
-    failures += check(
-        !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
-            !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
-            !defaults.sampling_overrides.frequency_penalty,
-        "server defaults unexpectedly override registered model sampling");
-    failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
-                      "artifact model id was not selected by default");
+                      "Responses store defaults changed");
+    failures += check(!defaults.model_id_override && !defaults.default_thinking_budget,
+                      "model id or thinking budget set by default");
+    failures += check(resolve_public_model_id(defaults, "loaded-model") == "loaded-model",
+                      "public model id does not follow the loaded model");
 
-    const ServeOptions fp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp8"});
-    failures += check(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256,
-                      "--kv-dtype fp8 did not select row-scaled E4M3 KV");
+    const ServeOptions vision = parse(package({"--vision", "bf16"}));
+    failures += check(vision.vision_enabled() && vision.model.vision_directory == "bf16",
+                      "--vision did not select the BF16 Vision tower");
 
-    const ServeOptions vericache = parse({"ninfer-serve", "model.ninfer", "--kv-dtype",
-                                          "vericache-nvfp4", "--spec", "mtp",
-                                          "--draft-tokens", "4"});
-    failures += check(vericache.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 &&
-                          vericache.speculative.backend == ninfer::SpeculativeBackend::Mtp,
-                      "--kv-dtype vericache-nvfp4 did not select the hybrid profile");
-    bool vericache_without_mtp_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "vericache-nvfp4",
-                     "--no-spec"});
-    } catch (const std::invalid_argument&) { vericache_without_mtp_rejected = true; }
-    failures += check(vericache_without_mtp_rejected,
-                      "VeriCache NVFP4 was accepted without an MTP draft tier");
+    const ServeOptions long_context = parse(package({"--max-context", "262144"}));
+    failures += check(long_context.context_cache.host_kv_capacity_bytes == 262144ULL * 65536,
+                      "host KV does not scale to one exact snapshot of max-context");
+    const ServeOptions explicit_host_kv =
+        parse(package({"--max-context", "262144", "--host-kv-mib", "20000"}));
+    failures += check(explicit_host_kv.context_cache.host_kv_capacity_bytes == 20000ULL << 20,
+                      "--host-kv-mib did not override the default");
+    failures += check(rejects([] { (void)parse(package({"--max-context", "1024"})); }) &&
+                          rejects([] { (void)parse(package({"--max-context", "300000"})); }),
+                      "--max-context outside [2048,262144] was accepted");
+    for (const char* removed : {"--kv-dtype", "--spec", "--exl3-round", "--kv-capacity",
+                                "--hierarchical-vericache", "--no-cuda-graph"})
+        failures += check(rejects([&] { (void)parse(package({removed, "x"})); }),
+                          "a removed .ninfer-route option was accepted");
 
-    const ServeOptions vericache_dflash = parse({"ninfer-serve", "model.ninfer", "--kv-dtype",
-                                                 "vericache-nvfp4", "--spec", "dflash",
-                                                 "--draft-tokens", "15"});
-    failures += check(vericache_dflash.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 &&
-                          vericache_dflash.speculative.backend ==
-                              ninfer::SpeculativeBackend::DFlash,
-                      "--kv-dtype vericache-nvfp4 did not select DFlash hybrid profile");
+    const ServeOptions configured =
+        parse(package({"--max-concurrency", "4", "--max-context", "4096", "--max-pending-requests",
+                       "12", "--pending-timeout-ms", "2500", "--log-stats-interval-ms", "0",
+                       "--media-cache-mib", "256", "--preserve-thinking", "--no-prefix-reuse"}));
+    failures += check(configured.max_concurrency == 4 && configured.max_context == 4096 &&
+                          configured.max_pending_requests == 12 &&
+                          configured.pending_timeout_ms == 2500 &&
+                          configured.log_stats_interval_ms == 0 &&
+                          configured.media_cache_bytes == (256ULL << 20) &&
+                          configured.preserve_thinking,
+                      "configured serving options were not preserved");
+    failures += check(!configured.allow_prefix_reuse && configured.context_cache.enabled,
+                      "--no-prefix-reuse must keep the host-root cache and disable reuse");
 
-    const ServeOptions hierarchical = parse(
-        {"ninfer-serve", "model.ninfer", "--hierarchical-vericache",
-         "--vericache-host-snapshots", "--vericache-l0-horizon", "48", "--vericache-l1-horizon",
-         "1024", "--vericache-host-snapshot-horizon", "1536",
-         "--vericache-protected-recent", "128", "--vericache-protected-sinks", "8",
-         "--vericache-protected-pivots", "16"});
-    failures += check(hierarchical.hierarchical_vericache.enabled &&
-                          hierarchical.hierarchical_vericache.enable_host_tier_snapshots &&
-                          hierarchical.hierarchical_vericache.l0_to_l1_horizon == 48 &&
-                          hierarchical.hierarchical_vericache.l1_to_l2_horizon == 1024 &&
-                          hierarchical.hierarchical_vericache.host_snapshot_horizon == 1536 &&
-                          hierarchical.hierarchical_vericache.protected_recent_tokens == 128 &&
-                          hierarchical.hierarchical_vericache.protected_sink_tokens == 8 &&
-                          hierarchical.hierarchical_vericache.protected_pivot_tokens == 16,
-                      "hierarchical VeriCache serving controls did not parse");
-    bool host_snapshot_without_hierarchy_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--no-hierarchical-vericache",
-                     "--vericache-host-snapshots"});
-    } catch (const std::invalid_argument&) { host_snapshot_without_hierarchy_rejected = true; }
-    failures += check(host_snapshot_without_hierarchy_rejected,
-                      "host-tier snapshots were accepted without hierarchical VeriCache");
-    bool invalid_l0_horizon_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--vericache-l0-horizon", "23"});
-    } catch (const std::invalid_argument&) { invalid_l0_horizon_rejected = true; }
-    failures += check(invalid_l0_horizon_rejected,
-                      "out-of-range L0 VeriCache horizon was accepted");
-    bool invalid_l1_horizon_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--vericache-l1-horizon", "2049"});
-    } catch (const std::invalid_argument&) { invalid_l1_horizon_rejected = true; }
-    failures += check(invalid_l1_horizon_rejected,
-                      "out-of-range L1 VeriCache horizon was accepted");
-    bool invalid_host_snapshot_horizon_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--vericache-host-snapshot-horizon", "2049"});
-    } catch (const std::invalid_argument&) { invalid_host_snapshot_horizon_rejected = true; }
-    failures += check(invalid_host_snapshot_horizon_rejected,
-                      "out-of-range host snapshot horizon was accepted");
-
-    const ServeOptions model_alias =
-        parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
-    failures +=
-        check(model_alias.model_id_override == "deployment-alias" &&
-                  resolve_public_model_id(model_alias, "artifact-model") == "deployment-alias",
-              "explicit model id did not override the artifact identity");
-
-    const ServeOptions context_cost =
-        parse({"ninfer-serve", "model.ninfer", "--context-cost-presets", "local-costs.json"});
-    failures += check(context_cost.context_cost_presets == "local-costs.json",
-                      "--context-cost-presets did not preserve its path");
-
-    const ServeOptions thinking_budget =
-        parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "37"});
+    const ServeOptions model_alias = parse(package({"--model-id", "deployment-alias"}));
+    failures += check(resolve_public_model_id(model_alias, "loaded-model") == "deployment-alias",
+                      "--model-id did not override the public model id");
+    failures += check(rejects([] { (void)parse(package({"--model-id", ""})); }),
+                      "empty --model-id was accepted");
+    const ServeOptions thinking_budget = parse(package({"--default-thinking-budget", "37"}));
     failures += check(thinking_budget.default_thinking_budget == 37,
-                      "--default-thinking-budget did not preserve its positive value");
-    bool zero_thinking_budget_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "0"});
-    } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
-    failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
-
-    bool empty_model_id_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--model-id", ""});
-    } catch (const std::invalid_argument&) { empty_model_id_rejected = true; }
-    failures += check(empty_model_id_rejected, "empty --model-id was accepted");
-
-    const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
-                                       "--draft-tokens", "15", "--lm-head-draft"});
-    failures += check(dflash.speculative.backend == ninfer::SpeculativeBackend::DFlash,
-                      "--spec dflash did not select DFlash");
-    failures += check(dflash.speculative.draft_tokens == 15,
-                      "--draft-tokens did not preserve the DFlash window");
-    failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
-                      "--lm-head-draft did not select the optimized proposal head");
-
-    const ServeOptions implicit_vision = parse({"ninfer-serve", "model.ninfer", "--vision"});
-    failures += check(implicit_vision.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
-                          implicit_vision.speculative.draft_tokens == 5 &&
-                          implicit_vision.kv_cache == ninfer::KvCacheStorage::VeriCacheNvfp4 &&
-                          implicit_vision.hierarchical_vericache.enabled,
-                      "implicit default vision route did not fall back to protected MTP");
-
-    bool dflash_vision_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",
-                     "--vision"});
-    } catch (const std::invalid_argument&) { dflash_vision_rejected = true; }
-    failures += check(dflash_vision_rejected, "DFlash and Vision were accepted together");
-
-    const ServeOptions default_draft_override =
-        parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "3"});
-    failures += check(default_draft_override.speculative.backend ==
-                              ninfer::SpeculativeBackend::DFlash &&
-                          default_draft_override.speculative.draft_tokens == 3,
-                      "--draft-tokens did not override the default DFlash2 window");
-    const ServeOptions no_spec =
-        parse({"ninfer-serve", "model.ninfer", "--no-spec"});
-    failures += check(no_spec.speculative.backend == ninfer::SpeculativeBackend::None &&
-                          no_spec.kv_cache == ninfer::KvCacheStorage::BFloat16 &&
-                          !no_spec.hierarchical_vericache.enabled &&
-                          !no_spec.hierarchical_vericache.enable_host_tier_snapshots,
-                      "--no-spec did not restore the stable KV/speculation defaults");
-
-    const ServeOptions configured = parse({"ninfer-serve",
-                                           "model.ninfer",
-                                           "--no-prefix-reuse",
-                                           "--vision",
-                                           "--max-concurrency",
-                                           "4",
-                                           "--max-pending-requests",
-                                           "12",
-                                           "--pending-timeout-ms",
-                                           "2500",
-                                           "--max-context",
-                                           "4096",
-                                           "--kv-capacity",
-                                           "8192",
-                                           "--log-stats-interval-ms",
-                                           "0",
-                                           "--preserve-thinking",
-                                           "--media-cache-mib",
-                                           "256",
-                                           "--media-live-mib",
-                                           "512",
-                                           "--media-preprocess-threads",
-                                           "6"});
-    failures += check(!configured.allow_prefix_reuse,
-                      "--no-prefix-reuse did not disable server prefix reuse");
-    failures += check(configured.context_cache.host_state_slots == 0 &&
-                          configured.context_cache.host_kv_capacity_bytes == 0,
-                      "root-only server mode retained default Host capacities");
-    failures += check(configured.enable_vision, "--vision did not enable Vision");
-    failures +=
-        check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
-    failures +=
-        check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
-    failures += check(configured.max_context == 4096 &&
-                          configured.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          configured.kv_capacity.explicit_tokens == 8192,
-                      "context and KV capacity options were not kept distinct");
-    failures += check(configured.max_pending_requests == 12,
-                      "--max-pending-requests did not reach serving options");
-    failures += check(configured.pending_timeout_ms == 2500,
-                      "--pending-timeout-ms did not reach serving options");
-    failures += check(configured.log_stats_interval_ms == 0,
-                      "--log-stats-interval-ms did not disable periodic reporting");
-    failures += check(configured.media_cache_bytes == (256ULL << 20) &&
-                          configured.media_live_bytes == (512ULL << 20) &&
-                          configured.media_preprocess_threads == 6,
-                      "media preparation limits did not reach serving options");
-
-    const ServeOptions context_cache = parse(
-        {"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots", "5",
-         "--host-kv-mib", "64", "--max-private-continuations", "9", "--max-shared-prefixes", "4",
-         "--max-long-anchors-per-continuation", "2", "--max-cache-markers-per-request", "6"});
-    failures += check(context_cache.context_cache.enabled &&
-                          context_cache.context_cache.device_state_slots == 3 &&
-                          context_cache.context_cache.host_state_slots == 5 &&
-                          context_cache.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
-                          context_cache.context_cache.max_private_continuations == 9 &&
-                          context_cache.context_cache.max_shared_prefixes == 4 &&
-                          context_cache.context_cache.max_long_anchors_per_continuation == 2 &&
-                          context_cache.context_cache.max_cache_markers_per_request == 6,
-                      "context-cache capacities did not reach serving options");
-    bool disabled_cache_capacity_rejected = false;
-    try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--host-kv-mib", "64"});
-    } catch (const std::invalid_argument&) { disabled_cache_capacity_rejected = true; }
-    failures += check(disabled_cache_capacity_rejected,
-                      "root-only server mode accepted context-cache capacity options");
-
+                      "--default-thinking-budget did not reach serving options");
+    failures += check(rejects([] { (void)parse(package({"--default-thinking-budget", "0"})); }),
+                      "zero --default-thinking-budget was accepted");
     const ServeOptions response_store =
-        parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
-               "--response-store-max-mib", "8"});
+        parse(package({"--response-store-max-records", "42", "--response-store-max-mib", "7"}));
     failures += check(response_store.response_store_max_records == 42 &&
-                          response_store.response_store_max_bytes == (8ULL << 20),
+                          response_store.response_store_max_bytes == (7ULL << 20),
                       "Responses store limits did not reach serving options");
 
-    const ServeOptions sampling =
-        parse({"ninfer-serve", "model.ninfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
-               "40", "--min-p", "0.1", "--presence-penalty", "1.25", "--frequency-penalty", "-0.5",
-               "--seed", "0"});
+    const ServeOptions sampling = parse(package(
+        {"--temperature", "0", "--top-p", "0.9", "--top-k", "40", "--min-p", "0.1", "--seed", "0"}));
     failures += check(sampling.sampling_overrides.temperature == 0.0F &&
                           sampling.sampling_overrides.top_p == 0.9F &&
                           sampling.sampling_overrides.top_k == 40 &&
                           sampling.sampling_overrides.min_p == 0.1F &&
-                          sampling.sampling_overrides.presence_penalty == 1.25F &&
-                          sampling.sampling_overrides.frequency_penalty == -0.5F &&
                           sampling.sampling_overrides.seed == 0,
                       "server sampling flags did not preserve explicit values and zeros");
 
@@ -448,65 +173,20 @@ int main() {
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "request preserve-thinking override did not win");
 
-    failures +=
-        check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
-              "serve help omits --no-prefix-reuse");
-    failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
-                      "serve help omits context-cache capacities");
-    failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
-                          std::string::npos,
-                      "serve help omits context-cache defaults");
-    failures +=
-        check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
-              "serve help omits --preserve-thinking");
-    failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
-                          std::string::npos,
-                      "serve help omits --default-thinking-budget");
-    failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
-                      "serve help omits --vision");
-    failures += check(serve_usage_text("ninfer-serve").find("--hierarchical-vericache") !=
-                          std::string::npos,
-                      "serve help omits hierarchical VeriCache controls");
-    failures += check(serve_usage_text("ninfer-serve").find("--no-spec") != std::string::npos,
-                      "serve help omits the stable speculation fallback");
-    failures +=
-        check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
-              "serve help omits --log-stats-interval-ms");
-    failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=
-                          std::string::npos,
-                      "serve help omits media preparation controls");
-    failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
-                      "serve help omits --kv-capacity");
-    failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
-                          std::string::npos,
-                      "serve help omits Responses store limits");
-    failures +=
-        check(serve_usage_text("ninfer-serve").find("--context-cost-presets") != std::string::npos,
-              "serve help omits external context-cost presets");
-    failures +=
-        check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
-              "serve help omits the artifact-derived model id default");
+    const std::string usage = serve_usage_text("ninfer-serve");
+    for (const char* flag : {"--target", "--draft", "--vision", "--host-kv-mib", "--no-prefix-reuse",
+                             "--preserve-thinking", "--default-thinking-budget",
+                             "--log-stats-interval-ms", "--media-preprocess-threads",
+                             "--response-store-max-mib", "--request-log-jsonl"})
+        failures += check(usage.find(flag) != std::string::npos, "serve help omits a flag");
+    failures += check(usage.find(".ninfer") == std::string::npos &&
+                          usage.find("--kv-dtype") == std::string::npos,
+                      "serve help still documents the .ninfer route");
 
-    const ServeOptions inherited =
-        parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
-    failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          inherited.kv_capacity.explicit_tokens == 16384,
-                      "omitted --kv-capacity did not follow --max-context");
-
-    const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
-    failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
-                          automatic.kv_capacity.explicit_tokens == 0 &&
-                          automatic.kv_capacity.automatic_headroom_bytes ==
-                              ninfer::kDefaultKvCapacityHeadroomBytes,
-                      "--kv-capacity auto did not select automatic sizing");
-
-    const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
-                                       "requests.jsonl", "--api-key", "do-not-log"});
+    const ServeOptions logged =
+        parse(package({"--request-log-jsonl", "requests.jsonl", "--api-key", "do-not-log"}));
     failures += check(logged.request_log_jsonl == "requests.jsonl",
                       "--request-log-jsonl did not preserve its path");
-    failures +=
-        check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
-              "serve help omits --request-log-jsonl");
     bool secret_present    = false;
     bool redaction_present = false;
     for (const std::string& argument : logged.startup_argv) {

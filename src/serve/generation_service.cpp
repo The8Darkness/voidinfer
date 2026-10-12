@@ -236,23 +236,14 @@ private:
 GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
     : options_(std::move(options)) {
     ninfer::EngineOptions engine_options;
-    engine_options.artifact_path            = options_.artifact_path;
-    engine_options.exl3_package             = options_.exl3_package;
+    engine_options.model                    = options_.model;
     engine_options.device                   = options_.device;
     engine_options.max_context              = options_.max_context;
-    engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.kv_cache                 = options_.kv_cache;
-    engine_options.enable_vision            = options_.enable_vision;
-    engine_options.use_cuda_graph           = options_.use_cuda_graph;
-    engine_options.disable_dual_artifact_loading = options_.disable_dual_artifact_loading;
-    engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
-    engine_options.hierarchical_vericache   = options_.hierarchical_vericache;
-    engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
@@ -314,7 +305,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
     const bool request_has_media               = request.media_item_count() != 0;
-    if (request_has_media && !options_.enable_vision) {
+    if (request_has_media && !options_.vision_enabled()) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
@@ -362,7 +353,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     const bool request_has_media = request.media_item_count() != 0;
-    if (request_has_media && !options_.enable_vision) {
+    if (request_has_media && !options_.vision_enabled()) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
@@ -433,7 +424,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.materialization             = result.materialization;
-    outcome.metrics.speculative_backend         = result.speculative.backend;
+    outcome.metrics.speculative_enabled         = result.speculative.enabled;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;
     outcome.metrics.speculative_draft_tokens    = result.speculative.drafted_tokens;
@@ -481,9 +472,9 @@ void GenerationService::warmup() {
     request.messages.push_back(std::move(turn));
     request.max_tokens       = 4;
     request.max_tokens_set   = true;
-    if (options_.exl3_package &&
-        options_.exl3_package->round_implementation ==
-            Exl3RoundImplementation::CoherentDevice) {
+    // Warm the long-prompt (layer-major) prefill as well: a prompt of at
+    // least 2048 tokens.
+    {
         auto& warmup_text = request.messages.back().content.front().text;
         const auto count_repeated = [&](int repetitions) {
             warmup_text.clear();
@@ -504,7 +495,7 @@ void GenerationService::warmup() {
         }
         if (count_repeated(upper) + request.max_tokens > options_.max_context) {
             throw std::invalid_argument(
-                "coherent-device startup warmup needs context headroom above 2048 tokens");
+                "startup warmup needs context headroom above 2048 tokens");
         }
     }
     PreparedRequest prepared = prepare_impl(request, {}, {}, CacheParticipation::Disabled,

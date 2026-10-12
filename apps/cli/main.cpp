@@ -4,6 +4,7 @@
 
 #include "ninfer/engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -92,22 +93,6 @@ std::string format_finish(ninfer::FinishReason reason) {
     return "unknown";
 }
 
-std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8-group64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-row256";
-    }
-    return "unknown";
-}
-
-std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
-}
-
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
     std::cerr << std::left << std::setw(12) << group << std::setw(26) << detail << std::right
               << std::setw(12) << format_seconds(seconds) << '\n';
@@ -147,41 +132,12 @@ private:
 };
 
 void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
-    print_stage("load", "engine construction", wall_seconds);
-    print_stage("load", "artifact/materialize", load.load_seconds);
-    print_stage("load", "host to device", load.upload_seconds);
-    print_stage("load", "reader open/map", load.reader_open_map_seconds);
-    print_stage("load", "directory parse", load.directory_parse_seconds);
-    print_stage("load", "directory validate", load.directory_validate_seconds);
-    print_stage("load", "direct file reads", load.direct_read_seconds);
-    print_stage("load", "device allocation", load.device_allocation_seconds);
-    print_stage("load", "host staging alloc", load.host_staging_allocation_seconds);
-    print_stage("load", "host resource copy", load.host_resource_copy_seconds);
-    print_stage("load", "H2D stream span", load.h2d_stream_seconds);
-    print_stage("load", "H2D active", load.h2d_active_seconds);
-    print_stage("load", "materialize sync", load.materialization_sync_seconds);
-    print_stage("load", "tensor binding", load.tensor_binding_seconds);
-    print_stage("load", "planner", load.planner_seconds);
-    print_stage("load", "instance init", load.instance_seconds);
-    print_stage("load", "startup sync", load.startup_sync_seconds);
-    print_metric("target", load.target);
+    print_stage("load", "wall", wall_seconds);
+    print_stage("load", "model load", load.load_seconds);
+    print_metric("model", load.target);
     print_metric("weights", load.weights_id);
-    print_metric("artifact file read", format_bytes(load.artifact_bytes_read));
-    print_metric("direct read bytes", format_bytes(load.direct_read_bytes));
-    print_metric("weight H2D", format_bytes(load.host_to_device_bytes));
+    print_metric("model bytes read", format_bytes(load.model_bytes_read));
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
-    print_metric("direct read requests", std::to_string(load.direct_read_requests));
-    print_metric("read request range",
-                 format_bytes(load.direct_read_min_bytes) + " .. " +
-                     format_bytes(load.direct_read_max_bytes));
-    print_metric("max read depth", std::to_string(load.direct_read_max_outstanding));
-    if (load.direct_read_seconds > 0.0) {
-        print_metric("direct read rate",
-                     format_rate(static_cast<double>(load.direct_read_bytes),
-                                 load.direct_read_seconds));
-    }
-    print_metric("tensors/resources",
-                 std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
 }
 
 void print_generation_summary(const ninfer::GenerationResult& result,
@@ -221,27 +177,20 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                    memory.runtime_reservation_bytes;
     print_metric("device", std::to_string(memory.device));
     print_metric("max context", std::to_string(memory.max_context));
-    print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
-    print_metric("KV capacity", std::to_string(memory.kv_capacity));
-    print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
-                                       std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
-    print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
     print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
-    print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
     print_metric("planned device total", format_bytes(reserved));
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
     if (speculative.enabled) {
-        const std::string backend =
-            speculative.backend == ninfer::SpeculativeBackend::DFlash ? "dflash" : "mtp";
+        const std::string backend = "dflash2";
         print_metric(backend + " draft window", std::to_string(speculative.draft_window));
         print_metric(backend + " rounds", std::to_string(speculative.rounds));
         print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
@@ -282,7 +231,7 @@ int main(int argc, char** argv) {
             cli.messages_path.empty()
                 ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
                 : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
-                                                        cli.enable_vision);
+                                                        !cli.model.vision_directory.empty());
         input.options.reasoning_effort = cli.reasoning_effort;
 
         ninfer::RequestOptions request;
@@ -297,21 +246,13 @@ int main(int argc, char** argv) {
         ninfer::product::LoadProgressRenderer load_progress(
             std::cerr, ninfer::product::stderr_load_progress_options());
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path  = cli.artifact_path;
-        engine_options.device         = cli.device;
-        engine_options.max_context    = cli.max_context;
-        engine_options.kv_capacity    = cli.kv_capacity;
-        engine_options.prefill_chunk  = cli.prefill_chunk;
-        engine_options.kv_cache       = cli.kv_cache;
-        engine_options.speculative    = cli.speculative;
-        engine_options.enable_vision  = cli.enable_vision;
-        engine_options.use_cuda_graph = cli.use_cuda_graph;
-        engine_options.disable_dual_artifact_loading = cli.disable_dual_artifact_loading;
-        // One CLI invocation owns exactly one request, so retained cross-request context has no
-        // consumer and must not reserve an extra Device StateImage or run terminal capture.
-        engine_options.context_cache.enabled                = false;
-        engine_options.context_cache.host_state_slots       = 0;
-        engine_options.context_cache.host_kv_capacity_bytes = 0;
+        engine_options.model         = cli.model;
+        engine_options.device        = cli.device;
+        engine_options.max_context   = cli.max_context;
+        engine_options.prefill_chunk = cli.prefill_chunk;
+        engine_options.context_cache.host_kv_capacity_bytes =
+            std::max<std::size_t>(engine_options.context_cache.host_kv_capacity_bytes,
+                                  static_cast<std::size_t>(cli.max_context) * 65536);
         engine_options.load_progress                        = load_progress.callback();
 
         const auto load_started = Clock::now();

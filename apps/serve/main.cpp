@@ -1,5 +1,4 @@
 #include "product/load_progress/load_progress.h"
-#include "product/speculative_options.h"
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -99,53 +98,19 @@ int main(int argc, char** argv) {
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
 
-        const ninfer::MemorySummary memory            = service.memory_summary();
-        const ninfer::ContextCostSummary context_cost = service.load_summary().context_cost;
-        const ninfer::EngineOptions& engine           = service.engine_options();
-        const ninfer::ContextCacheOptions& cache      = engine.context_cache;
+        const ninfer::MemorySummary memory       = service.memory_summary();
+        const ninfer::EngineOptions& engine      = service.engine_options();
+        const ninfer::ContextCacheOptions& cache = engine.context_cache;
         std::ostringstream capacity;
-        capacity << "KV capacity "
-                 << (memory.kv_capacity_mode == ninfer::KvCapacityMode::Automatic ? "auto"
-                                                                                  : "explicit")
-                 << " resolved=" << memory.kv_capacity
-                 << " tokens pages=" << memory.kv_capacity_page_groups << '/'
-                 << memory.kv_capacity_max_page_groups
+        capacity << "lanes=" << engine.max_concurrency << " max-context=" << engine.max_context
+                 << " weights=" << format_bytes(memory.weights.capacity_bytes)
                  << " runtime=" << format_bytes(memory.runtime_reservation_bytes)
-                 << " free-after-weights=" << format_bytes(memory.available_after_weights_bytes)
                  << " free-after-startup=" << format_bytes(memory.available_after_startup_bytes)
-                 << " headroom=" << format_bytes(memory.kv_capacity_headroom_bytes)
-                 << " slack=" << format_bytes(memory.planned_slack_bytes)
-                 << " graph-allowance=" << format_bytes(memory.cuda_graph_allowance_bytes)
-                 << " context-cache=" << (cache.enabled ? "on" : "root-only")
-                 << " device-state=" << *cache.device_state_slots << "-cache+"
-                 << engine.max_concurrency << "-active" << " host-state=" << cache.host_state_slots
                  << " host-kv=" << format_bytes(cache.host_kv_capacity_bytes)
-                 << " private=" << *cache.max_private_continuations
+                 << " host-state=" << cache.host_state_slots
                  << " shared=" << *cache.max_shared_prefixes
-                 << " anchors=" << *cache.max_long_anchors_per_continuation
-                 << " markers=" << *cache.max_cache_markers_per_request;
-        capacity << " speculative="
-                 << ninfer::product::speculative_backend_name(engine.speculative.backend)
-                 << " draft=" << engine.speculative.draft_tokens
-                 << " proposal-head="
-                 << (engine.speculative.proposal_head == ninfer::ProposalHead::Optimized
-                         ? "optimized"
-                         : "full")
-                 << " vericache="
-                 << (engine.hierarchical_vericache.enabled ? "on" : "off");
-        if (engine.hierarchical_vericache.enabled) {
-            capacity << " l0-l1=" << engine.hierarchical_vericache.l0_to_l1_horizon
-                     << " l1-l2=" << engine.hierarchical_vericache.l1_to_l2_horizon
-                     << " host-snapshots="
-                     << (engine.hierarchical_vericache.enable_host_tier_snapshots ? "on" : "off");
-        }
-        capacity << " context-cost-transfer="
-                 << ninfer::context_cost_preset_source_name(context_cost.transfer_source)
-                 << " context-cost-prefill="
-                 << ninfer::context_cost_preset_source_name(context_cost.prefill_source)
-                 << " cost-profile=" << context_cost.hardware_class << '/' << context_cost.model_id
-                 << '/' << context_cost.weights_id;
-        if (options.enable_vision) {
+                 << " speculative=dflash2-k7 vision=" << (engine.vision_enabled() ? "bf16" : "off");
+        if (options.vision_enabled()) {
             const ninfer::MediaCacheSummary media = service.media_cache_summary();
             capacity << " media-workers=" << media.preprocess_threads
                      << " media-cache=" << format_bytes(media.capacity_bytes)

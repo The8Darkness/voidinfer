@@ -31,7 +31,7 @@ struct GenerationMetrics {
     double total_seconds   = 0.0;
     ninfer::GenerationEngineTiming engine_timing;
 
-    SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
+    bool speculative_enabled                  = false;
     std::uint32_t speculative_draft_window    = 0;
     std::uint64_t speculative_rounds          = 0;
     std::uint64_t speculative_draft_tokens    = 0;

@@ -250,23 +250,20 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error,
-                                                                selected_exl3_round(service_->engine_options())));
+                                                                request.generation, error));
         write_error(res, error);
         return;
     } catch (const std::exception& exception) {
         const ApiError error = internal_error(exception);
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error,
-                                                                selected_exl3_round(service_->engine_options())));
+                                                                request.generation, error));
         write_error(res, error);
         return;
     }
 
     const std::int64_t created = unix_time_now();
     const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_responses", request.generation, prepared,
-                                 selected_exl3_round(service_->engine_options()));
+        make_request_log_context(req_id, "openai_responses", request.generation, prepared);
     request.generation.messages.clear();
     log_request_start(log_context);
 

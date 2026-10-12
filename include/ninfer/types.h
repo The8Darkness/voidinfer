@@ -29,62 +29,6 @@ inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
-enum class KvCacheStorage : std::uint8_t {
-    BFloat16,
-    Int8Group64,
-    Fp8E4M3Row256,
-    // Packed E2M1 values with one positive E4M3 scale per 16-value group. This is an
-    // explicitly lossy draft-cache format; exact VeriCache promotion/verification owns the
-    // authoritative fallback rather than treating the packed cache as lossless.
-    Nvfp4,
-    // Exact target KV plus an NVFP4 MTP draft tier. The target cache remains BF16 and is the
-    // authoritative representation; its existing host context tier may evict and restore pages.
-    VeriCacheNvfp4,
-    Float16Host, // Pinned EXL3 package only: ordinary FP16 authoritative Host KV.
-    Float16Device, // Pinned EXL3 coherent round: ordinary FP16 authoritative Device KV.
-};
-
-enum class KvCapacityMode : std::uint8_t {
-    Explicit,
-    Automatic,
-};
-
-inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
-
-struct KvCapacityPolicy {
-    KvCapacityMode mode                  = KvCapacityMode::Explicit;
-    std::uint32_t explicit_tokens        = 2048;
-    std::size_t automatic_headroom_bytes = 0;
-
-    [[nodiscard]] static constexpr KvCapacityPolicy
-    explicit_capacity(std::uint32_t tokens) noexcept {
-        return KvCapacityPolicy{KvCapacityMode::Explicit, tokens, 0};
-    }
-
-    [[nodiscard]] static constexpr KvCapacityPolicy
-    automatic(std::size_t headroom_bytes = kDefaultKvCapacityHeadroomBytes) noexcept {
-        return KvCapacityPolicy{KvCapacityMode::Automatic, 0, headroom_bytes};
-    }
-};
-
-enum class ProposalHead : std::uint8_t {
-    Full,
-    Optimized,
-};
-
-enum class SpeculativeBackend : std::uint8_t {
-    None,
-    Mtp,
-    DFlash,
-    DFlash2,
-};
-
-struct SpeculativeOptions {
-    SpeculativeBackend backend = SpeculativeBackend::None;
-    std::uint32_t draft_tokens = 0;
-    ProposalHead proposal_head = ProposalHead::Full;
-};
-
 struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
@@ -107,121 +51,32 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_cache_markers_per_request;
 };
 
-// Experimental hierarchical VeriCache control. The default keeps the stable cache route
-// unchanged. When enabled, compressed L0 execution remains speculative until an attached
-// verifier commits it; this option does not authorize an approximate result to bypass the exact
-// target. The horizon values are initial values and are adapted inside their corresponding
-// min/max bounds using observed disagreement and rollback.
-struct HierarchicalVeriCacheOptions {
-    bool enabled = false;
-
-    std::uint32_t l0_to_l1_horizon     = 32;
-    std::uint32_t l0_to_l1_min_horizon = 24;
-    std::uint32_t l0_to_l1_max_horizon = 64;
-
-    std::uint32_t l1_to_l2_horizon     = 512;
-    std::uint32_t l1_to_l2_min_horizon = 256;
-    std::uint32_t l1_to_l2_max_horizon = 2048;
-
-    // Optional fixed cadence for asynchronous host checkpoints. Zero follows the adaptive
-    // L1-to-L2 verifier horizon; a nonzero value is independent from verifier adaptation and is
-    // clamped to the configured L1-to-L2 bounds. This is a persistence policy, not permission for
-    // an approximate host snapshot to bypass the exact target.
-    std::uint32_t host_snapshot_horizon = 0;
-
-    // These are default protection classes. Prompt-derived vision/system/tool ranges are added
-    // by the runtime when their exact token spans are known.
-    // A 128-token BF16 recent sidecar is the measured Q2/DFlash acceptance knee on the RTX 5090;
-    // larger protection windows add memory without improving the short-context result.
-    std::uint32_t protected_recent_tokens = 128;
-    std::uint32_t protected_sink_tokens   = 4;
-    std::uint32_t protected_pivot_tokens  = 4;
-
-    // L0 is the resident OSCAR-Q2 device KV. Q4 is a pinned-host representation; sensitive
-    // ranges may additionally use the explicit BF16 protection sidecar.
-    // A disabled hierarchy must remain valid on the stable path. The research server explicitly
-    // selects OSCAR-Q2 when it enables hierarchical VeriCache.
-    std::uint8_t l0_bits = 4;
-    // Reserved for a future host-side live verifier. It must not cause a persistent Q4 device
-    // shadow to be allocated.
-    bool l1_live_verifier_primary = true;
-    bool direct_low_bit_attention = false;
-    // Opt-in asynchronous StateImage promotion. This materializes the existing compressed
-    // DFlash mirror plus authoritative GDN/recurrent state in pinned host memory at the adaptive
-    // L1->L2 boundary; it never replaces the exact GPU target or enters the hot verification path.
-    bool enable_host_tier_snapshots = false;
-    std::filesystem::path cold_store_path;
-};
-
-struct ContextCostOptions {
-    // Empty selects generic defaults plus any matching values compiled into the binary. A
-    // nonempty runtime preset independently overrides its matching machine transfer and
-    // artifact-prefill components; absent entries retain the preceding numerical layer.
-    std::filesystem::path preset_path;
-};
-
-// Optional secondary materialization source. If it is empty, the engine may discover an
-// equivalent C:/D: artifact at the same relative path. The dual modes read the same planned
-// byte ranges from two complete, equivalent artifacts.
-enum class ArtifactReadMode : std::uint8_t {
-    Single,
-    DualStaticAlternating,
-    DualDynamic,
-};
-
-enum class Exl3RoundImplementation : std::uint8_t {
-    Established,
-    CoherentDevice,
-};
-
-struct PinnedExl3PackageOptions {
+// The model package: an EXL3 target, its DFlash2 draft and, optionally, the
+// BF16 Vision tower (`model.visual.*` tensors, e.g. the target's BF16
+// checkpoint), which enables image and video input.
+struct ModelPackageOptions {
     std::filesystem::path target_directory;
     std::filesystem::path draft_directory;
-    std::filesystem::path verified_dual_manifest;
-    // BF16 Vision tower weights (`model.visual.*`, e.g. the target's BF16
-    // checkpoint). Set: image/video requests run on the coherent-device route.
     std::filesystem::path vision_directory;
-    // Explicit package-local round identity. The established implementation remains the default.
-    Exl3RoundImplementation round_implementation = Exl3RoundImplementation::Established;
+    std::filesystem::path verified_dual_manifest;
 };
 
-[[nodiscard]] inline constexpr std::string_view exl3_round_implementation_name(
-    Exl3RoundImplementation implementation) noexcept {
-    switch (implementation) {
-    case Exl3RoundImplementation::Established: return "established";
-    case Exl3RoundImplementation::CoherentDevice: return "coherent-device";
-    }
-    return "unknown";
-}
-
 struct EngineOptions {
-    // Explicit typed package selection; never inferred from an artifact suffix.
-    std::optional<PinnedExl3PackageOptions> exl3_package;
-    std::filesystem::path artifact_path;
-    std::filesystem::path secondary_artifact_path;
-    ArtifactReadMode artifact_read_mode    = ArtifactReadMode::Single;
-    // When a secondary artifact is supplied or discovered, dynamic dual-source loading is
-    // selected by default. Set this opt-out before Engine construction to keep the primary only.
-    bool disable_dual_artifact_loading = false;
+    ModelPackageOptions model;
     int device                         = 0;
-    std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
-    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    std::uint32_t max_context          = 32768; // Exact logical ceiling of each request.
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
-    SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
-    bool enable_vision                     = false;
-    bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
-    HierarchicalVeriCacheOptions hierarchical_vericache;
-    ContextCostOptions context_cost;
     LoadProgress load_progress;
+
+    [[nodiscard]] bool vision_enabled() const noexcept { return !model.vision_directory.empty(); }
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -589,7 +444,6 @@ struct GenerationEngineTiming {
 };
 
 struct SpeculativeStats {
-    SpeculativeBackend backend    = SpeculativeBackend::None;
     bool enabled                  = false;
     std::uint32_t draft_window    = 0;
     std::uint64_t rounds          = 0;
@@ -787,37 +641,16 @@ struct ArenaMemorySummary {
     std::size_t peak_used_bytes = 0;
 };
 
-// Logical regions within the one physical workspace allocation. These byte values describe
-// layout and live extents and must not be added to workspace.capacity_bytes.
-struct VisionWorkspaceMemorySummary {
-    std::uint32_t aggregate_prompt_tokens = 0;
-    std::uint32_t max_item_tokens         = 0;
-    std::size_t general_capacity_bytes    = 0;
-    std::size_t encode_peak_bytes         = 0;
-    std::size_t handoff_offset_bytes      = 0;
-    std::size_t handoff_capacity_bytes    = 0;
-    std::size_t handoff_active_bytes      = 0;
-    std::size_t handoff_peak_bytes        = 0;
-};
-
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
-    KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
-    std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
-    std::uint32_t kv_capacity_page_groups     = 0;
-    std::uint32_t kv_capacity_max_page_groups = 0;
-    KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
-    std::optional<VisionWorkspaceMemorySummary> vision_workspace;
     std::size_t minimum_runtime_reservation_bytes = 0;
-    std::size_t kv_capacity_increment_bytes       = 0;
     std::size_t runtime_reservation_bytes         = 0;
     std::size_t available_after_weights_bytes     = 0;
     std::size_t available_after_startup_bytes     = 0;
-    std::size_t kv_capacity_headroom_bytes        = 0;
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
@@ -828,38 +661,9 @@ struct MemorySummary {
     std::size_t host_kv_occupied_bytes            = 0;
 };
 
-// Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
-// device_wait_ns is blocked wall time and is intentionally excluded from their sum. Detail values
-// are subsets of a top-level phase and must not be added to Host-active time again.
-struct RuntimeHostWorkStats {
-    std::uint64_t engine_boundary_ns      = 0;
-    std::uint64_t program_submit_ns       = 0;
-    std::uint64_t program_post_ns         = 0;
-    std::uint64_t engine_commit_output_ns = 0;
-    std::uint64_t engine_maintenance_ns   = 0;
-    std::uint64_t device_wait_ns          = 0;
-
-    std::uint64_t decode_host_ns         = 0;
-    std::uint64_t decode_device_wait_ns  = 0;
-    std::uint64_t prefill_host_ns        = 0;
-    std::uint64_t prefill_device_wait_ns = 0;
-    std::uint64_t control_host_ns        = 0;
-    std::uint64_t control_device_wait_ns = 0;
-    std::uint64_t prefill_units          = 0;
-    std::uint64_t control_units          = 0;
-
-    std::uint64_t admission_policy_ns           = 0;
-    std::uint64_t context_progress_ns           = 0;
-    std::uint64_t stats_publication_ns          = 0;
-    std::uint64_t admission_policy_invocations  = 0;
-    std::uint64_t context_progress_invocations  = 0;
-    std::uint64_t stats_publication_invocations = 0;
-};
-
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
-    RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
@@ -867,122 +671,17 @@ struct RuntimeStats {
     // Partition of committed EXL3 result tokens. Diagnostic state rows are not
     // included in any of these counters or in useful output throughput.
     std::uint64_t visible_model_tokens = 0;
-    std::uint64_t injected_control_tokens = 0;
     std::uint64_t hidden_terminal_tokens = 0;
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds             = 0;
-    std::uint64_t decode_row_rounds         = 0;
     std::uint32_t running_requests          = 0;
-    std::uint32_t prefilling_requests       = 0;
-    std::uint32_t decode_ready_requests     = 0;
     std::uint32_t waiting_requests          = 0;
-    std::uint32_t materializing_requests    = 0;
-    std::uint32_t capture_pending_requests  = 0;
-    std::uint32_t terminal_pending_requests = 0;
-    std::uint64_t active_captures_completed = 0;
-    std::uint64_t active_captures_aborted   = 0;
 
     std::uint64_t root_selections                    = 0;
-    std::uint64_t private_endpoint_selections        = 0;
-    std::uint64_t private_turn_closure_selections    = 0;
-    std::uint64_t private_response_replay_selections = 0;
-    std::uint64_t private_long_anchor_selections     = 0;
     std::uint64_t shared_stable_prefix_selections    = 0;
     std::uint64_t reused_prompt_tokens               = 0;
     std::uint32_t last_selected_frontier_tokens      = 0;
 
-    std::uint64_t state_moves     = 0;
-    std::uint64_t state_forks     = 0;
-    std::uint64_t state_restores  = 0;
-    std::uint64_t state_d2h_count = 0;
-    std::uint64_t state_h2d_count = 0;
-    std::uint64_t state_d2d_count = 0;
-    std::uint64_t state_d2h_bytes = 0;
-    std::uint64_t state_h2d_bytes = 0;
-    std::uint64_t state_d2d_bytes = 0;
-    double state_d2h_seconds      = 0.0;
-    double state_h2d_seconds      = 0.0;
-    double state_d2d_seconds      = 0.0;
-
-    std::uint64_t main_kv_d2h_pages    = 0;
-    std::uint64_t main_kv_h2d_pages    = 0;
-    std::uint64_t main_kv_d2d_pages    = 0;
-    std::uint64_t main_kv_d2h_bytes    = 0;
-    std::uint64_t main_kv_h2d_bytes    = 0;
-    std::uint64_t main_kv_d2d_bytes    = 0;
-    double main_kv_d2h_seconds         = 0.0;
-    double main_kv_h2d_seconds         = 0.0;
-    double main_kv_d2d_seconds         = 0.0;
-    std::uint64_t backend_kv_d2h_pages = 0;
-    std::uint64_t backend_kv_h2d_pages = 0;
-    std::uint64_t backend_kv_d2d_pages = 0;
-    std::uint64_t backend_kv_d2h_bytes = 0;
-    std::uint64_t backend_kv_h2d_bytes = 0;
-    std::uint64_t backend_kv_d2d_bytes = 0;
-    double backend_kv_d2h_seconds      = 0.0;
-    double backend_kv_h2d_seconds      = 0.0;
-    double backend_kv_d2d_seconds      = 0.0;
-
-    std::uint64_t pressure_spill_pages                 = 0;
-    std::uint64_t partial_tail_cow_pages               = 0;
-    std::uint32_t device_state_occupied_slots          = 0;
-    std::uint32_t host_state_occupied_slots            = 0;
-    std::uint32_t device_main_kv_occupied_pages        = 0;
-    std::uint32_t device_backend_kv_occupied_pages     = 0;
-    std::size_t host_kv_occupied_bytes                 = 0;
-    std::uint64_t pressure_private_owners_degraded     = 0;
-    std::uint64_t pressure_private_owners_evicted      = 0;
-    std::uint64_t pressure_shared_owners_degraded      = 0;
-    std::uint64_t pressure_shared_owners_evicted       = 0;
-    std::uint64_t pressure_checkpoints_dropped         = 0;
-    std::uint64_t pressure_searches                    = 0;
-    std::uint64_t pressure_search_budget_exhaustions   = 0;
-    std::uint64_t pressure_maximal_fallback_selections = 0;
-    std::uint32_t shared_active_references             = 0;
-    std::uint64_t historical_fork_hits                 = 0;
-    double actual_context_transfer_seconds             = 0.0;
-
-    // Hierarchical VeriCache observations. L0/L1/L2 counters are zero until that verifier stage
-    // is actually attached; the current DFlash/MTP exact-target fallback is reported separately
-    // as speculative transaction activity.
-    bool hierarchical_vericache_enabled                = false;
-    std::uint32_t vericache_l0_to_l1_horizon            = 0;
-    std::uint32_t vericache_l1_to_l2_horizon            = 0;
-    std::uint64_t vericache_l0_l1_checks                = 0;
-    std::uint64_t vericache_l0_l1_proposed_tokens       = 0;
-    std::uint64_t vericache_l0_l1_accepted_tokens       = 0;
-    std::uint64_t vericache_l0_l1_disagreements         = 0;
-    std::uint64_t vericache_l1_l2_checks                = 0;
-    std::uint64_t vericache_l1_l2_proposed_tokens       = 0;
-    std::uint64_t vericache_l1_l2_accepted_tokens       = 0;
-    std::uint64_t vericache_l1_l2_disagreements         = 0;
-    // The current DFlash/MTP route still verifies against the exact target on the GPU. Keep that
-    // path separate from L0/L1 and L1/L2 host-tier verification until those consumers are attached.
-    std::uint64_t vericache_exact_target_checks          = 0;
-    std::uint64_t vericache_exact_target_proposed_tokens = 0;
-    std::uint64_t vericache_exact_target_accepted_tokens = 0;
-    std::uint64_t vericache_exact_target_disagreements   = 0;
-    std::uint64_t vericache_speculative_rounds          = 0;
-    std::uint64_t vericache_speculative_rollbacks       = 0;
-    std::uint64_t vericache_nested_commits              = 0;
-    std::uint64_t vericache_nested_rollbacks            = 0;
-    std::uint32_t vericache_max_nested_depth            = 0;
-    std::uint64_t vericache_gdn_state_restores          = 0;
-    std::uint64_t vericache_gdn_state_restore_bytes     = 0;
-    double vericache_gdn_state_restore_seconds          = 0.0;
-    std::uint64_t vericache_host_tier_snapshots         = 0;
-    std::uint64_t vericache_host_tier_snapshot_bytes    = 0;
-    std::uint64_t vericache_host_state_d2h_bytes        = 0;
-    std::uint64_t vericache_host_kv_d2h_pages           = 0;
-    std::uint64_t vericache_host_kv_d2h_bytes           = 0;
-    double vericache_host_kv_d2h_seconds                = 0.0;
-    std::size_t vericache_l0_bytes                      = 0;
-    // Temporary device-side source shadow used to produce independent OSCAR-Q4 host snapshots;
-    // it is not part of the resident L0 tier and is zero when Q4 is the resident format.
-    std::size_t vericache_l0_q4_shadow_bytes             = 0;
-    std::size_t vericache_l1_bytes                      = 0;
-    std::size_t vericache_l2_bytes                      = 0;
-    std::size_t vericache_l3_bytes                      = 0;
     // Completed physical projection batches and independent rendezvous fallbacks;
     // neither counter establishes token/state equivalence or a speedup.
     std::uint64_t shared_target_projection_batches = 0;
@@ -1239,12 +938,11 @@ struct RuntimeStats {
     // Joined fills and cache hits are distinct; these are not generated tokens
     // or counts of numerical submissions by producers cancelled during a fill.
     std::uint64_t prefix_preparation_returns=0,concurrent_prefix_preparation_returns=0;
-    std::uint64_t prefix_preparation_joins=0,prefix_preparation_cache_hits=0;
+    std::uint64_t prefix_preparation_cache_hits=0;
     // Immutable host prefix-plan completions accepted before this request's
     // first numerical operation.  Peer overlap counts plans completed while a
     // different lane retained pending numerical ownership, not elapsed time.
-    std::uint64_t host_preparation_returns=0,host_preparation_peer_numeric_overlaps=0;
-    std::uint64_t host_preparation_cancelled_before_accept=0;
+    std::uint64_t host_preparation_peer_numeric_overlaps=0;
     // Complete selected nondefault-stream command chains, not individual
     // kernels or elapsed overlap. Failures retain graph owners until a drain.
     std::uint64_t execution_dependency_graph_begins=0;
@@ -1283,76 +981,15 @@ struct RuntimeStats {
     std::uint64_t private_device_prefix_bytes=0;
 };
 
-enum class ContextCostPresetSource : std::uint8_t {
-    GenericDefault,
-    CompiledDefault,
-    External,
-};
-
-[[nodiscard]] inline constexpr const char*
-context_cost_preset_source_name(ContextCostPresetSource source) noexcept {
-    switch (source) {
-    case ContextCostPresetSource::GenericDefault:
-        return "generic-default";
-    case ContextCostPresetSource::CompiledDefault:
-        return "compiled-default";
-    case ContextCostPresetSource::External:
-        return "external";
-    }
-    return "unknown";
-}
-
-struct ContextCostSummary {
-    ContextCostPresetSource transfer_source = ContextCostPresetSource::GenericDefault;
-    ContextCostPresetSource prefill_source  = ContextCostPresetSource::GenericDefault;
-    std::string hardware_class;
-    std::string model_id;
-    std::string weights_id;
-    std::filesystem::path preset_path;
-};
-
 struct LoadSummary {
     std::string target;
     std::string model_id;
     std::string weights_id;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
-    std::uint64_t artifact_bytes_read  = 0;
+    std::uint64_t model_bytes_read     = 0;
     std::uint64_t host_to_device_bytes = 0;
     std::uint64_t peak_staging_bytes   = 0;
-    std::size_t tensor_count           = 0;
-    std::size_t resource_count         = 0;
-    // Optional startup bottleneck diagnostics; these extend rather than replace the stable
-    // summary fields above.
-    double reader_open_map_seconds            = 0.0;
-    double directory_parse_seconds            = 0.0;
-    double directory_validate_seconds         = 0.0;
-    double direct_read_seconds                = 0.0;
-    std::uint64_t direct_read_requests        = 0;
-    std::uint64_t direct_read_bytes           = 0;
-    std::uint64_t direct_read_min_bytes       = 0;
-    std::uint64_t direct_read_max_bytes       = 0;
-    std::uint32_t direct_read_max_outstanding = 0;
-    double device_allocation_seconds          = 0.0;
-    double host_staging_allocation_seconds    = 0.0;
-    double host_resource_copy_seconds         = 0.0;
-    double h2d_stream_seconds                 = 0.0;
-    double h2d_active_seconds                 = 0.0;
-    double materialization_sync_seconds       = 0.0;
-    double tensor_binding_seconds             = 0.0;
-    double planner_seconds                    = 0.0;
-    double instance_seconds                   = 0.0;
-    double startup_sync_seconds               = 0.0;
-    bool dual_source                           = false;
-    std::uint32_t dual_max_parallel_reads     = 0;
-    double dual_direct_read_wall_seconds       = 0.0;
-    std::uint64_t secondary_direct_read_bytes = 0;
-    std::uint64_t secondary_direct_read_requests = 0;
-    std::uint64_t secondary_direct_read_min_bytes = 0;
-    std::uint64_t secondary_direct_read_max_bytes = 0;
-    std::uint32_t secondary_direct_read_max_outstanding = 0;
-    double secondary_direct_read_seconds       = 0.0;
-    ContextCostSummary context_cost;
 };
 
 } // namespace ninfer

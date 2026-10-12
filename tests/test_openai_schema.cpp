@@ -849,11 +849,10 @@ int test_llama_webui_dialect() {
 int test_props_stub() {
     int failures = 0;
     ServeOptions options;
-    options.artifact_path              = "models/qwen3_6_27b.ninfer";
+    options.model.target_directory     = "models/qwen3.8-27b-exl3";
     options.max_context                = 16384;
     options.default_max_tokens         = 4096;
-    options.enable_vision              = true;
-    options.speculative.backend        = ninfer::SpeculativeBackend::Mtp;
+    options.model.vision_directory     = "models/qwen3.8-27b-bf16";
     options.sampling_overrides.temperature = 1.0F;
     options.sampling_overrides.top_k       = 20;
 

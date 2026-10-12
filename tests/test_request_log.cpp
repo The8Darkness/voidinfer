@@ -35,91 +35,31 @@ int check(bool condition, const char* message) {
 int main() {
     int failures = 0;
 
-    bool protected_artifact_rejected = false;
-    try {
-        JsonlRequestLog unsafe("same-path.ninfer", "same-path.ninfer");
-    } catch (const std::invalid_argument&) { protected_artifact_rejected = true; }
-    failures += check(protected_artifact_rejected,
-                      "request log accepted the model artifact as its output path");
-
-#ifdef _WIN32
-    {
-        const std::filesystem::path directory =
-            std::filesystem::temp_directory_path() / "ninfer-request-log-case-test";
-        const std::filesystem::path artifact = directory / "Model-Artifact.NINFER";
-        const std::filesystem::path alternate = directory / "model-artifact.ninfer";
-        std::filesystem::remove_all(directory);
-        std::filesystem::create_directories(directory);
-        {
-            std::ofstream artifact_file(artifact);
-            artifact_file << "artifact";
-        }
-        bool alternate_case_rejected = false;
-        try {
-            JsonlRequestLog unsafe(alternate.string(), artifact.string());
-        } catch (const std::invalid_argument&) { alternate_case_rejected = true; }
-        std::filesystem::remove_all(directory);
-        failures += check(alternate_case_rejected,
-                          "request log accepted an alternate-case model artifact path");
-    }
-    {
-        const std::filesystem::path directory =
-            std::filesystem::temp_directory_path() / "ninfer-request-log-missing-case-test";
-        const std::filesystem::path artifact = directory / "Missing-Artifact.NINFER";
-        const std::filesystem::path alternate = directory / "missing-artifact.ninfer";
-        std::filesystem::remove_all(directory);
-        std::filesystem::create_directories(directory);
-        bool missing_alternate_case_rejected = false;
-        try {
-            JsonlRequestLog unsafe(alternate.string(), artifact.string());
-        } catch (const std::invalid_argument&) { missing_alternate_case_rejected = true; }
-        failures += check(missing_alternate_case_rejected,
-                          "request log accepted alternate-case missing artifact path");
-        std::filesystem::remove_all(directory);
-    }
-#endif
-
     ServeOptions options;
-    options.artifact_path                  = "/models/qwen3_6_27b.ninfer";
+    options.model.target_directory         = "/models/qwen3.8-27b-exl3";
+    options.model.draft_directory          = "/models/qwen3.8-27b-dflash2";
     options.host                           = "127.0.0.1";
     options.port                           = 8123;
     options.api_key                        = "must-not-appear";
     options.model_id_override              = "deployment-alias";
     options.request_log_jsonl              = "requests.jsonl";
     options.max_context                    = 262144;
-    options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
     options.prefill_chunk                  = 1024;
     options.log_stats_interval_ms          = 2500;
-    options.kv_cache                       = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens       = 3;
-    options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
-    options.enable_vision                  = false;
     options.allow_prefix_reuse             = true;
     options.preserve_thinking              = true;
     options.default_thinking_budget        = 512;
-    options.hierarchical_vericache.enabled = true;
-    options.hierarchical_vericache.l0_to_l1_horizon = 48;
-    options.hierarchical_vericache.l1_to_l2_horizon = 1024;
-    options.hierarchical_vericache.enable_host_tier_snapshots = true;
-    options.hierarchical_vericache.protected_recent_tokens = 128;
-    options.hierarchical_vericache.protected_sink_tokens = 8;
-    options.hierarchical_vericache.protected_pivot_tokens = 16;
     options.sampling_overrides.temperature = 0.6F;
-    options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
+    options.startup_argv = {"ninfer-serve", "--target", "--api-key", "<redacted>"};
 
     ninfer::EngineOptions engine_options;
-    engine_options.artifact_path                                   = options.artifact_path;
+    engine_options.model                                           = options.model;
     engine_options.device                                          = options.device;
     engine_options.max_context                                     = options.max_context;
     engine_options.max_concurrency                                 = 2;
     engine_options.max_pending_requests                            = options.max_pending_requests;
     engine_options.pending_timeout_ms                              = options.pending_timeout_ms;
     engine_options.prefill_chunk                                   = options.prefill_chunk;
-    engine_options.kv_cache                                        = options.kv_cache;
-    engine_options.speculative                                     = options.speculative;
-    engine_options.enable_vision                                   = options.enable_vision;
-    engine_options.use_cuda_graph                                  = options.use_cuda_graph;
     engine_options.context_cache.device_state_slots                = 2;
     engine_options.context_cache.host_state_slots                  = 3;
     engine_options.context_cache.host_kv_capacity_bytes            = 64ULL << 20;
@@ -127,7 +67,6 @@ int main() {
     engine_options.context_cache.max_shared_prefixes               = 2;
     engine_options.context_cache.max_long_anchors_per_continuation = 2;
     engine_options.context_cache.max_cache_markers_per_request     = 4;
-    engine_options.hierarchical_vericache = options.hierarchical_vericache;
 
     const ninfer::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
@@ -135,47 +74,21 @@ int main() {
     };
 
     ninfer::LoadSummary load;
-    load.target               = "qwen3_6_27b";
-    load.model_id             = "qwen3.6-27b";
-    load.weights_id           = "groupwise-int";
+    load.target               = "qwen3.8-27b/exl3";
+    load.model_id             = "qwen3.8-27b";
+    load.weights_id           = "exl3-6bpw";
     load.load_seconds         = 1.234567890123;
     load.upload_seconds       = 0.345678901234;
-    load.artifact_bytes_read  = 1000;
+    load.model_bytes_read     = 1000;
     load.host_to_device_bytes = 900;
     load.peak_staging_bytes   = 128;
-    load.tensor_count         = 42;
-    load.resource_count       = 6;
-    load.context_cost         = {
-                .transfer_source = ninfer::ContextCostPresetSource::External,
-                .prefill_source  = ninfer::ContextCostPresetSource::CompiledDefault,
-                .hardware_class  = "nvidia-geforce-rtx-5090-sm120",
-                .model_id        = "qwen3.6-27b",
-                .weights_id      = "groupwise-int",
-                .preset_path     = "local-costs.json",
-    };
 
     ninfer::MemorySummary memory;
-    memory.max_context                 = 262144;
-    memory.kv_capacity_mode            = ninfer::KvCapacityMode::Explicit;
-    memory.kv_capacity                 = 524288;
-    memory.kv_capacity_page_groups     = 8192;
-    memory.kv_capacity_max_page_groups = 16384;
-    memory.kv_cache                    = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    memory.weights.capacity_bytes      = 100;
-    memory.sequence.capacity_bytes     = 200;
-    memory.workspace.capacity_bytes    = 500;
-    memory.vision_workspace            = ninfer::VisionWorkspaceMemorySummary{
-                   .aggregate_prompt_tokens = 32768,
-                   .max_item_tokens         = 16384,
-                   .general_capacity_bytes  = 300,
-                   .encode_peak_bytes       = 400,
-                   .handoff_offset_bytes    = 300,
-                   .handoff_capacity_bytes  = 200,
-                   .handoff_active_bytes    = 0,
-                   .handoff_peak_bytes      = 150,
-    };
+    memory.max_context                       = 262144;
+    memory.weights.capacity_bytes            = 100;
+    memory.sequence.capacity_bytes           = 200;
+    memory.workspace.capacity_bytes          = 500;
     memory.minimum_runtime_reservation_bytes = 1300;
-    memory.kv_capacity_increment_bytes       = 100;
     memory.runtime_reservation_bytes         = 1600;
     memory.available_after_weights_bytes     = 1700;
     memory.available_after_startup_bytes     = 180;
@@ -200,7 +113,7 @@ int main() {
 
     const Json server = Json::parse(format_server_start_json(
         "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
-        memory, environment, std::uint64_t{123456}));
+        memory, environment));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
@@ -208,44 +121,23 @@ int main() {
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
-    failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
-    failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
+    failures += check(server.at("model").at("identity") == "qwen3.8-27b/exl3" &&
+                          server.at("model").at("target") == "/models/qwen3.8-27b-exl3" &&
+                          server.at("model").at("draft") == "/models/qwen3.8-27b-dflash2",
+                      "server model package missing");
+    failures += check(server.at("model").at("weights_id") == "exl3-6bpw",
                       "server weights id missing");
-    failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
+    failures += check(server.at("model").at("bytes_read") == 1000, "model bytes read missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
-    failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
-    failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
-                          server.at("engine").at("kv_capacity_page_groups") == 8192 &&
-                          server.at("engine").at("kv_capacity_max_page_groups") == 16384,
-                      "KV capacity resolution metadata missing");
     failures +=
         check(server.at("engine").at("log_stats_interval_ms") == 2500, "stats interval missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
-    failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
-    failures += check(server.at("engine").at("speculative_backend") == "mtp",
-                      "speculative backend missing");
-    failures +=
-        check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
-    failures += check(
-        server.at("engine").at("hierarchical_vericache").at("enabled") == true &&
-            server.at("engine").at("hierarchical_vericache").at("l0_to_l1_horizon") == 48 &&
-            server.at("engine").at("hierarchical_vericache").at("l1_to_l2_horizon") == 1024 &&
-            server.at("engine").at("hierarchical_vericache").at("l1_live_verifier_primary") ==
-                true &&
-            server.at("engine").at("hierarchical_vericache").at("host_tier_snapshots") == true &&
-            server.at("engine").at("hierarchical_vericache").at("protected_recent_tokens") == 128,
-        "hierarchical VeriCache startup provenance missing");
-    failures += check(
-        server.at("engine").at("context_cost").at("transfer_source") == "external" &&
-            server.at("engine").at("context_cost").at("prefill_source") == "compiled-default" &&
-            server.at("engine").at("context_cost").at("hardware_class") ==
-                "nvidia-geforce-rtx-5090-sm120" &&
-            server.at("engine").at("context_cost").at("preset_path") == "local-costs.json",
-        "resolved context-cost layers missing");
+    failures += check(server.at("engine").at("speculative") == "dflash2-k7",
+                      "speculative profile missing");
     failures += check(server.at("engine").at("prefix_reuse") == true, "prefix-reuse state missing");
     failures += check(
         server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
@@ -268,18 +160,13 @@ int main() {
         "server sampling overrides lost omission state");
     failures += check(server.at("environment").at("gpu_name") == "NVIDIA GeForce RTX 5090",
                       "GPU name missing");
-    failures +=
-        check(server.at("memory").at("workspace").at("capacity_bytes") == 500 &&
-                  server.at("memory").at("vision_workspace").at("general_capacity_bytes") == 300 &&
-                  server.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 200 &&
-                  server.at("memory").at("vision_workspace").at("handoff_peak_bytes") == 150,
-              "Vision workspace layout missing");
+    failures += check(server.at("memory").at("workspace").at("capacity_bytes") == 500,
+                      "workspace memory missing");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
                           server.at("memory").at("available_after_weights_bytes") == 1700 &&
                           server.at("memory").at("available_after_startup_bytes") == 180 &&
-                          server.at("memory").at("kv_capacity_headroom_bytes") == 0 &&
                           server.at("memory").at("planned_slack_bytes") == 100,
                       "adaptive KV memory ledger missing");
     failures += check(server.at("memory").at("host_state_capacity_slots") == 3 &&
@@ -400,7 +287,7 @@ int main() {
                   .decode_rounds                        = 2,
                   .control_units                        = 1,
     };
-    outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
+    outcome.metrics.speculative_enabled               = true;
     outcome.metrics.speculative_draft_window          = 3;
     outcome.metrics.speculative_rounds                = 300;
     outcome.metrics.speculative_draft_tokens          = 900;
@@ -466,7 +353,7 @@ int main() {
         check(done.at("timings_seconds").at("ttft").get<double>() ==
                           outcome.metrics.ttft_seconds,
               "TTFT missing or lost precision");
-    failures += check(done.at("speculative").at("backend") == "mtp",
+    failures += check(done.at("speculative").at("backend") == "dflash2",
                       "speculative backend missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "draft window missing");
@@ -525,145 +412,36 @@ int main() {
                       "human request log mislabels a submitted request");
 
     ThroughputReport throughput;
-    throughput.interval_seconds                         = 2.0;
-    throughput.computed_prefill_tokens                  = 100;
-    throughput.committed_decode_tokens                  = 40;
-    throughput.decode_rounds                            = 10;
-    throughput.decode_row_rounds                        = 18;
-    throughput.previous.root_selections                 = 2;
-    throughput.previous.state_h2d_bytes                 = 100;
-    throughput.current.running_requests                 = 2;
-    throughput.current.prefilling_requests              = 1;
-    throughput.current.decode_ready_requests            = 1;
-    throughput.current.waiting_requests                 = 3;
-    throughput.current.materializing_requests           = 1;
-    throughput.current.capture_pending_requests         = 1;
-    throughput.current.terminal_pending_requests        = 1;
-    throughput.current.root_selections                  = 3;
-    throughput.current.state_h2d_count                  = 1;
-    throughput.current.state_h2d_bytes                  = 132;
-    throughput.current.state_h2d_seconds                = 0.25;
-    throughput.current.device_state_occupied_slots      = 3;
-    throughput.current.host_state_occupied_slots        = 1;
-    throughput.current.last_selected_frontier_tokens    = 64;
-    throughput.current.pressure_spill_pages             = 4;
-    throughput.current.pressure_private_owners_degraded = 1;
-    throughput.current.pressure_checkpoints_dropped     = 1;
-    throughput.current.pressure_searches                = 1;
-    throughput.current.hierarchical_vericache_enabled   = true;
-    throughput.current.vericache_l0_to_l1_horizon       = 48;
-    throughput.current.vericache_l1_to_l2_horizon       = 1024;
-    throughput.previous.vericache_l0_l1_checks          = 1;
-    throughput.current.vericache_l0_l1_checks            = 3;
-    throughput.previous.vericache_l0_l1_proposed_tokens = 4;
-    throughput.current.vericache_l0_l1_proposed_tokens  = 12;
-    throughput.previous.vericache_l0_l1_accepted_tokens = 2;
-    throughput.current.vericache_l0_l1_accepted_tokens  = 9;
-    throughput.previous.vericache_l0_l1_disagreements   = 1;
-    throughput.current.vericache_l0_l1_disagreements    = 2;
-    throughput.previous.vericache_exact_target_checks   = 2;
-    throughput.current.vericache_exact_target_checks    = 5;
-    throughput.previous.vericache_host_tier_snapshots   = 1;
-    throughput.current.vericache_host_tier_snapshots    = 2;
-    throughput.current.vericache_l0_bytes                = 128;
-    throughput.current.vericache_l1_bytes                = 256;
-    throughput.current.vericache_l2_bytes                = 512;
-    throughput.current.vericache_l3_bytes                = 1024;
-    throughput.current.host_work                        = {
-                               .engine_boundary_ns            = 1000000,
-                               .program_submit_ns             = 2000000,
-                               .program_post_ns               = 3000000,
-                               .engine_commit_output_ns       = 4000000,
-                               .engine_maintenance_ns         = 5000000,
-                               .device_wait_ns                = 300000000,
-                               .decode_host_ns                = 10000000,
-                               .decode_device_wait_ns         = 200000000,
-                               .prefill_host_ns               = 3000000,
-                               .prefill_device_wait_ns        = 50000000,
-                               .control_host_ns               = 2000000,
-                               .control_device_wait_ns        = 50000000,
-                               .prefill_units                 = 4,
-                               .control_units                 = 1,
-                               .admission_policy_ns           = 1000000,
-                               .context_progress_ns           = 2000000,
-                               .stats_publication_ns          = 250000,
-                               .admission_policy_invocations  = 2,
-                               .context_progress_invocations  = 4,
-                               .stats_publication_invocations = 5,
-    };
+    throughput.interval_seconds              = 2.0;
+    throughput.computed_prefill_tokens       = 100;
+    throughput.committed_decode_tokens       = 40;
+    throughput.decode_rounds                 = 10;
+    throughput.previous.root_selections      = 2;
+    throughput.previous.reused_prompt_tokens = 1000;
+    throughput.current.running_requests      = 2;
+    throughput.current.waiting_requests      = 3;
+    throughput.current.root_selections       = 3;
+    throughput.current.reused_prompt_tokens  = 1512;
     const std::string human_throughput = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
                           human_throughput.find("decode=20.0tok/s") != std::string::npos &&
-                          human_throughput.find("materializing=1") != std::string::npos &&
-                          human_throughput.find("capture_pending=1") != std::string::npos &&
-                          human_throughput.find("terminal_pending=1") != std::string::npos &&
-                          human_throughput.find("avg_decode_batch=1.80") != std::string::npos &&
-                          human_throughput.find("host=15.00ms") != std::string::npos &&
-                          human_throughput.find("decode-host=1000.0us/round") != std::string::npos,
+                          human_throughput.find("rounds=10") != std::string::npos &&
+                          human_throughput.find("running=2") != std::string::npos &&
+                          human_throughput.find("waiting=3") != std::string::npos &&
+                          human_throughput.find("reused_prompt_tokens=512") != std::string::npos,
                       "human throughput report mismatch");
-    failures += check(human_throughput.find("vericache=l0->l1@48 l1->l2@1024") !=
-                          std::string::npos,
-                      "human throughput report omits hierarchical VeriCache state");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
-                          throughput_json.at("tokens").at("committed_decode") == 40,
+                          throughput_json.at("tokens").at("committed_decode") == 40 &&
+                          throughput_json.at("tokens").at("reused_prompt") == 512,
                       "throughput token deltas mismatch");
-    failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
-                      "throughput batch average mismatch");
-    failures += check(throughput_json.at("scheduler").at("materializing") == 1 &&
-                          throughput_json.at("scheduler").at("capture_pending") == 1 &&
-                          throughput_json.at("scheduler").at("terminal_pending") == 1,
-                      "context scheduler gauges missing");
-    failures += check(
-        std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -
-                 0.015) < 1.0e-15 &&
-            std::abs(throughput_json.at("host_work").at("device_wait_seconds").get<double>() -
-                     0.3) < 1.0e-15 &&
-            std::abs(throughput_json.at("host_work")
-                         .at("decode_host_microseconds_per_round")
-                         .get<double>() -
-                     1000.0) < 1.0e-12 &&
-            std::abs(throughput_json.at("host_work")
-                         .at("decode_device_wait_microseconds_per_round")
-                         .get<double>() -
-                     20000.0) < 1.0e-12 &&
-            std::abs(throughput_json.at("host_work")
-                         .at("detail_microseconds_per_invocation")
-                         .at("stats_publication")
-                         .get<double>() -
-                     50.0) < 1.0e-12,
-        "throughput Host work deltas or normalization are incorrect");
-
-    ThroughputReport zero_rounds;
-    const Json zero_rounds_json =
-        Json::parse(format_throughput_json("serve-test", 5001, zero_rounds));
-    failures += check(
-        zero_rounds_json.at("decode_batch").at("average_size").is_null() &&
-            zero_rounds_json.at("host_work").at("decode_host_microseconds_per_round").is_null() &&
-            zero_rounds_json.at("host_work")
-                .at("detail_microseconds_per_invocation")
-                .at("admission_policy")
-                .is_null(),
-        "zero Host-work denominators must serialize as null");
-    failures += check(
-        throughput_json.at("context_cache").at("selections").at("root") == 1 &&
-            throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
-            throughput_json.at("context_cache").at("occupancy").at("device_state_slots") == 3 &&
-            throughput_json.at("context_cache").at("pressure").at("spill_pages") == 4 &&
-            throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
-            !throughput_json.at("context_cache").contains("last_materialization"),
-        "context-cache throughput statistics missing or not interval-scoped");
-    failures += check(
-        throughput_json.at("hierarchical_vericache").at("enabled") == true &&
-            throughput_json.at("hierarchical_vericache").at("horizons").at("l0_to_l1") == 48 &&
-            throughput_json.at("hierarchical_vericache").at("l0_to_l1").at("checks") == 2 &&
-            throughput_json.at("hierarchical_vericache").at("l0_to_l1").at("accepted_tokens") == 7 &&
-            throughput_json.at("hierarchical_vericache").at("exact_target_fallback").at("checks") == 3 &&
-            throughput_json.at("hierarchical_vericache").at("host_tier").at("snapshots") == 1 &&
-            throughput_json.at("hierarchical_vericache").at("tier_bytes").at("l3_nvme") == 1024,
-        "hierarchical VeriCache throughput telemetry missing or not interval-scoped");
+    failures += check(throughput_json.at("decode_rounds") == 10 &&
+                          throughput_json.at("requests").at("running") == 2 &&
+                          throughput_json.at("requests").at("waiting") == 3 &&
+                          throughput_json.at("prefix_reuse").at("root_selections") == 1,
+                      "throughput gauges or interval deltas mismatch");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);

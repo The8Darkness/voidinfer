@@ -134,9 +134,8 @@ int main() {
         if((prefix<2048 || prefix>32768) && !l0_long)
             throw std::invalid_argument("device Engine witness prefix must be 2K..32K (L0 OSCAR: up to 260000)");
         EngineOptions options;
-        options.exl3_package=PinnedExl3PackageOptions{target,draft,{}};
-        options.exl3_package->round_implementation=
-            Exl3RoundImplementation::CoherentDevice;
+        options.model.target_directory=target;
+        options.model.draft_directory=draft;
         int long_outputs=128;
         if(const auto* output_option=std::getenv(
                "NINFER_TEST_ENGINE_DEVICE_OUTPUT_TOKENS")) {
@@ -146,15 +145,11 @@ int main() {
                     "device Engine long output budget must be 128..4096");
         }
         options.max_context=prefix+long_outputs+128;
-        options.kv_capacity=KvCapacityPolicy::explicit_capacity(options.max_context);
         options.max_concurrency=1;
-        options.enable_vision=false;
-        options.use_cuda_graph=false;
-        options.speculative={SpeculativeBackend::DFlash2,7,ProposalHead::Full};
         options.context_cache.enabled=true;
         options.context_cache.max_shared_prefixes=1;
-        // L0 OSCAR long witnesses: one terminal exact host snapshot of the full context.
-        if(l0_long)options.context_cache.host_kv_capacity_bytes=std::max<std::size_t>(
+        // One terminal exact host snapshot of the full context.
+        options.context_cache.host_kv_capacity_bytes=std::max<std::size_t>(
             options.context_cache.host_kv_capacity_bytes,
             static_cast<std::size_t>(options.max_context)*65536);
         options.max_pending_requests=2;
@@ -274,7 +269,6 @@ int main() {
         }
         if(first.generated_token_ids.empty() || first.generated_token_ids.size()>16 ||
            !first.speculative.enabled ||
-           first.speculative.backend!=SpeculativeBackend::DFlash2 ||
            first.reused_prompt_tokens!=0 ||
            first.prefix_reuse_path!=PrefixReusePath::Root ||
            !first.token_accounting.conserves_result_tokens(
