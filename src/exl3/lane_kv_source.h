@@ -15,12 +15,21 @@
 // A fill of a page that carries its L0 OSCAR codes (export assigns them)
 // packs the rows losslessly against those codes (l0_kv_pack.cuh, ~1.36x
 // smaller): the page stays deferred, now `packed_in_ram`. Under host memory
-// pressure (kv_spill_store.h) a fill writes the packed blob (or the FP16 rows
+// pressure (kv_spill_store.h: hard pressure for a fill on a lane's path, any
+// pressure for the relief pass) a fill writes the packed blob (or the FP16 rows
 // of a page without codes) to the spill file instead (the page stays
 // deferred, now `spilled`), and filled or packed pages of every source are
 // spilled before the planes grow. A restore decodes packed and spilled rows
 // straight into its planes and re-homes the pages; other readers bring them
 // back into RAM as FP16. NINFER_EXL3_KV_PACK=0 fills FP16 rows.
+//
+// Plane sets: a source over growable planes owns them (`backing`), so an
+// agent's history stays where its last lane wrote it. A context binds one
+// set at a time and maps it into its fixed plane window; resuming an agent
+// whose set is idle binds that set (a remap, no copy), a fresh conversation
+// binds a new set, and the previous set keeps its deferred pages. Only under
+// host memory pressure are idle sets packed (and spilled) and their planes
+// released (relieve_memory_pressure).
 //
 // Locking: a page's owner (`source`), payload vectors and `deferred` flag
 // change only under the process-wide payload mutex held exclusively; readers
@@ -41,6 +50,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
 #include <execution>
 #include <memory>
 #include <mutex>
@@ -84,6 +97,24 @@ public:
     Exl3LaneKvSource& operator=(const Exl3LaneKvSource&) = delete;
 
     const Planes& planes() const noexcept { return planes_; }
+
+    // Plane set ownership (see above). `release_rows` shrinks the backing to
+    // the given rows (called on idle sets once no page rows are deferred).
+    void set_backing(std::shared_ptr<void> backing, std::function<void(int)> release_rows) {
+        backing_ = std::move(backing);
+        release_rows_ = std::move(release_rows);
+    }
+    const std::shared_ptr<void>& backing() const noexcept { return backing_; }
+    // At most one owner (a context, or a pressure relief pass) binds a set.
+    bool try_bind(const void* owner) noexcept {
+        const void* expected = nullptr;
+        return bound_.compare_exchange_strong(expected, owner, std::memory_order_acq_rel);
+    }
+    void unbind(const void* owner) noexcept {
+        const void* expected = owner;
+        bound_.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+    }
+    const void* bound() const noexcept { return bound_.load(std::memory_order_acquire); }
 
     // The page's rows still live only in this source's planes.
     bool holds(const Exl3ExactKVPage& page) const noexcept {
@@ -159,8 +190,57 @@ public:
     // Host memory is short: spills filled and packed lane-backed pages of
     // every source (idle histories) until `extra` more bytes fit above the
     // spill floor.
+    // Below the floor a background pass restores the margin off the lanes'
+    // critical path; only growth that would reach into the lower half of the
+    // floor is relieved by the caller.
     static void relieve_memory_pressure(std::uint64_t extra) {
         if (!Exl3KvSpillStore::get() || !Exl3KvSpillStore::under_pressure(extra)) return;
+        if (!Exl3KvSpillStore::under_pressure(extra, true)) {
+            background_relief();
+            return;
+        }
+        relieve_now(extra);
+    }
+
+private:
+    struct BackgroundRelief {
+        std::mutex mutex;
+        std::condition_variable wake;
+        bool requested = false;
+        int device = 0;
+    };
+    static void background_relief() {
+        // Leaked: the worker outlives static destruction at process exit.
+        static BackgroundRelief* relief = [] {
+            auto* state = new BackgroundRelief;
+            check(cudaGetDevice(&state->device), "KV relief device");
+            std::thread([state] {
+                if (cudaSetDevice(state->device) != cudaSuccess) return;
+                for (;;) {
+                    {
+                        std::unique_lock lock(state->mutex);
+                        state->wake.wait(lock, [&] { return state->requested; });
+                        state->requested = false;
+                    }
+                    try {
+                        relieve_now(0);
+                    } catch (const std::exception& error) {
+                        std::fprintf(stderr, "KV relief failed: %s\n", error.what());
+                    }
+                }
+            }).detach();
+            return state;
+        }();
+        {
+            std::lock_guard lock(relief->mutex);
+            relief->requested = true;
+        }
+        relief->wake.notify_one();
+    }
+    static void relieve_now(std::uint64_t extra) {
+        static std::mutex relief_mutex;
+        std::lock_guard relieving(relief_mutex);
+        if (!Exl3KvSpillStore::under_pressure(extra)) return;
         std::vector<std::shared_ptr<Exl3LaneKvSource>> sources;
         {
             std::lock_guard lock(registry_mutex());
@@ -171,7 +251,25 @@ public:
             source->spill_filled(extra);
             if (!Exl3KvSpillStore::under_pressure(extra)) return;
         }
+        // Idle plane sets: their deferred rows are packed (spilled while the
+        // pressure lasts) and the planes released.
+        static const char relief_owner = 0;
+        for (const auto& source : sources) {
+            if (!source->backing_ || !source->try_bind(&relief_owner)) continue;
+            try {
+                source->fill_where([](const Exl3ExactKVPage& page) { return page.pins.load() == 0; });
+                source->spill_filled(extra);
+                if (!source->deferred_beyond(0) && source->release_rows_) source->release_rows_(0);
+            } catch (...) {
+                source->unbind(&relief_owner);
+                throw;
+            }
+            source->unbind(&relief_owner);
+            if (!Exl3KvSpillStore::under_pressure(extra)) return;
+        }
     }
+
+public:
 
     // Fills every page of this source holding a row >= `row`.
     void materialize_from(int row) {
@@ -836,7 +934,7 @@ private:
                             packed.push_back(page);
                             bytes += page->packed.size();
                         }
-                    if (!packed.empty() && Exl3KvSpillStore::under_pressure(bytes))
+                    if (!packed.empty() && Exl3KvSpillStore::under_pressure(bytes, true))
                         par_each(packed.begin(), packed.end(), [&](Exl3ExactKVPage* page) { spill_packed_locked(*page); });
                 }
                 std::sort(rest.begin(), rest.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
@@ -847,7 +945,7 @@ private:
         if (may_spill && Exl3KvSpillStore::get()) {
             std::uint64_t bytes = 0;
             for (const auto* page : pages) bytes += page_bytes(*page);
-            if (Exl3KvSpillStore::under_pressure(bytes)) {
+            if (Exl3KvSpillStore::under_pressure(bytes, true)) {
                 spill_from_planes_locked(pages);
                 return;
             }
@@ -900,6 +998,9 @@ private:
     }
 
     Planes planes_;
+    std::shared_ptr<void> backing_;
+    std::function<void(int)> release_rows_;
+    std::atomic<const void*> bound_{nullptr};
     std::mutex mutex_;
     std::vector<std::weak_ptr<Exl3ExactKVPage>> pages_;
     std::size_t live_hint_ = 0;

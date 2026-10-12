@@ -5,6 +5,12 @@
 // physical memory follows the bytes actually in use, so per-context buffers
 // sized for max_context cost only what the context occupies (the paged-pool
 // effect without block tables).
+//
+// A region may also be mirrored into a window: a second reserved range that
+// maps the same chunks (attach_window). Kernels and captured graphs keep the
+// window address while the backing behind it changes (L0 plane sets of
+// agents trade places in a lane by remapping, not by copying), and the
+// backing stays reachable at its own address meanwhile.
 #include <cuda.h>
 
 #include <algorithm>
@@ -77,6 +83,13 @@ public:
                 cuMemRelease(handle);
                 throw std::runtime_error("growable region access");
             }
+            if (window_ && (cuMemMap(window_ + mapped, granularity_, 0, handle, 0) != CUDA_SUCCESS ||
+                            cuMemSetAccess(window_ + mapped, granularity_, &access_, 1) != CUDA_SUCCESS)) {
+                cuMemUnmap(window_ + mapped, granularity_);
+                cuMemUnmap(address, granularity_);
+                cuMemRelease(handle);
+                throw std::runtime_error("growable region window map");
+            }
             handles_.push_back(handle);
             mapped_.store(mapped + granularity_, std::memory_order_release);
         }
@@ -91,6 +104,7 @@ public:
         std::size_t mapped = mapped_.load(std::memory_order_relaxed);
         while (mapped > bytes && !handles_.empty()) {
             mapped -= granularity_;
+            if (window_) cuMemUnmap(window_ + mapped, granularity_);
             cuMemUnmap(base_ + mapped, granularity_);
             cuMemRelease(handles_.back());
             handles_.pop_back();
@@ -98,9 +112,39 @@ public:
         mapped_.store(mapped, std::memory_order_release);
     }
 
+    // Maps every chunk (and later growth) also at `window` (a reserved range
+    // of at least this capacity). The caller guarantees no in-flight work
+    // references the window range being replaced.
+    void attach_window(CUdeviceptr window) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (window_) throw std::logic_error("growable region window already attached");
+        const std::size_t mapped = mapped_.load(std::memory_order_relaxed);
+        for (std::size_t index = 0; index < handles_.size(); ++index)
+            if (cuMemMap(window + index * granularity_, granularity_, 0, handles_[index], 0) != CUDA_SUCCESS) {
+                if (index) cuMemUnmap(window, index * granularity_);
+                throw std::runtime_error("growable region window map");
+            }
+        if (mapped && cuMemSetAccess(window, mapped, &access_, 1) != CUDA_SUCCESS) {
+            cuMemUnmap(window, mapped);
+            throw std::runtime_error("growable region window access");
+        }
+        window_ = window;
+    }
+    // Unmaps the window (the chunks stay mapped at this region's address).
+    void detach_window() noexcept {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (!window_) return;
+        const std::size_t mapped = mapped_.load(std::memory_order_relaxed);
+        if (mapped) cuMemUnmap(window_, mapped);
+        window_ = 0;
+    }
+
     void reset() noexcept {
         if (!base_) return;
         const std::lock_guard<std::mutex> lock(mutex_);
+        if (window_ && mapped_.load(std::memory_order_relaxed))
+            cuMemUnmap(window_, mapped_.load(std::memory_order_relaxed));
+        window_ = 0;
         std::size_t mapped = mapped_.load(std::memory_order_relaxed);
         while (!handles_.empty()) {
             mapped -= granularity_;
@@ -127,13 +171,41 @@ private:
     std::size_t round_up(std::size_t bytes) const noexcept {
         return granularity_ ? (bytes + granularity_ - 1) / granularity_ * granularity_ : bytes;
     }
-    CUdeviceptr base_ = 0;
+    CUdeviceptr base_ = 0, window_ = 0;
     std::size_t capacity_ = 0, granularity_ = 0;
     std::atomic<std::size_t> mapped_{0};
     std::mutex mutex_;
     CUmemAllocationProp prop_{};
     CUmemAccessDesc access_{};
     std::vector<CUmemGenericAllocationHandle> handles_;
+};
+
+// A reserved virtual range without backing of its own: the window that a
+// growable region's chunks are mirrored into (attach_window).
+class Exl3RegionWindow {
+public:
+    explicit Exl3RegionWindow(std::size_t capacity) {
+        CUdevice device = 0;
+        if (cuCtxGetDevice(&device) != CUDA_SUCCESS) throw std::runtime_error("region window device");
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_HOST;
+        std::size_t granularity = 0;
+        if (cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS)
+            throw std::runtime_error("region window granularity");
+        capacity_ = (std::max<std::size_t>(capacity, 1) + granularity - 1) / granularity * granularity;
+        if (cuMemAddressReserve(&base_, capacity_, 0, 0, 0) != CUDA_SUCCESS)
+            throw std::runtime_error("region window reserve");
+    }
+    ~Exl3RegionWindow() { if (base_) cuMemAddressFree(base_, capacity_); }
+    Exl3RegionWindow(const Exl3RegionWindow&) = delete;
+    Exl3RegionWindow& operator=(const Exl3RegionWindow&) = delete;
+    CUdeviceptr base() const noexcept { return base_; }
+    std::size_t capacity_bytes() const noexcept { return capacity_; }
+
+private:
+    CUdeviceptr base_ = 0;
+    std::size_t capacity_ = 0;
 };
 
 }  // namespace ninfer::exl3

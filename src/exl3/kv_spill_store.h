@@ -48,8 +48,9 @@ public:
         return store;
     }
 
-    // Available physical memory below the configured floor (plus `extra`).
-    static bool under_pressure(std::uint64_t extra = 0) {
+    // Available physical memory below the configured floor (plus `extra`);
+    // `hard`: below half the floor (plus `extra`).
+    static bool under_pressure(std::uint64_t extra = 0, bool hard = false) {
         static const std::uint64_t floor = [] {
             const char* value = std::getenv("NINFER_EXL3_KV_SPILL_FREE_MIB");
             return static_cast<std::uint64_t>(value ? std::strtoull(value, nullptr, 10) : 12288) << 20;
@@ -57,7 +58,7 @@ public:
         MEMORYSTATUSEX memory{};
         memory.dwLength = sizeof(memory);
         if (!GlobalMemoryStatusEx(&memory)) return false;
-        return memory.ullAvailPhys < floor + extra;
+        return memory.ullAvailPhys < (hard ? floor / 2 : floor) + extra;
     }
 
     std::int64_t allocate() {

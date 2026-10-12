@@ -343,7 +343,21 @@ struct DeviceAllocation {
     // L0 OSCAR K/V planes: host memory behind a fixed GPU address range,
     // backed as the context grows (ensure_host_bytes) instead of pinning
     // max_context rows per lane up front. The CPU reaches it by copies only.
-    std::unique_ptr<Exl3GrowableDeviceRegion> host_region;
+    // The range (`window`, what kernels and graphs address) mirrors the
+    // chunks of the bound plane set's region (`host_region`), which a lane
+    // swaps by remapping (swap_backing).
+    std::shared_ptr<Exl3GrowableDeviceRegion> host_region;
+    std::unique_ptr<Exl3RegionWindow> window;
+    // Binds `next` (same capacity) behind the window; returns the previous
+    // backing. No in-flight work may reference the window.
+    std::shared_ptr<Exl3GrowableDeviceRegion> swap_backing(std::shared_ptr<Exl3GrowableDeviceRegion> next) {
+        if(!host_region || !window || !next || next->capacity_bytes()>window->capacity_bytes())
+            throw std::logic_error("plane backing swap extent");
+        host_region->detach_window();
+        next->attach_window(window->base());
+        std::swap(host_region,next);
+        return next;
+    }
     bool cpu_visible() const noexcept {return !host_region;}
     void ensure_host_bytes(std::size_t used) {
         if(host_region)host_region->ensure(std::min(used,bytes));
@@ -410,8 +424,10 @@ struct DeviceAllocation {
     void release() noexcept {
         if(!ptr)return;
         if(host_region) {
-            host_region->reset();
+            // The backing may outlive the planes (a plane set with deferred pages).
+            host_region->detach_window();
             host_region.reset();
+            window.reset();
             if(retirement)retirement->device_credit.reset();
             ptr=nullptr;
             return;
@@ -478,9 +494,11 @@ struct DeviceAllocation {
         if(l0_host_kv_plane(label)) {
             host_mapped=true;
             if(growable_host_planes(label,bytes)) {
-                host_region=std::make_unique<Exl3GrowableDeviceRegion>();
+                window=std::make_unique<Exl3RegionWindow>(bytes);
+                host_region=std::make_shared<Exl3GrowableDeviceRegion>();
                 host_region->reserve(bytes,true);
-                ptr=host_region->data<void>();
+                host_region->attach_window(window->base());
+                ptr=reinterpret_cast<void*>(window->base());
             } else
                 cuda_check(cudaHostAlloc(&ptr,bytes,cudaHostAllocMapped|cudaHostAllocPortable),label);
         } else {
@@ -1515,6 +1533,35 @@ struct Exl3TextContext::Impl {
     // their KV rows in these L0 planes until the rows are about to change.
     std::shared_ptr<Exl3LaneKvSource> kv_source;
     // The lane source over this context's L0 host planes (null otherwise).
+    // Growable planes form a plane set the source owns (lane_kv_source.h):
+    // its regions, addressed at their own ranges by the source and mirrored
+    // into this context's plane windows while bound.
+    struct PlaneSet {
+        std::array<std::shared_ptr<Exl3GrowableDeviceRegion>,kLayers> k,v;
+    };
+    std::shared_ptr<Exl3LaneKvSource> make_plane_source(const std::shared_ptr<PlaneSet>& set) {
+        Exl3LaneKvSource::Planes planes;
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer]) {
+                planes.k[planes.banks]=set->k[layer]->data<const std::uint16_t>();
+                planes.v[planes.banks]=set->v[layer]->data<const std::uint16_t>();
+                ++planes.banks;
+            }
+        planes.cpu_visible=false;
+        auto source=Exl3LaneKvSource::create(planes);
+        source->set_backing(set,[set](int rows) {
+            const std::size_t used=static_cast<std::size_t>(std::max(rows,0))*kPlaneRowBytes;
+            for(int layer=0;layer<kLayers;++layer)
+                for(const auto& region:{set->k[layer],set->v[layer]})if(region)region->shrink(used);
+        });
+        return source;
+    }
+    bool plane_sets_enabled() const {
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer] && (!cache_k[layer] || !cache_v[layer] ||
+               !cache_k[layer]->window || !cache_v[layer]->window))return false;
+        return true;
+    }
     void ensure_kv_source() {
         if(kv_source || exact_line || !Exl3NativeContextExtent::l0_oscar_enabled() || host_kv.enabled)return;
         Exl3LaneKvSource::Planes planes;
@@ -1529,9 +1576,68 @@ struct Exl3TextContext::Impl {
                 ++planes.banks;
             }
         if(!planes.banks)return;
+        if(plane_sets_enabled()) {
+            auto set=std::make_shared<PlaneSet>();
+            for(int layer=0;layer<kLayers;++layer)
+                if(full_layers[layer]) {set->k[layer]=cache_k[layer]->host_region;set->v[layer]=cache_v[layer]->host_region;}
+            kv_source=make_plane_source(set);
+            (void)kv_source->try_bind(this);
+            return;
+        }
         planes.cpu_visible=cpu_visible;
         kv_source=Exl3LaneKvSource::create(planes);
     }
+    // Binds `next` (already claimed for this context): its regions go behind
+    // the plane windows; the previous set keeps its pages and becomes idle.
+    void bind_plane_set(std::shared_ptr<Exl3LaneKvSource> next) {
+        auto set=std::static_pointer_cast<PlaneSet>(next->backing());
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer]) {
+                (void)cache_k[layer]->swap_backing(set->k[layer]);
+                (void)cache_v[layer]->swap_backing(set->v[layer]);
+            }
+        if(kv_source)kv_source->unbind(this);
+        kv_source=std::move(next);
+        ++plane_set_binds;
+    }
+    // A new empty plane set for a fresh conversation.
+    void bind_fresh_plane_set() {
+        auto set=std::make_shared<PlaneSet>();
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer]) {
+                for(auto* side:{&set->k[layer],&set->v[layer]}) {
+                    *side=std::make_shared<Exl3GrowableDeviceRegion>();
+                    (*side)->reserve(cache_k[layer]->bytes,true);
+                }
+            }
+        auto source=make_plane_source(set);
+        (void)source->try_bind(this);
+        bind_plane_set(std::move(source));
+    }
+    // Restoring a history whose rows an idle plane set holds (the agent's
+    // own set, where its last lane left it): bind that set instead of
+    // copying the rows into the current one.
+    void adopt_plane_set_of(const Exl3ExactHostState& state) {
+        if(!kv_source || !kv_source->backing() || exact_line)return;
+        std::shared_ptr<Exl3LaneKvSource> best;
+        std::size_t best_count=0;
+        {
+            std::shared_lock payload(exl3_page_payload_mutex());
+            std::vector<std::pair<Exl3LaneKvSource*,std::size_t>> counts;
+            for(const auto& page:state.kv_pages_) {
+                const auto& owner=page->source;
+                if(!owner || owner==kv_source || !owner->backing() || !owner->holds(*page))continue;
+                auto at=std::find_if(counts.begin(),counts.end(),[&](const auto& c){return c.first==owner.get();});
+                std::size_t count=1;
+                if(at==counts.end())counts.emplace_back(owner.get(),1);
+                else count=++at->second;
+                if(count>best_count){best_count=count;best=owner;}
+            }
+        }
+        if(!best || best_count*2<state.kv_pages_.size() || !best->try_bind(this))return;
+        bind_plane_set(std::move(best));
+    }
+    std::uint64_t plane_set_binds=0;
     // Called before rows >= `row` of the L0 planes are rewritten.
     void kv_rows_rewritten_from(int row) {
         line_fp8_rewritten_from(row);
@@ -1545,6 +1651,13 @@ struct Exl3TextContext::Impl {
         if(kv_rewrite_pending<0)return;
         const int row=kv_rewrite_pending;
         kv_rewrite_pending=-1;
+        // A fresh conversation over planes that still hold another history's
+        // deferred pages: that set stays as it is (idle) and a new one is bound.
+        if(row==0 && kv_source && kv_source->backing() && kv_source->deferred_beyond(0)) {
+            line_fp8_rewritten_from(0);
+            bind_fresh_plane_set();
+            return;
+        }
         kv_rows_rewritten_from(row);
     }
     // Complete L0 OSCAR code chunks of the resident lineage (export/restore).
@@ -3646,6 +3759,7 @@ struct Exl3TextContext::Impl {
     // granule (~1 s of GPU idle at 64K when mapped inline). The returned
     // future must be joined before the planes shrink or are released.
     std::future<void> pregrow_l0_planes(int rows) {
+        if(!exact_line)consume_kv_rewrite();
         const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
         std::vector<DeviceAllocation*> planes;
         std::size_t step=0;
@@ -13780,19 +13894,32 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     // The restored pages stay pinned (no pressure spill or foreign re-home of
     // their payload) until the restore has read them.
     const Exl3PagePins restore_pins(state.kv_pages_);
+    // NINFER_EXL3_VERICACHE_STATS: one KV_RESTORE line per restore (phase ms).
+    using RestoreClock=std::chrono::steady_clock;
+    const auto restore_begin=RestoreClock::now();
+    auto restore_mark=restore_begin;
+    std::array<double,5> restore_ms{};
+    const auto restore_phase=[&](int phase) {
+        const auto now=RestoreClock::now();
+        restore_ms[phase]+=std::chrono::duration<double,std::milli>(now-restore_mark).count();
+        restore_mark=now;
+    };
     // Lane-backed pages: this lane's deferred pages outside the restored
     // history are filled before the planes change; the restored state's own
     // still-deferred pages already sit in these planes. Pages backed by
     // another lane are filled from that lane's planes.
     impl_->kv_rewrite_pending=-1;   // the handover below is exact
     impl_->line_fp8_rewritten_from(0);
-    impl_->ensure_l0_rows(state.position_);
     impl_->ensure_kv_source();
+    impl_->adopt_plane_set_of(state);
+    impl_->ensure_l0_rows(state.position_);
     const bool all_lane_resident=kv_lane_resident(state);
     // Filled pages of the restored history trade places with this lane's
     // outgoing pages (no second host copy during the handover).
     if(impl_->kv_source && !all_lane_resident)impl_->kv_source->exchange(state.kv_pages_);
+    restore_phase(0);
     if(impl_->kv_source)impl_->kv_source->materialize_except(state.kv_pages_);
+    restore_phase(1);
     // Pages these planes already hold (own lane-backed pages; pages of other
     // lanes copied plane to plane, one DMA per bank and contiguous run) are
     // not copied from values; other lane-backed pages are filled first.
@@ -13837,6 +13964,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                 if(page->source_id.load())adoptable.push_back(page);
             }
     }
+    restore_phase(2);
     const auto lane_resident_page=[&](const std::shared_ptr<const Exl3ExactKVPage>& page) {
         return all_lane_resident ||
             std::binary_search(resident_pages.begin(),resident_pages.end(),page.get());
@@ -13997,8 +14125,15 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
         if(restore_layer_observer)restore_layer_observer(layer);
     }
     payload_read.unlock();
+    restore_phase(3);
     // Restored filled lane-backed pages now live in these planes: re-home them.
     if(impl_->kv_source && !adoptable.empty())impl_->kv_source->adopt(adoptable);
+    restore_phase(4);
+    if(std::getenv("NINFER_EXL3_VERICACHE_STATS"))
+        std::fprintf(stderr,"KV_RESTORE rows=%d pages=%zu lane_resident=%zu all_resident=%d exchange_ms=%.1f fill_ms=%.1f "
+            "foreign_ms=%.1f layers_ms=%.1f adopt_ms=%.1f total_ms=%.1f\n",state.position_,state.kv_pages_.size(),
+            resident_pages.size(),all_lane_resident?1:0,restore_ms[0],restore_ms[1],restore_ms[2],restore_ms[3],
+            restore_ms[4],std::chrono::duration<double,std::milli>(RestoreClock::now()-restore_begin).count());
     // Plane rows of the previous history beyond this one are no longer needed
     // (rows still backing deferred pages stay mapped).
     impl_->release_l0_rows_beyond(state.position_,
