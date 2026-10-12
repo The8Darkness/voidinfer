@@ -731,7 +731,7 @@ public:
     // Verifies the remaining drafted tokens on the line alone (no further
     // round: terminal, budget or cancellation).
     VerifiedBlock flush_fold(std::span<const std::int64_t> tokens,float delta) {
-        if(phase_!=Phase::ready || !line_ || fold_armed_ ||
+        if((phase_!=Phase::ready && phase_!=Phase::closed) || !line_ || fold_armed_ ||
            static_cast<int>(tokens.size())!=frontier_-verified_frontier_)
             throw std::logic_error("folded verification flush");
         if(tokens.empty())return {};
@@ -773,8 +773,10 @@ public:
     // the line head that the next block forwards first, sharing that block's
     // history stream; the drafting context re-runs them on its L0 history.
     // Roots stay at the line frontier until a block is accepted.
+    // A block ending in a terminal token is launched, settled and committed on
+    // a closed round, like the synchronous verify/commit_verification.
     void launch_async(std::span<const std::int64_t> tokens,float delta) {
-        if(phase_!=Phase::ready || !line_ || fold_armed_ || async_inflight_ || fold_commit_.pending ||
+        if((phase_!=Phase::ready && phase_!=Phase::closed) || !line_ || fold_armed_ || async_inflight_ || fold_commit_.pending ||
            tokens.empty() || static_cast<int>(tokens.size())!=frontier_-verified_frontier_ ||
            line_->position()!=line_frontier())
             throw std::logic_error("asynchronous verification launch extent");
@@ -799,7 +801,9 @@ public:
     // Waits for the block in flight and checks it; `next_token` is the token
     // drafted after it (< 0: none, the last row goes unchecked).
     VerifiedBlock settle_async(std::int64_t next_token,float delta) {
-        if(phase_!=Phase::ready || !async_inflight_)throw std::logic_error("asynchronous verification settle");
+        const auto settled_phase=phase_;
+        if((phase_!=Phase::ready && phase_!=Phase::closed) || !async_inflight_)
+            throw std::logic_error("asynchronous verification settle");
         phase_=Phase::executing;
         try {
             const auto wait_start=Clock::now();
@@ -855,7 +859,7 @@ public:
             totals_.corrected_blocks+=result.corrected?1:0;
             result.verify_ms=elapsed(async_start_);
             totals_.verify_ms+=elapsed(wait_start);
-            phase_=Phase::ready;
+            phase_=settled_phase;
             return result;
         } catch(...) {
             phase_=Phase::poisoned;
@@ -866,7 +870,8 @@ public:
     // Keeps the first `retained` tokens of the settled block (all, or the
     // prefix the output session accepted).
     void commit_async(std::size_t retained) {
-        if(phase_!=Phase::ready || !fold_commit_.pending || retained>fold_commit_.tokens.size() || async_inflight_)
+        if((phase_!=Phase::ready && phase_!=Phase::closed) || !fold_commit_.pending ||
+           retained>fold_commit_.tokens.size() || async_inflight_)
             throw std::logic_error("asynchronous verification commit");
         auto commit=std::move(fold_commit_);
         fold_commit_={};
