@@ -1,0 +1,11 @@
+w 4096 ours_l0_d12x       KL 0.01374 +-0.00566  top1-agree 97.24%  (n=8)
+w 4096 ninfer.nv.fp8      KL 0.08705 +-0.03929  top1-agree 92.55%  (n=8)
+w 4096 ninfer.nv.bf16     KL 0.08473 +-0.03807  top1-agree 92.65%  (n=8)
+w 4096 ninfer.gw.fp8      KL 0.08152 +-0.02890  top1-agree 92.43%  (n=8)
+w 4096 ninfer.gw.bf16     KL 0.08010 +-0.02781  top1-agree 92.38%  (n=8)
+-- all windows
+ALL   ours_l0_d12x       KL 0.01374 +-0.00566 (n=8)
+ALL   ninfer.nv.fp8      KL 0.08705 +-0.03929 (n=8)
+ALL   ninfer.nv.bf16     KL 0.08473 +-0.03807 (n=8)
+ALL   ninfer.gw.fp8      KL 0.08152 +-0.02890 (n=8)
+ALL   ninfer.gw.bf16     KL 0.08010 +-0.02781 (n=8)

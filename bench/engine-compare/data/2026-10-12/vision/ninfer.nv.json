@@ -1,0 +1,130 @@
+[
+ {
+  "label": "ninfer.nv",
+  "image": "natural_scene",
+  "rep": 0,
+  "ok": true,
+  "s": 1.2886312007904053,
+  "usage": {
+   "completion_tokens": 256,
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   },
+   "prompt_tokens": 404,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "total_tokens": 660
+  },
+  "timings": {
+   "cache_n": 0,
+   "draft_n": 524,
+   "draft_n_accepted": 179,
+   "predicted_ms": 1145.7382,
+   "predicted_n": 256,
+   "predicted_per_second": 222.56393301715872,
+   "predicted_per_token_ms": 4.493090980392157,
+   "prompt_ms": 86.4084,
+   "prompt_n": 404,
+   "prompt_per_second": 4675.4713662097665,
+   "prompt_per_token_ms": 0.2138821782178218
+  },
+  "text": "This is a cheerful, flat-style digital illustration titled **“A SUNNY HOUSE BY THE MOUNTAINS”**, displayed in bold, dark blue capital letters at the top left of the image.\n\nThe scene depicts a peaceful rural landscape under a bright sky:\n\n---\n\n### **Sky and Sun**\n- The background features a clear, light-blue sky that gradients slightly lighter near the horizon.\n- In the upper right corner, a large, solid yellow sun with a thin orange outline shines brightly, reinforcing the “sunny” theme.\n\n---\n\n### **Mountains**\n- Behind the house are three stylized mountains:\n  - The central mountain is the tallest, with a white snow-capped peak and gray-blue slopes.\n  - To its left is a smaller, darker gray mountain.\n  - To its right is another medium-sized gray mountain, partially obscured by the tree.\n- All mountains have simple triangular shapes with no texture or detail — consistent with the minimalist art style.\n\n---\n\n### **House**\n- Centered in the foreground is a small, cozy house:\n  - **Walls**: Light beige or tan color.\n  - **Roof**: A steep, red gabled roof with black outlines.\n"
+ },
+ {
+  "label": "ninfer.nv",
+  "image": "natural_scene",
+  "rep": 1,
+  "ok": true,
+  "s": 1.2122993469238281,
+  "usage": {
+   "completion_tokens": 256,
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   },
+   "prompt_tokens": 404,
+   "prompt_tokens_details": {
+    "cached_tokens": 395
+   },
+   "total_tokens": 660
+  },
+  "timings": {
+   "cache_n": 395,
+   "draft_n": 524,
+   "draft_n_accepted": 179,
+   "predicted_ms": 1144.0877,
+   "predicted_n": 256,
+   "predicted_per_second": 222.88501135009142,
+   "predicted_per_token_ms": 4.486618431372549,
+   "prompt_ms": 42.946400000000004,
+   "prompt_n": 9,
+   "prompt_per_second": 209.56354898198683,
+   "prompt_per_token_ms": 4.771822222222223
+  },
+  "text": "This is a cheerful, flat-style digital illustration titled **“A SUNNY HOUSE BY THE MOUNTAINS”**, displayed in bold, dark blue capital letters at the top left of the image.\n\nThe scene depicts a peaceful rural landscape under a bright sky:\n\n---\n\n### **Sky and Sun**\n- The background features a clear, light-blue sky that gradients slightly lighter near the horizon.\n- In the upper right corner, a large, solid yellow sun with a thin orange outline shines brightly, reinforcing the “sunny” theme.\n\n---\n\n### **Mountains**\n- Behind the house are three stylized mountains:\n  - The central mountain is the tallest, with a white snow-capped peak and gray-blue slopes.\n  - To its left is a smaller, darker gray mountain.\n  - To its right is another medium-sized gray mountain, partially obscured by the tree.\n- All mountains have simple triangular shapes with no texture or detail — consistent with the minimalist art style.\n\n---\n\n### **House**\n- Centered in the foreground is a small, cozy house:\n  - **Walls**: Light beige or tan color.\n  - **Roof**: A steep, red gabled roof with black outlines.\n"
+ },
+ {
+  "label": "ninfer.nv",
+  "image": "visual_chart",
+  "rep": 0,
+  "ok": true,
+  "s": 1.0957694053649902,
+  "usage": {
+   "completion_tokens": 256,
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   },
+   "prompt_tokens": 411,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "total_tokens": 667
+  },
+  "timings": {
+   "cache_n": 0,
+   "draft_n": 437,
+   "draft_n_accepted": 192,
+   "predicted_ms": 950.456,
+   "predicted_n": 256,
+   "predicted_per_second": 268.29227234085533,
+   "predicted_per_token_ms": 3.727278431372549,
+   "prompt_ms": 107.77770000000001,
+   "prompt_n": 411,
+   "prompt_per_second": 3813.404813797288,
+   "prompt_per_token_ms": 0.2622328467153285
+  },
+  "text": "This chart, titled **“NIFER VISION 731”**, appears to be a simple visual representation or test of basic shape recognition and spatial relationships — possibly for educational, diagnostic, or cognitive assessment purposes. It is divided into two labeled sections: **COUNT** and **POSITION**.\n\n---\n\n### ✅ What the Chart Shows:\n\n#### 1. **COUNT Section**\n- Displays **three red circles** arranged horizontally.\n- Below them, text reads: **“THREE RED CIRCLES”**\n- This section tests the ability to count objects and identify their color and shape.\n\n> **Values you can read:**\n> - Number of shapes: **3**\n> - Shape type: **Circles**\n> - Color: **Red**\n> - Label: **“THREE RED CIRCLES”**\n\n---\n\n#### 2. **POSITION Section**\n- Shows a **blue square** on the left.\n- An arrow points from the blue square to a **green triangle** on the right.\n- Below each shape are labels:\n  - Under the square: **“BLUE SQUARE”**\n  - Under the triangle: **“GREEN TRIANGLE”**\n- The arrow suggests a directional relationship (e.g., “"
+ },
+ {
+  "label": "ninfer.nv",
+  "image": "visual_chart",
+  "rep": 1,
+  "ok": true,
+  "s": 1.0070321559906006,
+  "usage": {
+   "completion_tokens": 256,
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   },
+   "prompt_tokens": 411,
+   "prompt_tokens_details": {
+    "cached_tokens": 402
+   },
+   "total_tokens": 667
+  },
+  "timings": {
+   "cache_n": 402,
+   "draft_n": 437,
+   "draft_n_accepted": 192,
+   "predicted_ms": 949.0168,
+   "predicted_n": 256,
+   "predicted_per_second": 268.69914210159396,
+   "predicted_per_token_ms": 3.7216345098039216,
+   "prompt_ms": 43.9877,
+   "prompt_n": 9,
+   "prompt_per_second": 204.60265028633006,
+   "prompt_per_token_ms": 4.887522222222222
+  },
+  "text": "This chart, titled **“NIFER VISION 731”**, appears to be a simple visual representation or test of basic shape recognition and spatial relationships — possibly for educational, diagnostic, or cognitive assessment purposes. It is divided into two labeled sections: **COUNT** and **POSITION**.\n\n---\n\n### ✅ What the Chart Shows:\n\n#### 1. **COUNT Section**\n- Displays **three red circles** arranged horizontally.\n- Below them, text reads: **“THREE RED CIRCLES”**\n- This section tests the ability to count objects and identify their color and shape.\n\n> **Values you can read:**\n> - Number of shapes: **3**\n> - Shape type: **Circles**\n> - Color: **Red**\n> - Label: **“THREE RED CIRCLES”**\n\n---\n\n#### 2. **POSITION Section**\n- Shows a **blue square** on the left.\n- An arrow points from the blue square to a **green triangle** on the right.\n- Below each shape are labels:\n  - Under the square: **“BLUE SQUARE”**\n  - Under the triangle: **“GREEN TRIANGLE”**\n- The arrow suggests a directional relationship (e.g., “"
+ }
+]

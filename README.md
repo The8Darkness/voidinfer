@@ -4,40 +4,75 @@
 
 VoidInfer is a native Windows C++20/CUDA inference engine for **Qwen3.8-27B on a single RTX 5090**
 (Blackwell, `sm_120a`). It runs 6-bit EXL3 weights through hand-written CUDA kernels and does
-DFlash2 speculative decoding with exact, transactional state rollback. Its default KV tier
-(L0 OSCAR: INT2 history on the GPU with an exact FP16 hot-row cache, FP16 planes in host RAM)
-stretches one request to **262,144 tokens** on a 32 GiB GPU. It began as a Windows adaptation of
-the NInfer codebase and has since grown into its own engine.
+DFlash2 speculative decoding with exact, transactional state rollback. Attention history lives on
+the GPU as INT4 OSCAR codes (L0) with full-precision history in host RAM, and every drafted token is
+verified against that full-precision history before it is published (exact VeriCache). One request
+reaches **262,144 tokens** and eight ~108K-token agents (865K tokens) run on one 32 GiB GPU. It began as
+a Windows adaptation of the NInfer codebase and has since grown into its own engine.
 
-## Results at a glance (RTX 5090, 2026-10-08)
+## Results at a glance (RTX 5090, 2026-10-12)
 
-Measured head-to-head against the latest NInfer (upstream `81c8ce0` via its native Windows port).
-Both engines were built with the same VS 2026 + CUDA 13.3 toolchain, run on the same GPU, and given
-token-identical prompts with greedy decoding. Full method and tables:
-[docs/ninfer-comparison-2026-10-08.md](docs/ninfer-comparison-2026-10-08.md).
+Measured head-to-head against the latest NInfer (upstream `81c8ce0` via its native Windows port
+`a0cf1c17`) on the same GPU and day, with the same VS 2026 + CUDA 13.3 toolchain, token-identical
+prompts and greedy decoding. VoidInfer ran its defaults (6-bit EXL3, L0 OSCAR INT4 KV tier, exact
+VeriCache); NInfer ran its official NVFP4 and groupwise artifacts with FP8 KV. Full protocol, every
+table and the raw data: [docs/ninfer-comparison-2026-10-12.md](docs/ninfer-comparison-2026-10-12.md).
 
-| | VoidInfer | NInfer (best config) | |
+| | VoidInfer | NInfer (best config that runs) | |
 |---|---:|---:|---|
-| DFlash2 decode, 4K code workload | **211 tok/s** | 191 tok/s | **+11%** |
-| DFlash2 decode, 128K context | **180 tok/s** | 172 tok/s | **+5%** |
-| DFlash2 committed tokens / round, 4K | **3.74** | 3.05 | **+23%** |
-| DFlash2, NInfer's 12 scenario prompts (geomean) | 241 tok/s | 252 tok/s | −5% |
-| Model quality, paired NLL, 4K–16K | **best of all configs** | +0.017–0.020 nats/token | 95% CI excludes 0 |
-| Base decode, 4K | 79 tok/s | 94 tok/s (16 GiB weights) | −16% |
-| Prefill, 4K / 16K | 10.1K / 9.6K tok/s | 13.6K / 13.0K tok/s (NVFP4) | −26% |
+| Quality: KL divergence from the BF16 model (4K) | **0.014** | 0.080 | **~6× closer to BF16** |
+| Quality: paired NLL, 4K–32K (12,288 identical tokens) | **reference** | +0.016 nats/token | 95% CI excludes 0 |
+| Top-1 agreement with the BF16 model (4K) | **97.2%** | 92.7% | |
+| DFlash2 decode, code workload, 4K / 16K / 32K / 64K / 128K | 180 / 169 / 145 / 160 / 158 tok/s | 187 / 187 / 190 / 195 / 172 | NInfer +3% to +32% |
+| Largest single request (259,483-token prompt), decode | **137 tok/s** with every token verified | 141 tok/s, only with k8v4 KV (FP8 KV does not fit) | NInfer +3% |
+| DFlash2 committed tokens / round, 4K / 128K | **3.56 / 3.67** | 2.84 / 3.04 | **+21–25%** |
+| DFlash2, NInfer's 12 scenario prompts (geomean) | 212 tok/s | 247 tok/s | NInfer +16% |
+| Base decode, 4K | 76 tok/s | 94 tok/s (groupwise, 15.9 GiB weights) | NInfer +23% |
+| Prefill, 4K / 128K | 7.8K / 4.9K tok/s | 14.1K / 6.6K tok/s (NVFP4) | NInfer +34–81% |
+| Concurrent requests, 4K, C1 / C2 / C4 aggregate | 161 / 258 / 365 tok/s | 189 / 340 / 526 tok/s | NInfer +18–44% |
+| C8 at 4K, C4 / C8 at 31K | **396 / 214 / 180 tok/s** | does not start (per-slot FP8 KV exceeds VRAM) | VoidInfer only |
+| 8 agents × 99K–113K tokens (865K live context), 4 lanes | all served: **223 s** first turn, 52 s resumed turn | all served (groupwise; NVFP4 does not start): 310 s, **11 s** resumed | first turn −28%, resume 4.6× slower |
+| Vision (image input) | not supported by the EXL3 engine | supported (≈1.0–1.3 s per image request) | NInfer |
 
 What the numbers say:
 
-* VoidInfer gives the highest-quality output of every configuration tested, and its speculative
-  decoding commits up to 23% more tokens per verification round.
-* NInfer wins on raw bandwidth-bound work (base decode, prefill) because it runs smaller 4-bit
-  weight formats. Per byte of weights read, VoidInfer's decode is faster.
-* At 128K context VoidInfer is faster than NInfer while keeping only INT2 codes plus an exact window
-  on the GPU. Its quality there is statistically level with NInfer's FP8 KV.
+* **Quality is VoidInfer's clear lead.** A 6-bit model whose published tokens are verified against
+  full-precision attention history: about six times closer to the BF16 reference than NInfer's 4-bit
+  artifacts, and measurably better on real text at every depth.
+* **Capacity is the second.** One request reaches 259K tokens with every token verified, and eight
+  agents with 865K tokens of live context run on one 32 GiB card, with a 28% faster first turn.
+  NInfer's fastest artifact cannot reserve FP8 KV for those sizes.
+* **Raw speed is NInfer's.** Its smaller weights read fewer bytes per token, so base decode, prefill
+  and batched concurrency are faster, and it resumes parked agents 4.6× faster (host checkpoints).
+  VoidInfer's DFlash2 commits 21–25% more tokens per round, which keeps single-request decode within
+  4% at 4K and at the largest context, but verifying every token costs 10–30% at 16K–64K and on
+  short, high-acceptance prompts.
 
-These rows were measured before L0 OSCAR with exact hot rows became the default KV tier: the 4K and
-16K VoidInfer rows used FP16 device KV, which stays available with `NINFER_EXL3_L0_OSCAR=0`.
-The hot rows have since cut L0's quality loss against FP16 KV by about three quarters (below).
+## Engine direction
+
+VoidInfer is a **quality-first long-context engine**: exact output, maximum context per GPU, then
+speed.
+
+1. **Exact output from compressed context.** Attention history lives on the GPU as INT4 OSCAR codes
+   (17 KB per token instead of 64 KB), so one card holds a quarter-million-token request or several
+   long agents. Drafting runs on those codes; VeriCache re-checks every drafted token against
+   attention over the full-precision history streamed from host RAM, and only verified tokens are
+   published, so the INT4 codes change speed, not output. (A single request verifies on an
+   asynchronous line that reads history beyond the recent window through an FP8 e4m3 mirror,
+   measured at KL 0.005 against FP16 history; several lanes verify against FP16.)
+2. **6-bit weights.** EXL3 6 bpw keeps the model close to BF16 (KL 0.014). The bandwidth cost
+   (21 GiB read per token vs 16–19 GiB) is partly paid back by higher DFlash2 acceptance.
+3. **Many long agents per GPU.** Coherent-device lanes batch up to eight requests into one round,
+   admit a lane only when its INT4 codes fit in free VRAM, park idle agents' exact history in host
+   RAM (losslessly packed) and spill to disk, so total live context can exceed 1M tokens
+   (8 × 125K measured on 2026-10-10).
+4. **Next.** The measured gaps are prefill (layer-major GEMMs on 6-bit weights, exact-history
+   ingestion), batched concurrency rounds, the exact line's GPU share at 16K–64K, agent resume
+   (GPU-side packing instead of moving packed FP16 history through the CPU on every swap), and vision
+   input on the EXL3 route.
+
+The 2026-10-08 comparison (older configuration: FP16 device KV at short context, no VeriCache) is kept
+at [docs/ninfer-comparison-2026-10-08.md](docs/ninfer-comparison-2026-10-08.md).
 
 ## What is inside
 
@@ -59,12 +94,13 @@ fused weight decode, FA2-style GQA attention with FP16-accumulated tensor-core s
 chunk-parallel Gated-DeltaNet recurrence.
 
 **L0 OSCAR with exact hot rows (default KV tier).** Attention history beyond an exact 64-token sink
-and the exact 960-token recent window is stored as calibrated-rotation INT2 codes on the device, with FP16 planes
-in pinned host memory (L2). History attention runs on int8 MMAs for QK and u8 MMAs for PV.
+and the exact 960-token recent window is stored as calibrated-rotation INT4 codes on the device (INT2 until
+2026-10-11; the hot-row gate numbers below were measured with INT2), with FP16 planes in pinned host memory
+(L2). History attention runs on int8 MMAs for QK and u8 MMAs for PV.
 Attention mass is concentrated: a small, slowly changing set of history rows carries most of it.
 So each layer keeps 512 rows per KV head as exact FP16 copies on the device (the hot rows, 32 MiB
-in total; `NINFER_EXL3_L0_HOT` sets 0..4096). The INT2 kernel skips them, and every history CTA first attends exactly to its share of
-them. The INT2 pass also nominates rows whose probability crosses 0.2% of the history mass as a
+in total; `NINFER_EXL3_L0_HOT` sets 0..4096). The code-history kernel skips them, and every history CTA first attends exactly to its share of
+them. The code-history pass also nominates rows whose probability crosses 0.2% of the history mass as a
 side effect, and the stalest hot rows are swapped for those candidates each round (copied from L2
 beside the next round's encode). On the DFlash2 verify-quality gate (4K/16K × code/prose, 2,016
 teacher-forced rows) this cuts the paired NLL loss against FP16 KV from +0.024 to +0.006
@@ -130,16 +166,19 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
 
 ## Current state and limitations
 
-* Greedy text generation, one request at a time (physical C1); a bounded C2 configuration exists.
-  Positive-temperature sampling and EXL3 vision input are not broadly qualified.
-* L0 OSCAR with exact hot rows is the default at every context length; it costs +0.006 nats/token
-  in paired NLL against FP16 device KV, and at 4K about 3% round time and 5% prefill.
-  `NINFER_EXL3_L0_OSCAR=0` selects FP16 device KV (DFlash2 contexts to ~16K on 32 GiB) and
-  `NINFER_EXL3_L0_HOT=0` turns the hot rows off. The OSCAR rotations are read from
-  `<model directory>/l0_oscar` (or `NINFER_EXL3_L0_OSCAR_ROT`).
-* VeriCache is opt-in on the coherent-device Engine route and costs +8–9% round time.
-  Plain concurrent streams do not overlap the verifier pass with drafting. SM partitions (green
-  contexts) would first need the cooperative decode GEMVs re-gridded for a smaller SM budget.
+* Greedy text generation through the coherent-device Engine, one to eight concurrent requests
+  (`--max-concurrency 1..8`). Positive-temperature sampling is not broadly qualified, and the EXL3
+  engine has no image or video input.
+* L0 OSCAR (INT4 history codes, exact sink, recent window and 512 hot rows per KV head) with exact
+  VeriCache is the default at every context length; L2 history stays in host RAM (FP16 planes, losslessly
+  packed when parked, spilled to disk under memory pressure). `NINFER_EXL3_VERICACHE=tolerance`
+  trades exactness for speed; `NINFER_EXL3_L0_OSCAR=0` selects FP16 device KV (about 16K with DFlash2).
+  The OSCAR rotations are read from `<model directory>/l0_oscar` (or `NINFER_EXL3_L0_OSCAR_ROT`).
+* With one lane, verification runs on an asynchronous exact line that reads history beyond the recent
+  window through an FP8 e4m3 mirror (KL 0.005 against FP16 history); `NINFER_EXL3_VERICACHE_LINE_FP8=0`
+  keeps FP16. With several lanes, verification passes are exclusive and use FP16 history.
+* Speed gaps to NInfer (2026-10-12): prefill 1.3–1.8×, base decode 1.2×, batched concurrency 1.3–1.4×,
+  single-request DFlash2 at 16K–64K 1.1–1.3×, agent resume 4.6×.
 * The public Engine route is DFlash2-only; base decode is measured on the target-only route.
 * Research routes and default-off kernels keep explicit dispositions in
   [docs/current-status.md](docs/current-status.md) and are not presented as supported defaults.
@@ -164,7 +203,7 @@ Model weights are not included. The EXL3 serving route and its options are descr
 
 ## Reading paths
 
-* Results: [NInfer comparison](docs/ninfer-comparison-2026-10-08.md),
+* Results: [NInfer comparison 2026-10-12](docs/ninfer-comparison-2026-10-12.md) (earlier: [2026-10-08](docs/ninfer-comparison-2026-10-08.md)),
   [benchmark harness](bench/engine-compare/README.md), [KV-tier fidelity](docs/OSCAR_KV_FIDELITY.md).
 * Overview: [current status](docs/current-status.md),
   [engineering case study](docs/engineering-case-study.md), [interview/demo guide](docs/interview-guide.md).

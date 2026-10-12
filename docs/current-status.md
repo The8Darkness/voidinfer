@@ -1,5 +1,23 @@
 # Current status
 
+## Status 2026-10-12 (NInfer comparison)
+
+Full head-to-head against NInfer `a0cf1c17` (upstream `81c8ce0`) on 2026-10-12:
+[ninfer-comparison-2026-10-12.md](ninfer-comparison-2026-10-12.md).
+
+| Area | VoidInfer default (L0 OSCAR INT4 + exact VeriCache) | NInfer best configuration |
+| --- | --- | --- |
+| Quality | KL vs BF16 0.0137, top-1 97.2%; paired NLL better by 0.016 nats/token (CI excludes 0) | KL 0.080–0.087, top-1 92.4–92.7% |
+| DFlash2 C1, code 4K / 16K / 32K / 64K / 128K / 254K | 180 / 169 / 145 / 160 / 158 / 137 tok/s, 2.95–3.67 tokens/round | 187 / 187 / 190 / 195 / 172 / 141 (254K only with k8v4 KV) |
+| Scenarios (12 NInfer prompts, geomean) | 212 tok/s | 247 tok/s |
+| Base decode 4K / prefill 4K | 76 tok/s / 7.8K tok/s | 94 tok/s (groupwise) / 14.1K tok/s (NVFP4) |
+| Concurrency 4K C2 / C4 / C8 | 258 / 365 / 396 tok/s | 340 / 526 / does not start (per-slot FP8 KV) |
+| 8 agents x 99K-113K tokens, 4 lanes | first turn 223 s, resume 52 s | first turn 310 s, resume 11 s (groupwise) |
+| Vision | none (EXL3 route text-only) | image and video |
+
+Fixed during the run: `98f10860` asynchronous VeriCache blocks settle on a round closed by the terminal
+token (every C1 request that ended at EOS before its budget failed with "asynchronous verification settle").
+
 ## Status 2026-10-08
 
 Toolchain: VS 2026 Build Tools (MSVC 14.51) + CUDA 13.3.1, `sm_120a`, RTX 5090 (driver 617.14).

@@ -32,3 +32,22 @@ machine (`D:\AI\...`); change the paths at the top of each script to reproduce e
 6. `python make_tables.py`.
 
 Run one GPU job at a time; the speed numbers assume an otherwise idle GPU.
+
+## 2026-10-12 full comparison
+
+Tooling and raw data behind [docs/ninfer-comparison-2026-10-12.md](../../docs/ninfer-comparison-2026-10-12.md)
+are in the same directory (scripts suffixed `_20261012`) and `data/2026-10-12/`.
+
+| Path | Purpose |
+|---|---|
+| `run_ninfer_20261012.sh`, `run_ninfer_254k_20261012.sh` | NInfer single-request matrix: {NVFP4, groupwise} × DFlash2 4K–128K + 12 scenarios, base decode, 254K (FP8, then `k8v4`/`nvfp4` KV where FP8 does not fit) |
+| `run_ours_20261012.ps1` | VoidInfer single-request matrix with its defaults (`ours_bench.ps1 -L0`) |
+| `run_all_20261012.ps1`, `run_resume_20261012.ps1` | The sequential GPU queue; the resume re-ran scenarios, base decode and the rest after the terminal-round VeriCache fix (`98f10860`) |
+| `conc_client.py`, `ours_conc.ps1`, `ninfer_conc.py`, `run_conc_20261012.ps1`, `run_conc_prefix_20261012.ps1` | Concurrency C1–C8 (one warm request with a distinct prompt, then N simultaneous requests); NInfer with and without prefix reuse |
+| `run_conc_retry_20261012.ps1` | NInfer `--kv-capacity auto` retry for the configurations whose per-slot reservation does not start (prepared, **not run**) |
+| `agents_client.py`, `ours_agents.ps1`, `ninfer_agents.py`, `run_ninfer_agents_fallback_20261012.ps1`, `rerun_agents_20261012.ps1` | 8 agents × 400,000-character code slices, 2 turns, 4 lanes; NInfer tried in order NVFP4/FP8, NVFP4/k8v4, groupwise/FP8 |
+| `vision_client.py`, `run_vision_20261012.ps1`, `run_vision_inherited_20261012.ps1` | Two NInfer example images, 2 greedy requests each |
+| `quality/ours_nll.ps1 -L0 -TopK -Tag _d12x -Env 'NINFER_EXL3_L0_EXACT=1;LONG_NLL_LAYER_MAJOR=1'` | VoidInfer verification-path NLL and top-k records |
+| `quality/kl_compare.py _l0_d12x`, `quality_report.py "ours_exact=.ours_l0_d12x.tok:ours exact (served)" --out=...` | KL against BF16 and paired NLL against NInfer's recorded quality data |
+| `make_tables_20261012.py` | All tables of the report (`data/2026-10-12/tables.md`) |
+| `data/2026-10-12/logs/` | Queue log and excerpts of server logs (startup failures, capacity lines, request summaries) |

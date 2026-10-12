@@ -1,0 +1,25 @@
+{
+ "engine": "ninfer",
+ "artifact": "qwen3_8_27b_nvfp4.ninfer",
+ "kv_capacity": "conc",
+ "prefix_reuse": true,
+ "kv": "fp8",
+ "spec": "dflash2",
+ "conc": 2,
+ "prompt": "code_4k",
+ "wall_s": 6.440360069274902,
+ "completion_tokens": 2048,
+ "aggregate_tps": 317.9946428415418,
+ "per_request": [
+  {
+   "s": 6.408287286758423,
+   "tokens": 1024,
+   "tps": 159.7930857619184
+  },
+  {
+   "s": 6.438857555389404,
+   "tokens": 1024,
+   "tps": 159.03442360561294
+  }
+ ]
+}

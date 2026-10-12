@@ -7,8 +7,13 @@ Q = r"D:\AI\engine-compare-20261008\quality"
 K = 512
 WS = (4096, 16384, 32768)
 NINFER = [("gw", "bf16"), ("gw", "fp8"), ("nv", "bf16"), ("nv", "fp8")]
-ENGINES = ["ours_fp16", "ours_l0"] + [f"{n}.{k}" for n, k in NINFER]
-LABEL = {"ours_fp16": "ours FP16-KV", "ours_l0": "ours L0-OSCAR", "gw.bf16": "NInfer gw/bf16",
+# Optional args: name=suffix:label ... (our tagged runs) and --out path; default = the Oct 8 FP16/L0 pair.
+ARGS = [x for x in sys.argv[1:] if not x.startswith("--out=")]
+OUT = next((x[6:] for x in sys.argv[1:] if x.startswith("--out=")), os.path.join(Q, "summary.json"))
+OURS = [tuple(x.split("=", 1)[0:1] + x.split("=", 1)[1].split(":", 1)) for x in ARGS] or [
+    ("ours_fp16", ".ours.tok", "ours FP16-KV"), ("ours_l0", ".ours_l0.tok", "ours L0-OSCAR")]
+ENGINES = [o[0] for o in OURS] + [f"{n}.{k}" for n, k in NINFER]
+LABEL = {**{o[0]: o[2] for o in OURS}, "gw.bf16": "NInfer gw/bf16",
          "gw.fp8": "NInfer gw/fp8", "nv.bf16": "NInfer nvfp4/bf16", "nv.fp8": "NInfer nvfp4/fp8"}
 out = []
 for W in WS:
@@ -32,7 +37,7 @@ for W in WS:
         ids = list(map(int, open(os.path.join(d, sid + ".ids")).read().split()))
         targets = ids[W:W + K]
         rec = {"W": W, "stream": sid, "domain": dom, "targets": targets}
-        for eng, suffix in (("ours_fp16", ".ours.tok"), ("ours_l0", ".ours_l0.tok")):
+        for eng, suffix, _ in OURS:
             p = os.path.join(d, sid + suffix)
             if os.path.exists(p):
                 o = [ln.split() for ln in open(p)]
@@ -68,7 +73,7 @@ for name, cells in rows:
 
 print("\npaired: mean(NLL_x - NLL_ref) per token [95% CI] and top-1 agreement with ref")
 summary = {"table": [{"slice": n, **{e: c for e, c in cells.items()}} for n, cells in rows], "paired": []}
-for ref in ("ours_fp16", "ours_l0"):
+for ref in [o[0] for o in OURS]:
     for e in ENGINES:
         if e == ref:
             continue
@@ -82,4 +87,4 @@ for ref in ("ours_fp16", "ours_l0"):
         by = "  ".join(f"{W//1024}K {st.mean(a - b for r in recs if r['W'] == W for a, b in zip(r[e + '_nll'], r[ref + '_nll'])):+.4f}" for W in depths)
         print(f"  {LABEL[e]:>18} vs {LABEL[ref]:<14} {m:+.4f} [{m-1.96*se:+.4f},{m+1.96*se:+.4f}] agree {agree*100:5.1f}%  | {by}")
         summary["paired"].append({"x": e, "ref": ref, "mean": m, "ci95": 1.96 * se, "agree": agree, "tokens": len(diffs)})
-json.dump(summary, open(os.path.join(Q, "summary.json"), "w"), indent=1)
+json.dump(summary, open(OUT, "w"), indent=1)

@@ -1,0 +1,14 @@
+{"label": "ours.code_4k.c1.rep1", "conc": 1, "prompt": "code_4k", "wall_s": 6.372710943222046, "completion_tokens": 1024, "aggregate_tps": 160.68514783164872, "per_request_tps": [160.7]}
+{"label": "ours.code_4k.c1.rep2", "conc": 1, "prompt": "code_4k", "wall_s": 6.372016668319702, "completion_tokens": 1024, "aggregate_tps": 160.70265558015691, "per_request_tps": [160.7]}
+{"label": "ours.code_4k.c2.rep1", "conc": 2, "prompt": "code_4k", "wall_s": 8.087034225463867, "completion_tokens": 2048, "aggregate_tps": 253.24487851818483, "per_request_tps": [132.8, 126.6]}
+{"label": "ours.code_4k.c2.rep2", "conc": 2, "prompt": "code_4k", "wall_s": 7.784167766571045, "completion_tokens": 2048, "aggregate_tps": 263.09813218506105, "per_request_tps": [131.6, 137.0]}
+{"label": "ours.code_4k.c4.rep1", "conc": 4, "prompt": "code_4k", "wall_s": 11.875762701034546, "completion_tokens": 4096, "aggregate_tps": 344.90416347264846, "per_request_tps": [99.5, 95.5, 86.2, 92.5]}
+{"label": "ours.code_4k.c4.rep2", "conc": 4, "prompt": "code_4k", "wall_s": 10.613441467285156, "completion_tokens": 4096, "aggregate_tps": 385.92571623685865, "per_request_tps": [108.3, 99.3, 118.4, 96.5]}
+{"label": "ours.code_4k.c8.rep1", "conc": 8, "prompt": "code_4k", "wall_s": 20.64700150489807, "completion_tokens": 8192, "aggregate_tps": 396.76463422820103, "per_request_tps": [55.9, 51.0, 58.1, 49.6, 52.3, 69.4, 63.2, 50.1]}
+{"label": "ours.code_4k.c8.rep2", "conc": 8, "prompt": "code_4k", "wall_s": 20.705036878585815, "completion_tokens": 8192, "aggregate_tps": 395.6525191448742, "per_request_tps": [56.9, 51.0, 53.1, 57.9, 68.6, 50.1, 63.8, 49.5]}
+{"label": "ours.code_31k.c2.rep1", "conc": 2, "prompt": "code_31k", "wall_s": 16.625807285308838, "completion_tokens": 2048, "aggregate_tps": 123.18198839040355, "per_request_tps": [64.1, 61.6]}
+{"label": "ours.code_31k.c2.rep2", "conc": 2, "prompt": "code_31k", "wall_s": 16.12836217880249, "completion_tokens": 2048, "aggregate_tps": 126.98127542619838, "per_request_tps": [63.5, 65.1]}
+{"label": "ours.code_31k.c4.rep1", "conc": 4, "prompt": "code_31k", "wall_s": 18.597707748413086, "completion_tokens": 4096, "aggregate_tps": 220.24219626472544, "per_request_tps": [58.6, 62.6, 55.1, 56.3]}
+{"label": "ours.code_31k.c4.rep2", "conc": 4, "prompt": "code_31k", "wall_s": 19.72942280769348, "completion_tokens": 4096, "aggregate_tps": 207.60870908006322, "per_request_tps": [59.5, 52.0, 54.5, 51.9]}
+{"label": "ours.code_31k.c8.rep1", "conc": 8, "prompt": "code_31k", "wall_s": 45.3651864528656, "completion_tokens": 8192, "aggregate_tps": 180.57899990142184, "per_request_tps": [26.5, 46.9, 27.1, 51.7, 41.6, 24.2, 22.6, 25.4]}
+{"label": "ours.code_31k.c8.rep2", "conc": 8, "prompt": "code_31k", "wall_s": 45.665061712265015, "completion_tokens": 8192, "aggregate_tps": 179.39316608434015, "per_request_tps": [44.5, 50.7, 25.6, 23.4, 22.4, 25.9, 26.4, 50.8]}

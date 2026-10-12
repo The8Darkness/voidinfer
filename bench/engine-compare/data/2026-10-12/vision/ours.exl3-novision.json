@@ -1,0 +1,38 @@
+[
+ {
+  "label": "ours.exl3-novision",
+  "image": "natural_scene",
+  "rep": 0,
+  "ok": false,
+  "s": 0.020050764083862305,
+  "status": 400,
+  "error": "{\"error\":{\"code\":\"vision_disabled\",\"message\":\"Vision is disabled for this server\",\"param\":\"messages\",\"type\":\"invalid_request_error\"}}"
+ },
+ {
+  "label": "ours.exl3-novision",
+  "image": "natural_scene",
+  "rep": 1,
+  "ok": false,
+  "s": 0.01602315902709961,
+  "status": 400,
+  "error": "{\"error\":{\"code\":\"vision_disabled\",\"message\":\"Vision is disabled for this server\",\"param\":\"messages\",\"type\":\"invalid_request_error\"}}"
+ },
+ {
+  "label": "ours.exl3-novision",
+  "image": "visual_chart",
+  "rep": 0,
+  "ok": false,
+  "s": 0.0009999275207519531,
+  "status": 400,
+  "error": "{\"error\":{\"code\":\"vision_disabled\",\"message\":\"Vision is disabled for this server\",\"param\":\"messages\",\"type\":\"invalid_request_error\"}}"
+ },
+ {
+  "label": "ours.exl3-novision",
+  "image": "visual_chart",
+  "rep": 1,
+  "ok": false,
+  "s": 0.00099945068359375,
+  "status": 400,
+  "error": "{\"error\":{\"code\":\"vision_disabled\",\"message\":\"Vision is disabled for this server\",\"param\":\"messages\",\"type\":\"invalid_request_error\"}}"
+ }
+]
