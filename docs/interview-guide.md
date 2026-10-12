@@ -20,28 +20,29 @@ research workload—not HTTP throughput—and its best recorded arm is 47.83 use
 
 ## Five-minute demo
 
-Primary route (requires a locally licensed `.ninfer` artifact and a build validated on the current
-machine):
+Primary route (needs the model directories and an RTX 5090):
 
 ```powershell
-$env:VOIDINFER_MODEL = 'C:\models\qwen3_8_27b.ninfer'
-& .\build\apps\ninfer-serve.exe $env:VOIDINFER_MODEL --host 127.0.0.1 --port 8080
+& .\build\apps\voidinfer-serve.exe --target C:\models\Qwen3.8-27B-exl3-6bpw-H6-V6 `
+  --draft C:\models\Qwen3.8-27B-DFlash2-EXL3-5bpw --host 127.0.0.1 --port 8080 --model-id qwen3.8-27b
 ```
 
-Show the startup log's effective configuration, send one temperature-zero loopback request using
-[build-and-run.md](build-and-run.md), and point out that this proves only the serving smoke.
+Show the startup line (lanes, context, weights, runtime, host KV), send one temperature-zero loopback
+request from [build-and-run.md](build-and-run.md), and point at the `speculative=dflash2 N tok/round`
+summary in the completion log.
 
-Fallback (no model/GPU): open [R608 evidence](../evidence/r608/README.md), recompute one throughput
-row from `workloads.csv`, then trace the exactness/timing boundary into
-`tests/test_exl3_real_dflash_execution.h`. This is a dated recorded-evidence demo, not a live result.
+Fallback (no model/GPU): walk the [2026-10-12 comparison](ninfer-comparison-2026-10-12.md) tables and
+the KL/NLL quality panel, or open [R608 evidence](../evidence/r608/README.md) and recompute one
+throughput row from `workloads.csv`. These are recorded-evidence demos, not live results.
 
 ## Code tour
 
-1. `include/ninfer/engine.h` and `src/runtime/engine/`: public lifecycle, admission, ownership.
-2. `src/exl3/text_model.*`: EXL3 target/draft execution and state.
-3. `src/ops/` and `src/exl3/kernels/`: specialized CUDA dispatch and kernels.
-4. `tests/test_exl3_dflash2_accept.cpp`: test entry and qualification gates.
-5. `tests/test_exl3_real_dflash_execution.h`: frozen workload, exactness, and timing boundary.
+1. `include/voidinfer/engine.h` and `src/runtime/engine/`: public lifecycle and request options.
+2. `src/exl3/exl3_engine_core.cpp`: lanes, admission, batched DFlash2 rounds, VeriCache, roots.
+3. `src/exl3/text_model.*`, `full_attention_layer.*`, `l0_oscar.cuh`: target execution, L0 OSCAR
+   history and exact hot rows.
+4. `src/exl3/dflash2_draft.*`: the block-diffusion draft and its ring.
+5. `tests/test_exl3_dflash2_accept.cpp`: exact DFlash2 oracle and qualification gates.
 6. `src/serve/` and `apps/serve/main.cpp`: HTTP schemas, error contracts, streaming, startup.
 
 ## Technical questions and answer notes
@@ -68,8 +69,9 @@ row from `workloads.csv`, then trace the exactness/timing boundary into
     teardown ordering, and lifecycle/failure tests; asynchronous GPU work must finish before owners die.
 11. **How are defaults selected?** Exactness, actual dispatch, frozen workload, matched controls,
     and provenance. An implementation can remain useful and default-off.
-12. **What would you do next?** First reproduce the publication commit and complete the held-out
-    quality/TTFT gates; only then profile the exact verifier and choose a bounded optimization.
+12. **What would you do next?** Close the measured gaps to NInfer: prefill on 6-bit weights,
+    batched concurrency rounds, the exact line's GPU share at 16K-64K, and lanes per VRAM for long
+    agents.
 
 ## Defensible portfolio bullets
 

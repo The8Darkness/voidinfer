@@ -8,7 +8,8 @@ DFlash2 speculative decoding with exact, transactional state rollback. Attention
 the GPU as INT4 OSCAR codes (L0) with full-precision history in host RAM, and every drafted token is
 verified against that full-precision history before it is published (exact VeriCache). One request
 reaches **262,144 tokens** and eight ~108K-token agents (865K tokens) run on one 32 GiB GPU. It began as
-a Windows adaptation of the NInfer codebase and has since grown into its own engine.
+a Windows adaptation of the NInfer codebase; the inherited artifact engine has since been removed and
+VoidInfer is its own engine.
 
 ## Results at a glance (RTX 5090, 2026-10-12)
 
@@ -107,7 +108,7 @@ and the exact 960-token recent window is stored as calibrated-rotation INT4 code
 (L2). History attention runs on int8 MMAs for QK and u8 MMAs for PV.
 Attention mass is concentrated: a small, slowly changing set of history rows carries most of it.
 So each layer keeps 512 rows per KV head as exact FP16 copies on the device (the hot rows, 32 MiB
-in total; `NINFER_EXL3_L0_HOT` sets 0..4096). The code-history kernel skips them, and every history CTA first attends exactly to its share of
+in total; `VOIDINFER_EXL3_L0_HOT` sets 0..4096). The code-history kernel skips them, and every history CTA first attends exactly to its share of
 them. The code-history pass also nominates rows whose probability crosses 0.2% of the history mass as a
 side effect, and the stalest hot rows are swapped for those candidates each round (copied from L2
 beside the next round's encode). On the DFlash2 verify-quality gate (4K/16K × code/prose, 2,016
@@ -116,7 +117,7 @@ nats/token and raises top-1 agreement from 95.1% to 96.8%. It costs 0.2–0.4 ms
 round (1–2%). Rounds take 18.3 ms at 4K and 18.5–20.3 ms from 16K to 128K; parked agent contexts
 resume in 0.3–1.9 s.
 
-**Vision.** `--exl3-vision DIR` (a directory with the BF16 `model.visual.*` tensors, e.g. the BF16
+**Vision.** `--vision DIR` (a directory with the BF16 `model.visual.*` tensors, e.g. the BF16
 checkpoint) enables image and video input. The 27-block tower runs in BF16 with FP32-accumulated
 cuBLAS GEMMs; its 0.88 GB of weights stay in pinned host memory and stream through a two-slot device
 buffer (19 ms per 1,536-patch image). Merged embeddings replace the placeholder tokens in prefill, and
@@ -129,11 +130,11 @@ publish prefix roots.
 FP16 history, after VeriCache (arXiv 2605.17613). The prompt is ingested with exact FP16 history
 attention. DFlash2 then drafts blocks on L0 without publishing them. One wide exact pass over the
 block rescores every row against FP16 history streamed from host RAM. In exact mode (default,
-`NINFER_EXL3_VERICACHE=1` or `exact`), a drafted token is kept when its exact logit is within 0.0625
+`VOIDINFER_EXL3_VERICACHE=1` or `exact`), a drafted token is kept when its exact logit is within 0.0625
 of the exact top logit (twice the measured decode/verifier arithmetic floor); the first token outside
 is replaced by the exact argmax and the rest of the block is redrafted. Block lengths follow the
 measured pass cost and mismatch rate (learned across requests); rounds may run past a block into the
-same pass. `NINFER_EXL3_VERICACHE=tolerance` accepts within 1.0 on fixed 1,024-token blocks;
+same pass. `VOIDINFER_EXL3_VERICACHE=tolerance` accepts within 1.0 on fixed 1,024-token blocks;
 `=0` disables. Tokens are published only after verification, and the verified prefix becomes the next
 exact root (device GDN checkpoint plus L0 rewind).
 
@@ -143,7 +144,7 @@ own stream from a worker thread while DFlash2 keeps drafting past it, so the PCI
 overlaps the HBM-bound decode rounds. A correction rewinds drafting to the verified root (L0 re-run,
 no history stream); the kept tokens and the exact replacement lead the next block on the line. Waits
 on that path poll instead of blocking in the driver (a blocked call holds the WDDM context lock and
-stalls the other thread). `NINFER_EXL3_VERICACHE_ASYNC=0` restores the synchronous pass. DFlash2
+stalls the other thread). `VOIDINFER_EXL3_VERICACHE_ASYNC=0` restores the synchronous pass. DFlash2
 code workload, 512-1,024 tokens, exact: 4K 169-173 tok/s (synchronous 151-162, no VeriCache 197),
 32K 150, 128K 130-137 (synchronous 76, no VeriCache 172), 254K 107-112 (synchronous 42, no
 VeriCache 158). The remaining cost is the line's own GPU work (~1.2 ms/token at 128K: projections and
@@ -184,20 +185,22 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
 ## Current state and limitations
 
 * Greedy generation through the coherent-device Engine, one to eight concurrent requests
-  (`--max-concurrency 1..8`), text of any length and, with `--exl3-vision`, images and video.
-  Positive-temperature sampling is not broadly qualified. Media prompts are not reused as prefix
-  roots.
+  (`--max-concurrency 1..8`), text of any length and, with `--vision`, images and video.
+  Positive-temperature sampling is not broadly qualified; thinking budgets, stop strings and
+  penalties are rejected. Media prompts are not reused as prefix roots.
 * L0 OSCAR (INT4 history codes, exact sink, recent window and 512 hot rows per KV head) with exact
   VeriCache is the default at every context length; L2 history stays in host RAM (FP16 planes, losslessly
-  packed when parked, spilled to disk under memory pressure). `NINFER_EXL3_VERICACHE=tolerance`
-  trades exactness for speed; `NINFER_EXL3_L0_OSCAR=0` selects FP16 device KV (about 16K with DFlash2).
-  The OSCAR rotations are read from `<model directory>/l0_oscar` (or `NINFER_EXL3_L0_OSCAR_ROT`).
+  packed when parked, spilled to disk under memory pressure). `VOIDINFER_EXL3_VERICACHE=tolerance`
+  trades exactness for speed; `VOIDINFER_EXL3_L0_OSCAR=0` selects FP16 device KV (about 16K with DFlash2).
+  The OSCAR rotations are read from `<model directory>/l0_oscar` (or `VOIDINFER_EXL3_L0_OSCAR_ROT`).
 * With one lane, verification runs on an asynchronous exact line that reads history beyond the recent
-  window through an FP8 e4m3 mirror (KL 0.005 against FP16 history); `NINFER_EXL3_VERICACHE_LINE_FP8=0`
+  window through an FP8 e4m3 mirror (KL 0.005 against FP16 history); `VOIDINFER_EXL3_VERICACHE_LINE_FP8=0`
   keeps FP16. With several lanes, verification passes are exclusive and use FP16 history.
 * Speed gaps to NInfer (2026-10-12): prefill 1.3–1.8×, base decode 1.2×, batched concurrency 1.3–1.4×,
   single-request DFlash2 at 16K–64K 1.1–1.3×, agent resume 2.2×, image requests 1.4–1.6×.
 * The public Engine route is DFlash2-only; base decode is measured on the target-only route.
+* The Engine applies its benchmarked kernel and route profile at startup
+  (`src/exl3/engine_profile.cpp`); `VOIDINFER_*` variables only override it.
 * Research routes and default-off kernels keep explicit dispositions in
   [docs/current-status.md](docs/current-status.md) and are not presented as supported defaults.
 
@@ -213,12 +216,20 @@ From a `cmd` shell:
 call C:\BuildTools2026\Common7\Tools\VsDevCmd.bat -arch=amd64
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a ^
       -DCMAKE_CUDA_COMPILER="%CUDA_PATH_V13_3%\bin\nvcc.exe" -DBUILD_TESTING=ON
-cmake --build build --target ninfer-serve
+cmake --build build -j --target voidinfer voidinfer-serve
 ```
 
-Model weights are not included. The EXL3 serving route and its options are described in
-[docs/exl3-serving.md](docs/exl3-serving.md); add `--exl3-vision <BF16 checkpoint directory>` for
-image and video input.
+Model weights are not included. Point the server at the EXL3 target and its DFlash2 draft (the target
+directory carries the OSCAR rotations in `l0_oscar/`):
+
+```bat
+build\apps\voidinfer-serve.exe --target C:\models\Qwen3.8-27B-exl3-6bpw-H6-V6 ^
+      --draft C:\models\Qwen3.8-27B-DFlash2-EXL3-5bpw --model-id qwen3.8-27b --max-context 65536
+```
+
+Add `--vision <BF16 checkpoint directory>` for image and video input and `--max-concurrency N` for up
+to eight lanes. The endpoints and options are in [serving](docs/serving.md); the one-request CLI
+(`voidinfer`) is in [cli](docs/cli.md).
 
 ## Reading paths
 
@@ -227,6 +238,7 @@ image and video input.
 * Overview: [current status](docs/current-status.md),
   [engineering case study](docs/engineering-case-study.md), [interview/demo guide](docs/interview-guide.md).
 * Implementation: [architecture](docs/architecture.md), [build and run](docs/build-and-run.md),
+  [serving](docs/serving.md), [CLI](docs/cli.md), [performance](docs/performance.md),
   [benchmarking](docs/benchmarking.md), [limitations](docs/limitations.md),
   [maintenance](docs/maintenance.md).
 

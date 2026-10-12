@@ -1,6 +1,5 @@
 // voidinfer::ops - residual_add wrapper: implements the public api, validates parameters, and
 // dispatches to the launcher. Host-compiled; never includes the kernel header.
-// See docs/op-development.md §2.
 #include "voidinfer/ops/residual_add.h"
 
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch

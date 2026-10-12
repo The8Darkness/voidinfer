@@ -1,4 +1,4 @@
-# Contributing to NInfer
+# Contributing to VoidInfer
 
 High-quality contributions are welcome. A pull request is expected to arrive as a reasoned,
 validated implementation, not as a request for the maintainer to discover its basic correctness
@@ -36,7 +36,7 @@ The contributor must be able to explain the implementation and why it is correct
 is not a substitute for basic validation or debugging by the contributor.
 
 Discuss a change before implementation when it would revise an established architecture, ownership,
-artifact, numerical, or external protocol contract.
+model-loading, numerical, or external protocol contract.
 
 ## AI-assisted and AI-generated contributions
 
@@ -69,10 +69,9 @@ Select evidence according to the claim being made:
 
 Use the existing project workflows instead of inventing parallel verification paths:
 
-- [`tests/README.md`](tests/README.md) for test organization and commands;
-- [`bench/README.md`](bench/README.md) for product and operator benchmarks; and
-- [`docs/maintainer/op-development.md`](docs/maintainer/op-development.md) for numerical Op
-  development and qualification.
+- [`tests/README.md`](tests/README.md) for test organization and commands; and
+- [`bench/engine-compare/README.md`](bench/engine-compare/README.md) for end-to-end speed and
+  quality measurements.
 
 Run the focused checks relevant to the change. State exactly what was run and summarize the result.
 If a relevant check could not be run, state that limitation and why. Do not claim validation that
@@ -90,8 +89,8 @@ A pull request description must include:
 - any relevant check that was not run and the resulting limitation; and
 - for an entirely AI-generated implementation, the exact model and version used.
 
-Keep the change coherent and exclude unrelated cleanup. A public CLI, serving, artifact, or
-documentation contract must be updated consistently across its implementation, tests, and active
+Keep the change coherent and exclude unrelated cleanup. A public CLI, serving, or documentation
+contract must be updated consistently across its implementation, tests, and active
 documentation.
 
 ## Review policy

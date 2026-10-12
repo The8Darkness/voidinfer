@@ -43,30 +43,13 @@ the post-RoPE Q/K/V boundary, with separate K and V payloads. Run the validator 
 python tools/oscar/validate_dump.py <dump-root>/manifest.json
 ```
 
-## Phase B2 smoke capture
+## Capture
 
-The native opt-in smoke path captures only the verified full-attention layers at the post-Q/K
-RMSNorm + post-RoPE boundary, before causal attention/cache append. It submits 256 deterministic
-copies of token id 198 and writes BF16 raw payloads plus provenance to
-`results/oscar/captures/phase-b2-qkv-256`.
-
-Build the focused target in the latest build tree:
-
-```powershell
-cmd /c "call C:\BuildTools\Common7\Tools\VsDevCmd.bat -arch=amd64 && cmake --build build --target voidinfer_qwen3_6_27b_oscar_capture_test -j 1"
-```
-
-Run the reproducible wrapper from an elevated/native Developer PowerShell when the isolated
-Python launcher is restricted by the host shell:
-
-```powershell
-& .\tools\oscar\capture_qkv_smoke.ps1 -ArtifactPath $env:VOIDINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS -BuildRoot .\build
-```
-
-The validator is fail-closed: it checks the exact 16-layer topology, Q/K/V shape and token
-alignment, GQA mapping, stage identity, finite BF16 contents, exact file sizes, payload hashes,
-per-tensor provenance, and the manifest SHA-256 sidecar. The completed Phase B2 smoke result is
-documented in `results/oscar/phase-b2-qkv-smoke-capture.md`.
+The EXL3 engine captures post-RoPE K/V of the 16 full-attention layers for calibration with
+`tests/research_exl3_kv_tier_capture` (`VOIDINFER_EXL3_TARGET_PATH`, `KV_CAPTURE_WIDE=1024` for the
+wide-prefill route). The rotations the L0 tier loads (`<target>/l0_oscar/`) are per-head, centered
+fits on such captures; see [KV-tier fidelity](../../docs/OSCAR_KV_FIDELITY.md). The capture wrappers
+of the removed artifact runtime (Phase B2-C4) are in the git history before 2026-10-12.
 
 ## Phase B3 fitter smoke
 

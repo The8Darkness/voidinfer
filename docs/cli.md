@@ -1,122 +1,45 @@
-# NInfer CLI
+# VoidInfer CLI
 
-`build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
-download an artifact using the [project README](../README.md) before following this guide.
+`build/apps/voidinfer` runs one request through the same Engine as the server: the EXL3 6 bpw
+target, its DFlash2 draft (K=7), L0 OSCAR history and exact VeriCache. Build it as described in
+[build and run](build-and-run.md).
 
 ## Text input
 
-```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
-  --prompt "Summarize the difference between prefill and decode." \
-  --max-context 16384 \
-  --max-new 256
+```powershell
+.\build\apps\voidinfer.exe --target C:\models\Qwen3.8-27B-exl3-6bpw-H6-V6 `
+  --draft C:\models\Qwen3.8-27B-DFlash2-EXL3-5bpw `
+  --prompt "Summarize the difference between prefill and decode." --max-new 256
 ```
 
-Exactly one of `--prompt` and `--messages` is required.
+Exactly one of `--prompt` and `--messages` is required. Answer content streams to stdout;
+reasoning, model loading, timings, throughput, GPU memory and speculative statistics go to stderr,
+so the two can be redirected independently (`> answer.txt 2> run.log`).
 
-Answer content is streamed to stdout. Reasoning, model loading (including the registered target and
-canonical `weights_id`), timings, throughput, GPU memory, and speculative-decoding statistics are
-written to stderr, so stdout can be redirected independently:
+Thinking is enabled by default. `--reasoning-effort low|medium|xhigh` selects an effort when the
+model's chat template exposes one; `--no-thinking` renders a direct-response prompt (not combinable
+with `--reasoning-effort`).
 
-```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
-  --prompt "Return one sentence." --max-new 64 \
-  > answer.txt 2> run.log
+The Engine currently rejects requests that carry a thinking budget (`--thinking-budget`), stop
+strings (`--stop`, `--reasoning-stop`) or penalties; stop token ids (`--stop-token-id`) are
+supported. `--max-new` counts every committed token.
+
+## Images and video
+
+`--vision DIR` names a directory with the BF16 Vision tower tensors (`model.visual.*`, for example
+the BF16 checkpoint) and enables image and video message parts. The tower streams its weights from
+pinned host memory per request; it holds no resident VRAM.
+
+```powershell
+.\build\apps\voidinfer.exe --target $target --draft $draft --vision C:\models\Qwen3.8-27B-bf16 `
+  --messages examples\cli\messages\image_chart.json --max-new 128
 ```
-
-Thinking is enabled by default. If the chat template embedded in the loaded artifact exposes
-reasoning effort, `--reasoning-effort low|medium|xhigh` selects it; omitting the option uses the
-template's default. An artifact whose template does not expose effort rejects the option. Add
-`--no-thinking` for direct-response prompt rendering; it cannot be combined with
-`--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
-
-`--thinking-budget N` places a positive upper bound on accepted model-origin tokens while the
-new-turn Qwen thinking block remains open. If the model has not emitted `</think>` at that exact
-boundary, Engine appends [Qwen's canonical early-close guidance](https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/thinking_budget.md)
-and `</think>` to the same resident sequence without sampling, publishes the guidance through the
-reasoning stream, then resumes ordinary generation from the updated context. A natural thinking
-close, stop condition, cancellation, or total output/context limit at the boundary takes priority
-and suppresses this insertion. The option cannot be combined with `--no-thinking`, but it can be
-combined with `--reasoning-effort`.
-
-`--max-new` counts every committed generated token, including internally inserted control tokens.
-When the effective output capacity extends beyond the thinking budget, it must have room for the
-complete tokenizer-derived control suffix plus one post-close model token; an undersized request is
-rejected rather than truncating the suffix. Normal output sends the inserted guidance to stderr as
-reasoning. `--print-token-ids` includes the inserted IDs, while `--raw-output` preserves the raw
-control representation.
-
-For example, this allows at most 512 model-origin thinking tokens while retaining enough total
-output capacity for the inserted suffix and the answer:
-
-```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
-  --prompt "Explain speculative decoding, then give a concise conclusion." \
-  --max-context 4096 \
-  --max-new 1024 \
-  --thinking-budget 512
-```
-
-## Startup memory profile
-
-GPU residency is frozen when the Engine starts:
-
-- no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
-- `--spec mtp` loads only MTP, while `--spec dflash` loads only the 35B-A3B text-only DFlash
-  backend;
-- a speculative backend with the full proposal head omits the optimized proposal head;
-- Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
-- `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
-  enables image/video input.
-- the one-request CLI uses root-only context mode, so it does not reserve an extra Device
-  checkpoint StateImage or capture a continuation that no later request could consume.
-
-The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
-text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
-exclusive. The default speculative and Vision settings produce the smallest resident profile.
 
 ## Structured messages
 
-`--messages` accepts either a non-empty JSON message array or an object containing `messages`
-and an optional `tools` array.
-
-```json
-[
-  {
-    "role": "system",
-    "content": "Answer concisely."
-  },
-  {
-    "role": "user",
-    "content": [
-      {
-        "type": "image",
-        "image": "examples/cli/media/visual_chart.png"
-      },
-      {
-        "type": "text",
-        "text": "Describe the chart."
-      }
-    ]
-  }
-]
-```
-
-Run message files from the repository root when they contain repository-relative media paths:
-
-```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
-  --messages examples/cli/messages/image_chart.json \
-  --max-context 8192 \
-  --max-new 128 \
-  --vision
-```
-
-Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`.
-System and developer messages retain their array positions; the Qwen family frontend renders both
-as system-class ChatML turns rather than moving later instructions to the beginning.
-
-Message content may be a string or an ordered array containing:
+`--messages` accepts a non-empty JSON message array or an object containing `messages` and an
+optional `tools` array. Roles: `system`, `developer`, `user`, `assistant`, `tool`. Content is a
+string or an ordered array of parts:
 
 | Content type | Source field | Accepted source |
 |---|---|---|
@@ -124,117 +47,36 @@ Message content may be a string or an ordered array containing:
 | image / image_url | `image` or `image_url` | local path, HTTP(S) URL, or base64 data URI |
 | video / video_url | `video` or `video_url` | local path, HTTP(S) URL, or base64 data URI |
 
-`image_url` and `video_url` may be strings or objects containing a string `url`. Assistant
-history may include `reasoning_content` and `tool_calls`; a tool result uses role `tool` and
-`tool_call_id`.
+Assistant history may carry `reasoning_content` and `tool_calls`; a tool result uses role `tool`
+and `tool_call_id`. Run message files from the repository root when they contain
+repository-relative media paths. [`examples/cli/`](../examples/cli/) has text, image, video,
+thinking and long-context inputs.
 
-See [`examples/cli/`](../examples/cli/) for committed text, image, video, mixed-media, thinking,
-long-decode, and long-context inputs.
-
-## Speculative decoding
-
-Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
-35B-A3B text-only DFlash backend with one to fifteen. `--lm-head-draft` selects the optimized
-proposal head and requires a selected backend:
-
-```bash
-./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
-  --prompt "Write a short explanation of speculative decoding." \
-  --max-context 16384 \
-  --max-new 512 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
-```
-
-For DFlash:
-
-```bash
-./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
-  --prompt "Write a short explanation of speculative decoding." \
-  --max-context 16384 --max-new 512 \
-  --spec dflash --draft-tokens 7 --lm-head-draft
-```
-
-MTP and DFlash cannot be enabled together. The published [performance results](performance.md)
-use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
-the optimized proposal head. DFlash accepts up to fifteen draft tokens; seven is the current
-measured recommendation rather than a semantic limit.
-
-## Common options
+## Options
 
 | Option | Meaning | Default |
 |---|---|---:|
-| `--max-context N` | per-sequence logical context ceiling | `2048` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
-| `--max-new N` | requested output-token limit | `128` |
+| `--target DIR` | EXL3 target model directory (required) | |
+| `--draft DIR` | DFlash2 draft directory (required) | |
+| `--vision DIR` | BF16 Vision tower directory; enables image/video parts | off |
+| `--max-context N` | context ceiling, 2048..262144 | `32768` |
+| `--prefill-chunk N` | text prefill chunk | `1024` |
+| `--max-new N` | output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8\|fp8` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
-| `--lm-head-draft` | optimized proposal head | off |
-| `--vision` | enable image/video input and load Vision GPU allocations | off |
-| `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--no-thinking` | disable thinking in prompt rendering | thinking on |
-| `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
-| `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
-| `--greedy` | exact argmax decoding | off |
-| `--temperature F` | sampling temperature override | registered model/mode default |
-| `--top-p F` | nucleus-threshold override | registered model/mode default |
-| `--top-k N` | top-k-threshold override | registered model/mode default |
-| `--min-p F` | min-p-threshold override | registered model/mode default |
-| `--presence-penalty F` | presence-penalty override | registered model/mode default |
-| `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
+| `--no-thinking` | direct-response prompt rendering | thinking on |
+| `--thinking-budget N` | thinking-token cap (currently rejected by the Engine) | unlimited |
+| `--reasoning-effort low\|medium\|xhigh` | effort exposed by the chat template | template default |
+| `--greedy` | exact argmax decoding (temperature 0) | off |
+| `--temperature F`, `--top-p F`, `--top-k N`, `--min-p F` | sampler overrides | model/mode preset |
 | `--seed N` | sampling seed | `0` |
+| `--stop-token-id N` | repeatable stop token id | none |
+| `--stop TEXT`, `--reasoning-stop TEXT` | stop strings (currently rejected by the Engine) | none |
+| `--raw-output`, `--print-token-ids` | raw frontend stream; token ids in diagnostics | off |
 
-When a sampling flag is omitted, Engine selects the official general-task preset registered for
-the loaded model and the rendered prompt mode. The current presets are:
+Sampler defaults come from the model's thinking or non-thinking preset; each flag overrides one
+field. Presence and frequency penalties are not supported. Generation is greedy-first:
+positive-temperature sampling works but is not broadly qualified.
 
-| Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
-|---|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
-| Qwen3.8-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
-| Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
-| Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
-
-Frequency penalty is `0` in every registered preset. Qwen's separate precise-coding recommendation
-is task-specific and is therefore an explicit override rather than an inferred Engine default.
-
-Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
-`--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
-generated token IDs in diagnostics.
-
-Run `./build/apps/ninfer --help` for the exact option contract.
-
-## Context and memory
-
-The registered model IDs have a native context limit of 262,144 tokens. The practical
-allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
-KV-cache type.
-Use `--kv-dtype int8` or `--kv-dtype fp8` for compact large-context allocations. FP8 selects the
-row-scaled E4M3 D256 cache profile. The prepared prompt must fit
-`--max-context`; generation stops at the remaining context capacity when necessary.
-`--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
-the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
-memory, and directly chooses the largest legal page capacity for the complete enabled runtime
-layout. This includes the selected speculative backend, fixed sequence state, unified workspace,
-and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
-unallocated. It does not probe allocations or resize the pool at request time. The single-request
-CLI normally leaves the option omitted so it follows
-`--max-context`; the distinction matters primarily to a concurrent Engine or server.
-
-At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
-Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one
-workspace contains a general execution prefix and a fixed item-output handoff region. Vision encode
-may reuse the full backing before producing the output; Text/MTP/decode work remains inside the
-general prefix while the handoff is live. The capacity is therefore the maximum legal simultaneous
-extent, not the sum of Text, Vision scratch, and Vision output allocations. Text prefill uses
-`min(--prefill-chunk,--max-context)`; Vision keeps the existing 32,768-token aggregate prompt budget
-but plans Device execution for the registered 16,384-token maximum single item. Requests perform no
-project-owned device allocation or growth. Context-cache capacity controls are intentionally absent
-from this one-request interface; the persistent Engine and server routes own cross-request reuse and
-optional Host backing.
-
-All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.
+The Engine reserves weights (19.3 GiB), the L0 history codes and its runtime at startup; exact FP16
+history lives in host memory (at least `--max-context` × 64 KiB). Run `voidinfer --help` for the
+exact option contract.

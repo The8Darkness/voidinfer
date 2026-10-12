@@ -104,33 +104,24 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 
 ## Current product contract
 
-NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance on
-a small set of explicitly registered checkpoint artifacts. The supported identities are
-`qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
-`qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled
-for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute Text,
-image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the
-same public `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
+VoidInfer is a native Windows C++20/CUDA inference engine for maximum single-GPU quality and
+long-context capacity, then speed, on one model: Qwen3.8-27B as an EXL3 6 bpw target with its
+DFlash2 draft (K=7) and, optionally, the BF16 Vision tower. It is compiled for `sm_120a` and tuned
+and measured on an NVIDIA GeForce RTX 5090.
 
-The current workload is one GPU and one resident model instance with a startup-fixed one to eight
-active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
-FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
-scheduling, additional checkpoint targets, and retargeting the implementation to another execution
-platform are outside the current product. This is a local, single-owner project. Registered models,
-generated artifacts, and the local workflow are trusted.
-Requirements derived from a different workload, trust model, or deployment model are out of scope
-until that product contract is explicitly changed.
+The Engine is the EXL3 coherent-device lane engine (`src/exl3/exl3_engine_core.*`): one resident
+model, a startup-fixed one to eight lanes batched into one DFlash2 round, FIFO admission with
+VRAM-aware lane admission and no preemption. Attention history is L0 OSCAR (INT4 codes, exact sink,
+recent window and hot rows on the device; exact FP16 planes in host memory); every published token
+is verified by exact VeriCache. FP16 device KV for context and non-exact VeriCache are diagnostics,
+not product routes. The Engine applies its benchmarked kernel/route profile itself
+(`src/exl3/engine_profile.cpp`); `VOIDINFER_*` variables only override it.
 
-The 27B and 35B-A3B execution packages are peer compile-time Variants of one identity-free Qwen3.6
-family runtime. The family owns the shared `SequencePlan<Variant>`, `RequestPlan<Variant>`, and
-`Program<Variant>` algorithms; frontend and output semantics; Text/Vision/speculative schedules;
-state transactions; workspace composition; and CUDA Graph capture/replay mechanics. Each package
-separately owns its registered artifact identities and bindings, immutable model view,
-dimensions/storage facts, three closed execution-leaf families, graph frontier data, and Program
-instance bytes. No mutable state or device allocation is shared between Programs, neither package
-is defined as a delta from the other, and there is no runtime family selection or target-dependent
-branch inside family scheduling. All artifacts embed the same six frontend resources, and a
-prepared prompt carries no exact-target tag.
+CLI, OpenAI/Anthropic serving and measurement all go through the public Engine. Additional models,
+quantization formats, other GPUs, large-scale or preemptive batching and priority scheduling are
+outside the current product. This is a local, single-owner project; the model directories and the
+local workflow are trusted. Requirements derived from a different workload, trust model, or
+deployment model are out of scope until that product contract is explicitly changed.
 
 ## Engineering priorities
 
@@ -152,70 +143,37 @@ Read only current authorities relevant to a live decision in the task. The follo
 routing map, not a mandatory reading list:
 
 - `README.md` and executable `--help`: delivered capabilities and exact commands;
-- `docs/README.md`: public documentation map;
-- `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
-- `docs/serving.md`: OpenAI/Anthropic HTTP behavior;
-- `docs/performance.md`: published performance methodology and results;
-- `docs/maintainer/engine-architecture.md`: Gateway/Frontend/Engine/Runtime boundaries, execution
-  ownership, request/response/continuation lifecycles, admission, scheduling, output transactions,
-  batched execution, and CUDA Graph semantics;
-- `docs/maintainer/resource-scheduling-and-context-cache.md`: resource selection and accounting,
-  continuation/checkpoint ownership, materialization transactions, and Device/Host replica policy;
-- `docs/maintainer/paged-kv-cache.md`: shared KV capacity, page ownership, retention, physical
-  layouts, and paged consumer contracts;
-- `docs/maintainer/artifact-container.md`, `storage-layouts.md`, and `tensor-formats.md`:
-  generic `.ninfer` contracts;
-- `docs/maintainer/qwen3.6-27b-artifact.md`, `qwen3.8-27b-artifact.md`, and
-  `qwen3.6-35b-a3b-artifact.md`: exact target inventories, conversion, and binding;
-- `docs/maintainer/qwen3.6-27b-model.md` and `qwen3.6-35b-a3b-model.md`: exact model mathematics,
-  dimensions, and state semantics;
-- `docs/maintainer/op-development.md`: Op admission, contracts, implementation ownership,
-  qualification, and performance evidence rules;
-- `include/ninfer/engine.h` and `include/ninfer/types.h`: in-tree C++ product interface.
+- `docs/README.md`: documentation map;
+- `docs/cli.md` and `docs/serving.md`: CLI and OpenAI/Anthropic HTTP behavior;
+- `docs/architecture.md`: Engine, lane, KV-tier and VeriCache structure and the source map;
+- `docs/current-status.md`: supported defaults, measured state and rejected routes;
+- `docs/OSCAR_KV_FIDELITY.md`: KV-tier quality instruments and results;
+- `bench/engine-compare/README.md`: the benchmark harness and comparison protocol;
+- `include/voidinfer/engine.h` and `include/voidinfer/types.h`: in-tree C++ product interface.
 
-Do not survey unrelated references for completeness. Read additional documents only when they
-govern a live decision in the current task.
+Do not survey unrelated references for completeness.
 
 ## Product and ownership boundaries
 
 These boundaries govern ordinary implementation work. An explicit architecture task may revise
 them, but must update the corresponding active authorities and affected implementation together.
 
-- `.ninfer` is the only C++ product artifact. Do not add `.qus` fallback, extension detection,
-  compatibility shims, or a second product lane.
-- `include/ninfer/engine.h` and `include/ninfer/types.h` are the opaque Engine interface used by
-  in-tree applications and owning host values. NInfer does not currently install or export a C++
-  SDK. `include/ninfer/ops/` contains repository-internal semantic Op contracts.
-- `src/core` owns device primitives, tensors/views, checked layouts, arenas, graph RAII, physical
-  KV-cache containers, and raw transfer mechanisms.
-- `src/artifact` owns generic `.ninfer` framing, descriptors, binding primitives, and
-  materialization. It has no checkpoint execution semantics.
-- `src/ops` owns every semantically closed Op implementation, including fused, fixed-shape, and
-  device-specialized paths. Op ownership follows the mathematical or state-transition contract,
-  not its first model caller or demonstrated cross-target reuse.
-- `src/targets/qwen3_6` owns only the Qwen3.6-family invariants shared by the 27B and 35B-A3B
-  targets: tokenizer/template and output semantics, media preprocessing and MRoPE prompt
-  construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive
-  Vision definitions, and the fixed
-  planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms. It has no target
-  identity, registry entry, artifact binder, target leaf
-  implementation, or storage for a live Program instance.
-- `src/targets/<package>` owns its registered checkpoint identities, storage profiles, binder,
-  `LoadedModel`, configuration, populated family model-view values and private leaf payloads,
-  diagnostics, graph frontier values, and exactly three execution-leaf families: attention
-  projection, GDN projection/control, and post-mixer. It aliases and instantiates the family
-  runtime types; it does not own a copied Program, Text/Vision/speculative schedule, workspace
-  composition, state transaction, or graph-capture algorithm. Leaf Ops remain implemented under
-  `src/ops`.
-- `src/runtime` owns common contracts, generated-token transaction/publication policy, and the
-  public Engine PIMPL. It does not own model mathematics or target state.
+- `include/voidinfer/engine.h` and `include/voidinfer/types.h` are the opaque Engine interface used
+  by in-tree applications. VoidInfer does not install or export a C++ SDK.
+  `include/voidinfer/ops/` holds repository-internal Op contracts.
+- `src/exl3` owns the model: EXL3 weight loading and linears, the text model (attention, GDN, MLP,
+  L0 OSCAR), the DFlash2 draft, VeriCache, lanes, plane sets and the Engine core.
+- `src/core` owns device primitives, tensors/views, arenas, graph RAII and raw transfer mechanisms.
+- `src/ops` owns the shared semantic Ops the engine still launches (Vision tower ops, gated
+  RMSNorm, OSCAR INT2 history). Engine-specific kernels live in `src/exl3`.
+- `src/targets/qwen3_6` owns the Qwen family frontend: tokenizer/template and output semantics,
+  media preprocessing and M-RoPE prompt construction, prepared prompts and output sessions.
+- `src/runtime` owns common request contracts, sampling resolution and the public Engine PIMPL.
 - `src/media/decode` consumes already-owned bytes. URL/path/data acquisition belongs to
-  `src/product/media_acquire`, CLI, or serving and is not linked into a target.
-- `src/product/prompt_input` owns the shared product-side JSON/message-to-owning-input adapter.
-- `src/serve` owns protocol translation and transport. CLI, server, and benchmark call only the
-  public Engine for inference.
-- `tools/convert/<target>`, `tools/reference/<target>`, and `tools/parity/<target>` remain
-  target-private conversion, correctness, and diagnostic implementations.
+  `src/product/media_acquire`, the CLI or serving.
+- `src/serve` owns protocol translation and transport. CLI, server and benchmarks call only the
+  public Engine for inference; research tools under `tests/research_exl3_*` may drive the text
+  model directly.
 
 ## Compatibility and document lifecycle
 
@@ -256,8 +214,9 @@ lower-precision intermediate when that is the natural qualified implementation. 
 route is checked directly against the same oracle with a criterion appropriate to its output and
 implementation profile; pairwise implementation parity is supplementary evidence only.
 
-Where relevant to the changed behavior, account for numeric-format decode, BF16 fusion order, FP32
-GDN state, BF16/INT8 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address stability.
+Where relevant to the changed behavior, account for EXL3 trellis decode, FP16/BF16 fusion order,
+FP32 GDN state, L0 OSCAR codes and exact history, DFlash2 accept/commit and rollback state, arena
+lifetime, and CUDA Graph address stability.
 This is a risk map, not a checklist for every numerical task.
 
 ## Performance work
@@ -272,14 +231,14 @@ the current design or implementation decision. Do not collect additional profili
 relevant alternatives can be distinguished and the requested claim has adequate support.
 
 Retain concise context sufficient to interpret a reported result: relevant hardware/toolchain,
-artifact identity at the descriptive level, workload or command, and summarized measurements. Raw
-reports and fixed repository or artifact hashes are not required by default.
+model identity at the descriptive level, workload or command, and summarized measurements. Raw
+reports and fixed repository or model hashes are not required by default.
 
 ## Tests and verification
 
 Add or retain a test only when it protects supported observable behavior or a realistic regression:
-numerical kernel/model correctness, `.ninfer` framing/binding, external schema/report behavior, a
-small real integration route, GPU lifetime, or a reproduced bug. Do not add tests for coverage,
+numerical kernel/model correctness, EXL3 weight loading, external schema/report behavior, a small
+real integration route, GPU lifetime, or a reproduced bug. Do not add tests for coverage,
 private file/class shape, getters/constructors, deleted compatibility, source-string scans,
 hypothetical failures, or test ceremony.
 
@@ -291,7 +250,7 @@ The following are typical choices, not a cumulative checklist:
 | documentation | affected active-link/stale-reference review and `git diff --check` |
 | C++ runtime/API | affected explicit targets and meaningful tests |
 | Python tooling | `py_compile` and affected Python tests |
-| `.ninfer` reader/converter/binder | affected contract tests and a real artifact when semantics require it |
+| EXL3 loading / model numerics | affected contract tests and the real model when semantics require it |
 | CUDA math | independent numerical oracle at relevant shapes |
 | memory/lifetime | the affected execution; sanitizer only for a concrete lifetime risk |
 | performance | measurement at the claimed scope; attribution tools only when needed |
@@ -310,24 +269,17 @@ These are conventional project resources, not a checklist of resources every tas
 | Purpose | Path |
 |---|---|
 | repository | current checkout |
-| Python 3.11 | `python3` in the selected maintainer environment |
-| BF16 source checkpoint | explicit local checkpoint directory |
-| product artifact | `out/qwen3_6_27b.ninfer` |
-| conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
+| EXL3 target | `C:\AI\models\Qwen3.8-27B-exl3-6bpw-H6-V6` (OSCAR rotations in `l0_oscar/`) |
+| DFlash2 draft | `C:\AI\models\Qwen3.8-27B-DFlash2-EXL3-5bpw` |
+| BF16 checkpoint / Vision tower | `D:\AI\models\Qwen3.8-27B-bf16` |
 | normal build | `build/` |
-| profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
+| benchmark harness | `bench/engine-compare/` (`ours_env.ps1` sets the model package) |
+| profiler output | `profiles/ncu/`, `profiles/nsys/` |
 | hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.3, MSVC 14.51 (VS 2026 Build Tools) |
 
-Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
-the task requires it. Never select an artifact by glob, modification time, or an unqualified
-“latest” name. Large artifacts, source checkpoints, and profiler outputs are local prerequisites;
-do not download or regenerate them unless that work is in scope.
-
-```bash
-PYTHON=python3
-MODEL=/path/to/Qwen3.6-27B
-NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
-```
+Do not install or upgrade dependencies unless the task requires it. Never select a model directory
+by glob, modification time, or an unqualified "latest" name. Model weights and profiler outputs are
+local prerequisites; do not download or regenerate them unless that work is in scope.
 
 ## Commits
 
@@ -335,7 +287,7 @@ Create a commit only when the user requests one. Use Conventional Commit-style s
 example:
 
 ```text
-feat(engine): cut over the registered target to native artifacts
+perf(exl3): fuse the verifier history pass into the exact line
 ```
 
 Use concise lowercase types consistent with repository history (`feat`, `fix`, `perf`, `bench`,

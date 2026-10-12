@@ -2,7 +2,7 @@
 //
 // op_tester.h — small reusable building blocks for Op tests: checked CUDA
 // calls, device buffers and transfers, deterministic inputs, output guards,
-// and exact/numerical verdicts. See docs/maintainer/op-development.md.
+// and exact/numerical verdicts.
 //
 // Typical per-op test flow (one shape):
 //   std::vector<float> x(n); fill_uniform(x, seed, -8.f, 8.f);

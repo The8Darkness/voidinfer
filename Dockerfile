@@ -22,7 +22,6 @@ RUN cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DVOIDINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
-        -DVOIDINFER_BUILD_BENCHMARKS=OFF \
     && cmake --build /build --parallel --target voidinfer voidinfer-serve
 
 FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04

@@ -34,7 +34,7 @@ default claim.
 
 ## Story 2: repair the benchmark before optimizing the wrong signal
 
-**Problem.** Phase timing suggested large proposal/verifier costs, but `NINFER_DFLASH2_TIMING`
+**Problem.** Phase timing suggested large proposal/verifier costs, but `VOIDINFER_DFLASH2_TIMING`
 inserted synchronization after proposal phases.
 
 **Investigation.** R604 used NVTX/Nsight to locate the verifier as the broad bottleneck. It also

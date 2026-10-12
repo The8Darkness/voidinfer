@@ -1,23 +1,16 @@
 # Limitations
 
-- The current project targets native Windows and CUDA `sm_120a`; portability beyond that is not
-  qualified.
-- Model weights are external and large. Public reproduction requires matching model manifests and
-  revisions, not just a source commit.
-- R608 is a research-harness measurement, not HTTP throughput, pure-kernel decode, startup latency,
-  or client-visible TTFT.
-- EXL3 serving is greedy-first. Images and video run on the coherent-device route with
-  `--exl3-vision` (BF16 tower), but media prompts are not reused as prefix roots; positive-temperature
-  sampling is not broadly qualified.
-- The held-out quality panel, Mia parity, Engine/client TTFT parity, and the 70/200/3000 performance
-  goals are incomplete.
-- WMMA32 prefill and native MTP remain default-off and unqualified. R49 and segmented-prefix R612
-  remain rejected/default-off for their documented reasons.
-- Historical OSCAR/NVFP4/VeriCache results use different model and cache contracts; they are not
-  current EXL3 numbers.
-- Profiler captures perturb execution. R604 locates a verifier bottleneck but its CUDA API shares
-  are not normal wall-time proportions.
-- Passing frozen exactness gates is not broad numerical equivalence or model-quality proof.
-
-The project is best presented as a rigorous systems research and implementation portfolio, not as a
-drop-in production inference server.
+- One model and one GPU class: Qwen3.8-27B as EXL3 6 bpw with its DFlash2 draft, native Windows,
+  CUDA `sm_120a` (RTX 5090). Portability beyond that is not qualified.
+- Model weights are external and large; reproduction needs the same model directories (target,
+  draft, OSCAR rotations, optional BF16 Vision tower), not just a source commit.
+- Generation is greedy-first. Positive-temperature sampling runs but is not broadly qualified;
+  thinking budgets, stop strings and penalties are rejected by the Engine.
+- Media prompts are served without prefix reuse.
+- Raw speed trails NInfer (2026-10-12): prefill 1.3-1.8x, base decode 1.2x, batched concurrency
+  1.3-1.4x, single-request DFlash2 at 16K-64K 1.1-1.3x, agent resume 2.2x, image requests 1.4-1.6x.
+- The resident (pre-L0) OSCAR runtime is still in the source, refused by the Engine and entangled
+  with the exact host-state restore path.
+- Profiler captures perturb execution; attribution captures are not wall-time shares.
+- Passing exactness gates is not broad numerical equivalence or model-quality proof; the KL and
+  paired-NLL panels are the quality evidence.
