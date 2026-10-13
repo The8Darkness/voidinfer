@@ -2564,9 +2564,24 @@ struct DraftSelectSampling {
     int top_k=0;
     unsigned long long seed=0;
     int key_base=0,pad=0;
+    // Presence penalty (sampled_select.h): candidates generated before the
+    // proposed index (committed output, the block's seed or an earlier proposal).
+    float presence_penalty=0.0f;
+    const std::int32_t* first_occurrence=nullptr;
 };
 __device__ inline int dflash_sampled_choice(const DraftSelectSampling& s,int key,
-    const float* scores,const std::int64_t* candidates) {
+    const float* raw_scores,const std::int64_t* candidates,std::int64_t seed_token,
+    const std::int64_t* chain,int chain_rows) {
+    float scores[kTopK];
+    for(int c=0;c<kTopK;++c) {
+        scores[c]=raw_scores[c];
+        if(s.presence_penalty==0.0f) continue;
+        const auto token=candidates[c];
+        bool seen=token==seed_token ||
+            (s.first_occurrence && s.first_occurrence[token]<key);
+        for(int i=0;i<chain_rows && !seen;++i) seen=chain[i]==token;
+        if(seen) scores[c]-=s.presence_penalty;
+    }
     int order[kTopK];
     for(int c=0;c<kTopK;++c) order[c]=c;
     for(int i=1;i<kTopK;++i) {
@@ -2615,6 +2630,7 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
     if (t == 0)
         anchor = device_anchor != nullptr ? device_anchor[0] : initial_anchor;
     __syncthreads();
+    const std::int64_t seed_token = anchor;
 
     for (int position = 0; position < proposal_rows; ++position) {
         const auto* pred_row = pred_cb + static_cast<std::size_t>(anchor) * kRank;
@@ -2646,7 +2662,8 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
             if (sampling && sampling->inv_temperature > 0.0f)
                 best = dflash_sampled_choice(*sampling, sampling->key_base + position,
                     cand_unary + static_cast<std::size_t>(position) * kTopK,
-                    cand_ids + static_cast<std::size_t>(position) * kTopK);
+                    cand_ids + static_cast<std::size_t>(position) * kTopK,
+                    seed_token, proposal_out, position);
             else
             for (int c = 1; c < kTopK; ++c)
                 if (scores[c] > best_score) { best_score = scores[c]; best = c; }
@@ -3151,6 +3168,7 @@ struct Exl3Dflash2DraftModel::Impl {
         float* edge_scores = nullptr;       // [16]
         std::int64_t* proposal_out = nullptr; // [P]
         DraftPositionConfidence* confidence_out = nullptr; // [P], T73A only
+        DraftSelectSampling* select_sampling = nullptr;   // coupled proposals (fused selector)
     } s{};
 
     std::vector<std::unique_ptr<DeviceAllocation>> scratch;
@@ -3408,6 +3426,7 @@ struct Exl3Dflash2DraftModel::Impl {
         alloc(kTopK * sizeof(float), reinterpret_cast<void**>(&s.edge_scores), "dflash edge scores");
         // [0, kBlockCap) proposals (slot 7: device-seed status).
         alloc(rowsB(kBlockCap) * sizeof(std::int64_t), reinterpret_cast<void**>(&s.proposal_out), "dflash proposal out");
+        alloc(sizeof(DraftSelectSampling), reinterpret_cast<void**>(&s.select_sampling), "dflash selection sampling");
         if (position_confidence)
             alloc(rowsB(kBlockCap) * sizeof(DraftPositionConfidence),
                   reinterpret_cast<void**>(&s.confidence_out),
@@ -5373,6 +5392,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             if(cfg.sampled()) {
                 value.inv_temperature=1.0f/cfg.temperature;value.top_p=cfg.top_p;value.min_p=cfg.min_p;
                 value.top_k=cfg.top_k;value.seed=cfg.seed;
+                value.presence_penalty=cfg.presence_penalty;value.first_occurrence=cfg.first_occurrence;
             }
             value.key_base=members[i]->block_pos0+1;
         }
@@ -6650,10 +6670,25 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     std::int64_t anchor = block_ids[0];
     require(anchor >= 0 && anchor < kVocab, "E5A2 draft anchor outside vocabulary");
     if (fused_selector) {
+        // Sampled requests draft with the target's coupled draw (same noise,
+        // truncation and presence penalty), as the batched path does: the
+        // proposals are the tokens the verifier most likely selects.
+        const DraftSelectSampling* select_sampling = nullptr;
+        if (m.sampling.sampled()) {
+            DraftSelectSampling value{};
+            value.inv_temperature=1.0f/m.sampling.temperature;value.top_p=m.sampling.top_p;
+            value.min_p=m.sampling.min_p;value.top_k=m.sampling.top_k;value.seed=m.sampling.seed;
+            value.key_base=block_pos0+1;
+            value.presence_penalty=m.sampling.presence_penalty;
+            value.first_occurrence=m.sampling.first_occurrence;
+            cuda_check(exl3_h2d_async(m.s.select_sampling,&value,sizeof(value),stream),
+                       "E5A2 upload draft selection sampling");
+            select_sampling = m.s.select_sampling;
+        }
         dflash_selector_fused_chain_kernel<<<1, kSelectorFusedThreads, 0, stream>>>(
             proposal_rows, anchor, device_seed ? m.s.ids : nullptr,
             m.s.cand_ids, m.s.hidden_proj_out, m.pred_cb, m.succ_cb,
-            m.s.cand_unary, m.s.proposal_out);
+            m.s.cand_unary, m.s.proposal_out, select_sampling);
         cuda_check(cudaGetLastError(), "E5A2 launch fused draft selector");
         ++m.fused_selector_calls;
         cuda_check(voidinfer::cuda_poll_stream(stream), "E5A2 fused draft proposals poll");
