@@ -957,6 +957,10 @@ public:
     // Logical depth of each verifier row (verification tree) for the coupled
     // draw keys of packets with exactly that many rows; empty = plain chain.
     void set_sampling_row_depths(std::span<const int> depths);
+    // Input tokens of the verifier rows of packets with exactly that many rows
+    // ([seed, chain drafts, sibling leaves]): their drafted history for the
+    // presence penalty; empty = rows see only the committed output.
+    void set_sampling_row_inputs(std::span<const std::int64_t> inputs);
     Exl3GreedyPacket greedy_packet(bool continuation, cudaStream_t stream = nullptr);
     Exl3PendingGreedyPacket submit_greedy_packet(
         bool continuation,std::uint64_t acquisition,std::uint64_t execution,

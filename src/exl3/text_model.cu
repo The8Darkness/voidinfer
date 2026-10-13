@@ -2024,6 +2024,7 @@ struct Exl3TextContext::Impl {
     std::uint64_t greedy_serial = 0;
     Exl3DeviceSampling sampling;
     std::vector<int> sampling_row_depths;   // verification-tree rows (set_sampling_row_depths)
+    std::vector<int> sampling_row_inputs;   // verifier row input tokens (set_sampling_row_inputs)
     std::array<Exl3GreedyRow,16> greedy_host_rows{};
     bool greedy_readback_failed=false;
     GreedyReadbackStats greedy_readback;
@@ -11384,6 +11385,43 @@ void Exl3TextContext::prepare_greedy_packet() {
         impl_->persistent_bytes=next_impl;persistent_bytes_=next_public;
     }
 }
+namespace {
+constexpr int kPresenceChunk=64;
+struct PresenceChunk {int first,count;int token[kPresenceChunk];};
+__global__ void exl3_presence_truncate_kernel(std::int32_t* table,int vocabulary,int from) {
+    const int v=static_cast<int>(blockIdx.x*blockDim.x+threadIdx.x);
+    if(v<vocabulary && table[v]>=from) table[v]=kExl3AbsentOccurrence;
+}
+__global__ void exl3_presence_record_kernel(std::int32_t* table,PresenceChunk chunk) {
+    const int i=static_cast<int>(threadIdx.x);
+    if(i<chunk.count) atomicMin(table+chunk.token[i],chunk.first+i);
+}
+} // namespace
+
+void exl3_presence_reset(std::int32_t* table,cudaStream_t stream) {
+    cuda_check(cudaMemsetAsync(table,0x7f,static_cast<std::size_t>(kVocab)*sizeof(std::int32_t),stream),
+        "presence table reset");
+}
+void exl3_presence_truncate(std::int32_t* table,int from,cudaStream_t stream) {
+    exl3_presence_truncate_kernel<<<(kVocab+255)/256,256,0,stream>>>(table,kVocab,from);
+    cuda_check(cudaGetLastError(),"presence table truncate");
+}
+void exl3_presence_record(std::int32_t* table,int first,const std::int64_t* tokens,std::size_t count,
+    cudaStream_t stream) {
+    for(std::size_t at=0;at<count;at+=kPresenceChunk) {
+        PresenceChunk chunk{};
+        chunk.first=first+static_cast<int>(at);
+        chunk.count=static_cast<int>(std::min<std::size_t>(kPresenceChunk,count-at));
+        for(int i=0;i<chunk.count;++i) {
+            const auto token=tokens[at+static_cast<std::size_t>(i)];
+            require(token>=0 && token<kVocab,"presence token outside the vocabulary");
+            chunk.token[i]=static_cast<int>(token);
+        }
+        exl3_presence_record_kernel<<<1,kPresenceChunk,0,stream>>>(table,chunk);
+        cuda_check(cudaGetLastError(),"presence table record");
+    }
+}
+
 void Exl3TextContext::set_device_sampling(const Exl3DeviceSampling& sampling) noexcept {
     impl_->sampling=sampling;
 }
@@ -11392,6 +11430,9 @@ const Exl3DeviceSampling& Exl3TextContext::device_sampling() const noexcept {
 }
 void Exl3TextContext::set_sampling_row_depths(std::span<const int> depths) {
     impl_->sampling_row_depths.assign(depths.begin(),depths.end());
+}
+void Exl3TextContext::set_sampling_row_inputs(std::span<const std::int64_t> inputs) {
+    impl_->sampling_row_inputs.assign(inputs.begin(),inputs.end());
 }
 Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t stream) {
     const auto* source=continuation ? continuation_logits_device() : logits_device();
@@ -11407,7 +11448,7 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
     try {
         if(impl_->sampling.active()) {
             exl3_launch_sampled_packet(rows,stream,source,kVocab,kVocab,impl_->sampling,
-                position_-rows+1,impl_->sampling_row_depths,result.serial,output);
+                position_-rows+1,impl_->sampling_row_depths,impl_->sampling_row_inputs,result.serial,output);
         }
         else
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,result.serial,output,impl_->greedy_split_scratch());
@@ -11470,7 +11511,7 @@ Exl3PendingGreedyPacket Exl3TextContext::submit_greedy_packet(
     try {
         if(impl_->sampling.active()) {
             exl3_launch_sampled_packet(rows,stream,source,kVocab,kVocab,impl_->sampling,
-                position_-rows+1,impl_->sampling_row_depths,pending.serial_,
+                position_-rows+1,impl_->sampling_row_depths,impl_->sampling_row_inputs,pending.serial_,
                 static_cast<Exl3GreedyRow*>(transfer->device->ptr));
         }
         else

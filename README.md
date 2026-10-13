@@ -186,8 +186,9 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
 
 * Greedy generation through the coherent-device Engine, one to eight concurrent requests
   (`--max-concurrency 1..8`), text of any length and, with `--vision`, images and video.
-  Positive-temperature sampling is not broadly qualified; thinking budgets, stop strings and
-  penalties are rejected. Media prompts are not reused as prefix roots.
+  Sampling uses the model-card presets (non-thinking: temperature 0.7, top-p 0.8, presence penalty
+  1.5); thinking budgets, stop strings and frequency penalties are rejected. Media prompts are not
+  reused as prefix roots.
 * L0 OSCAR (INT4 history codes, exact sink, recent window and 512 hot rows per KV head) with exact
   VeriCache is the default at every context length; L2 history stays in host RAM (FP16 planes, losslessly
   packed when parked, spilled to disk under memory pressure). `VOIDINFER_EXL3_VERICACHE=tolerance`

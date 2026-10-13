@@ -2668,7 +2668,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     catch(const std::runtime_error&){failed=true;}
     require(failed,"failed provider converted into free capacity");
     using Taps=voidinfer::exl3::Exl3EngineTapRequirements;
-    require(Taps::for_lanes(1).units[0]==5ULL*16*5120*2,"C1 allocator requirement drift");
+    require(Taps::for_lanes(1).units[0]==5ULL*16*5120*2+248320ULL*4,"C1 allocator requirement drift");
     require(Taps::for_lanes(2).units[0]==2*Taps::for_lanes(1).units[0],"C2 allocator requirement drift");
     const auto with_metadata=Taps::for_lanes(2,40);
     require(with_metadata.units[0]==Taps::for_lanes(2).units[0] &&

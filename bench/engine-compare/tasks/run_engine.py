@@ -81,7 +81,7 @@ def run_suite(port, config, name, conc, limit, ids=None):
     def one(it):
         messages = it.get("messages") or [{"role": "user", "content": it["prompt"]}]
         body = {"model": "qwen3.8-27b", "messages": messages,
-                "max_tokens": max_tokens, "temperature": 0, "enable_thinking": thinking}
+                "max_tokens": max_tokens, "temperature": 0, "presence_penalty": 0, "enable_thinking": thinking}
         t0 = time.time()
         try:
             r = post(port, body)

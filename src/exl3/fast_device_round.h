@@ -1461,9 +1461,12 @@ private:
             row_depths.insert(row_depths.end(),sibling_offsets.begin(),sibling_offsets.end());
         }
         context_->set_sampling_row_depths(row_depths);
+        // Presence penalty: each row's drafted history ([seed, chain, siblings]).
+        if(context_->device_sampling().presence_penalty!=0.0f)
+            context_->set_sampling_row_inputs(std::span<const std::int64_t>(value.proposal).first(value.width));
         struct RowDepthReset {
             Exl3TextContext& context;
-            ~RowDepthReset() {context.set_sampling_row_depths({});}
+            ~RowDepthReset() {context.set_sampling_row_depths({});context.set_sampling_row_inputs({});}
         } row_depth_reset{*context_};
         if(before_verify)before_verify(*context_);
         const auto verifier_start=Clock::now();

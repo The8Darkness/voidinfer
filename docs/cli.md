@@ -21,7 +21,7 @@ model's chat template exposes one; `--no-thinking` renders a direct-response pro
 with `--reasoning-effort`).
 
 The Engine currently rejects requests that carry a thinking budget (`--thinking-budget`), stop
-strings (`--stop`, `--reasoning-stop`) or penalties; stop token ids (`--stop-token-id`) are
+strings (`--stop`, `--reasoning-stop`) or a frequency penalty; stop token ids (`--stop-token-id`) are
 supported. `--max-new` counts every committed token.
 
 ## Images and video
@@ -74,8 +74,9 @@ thinking and long-context inputs.
 | `--raw-output`, `--print-token-ids` | raw frontend stream; token ids in diagnostics | off |
 
 Sampler defaults come from the model's thinking or non-thinking preset; each flag overrides one
-field. Presence and frequency penalties are not supported. Generation is greedy-first:
-positive-temperature sampling works but is not broadly qualified.
+field. The non-thinking preset is the model card's instruct preset (temperature 0.7, top-p 0.8,
+top-k 20, presence penalty 1.5); the thinking preset comes from `generation_config.json`. The
+presence penalty applies to the generated tokens; frequency penalties are not supported.
 
 The Engine reserves weights (19.3 GiB), the L0 history codes and its runtime at startup; exact FP16
 history lives in host memory (at least `--max-context` × 64 KiB). Run `voidinfer --help` for the

@@ -96,7 +96,38 @@ double seconds(Clock::time_point t){return std::chrono::duration<double>(Clock::
 void check(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
 struct DraftTapStaging {
     std::array<std::uint16_t*,Exl3EngineTapRequirements::layers> pointers{};
-    ~DraftTapStaging(){for(auto p:pointers)if(p)cudaFree(p);}
+    // First output position of every token of the lane's request (presence
+    // penalty; Exl3DeviceSampling::first_occurrence).
+    std::int32_t* first_occurrence=nullptr;
+    ~DraftTapStaging(){for(auto p:pointers)if(p)cudaFree(p);if(first_occurrence)cudaFree(first_occurrence);}
+};
+// Presence penalty of one lane request: the lane's first-occurrence table
+// (Exl3DeviceSampling::first_occurrence) follows its output, published and
+// drafted (unverified) tokens alike, at positions prompt, prompt+1, ... after
+// every round and verification; only the changed suffix is rewritten.
+struct PresenceTrack {
+    std::int32_t* table=nullptr;
+    int first_position=0;
+    std::vector<std::int64_t> recorded;
+    void begin(std::int32_t* value,int prompt_tokens,cudaStream_t stream) {
+        table=value;first_position=prompt_tokens;recorded.clear();
+        exl3_presence_reset(table,stream);
+    }
+    void sync(std::span<const std::int64_t> published,std::span<const std::int64_t> drafted,
+              int frontier,cudaStream_t stream) {
+        if(!table)return;
+        const auto count=published.size()+drafted.size();
+        if(first_position+static_cast<int>(count)!=frontier)
+            throw std::logic_error("presence penalty output/frontier mismatch");
+        const auto at=[&](std::size_t i){return i<published.size()?published[i]:drafted[i-published.size()];};
+        std::size_t keep=0;
+        while(keep<recorded.size() && keep<count && recorded[keep]==at(keep))++keep;
+        if(keep<recorded.size())exl3_presence_truncate(table,first_position+static_cast<int>(keep),stream);
+        recorded.resize(keep);
+        for(std::size_t i=keep;i<count;++i)recorded.push_back(at(i));
+        if(keep<count)exl3_presence_record(table,first_position+static_cast<int>(keep),
+            recorded.data()+keep,count-keep,stream);
+    }
 };
 // Physical Engine lanes (coherent-device C1..C8; the ordinary route C1/C2).
 constexpr std::size_t kMaxLanes=8;
@@ -936,9 +967,14 @@ struct Exl3EngineCore::Impl {
         // floor, including mandatory opted-in attention metadata; weights,
         // other lane resources and runtime owners still need full admission.
         const auto cfg=nlohmann::json::parse(resources.generation_config_json);
-        SamplingPreset preset;
-        preset.temperature=cfg.value("temperature",1.0F);preset.top_k=cfg.value("top_k",20);preset.top_p=cfg.value("top_p",0.95F);
-        defaults={preset,preset};
+        // generation_config.json carries the thinking preset; the model card's
+        // instruct (non-thinking) preset is temperature 0.7, top_p 0.8, top_k 20,
+        // presence_penalty 1.5.
+        SamplingPreset thinking;
+        thinking.temperature=cfg.value("temperature",1.0F);thinking.top_k=cfg.value("top_k",20);thinking.top_p=cfg.value("top_p",0.95F);
+        SamplingPreset non_thinking;
+        non_thinking.temperature=0.7F;non_thinking.top_k=20;non_thinking.top_p=0.8F;non_thinking.presence_penalty=1.5F;
+        defaults={thinking,non_thinking};
         Exl3LoadOptions loading;loading.verified_dual_manifest=value.model.verified_dual_manifest;
         // Deliberate pre-authority construction boundary: target/draft immutable
         // weights (and qualified vision weights) are allocated by their artifact
@@ -1481,13 +1517,15 @@ struct Exl3EngineCore::Impl {
             unsigned allocated_planes=0;
             for(std::uint32_t i=0;i<value.max_concurrency;++i) {
                 pending[i]=std::make_shared<DraftTapStaging>();
+                check(cudaMalloc(reinterpret_cast<void**>(&pending[i]->first_occurrence),
+                    Exl3EngineTapRequirements::occurrence_bytes));
                 for(auto& p:pending[i]->pointers) {
                     check(cudaMalloc(reinterpret_cast<void**>(&p),Exl3EngineTapRequirements::plane_bytes));
                     if(context_startup_fault==40+(++allocated_planes))
                         throw std::runtime_error("injected Engine tap staging allocation failure");
                 }
                 actual.add({pending[i],0,Domain::device,
-                    Exl3EngineTapRequirements::layers*Exl3EngineTapRequirements::plane_bytes-
+                    Exl3EngineTapRequirements::lane_device_bytes-
                         (context_startup_fault==52 && i==0?1:0)});
                 actual.add({pending[i],1,Domain::host_metadata,sizeof(DraftTapStaging)-
                     (context_startup_fault==53 && i==0?1:0)});
@@ -2274,10 +2312,9 @@ struct Exl3EngineCore::Impl {
            ids.size()>options.max_context ||
            !request.options.stop.strings.empty() ||
            request.options.execution.thinking.budget.has_value() ||
-           request.options.execution.sampling.presence_penalty!=0 ||
            request.options.execution.sampling.frequency_penalty!=0)
             throw std::invalid_argument(
-                "coherent-device EXL3 requires a prompt without penalties, stop strings or a thinking budget (media needs --vision)");
+                "coherent-device EXL3 requires a prompt without frequency penalty, stop strings or a thinking budget (media needs --vision)");
         if(request.cancelled) {result.finish_reason=FinishReason::Cancelled;return;}
         if(Clock::now()>=request.deadline)
             throw RequestError(RequestErrorKind::QueueTimeout,
@@ -2290,6 +2327,7 @@ struct Exl3EngineCore::Impl {
         std::unique_ptr<Exl3FastDeviceRound> round;
         std::optional<std::uint64_t> pending_ticket;
         std::vector<std::int64_t> committed;
+        PresenceTrack presence;
         auto root=Root{};
         std::vector<std::int64_t> terminal_tokens;
         if(request.options.stop.include_model_defaults)
@@ -2319,7 +2357,13 @@ struct Exl3EngineCore::Impl {
                 if(sp.temperature>0 && !seed)
                     seed=std::hash<std::uint64_t>{}(request.ready_work.generation()^
                         (static_cast<std::uint64_t>(Clock::now().time_since_epoch().count())<<1))|1u;
-                context->set_device_sampling({sp.temperature,sp.top_k,sp.top_p,sp.min_p,seed});
+                Exl3DeviceSampling device_sampling{sp.temperature,sp.top_k,sp.top_p,sp.min_p,seed};
+                if(sp.presence_penalty!=0) {
+                    presence.begin(staging_owners[lane_index]->first_occurrence,static_cast<int>(ids.size()),stream);
+                    device_sampling.presence_penalty=sp.presence_penalty;
+                    device_sampling.first_occurrence=presence.table;
+                }
+                context->set_device_sampling(device_sampling);
                 draft.set_sampling(context->device_sampling());
             }
             struct SamplingReset {
@@ -2749,6 +2793,7 @@ struct Exl3EngineCore::Impl {
                         unverified.insert(unverified.end(),settled.committed_tokens.begin(),
                             settled.committed_tokens.end());
                         terminal_seen=settled.terminal;
+                        presence.sync(committed,unverified,round->frontier(),stream);
                         ++result.speculative.rounds;
                         result.speculative.accepted_tokens+=settled.verification.accepted;
                         result.speculative.accepted_prefix_per_round.push_back(
@@ -2899,6 +2944,7 @@ struct Exl3EngineCore::Impl {
                         unverified.clear();
                         terminal_seen=false;
                     }
+                    presence.sync(committed,unverified,round->frontier(),stream);
                     if(finished)break;
                     draft_mark=Clock::now();
                 }
@@ -3034,6 +3080,7 @@ struct Exl3EngineCore::Impl {
                 if(!request.publication_boundary.resident_committed(boundary))
                     throw std::logic_error("coherent-device logical commit ordering");
                 committed.insert(committed.end(),selected.begin(),selected.end());
+                presence.sync(committed,{},round->frontier(),stream);
                 result.generated_token_ids.insert(
                     result.generated_token_ids.end(),tokens.begin(),tokens.end());
                 remaining-=static_cast<std::uint32_t>(selected.size());
@@ -4665,10 +4712,9 @@ Exl3EngineCore::Submission Exl3EngineCore::submit(targets::qwen3_6::PreparedProm
     const auto sampled_admission=Exl3SampledAuthorityBoundary::decide({
         sampling_policy,impl_->drafts[0]->sampled_distribution_availability()});
     // The coherent-device route samples on device with VeriCache-coupled
-    // selection (temperature, top_k, top_p, min_p; no penalties).
-    const bool coupled_sampling=
-        options.execution.sampling.presence_penalty==0 &&
-        options.execution.sampling.frequency_penalty==0;
+    // selection (temperature, top_k, top_p, min_p, presence penalty; no
+    // frequency penalty).
+    const bool coupled_sampling=options.execution.sampling.frequency_penalty==0;
     if(!sampled_admission.greedy() && !coupled_sampling)
         throw RequestError(RequestErrorKind::UnsupportedSampling,
             std::string(Exl3SampledAuthorityBoundary::message(

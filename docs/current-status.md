@@ -64,7 +64,7 @@ The 2026-09-22 publication table below remains as the historical record of that 
 | Tolerance VeriCache (`VOIDINFER_EXL3_VERICACHE=tolerance`) | Default off | `src/exl3/vericache_*` | Trades exactness for 8-9% per round |
 | Resident OSCAR runtime (`VOIDINFER_OSCAR_EXL3=1`) | Research, refused by the Engine | `src/exl3/oscar_runtime.*` | Pre-L0 OSCAR route; still entangled with the exact host-state restore path |
 | Positive-temperature sampling | Runs, not broadly qualified | `src/exl3/sampling_policy.h`, `sampled_select.*` | Greedy authority does not establish distribution preservation |
-| Thinking budgets, stop strings, penalties | Rejected by the Engine | `src/exl3/exl3_engine_core.cpp` | Parsed by CLI/server, refused at submission |
+| Thinking budgets, stop strings, frequency penalty | Rejected by the Engine (presence penalty is served) | `src/exl3/exl3_engine_core.cpp` | Parsed by CLI/server, refused at submission |
 | Segmented resident prefix | Rejected, default off | `src/exl3/text_model.*` | R612 exact screen, 17-21% slower |
 | WMMA32 prefill | Quality-pending, default off | EXL3 prefill | Does not match the frozen exact token stream |
 

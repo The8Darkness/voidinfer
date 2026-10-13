@@ -61,8 +61,9 @@ The endpoint supports:
 - `system`, `developer`, `user`, `assistant`, and `tool` history;
 - string content and ordered text, `image_url`, and `video_url` parts;
 - `max_completion_tokens` and the legacy `max_tokens` spelling;
-- `temperature`, `top_p`, `top_k`, `min_p` and a nonnegative `seed` (presence/frequency penalties
-  are parsed but the Engine rejects non-zero values);
+- `temperature`, `top_p`, `top_k` (at most 20 candidates are kept: `0` or values above 20 mean 20),
+  `min_p`, `presence_penalty` (OpenAI semantics over the generated tokens, also with temperature 0)
+  and a nonnegative `seed`; `frequency_penalty` is parsed but the Engine rejects non-zero values;
 - stop strings are parsed but currently rejected by the Engine;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
@@ -494,10 +495,12 @@ curl http://127.0.0.1:8080/v1/models \
 | `--cors` | permissive browser CORS headers | off |
 | `--webui`, `--webui-dir DIR` | download and serve the llama.cpp web UI at `/` | off / `<target>/webui` |
 
-Sampler defaults come from the target's `generation_config.json` (temperature, top-p, top-k) for
-both thinking modes. Process flags override them, request fields override process flags, and
-`--greedy` finally forces temperature `0`. Generation is greedy-first: positive-temperature sampling
-runs on device with VeriCache-coupled selection but is not broadly qualified.
+Sampler defaults follow the model card: thinking requests take the target's `generation_config.json`
+(temperature 1.0, top-p 0.95, top-k 20), non-thinking requests the instruct preset (temperature 0.7,
+top-p 0.8, top-k 20, presence penalty 1.5). Process flags override them, request fields override
+process flags, and `--greedy` finally forces temperature `0` (a preset or requested presence penalty
+still applies). Sampling runs on device with VeriCache-coupled selection: drafting, decode rounds and
+the exact verification draw with the same noise and the same penalties.
 
 Run `voidinfer-serve --help` for the exact option contract.
 

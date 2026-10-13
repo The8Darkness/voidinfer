@@ -5370,7 +5370,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         for(int i=0;i<count;++i) {
             const auto& cfg=members[i]->draft->impl_->sampling;
             auto& value=sampling[static_cast<std::size_t>(i)];
-            if(cfg.active()) {
+            if(cfg.sampled()) {
                 value.inv_temperature=1.0f/cfg.temperature;value.top_p=cfg.top_p;value.min_p=cfg.min_p;
                 value.top_k=cfg.top_k;value.seed=cfg.seed;
             }
