@@ -750,6 +750,9 @@ public:
         if(phase_!=Phase::ready || ring_rows<1 || ring_rows>2047 || !line.exact_line())
             throw std::logic_error("folded verification begin");
         line_=&line;
+        // The line verifies this request's draws: it selects with the same
+        // coupled sampler (a greedy line "corrected" every sampled token).
+        line.set_device_sampling(context_->device_sampling());
         const OrderedPass ordered(pass_order_,stream_);
         line.sync_exact_line_from(*context_,stream_);
         line.save_verified_root(stream_);
