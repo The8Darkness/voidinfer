@@ -60,7 +60,7 @@ int main() {
                           voidinfer::kDefaultHostKvCapacityBytes,
                       "host KV does not default to 8 GiB at 32K");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
-    failures += check(!defaults.preserve_thinking, "thinking history preserved by default");
+    failures += check(defaults.preserve_thinking, "thinking history not preserved by default");
     failures += check(defaults.request_log_jsonl.empty(), "request log enabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000, "stats interval default changed");
     failures += check(defaults.media_cache_bytes == voidinfer::kDefaultMediaCacheBytes &&
@@ -96,13 +96,13 @@ int main() {
     const ServeOptions configured =
         parse(package({"--max-concurrency", "4", "--max-context", "4096", "--max-pending-requests",
                        "12", "--pending-timeout-ms", "2500", "--log-stats-interval-ms", "0",
-                       "--media-cache-mib", "256", "--preserve-thinking", "--no-prefix-reuse"}));
+                       "--media-cache-mib", "256", "--no-preserve-thinking", "--no-prefix-reuse"}));
     failures += check(configured.max_concurrency == 4 && configured.max_context == 4096 &&
                           configured.max_pending_requests == 12 &&
                           configured.pending_timeout_ms == 2500 &&
                           configured.log_stats_interval_ms == 0 &&
                           configured.media_cache_bytes == (256ULL << 20) &&
-                          configured.preserve_thinking,
+                          !configured.preserve_thinking,
                       "configured serving options were not preserved");
     failures += check(!configured.allow_prefix_reuse && configured.context_cache.enabled,
                       "--no-prefix-reuse must keep the host-root cache and disable reuse");
@@ -166,16 +166,16 @@ int main() {
                       "non-thinking request inherited the server thinking budget");
     request.enable_thinking.reset();
     failures +=
-        check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
-              "server preserve-thinking default was not resolved");
-    request.preserve_thinking = false;
-    failures +=
         check(!resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
+              "server preserve-thinking default was not resolved");
+    request.preserve_thinking = true;
+    failures +=
+        check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "request preserve-thinking override did not win");
 
     const std::string usage = serve_usage_text("voidinfer-serve");
     for (const char* flag : {"--target", "--draft", "--vision", "--host-kv-mib", "--no-prefix-reuse",
-                             "--preserve-thinking", "--default-thinking-budget",
+                             "--no-preserve-thinking", "--default-thinking-budget",
                              "--log-stats-interval-ms", "--media-preprocess-threads",
                              "--response-store-max-mib", "--request-log-jsonl"})
         failures += check(usage.find(flag) != std::string::npos, "serve help omits a flag");

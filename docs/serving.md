@@ -96,9 +96,10 @@ select the corresponding template effort when available. The other OpenAI protoc
 `reasoning_effort` returns `conflicting_template_option`.
 
 `preserve_thinking` controls whether reasoning from closed assistant turns remains in later
-prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
-both OpenAI spellings are present they must carry the same boolean value. Unknown non-null
-`chat_template_kwargs` are rejected.
+prompts (each closed turn keeps its `<think>` block, empty when it had no reasoning). It defaults
+to the server setting, which is on, as in the model's chat template, unless `--no-preserve-thinking`
+is used. If both OpenAI spellings are present they must carry the same boolean value. Unknown
+non-null `chat_template_kwargs` are rejected.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -483,7 +484,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--default-max-tokens N` | output limit when a request omits one | `8192` |
 | `--default-thinking-budget N` | thinking cap for thinking-enabled requests (currently rejected by the Engine) | unset |
 | `--no-thinking` | disable thinking by default | thinking on |
-| `--preserve-thinking` | keep closed-turn reasoning in later prompts | off |
+| `--no-preserve-thinking` | drop closed-turn reasoning from later prompts | keep (template default) |
 | `--temperature F`, `--top-p F`, `--top-k N`, `--min-p F` | process-level sampler overrides | model preset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed |
 | `--greedy` | force exact argmax for all requests | off |

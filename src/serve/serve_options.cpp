@@ -59,7 +59,7 @@ std::string serve_usage_text(const char* argv0) {
            "       [--max-long-anchors-per-continuation N] [--max-cache-markers-per-request N]\n"
            "       [--request-log-jsonl FILE] [--response-store-max-records N]\n"
            "       [--response-store-max-mib N] [--default-max-tokens N] [--default-thinking-budget N]\n"
-           "       [--no-prefix-reuse] [--no-thinking] [--preserve-thinking] [--cors]\n"
+           "       [--no-prefix-reuse] [--no-thinking] [--no-preserve-thinking] [--cors]\n"
            "       [--webui | --webui-dir DIR] [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--seed N] [--greedy]\n"
            "\n"
@@ -78,7 +78,8 @@ std::string serve_usage_text(const char* argv0) {
            "--log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs.\n"
            "--no-prefix-reuse serves every request without reusing a cached conversation prefix.\n"
            "--default-thinking-budget caps model-origin thinking; control tokens count toward\n"
-           "the output limit. --preserve-thinking keeps closed-turn reasoning in later prompts.\n"
+           "the output limit. Closed-turn reasoning stays in later prompts, as the model template\n"
+           "defaults; --no-preserve-thinking drops it.\n"
            "Sampler defaults come from the model and thinking mode; flags and request fields\n"
            "override individual values (temperature, top_p, top_k, min_p; no penalties).\n"
            "--webui downloads the prebuilt llama.cpp web UI into --webui-dir (default\n"
@@ -240,8 +241,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.allow_prefix_reuse = false;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
-        } else if (arg == "--preserve-thinking") {
-            options.preserve_thinking = true;
+        } else if (arg == "--no-preserve-thinking") {
+            options.preserve_thinking = false;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--webui") {

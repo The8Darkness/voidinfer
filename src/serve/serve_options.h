@@ -43,7 +43,7 @@ struct ServeOptions {
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
-    bool preserve_thinking = false;
+    bool preserve_thinking = true; // closed-turn thinking kept, as the model template defaults (--no-preserve-thinking opts out)
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
