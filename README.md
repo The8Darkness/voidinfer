@@ -194,9 +194,10 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
   packed when parked, spilled to disk under memory pressure). `VOIDINFER_EXL3_VERICACHE=tolerance`
   trades exactness for speed; `VOIDINFER_EXL3_L0_OSCAR=0` selects FP16 device KV (about 16K with DFlash2).
   The OSCAR rotations are read from `<model directory>/l0_oscar` (or `VOIDINFER_EXL3_L0_OSCAR_ROT`).
-* With one lane, verification runs on an asynchronous exact line that reads history beyond the recent
-  window through an FP8 e4m3 mirror (KL 0.005 against FP16 history); `VOIDINFER_EXL3_VERICACHE_LINE_FP8=0`
-  keeps FP16. With several lanes, verification passes are exclusive and use FP16 history.
+* With one lane, verification runs on an asynchronous exact line over the FP16 history;
+  `VOIDINFER_EXL3_VERICACHE_LINE_FP8=1` reads history beyond the recent window through an FP8 e4m3
+  mirror instead (6-10% faster at 128K-254K, KL 0.005 against FP16 history). With several lanes,
+  verification passes are exclusive and use FP16 history.
 * Speed gaps to NInfer (2026-10-12): prefill 1.3–1.8×, base decode 1.2×, batched concurrency 1.3–1.4×,
   single-request DFlash2 at 16K–64K 1.1–1.3×, agent resume 2.2×, image requests 1.4–1.6×.
 * The public Engine route is DFlash2-only; base decode is measured on the target-only route.

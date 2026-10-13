@@ -10864,12 +10864,13 @@ void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
         impl_->full_layers[layer]->set_l0_exact_only(true);
         impl_->full_layers[layer]->set_rope_map(drafting.impl_->position_device+4);
     }
-    // FP8 history of the asynchronous line (default; VOIDINFER_EXL3_VERICACHE_LINE_FP8=0
-    // keeps the FP16 planes): half the PCIe bytes per pass, 128K -4%, 254K -6%
-    // per round; history past the window rounds to e4m3 (per row/head scale).
+    // FP8 history of the asynchronous line (VOIDINFER_EXL3_VERICACHE_LINE_FP8=1; default
+    // off: the line verifies against the exact FP16 planes): half the PCIe bytes per
+    // pass, 128K -4%, 254K -6% per round, but history past the window rounds to e4m3
+    // (per row/head scale; KL 0.005 against FP16 history), so verification is inexact.
     static const bool line_fp8=[] {
         const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_LINE_FP8");
-        return !value || std::strcmp(value,"0")!=0;
+        return value && std::strcmp(value,"1")==0;
     }();
     if(line_fp8) {
         auto& owner=*drafting.impl_;
