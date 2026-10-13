@@ -1391,10 +1391,22 @@ private:
                 resident_.admit_host_metadata_lifetime(allocation.owner,
                     allocation.bytes,allocation.matches,allocation.attach);
             });
+        // Allocations the CUDA driver already page-locks (registered recurrent
+        // slabs, cudaHostAlloc pools) cannot be paged out: they stay out of the
+        // VirtualLock set (re-locking a fresh root's 144 MiB slab cost ~40 ms of
+        // first-token time) and their bytes stay bounded by their own pools.
+        const auto driver_pinned=[](const void* data,std::size_t bytes) {
+            const auto pinned=[](const void* p) {
+                cudaPointerAttributes attributes{};
+                if(cudaPointerGetAttributes(&attributes,p)!=cudaSuccess) {(void)cudaGetLastError();return false;}
+                return attributes.type==cudaMemoryTypeHost;
+            };
+            return bytes && pinned(data) && pinned(static_cast<const unsigned char*>(data)+bytes-1);
+        };
         std::size_t range_count=0;
         if(!roots.empty())Exl3VeriCacheRequest::visit_host_allocations(roots,
-            [&](const void*,std::size_t bytes) {
-                if(!bytes)return;
+            [&](const void* data,std::size_t bytes) {
+                if(!bytes || driver_pinned(data,bytes))return;
                 if(range_count==std::numeric_limits<std::size_t>::max())
                     throw std::overflow_error("coordinator snapshot range count overflow");
                 ++range_count;
@@ -1428,7 +1440,7 @@ private:
         for (const auto& root : roots) snapshot.owners.push_back(root);
         if (!roots.empty()) Exl3VeriCacheRequest::visit_host_allocations(roots,
             [&](const void* data, std::size_t bytes) {
-                snapshot.add(data, bytes);
+                if (!driver_pinned(data, bytes)) snapshot.add(data, bytes);
             }, false);
         resident_inventory_ms_ += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - inventory_started).count();
