@@ -2378,6 +2378,9 @@ struct Exl3EngineCore::Impl {
             const bool split=reuse_allowed && stable>=64 && stable<ids.size() &&
                 stable>split_floor;
             const auto span_ids=std::span<const std::int64_t>(ids);
+            if(std::getenv("VOIDINFER_EXL3_MEMORY_TRACE"))
+                std::fprintf(stderr,"PROMPT_ROUTE ids=%zu reused=%zu shared=%zu shared_split=%d stable=%zu split=%d%c",
+                    ids.size(),reused_rows,shared,shared_split?1:0,stable,split?1:0,10);
             const auto extend_device=[&](const std::shared_ptr<const Exl3VeriCacheRequest>& from,std::size_t end,
                                          bool resident) {
                 const auto first=from->token_count();

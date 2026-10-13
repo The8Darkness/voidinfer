@@ -214,13 +214,22 @@ public:
         }catch(...) {phase_=Phase::poisoned;throw;}
     }
 
-    // Prompt suffix after a restored root: wide target chunks, every block's
-    // taps committed to the (contiguous) draft ring.
+    // Prompt suffix after a restored root. A suffix that replaces the whole
+    // draft ring (L0 OSCAR, at least kLayerMajorSuffixRows rows) is ingested
+    // layer-major like a fresh prompt: the draft restarts its ring on the
+    // suffix and commits only the retained tail. Shorter suffixes run wide
+    // target chunks with every block's taps committed to the (contiguous) ring.
+    static constexpr int kLayerMajorSuffixRows=4096;
     void ingest_suffix(std::span<const std::int64_t> input,int first) {
         if(phase_!=Phase::unstarted || first<=0 || context_->position()!=first ||
            static_cast<std::size_t>(first)>=input.size() ||
            draft_.ring_base_abs()+draft_.ring_count()!=first)
             throw std::invalid_argument("fast device suffix ingestion frontier");
+        if(Exl3NativeContextExtent::l0_oscar_enabled() &&
+           input.size()-static_cast<std::size_t>(first)>=static_cast<std::size_t>(kLayerMajorSuffixRows)) {
+            ingest_suffix_layer_major(input,first);
+            return;
+        }
         phase_=Phase::executing;
         try {
             for(std::size_t at=static_cast<std::size_t>(first);at<input.size();) {
@@ -230,6 +239,48 @@ public:
                 at+=static_cast<std::size_t>(rows);
             }
             check(poll_then_sync(stream_),"fast device suffix ingestion completion");
+            phase_=Phase::unstarted;
+        }catch(...) {phase_=Phase::poisoned;throw;}
+    }
+
+    // Layer-major suffix: the draft's 16-row calls start at `first`; calls
+    // ending at or before total-2048 are skipped and the rest (the retained
+    // 2048..2063-row tail) commit in one bulk pass, as prefill_layer_major does.
+    void ingest_suffix_layer_major(std::span<const std::int64_t> input,int first) {
+        const int total=static_cast<int>(input.size());
+        int tail=first;
+        for(int at=first;at<total;at+=16) {
+            const int count=std::min(16,total-at);
+            if(at+count<=total-2048)tail=at+count;
+        }
+        const int rows=total-tail;
+        if(rows<2032 || rows>2063)
+            throw std::logic_error("fast device suffix retained tap partition halo");
+        phase_=Phase::executing;
+        try {
+            const auto bytes=static_cast<std::size_t>(rows)*5*tap_hidden*sizeof(std::uint16_t);
+            struct Arena {
+                std::uint16_t* ptr=nullptr;
+                ~Arena(){if(ptr)cudaFree(ptr);}
+            } arena;
+            check(cudaMalloc(reinterpret_cast<void**>(&arena.ptr),bytes),"fast device suffix tap arena");
+            const Exl3TextContext::RetainedTapTail retained{arena.ptr,bytes,tail,rows};
+            draft_.reset(stream_);
+            draft_.begin_fresh_prefill(first,total,stream_);
+            try {
+                context_->append_prefill_layer_major(input.subspan(static_cast<std::size_t>(first)),stream_,&retained);
+                for(int at=first;at<tail;at+=16)
+                    draft_.skip_fresh_prefill_block(std::min(16,tail-at),at,stream_);
+                std::array<const std::uint16_t*,5> sources{};
+                for(std::size_t tap=0;tap<5;++tap)
+                    sources[tap]=arena.ptr+tap*static_cast<std::size_t>(rows)*tap_hidden;
+                draft_.commit_prefill_bulk(sources.data(),rows,tail,stream_);
+                draft_.finish_fresh_prefill(stream_);
+                check(poll_then_sync(stream_),"fast device suffix layer-major completion");
+            }catch(...) {
+                poll_then_sync(stream_);
+                throw;
+            }
             phase_=Phase::unstarted;
         }catch(...) {phase_=Phase::poisoned;throw;}
     }

@@ -9149,7 +9149,17 @@ void Exl3TextContext::append_prefill_layer_major(
             // bounded device cache; when concurrent lanes leave too little
             // free memory for it the block runs row-major (same arithmetic
             // profile as the shorter blocks, slower prefill).
-            if (ids.size() > 1024 && l0_layer_major_headroom()) {
+            const bool layer_major = ids.size() > 1024 && l0_layer_major_headroom();
+            static const bool trace = std::getenv("VOIDINFER_EXL3_MEMORY_TRACE") != nullptr;
+            if (trace) {
+                std::size_t free_bytes = 0, total_bytes = 0;
+                (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+                const std::size_t cached = impl_->numeric_prefill_projection_workspace ?
+                    impl_->numeric_prefill_projection_workspace->stats().cached_weight_capacity_bytes : 0;
+                std::fprintf(stderr, "L0_PREFILL_BLOCK rows=%zu position=%d route=%s free_mib=%zu cache_mib=%zu\n",
+                    ids.size(), position_, layer_major ? "layer-major" : "row-major", free_bytes >> 20, cached >> 20);
+            }
+            if (layer_major) {
                 impl_->l0_layer_major_block = true;
                 try { append_prefill_layer_major(ids, stream, retained); }
                 catch (...) { impl_->l0_layer_major_block = false; throw; }
