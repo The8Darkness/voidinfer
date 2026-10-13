@@ -98,7 +98,7 @@ with checkpoint graphs, and retained-prefix GDN repair overlapped with the next 
 campaign fixtures the tree produces the same tokens as chain-only verification. Draft-side work runs on split-K tensor-core ring attention, a fused
 warp-per-candidate selector and a vocabulary-prefix draft head.
 
-**Prefill (~10K tok/s).** Layer-major prefill with MXFP8/NVFP4 block-quantized projection routes and
+**Prefill (~4-6K tok/s served).** Layer-major prefill with FP16 projections (MXFP8/NVFP4 block-quantized routes are opt-in) and
 fused weight decode, FA2-style GQA attention with FP16-accumulated tensor-core steps, and a
 chunk-parallel Gated-DeltaNet recurrence.
 

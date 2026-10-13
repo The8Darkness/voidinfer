@@ -39,7 +39,9 @@ rows rather than relying on verification to repair INT2.
 | Configuration | Measure | Value |
 |---|---|---|
 | L0 INT4 + 512 hot rows vs FP16 KV (KV tier alone) | KL, 4K / 16K | 0.0021 / 0.0030 (INT2 was 0.0081 / 0.0125) |
-| Served default (MXFP8 prefill, L0 INT4, exact VeriCache) vs BF16 model | KL, 4K | 0.014; top-1 agreement 97.2% |
+| Served default (FP16 prefill, L0 INT4, exact VeriCache) vs FP16 KV + FP16 prefill | KL, 4K / 16K | 0.0014 / 0.0024 (MXFP8 prefill: 0.0086 / 0.0104) |
+| Served default vs BF16 model | KL, 4K | 0.0097, top-1 agreement 97.7% (the EXL3 weights alone; MXFP8 prefill 0.014, 97.2%) |
+| Raw L0 tier (drafts, before verification) vs FP16 KV, FP16 prefill | KL, 4K / 16K | INT4 0.0021 / 0.0040; INT2 0.0065 / 0.0156 |
 | Single-lane exact line with FP8 e4m3 history mirror vs FP16 history | KL | 0.005 |
 | VoidInfer vs NInfer (NVFP4/groupwise, FP8 KV), 4K-32K | paired NLL | 0.016 nats/token better, 95% CI excludes 0 |
 

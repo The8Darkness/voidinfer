@@ -43,7 +43,7 @@ CUDA 13.1 and 13.3 builds give identical greedy state hashes and tokens at 4K/16
 
 | Capability | State/default | Measured (2026-10-08) |
 | --- | --- | --- |
-| Cold prefill, target-only | Default (layer-major, MXFP8/NVFP4 block-quantized projections, FA2 attention) | 10.1K tok/s at 4K, 9.6K at 16K |
+| Cold prefill, target-only | Default (layer-major, FP16 projections, FA2 attention); `VOIDINFER_EXL3_PREFILL_MXFP8=1` opts into MXFP8/NVFP4 block-quantized projections (about 1.5x faster; KL vs FP16 KV + FP16 prefill 0.0086 / 0.0104 instead of 0.0014 / 0.0024 at 4K / 16K) | Served C1, 31K prompts: 3.8K tok/s FP16, 5.9K MXFP8 (2026-10-13); MXFP8 target-only 10.1K tok/s at 4K, 9.6K at 16K (2026-10-08) |
 | Base greedy decode, target-only | Default (whole-stack decode graph, fused reductions, L2 prefetch) | 79.2 tok/s at 4K, 75.7 at 16K |
 | DFlash2 K=7 decode, public Engine (coherent-device C1) | Default (verification trees, ≤8 verify rows) | 211 tok/s at 4K, 186 at 16K (code-review workload); 241 tok/s geomean on NInfer's 12 scenario prompts |
 | L0 OSCAR KV tier with exact hot rows | Default at every context: exact 960-row recent window (`VOIDINFER_EXL3_L0_RECENT`, 0..960) and 512 hot rows per KV head (`VOIDINFER_EXL3_L0_HOT`, 0..4096); `VOIDINFER_EXL3_L0_OSCAR=0` opts out; rotations from `<model directory>/l0_oscar` | DFlash2 code workload 18.3 / 18.5 / 18.8 / 19.4 / 20.3 ms per round at 4K / 16K / 32K / 64K / 128K (hot rows +0.2–0.4 ms); prefill 6.9K / 7.7K / 7.3K / 6.4K / 5.1K tok/s; verify-quality gate vs FP16 KV: +0.006 nats/token, mean abs. delta 0.037, top-1 96.8% (INT2 history alone: +0.024, 0.067, 95.1%) |

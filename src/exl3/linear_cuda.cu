@@ -7225,18 +7225,20 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->large_lt_enabled=accept_all_model_shapes && large_lt &&
         std::strcmp(large_lt,"1")==0;
-    // Prefill numerical policy (default 1, quality-gated; 0 = FP16 control):
-    // large-M projections run as MXFP8 (E4M3 with block-32 E8M0 scales on
-    // weights and activations, FP32 accumulation).
+    // Prefill numerical policy (default 0 = FP16 projections). 1 runs large-M
+    // projections as MXFP8 (E4M3 with block-32 E8M0 scales on weights and
+    // activations, FP32 accumulation): ~1.5x faster prefill, but its prompt KV
+    // is what exact VeriCache verifies against, so it stays in every answer:
+    // KL vs FP16 KV + FP16 prefill 0.0086 / 0.0104 at 4K / 16K against
+    // 0.0014 / 0.0024 with FP16 prefill (8-fixture panel, Oct 13 2026).
     const char* mxfp8=std::getenv("VOIDINFER_EXL3_PREFILL_MXFP8");
     if(mxfp8 && std::strcmp(mxfp8,"0")!=0 && std::strcmp(mxfp8,"1")!=0) {
         delete impl_; impl_=nullptr;
         throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_MXFP8 must be 0 or 1");
     }
-    impl_->mxfp8_enabled=accept_all_model_shapes &&
-        (!mxfp8 || std::strcmp(mxfp8,"1")==0);
-    // NVFP4 prefill numerical policy (nvfp4_projection). Default 0 = MXFP8
-    // everywhere. Measured as KL(BF16 || ours) on the 4K paired panel (8
+    impl_->mxfp8_enabled=accept_all_model_shapes && mxfp8 && std::strcmp(mxfp8,"1")==0;
+    // NVFP4 prefill numerical policy (nvfp4_projection), on top of the MXFP8
+    // route only. 0 = MXFP8 everywhere. Measured as KL(BF16 || ours) on the 4K paired panel (8
     // fixtures, top-60, L0 decode): full-precision ingest 0.0147, mode 0
     // 0.0161 (prefill 0.55 s at 4K, 5.12 s at 32K); 7 = gate/up of layers
     // 32..63 0.0188 (0.51 / 4.77 s); 8 = MLP down everywhere 0.0247; 5 = 7 + 8
