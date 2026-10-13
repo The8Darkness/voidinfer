@@ -6,7 +6,7 @@ Reset-VoidEnv $Env
 $port=18436; $log="$Out.server.log"
 $a=@('--target',$VoidTarget,'--draft',$VoidDraft,'--host','127.0.0.1','--port',[string]$port,
  '--max-context',[string]$MaxContext,'--max-concurrency',[string]$Conc,'--max-pending-requests','16',
- '--no-thinking','--greedy','--temperature','0','--default-max-tokens',[string]$Tokens,'--max-shared-prefixes','16',
+ '--no-thinking','--greedy','--temperature','0','--default-max-tokens',[string]$Tokens,'--max-private-continuations','16',
  '--host-kv-mib',[string]$HostKvMib,'--pending-timeout-ms','3600000','--model-id','conc')+($Extra -split ' ' | ? {$_})
 $p=Start-Process -FilePath $VoidServe -ArgumentList $a -PassThru -NoNewWindow -RedirectStandardError $log -RedirectStandardOutput "$log.out"
 try {

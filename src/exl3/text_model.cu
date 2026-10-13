@@ -1614,11 +1614,14 @@ struct Exl3TextContext::Impl {
         (void)source->try_bind(this);
         bind_plane_set(std::move(source));
     }
-    // Restoring a history whose rows an idle plane set holds (the agent's
-    // own set, where its last lane left it): bind that set instead of
-    // copying the rows into the current one.
+    // Restoring a long history whose rows an idle plane set holds (the
+    // agent's own set, where its last lane left it): bind that set instead of
+    // copying the rows into the current one. Rebinding remaps every plane
+    // window (~0.2 s); below kAdoptMinPages pages the plane-to-plane copy
+    // (~27 GB/s) is cheaper.
+    static constexpr std::size_t kAdoptMinPages=1024;
     void adopt_plane_set_of(const Exl3ExactHostState& state) {
-        if(!kv_source || !kv_source->backing() || exact_line)return;
+        if(!kv_source || !kv_source->backing() || exact_line || state.kv_pages_.size()<kAdoptMinPages)return;
         std::shared_ptr<Exl3LaneKvSource> best;
         std::size_t best_count=0;
         {
@@ -13740,6 +13743,13 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     impl_->line_fp8_rewritten_from(0);
     impl_->ensure_kv_source();
     impl_->adopt_plane_set_of(state);
+    // The set also holds more of another retained history (a conversation
+    // that extended this prefix) than the restored rows: copying the restored
+    // rows into a fresh set is cheaper than packing that history out of these
+    // planes; its set stays idle and intact.
+    if(impl_->kv_source && impl_->kv_source->backing() && !impl_->exact_line &&
+       impl_->kv_source->deferred_outside(state.kv_pages_)>state.kv_pages_.size())
+        impl_->bind_fresh_plane_set();
     impl_->ensure_l0_rows(state.position_);
     const bool all_lane_resident=kv_lane_resident(state);
     // Filled pages of the restored history trade places with this lane's
@@ -13962,10 +13972,8 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
             "foreign_ms=%.1f layers_ms=%.1f adopt_ms=%.1f total_ms=%.1f\n",state.position_,state.kv_pages_.size(),
             resident_pages.size(),all_lane_resident?1:0,restore_ms[0],restore_ms[1],restore_ms[2],restore_ms[3],
             restore_ms[4],std::chrono::duration<double,std::milli>(RestoreClock::now()-restore_begin).count());
-    // Plane rows of the previous history beyond this one are no longer needed
-    // (rows still backing deferred pages stay mapped).
-    impl_->release_l0_rows_beyond(state.position_,
-        std::max(state.position_,Impl::kL0RetainedBackingRows));
+    // Backing beyond the restored rows stays mapped: the suffix that follows a
+    // restore grows into it, and the next request reset returns what is left.
     upload(impl_->logits, state.logits_);
     upload(impl_->embedding_trace->ptr, state.embedding_);
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap) upload(impl_->taps[tap]->ptr, state.taps_[tap]);

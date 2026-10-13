@@ -472,8 +472,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--host-kv-mib N` | exact FP16 history in host memory | `max(8192, max-context × 64 KiB)` |
 | `--host-state-slots N`, `--device-state-slots N` | host/device checkpoint slots | `8` / `max-concurrency` |
-| `--max-shared-prefixes N` | shared prefix roots kept for reuse | `max-concurrency` |
-| `--max-private-continuations N`, `--max-long-anchors-per-continuation N`, `--max-cache-markers-per-request N` | continuation descriptor bounds | `2 × C` / `2` / `4` |
+| `--max-private-continuations N` | conversation roots kept for follow-up turns | `2 × max-concurrency` |
+| `--max-shared-prefixes N` | cross-conversation shared-prefix roots kept for reuse (not evicted by conversation turnover) | `max-concurrency` |
+| `--max-long-anchors-per-continuation N`, `--max-cache-markers-per-request N` | continuation descriptor bounds | `2` / `4` |
 | `--no-prefix-reuse` | serve every request without reusing a cached prefix | reuse on |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |

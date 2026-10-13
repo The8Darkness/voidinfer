@@ -632,7 +632,10 @@ struct Exl3EngineCore::Impl {
             .max_cache_markers_per_request=value.context_cache.max_cache_markers_per_request.value_or(4)})),
         identity{"exl3-engine-epoch-1",pinned_weights_id(value.model.target_directory),"0997f410-c3cf9e34",
             "coherent-device-P1-K6-B8-greedy",dense_vision_enabled?"text+bf16-vision":"text"},
-        cache(Exl3VeriCacheServingPrefixCache::Policy{std::max(1U,value.context_cache.max_shared_prefixes.value_or(1)),64,std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30},identity),
+        cache(Exl3VeriCacheServingPrefixCache::Policy{
+            std::max(1U,value.context_cache.max_private_continuations.value_or(2*value.max_concurrency)),64,
+            std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30,
+            value.context_cache.max_shared_prefixes.value_or(value.max_concurrency)},identity),
         coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
         // A single exact-VeriCache lane gets an exact line (below): its
         // contexts share prompt workspaces, and with the asynchronous line two
@@ -2351,6 +2354,7 @@ struct Exl3EngineCore::Impl {
                        (!reused || candidate->token_count()>reused->token_count()) &&
                        candidate->matches_tokens(std::span<const std::int64_t>(ids).first(candidate->token_count())))
                         reused=candidate;
+            if(reused)(void)cache.refresh(reused);
             // The turn-closure frontier is the rendered prefix the next turn of
             // this conversation agrees with: it gets its own retained root.
             std::size_t stable=ids.size();
@@ -2404,7 +2408,7 @@ struct Exl3EngineCore::Impl {
                         span_ids.first(shared),stream);
                 }
                 base_resident=true;
-                const auto admitted=cache.admit_input_authority(base,span_ids.first(shared),available());
+                const auto admitted=cache.admit_shared_prefix(base,span_ids.first(shared),available());
                 if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
                     std::fprintf(stderr,"SHARED_PREFIX_ROOT tokens=%zu reused=%zu admitted=%d%c",shared,reused_rows,
                         admitted.admitted?1:0,10);

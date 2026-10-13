@@ -6,7 +6,7 @@ Reset-VoidEnv $Env
 $port=18433; $log="D:\AI\kvtier\ours_conc.log"
 $a=@('--target',$VoidTarget,'--draft',$VoidDraft,'--host','127.0.0.1','--port',[string]$port,
  '--max-context',[string]$MaxContext,'--max-concurrency',[string]$Conc,'--max-pending-requests','8',
- '--no-thinking','--greedy','--temperature','0','--default-max-tokens',[string]$Tokens,'--max-shared-prefixes','16','--host-kv-mib','8000','--model-id','conc')
+ '--no-thinking','--greedy','--temperature','0','--default-max-tokens',[string]$Tokens,'--max-private-continuations','16','--host-kv-mib','8000','--model-id','conc')
 $p=Start-Process -FilePath $VoidServe -ArgumentList $a -PassThru -NoNewWindow -RedirectStandardError $log -RedirectStandardOutput "$log.out"
 try {
   $ok=$false

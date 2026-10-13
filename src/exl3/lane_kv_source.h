@@ -395,6 +395,23 @@ public:
     }
 
     // Some page of this source holding a row >= `row` is still deferred.
+    // Deferred pages these planes hold outside `keep` (what materialize_except
+    // would fill).
+    std::size_t deferred_outside(const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& keep) {
+        std::vector<const Exl3ExactKVPage*> kept;
+        kept.reserve(keep.size());
+        for (const auto& page : keep) kept.push_back(page.get());
+        std::sort(kept.begin(), kept.end());
+        std::lock_guard lock(mutex_);
+        std::vector<const Exl3ExactKVPage*> outside;
+        for (const auto& weak : pages_)
+            if (auto page = weak.lock())
+                if (holds(*page) && !std::binary_search(kept.begin(), kept.end(), page.get()))
+                    outside.push_back(page.get());
+        std::sort(outside.begin(), outside.end());
+        return static_cast<std::size_t>(std::unique(outside.begin(), outside.end()) - outside.begin());
+    }
+
     bool deferred_beyond(int row) {
         std::lock_guard lock(mutex_);
         for (const auto& weak : pages_)
