@@ -234,7 +234,10 @@ public:
         try {
             for(std::size_t at=static_cast<std::size_t>(first);at<input.size();) {
                 const int rows=static_cast<int>(std::min<std::size_t>(1024,input.size()-at));
-                context_->append_prefill_wide(input.subspan(at,rows),stream_);
+                // Up to 8 rows (the turn-closure tail: an assistant header) run
+                // the decode-row route, 7 rows 40 -> 17 ms at 3.8K context.
+                if(rows<=8)context_->append_prefill(input.subspan(at,rows),stream_);
+                else context_->append_prefill_wide(input.subspan(at,rows),stream_);
                 commit_captured(rows,static_cast<int>(at));
                 at+=static_cast<std::size_t>(rows);
             }
