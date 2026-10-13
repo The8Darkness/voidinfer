@@ -1690,6 +1690,28 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
             repaired_text.size()<=frontend.output_text_byte_bound(partial_count),
             "tokenizer-derived output bound omitted terminal UTF-8 repair");
     }
+    // Sampled byte-level tokens can form ill-formed UTF-8: each ill-formed
+    // sequence decodes to U+FFFD and generation continues (it used to throw
+    // and fail the engine). Fixture ids: 10 = byte E4, 11 = byte B8, 0 = "x".
+    const std::vector<std::pair<std::vector<voidinfer::TokenId>,std::string>> ill_formed{
+        {{11,0},"\xef\xbf\xbd" "x"},  // stray continuation byte
+        {{10,0},"\xef\xbf\xbd" "x"},  // lead byte broken by ASCII
+        {{1000+0xC0,1000+0x80,0},"\xef\xbf\xbd\xef\xbf\xbd" "x"},  // invalid lead, then stray continuation
+        {{10,11,12},"中"}};  // well-formed bytes still join
+    for(const auto& [tokens,expected]:ill_formed) {
+        auto ill_prompt=frontend.prepare_tokens({0});
+        auto ill=frontend.make_output_session(ill_prompt,{});
+        ill.preallocate_pending_storage();
+        std::string text;
+        std::uint32_t left=8;
+        for(const auto token:tokens) {
+            const auto decision=ill.preview_model(std::array<voidinfer::TokenId,1>{token},left,
+                voidinfer::FinishReason::OutputLimit);
+            left-=decision.accepted_tokens;
+            text+=channel_text(ill.commit_preview(),voidinfer::OutputChannel::Content);
+        }
+        failures+=check(text==expected,"ill-formed UTF-8 token bytes did not decode to U+FFFD");
+    }
 
     auto eos_prompt         = frontend.prepare_tokens({0});
     auto eos_session        = frontend.make_output_session(eos_prompt, {});

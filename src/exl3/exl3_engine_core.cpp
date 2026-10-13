@@ -3466,8 +3466,25 @@ struct Exl3EngineCore::Impl {
                 // obligations until the owning shutdown drain completes.
                 for(auto& peer:active)if(peer && peer!=request && !peer->cancelled.exchange(true))
                     ++stats.failure_cancelled_active_requests;
-                for(auto& queued:queue)if(!queued->cancelled.exchange(true))
-                    ++stats.failure_cancelled_queued_requests;
+                // Queued requests never reached a worker: complete them now
+                // (workers skip cancelled entries and submissions are refused
+                // after a failure, so nothing else would release them).
+                for(auto& queued:queue) {
+                    if(!queued->cancelled.exchange(true))++stats.failure_cancelled_queued_requests;
+                    {
+                        std::lock_guard request_lock(queued->mutex);
+                        queued->failure=std::make_exception_ptr(
+                            RequestError(RequestErrorKind::Unavailable,"EXL3 engine unavailable"));
+                        queued->result.timings.total_seconds=seconds(queued->submitted)+
+                            queued->result.timings.prepare_seconds;
+                        queued->done=true;
+                    }
+                    queued->changed.notify_all();
+                    --outstanding;
+                }
+                while(!queue.empty())queue.pop_front();
+                ready_work_authority.revise();
+                stats.waiting_requests=0;
             }
             // Transfer work happened even if the request was cancelled or later
             // failed. Publish once, before notifying completion, on every exit.
