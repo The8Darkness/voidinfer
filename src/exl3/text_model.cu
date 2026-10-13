@@ -1992,6 +1992,15 @@ struct Exl3TextContext::Impl {
         }
         return Exl3GreedySplitScratch::carve(greedy_split_storage);
     }
+    // Per-context vocabulary-slice candidates of the sampled packet selection
+    // (sampled_select.cuh). Allocated outside any capture.
+    void* sampled_slice_storage=nullptr;
+    Exl3SampledSliceScratch sampled_slice_scratch() {
+        if(!sampled_slice_storage)
+            cuda_check(cudaMalloc(&sampled_slice_storage,Exl3SampledSliceScratch::bytes()),
+                "allocate sampled slice scratch");
+        return Exl3SampledSliceScratch::carve(sampled_slice_storage);
+    }
     // Final residual rows of the last completed layer stack (exact_row_scores).
     std::uint16_t* last_stack_output = nullptr;
     // VeriCache verified root: device GDN recurrent/convolution checkpoint and
@@ -9634,10 +9643,12 @@ std::size_t Exl3TextContext::continuation_bytes_required(int capacity) const {
 }
 void Exl3TextContext::prepare_continuation(int capacity) {
     (void)impl_->greedy_split_scratch();
+    (void)impl_->sampled_slice_scratch();
     prepare_continuation_impl(capacity,nullptr);
 }
 void Exl3TextContext::prepare_continuation_reserved(Exl3VeriCacheServingCoordinator& authority,int capacity,unsigned startup_fault_for_test) {
     (void)impl_->greedy_split_scratch();
+    (void)impl_->sampled_slice_scratch();
     prepare_continuation_impl(capacity,&authority,startup_fault_for_test);
 }
 std::size_t Exl3TextContext::continuation_owner_metadata_bytes() noexcept {
@@ -11450,7 +11461,8 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
     try {
         if(impl_->sampling.active()) {
             exl3_launch_sampled_packet(rows,stream,source,kVocab,kVocab,impl_->sampling,
-                position_-rows+1,impl_->sampling_row_depths,impl_->sampling_row_inputs,result.serial,output);
+                position_-rows+1,impl_->sampling_row_depths,impl_->sampling_row_inputs,result.serial,output,
+                impl_->sampled_slice_scratch());
         }
         else
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,result.serial,output,impl_->greedy_split_scratch());
@@ -11514,7 +11526,7 @@ Exl3PendingGreedyPacket Exl3TextContext::submit_greedy_packet(
         if(impl_->sampling.active()) {
             exl3_launch_sampled_packet(rows,stream,source,kVocab,kVocab,impl_->sampling,
                 position_-rows+1,impl_->sampling_row_depths,impl_->sampling_row_inputs,pending.serial_,
-                static_cast<Exl3GreedyRow*>(transfer->device->ptr));
+                static_cast<Exl3GreedyRow*>(transfer->device->ptr),impl_->sampled_slice_scratch());
         }
         else
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,
