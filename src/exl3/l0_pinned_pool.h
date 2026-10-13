@@ -18,9 +18,13 @@ namespace voidinfer::exl3 {
 
 class Exl3L0PinnedPool {
 public:
-    // One 4096-row chunk: codes then FP16 meta (l0_oscar_format.h).
-    static constexpr std::size_t kBlockBytes = 4096ull * (l0_oscar_format::kRowCodeBytes +
-        l0_oscar_format::kRowMetaBytes);
+    // One 4096-row chunk: codes then FP16 meta (l0_oscar_format.h; the code
+    // width is fixed for the process).
+    static std::size_t block_bytes() {
+        static const std::size_t value = 4096ull * (l0_oscar_format::row_code_bytes() +
+            l0_oscar_format::kRowMetaBytes);
+        return value;
+    }
     static constexpr std::size_t kSlabBlocks = 64;
 
     struct Block {
@@ -44,11 +48,11 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (free_.empty()) {
             void* slab = nullptr;
-            if (cudaHostAlloc(&slab, kBlockBytes * kSlabBlocks, cudaHostAllocPortable) != cudaSuccess)
+            if (cudaHostAlloc(&slab, block_bytes() * kSlabBlocks, cudaHostAllocPortable) != cudaSuccess)
                 throw std::runtime_error("L0 OSCAR pinned chunk slab allocation");
             slabs_.push_back(slab);
             for (std::size_t i = 0; i < kSlabBlocks; ++i)
-                free_.push_back(static_cast<std::uint8_t*>(slab) + i * kBlockBytes);
+                free_.push_back(static_cast<std::uint8_t*>(slab) + i * block_bytes());
         }
         auto* p = free_.back();
         free_.pop_back();

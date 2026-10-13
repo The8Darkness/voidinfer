@@ -13512,7 +13512,7 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         // a later fill packs them losslessly against these chunks
         // (l0_kv_pack.cuh); pages the planes no longer hold keep theirs.
         if(impl_->kv_source && l0_kv_pack::enabled()) {
-            constexpr std::size_t code_row=l0_oscar_format::kRowCodeBytes/2;
+            const std::size_t code_row=l0_oscar_format::row_code_bytes()/2;
             constexpr std::size_t meta_row=l0_oscar_format::kRowMetaBytes/4;
             for(const auto& page:state->kv_pages_) {
                 std::shared_ptr<Exl3PageCodes> codes;

@@ -9,9 +9,12 @@ token ids.
 Beyond an exact 64-token sink and the exact 960-token recent window, attention history is stored on
 the device as OSCAR INT4 codes (17.4 KiB per token over 16 attention layers × 4 KV heads × 256, versus
 64 KiB in FP16). Keys and values are rotated with calibrated per-head rotations and centered keys
-before quantization (FutureMLS-Lab OSCAR, arXiv 2605.17757). 512 rows per KV head stay as exact FP16
-copies on the device (hot rows), chosen from the rows the code pass nominates. Exact FP16 history
-stays in host memory, and every published token is checked against it by exact VeriCache.
+before quantization (FutureMLS-Lab OSCAR, arXiv 2605.17757). `VOIDINFER_EXL3_L0_CODE_BITS=2` selects INT2
+codes clipped at the 0.96 (K) / 0.92 (V) per-row quantile instead (9.2 KiB per token; the kernels are
+instantiated per width, and lossless packing of parked pages is off for INT2, where it saves only 4%).
+512 rows per KV head stay as exact FP16 copies on the device (hot rows), chosen from the rows the code
+pass nominates. Exact FP16 history stays in host memory, and every published token is checked against
+it by exact VeriCache.
 
 Rotation assets live in `<target>/l0_oscar/` (`k_mean.bin`, `k_rot_perhead.bin`, `v_rot_perhead.bin`;
 `VOIDINFER_EXL3_L0_OSCAR_ROT` names another directory). They were fitted per head with centering on

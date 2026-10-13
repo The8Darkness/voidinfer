@@ -5,15 +5,16 @@
 
 namespace l0 = voidinfer::exl3::l0_oscar;
 
-// Verifier history attention over INT4 codes, consumed straight from the
-// codes (no FP16 tiles):
+// Verifier history attention over INT4 or INT2 codes (template Bits,
+// l0_oscar_format.h), consumed straight from the codes (no FP16 tiles):
 //   QK  s8 MMA (m16n8k32) of the int8-quantized rotated queries (per 128-dim
-//       group scale) against the raw codes (one code word = 8 dims per lane
-//       and k-step, nibbles masked in place); the per-key K scale and zero
-//       are applied to the int32 sums of each group.
+//       group scale) against the raw codes, masked in place (INT4: one code
+//       word = 8 dims per lane and k-step, nibble masks; INT2: 2-bit masks);
+//       the per-key K scale and zero are applied to the int32 sums of each
+//       group.
 //   PV  u8 MMA of P (scaled by the per-key V scale, quantized per row)
-//       against the V codes read in place (c 16^(n & 1)); the V zero term
-//       is carried as a per-row bias.
+//       against the V codes read in place (c 16^(n & 1) / c 4^(n & 3)); the
+//       V zero term is carried as a per-row bias.
 // CTA = (history segment, KV head), 12 warps = (m-tile of 16 query vectors,
 // 128-dim value group, key stream). Raw codes and metadata stream through a
 // cp.async ring of 64-key stages shared by all warps; each stream takes one
@@ -23,14 +24,21 @@ constexpr int kL0KeyStreams=2;              // in-CTA key streams
 constexpr int kL0HistoryThreads=192*kL0KeyStreams;
 constexpr int kL0Queries=48;
 constexpr int kL0StageKeys=64;
-constexpr int kL0Stages=4;   // 272-byte INT4 keys: 4 x 17 KiB stages + ~26 KiB static
-constexpr int kL0RawKeyBytes=2*l0::kCodeBytes+2*l0::kMetaFloats*2;   // K codes, V codes, K meta, V meta (FP16)
-constexpr std::size_t kL0StageBytes=static_cast<std::size_t>(kL0StageKeys)*kL0RawKeyBytes;
+// Per code width: raw key bytes (K codes, V codes, K meta, V meta, FP16) and
+// the cp.async ring depth (INT4 272-byte keys: 4 x 17 KiB stages + ~26 KiB
+// static; INT2 144-byte keys: 5 stages).
+template<int Bits> struct L0HistoryLayout {
+    static constexpr int code_bytes=voidinfer::exl3::l0_oscar_format::CodeFormat<Bits>::code_bytes;
+    static constexpr int stages=Bits==4?4:5;
+    static constexpr int raw_key_bytes=2*code_bytes+2*l0::kMetaFloats*2;
+    static constexpr std::size_t stage_bytes=static_cast<std::size_t>(kL0StageKeys)*raw_key_bytes;
+};
 constexpr std::size_t kL0MergeBytes=static_cast<std::size_t>(6)*32*70*sizeof(float);
 #include "exl3/l0_hot.cuh"
 #include "exl3/l0_exact.cuh"
-constexpr std::size_t l0_history_smem_bytes() {
-    constexpr std::size_t a=kL0Stages*kL0StageBytes>kL0MergeBytes?kL0Stages*kL0StageBytes:kL0MergeBytes;
+template<int Bits> constexpr std::size_t l0_history_smem_bytes() {
+    using L=L0HistoryLayout<Bits>;
+    constexpr std::size_t a=L::stages*L::stage_bytes>kL0MergeBytes?L::stages*L::stage_bytes:kL0MergeBytes;
     return a>l0_hot_smem_bytes()?a:l0_hot_smem_bytes();
 }
 
@@ -53,9 +61,11 @@ __device__ __forceinline__ void l0_imma(int (&c)[4],const unsigned (&a)[4],unsig
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3]) : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
 }
-// Undoes the in-place code scale 16^(n & 1) of PV n-tile n (see the PV loop).
-__device__ __forceinline__ constexpr float l0_code_scale(int n) {
-    return (n&1)?0.0625f:1.0f;
+// Undoes the in-place code scale of PV n-tile n (see the PV loop): INT4
+// 16^(n & 1), INT2 4^(n & 3).
+template<int Bits> __device__ __forceinline__ constexpr float l0_code_scale(int n) {
+    if constexpr(Bits==4) return (n&1)?0.0625f:1.0f;
+    else return 1.0f/static_cast<float>(1<<(2*(n&3)));
 }
 __device__ __forceinline__ void l0_immau(int (&c)[4],const unsigned (&a)[4],unsigned b0,unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.u8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -74,7 +84,7 @@ __device__ __forceinline__ float l0_int_value(int bits) {
 // original-basis queries `q_orig`; rows marked hot are then skipped and keys
 // whose probability relative to the previous round's history LSE exceeds tau
 // are emitted once per (key, KV head) as hot candidates.
-template<int kKeys,bool kHot>
+template<int kKeys,bool kHot,int Bits>
 __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
     const std::uint8_t* v_codes,const __half* k_meta,const __half* v_meta,
@@ -83,10 +93,14 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     const std::uint16_t* q_orig,float lambda) {
     constexpr int H=kFastFusedFlashHeads;
     constexpr float kLog2Scale=0.0625f*1.4426950408889634f;
+    using L=L0HistoryLayout<Bits>;
+    constexpr int kL0Stages=L::stages,kL0RawKeyBytes=L::raw_key_bytes,kCodeBytes=L::code_bytes;
+    constexpr std::size_t kL0StageBytes=L::stage_bytes;
     const auto* q_rot=reinterpret_cast<const __half*>(q_rot_bits);
     extern __shared__ __align__(16) unsigned char l0_smem[];
     __shared__ __align__(16) signed char q8[kL0Queries][kHeadDim];
-    __shared__ __align__(16) unsigned qfrag[3][8][32][4];
+    // INT4: [m-tile][k-step][lane] one uint4; INT2: [m-tile][k-step pair][lane] two uint4.
+    __shared__ __align__(16) unsigned qfrag[3][Bits==4?8:4][32][Bits==4?4:8];
     __shared__ float qinfo[kL0Queries][5];   // qs0, qs1, qsum0, qsum1, mu (log2 units)
     // Per stage key: bits of 1 + log2 p - log2 tau of its best vector (0 = none), double-buffered.
     __shared__ unsigned hot_emit[2][kL0StageKeys];
@@ -108,7 +122,7 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     if(first>=end) return;
     const int segment_end=min(first+span,end);
     const int stages=(segment_end-first+kL0StageKeys-1)/kL0StageKeys;
-    constexpr int kCodeChunks=l0::kCodeBytes/16;
+    constexpr int kCodeChunks=kCodeBytes/16;
     constexpr int kChunksPerKey=2*kCodeChunks+2;   // K and V codes in 16 B chunks, 2 x 8 B meta
     const auto fetch=[&](int stage) {
         if(stage<stages) {
@@ -118,12 +132,12 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
                 const int key_off=c/kChunksPerKey,part=c%kChunksPerKey,key=key0+key_off;
                 const bool valid=key<segment_end;
                 const std::size_t cell=static_cast<std::size_t>(valid?key:first)*kKVHeads+kv_head;
-                const void* src=part<kCodeChunks?static_cast<const void*>(k_codes+cell*l0::kCodeBytes+part*16):
-                    part<2*kCodeChunks?static_cast<const void*>(v_codes+cell*l0::kCodeBytes+(part-kCodeChunks)*16):
+                const void* src=part<kCodeChunks?static_cast<const void*>(k_codes+cell*kCodeBytes+part*16):
+                    part<2*kCodeChunks?static_cast<const void*>(v_codes+cell*kCodeBytes+(part-kCodeChunks)*16):
                     part==2*kCodeChunks?static_cast<const void*>(k_meta+cell*l0::kMetaFloats):
                             static_cast<const void*>(v_meta+cell*l0::kMetaFloats);
                 if(part<2*kCodeChunks) l0_cp16(dst+key_off*kL0RawKeyBytes+part*16,src,valid);
-                else l0_cp8(dst+key_off*kL0RawKeyBytes+2*l0::kCodeBytes+(part-2*kCodeChunks)*8,src,valid);
+                else l0_cp8(dst+key_off*kL0RawKeyBytes+2*kCodeBytes+(part-2*kCodeChunks)*8,src,valid);
             }
         }
         asm volatile("cp.async.commit_group;\n");
@@ -176,9 +190,11 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
         }
     }
     __syncthreads();
-    // A fragments: k-step s uses code word W = 8 (s >> 1) + 2t + (s & 1) of each
-    // key; byte i of (w >> 4j) & 0x0F0F0F0F is dim 8 W + 2 i + j (k rows 4t + i
-    // for j = 0, 16 + 4t + i for j = 1).
+    // A fragments. INT4: k-step s uses code word W = 8 (s >> 1) + 2t + (s & 1)
+    // of each key; byte i of (w >> 4j) & 0x0F0F0F0F is dim 8 W + 2 i + j (k rows
+    // 4t + i for j = 0, 16 + 4t + i for j = 1). INT2: k-step pair m uses code
+    // word W = 8 (m >> 1) + 2t + (m & 1); byte i of (w >> 2j) & 0x03030303 is
+    // dim 16 W + 4 i + j.
     if constexpr(kHot) {
         if(tid<2*kL0StageKeys) hot_emit[tid/kL0StageKeys][tid%kL0StageKeys]=0u;
         if(tid<kL0Queries) hot_ref_s[tid]=hot.ref[kv_head*H+tid%H]+log2_tau;
@@ -199,21 +215,46 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
             }
         }
     };
-    for(int e=tid;e<3*8*32;e+=kL0HistoryThreads) {
-        const int mt=e/256,s=(e/32)%8,ln=e%32,gg=ln>>2,tt=ln&3;
-        const int W=8*(s>>1)+2*tt+(s&1);
-        const signed char* r0=q8[mt*16+gg];
-        const signed char* r1=q8[mt*16+gg+8];
-        unsigned a0=0,a1=0,a2=0,a3=0;
-        #pragma unroll
-        for(int i=0;i<4;++i) {
-            const int d=8*W+2*i;
-            a0|=static_cast<unsigned>(static_cast<unsigned char>(r0[d]))<<(8*i);
-            a1|=static_cast<unsigned>(static_cast<unsigned char>(r1[d]))<<(8*i);
-            a2|=static_cast<unsigned>(static_cast<unsigned char>(r0[d+1]))<<(8*i);
-            a3|=static_cast<unsigned>(static_cast<unsigned char>(r1[d+1]))<<(8*i);
+    if constexpr(Bits==4) {
+        for(int e=tid;e<3*8*32;e+=kL0HistoryThreads) {
+            const int mt=e/256,s=(e/32)%8,ln=e%32,gg=ln>>2,tt=ln&3;
+            const int W=8*(s>>1)+2*tt+(s&1);
+            const signed char* r0=q8[mt*16+gg];
+            const signed char* r1=q8[mt*16+gg+8];
+            unsigned a0=0,a1=0,a2=0,a3=0;
+            #pragma unroll
+            for(int i=0;i<4;++i) {
+                const int d=8*W+2*i;
+                a0|=static_cast<unsigned>(static_cast<unsigned char>(r0[d]))<<(8*i);
+                a1|=static_cast<unsigned>(static_cast<unsigned char>(r1[d]))<<(8*i);
+                a2|=static_cast<unsigned>(static_cast<unsigned char>(r0[d+1]))<<(8*i);
+                a3|=static_cast<unsigned>(static_cast<unsigned char>(r1[d+1]))<<(8*i);
+            }
+            *reinterpret_cast<uint4*>(&qfrag[mt][s][ln][0])=make_uint4(a0,a1,a2,a3);
         }
-        *reinterpret_cast<uint4*>(&qfrag[mt][s][ln][0])=make_uint4(a0,a1,a2,a3);
+    } else {
+        for(int e=tid;e<3*4*32;e+=kL0HistoryThreads) {
+            const int mt=e/128,m=(e/32)%4,ln=e%32,gg=ln>>2,tt=ln&3;
+            const int W=8*(m>>1)+2*tt+(m&1);
+            const signed char* r0=q8[mt*16+gg];
+            const signed char* r1=q8[mt*16+gg+8];
+            unsigned out[8];
+            #pragma unroll
+            for(int sb=0;sb<2;++sb) {
+                unsigned a0=0,a1=0,a2=0,a3=0;
+                #pragma unroll
+                for(int i=0;i<4;++i) {
+                    const int d=16*W+4*i+2*sb;
+                    a0|=static_cast<unsigned>(static_cast<unsigned char>(r0[d]))<<(8*i);
+                    a1|=static_cast<unsigned>(static_cast<unsigned char>(r1[d]))<<(8*i);
+                    a2|=static_cast<unsigned>(static_cast<unsigned char>(r0[d+1]))<<(8*i);
+                    a3|=static_cast<unsigned>(static_cast<unsigned char>(r1[d+1]))<<(8*i);
+                }
+                out[4*sb]=a0;out[4*sb+1]=a1;out[4*sb+2]=a2;out[4*sb+3]=a3;
+            }
+            *reinterpret_cast<uint4*>(&qfrag[mt][m][ln][0])=make_uint4(out[0],out[1],out[2],out[3]);
+            *reinterpret_cast<uint4*>(&qfrag[mt][m][ln][4])=make_uint4(out[4],out[5],out[6],out[7]);
+        }
     }
     const int v0=mtile*16+g,v1=v0+8;
     // acc[n][e]: rows v0 (e < 2) / v1, dims 128 vgroup + 16 (2t + (e & 1)) + n in
@@ -222,7 +263,6 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
     #pragma unroll
     for(int n=0;n<16;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.0f;
     float mx[2]={-INFINITY,-INFINITY},den[2]={0.f,0.f},bias[2]={0.f,0.f};
-    constexpr int kWords=l0::kCodeBytes/4;
     for(int stage=0;stage<stages;++stage) {
         asm volatile("cp.async.wait_group %0;\n"::"n"(kL0Stages-2));
         __syncthreads();
@@ -244,22 +284,45 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
         for(int h=0;h<2;++h)
             #pragma unroll
             for(int j=0;j<4;++j) s[h][j][0]=s[h][j][1]=s[h][j][2]=s[h][j][3]=0;
-        uint2 kc[4][4];
-        #pragma unroll
-        for(int j=0;j<4;++j) {
-            const int key=4*(g>>1)+2*(j&1)+(g&1)+16*(j>>1);
-            const uint2* w=reinterpret_cast<const uint2*>(bk+key*kL0RawKeyBytes);
-            #pragma unroll
-            for(int k=0;k<4;++k) kc[j][k]=w[4*k+t];   // words 8k + 2t, 8k + 2t + 1
-        }
-        #pragma unroll
-        for(int st=0;st<8;++st) {
-            const uint4 f=*reinterpret_cast<const uint4*>(&qfrag[mtile][st][lane][0]);
-            const unsigned a[4]={f.x,f.y,f.z,f.w};
+        if constexpr(Bits==4) {
+            uint2 kc[4][4];
             #pragma unroll
             for(int j=0;j<4;++j) {
-                const unsigned w=(st&1)?kc[j][st>>1].y:kc[j][st>>1].x;
-                l0_imma(s[st>>2][j],a,w&0x0F0F0F0FU,(w>>4)&0x0F0F0F0FU);
+                const int key=4*(g>>1)+2*(j&1)+(g&1)+16*(j>>1);
+                const uint2* w=reinterpret_cast<const uint2*>(bk+key*kL0RawKeyBytes);
+                #pragma unroll
+                for(int k=0;k<4;++k) kc[j][k]=w[4*k+t];   // words 8k + 2t, 8k + 2t + 1
+            }
+            #pragma unroll
+            for(int st=0;st<8;++st) {
+                const uint4 f=*reinterpret_cast<const uint4*>(&qfrag[mtile][st][lane][0]);
+                const unsigned a[4]={f.x,f.y,f.z,f.w};
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    const unsigned w=(st&1)?kc[j][st>>1].y:kc[j][st>>1].x;
+                    l0_imma(s[st>>2][j],a,w&0x0F0F0F0FU,(w>>4)&0x0F0F0F0FU);
+                }
+            }
+        } else {
+            uint2 kc[4][2];
+            #pragma unroll
+            for(int j=0;j<4;++j) {
+                const int key=4*(g>>1)+2*(j&1)+(g&1)+16*(j>>1);
+                const uint2* w=reinterpret_cast<const uint2*>(bk+key*kL0RawKeyBytes);
+                kc[j][0]=w[t];kc[j][1]=w[4+t];
+            }
+            #pragma unroll
+            for(int m=0;m<4;++m) {
+                const uint4 f0=*reinterpret_cast<const uint4*>(&qfrag[mtile][m][lane][0]);
+                const uint4 f1=*reinterpret_cast<const uint4*>(&qfrag[mtile][m][lane][4]);
+                const unsigned a[2][4]={{f0.x,f0.y,f0.z,f0.w},{f1.x,f1.y,f1.z,f1.w}};
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    const unsigned w=(m&1)?kc[j][m>>1].y:kc[j][m>>1].x;
+                    #pragma unroll
+                    for(int sb=0;sb<2;++sb)
+                        l0_imma(s[m>>1][j],a[sb],(w>>(4*sb))&0x03030303U,(w>>(4*sb+2))&0x03030303U);
+                }
             }
         }
         // This lane's keys: 4t + (i & 3) + 16 (i >> 2), i = 4 (j >> 1) + 2 (j & 1) + (e & 1).
@@ -272,7 +335,7 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
             #pragma unroll
             for(int e=0;e<4;++e) {
                 const int r=e>>1,i=4*(j>>1)+2*(j&1)+(e&1),key=4*t+(i&3)+16*(i>>2);
-                const float4 k=l0_meta4(bk+key*kL0RawKeyBytes+2*l0::kCodeBytes);
+                const float4 k=l0_meta4(bk+key*kL0RawKeyBytes+2*kCodeBytes);
                 const float v=qi[r][0]*k.x*static_cast<float>(s[0][j][e])+qi[r][1]*k.z*static_cast<float>(s[1][j][e])-
                     qi[r][2]*k.y*k.x-qi[r][3]*k.w*k.z+qi[r][4];
                 sc[r][i]=kb+key<segment_end && !((hot_word>>key)&1u)?v:-INFINITY;
@@ -325,7 +388,7 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
                 const int key=4*t+(i&3)+16*(i>>2);
                 const float p=sc[r][i]==-INFINITY?0.f:exp2f(sc[r][i]-mx[r]);
                 const float2 vm=__half22float2(*reinterpret_cast<const __half2*>(
-                    bk+key*kL0RawKeyBytes+2*l0::kCodeBytes+8+4*vgroup));
+                    bk+key*kL0RawKeyBytes+2*kCodeBytes+8+4*vgroup));
                 den[r]+=p;
                 bias[r]=fmaf(-p*vm.y,vm.x,bias[r]);
                 pv[r][i]=p*vm.x;
@@ -347,16 +410,18 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
                 pa[2*half_index+r]=w;
             }
         }
-        // PV: B column g of n-tile n is dim 128 vgroup + 16 g + n (word
-        // 16 vgroup + 2 g + (n >> 3), byte (n & 7) >> 1, nibble n & 1); b0 keys
-        // 4t..4t+3, b1 keys 16+4t..16+4t+3.
-        unsigned u[2][2][4];   // [word][quad][byte]: that byte of the 4 keys
+        // PV: B column g of n-tile n is dim 128 vgroup + 16 g + n. INT4: word
+        // 16 vgroup + 2 g + (n >> 3), byte (n & 7) >> 1, nibble n & 1. INT2: word
+        // 8 vgroup + g, byte n >> 2, bits 2 (n & 3). b0 keys 4t..4t+3, b1 keys
+        // 16+4t..16+4t+3.
+        constexpr int kWordsPerColumn=Bits==4?2:1;
+        unsigned u[kWordsPerColumn][2][4];   // [word][quad][byte]: that byte of the 4 keys
         #pragma unroll
-        for(int half_word=0;half_word<2;++half_word)
+        for(int half_word=0;half_word<kWordsPerColumn;++half_word)
             #pragma unroll
             for(int quad=0;quad<2;++quad) {
-                const unsigned char* vb=bk+(16*quad+4*t)*kL0RawKeyBytes+l0::kCodeBytes+
-                    4*(16*vgroup+2*g+half_word);
+                const unsigned char* vb=bk+(16*quad+4*t)*kL0RawKeyBytes+kCodeBytes+
+                    4*(Bits==4?16*vgroup+2*g+half_word:8*vgroup+g);
                 const unsigned w0=*reinterpret_cast<const unsigned*>(vb);
                 const unsigned w1=*reinterpret_cast<const unsigned*>(vb+kL0RawKeyBytes);
                 const unsigned w2=*reinterpret_cast<const unsigned*>(vb+2*kL0RawKeyBytes);
@@ -368,15 +433,19 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
             }
         #pragma unroll
         for(int n=0;n<16;++n) {
-            const unsigned mask=0x0F0F0F0FU<<(4*(n&1));
             int c[4]={kL0IntMagic,kL0IntMagic,kL0IntMagic,kL0IntMagic};
-            l0_immau(c,pa,u[n>>3][0][(n&7)>>1]&mask,u[n>>3][1][(n&7)>>1]&mask);
+            if constexpr(Bits==4) {
+                const unsigned mask=0x0F0F0F0FU<<(4*(n&1));
+                l0_immau(c,pa,u[n>>3][0][(n&7)>>1]&mask,u[n>>3][1][(n&7)>>1]&mask);
+            } else {
+                const unsigned mask=0x03030303U<<(2*(n&3));
+                l0_immau(c,pa,u[0][0][n>>2]&mask,u[0][1][n>>2]&mask);
+            }
             acc[n][0]=fmaf(qscale[0],l0_int_value(c[0]),acc[n][0]);
             acc[n][1]=fmaf(qscale[0],l0_int_value(c[1]),acc[n][1]);
             acc[n][2]=fmaf(qscale[1],l0_int_value(c[2]),acc[n][2]);
             acc[n][3]=fmaf(qscale[1],l0_int_value(c[3]),acc[n][3]);
         }
-        (void)kWords;
     }
     asm volatile("cp.async.wait_group 0;\n");
     #pragma unroll
@@ -433,8 +502,8 @@ __global__ void __launch_bounds__(kL0HistoryThreads,1) l0_history_mma_kernel(
             #pragma unroll
             for(int n=0;n<16;n+=4)
                 *reinterpret_cast<float4*>(dst+n)=make_float4(
-                    acc[n][2*r+c]*l0_code_scale(n)+bias[r],acc[n+1][2*r+c]*l0_code_scale(n+1)+bias[r],
-                    acc[n+2][2*r+c]*l0_code_scale(n+2)+bias[r],acc[n+3][2*r+c]*l0_code_scale(n+3)+bias[r]);
+                    acc[n][2*r+c]*l0_code_scale<Bits>(n)+bias[r],acc[n+1][2*r+c]*l0_code_scale<Bits>(n+1)+bias[r],
+                    acc[n+2][2*r+c]*l0_code_scale<Bits>(n+2)+bias[r],acc[n+3][2*r+c]*l0_code_scale<Bits>(n+3)+bias[r]);
         }
         if(t==0&&vgroup==0) {
             slot[kFastFusedFlashValues+head]=mx[r]*0.6931471805599453f;
@@ -494,26 +563,30 @@ __global__ void __launch_bounds__(256) l0_history_merge_kernel(const float* work
 }
 
 // L0 OSCAR prefill history: FA2-shaped (64 query rows x 2 query heads per
-// CTA, 32-key tiles) over the INT4 history [kSink, history_end) of a prefill
+// CTA, 32-key tiles) over the INT4 / INT2 history [kSink, history_end) of a prefill
 // chunk whose rows all follow it, entirely on s8/u8 MMAs over the raw codes:
 //   QK  int8 rotated queries (per 128-dim group, quantized in registers)
 //       against the K codes, as in l0_history_mma_kernel. Score columns are
 //       permuted so this lane's scores are keys 4t..4t+3 and 16+4t..16+4t+3,
 //       the A-fragment keys of the PV MMA.
 //   PV  P scaled by the per-key V scale (per 128-dim group), quantized to u8
-//       per (row, tile), against the V codes read in place (c 16^j), with the
+//       per (row, tile), against the V codes read in place (c 16^j / c 4^j), with the
 //       V zero term as a per-row bias; each n-tile's int32 tile sum is folded
 //       into the FP32 accumulator.
 // Writes the normalized rotated-basis output and (max, denominator).
 constexpr int kL0PrefillSplits=4;
 constexpr int kL0PrefillThreads=256;
-// Key rows of kL0PrefillRowStride words (32 code words + 4 pad); dynamic
-// shared memory: K and V raw tiles (double-buffered), meta, query fragments.
-constexpr int kL0PrefillRowStride=l0::kCodeBytes/4+4;
-constexpr std::size_t l0_prefill_smem_bytes() {
-    return 2*2*static_cast<std::size_t>(fa2_prefill::BN)*kL0PrefillRowStride*sizeof(unsigned)+
+// Key rows of l0_prefill_row_stride words (32 / 16 code words + 4 pad);
+// dynamic shared memory: K and V raw tiles (double-buffered), meta, query
+// fragments.
+template<int Bits> __host__ __device__ constexpr int l0_prefill_row_stride() {
+    return voidinfer::exl3::l0_oscar_format::CodeFormat<Bits>::code_bytes/4+4;
+}
+template<int Bits> constexpr std::size_t l0_prefill_smem_bytes() {
+    return 2*2*static_cast<std::size_t>(fa2_prefill::BN)*l0_prefill_row_stride<Bits>()*sizeof(unsigned)+
         2*2*static_cast<std::size_t>(fa2_prefill::BN)*sizeof(uint2)+8*8*32*sizeof(uint4);
 }
+template<int Bits>
 __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     const std::uint16_t* q_rot_bits,const float* q_mu,const std::uint8_t* k_codes,
     const std::uint8_t* v_codes,const __half* k_meta,const __half* v_meta,
@@ -521,14 +594,16 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
   // blockIdx.z = head group * kL0PrefillSplits + split over the history tiles.
   using namespace fa2_prefill;
   constexpr float kLog2Scale=0.0625f*1.4426950408889634f;
-  constexpr int kWords=l0::kCodeBytes/4;   // 32 code words per key
+  constexpr int kCodeBytes=voidinfer::exl3::l0_oscar_format::CodeFormat<Bits>::code_bytes;
+  constexpr int kChunks=kCodeBytes/16;   // 16-byte code chunks per key (8 INT4, 4 INT2)
   const auto* q=reinterpret_cast<const __half*>(q_rot_bits);
   // Two raw tile stages (cp.async a tile ahead): codes and FP16 meta.
   // Key rows of kRowStride words with the 16-byte chunks XOR-swizzled by
-  // (key >> 2) & 7.
-  constexpr int kRowStride=kL0PrefillRowStride;
+  // (key >> 2) & (kChunks - 1): the QK code loads and the PV byte transposes
+  // are bank-conflict free.
+  constexpr int kRowStride=l0_prefill_row_stride<Bits>();
   const auto word_at=[](int key,int word) {
-      return key*kRowStride+(((word>>2)^((key>>2)&7))<<2)+(word&3);
+      return key*kRowStride+(((word>>2)^((key>>2)&(kChunks-1)))<<2)+(word&3);
   };
   extern __shared__ __align__(16) unsigned char l0_prefill_smem[];
   using RawTile=unsigned[BN*kRowStride];
@@ -558,12 +633,15 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
   const int active_rows=min(BM,rows-query_base);
   if(active_rows<=0) return;
   const bool l0r=row0<active_rows, l1r=row1<active_rows;
-  // Int8 A fragments: k-step s reads code word W = 8 (s >> 1) + 2t + (s & 1)
-  // of each key; byte i of (w >> 4j) & 0x0F0F0F0F is dim 8 W + 2 i + j. This
-  // lane holds rows g, g + 8 at the dims of words {8k + 2t, 8k + 2t + 1}.
+  // Int8 A fragments. INT4: k-step s reads code word W = 8 (s >> 1) + 2t +
+  // (s & 1) of each key; byte i of (w >> 4j) & 0x0F0F0F0F is dim 8 W + 2 i + j;
+  // this lane holds rows g, g + 8 at the dims of words {8k + 2t, 8k + 2t + 1}.
+  // INT2: k-step pair m reads code word W = 8 (m >> 1) + 2t + (m & 1); byte i
+  // of (w >> 2j) & 0x03030303 is dim 16 W + 4 i + j; this lane holds the dims
+  // of words {2t, 2t+1, 8+2t, 9+2t}.
 
   float qs[2][2],qsum[2][2],qmu[2];
-  {
+  if constexpr(Bits==4) {
     float x[2][8][8];
     #pragma unroll
     for(int r=0;r<2;++r) {
@@ -610,16 +688,66 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
       }
       qa_s[warp][st][lane]=make_uint4(w[0],w[1],w[2],w[3]);
     }
+  } else {
+    float x[2][4][16];
+    #pragma unroll
+    for(int r=0;r<2;++r) {
+      const bool live=r?l1r:l0r;
+      const __half* src=q+(static_cast<std::size_t>(query_base+(live?(r?row1:row0):0))*kQHeads+q_head)*kHeadDim;
+      #pragma unroll
+      for(int m=0;m<4;++m) {
+        const int W=8*(m>>1)+2*t+(m&1);
+        uint4 raw[2]={make_uint4(0,0,0,0),make_uint4(0,0,0,0)};
+        if(live) { raw[0]=*reinterpret_cast<const uint4*>(src+16*W); raw[1]=*reinterpret_cast<const uint4*>(src+16*W+8); }
+        const __half* h=reinterpret_cast<const __half*>(raw);
+        #pragma unroll
+        for(int d=0;d<16;++d) x[r][m][d]=__half2float(h[d]);
+      }
+      qmu[r]=live?q_mu[(query_base+(r?row1:row0))*kQHeads+q_head]*kLog2Scale:0.f;
+    }
+    #pragma unroll
+    for(int r=0;r<2;++r)
+      #pragma unroll
+      for(int grp=0;grp<2;++grp) {
+        float amax=0.f,sum=0.f;
+        #pragma unroll
+        for(int mm=0;mm<2;++mm)
+          #pragma unroll
+          for(int d=0;d<16;++d) { amax=fmaxf(amax,fabsf(x[r][2*grp+mm][d])); sum+=x[r][2*grp+mm][d]; }
+        amax=fmaxf(amax,__shfl_xor_sync(0xffffffffU,amax,1)); amax=fmaxf(amax,__shfl_xor_sync(0xffffffffU,amax,2));
+        sum+=__shfl_xor_sync(0xffffffffU,sum,1); sum+=__shfl_xor_sync(0xffffffffU,sum,2);
+        const float inv=amax>0.f?127.f/amax:0.f;
+        #pragma unroll
+        for(int mm=0;mm<2;++mm)
+          #pragma unroll
+          for(int d=0;d<16;++d) x[r][2*grp+mm][d]=static_cast<float>(__float2int_rn(x[r][2*grp+mm][d]*inv));
+        qs[r][grp]=amax/127.f*kLog2Scale; qsum[r][grp]=sum*kLog2Scale;
+      }
+    #pragma unroll
+    for(int m=0;m<4;++m)
+      #pragma unroll
+      for(int sb=0;sb<2;++sb) {
+        unsigned w[4]={0u,0u,0u,0u};
+        #pragma unroll
+        for(int i=0;i<4;++i) {
+          const int d=4*i+2*sb;
+          w[0]|=(static_cast<unsigned>(static_cast<int>(x[0][m][d]))&255u)<<(8*i);
+          w[1]|=(static_cast<unsigned>(static_cast<int>(x[1][m][d]))&255u)<<(8*i);
+          w[2]|=(static_cast<unsigned>(static_cast<int>(x[0][m][d+1]))&255u)<<(8*i);
+          w[3]|=(static_cast<unsigned>(static_cast<int>(x[1][m][d+1]))&255u)<<(8*i);
+        }
+        qa_s[warp][2*m+sb][lane]=make_uint4(w[0],w[1],w[2],w[3]);
+      }
   }
   // acc[16 h + n][e]: rows g (e < 2) / g + 8, dims 128 h + 16 (2t + (e & 1)) + n,
-  // in units of 4^-(n & 3) (codes read in place); bias[r][h] is the V zero term.
+  // in code-scale units (l0_code_scale, codes read in place); bias[r][h] is the
+  // V zero term.
   float acc[32][4];
   #pragma unroll
   for(int n=0;n<32;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
   float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f},bias[2][2]={{0.f,0.f},{0.f,0.f}};
   const bool warp_live=m_base<active_rows;
   // Raw tile: K codes, V codes (16 B chunks), K and V meta (32 x 8 B each).
-  constexpr int kChunks=l0::kCodeBytes/16;
   const auto fetch=[&](int tile_first,int buf){
     for(int c=tid;c<BN*(2*kChunks+2);c+=256) {
       const int part=c<BN*2*kChunks?c/(BN*kChunks):2+(c-BN*2*kChunks)/BN;   // 0 K, 1 V, 2 K meta, 3 V meta
@@ -627,8 +755,8 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
       const int key=tile_first+(part<2?idx/kChunks:idx);
       const bool valid=key<split_end;
       const std::size_t cell=static_cast<std::size_t>(valid?key:split_begin)*kKVHeads+kv_head;
-      if(part==0) l0_cp16(&kraw_s[buf][word_at(idx/kChunks,(idx%kChunks)*4)],k_codes+cell*l0::kCodeBytes+(idx%kChunks)*16,valid);
-      else if(part==1) l0_cp16(&vraw_s[buf][word_at(idx/kChunks,(idx%kChunks)*4)],v_codes+cell*l0::kCodeBytes+(idx%kChunks)*16,valid);
+      if(part==0) l0_cp16(&kraw_s[buf][word_at(idx/kChunks,(idx%kChunks)*4)],k_codes+cell*kCodeBytes+(idx%kChunks)*16,valid);
+      else if(part==1) l0_cp16(&vraw_s[buf][word_at(idx/kChunks,(idx%kChunks)*4)],v_codes+cell*kCodeBytes+(idx%kChunks)*16,valid);
       else if(part==2) l0_cp8(&kmeta_s[buf][idx],k_meta+cell*l0::kMetaFloats,valid);
       else l0_cp8(&vmeta_s[buf][idx],v_meta+cell*l0::kMetaFloats,valid);
     }
@@ -649,22 +777,44 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     for(int h=0;h<2;++h)
       #pragma unroll
       for(int j=0;j<BN/8;++j) si[h][j][0]=si[h][j][1]=si[h][j][2]=si[h][j][3]=kL0IntMagic;
-    uint2 kc[BN/8][4];
-    #pragma unroll
-    for(int j=0;j<BN/8;++j) {
-      const int key=4*(g>>1)+2*(j&1)+(g&1)+16*(j>>1);
-      #pragma unroll
-      for(int k=0;k<4;++k) kc[j][k]=*reinterpret_cast<const uint2*>(kraw+word_at(key,8*k+2*t));
-    }
-    #pragma unroll
-    for(int st=0;st<8;++st) {
-      const uint4 f=qa_s[warp][st][lane];
-      const unsigned qa[4]={f.x,f.y,f.z,f.w};
+    if constexpr(Bits==4) {
+      uint2 kc[BN/8][4];
       #pragma unroll
       for(int j=0;j<BN/8;++j) {
-        const unsigned w=(st&1)?kc[j][st>>1].y:kc[j][st>>1].x;
-        l0_imma(si[st>>2][j],qa,w&0x0F0F0F0FU,(w>>4)&0x0F0F0F0FU);
+        const int key=4*(g>>1)+2*(j&1)+(g&1)+16*(j>>1);
+        #pragma unroll
+        for(int k=0;k<4;++k) kc[j][k]=*reinterpret_cast<const uint2*>(kraw+word_at(key,8*k+2*t));
       }
+      #pragma unroll
+      for(int st=0;st<8;++st) {
+        const uint4 f=qa_s[warp][st][lane];
+        const unsigned qa[4]={f.x,f.y,f.z,f.w};
+        #pragma unroll
+        for(int j=0;j<BN/8;++j) {
+          const unsigned w=(st&1)?kc[j][st>>1].y:kc[j][st>>1].x;
+          l0_imma(si[st>>2][j],qa,w&0x0F0F0F0FU,(w>>4)&0x0F0F0F0FU);
+        }
+      }
+    } else {
+      uint2 kc[BN/8][2];
+      #pragma unroll
+      for(int j=0;j<BN/8;++j) {
+        const int key=4*(g>>1)+2*(j&1)+(g&1)+16*(j>>1);
+        kc[j][0]=*reinterpret_cast<const uint2*>(kraw+word_at(key,2*t));
+        kc[j][1]=*reinterpret_cast<const uint2*>(kraw+word_at(key,8+2*t));
+      }
+      #pragma unroll
+      for(int m=0;m<4;++m)
+        #pragma unroll
+        for(int sb=0;sb<2;++sb) {
+          const uint4 f=qa_s[warp][2*m+sb][lane];
+          const unsigned qa[4]={f.x,f.y,f.z,f.w};
+          #pragma unroll
+          for(int j=0;j<BN/8;++j) {
+            const unsigned w=(m&1)?kc[j][m>>1].y:kc[j][m>>1].x;
+            l0_imma(si[m>>1][j],qa,(w>>(4*sb))&0x03030303U,(w>>(4*sb+2))&0x03030303U);
+          }
+        }
     }
     // This lane's keys: 4t + (i & 3) + 16 (i >> 2). Per-key factors (shared
     // by both rows): K scale per group, K zero term -z s per group; same for V.
@@ -743,17 +893,18 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
     }
     #pragma unroll
     for(int h=0;h<2;++h){ bias[0][h]+=tile_bias[0][h]; bias[1][h]+=tile_bias[1][h]; }
-    // PV. B column g of n-tile 16 h + n is dim 128 h + 16 g + n (word
-    // 16 h + 2 g + (n >> 3), byte (n & 7) >> 1, nibble n & 1); b0 keys
-    // 4t..4t+3, b1 keys 16+4t..16+4t+3.
+    // PV. B column g of n-tile 16 h + n is dim 128 h + 16 g + n. INT4: word
+    // 16 h + 2 g + (n >> 3), byte (n & 7) >> 1, nibble n & 1. INT2: word 8 h + g,
+    // byte n >> 2, bits 2 (n & 3). b0 keys 4t..4t+3, b1 keys 16+4t..16+4t+3.
+    constexpr int kWordsPerColumn=Bits==4?2:1;
     #pragma unroll
     for(int h=0;h<2;++h) {
-      unsigned u[2][2][4];
+      unsigned u[kWordsPerColumn][2][4];
       #pragma unroll
-      for(int half_word=0;half_word<2;++half_word)
+      for(int half_word=0;half_word<kWordsPerColumn;++half_word)
         #pragma unroll
         for(int quad=0;quad<2;++quad) {
-          const int k0=16*quad+4*t,word=16*h+2*g+half_word;
+          const int k0=16*quad+4*t,word=Bits==4?16*h+2*g+half_word:8*h+g;
           const unsigned w0=vraw[word_at(k0,word)],w1=vraw[word_at(k0+1,word)];
           const unsigned w2=vraw[word_at(k0+2,word)],w3=vraw[word_at(k0+3,word)];
           const unsigned t0=__byte_perm(w0,w1,0x5140),t1=__byte_perm(w2,w3,0x5140);
@@ -764,9 +915,14 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
       const unsigned a[4]={pa[h][0],pa[h][1],pa[h][2],pa[h][3]};
       #pragma unroll
       for(int n=0;n<16;++n) {
-        const unsigned mask=0x0F0F0F0FU<<(4*(n&1));
         int c[4]={kL0IntMagic,kL0IntMagic,kL0IntMagic,kL0IntMagic};
-        l0_immau(c,a,u[n>>3][0][(n&7)>>1]&mask,u[n>>3][1][(n&7)>>1]&mask);
+        if constexpr(Bits==4) {
+          const unsigned mask=0x0F0F0F0FU<<(4*(n&1));
+          l0_immau(c,a,u[n>>3][0][(n&7)>>1]&mask,u[n>>3][1][(n&7)>>1]&mask);
+        } else {
+          const unsigned mask=0x03030303U<<(2*(n&3));
+          l0_immau(c,a,u[0][0][n>>2]&mask,u[0][1][n>>2]&mask);
+        }
         acc[16*h+n][0]=fmaf(qscale[0][h],l0_int_value(c[0]),acc[16*h+n][0]);
         acc[16*h+n][1]=fmaf(qscale[0][h],l0_int_value(c[1]),acc[16*h+n][1]);
         acc[16*h+n][2]=fmaf(qscale[1][h],l0_int_value(c[2]),acc[16*h+n][2]);
@@ -792,10 +948,10 @@ __global__ void __launch_bounds__(256,1) l0_history_prefill_kernel(
         #pragma unroll
         for(int n=0;n<16;n+=4)
           *reinterpret_cast<float4*>(dst+n)=make_float4(
-            (acc[16*h+n][2*r+c]+bias[r][h])*inv,
-            (acc[16*h+n+1][2*r+c]*0.0625f+bias[r][h])*inv,
-            (acc[16*h+n+2][2*r+c]+bias[r][h])*inv,
-            (acc[16*h+n+3][2*r+c]*0.0625f+bias[r][h])*inv);
+            (acc[16*h+n][2*r+c]*l0_code_scale<Bits>(n)+bias[r][h])*inv,
+            (acc[16*h+n+1][2*r+c]*l0_code_scale<Bits>(n+1)+bias[r][h])*inv,
+            (acc[16*h+n+2][2*r+c]*l0_code_scale<Bits>(n+2)+bias[r][h])*inv,
+            (acc[16*h+n+3][2*r+c]*l0_code_scale<Bits>(n+3)+bias[r][h])*inv);
       }
     if(t==0){
       const std::size_t stat=(static_cast<std::size_t>(query_base+row)*kQHeads+q_head)*2;

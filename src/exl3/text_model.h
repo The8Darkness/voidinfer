@@ -403,7 +403,7 @@ private:
     std::array<std::vector<std::uint16_t>, 5> taps_;
     // L0 OSCAR INT4 history parked with the state, so a resume skips
     // re-encoding: per full-attention layer, immutable chunks of
-    // kL0ChunkRows encoded rows (codes [rows][4][128] K then V, FP16 meta
+    // kL0ChunkRows encoded rows (codes [rows][4][code bytes] K then V, FP16 meta
     // [rows][4][4] K then V) covering [0, l0_rows_). Complete chunks are
     // shared with later states of the same lineage.
 public:
@@ -415,7 +415,7 @@ public:
         std::uint16_t* meta() const noexcept {
             return reinterpret_cast<std::uint16_t*>(block.data + code_bytes());
         }
-        std::size_t code_bytes() const noexcept { return static_cast<std::size_t>(rows) * l0_oscar_format::kRowCodeBytes; }
+        std::size_t code_bytes() const noexcept { return static_cast<std::size_t>(rows) * l0_oscar_format::row_code_bytes(); }
         std::size_t meta_bytes() const noexcept { return static_cast<std::size_t>(rows) * l0_oscar_format::kRowMetaBytes; }
     };
 private:

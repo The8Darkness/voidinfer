@@ -1,14 +1,16 @@
 #pragma once
-// L0 OSCAR KV history (FutureMLS-Lab OSCAR, arXiv 2605.17757; INT4 codes) for the
+// L0 OSCAR KV history (FutureMLS-Lab OSCAR, arXiv 2605.17757; INT4 or INT2 codes) for the
 // ordinary FP16-KV verifier/decode route. Committed rows that leave the
 // exact window (sink [0, 64) and the 256 most recent committed rows) are
 // encoded per KV head as
 //   K: x = (k - mu_h) R_k,h   V: x = v R_v,h          (row vector, orthogonal R)
-//   two 128-dim groups, asymmetric INT4 over the full range:
-//   scale = (max - min) / 15, zero = -min / scale,
-//   code = clamp(floor(x / scale + zero + 0.5), 0, 15), x^ = (code - zero) scale
-//   (l0_oscar_format.h: two dims per byte). INT4 measured KL 0.005 / 0.008
-//   against FP16 KV at 4K / 16K vs 0.035 / 0.042 for the former INT4 codes.
+//   two 128-dim groups, asymmetric b-bit codes (L = 2^b - 1 levels):
+//   scale = (max - min) / L, zero = -min / scale,
+//   code = clamp(floor(x / scale + zero + 0.5), 0, L), x^ = (code - zero) scale.
+//   INT4 (default) keeps the full range; INT2 clips |x| at the 0.96 (K) /
+//   0.92 (V) per-row quantile (l0_oscar_format.h, VOIDINFER_EXL3_L0_CODE_BITS).
+//   Attention-level KL against FP16 KV at 4K / 16K: INT4 0.005 / 0.008, INT2
+//   0.035 / 0.042.
 // R and mu are per-KV-head OSCAR-2 'center' rotations fitted offline
 // (<model directory>/l0_oscar or VOIDINFER_EXL3_L0_OSCAR_ROT: k_rot_perhead.bin,
 // v_rot_perhead.bin [16][4][256][256], k_mean.bin [16][4][256], fp32). Attention
@@ -58,9 +60,7 @@ __host__ __device__ __forceinline__ int recent_rows() {
 constexpr int kAlign = 64;
 constexpr int kDim = 256;
 constexpr int kKVHeadsL0 = 4;
-constexpr int kCodeBytes = l0_oscar_format::kCodeBytes;    // 4-bit codes, dims 2b, 2b+1 in byte b
 constexpr int kMetaFloats = l0_oscar_format::kMetaHalves;  // scale0, zero0, scale1, zero1 (FP16)
-constexpr int kCodeLevels = l0_oscar_format::kCodeLevels;
 constexpr int kRingRows = 2048;          // > sink-free exact window (<= 320) + one 1024-row prefill chunk
 
 // Device row of absolute key `key` in a window-ring addressed K or V plane.
@@ -268,6 +268,7 @@ __device__ __forceinline__ void encode_rotate(const float (*x)[kDim], const floa
 #pragma unroll
     for (int r = 0; r < Rows; ++r) y[r][j] = acc[r];
 }
+template <int Bits>
 __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cache,
     const std::uint16_t* v_cache, int capacity, const int* position_device, int position,
     int* state, Assets a, int bank, std::uint8_t* k_codes, std::uint8_t* v_codes,
@@ -311,10 +312,12 @@ __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cach
         else if (count <= 8) encode_rotate<8>(x, R, j, y);
         else encode_rotate<kEncodeRows>(x, R, j, y);
         __syncthreads();
-        // Range: the largest |y| of the row (rank 255 of the radix select over
+        // Range: the clip_index-th smallest |y| of the row (radix select over
         // the bit patterns; non-negative floats order as unsigned). INT4 keeps
-        // the full range (the INT4 codes clipped at the 0.92 / 0.96 quantile).
-        const int clip_index = 255;
+        // the full range (rank 255); INT2 clips at the 0.96 (K) / 0.92 (V)
+        // quantile (floor(0.96 * 256), floor(0.92 * 256)).
+        using Format = l0_oscar_format::CodeFormat<Bits>;
+        const int clip_index = Bits == 4 ? 255 : (kind ? 235 : 245);
         for (int r = j >> 5; r < count; r += 8) {
             const int lane = j & 31;
             const float4 a0 = *reinterpret_cast<const float4*>(&y[r][lane * 8]);
@@ -356,16 +359,20 @@ __global__ void __launch_bounds__(256) encode_kernel(const std::uint16_t* k_cach
             float gmn = extrema[r][g * 4], gmx = extrema[r][8 + g * 4];
             for (int w = 1; w < 4; ++w) { gmn = fminf(gmn, extrema[r][g * 4 + w]); gmx = fmaxf(gmx, extrema[r][8 + g * 4 + w]); }
             // Scale and zero are stored as FP16; the codes use the stored values.
-            const float scale = __half2float(__float2half_rn(fmaxf(gmx - gmn, 1.0e-6f) / kCodeLevels));
+            const float scale = __half2float(__float2half_rn(fmaxf(gmx - gmn, 1.0e-6f) / Format::levels));
             const float zero = __half2float(__float2half_rn(-gmn / scale));
             const int code = static_cast<int>(fminf(fmaxf(floorf(clipped / scale + zero + 0.5f), 0.0f),
-                                                    static_cast<float>(kCodeLevels)));
-            // pack 2 consecutive dims per byte (low nibble first)
-            const unsigned packed = __shfl_sync(0xffffffffu, code, (j & 31) & ~1) |
-                                    (__shfl_sync(0xffffffffu, code, ((j & 31) & ~1) + 1) << 4);
+                                                    static_cast<float>(Format::levels)));
+            // pack 8 / Bits consecutive dims per byte (lowest bits first)
+            constexpr int kPerByte = 8 / Bits;
+            const int first = (j & 31) & ~(kPerByte - 1);
+            unsigned packed = 0u;
+#pragma unroll
+            for (int i = 0; i < kPerByte; ++i)
+                packed |= static_cast<unsigned>(__shfl_sync(0xffffffffu, code, first + i)) << (Bits * i);
             const std::size_t cell = static_cast<std::size_t>(row0 + r) * kKVHeadsL0 + head;
-            auto* codes = (kind ? v_codes : k_codes) + cell * kCodeBytes;
-            if ((j & 1) == 0) codes[j >> 1] = static_cast<std::uint8_t>(packed);
+            auto* codes = (kind ? v_codes : k_codes) + cell * Format::code_bytes;
+            if ((j & (kPerByte - 1)) == 0) codes[j / kPerByte] = static_cast<std::uint8_t>(packed);
             if ((j & 127) == 0) {
                 __half* meta = (kind ? v_meta : k_meta) + cell * kMetaFloats;
                 meta[2 * g] = __float2half_rn(scale);

@@ -47,7 +47,7 @@ flowchart LR
 |---|---|---|
 | Exact window | device | 64-token sink, 960-token recent window, 1,024-row prefill chunk, ring |
 | Hot rows | device | 512 rows per KV head as exact FP16 copies, refreshed from the code pass's nominations |
-| L0 | device | calibrated-rotation INT4 history codes (`<target>/l0_oscar` rotations) |
+| L0 | device | calibrated-rotation INT4 (or `VOIDINFER_EXL3_L0_CODE_BITS=2`: INT2) history codes (`<target>/l0_oscar` rotations) |
 | L2 | pinned host memory | exact FP16 planes per conversation (plane sets in growable CUDA VMM regions); packed when idle, spilled to disk under pressure |
 
 The lane's window virtual address aliases the chunks of the plane set it serves

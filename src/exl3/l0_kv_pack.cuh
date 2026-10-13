@@ -1,6 +1,6 @@
 #pragma once
 // Lossless packing of exact L0 KV pages (lane_kv_source.h). The FP16 rows of
-// a 64-row page are coded against the L0 OSCAR INT4 codes of the same rows,
+// a 64-row page are coded against the L0 OSCAR codes (INT4 or INT2) of the same rows,
 // which the exported state keeps anyway (Exl3ExactHostState code chunks), so
 // a packed page costs ~11.7 bits per value instead of 16 (1.36x measured on
 // a 16K-token code context) and decodes back to the identical FP16 bits.
@@ -22,6 +22,7 @@
 // Rows, codes and meta live in host memory (L0 planes, code chunks): a fetch
 // kernel stages them into device memory with wide coalesced loads and a store
 // kernel writes decoded rows back, so the coding kernel never waits on PCIe.
+#include "exl3/l0_oscar_format.h"
 #include "exl3/l0_oscar_storage.h"
 
 #include <cuda_fp16.h>
@@ -79,7 +80,7 @@ struct Planes {
     std::uint16_t* v[kBanks];
 };
 // One page: its rows [row, row + rows) of the plane set and, per bank and
-// K|V, its codes ([rows][4][128] bytes) and meta ([rows][4][4] FP16) from the
+// K|V, its codes ([rows][4][code bytes]) and meta ([rows][4][4] FP16) from the
 // page's first row on (device-addressable, 16-byte aligned).
 struct Job {
     const std::uint8_t* codes[kBanks][2];
@@ -130,7 +131,7 @@ __device__ __forceinline__ unsigned block_scan(unsigned value, unsigned* scratch
 }
 
 // Device staging of a batch, per (job, bank, K|V) slot: 64 rows of FP16
-// [4][256], codes [4][128] and meta [4][4].
+// [4][256], codes [4][code bytes] (sized for INT4) and meta [4][4].
 constexpr std::size_t kSlotRowWords = static_cast<std::size_t>(kPageRows) * kRowWords;
 constexpr std::size_t kSlotCodeBytes = static_cast<std::size_t>(kPageRows) * kHeads * kDim / 2;
 constexpr std::size_t kSlotMetaWords = static_cast<std::size_t>(kPageRows) * kHeads * 4;
@@ -147,11 +148,12 @@ __device__ __forceinline__ void copy16(void* dst, const void* src, std::size_t b
 }
 // grid (banks * 2, jobs): stages each slot's codes, meta and (rows != null) rows.
 __global__ void __launch_bounds__(256) fetch_kernel(const Job* jobs, int banks, Planes planes,
-    std::uint16_t* rows, std::uint8_t* codes, std::uint16_t* meta) {
+    std::uint16_t* rows, std::uint8_t* codes, std::uint16_t* meta, int bits) {
     const Job& job = jobs[blockIdx.y];
     const int bank = static_cast<int>(blockIdx.x) >> 1, plane = static_cast<int>(blockIdx.x) & 1;
     const std::size_t slot = (static_cast<std::size_t>(blockIdx.y) * banks + bank) * 2 + plane;
-    copy16(codes + slot * kSlotCodeBytes, job.codes[bank][plane], static_cast<std::size_t>(job.rows) * kHeads * kDim / 2);
+    copy16(codes + slot * kSlotCodeBytes, job.codes[bank][plane],
+        static_cast<std::size_t>(job.rows) * kHeads * (kDim * bits / 8));
     copy16(meta + slot * kSlotMetaWords, job.meta[bank][plane], static_cast<std::size_t>(job.rows) * kHeads * 4 * 2);
     if (rows)
         copy16(rows + slot * kSlotRowWords, (plane ? planes.v[bank] : planes.k[bank]) +
@@ -175,7 +177,7 @@ __global__ void __launch_bounds__(256) store_kernel(const Job* jobs, int banks, 
 // in `error`.
 __global__ void __launch_bounds__(256) code_kernel(const Job* jobs, int banks, l0_oscar::RotationView assets,
     int decode, std::uint16_t* staged_rows, const std::uint8_t* staged_codes, const std::uint16_t* staged_meta,
-    std::uint8_t* io, unsigned* error) {
+    std::uint8_t* io, unsigned* error, int bits) {
     __shared__ __align__(16) float yh[kDim][kBatchRows];   // [j][row]: float4 row reads
     __shared__ float tile[kTileCols][kDim + 1];
     __shared__ float scales[kBatchRows][2];
@@ -187,7 +189,8 @@ __global__ void __launch_bounds__(256) code_kernel(const Job* jobs, int banks, l
     const int i = static_cast<int>(threadIdx.x);
     const int rows = job.rows;
     const std::size_t slot = (static_cast<std::size_t>(blockIdx.y) * banks + bank) * 2 + plane;
-    const std::uint8_t* codes = staged_codes + slot * kSlotCodeBytes + head * (kDim / 2);
+    const int code_bytes = kDim * bits / 8, per_byte = 8 / bits;
+    const std::uint8_t* codes = staged_codes + slot * kSlotCodeBytes + head * code_bytes;
     const std::uint16_t* meta = staged_meta + slot * kSlotMetaWords + head * 4;
     const float* R = (plane ? assets.rv : assets.rk) + (static_cast<std::size_t>(bank) * kHeads + head) * kDim * kDim;
     const float mu = plane ? 0.0f : assets.mu[(bank * kHeads + head) * kDim + i];
@@ -224,8 +227,8 @@ __global__ void __launch_bounds__(256) code_kernel(const Job* jobs, int banks, l
                 float y = 0.0f;
                 if (r < n) {
                     const int row = r0 + r;
-                    const unsigned byte = codes[static_cast<std::size_t>(row) * (kHeads * kDim / 2) + (i >> 1)];
-                    const unsigned q = (byte >> ((i & 1) * 4)) & 15u;
+                    const unsigned byte = codes[static_cast<std::size_t>(row) * (kHeads * code_bytes) + i / per_byte];
+                    const unsigned q = (byte >> ((i % per_byte) * bits)) & ((1u << bits) - 1u);
                     const std::uint16_t* m = meta + static_cast<std::size_t>(row) * kHeads * 4;
                     const int g = i >> 7;
                     const float scale = __half2float(__ushort_as_half(m[2 * g]));
@@ -417,10 +420,15 @@ __global__ void gather_kernel(const Job* jobs, int banks, const std::uint16_t* s
         esc[t] = reinterpret_cast<const std::uint16_t*>(base + kMainBytes)[t];
 }
 
+// Default on with INT4 codes (parked pages shrink ~1.36x). INT2 codes predict
+// the FP16 rows too coarsely (~1.04x for ~0.23 s per 470-page handover), so
+// packing is off there unless VOIDINFER_EXL3_KV_PACK=1.
 inline bool enabled() {
     static const bool value = [] {
         const char* v = std::getenv("VOIDINFER_EXL3_KV_PACK");
-        return !v || std::strcmp(v, "0") != 0;
+        if (v && std::strcmp(v, "0") == 0) return false;
+        if (v && std::strcmp(v, "1") == 0) return true;
+        return l0_oscar_format::code_bits() == 4;
     }();
     return value;
 }
@@ -471,10 +479,10 @@ public:
             upload_jobs(pages, begin, count, banks, nullptr, &source, slot);
             check(cudaMemsetAsync(scratch_, 0, static_cast<std::size_t>(count) * streams * kScratchStride, stream_),
                 "KV pack scratch clear");
-            fetch_kernel<<<dim3(banks * 2, count), 256, 0, stream_>>>(jobs_device_, banks, source, rows_, codes_, meta_);
+            fetch_kernel<<<dim3(banks * 2, count), 256, 0, stream_>>>(jobs_device_, banks, source, rows_, codes_, meta_, l0_oscar_format::code_bits());
             check(cudaGetLastError(), "KV pack fetch");
             code_kernel<<<dim3(streams, count), 256, 0, stream_>>>(jobs_device_, banks, l0_oscar::rotation_view(), 0,
-                rows_, codes_, meta_, scratch_, error_);
+                rows_, codes_, meta_, scratch_, error_, l0_oscar_format::code_bits());
             check(cudaGetLastError(), "KV pack encode");
             layout_kernel<<<count, 256, 0, stream_>>>(jobs_device_, streams, scratch_, slots_[slot].host_device,
                 slots_[slot].sizes_device);
@@ -522,10 +530,10 @@ public:
             check(cudaMemcpyAsync(blobs_, slots_[slot].host, offset, cudaMemcpyHostToDevice, stream_), "KV unpack upload");
             check(cudaEventRecord(slots_[slot].done, stream_), "KV unpack");
             fetch_kernel<<<dim3(banks * 2, count), 256, 0, stream_>>>(jobs_device_, banks, Planes{}, nullptr,
-                codes_, meta_);
+                codes_, meta_, l0_oscar_format::code_bits());
             check(cudaGetLastError(), "KV unpack fetch");
             code_kernel<<<dim3(streams, count), 256, 0, stream_>>>(jobs_device_, banks, l0_oscar::rotation_view(), 1,
-                rows_, codes_, meta_, blobs_, error_);
+                rows_, codes_, meta_, blobs_, error_, l0_oscar_format::code_bits());
             check(cudaGetLastError(), "KV unpack decode");
             if (destination) {
                 store_kernel<<<dim3(banks * 2, count), 256, 0, stream_>>>(jobs_device_, banks, *destination, rows_, error_);

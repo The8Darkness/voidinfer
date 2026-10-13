@@ -1,6 +1,6 @@
 // Round trip of the lossless L0 KV page packer (src/exl3/l0_kv_pack.cuh) on
 // captured FP16 K/V of the 16 full-attention layers: rows get real L0 OSCAR
-// INT4 codes (l0_oscar::encode_kernel), every 64-row page above the sink is
+// L0 codes (l0_oscar::encode_kernel, VOIDINFER_EXL3_L0_CODE_BITS), every 64-row page above the sink is
 // packed against them, decoded into a second plane set and compared bit for
 // bit; a corrupted blob must be rejected.
 //
@@ -49,7 +49,8 @@ int main() {
     // Source planes (mapped pinned, as the L0 FP16 planes) and their codes.
     pack::Planes source{}, target{};
     std::vector<std::uint8_t*> chunk(banks);
-    const std::size_t code_row = 4 * oscar::kCodeBytes, meta_row = 4 * oscar::kMetaFloats;
+    const std::size_t code_row = 4 * static_cast<std::size_t>(voidinfer::exl3::l0_oscar_format::code_bytes()),
+        meta_row = 4 * oscar::kMetaFloats;
     std::uint8_t *k_codes, *v_codes;
     __half *k_meta, *v_meta;
     int* state;
@@ -73,8 +74,12 @@ int main() {
         }
         const int init[2] = {oscar::kSink, 0};
         check(cudaMemcpy(state, init, sizeof(init), cudaMemcpyHostToDevice), "state");
-        oscar::encode_kernel<<<oscar::kEncodeBlocks, 256>>>(source.k[b], source.v[b], rows, nullptr,
-            rows + oscar::recent_rows() + 64, state, assets, b, k_codes, v_codes, k_meta, v_meta, oscar::HotView{});
+        const auto encode = [&](auto kernel) {
+            kernel<<<oscar::kEncodeBlocks, 256>>>(source.k[b], source.v[b], rows, nullptr,
+                rows + oscar::recent_rows() + 64, state, assets, b, k_codes, v_codes, k_meta, v_meta, oscar::HotView{});
+        };
+        if (voidinfer::exl3::l0_oscar_format::code_bits() == 4) encode(oscar::encode_kernel<4>);
+        else encode(oscar::encode_kernel<2>);
         check(cudaDeviceSynchronize(), "encode");
         // Chunk layout of Exl3ExactHostState::L0CodeChunk: K codes, V codes, K meta, V meta.
         check(cudaHostAlloc(&chunk[b], rows * (2 * code_row + 4 * meta_row), cudaHostAllocPortable), "chunk");

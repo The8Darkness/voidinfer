@@ -194,6 +194,9 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
   packed when parked, spilled to disk under memory pressure). `VOIDINFER_EXL3_VERICACHE=tolerance`
   trades exactness for speed; `VOIDINFER_EXL3_L0_OSCAR=0` selects FP16 device KV (about 16K with DFlash2).
   The OSCAR rotations are read from `<model directory>/l0_oscar` (or `VOIDINFER_EXL3_L0_OSCAR_ROT`).
+  `VOIDINFER_EXL3_L0_CODE_BITS=2` stores the history as INT2 codes instead (9.2 instead of 17.4 KiB per
+  token on the device): published tokens stay exact, but about 4x more VeriCache corrections cost
+  40-50% of decode speed (32K, 1 / 4 / 8 lanes: 93 / 33 / 23 vs 170 / 54 / 45 tok/s per lane).
 * With one lane, verification runs on an asynchronous exact line over the FP16 history;
   `VOIDINFER_EXL3_VERICACHE_LINE_FP8=1` reads history beyond the recent window through an FP8 e4m3
   mirror instead (6-10% faster at 128K-254K, KL 0.005 against FP16 history). With several lanes,

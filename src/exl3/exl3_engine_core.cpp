@@ -458,8 +458,8 @@ struct Exl3EngineCore::Impl {
     static std::uint64_t projected_l0_code_bytes(std::size_t tokens) {
         // Per token: 16 full-attention layers x 4 KV heads x (K and V codes + FP16 metadata),
         // plus half a 2 MiB granule of rounding for each of the 32 code planes.
-        constexpr std::uint64_t per_token=16ull*4ull*2ull*
-            (l0_oscar_format::kCodeBytes+l0_oscar_format::kMetaHalves*2ull);
+        const std::uint64_t per_token=16ull*4ull*2ull*
+            (static_cast<std::uint64_t>(l0_oscar_format::code_bytes())+l0_oscar_format::kMetaHalves*2ull);
         return static_cast<std::uint64_t>(tokens)*per_token+32ull*(1ull<<20);
     }
     bool l0_code_admission_enabled() const {

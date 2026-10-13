@@ -7909,7 +7909,7 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             return !value || std::strcmp(value,"0")!=0;
         }();
         if(growable) {
-            const std::array<std::size_t,4> bytes{{cells*l0_oscar::kCodeBytes,cells*l0_oscar::kCodeBytes,
+            const std::array<std::size_t,4> bytes{{cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()),cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()),
                 cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t),cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t)}};
             // A meta plane within one 2 MiB granule (contexts up to 64K)
             // is allocated exactly instead of a granule-backed range.
@@ -7927,8 +7927,8 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             else alloc(l.v_meta,bytes[3]);
             ensure_l0_rows(0);
         } else {
-        alloc(l.k_codes,cells*l0_oscar::kCodeBytes);
-        alloc(l.v_codes,cells*l0_oscar::kCodeBytes);
+        alloc(l.k_codes,cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+        alloc(l.v_codes,cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
         alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
         alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
         }
@@ -8048,8 +8048,8 @@ void Exl3FullAttentionLayer::ensure_l0_rows(int rows) {
     // 8192 code rows).
     const std::size_t target=static_cast<std::size_t>(std::min(cache_capacity_,
         std::max(rows,0)+kL0GrowthMarginRows))*kKVHeads;
-    l0_regions_[0]->ensure(target*l0_oscar::kCodeBytes);
-    l0_regions_[1]->ensure(target*l0_oscar::kCodeBytes);
+    l0_regions_[0]->ensure(target*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+    l0_regions_[1]->ensure(target*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
     if(l0_regions_[2])l0_regions_[2]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
     if(l0_regions_[3])l0_regions_[3]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
 }
@@ -8058,8 +8058,8 @@ void Exl3FullAttentionLayer::release_l0_rows_beyond(int rows) {
     if(!l0_regions_[0])return;
     const std::size_t keep=static_cast<std::size_t>(std::min(cache_capacity_,
         std::max(rows,0)+kL0GrowthMarginRows))*kKVHeads;
-    l0_regions_[0]->shrink(keep*l0_oscar::kCodeBytes);
-    l0_regions_[1]->shrink(keep*l0_oscar::kCodeBytes);
+    l0_regions_[0]->shrink(keep*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+    l0_regions_[1]->shrink(keep*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
     if(l0_regions_[2])l0_regions_[2]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
     if(l0_regions_[3])l0_regions_[3]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
 }
@@ -8184,7 +8184,7 @@ void Exl3FullAttentionLayer::l0_download_history(int first,int rows,std::uint8_t
     std::uint16_t* meta,cudaStream_t stream) const {
     if(!l0_.k_codes || rows<=0) return;
     if(first<0 || first+rows>l0_.capacity) throw std::invalid_argument("L0 OSCAR park extent");
-    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kCodeBytes;
+    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*static_cast<std::size_t>(l0_oscar_format::code_bytes());
     const std::size_t meta_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kMetaFloats;
     const std::size_t code_bytes=rows*code_row,meta_elements=rows*meta_row;
     cuda_check(cudaMemcpyAsync(codes,l0_.k_codes+first*code_row,code_bytes,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park codes");
@@ -8199,7 +8199,7 @@ void Exl3FullAttentionLayer::l0_upload_history(int first,int rows,const std::uin
     if(!l0_.k_codes || rows<=0) return;
     ensure_l0_rows(first+rows);
     if(first<0 || first+rows>l0_.capacity) throw std::invalid_argument("L0 OSCAR resume extent");
-    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kCodeBytes;
+    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*static_cast<std::size_t>(l0_oscar_format::code_bytes());
     const std::size_t meta_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kMetaFloats;
     const std::size_t code_bytes=rows*code_row,meta_elements=rows*meta_row;
     cuda_check(cudaMemcpyAsync(l0_.k_codes+first*code_row,codes,code_bytes,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume codes");
@@ -8599,11 +8599,16 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                     l0_oscar::hot_view(l0_),k_cache_,v_cache_,position_device_,position);
                 launch(cudaEventRecord(hot_branch.join,hot_branch.side),"L0 hot fill join");
             }
-            if(!l0_exact_only_)
-            l0_oscar::encode_kernel<<<l0_oscar::kEncodeBlocks,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
-                position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
-                reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta),
-                l0_oscar::hot_view(l0_));
+            if(!l0_exact_only_) {
+                const auto encode=[&](auto kernel) {
+                    kernel<<<l0_oscar::kEncodeBlocks,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
+                        position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
+                        reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta),
+                        l0_oscar::hot_view(l0_));
+                };
+                if(l0_oscar_format::code_bits()==4) encode(l0_oscar::encode_kernel<4>);
+                else encode(l0_oscar::encode_kernel<2>);
+            }
             l0_oscar::advance_kernel<<<1,1,0,stream>>>(position_device_,position,l0_.state,
                 cache_capacity_);
             if(l0_.hot_slots && !l0_exact_only_) launch(cudaStreamWaitEvent(stream,hot_branch.join,0),"L0 hot fill join");
@@ -8680,17 +8685,22 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
             constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
             l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
                 rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
-            static const bool prefill_smem_configured=[] {
-                cuda_check(cudaFuncSetAttribute(l0_history_prefill_kernel,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(l0_prefill_smem_bytes())),
-                    "configure L0 history prefill shared memory");
-                return true;
-            }();
-            (void)prefill_smem_configured;
-            l0_history_prefill_kernel<<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
-                kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,l0_prefill_smem_bytes(),stream>>>(l0_.q_rot,l0_.q_mu,
-                l0_.k_codes,l0_.v_codes,reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.prefill_hist,
-                l0_.prefill_hist_stats,rows,l0_prefill_history);
+            const auto prefill_history=[&](auto bits) {
+                constexpr int Bits=decltype(bits)::value;
+                static const bool configured=[&] {
+                    cuda_check(cudaFuncSetAttribute(l0_history_prefill_kernel<Bits>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(l0_prefill_smem_bytes<Bits>())),
+                        "configure L0 history prefill shared memory");
+                    return true;
+                }();
+                (void)configured;
+                l0_history_prefill_kernel<Bits><<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
+                    kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,l0_prefill_smem_bytes<Bits>(),stream>>>(l0_.q_rot,l0_.q_mu,
+                    l0_.k_codes,l0_.v_codes,reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.prefill_hist,
+                    l0_.prefill_hist_stats,rows,l0_prefill_history);
+            };
+            if(l0_oscar_format::code_bits()==4) prefill_history(std::integral_constant<int,4>{});
+            else prefill_history(std::integral_constant<int,2>{});
             l0_history_split_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
                 l0_.prefill_hist_stats,reinterpret_cast<__half*>(l0_.prefill_numer),
                 l0_.prefill_split_stats,rows,4);
@@ -9285,20 +9295,28 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 const int hot_ctas=std::min(l0_hot_tiles(l0_.hot_slots),segments);
                 const int slot_stride=segments*kL0HistoryStreams+hot_ctas;
                 const dim3 grid(segments,kKVHeads);
-                const auto history=[&](auto kernel) {
+                const auto history=[&](auto kernel,auto bits) {
+                    constexpr int Bits=decltype(bits)::value;
                     static const bool configured=[&] {
                         cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            static_cast<int>(l0_history_smem_bytes())),"configure L0 history shared memory");
+                            static_cast<int>(l0_history_smem_bytes<Bits>())),"configure L0 history shared memory");
                         return true;
                     }();
                     (void)configured;
-                    kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes(),hs>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
+                    kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes<Bits>(),hs>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
                         reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.hist_work,rows,position,cache_capacity_,
                         segments,position_device_,slot_stride,hot,hot_config.log2_tau,qr,
                         hot_config.lambda);
                 };
-                if(hot_ctas) history(l0_history_mma_kernel<64,true>);
-                else history(l0_history_mma_kernel<64,false>);
+                using Int4=std::integral_constant<int,4>;
+                using Int2=std::integral_constant<int,2>;
+                if(l0_oscar_format::code_bits()==4) {
+                    if(hot_ctas) history(l0_history_mma_kernel<64,true,4>,Int4{});
+                    else history(l0_history_mma_kernel<64,false,4>,Int4{});
+                } else {
+                    if(hot_ctas) history(l0_history_mma_kernel<64,true,2>,Int2{});
+                    else history(l0_history_mma_kernel<64,false,2>,Int2{});
+                }
                 l0_history_merge_kernel<<<rows*kQHeads+(hot_ctas?kKVHeads:0),256,0,hs>>>(l0_.hist_work,
                     l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,segments,
                     l0_.segment_keys,position,cache_capacity_,position_device_,slot_stride,hot_ctas,
