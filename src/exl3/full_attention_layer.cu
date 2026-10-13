@@ -8596,7 +8596,7 @@ void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
                 launch(cudaEventRecord(hot_branch.fork,stream),"L0 hot fill fork");
                 launch(cudaStreamWaitEvent(hot_branch.side,hot_branch.fork,0),"L0 hot fill fork");
                 l0_oscar::hot_fill_kernel<<<4*l0_oscar::kHotMaxInsert*2*(kHeadDim/8)/256,256,0,hot_branch.side>>>(
-                    l0_oscar::hot_view(l0_),k_cache_,v_cache_);
+                    l0_oscar::hot_view(l0_),k_cache_,v_cache_,position_device_,position);
                 launch(cudaEventRecord(hot_branch.join,hot_branch.side),"L0 hot fill join");
             }
             if(!l0_exact_only_)

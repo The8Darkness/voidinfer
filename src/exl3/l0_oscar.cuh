@@ -221,7 +221,12 @@ __device__ __forceinline__ void hot_clear(const HotView& h, int index, int strid
 }
 // Fills the hot slots won last round from the FP16 planes (16-byte mapped
 // reads); runs on a forked branch beside the encode of the same append.
-__global__ void hot_fill_kernel(HotView hot, const std::uint16_t* k_cache, const std::uint16_t* v_cache) {
+// Won rows are history of the context that nominated them: a row at or past
+// this append's first row belongs to a previous request (the encode of this
+// append clears the hot state when the context restarted) and may lie beyond
+// the planes the new history has mapped, so it is skipped.
+__global__ void hot_fill_kernel(HotView hot, const std::uint16_t* k_cache, const std::uint16_t* v_cache,
+                                const int* position_device, int position) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= 4 * kHotMaxInsert * 2 * (kDim / 8)) return;
     const int kv = i / (kHotMaxInsert * 2 * (kDim / 8)), rest = i % (kHotMaxInsert * 2 * (kDim / 8));
@@ -229,6 +234,8 @@ __global__ void hot_fill_kernel(HotView hot, const std::uint16_t* k_cache, const
     if (p >= hot.won[kv]) return;
     const int slot = hot.won[kHotWonSlots + kv * kHotMaxInsert + p];
     const int row = hot.won[kHotWonRows + kv * kHotMaxInsert + p];
+    const int base = position_device ? *position_device : position;
+    if (row < 0 || row >= base) return;
     reinterpret_cast<uint4*>((kind ? hot.v : hot.k) + (static_cast<std::size_t>(kv) * hot.slots + slot) * kDim)[c] =
         reinterpret_cast<const uint4*>((kind ? v_cache : k_cache) + (static_cast<std::size_t>(row) * kKVHeadsL0 + kv) * kDim)[c];
 }
