@@ -9346,9 +9346,10 @@ void Exl3TextContext::append_prefill_layer_major(
     // history copies of those rows overlap the layers before each attention.
     const L0HistoryWrittenScope history_written(base_position,stream);
     for (int layer=0;layer<kLayers;++layer) {
-        workspace.begin_layer_reuse(cache_budget,
-            base_position+total>=8192 ||
-            impl_->gdn_bulk_mlp_short_k5_enabled);
+        // K5 projections (attention q, MLP gate/up) reconstruct + GEMM in every
+        // layer-major pass: the direct trellis kernels they otherwise take cost
+        // 0.44 s of a 3.8 s FP16 16K prefill (reconstruct: -6%; 4K unchanged).
+        workspace.begin_layer_reuse(cache_budget,true);
         workspace.set_prefill_layer(layer);
         const auto execute_chunk=[&](int offset,int rows,
                 const Exl3GdnLayer::BulkPrefillBuffers* prepared) {
