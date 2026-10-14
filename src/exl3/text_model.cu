@@ -933,6 +933,29 @@ struct Exl3SharedPromptPool {
     ~Exl3SharedPromptPool() { for(auto* pointer:data)if(pointer)(void)cudaFree(pointer); }
 };
 
+// Concurrent lanes: the prompt-scale tap and embedding-trace planes (five
+// taps + embedding). One context's rows at a time: a pass claims the pool
+// (Exl3TextContext::Impl::enter_tap_pool) and its later reads stay valid until
+// another context claims it. `done` follows the owner's last use on the
+// device, so the next claimant's stream waits for it.
+struct Exl3SharedTapPool {
+    std::array<void*,6> data{};
+    std::size_t bytes=0;
+    std::mutex mutex;
+    const void* owner=nullptr;
+    bool owner_in_pass=false;
+    std::uint64_t claims=0;
+    cudaEvent_t done=nullptr;
+    bool done_recorded=false;
+    Exl3SharedTapPool() = default;
+    Exl3SharedTapPool(const Exl3SharedTapPool&) = delete;
+    Exl3SharedTapPool& operator=(const Exl3SharedTapPool&) = delete;
+    ~Exl3SharedTapPool() {
+        for(auto* pointer:data)if(pointer)(void)cudaFree(pointer);
+        if(done)(void)cudaEventDestroy(done);
+    }
+};
+
 struct Exl3TextModel::Impl {
     // Lifetime-stable process identity for exact host images; prevents address
     // reuse from making an old model's checkpoint compatible with a new model.
@@ -980,6 +1003,7 @@ struct Exl3TextModel::Impl {
     // Prompt-only FA2/WMMA32 attention partials shared by concurrent lanes.
     mutable std::shared_ptr<Exl3SharedPromptPool> shared_wmma;
     mutable std::shared_ptr<Exl3SharedPromptPool> shared_hidden;
+    mutable std::shared_ptr<Exl3SharedTapPool> shared_taps;
 
     TensorPayload load_tensor(const IndexedSafetensors& input, const std::string& name) {
         const auto start = std::chrono::steady_clock::now();
@@ -1275,6 +1299,8 @@ struct Exl3TextContext::Impl {
         std::size_t bytes = 0;
         int position = 0;
         int tap_rows = 0;
+        // First saved tap row (shared tap pool: older rows were no longer held).
+        int tap_first = 0;
         int embedding_rows = 0;
         int last_rows = 0;
         cudaStream_t stream = nullptr;
@@ -1875,6 +1901,10 @@ struct Exl3TextContext::Impl {
     int small_tier_rows = 0;
     int prompt_tier_depth = 0;
     void select_prompt_tier(bool prompt,int position,cudaStream_t stream) {
+        if(shared_taps) {
+            if(prompt)enter_tap_pool(stream);
+            else leave_tap_pool(stream);
+        }
         if(large_hidden_a) {
             std::swap(hidden_a,large_hidden_a);
             std::swap(hidden_b,large_hidden_b);
@@ -2041,7 +2071,213 @@ struct Exl3TextContext::Impl {
     GreedyReadbackStats greedy_readback;
     std::int64_t* token_ids = nullptr;
     std::size_t persistent_bytes = 0;
-    int tap_rows = 0;
+    // Rows of the last forward in the tap planes (and the embedding trace).
+    // Concurrent lanes (shared_taps): the planes keep kPrivateTapRows rows;
+    // prompt-scale passes write the shared pool instead (the prompt tier swaps
+    // the planes like hidden A/B). Leaving the tier keeps the last rows
+    // privately (logical rows [private_first,value) at index 0) and the older
+    // rows readable from the pool while this context's claim lasts. Any other
+    // assignment of the row count means the current planes hold [0,value).
+    struct TapRows {
+        int value=0;
+        bool in_pool=false;
+        int private_first=0;
+        int pool_first=0,pool_rows=0;
+        std::uint64_t claim=0;
+        TapRows& operator=(int rows) noexcept {
+            value=rows;private_first=0;
+            if(in_pool) {pool_first=0;pool_rows=rows;} else pool_rows=0;
+            return *this;
+        }
+        operator int() const noexcept {return value;}
+    };
+    static constexpr int kPrivateTapRows=32;
+    TapRows tap_rows;
+    std::shared_ptr<Exl3SharedTapPool> shared_taps;
+    std::array<void*,6> private_tap_planes{};
+    DeviceAllocation& tap_plane(std::size_t plane) const {
+        return plane<kTapLayers.size()?*taps[plane]:*embedding_trace;
+    }
+    static constexpr std::size_t tap_row_bytes=static_cast<std::size_t>(kHidden)*sizeof(std::uint16_t);
+    static bool tap_pool_trace() noexcept {
+        static const bool value=std::getenv("VOIDINFER_EXL3_TAP_POOL_TRACE")!=nullptr;
+        return value;
+    }
+    void trace_tap_pool(const char* what,int a=0,int b=0) const noexcept {
+        if(tap_pool_trace())std::fprintf(stderr,"TAP_POOL %s ctx=%p value=%d private_first=%d pool_first=%d pool_rows=%d claim=%llu pool_claims=%llu owner=%p in_pool=%d a=%d b=%d\n",
+            what,static_cast<const void*>(this),tap_rows.value,tap_rows.private_first,tap_rows.pool_first,tap_rows.pool_rows,
+            static_cast<unsigned long long>(tap_rows.claim),static_cast<unsigned long long>(shared_taps?shared_taps->claims:0),
+            shared_taps?shared_taps->owner:nullptr,tap_rows.in_pool?1:0,a,b);
+    }
+    // Claims the pool for a prompt-scale pass and points the planes at it.
+    void enter_tap_pool(cudaStream_t stream) {
+        auto& pool=*shared_taps;
+        std::lock_guard lock(pool.mutex);
+        require(!tap_rows.in_pool && !(pool.owner_in_pass && pool.owner!=this),
+            "shared tap pool claimed during another context's pass");
+        const bool held=pool.owner==this && tap_rows.claim==pool.claims;
+        // After the pool's last use (this context's own may be on another stream).
+        if(pool.done_recorded)cuda_check(cudaStreamWaitEvent(stream,pool.done,0),"order shared tap pool");
+        if(!held) {
+            pool.owner=this;
+            tap_rows.claim=++pool.claims;
+        }
+        pool.owner_in_pass=true;
+        if(!held || tap_rows.pool_rows!=tap_rows.value) {
+            // The pool does not hold the current rows: bring the private ones.
+            // (None when a restored row count exceeds the private tier.)
+            const bool fits=tap_rows.value-tap_rows.private_first<=kPrivateTapRows;
+            const int first=fits?tap_rows.private_first:tap_rows.value;
+            const int rows=tap_rows.value-first;
+            for(std::size_t plane=0;plane<pool.data.size() && rows>0;++plane)
+                cuda_check(cudaMemcpyAsync(static_cast<std::byte*>(pool.data[plane])+first*tap_row_bytes,
+                    tap_plane(plane).ptr,rows*tap_row_bytes,cudaMemcpyDeviceToDevice,stream),
+                    "enter shared tap pool");
+            tap_rows.pool_first=first;
+            tap_rows.pool_rows=tap_rows.value;
+        }
+        for(std::size_t plane=0;plane<pool.data.size();++plane) {
+            auto& owner=tap_plane(plane);
+            private_tap_planes[plane]=owner.ptr;
+            owner.ptr=pool.data[plane];
+        }
+        tap_rows.in_pool=true;
+        trace_tap_pool("enter",held?1:0);
+    }
+    // Keeps the pass's last rows privately and returns the planes.
+    void leave_tap_pool(cudaStream_t stream) noexcept {
+        auto& pool=*shared_taps;
+        std::lock_guard lock(pool.mutex);
+        const bool owned=pool.owner==this && tap_rows.claim==pool.claims;
+        const int end=tap_rows.value;
+        const int first=std::max(tap_rows.pool_first,end-kPrivateTapRows);
+        for(std::size_t plane=0;plane<pool.data.size();++plane) {
+            auto& owner=tap_plane(plane);
+            if(owned && end>first)
+                (void)cudaMemcpyAsync(private_tap_planes[plane],
+                    static_cast<const std::byte*>(pool.data[plane])+first*tap_row_bytes,
+                    (end-first)*tap_row_bytes,cudaMemcpyDeviceToDevice,stream);
+            owner.ptr=private_tap_planes[plane];
+            private_tap_planes[plane]=nullptr;
+        }
+        tap_rows.in_pool=false;
+        // Lost claim (an unordered pass): no row stays readable.
+        tap_rows.private_first=owned?std::min(first,end):end;
+        tap_rows.pool_rows=owned?end:0;
+        trace_tap_pool("leave",owned?1:0,first);
+        if(owned) {
+            pool.owner_in_pass=false;
+            if(pool.done || cudaEventCreateWithFlags(&pool.done,cudaEventDisableTiming)==cudaSuccess)
+                pool.done_recorded=cudaEventRecord(pool.done,stream)==cudaSuccess;
+        }
+    }
+    // Device rows [first,first+rows) of the six planes (five taps, embedding
+    // trace) passed to `use`, which enqueues its reads on `stream` (rows still
+    // only in the shared pool are read under the claim).
+    template<class F> void read_tap_rows(int first,int rows,cudaStream_t stream,const char* what,F&& use) const {
+        require(rows>0 && first>=0 && first+rows<=tap_rows.value,what);
+        std::array<const std::uint16_t*,6> planes{};
+        const auto from=[&](const std::array<void*,6>& base,int offset) {
+            for(std::size_t plane=0;plane<planes.size();++plane)
+                planes[plane]=static_cast<const std::uint16_t*>(base[plane])+
+                    static_cast<std::size_t>(first-offset)*kHidden;
+        };
+        std::array<void*,6> current{};
+        for(std::size_t plane=0;plane<current.size();++plane)current[plane]=tap_plane(plane).ptr;
+        if(!shared_taps || tap_rows.in_pool) {
+            require(!shared_taps || first>=tap_rows.pool_first,what);
+            from(current,0);use(planes);return;
+        }
+        if(first>=tap_rows.private_first) {
+            if(tap_rows.private_first>0)trace_tap_pool("read_private",first,rows);
+            require(first+rows-tap_rows.private_first<=kPrivateTapRows,what);
+            from(current,tap_rows.private_first);use(planes);return;
+        }
+        auto& pool=*shared_taps;
+        std::lock_guard lock(pool.mutex);
+        trace_tap_pool("read_pool",first,rows);
+        require(pool.owner==this && tap_rows.claim==pool.claims && tap_rows.pool_rows==tap_rows.value &&
+            first>=tap_rows.pool_first,
+            "tap rows left the shared pool (another context claimed it)");
+        from(pool.data,0);use(planes);
+        if(pool.done || cudaEventCreateWithFlags(&pool.done,cudaEventDisableTiming)==cudaSuccess)
+            pool.done_recorded=cudaEventRecord(pool.done,stream)==cudaSuccess;
+    }
+    // The rows still held, [first,value) for the smallest such first not below
+    // `lowest`, passed to use(first,planes) (nothing when none remain); returns first.
+    template<class F> int read_held_tap_rows(int lowest,cudaStream_t stream,F&& use) const {
+        const int end=tap_rows.value;
+        std::unique_lock<std::mutex> lock;
+        int first=0;
+        bool pooled=false;
+        if(shared_taps && !tap_rows.in_pool && tap_rows.private_first>0) {
+            auto& pool=*shared_taps;
+            lock=std::unique_lock(pool.mutex);
+            pooled=pool.owner==this && tap_rows.claim==pool.claims && tap_rows.pool_rows==end;
+            first=pooled?tap_rows.pool_first:tap_rows.private_first;
+        } else if(shared_taps) {
+            first=tap_rows.in_pool?tap_rows.pool_first:tap_rows.private_first;
+        }
+        // A row count restored without its rows (verified roots) can exceed
+        // what the private tier holds: then it holds none.
+        if(shared_taps && !tap_rows.in_pool && !(pooled && first<tap_rows.private_first) &&
+           end-tap_rows.private_first>kPrivateTapRows)
+            return end;
+        first=std::max(first,lowest);
+        if(first>=end)return end;
+        std::array<const std::uint16_t*,6> planes{};
+        const bool from_pool=pooled && first<tap_rows.private_first;
+        for(std::size_t plane=0;plane<planes.size();++plane) {
+            const auto* base=static_cast<const std::uint16_t*>(from_pool?shared_taps->data[plane]:tap_plane(plane).ptr);
+            const int offset=from_pool || tap_rows.in_pool || !shared_taps?0:tap_rows.private_first;
+            planes[plane]=base+static_cast<std::size_t>(first-offset)*kHidden;
+        }
+        if(!from_pool && shared_taps && !tap_rows.in_pool)
+            require(end-tap_rows.private_first<=kPrivateTapRows,"held tap rows exceed the private tier");
+        if(tap_pool_trace() && (from_pool || first>0))trace_tap_pool(from_pool?"held_pool":"held_private",first,end);
+        use(first,planes);
+        if(from_pool) {
+            auto& pool=*shared_taps;
+            if(pool.done || cudaEventCreateWithFlags(&pool.done,cudaEventDisableTiming)==cudaSuccess)
+                pool.done_recorded=cudaEventRecord(pool.done,stream)==cudaSuccess;
+        }
+        return first;
+    }
+    // Uploads `rows` host rows of the six planes ([0,rows) each); returns the
+    // first row the planes keep (publish_tap_rows).
+    int upload_tap_rows(const std::array<const std::vector<std::uint16_t>*,6>& source,int rows,
+                        cudaStream_t stream,const char* label) {
+        const int first=tap_write_first(rows);
+        for(std::size_t plane=0;plane<source.size() && rows>first;++plane) {
+            require(source[plane]->size()==static_cast<std::size_t>(rows)*kHidden,label);
+            cuda_check(exl3_h2d_async(tap_write_plane(plane,first),source[plane]->data()+static_cast<std::size_t>(first)*kHidden,
+                static_cast<std::size_t>(rows-first)*tap_row_bytes,stream),label);
+        }
+        cuda_check(cudaStreamSynchronize(stream),label);
+        return first;
+    }
+    // Writes of `rows` rows [0,rows) from outside a forward: the planes take
+    // logical rows [first,rows) (first >= available_first) at `first`'s slot;
+    // publish_tap_rows records them.
+    int tap_write_first(int rows,int available_first=0) const noexcept {
+        if(!shared_taps || tap_rows.in_pool)return available_first;
+        return std::max(available_first,rows-kPrivateTapRows);
+    }
+    std::uint16_t* tap_write_plane(std::size_t plane,int first) const noexcept {
+        auto* base=static_cast<std::uint16_t*>(tap_plane(plane).ptr);
+        return tap_rows.in_pool || !shared_taps?base+static_cast<std::size_t>(first)*kHidden:base;
+    }
+    void publish_tap_rows(int rows,int first) noexcept {
+        tap_rows=rows;
+        if(tap_rows.in_pool)tap_rows.pool_first=first;
+        else tap_rows.private_first=first;
+        if(first>0)trace_tap_pool("publish",rows,first);
+    }
+    // Readers that address the planes directly (graphs, sibling rows, batched
+    // peers): the planes must hold [0,value) at index 0.
+    bool tap_rows_identity() const noexcept {
+        return !shared_taps || (tap_rows.in_pool?tap_rows.pool_first==0:tap_rows.private_first==0);
+    }
     int embedding_rows = 0;
     int last_rows = 0;
     std::atomic<std::uint64_t> tap_generation{0};
@@ -5680,8 +5916,19 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     // Taps and the embedding trace hold one forward's rows (at most the
     // prefill capacity: layer-major blocks capture chunk by chunk), not the
     // whole L0 prompt block that hidden A/B keep.
-    const std::size_t tap_plane_bytes=std::min(hidden_bytes,
+    const std::size_t prompt_tap_plane_bytes=std::min(hidden_bytes,
         static_cast<std::size_t>(impl->prefill_capacity)*kHidden*sizeof(std::uint16_t));
+    // Concurrent lanes keep 32-row planes; prompt-scale passes use the model's
+    // shared tap pool (Impl::TapRows). C4 with exact lines: ~430 MiB less
+    // device memory, same speed. VOIDINFER_EXL3_SHARE_TAPS=0: private planes.
+    static const bool share_taps=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_TAPS");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    const bool tap_pool=share_prompt_rows && share_taps;
+    const std::size_t tap_plane_bytes=tap_pool?
+        std::min(prompt_tap_plane_bytes,static_cast<std::size_t>(std::remove_reference_t<decltype(*impl)>::kPrivateTapRows)*kHidden*sizeof(std::uint16_t)):
+        prompt_tap_plane_bytes;
     if(capture_taps)tap_requirement.add(Exl3ResourceInventory::Domain::device,kTapLayers.size()+1,tap_plane_bytes);
     const auto tap_extent=tap_requirement.units[static_cast<unsigned>(Exl3ResourceInventory::Domain::device)];
     require(tap_extent<=std::numeric_limits<std::size_t>::max(),"target tap extent overflow");
@@ -5697,6 +5944,12 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         }
         impl->embedding_trace = impl->make_private_allocation(tap_bytes, "allocate E4A embedding trace");
         impl->persistent_bytes += tap_bytes;
+        // Rows read before any forward wrote them (a pool claim's stale rows,
+        // a restored count) read zeros, never uninitialized bits.
+        if(tap_pool) {
+            for(auto& tap:impl->taps)cuda_check(cudaMemset(tap->ptr,0,tap_bytes),"clear E4A hidden tap");
+            cuda_check(cudaMemset(impl->embedding_trace->ptr,0,tap_bytes),"clear E4A embedding trace");
+        }
         require(impl->persistent_bytes==expected_tap_persistent,"target tap allocation requirement mismatch");
       }
     };
@@ -6084,6 +6337,20 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             pool=std::move(created);
         }
         require(pool->bytes[0]==hidden_bytes,"shared prompt hidden geometry differs between contexts");
+        if(capture_taps && tap_pool) {
+            auto& taps=impl->model->shared_taps;
+            if(!taps) {
+                auto created=std::make_shared<Exl3SharedTapPool>();
+                for(auto& plane:created->data) {
+                    cuda_check(cudaMalloc(&plane,prompt_tap_plane_bytes),"allocate shared tap pool plane");
+                    cuda_check(cudaMemset(plane,0,prompt_tap_plane_bytes),"clear shared tap pool plane");
+                }
+                created->bytes=prompt_tap_plane_bytes;
+                taps=std::move(created);
+            }
+            require(taps->bytes==prompt_tap_plane_bytes,"shared tap pool geometry differs between contexts");
+            impl->shared_taps=taps;
+        }
         impl->large_hidden_a=static_cast<std::uint16_t*>(pool->data[0]);
         impl->large_hidden_b=static_cast<std::uint16_t*>(pool->data[1]);
         impl->shared_hidden=pool;
@@ -8235,7 +8502,7 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                 impl_->tap_rows == impl_->last_rows,
             "P2 target transaction captured rows are invalid or inconsistent");
     if(impl_->tap_rows>16 && std::getenv("VOIDINFER_EXL3_MEMORY_TRACE"))
-        std::fprintf(stderr,"TRANSACTION_TAP_ROWS rows=%d position=%d%c",impl_->tap_rows,position_,10);
+        std::fprintf(stderr,"TRANSACTION_TAP_ROWS rows=%d position=%d%c",impl_->tap_rows.value,position_,10);
     impl_->validate_target_projection_execution(stream);
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     cuda_check(cudaStreamIsCapturing(stream, &capture_status),
@@ -8268,6 +8535,19 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                                    impl_->position_device,sizeof(int),
                                    cudaMemcpyDeviceToDevice, stream),
                    "save P2 target device position checkpoint");
+        if(impl_->shared_taps) {
+            transaction.tap_first=impl_->read_held_tap_rows(0,stream,
+                [&](int first,const std::array<const std::uint16_t*,6>& planes) {
+                    const std::size_t offset=static_cast<std::size_t>(first)*Impl::tap_row_bytes;
+                    const std::size_t bytes=static_cast<std::size_t>(impl_->tap_rows-first)*Impl::tap_row_bytes;
+                    for(std::size_t tap=0;tap<kTapLayers.size();++tap)
+                        cuda_check(cudaMemcpyAsync(tap_destination+tap*impl_->prefill_capacity*Impl::tap_row_bytes+offset,
+                            planes[tap],bytes,cudaMemcpyDefault,stream),"save P2 target hidden tap checkpoint");
+                    cuda_check(cudaMemcpyAsync(static_cast<std::byte*>(transaction.embedding->ptr)+offset,
+                        planes[5],bytes,cudaMemcpyDefault,stream),"save P2 target embedding checkpoint");
+                });
+            return;
+        }
         for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap)
             cuda_check(cudaMemcpyAsync(
                 tap_destination + tap * impl_->prefill_capacity * kHidden *
@@ -8278,6 +8558,7 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                                    impl_->embedding_trace->ptr,embedding_bytes,
                                    cudaMemcpyDefault,stream),
                    "save P2 target embedding checkpoint");
+        transaction.tap_first=0;
     };
     // The ordinary device-KV probe has B2..B8 continuation frontiers. Capture
     // the eight-row allocation extent once so the same graph can checkpoint
@@ -8286,9 +8567,11 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
     const bool device_checkpoint_graph_eligible=
         impl_->device_transaction_checkpoint_graph_enabled && device_kv &&
         impl_->tap_rows<=8 && impl_->prefill_capacity>=8;
+    // The graph copies the private planes from row 0.
     const bool checkpoint_graph_eligible=
-        (impl_->host_kv_transaction_checkpoint_graph_enabled && host_kv &&
-         impl_->tap_rows==1) || device_checkpoint_graph_eligible;
+        ((impl_->host_kv_transaction_checkpoint_graph_enabled && host_kv &&
+         impl_->tap_rows==1) || device_checkpoint_graph_eligible) &&
+        !impl_->tap_rows.in_pool && impl_->tap_rows_identity();
     if(checkpoint_graph_eligible) {
         const std::size_t graph_copy_rows=device_checkpoint_graph_eligible?
             8:static_cast<std::size_t>(impl_->tap_rows);
@@ -8384,6 +8667,7 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                     "order checkpoint after overlapped GDN repair");
         }
         transaction.checkpoint_graph_executable.launch(graph_stream);
+        transaction.tap_first=0;
         if(overlap_checkpoint) {
             cuda_check(cudaEventRecord(impl_->checkpoint_join,graph_stream),
                 "record overlapped transaction checkpoint completion");
@@ -8480,22 +8764,25 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
                                sizeof(int), cudaMemcpyDeviceToDevice, stream),
                "restore P2 target device position checkpoint");
     const auto* tap_source = static_cast<const std::byte*>(transaction.taps->ptr);
+    const int tap_first=impl_->tap_write_first(transaction.tap_rows,transaction.tap_first);
+    const std::size_t tap_offset=static_cast<std::size_t>(tap_first)*Impl::tap_row_bytes;
     const std::size_t tap_bytes =
-        static_cast<std::size_t>(transaction.tap_rows) * kHidden * sizeof(std::uint16_t);
+        static_cast<std::size_t>(transaction.tap_rows-tap_first) * kHidden * sizeof(std::uint16_t);
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap) {
-        cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,
-                                   tap_source + tap * impl_->prefill_capacity * kHidden * sizeof(std::uint16_t),
+        cuda_check(cudaMemcpyAsync(impl_->tap_write_plane(tap,tap_first),
+                                   tap_source + tap * impl_->prefill_capacity * kHidden * sizeof(std::uint16_t)+tap_offset,
                                    tap_bytes, cudaMemcpyDefault, stream),
                    "restore P2 target hidden tap checkpoint");
     }
     const std::size_t embedding_bytes =
-        static_cast<std::size_t>(transaction.embedding_rows) * kHidden * sizeof(std::uint16_t);
-    cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr, transaction.embedding->ptr,
+        static_cast<std::size_t>(transaction.embedding_rows-tap_first) * kHidden * sizeof(std::uint16_t);
+    cuda_check(cudaMemcpyAsync(impl_->tap_write_plane(5,tap_first),
+                               static_cast<const std::byte*>(transaction.embedding->ptr)+tap_offset,
                                embedding_bytes, cudaMemcpyDefault, stream),
                "restore P2 target embedding checkpoint");
     impl_->kv_rows_rewritten_from(transaction.position);
     position_ = transaction.position;
-    impl_->tap_rows = transaction.tap_rows;
+    impl_->publish_tap_rows(transaction.tap_rows,tap_first);
     impl_->embedding_rows = transaction.embedding_rows;
     impl_->last_rows = transaction.last_rows;
     if (host_kv) {
@@ -8892,7 +9179,8 @@ struct Exl3TextContext::PromptTierScope {
     PromptTierScope(Exl3TextContext& context,std::size_t rows,cudaStream_t stream)
         : context_(context),impl_(*context.impl_),stream_(stream),
           active_(impl_.small_tier_rows && rows>static_cast<std::size_t>(impl_.small_tier_rows)) {
-        if(active_ && impl_.prompt_tier_depth++==0)impl_.select_prompt_tier(true,context_.position_,stream_);
+        if(active_ && impl_.prompt_tier_depth==0)impl_.select_prompt_tier(true,context_.position_,stream_);
+        if(active_)++impl_.prompt_tier_depth;
     }
     ~PromptTierScope() {
         if(active_ && --impl_.prompt_tier_depth==0)
@@ -9433,13 +9721,6 @@ void Exl3TextContext::append_prefill_layer_major(
                     output_base,stream,block+count==total);
                 ++gdn_bulk_mlp_blocks;
                 gdn_bulk_mlp_rows+=static_cast<std::uint64_t>(count);
-                const int tap=impl_->tap_index(layer);
-                if(impl_->capture_taps && tap>=0 && block+count==total)
-                    cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,
-                        output_base+static_cast<std::size_t>(count-final_rows)*kHidden,
-                        static_cast<std::size_t>(final_rows)*kHidden*
-                            sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
-                        "capture final GDN bulk MLP hidden tap");
             });
         } else if (bulk) {
             constexpr int bulk_rows=4096;
@@ -9474,6 +9755,15 @@ void Exl3TextContext::append_prefill_layer_major(
                 execute_chunk(chunk_offsets[chunk],chunk_sizes[chunk],nullptr);
         }
         const int tap=impl_->tap_index(layer);
+        // Final-chunk taps of every tap layer (only the GDN bulk-MLP route
+        // published them before: full-attention tap layers kept an older
+        // forward's rows).
+        if (impl_->capture_taps && tap>=0)
+            cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,
+                (layer%2==0?impl_->hidden_b:impl_->hidden_a)+static_cast<std::size_t>(final_offset)*kHidden,
+                static_cast<std::size_t>(final_rows)*kHidden*sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice,stream),
+                "capture final layer-major hidden tap");
         if (retained_taps && tap>=0) {
             const auto relative=static_cast<std::size_t>(retained_taps->first_abs-base_position);
             const auto* completed=(layer%2==0?impl_->hidden_b:impl_->hidden_a)+
@@ -10074,6 +10364,7 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
             copies.push_back({p+static_cast<std::size_t>(source_row)*kHidden,
                 p+static_cast<std::size_t>(destination_row)*kHidden,kHidden,1,0});
         };
+        require(!impl_->tap_rows.in_pool,"sibling promotion needs the private tap planes");
         for(const auto& tap:impl_->taps)hidden_row(tap->ptr);
         hidden_row(impl_->embedding_trace->ptr);
         auto* logits=static_cast<std::uint16_t*>(impl_->continuation->logits->ptr);
@@ -10463,6 +10754,7 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
     // The owner's taps hold every row; each peer's rows move to its own taps
     // (batched copy launches instead of one copy per tap and peer).
     {
+        require(!impl_->tap_rows.in_pool,"batched round taps outside the private tier");
         Exl3SegmentCopies copies;
         const auto flush=[&] {
             cuda_check(exl3_launch_segment_copies(copies,stream),"move batched peer taps");
@@ -10935,6 +11227,19 @@ void Exl3TextContext::sync_exact_line_from(Exl3TextContext& source,cudaStream_t 
         cuda_check(cudaMemcpyAsync(impl_->logits,from.logits,kVocab*sizeof(std::uint16_t),
             cudaMemcpyDeviceToDevice,stream),"exact line logits");
         const auto rows_bytes=[](int rows){return static_cast<std::size_t>(rows)*kHidden*sizeof(std::uint16_t);};
+        if(impl_->shared_taps || from.shared_taps) {
+            // Rows the source still holds, as many as this context's planes take.
+            const int rows=from.tap_rows;
+            int first=rows;
+            if(rows>0 && impl_->taps[0] && from.taps[0])
+                first=from.read_held_tap_rows(impl_->tap_write_first(rows),stream,
+                    [&](int held,const std::array<const std::uint16_t*,6>& planes) {
+                        for(std::size_t plane=0;plane<planes.size();++plane)
+                            cuda_check(cudaMemcpyAsync(impl_->tap_write_plane(plane,held),planes[plane],
+                                rows_bytes(rows-held),cudaMemcpyDeviceToDevice,stream),"exact line taps");
+                    });
+            impl_->publish_tap_rows(rows,std::min(first,rows));
+        } else {
         for(std::size_t tap=0;tap<kTapLayers.size();++tap)
             if(impl_->taps[tap] && from.taps[tap] && from.tap_rows>0)
                 cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,from.taps[tap]->ptr,rows_bytes(from.tap_rows),
@@ -10942,10 +11247,12 @@ void Exl3TextContext::sync_exact_line_from(Exl3TextContext& source,cudaStream_t 
         if(impl_->embedding_trace && from.embedding_trace && from.embedding_rows>0)
             cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,from.embedding_trace->ptr,
                 rows_bytes(from.embedding_rows),cudaMemcpyDeviceToDevice,stream),"exact line embedding rows");
+        impl_->tap_rows=source.impl_->tap_rows;
+        }
     }
     position_=source.position_;
     impl_->last_rows=source.impl_->last_rows;
-    impl_->tap_rows=source.impl_->tap_rows;
+    if(!outputs)impl_->tap_rows=source.impl_->tap_rows;
     impl_->embedding_rows=source.impl_->embedding_rows;
     if(impl_->continuation)impl_->continuation->rows=0;
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
@@ -11044,17 +11351,15 @@ void Exl3TextContext::canonicalize_exact_rows(cudaStream_t stream) {
         "exact final-row canonicalization requires intact ordinary output");
     impl_->validate_target_projection_execution(stream);
     const int rows=impl_->tap_rows;
-    if(rows>1) {
-        for(const auto& tap:impl_->taps)
-            cuda_check(cudaMemcpyAsync(tap->ptr,
-                static_cast<const std::uint16_t*>(tap->ptr)+(rows-1)*kHidden,
-                kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
-                "retain exact continuation final tap");
-        cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,
-            static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+(rows-1)*kHidden,
-            kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
-            "retain exact continuation final embedding");
-    }
+    if(rows>1)
+        impl_->read_tap_rows(rows-1,1,stream,"retain exact continuation final row",
+            [&](const std::array<const std::uint16_t*,6>& planes) {
+                for(std::size_t plane=0;plane<planes.size();++plane)
+                    if(impl_->tap_write_plane(plane,0)!=planes[plane])
+                        cuda_check(cudaMemcpyAsync(impl_->tap_write_plane(plane,0),planes[plane],
+                            kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
+                            "retain exact continuation final tap");
+            });
     impl_->tap_rows=1; impl_->embedding_rows=1; impl_->last_rows=1;
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
 }
@@ -11838,7 +12143,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
             "active: compatible fixed-B8 graph reused after context reset";
         return true;
     }
-    const int saved_tap_rows = impl_->tap_rows;
+    const Impl::TapRows saved_tap_rows = impl_->tap_rows;
     const int saved_embedding_rows = impl_->embedding_rows;
     const int saved_last_rows = impl_->last_rows;
     const bool saved_qkv_trace_valid = impl_->qkv_trace_valid;
@@ -12061,7 +12366,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         continuation.graph_active = true;
         return true;
     }
-    const int saved_tap_rows = impl_->tap_rows;
+    const Impl::TapRows saved_tap_rows = impl_->tap_rows;
     const int saved_embedding_rows = impl_->embedding_rows;
     const int saved_last_rows = impl_->last_rows;
     const bool saved_qkv_trace_valid = impl_->qkv_trace_valid;
@@ -12621,7 +12926,10 @@ std::vector<float> Exl3TextContext::hidden_host(int layer, cudaStream_t stream) 
     require(tap >= 0, "E4A hidden layer is not one of the retained tap locations");
     require(impl_->capture_taps && impl_->tap_rows > 0, "E4A hidden taps were not captured");
     std::vector<std::uint16_t> raw(static_cast<std::size_t>(impl_->tap_rows) * kHidden);
-    cuda_check(exl3_d2h_async(raw.data(), impl_->taps[tap]->ptr, raw.size() * sizeof(std::uint16_t), stream), "download E4A hidden tap");
+    impl_->read_tap_rows(0,impl_->tap_rows,stream,"E4A hidden tap rows",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(exl3_d2h_async(raw.data(), planes[tap], raw.size() * sizeof(std::uint16_t), stream), "download E4A hidden tap");
+        });
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4A hidden tap");
     std::vector<float> result;
     result.reserve(raw.size());
@@ -13444,11 +13752,29 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
             batched_kv_plan.logical_ranges()-1;
     }
     stage_vector(state->logits_,impl_->logits,kVocab,false);
+    if(impl_->shared_taps) {
+        // Rows no longer held (an older pass's, after another context claimed
+        // the shared tap pool) export as zeros: only the draft reads taps, and
+        // only right after the forward that wrote them.
+        require(impl_->embedding_rows==impl_->tap_rows,"shared tap export needs matching embedding rows");
+        const auto elements=static_cast<std::size_t>(impl_->tap_rows)*kHidden;
+        state->embedding_.assign(elements,0);
+        for(auto& plane:state->taps_)plane.assign(elements,0);
+        impl_->read_held_tap_rows(0,stream,[&](int first,const std::array<const std::uint16_t*,6>& planes) {
+            const auto offset=static_cast<std::size_t>(first)*kHidden;
+            const auto bytes=static_cast<std::size_t>(impl_->tap_rows-first)*Impl::tap_row_bytes;
+            for(std::size_t tap=0;tap<kTapLayers.size();++tap)
+                cuda_check(exl3_d2h_async(state->taps_[tap].data()+offset,planes[tap],bytes,stream),"export held tap rows");
+            cuda_check(exl3_d2h_async(state->embedding_.data()+offset,planes[5],bytes,stream),"export held embedding rows");
+        });
+        cuda_check(cudaStreamSynchronize(stream),"complete held tap row export");
+    } else {
     stage_vector(state->embedding_,impl_->embedding_trace->ptr,
         static_cast<std::size_t>(impl_->embedding_rows)*kHidden,false);
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap)
         stage_vector(state->taps_[tap],impl_->taps[tap]->ptr,
             static_cast<std::size_t>(impl_->tap_rows)*kHidden,false);
+    }
     {
         Timing staged_timing{export_stats.recurrent_ms};
         struct Stage {
@@ -13731,13 +14057,20 @@ void Exl3TextContext::rebase_oscar_host_state_delta(const Exl3ExactHostState& ol
         }
     }
     upload(impl_->logits,new_root.logits_,"upload TurboAngle L1 delta logits");
+    int tap_first=0;
+    if(impl_->shared_taps)
+        tap_first=impl_->upload_tap_rows({&new_root.taps_[0],&new_root.taps_[1],&new_root.taps_[2],
+            &new_root.taps_[3],&new_root.taps_[4],&new_root.embedding_},new_root.tap_rows_,stream,
+            "upload TurboAngle L1 delta taps");
+    else {
     upload(impl_->embedding_trace->ptr,new_root.embedding_,"upload TurboAngle L1 delta embedding");
     for(std::size_t tap=0;tap<kTapLayers.size();++tap)
         upload(impl_->taps[tap]->ptr,new_root.taps_[tap],"upload TurboAngle L1 delta tap");
+    }
     cuda_check(exl3_h2d_async(impl_->position_device,&new_root.device_position_,sizeof(int),stream),"upload TurboAngle L1 delta position");
     cuda_check(cudaStreamSynchronize(stream),"complete TurboAngle L1 delta rebase");
     impl_->kv_rows_rewritten_from(0);
-    position_=new_root.position_;impl_->tap_rows=new_root.tap_rows_;
+    position_=new_root.position_;impl_->publish_tap_rows(new_root.tap_rows_,tap_first);
     impl_->embedding_rows=new_root.embedding_rows_;impl_->last_rows=new_root.last_rows_;
     impl_->qkv_trace_valid=false;if(impl_->continuation) impl_->continuation->rows=0;
 }
@@ -14035,12 +14368,18 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
     // Backing beyond the restored rows stays mapped: the suffix that follows a
     // restore grows into it, and the next request reset returns what is left.
     upload(impl_->logits, state.logits_);
+    int tap_first=0;
+    if(impl_->shared_taps)
+        tap_first=impl_->upload_tap_rows({&state.taps_[0],&state.taps_[1],&state.taps_[2],&state.taps_[3],
+            &state.taps_[4],&state.embedding_},state.tap_rows_,stream,"restore exact host taps");
+    else {
     upload(impl_->embedding_trace->ptr, state.embedding_);
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap) upload(impl_->taps[tap]->ptr, state.taps_[tap]);
+    }
     cuda_check(exl3_h2d_async(impl_->position_device, &state.device_position_, sizeof(int), stream), "restore exact host position");
     cuda_check(cudaStreamSynchronize(stream), "complete exact host restore");
     position_ = state.position_;
-    impl_->tap_rows = state.tap_rows_;
+    impl_->publish_tap_rows(state.tap_rows_,tap_first);
     impl_->embedding_rows = state.embedding_rows_;
     impl_->last_rows = state.last_rows_;
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
@@ -14328,11 +14667,12 @@ void Exl3TextContext::copy_tap_row_to_device(int layer, std::uint16_t* dst,
     require(impl_->capture_taps && impl_->tap_rows > 0 && impl_->taps[tap] != nullptr,
             "E5A2 tap rows were not captured");
     require(dst != nullptr, "E5A2 tap copy needs a device destination");
-    const auto* source = static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr) +
-        static_cast<std::size_t>(impl_->tap_rows - 1) * kHidden;
-    cuda_check(cudaMemcpyAsync(dst, source, kHidden * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToDevice, stream),
-               "E5A2 copy tap row");
+    impl_->read_tap_rows(impl_->tap_rows-1,1,stream,"E5A2 tap row",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(cudaMemcpyAsync(dst, planes[tap], kHidden * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "E5A2 copy tap row");
+        });
 }
 
 int Exl3TextContext::captured_tap_rows() const noexcept {
@@ -14412,12 +14752,15 @@ std::array<std::vector<std::uint16_t>,5> Exl3TextContext::exact_tap_rows_host(cu
             "authoritative tap export requires ordinary eager captured state");
     require(!impl_->host_kv_failed,"authoritative tap export after failed host KV forward");
     std::array<std::vector<std::uint16_t>,5> result;
-    for(int tap=0;tap<5;++tap) {
-        result[tap].resize(static_cast<std::size_t>(impl_->tap_rows)*kHidden);
-        cuda_check(exl3_d2h_async(result[tap].data(),impl_->taps[tap]->ptr,
-            result[tap].size()*sizeof(std::uint16_t),stream),
-            "export authoritative tap rows");
-    }
+    impl_->read_tap_rows(0,impl_->tap_rows,stream,"authoritative tap rows",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            for(int tap=0;tap<5;++tap) {
+                result[tap].resize(static_cast<std::size_t>(impl_->tap_rows)*kHidden);
+                cuda_check(exl3_d2h_async(result[tap].data(),planes[tap],
+                    result[tap].size()*sizeof(std::uint16_t),stream),
+                    "export authoritative tap rows");
+            }
+        });
     cuda_check(cudaStreamSynchronize(stream),"complete authoritative tap rows");
     return result;
 }
@@ -14455,7 +14798,7 @@ Exl3CommittedTapSegment Exl3TextContext::committed_tap_segment(
                 transaction_taps && !impl_->graph_active && !impl_->graph_capture_active &&
                 !impl_->host_kv_failed && impl_->capture_taps &&
                 impl_->tap_rows>0 && source_first>=0 && rows>0 &&
-                source_first<=impl_->tap_rows-rows,
+                source_first<=impl_->tap_rows-rows && impl_->tap_rows_identity(),
             "committed tap segment source owner/range");
     Exl3CommittedTapSegment result;
     result.owner=binding.context_owner;result.model_identity=model_identity();
@@ -14484,12 +14827,13 @@ void Exl3TextContext::copy_tap_rows_to_device(int layer, int first_row, std::uin
     require(impl_->capture_taps && impl_->taps[tap] != nullptr &&
             impl_->tap_rows >= first_row + rows,
             "E5A2 tap range was not captured");
-    const auto* source = static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr) +
-        static_cast<std::size_t>(first_row) * kHidden;
-    cuda_check(cudaMemcpyAsync(dst, source,
-                               static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToDevice, stream),
-               "E5A2 copy tap rows");
+    impl_->read_tap_rows(first_row,rows,stream,"E5A2 tap range",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(cudaMemcpyAsync(dst, planes[tap],
+                                       static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "E5A2 copy tap rows");
+        });
 }
 
 void Exl3TextContext::embed_token_to_device(std::int64_t token_id, std::uint16_t* dst,
@@ -14533,8 +14877,11 @@ const std::uint16_t* Exl3TextContext::target_embedding() const noexcept {
 std::vector<float> Exl3TextContext::embedding_host(cudaStream_t stream) const {
     require(impl_->capture_taps && impl_->embedding_rows > 0, "E4A embedding trace was not captured");
     std::vector<std::uint16_t> raw(static_cast<std::size_t>(impl_->embedding_rows) * kHidden);
-    cuda_check(exl3_d2h_async(raw.data(), impl_->embedding_trace->ptr,
-                               raw.size() * sizeof(std::uint16_t), stream), "download E4A embedding output");
+    impl_->read_tap_rows(0,impl_->embedding_rows,stream,"E4A embedding rows",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(exl3_d2h_async(raw.data(), planes[5],
+                                       raw.size() * sizeof(std::uint16_t), stream), "download E4A embedding output");
+        });
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4A embedding output");
     std::vector<float> result;
     result.reserve(raw.size());
@@ -14548,9 +14895,12 @@ std::vector<std::uint16_t> Exl3TextContext::embedding_bits_host_for_test(
             "P2 embedding bits were not captured");
     std::vector<std::uint16_t> result(
         static_cast<std::size_t>(impl_->embedding_rows) * kHidden);
-    cuda_check(exl3_d2h_async(result.data(), impl_->embedding_trace->ptr,
-                               result.size() * sizeof(std::uint16_t), stream),
-               "download P2 embedding bits");
+    impl_->read_tap_rows(0,impl_->embedding_rows,stream,"P2 embedding rows",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(exl3_d2h_async(result.data(), planes[5],
+                                       result.size() * sizeof(std::uint16_t), stream),
+                       "download P2 embedding bits");
+        });
     cuda_check(cudaStreamSynchronize(stream),
                "synchronize P2 embedding bits");
     return result;
