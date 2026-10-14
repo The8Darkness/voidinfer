@@ -2015,6 +2015,8 @@ struct Exl3TextContext::Impl {
     // Exact line of folded VeriCache (make_exact_line): borrowed planes, no
     // INT4 codes, exact history only.
     bool exact_line = false;
+    // Constructed as an exact line: its L0 layers own no meta planes or hot rows.
+    bool exact_line_storage = false;
     // FP8 history mirror the asynchronous line attends (make_exact_line,
     // VOIDINFER_EXL3_VERICACHE_LINE_FP8; l0_exact.cuh L0LineFp8), owned by the
     // drafting context beside its FP16 planes and grown with them.
@@ -4641,7 +4643,7 @@ std::unique_ptr<Exl3TextContext> Exl3TextModel::create_context(bool capture_taps
 std::shared_ptr<Exl3TextContext> Exl3TextModel::create_context_reserved(
     Exl3VeriCacheServingCoordinator& authority,bool capture_taps,
     unsigned startup_fault_for_test,bool enable_qualified_media,
-    bool allow_ordinary_graphs) const {
+    bool allow_ordinary_graphs,bool exact_line) const {
     Exl3ResourceInventory::Requirement initial;initial.configuration=0x4354585354415254;
     initial.add(Exl3ResourceInventory::Domain::host_metadata,1,Exl3TextContext::fixed_owner_metadata_bytes());
     ContextConstruction prepared;
@@ -4650,7 +4652,7 @@ std::shared_ptr<Exl3TextContext> Exl3TextModel::create_context_reserved(
         require(configuration==initial.configuration,"context planning reservation identity");
         Exl3ResourceInventory actual;
         prepared=create_context_impl(capture_taps,false,true,&authority,startup_fault_for_test,
-            extend,&actual,enable_qualified_media,allow_ordinary_graphs);
+            extend,&actual,enable_qualified_media,allow_ordinary_graphs,exact_line);
         return actual;
     },[&]() noexcept {
         const auto before=Exl3TextContext::retirement_quarantine_witness();
@@ -4670,7 +4672,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     Exl3VeriCacheServingCoordinator* authority,unsigned startup_fault,
     const std::function<void(const Exl3ResourceInventory::Requirement&)>& extend,
     Exl3ResourceInventory* actual_result,bool enable_qualified_media,
-    bool allow_ordinary_graphs) const {
+    bool allow_ordinary_graphs,bool exact_line) const {
     require((startup_fault<=4 || (startup_fault>=6 && startup_fault<=27)) && (!startup_fault || authority),
         "context startup fault requires reserved stage1..4 or6..19");
     require(hostkv_quarantined_contexts.load(std::memory_order_acquire)==0,
@@ -4695,6 +4697,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     } construction_retirement{impl,authority};
     impl->model = impl_;
     impl->max_context = max_context_;
+    impl->exact_line_storage = exact_line;
     impl->capture_taps = capture_taps;
     const char* continuation_graph_b8=
         std::getenv("VOIDINFER_E5A4_CONTINUATION_GRAPH_B8");
@@ -6152,6 +6155,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             }
             impl->full_layers[layer]->set_reconstructed_exact(reconstructed_exact_view);
             impl->full_layers[layer]->set_l0_scratch_owner(impl.get());
+            if(exact_line)impl->full_layers[layer]->set_l0_exact_only(true);
             impl->full_layers[layer]->set_kv_cache(
                 impl->oscar_only?nullptr:static_cast<std::uint16_t*>(impl->host_kv.enabled?impl->host_layer_k->ptr:impl->cache_k[layer]->ptr),
                 impl->oscar_only?nullptr:static_cast<std::uint16_t*>(impl->host_kv.enabled?impl->host_layer_v->ptr:impl->cache_v[layer]->ptr), max_context_);
@@ -10862,6 +10866,7 @@ void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
     require(Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->host_kv.enabled && !drafting.impl_->exact_line,
         "exact line needs L0 OSCAR contexts");
     require(impl_->max_context==drafting.impl_->max_context,"exact line needs the drafting context's capacity");
+    require(impl_->exact_line_storage,"exact line needs a context constructed as one (create_context_reserved exact_line)");
     // The line never exports exact state: no lane-backed page source.
     impl_->kv_source.reset();
     impl_->exact_line=true;

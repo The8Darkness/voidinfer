@@ -386,7 +386,8 @@ struct Exl3EngineCore::Impl {
     // L0 flips one sampled token per ~150-500 past the exact window, so a
     // 256-row exclusive block keeps ~2.3 tokens per round against 3.15 on the
     // line: 4K 313 vs 279, 12K 282 vs 222, 24K 244 vs 180 tok/s. Lines cost
-    // one context of device memory each (~610 MiB at 40K).
+    // one context of device memory each (~540 MiB at 40K: no INT4 meta planes
+    // or hot rows), so C4 still admits four 32K-output requests at 40K.
     static constexpr int kLaneLineMinContext=12288;
     static constexpr std::uint32_t kMaxLineLanes=4;
     bool exact_line_planned(const EngineOptions& value) const {
@@ -1923,7 +1924,7 @@ struct Exl3EngineCore::Impl {
             for(std::uint32_t i=0;i<value.max_concurrency;++i) {
                 // Eager only: graphs captured at construction would keep the
                 // line's own planes, which make_exact_line replaces.
-                auto line=target->create_context_reserved(coordinator,true,0,false,false);
+                auto line=target->create_context_reserved(coordinator,true,0,false,false,true);
                 line->make_exact_line(*lanes[i]->context_owner_for_device_round());
                 line->prepare_continuation_reserved(coordinator,kFoldRows,0);
                 line->bind_request_compatibility("exact-line");

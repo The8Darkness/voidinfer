@@ -689,7 +689,8 @@ public:
     void set_l0_exact_history(bool exact) noexcept { l0_exact_ = l0_exact_prefill_ = exact; }
     // Exact line of folded VeriCache (Exl3TextContext::make_exact_line): the
     // layer attends with exact history only and keeps no INT4 codes or hot
-    // rows (no encode, no hot fills); its window ring stays its own.
+    // rows (no encode, no hot fills); its window ring stays its own. Set
+    // before set_kv_cache, the L0 storage gets no meta planes or hot rows.
     // FP8 history mirror (l0_exact.cuh L0LineFp8) of the context's FP16
     // planes: `use` (the asynchronous VeriCache line) attends it in staged
     // exact passes; otherwise staged exact passes only extend it.

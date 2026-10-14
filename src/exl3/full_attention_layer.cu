@@ -7914,23 +7914,26 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             // A meta plane within one 2 MiB granule (contexts up to 64K)
             // is allocated exactly instead of a granule-backed range.
             constexpr std::size_t kGranule=2u<<20;
+            // An exact line encodes no history: no meta planes either.
             for(std::size_t i=0;i<l0_regions_.size();++i) {
-                if(i>=2 && bytes[i]<=kGranule)continue;
+                if(i>=2 && (bytes[i]<=kGranule || l0_exact_only_))continue;
                 l0_regions_[i]=std::make_unique<Exl3GrowableDeviceRegion>();
                 l0_regions_[i]->reserve(bytes[i]);
             }
             l.k_codes=l0_regions_[0]->data<std::uint8_t>();
             l.v_codes=l0_regions_[1]->data<std::uint8_t>();
             if(l0_regions_[2])l.k_meta=l0_regions_[2]->data<std::uint16_t>();
-            else alloc(l.k_meta,bytes[2]);
+            else if(!l0_exact_only_)alloc(l.k_meta,bytes[2]);
             if(l0_regions_[3])l.v_meta=l0_regions_[3]->data<std::uint16_t>();
-            else alloc(l.v_meta,bytes[3]);
+            else if(!l0_exact_only_)alloc(l.v_meta,bytes[3]);
             ensure_l0_rows(0);
         } else {
         alloc(l.k_codes,cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
         alloc(l.v_codes,cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
-        alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
-        alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+        if(!l0_exact_only_) {
+            alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+            alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+        }
         }
         alloc(l.state,2*sizeof(int));
         cudaMemset(l.state,0,2*sizeof(int));
@@ -7976,7 +7979,7 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             l0_exact_=mode=="1" || mode=="decode";
             l0_exact_prefill_=mode=="1" || mode=="prefill";
         }
-        l.hot_slots=l0_oscar::hot_config().slots;
+        l.hot_slots=l0_exact_only_?0:l0_oscar::hot_config().slots;
         if(l.hot_slots) {
             const std::size_t slots=static_cast<std::size_t>(kKVHeads)*l.hot_slots;
             l.hot_words=(capacity+31)/32;

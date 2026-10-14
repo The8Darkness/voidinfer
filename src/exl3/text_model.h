@@ -523,7 +523,7 @@ public:
     std::shared_ptr<Exl3TextContext> create_context_reserved(
         Exl3VeriCacheServingCoordinator&,bool capture_taps=true,
         unsigned startup_fault_for_test=0,bool enable_qualified_media=false,
-        bool allow_ordinary_graphs=true) const;
+        bool allow_ordinary_graphs=true,bool exact_line=false) const;
     int layer_count() const noexcept { return 64; }
     int full_attention_layer_count() const noexcept { return 16; }
     int gdn_layer_count() const noexcept { return 48; }
@@ -545,7 +545,7 @@ private:
         bool defer_reconstruction,Exl3VeriCacheServingCoordinator* authority,unsigned startup_fault=0,
         const std::function<void(const Exl3ResourceInventory::Requirement&)>& extend={},
         Exl3ResourceInventory* actual_result=nullptr,bool enable_qualified_media=false,
-        bool allow_ordinary_graphs=true) const;
+        bool allow_ordinary_graphs=true,bool exact_line=false) const;
     struct Impl;
     explicit Exl3TextModel(std::unique_ptr<Impl> impl);
     std::shared_ptr<Impl> impl_; // immutable uploaded backing also retained by contexts
