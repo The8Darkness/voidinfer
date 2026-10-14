@@ -820,9 +820,10 @@ struct Exl3EngineCore::Impl {
                 _putenv_s("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
             if(!std::getenv("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
                 _putenv_s("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"640":"1536");
-            // Batched rounds of more than four lanes: 64-row private tiers
-            // (eight lanes' verifier rows in one forward).
-            if(!std::getenv("VOIDINFER_EXL3_BATCH_ROWS") && std::min(value.max_concurrency,batched_group_lanes())>4)
+            // Batched rounds of more than 32 rows (lanes x round width): 64-row
+            // private tiers (eight lanes' verifier rows in one forward).
+            if(!std::getenv("VOIDINFER_EXL3_BATCH_ROWS") &&
+               std::min(value.max_concurrency,batched_group_lanes())*round_width_limit()>32)
                 _putenv_s("VOIDINFER_EXL3_BATCH_ROWS","64");
             // Prompt-scale passes are exclusive across lanes: one reconstruct
             // workspace serves every lane.
@@ -2016,8 +2017,10 @@ struct Exl3EngineCore::Impl {
                     if(!graphs || std::string_view(graphs)!="0")
                     for(const auto& members:group->groups()) {
                         std::vector<Exl3TextContext*> peers(members.begin()+1,members.end());
-                        const std::vector<int> rows(peers.size(),8);
-                        members[0]->prepare_batched_continuation_graph(peers,8,rows);
+                        // Full-width rounds (VOIDINFER_EXL3_ROUND_WIDTH rows per lane).
+                        const int width=static_cast<int>(round_width_limit());
+                        const std::vector<int> rows(peers.size(),width);
+                        members[0]->prepare_batched_continuation_graph(peers,width,rows);
                     }
                     // VOIDINFER_EXL3_BATCHED_DRAFT=0 keeps every lane's draft
                     // proposals private (one draft forward per lane).

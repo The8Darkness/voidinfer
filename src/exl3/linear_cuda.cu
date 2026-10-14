@@ -3763,18 +3763,18 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
 // Two same-input projections of 17..32 rows in one launch: blocks below
 // grid_a run the M32 128-column producer for the first tensor, the rest for
 // the second (one shared K split).
-template <int Bits, int MTiles = 2>
+template <int Bits, int MTiles = 2, bool Fp16 = false>
 __global__ void exl3_gemm_m32_dual_kernel(const std::uint16_t* transformed_a,
     const std::uint16_t* trellis_a, const std::int32_t* mul1_a, float* accum_a, int output_features_a,
     const std::uint16_t* transformed_b, const std::uint16_t* trellis_b, const std::int32_t* mul1_b,
     float* accum_b, int output_features_b, int rows, int input_features, int split_count, int grid_a) {
     const int block = static_cast<int>(blockIdx.x);
     if (block < grid_a)
-        exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, false,
+        exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, Fp16,
             false, false, 4, 4, 2, false, MTiles>(block, transformed_a, trellis_a, mul1_a, accum_a, rows,
             input_features, output_features_a, split_count, nullptr, nullptr);
     else
-        exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, false,
+        exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, Fp16,
             false, false, 4, 4, 2, false, MTiles>(block - grid_a, transformed_b, trellis_b, mul1_b, accum_b,
             rows, input_features, output_features_b, split_count, nullptr, nullptr);
 }
@@ -9904,7 +9904,17 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair_m32(
             second_weights.trellis,second_weights.mul1,second_accum,out_b,rows,in_features_,
             split,grid_a);
     };
-    if(m_tiles==4) switch(first_metadata.K) {
+    static const bool m64_fp16=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_M64_FP16_ACC");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(m_tiles==4 && m64_fp16) switch(first_metadata.K) {
+    case 4: launch(exl3_gemm_m32_dual_kernel<4,4,true>,4); break;
+    case 5: launch(exl3_gemm_m32_dual_kernel<5,4,true>,5); break;
+    case 6: launch(exl3_gemm_m32_dual_kernel<6,4,true>,6); break;
+    case 7: launch(exl3_gemm_m32_dual_kernel<7,4,true>,7); break;
+    default: launch(exl3_gemm_m32_dual_kernel<8,4,true>,8); break;
+    } else if(m_tiles==4) switch(first_metadata.K) {
     case 4: launch(exl3_gemm_m32_dual_kernel<4,4>,4); break;
     case 5: launch(exl3_gemm_m32_dual_kernel<5,4>,5); break;
     case 6: launch(exl3_gemm_m32_dual_kernel<6,4>,6); break;
@@ -12312,9 +12322,12 @@ static void launch_coherent_packed_partials(
                 const char* value = std::getenv("VOIDINFER_EXL3_M64_STAGES");
                 return value && std::atoi(value) == 4 ? 4 : 3;
             }();
+            // FP16 MMA accumulation (FP32 folds after every stage group): the
+            // M64 producer is tensor-bound; C8 sampled 51.8 -> 49.5 ms/round,
+            // VeriCache corrections not higher. VOIDINFER_EXL3_M64_FP16_ACC=0: FP32.
             static const bool m64_fp16 = [] {
                 const char* value = std::getenv("VOIDINFER_EXL3_M64_FP16_ACC");
-                return value && std::strcmp(value, "1") == 0;
+                return !value || std::strcmp(value, "0") != 0;
             }();
             if (m64_fp16)
                 launch_coherent_packed_variant<Bits, 3, 4, 2, 4, true, 2>(stream, transformed, trellis, mul1, accum,
