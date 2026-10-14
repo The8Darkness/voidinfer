@@ -374,17 +374,25 @@ struct Exl3EngineCore::Impl {
         return block;
     }
     static constexpr int kAsyncLead=200,kAsyncRingRows=256;
-    // One exact line per lane: folded or asynchronous at C1; asynchronous at
-    // C2, whose line passes join the ordered prompt passes, for requests of at
-    // least kLaneLineMinContext tokens (exact code, 1,024 tokens, HTTP C2:
-    // 16K 157 vs 115 tok/s, 31K 131 vs 115; 4K 198 vs 242, where the batched
-    // rounds leave the device no room for a line). C3+ verify in exclusive
-    // passes (C4 4K 261 vs 352, 31K 172 vs 193).
+    // One exact line per lane up to kMaxLineLanes lanes (one batched group):
+    // folded or asynchronous at C1; asynchronous at C2-C4, whose line passes
+    // join the ordered prompt passes. A lane verifies on its line at C1, for
+    // every sampled request, and at C2 for greedy requests of at least
+    // kLaneLineMinContext tokens; other requests verify in exclusive passes.
+    // Greedy (exact code, 1,024 tokens, HTTP C2: 16K 157 vs 115 tok/s, 31K 131
+    // vs 115; 4K 198 vs 242, where the batched rounds leave the device no room
+    // for a line; C4 4K 338 vs 346, 31K 172 vs 193): rare corrections, the
+    // 256+-row exclusive blocks are cheaper. Sampled (T 1.0, LCB prompts, C4):
+    // L0 flips one sampled token per ~150-500 past the exact window, so a
+    // 256-row exclusive block keeps ~2.3 tokens per round against 3.15 on the
+    // line: 4K 313 vs 279, 12K 282 vs 222, 24K 244 vs 180 tok/s. Lines cost
+    // one context of device memory each (~610 MiB at 40K).
     static constexpr int kLaneLineMinContext=12288;
+    static constexpr std::uint32_t kMaxLineLanes=4;
     bool exact_line_planned(const EngineOptions& value) const {
         return
             (value.max_concurrency==1?vericache_fold_enabled() || vericache_async_enabled():
-                value.max_concurrency==2 && vericache_async_enabled() && prompt_pass_overlap) &&
+                value.max_concurrency<=kMaxLineLanes && vericache_async_enabled() && prompt_pass_overlap) &&
             Exl3NativeContextExtent::l0_oscar_enabled() && Exl3VeriCacheConfig::get().enabled &&
             Exl3VeriCacheConfig::get().delta<0.5f;
     }
@@ -2619,8 +2627,9 @@ struct Exl3EngineCore::Impl {
             if(vericache.enabled) {
                 // Draft numerically ahead with L0 rounds, verify each block, then
                 // publish only verified tokens (in <= 16-token output previews).
-                Exl3TextContext* const fold_line=options.max_concurrency==1 ||
-                    context->position()>=kLaneLineMinContext?exact_lines[lane_index].get():nullptr;
+                Exl3TextContext* const fold_line=options.max_concurrency==1 || context->device_sampling().temperature>0.0f ||
+                    (options.max_concurrency==2 && context->position()>=kLaneLineMinContext)?
+                    exact_lines[lane_index].get():nullptr;
                 const bool async_verify=fold_line && vericache_async_enabled();
                 round->set_pass_order(fold_line && options.max_concurrency>1?&line_pass_order:nullptr);
                 if(fold_line)round->begin_fold_verification(*fold_line,async_verify?kAsyncRingRows:kFoldRingRows);
