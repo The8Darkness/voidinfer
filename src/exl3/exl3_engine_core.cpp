@@ -2000,8 +2000,14 @@ struct Exl3EngineCore::Impl {
                 for(std::uint32_t first=0;first<value.max_concurrency;first+=group_lanes) {
                     const auto end=std::min<std::uint32_t>(first+group_lanes,value.max_concurrency);
                     if(end-first<2)break;
+                    // Lanes wait for late lanes: a missed lane otherwise runs a
+                    // narrow (split or solo) round and stays out of phase.
+                    // Sampled LCB at C8 (32 x 4,096): 5 / 10 / 20 / 40 ms ->
+                    // 341 / 348 / 365 / 372 tok/s; C4 (8 x 6,144): 5 vs 20 ms
+                    // 87.5 / 86.4 vs 90.7 / 92.8 kept tok/s per lane.
+                    const int default_wait=end-first>4?40000:20000;
                     auto group=std::make_unique<Exl3BatchedVerifyCoordinator>(
-                        std::chrono::microseconds(wait?std::atoi(wait):5000));
+                        std::chrono::microseconds(wait?std::atoi(wait):default_wait));
                     for(std::uint32_t i=first;i<end;++i) {
                         group->register_context(*lanes[i]->context_owner_for_device_round());
                         lane_batched_verify[i]=group.get();
