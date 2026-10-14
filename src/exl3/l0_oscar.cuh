@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -188,6 +189,14 @@ inline const HotConfig& hot_config() {
                 throw std::invalid_argument("VOIDINFER_EXL3_L0_HOT must be 0..4096 slots, a multiple of 32");
             c.slots = static_cast<int>(slots);
         }
+        // Research overrides: VOIDINFER_EXL3_L0_HOT_TAU (candidate probability),
+        // _INSERT (slots replaced per round, 1..64), _LAMBDA (priority decay).
+        if (const char* v = std::getenv("VOIDINFER_EXL3_L0_HOT_TAU"))
+            c.log2_tau = std::log2(std::max(1e-9, std::atof(v)));
+        if (const char* v = std::getenv("VOIDINFER_EXL3_L0_HOT_INSERT"))
+            c.insert = std::clamp(std::atoi(v), 1, kHotMaxInsert);
+        if (const char* v = std::getenv("VOIDINFER_EXL3_L0_HOT_LAMBDA"))
+            c.lambda = static_cast<float>(std::atof(v));
         return c;
     }();
     return value;

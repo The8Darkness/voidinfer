@@ -2489,6 +2489,18 @@ struct Exl3EngineCore::Impl {
         std::optional<PromptPass> prefill_pass;
         runtime_memory_mark("prefill_begin",lane_index);
         prefill_pass.emplace(*this,stream);
+        // VOIDINFER_EXL3_PREFILL_TRACE: request-start phases (stream-synchronized marks).
+        static const bool prefill_trace=std::getenv("VOIDINFER_EXL3_PREFILL_TRACE")!=nullptr;
+        std::string prefill_phases;
+        auto prefill_mark_at=Clock::now();
+        const auto prefill_mark=[&](const char* phase) {
+            if(!prefill_trace)return;
+            (void)cudaStreamSynchronize(stream);
+            const auto now=Clock::now();
+            prefill_phases+=std::string(" ")+phase+"="+std::to_string(static_cast<int>(
+                std::chrono::duration<double,std::milli>(now-prefill_mark_at).count()));
+            prefill_mark_at=now;
+        };
         try {
             (void)context->reset_for_request(identity.contract());
             const auto epoch=context->request_generation();
@@ -2608,14 +2620,18 @@ struct Exl3EngineCore::Impl {
                             1,epoch,false,stream);
                         fresh.begin_fresh(span_ids.first(stable),stable>1040);
                     }
+                    prefill_mark("fresh");
                     base=Exl3VeriCacheRequest::initialize_device_root(*context,draft,
                         span_ids.first(stable),stream);
+                    prefill_mark("root");
                 }
                 base_resident=true;
                 (void)cache.admit_input_authority(base,span_ids.first(stable),available());
+                prefill_mark("admit_root");
             }
             if(base) {
                 root=extend_device(base,ids.size(),base_resident);
+                prefill_mark("extend");
             } else {
                 Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
                     1,epoch,false,stream);
@@ -2735,8 +2751,12 @@ struct Exl3EngineCore::Impl {
                 staging_owners[lane_index]->pointers,host_lease->acquisition,
                 epoch,false,stream);
             if(vericache.enabled)context->set_l0_exact_history(false);
+            prefill_mark("coordinator");
             round->begin_prefilled();
             check(cudaStreamSynchronize(stream));
+            prefill_mark("begin_round");
+            if(prefill_trace)std::fprintf(stderr,"PREFILL_PHASES lane=%zu prompt=%zu%s\n",lane_index,ids.size(),
+                prefill_phases.c_str());
             prefill_pass.reset();
             runtime_memory_mark("prefill_end",lane_index);
             device_lease=coordinator.enter_device_logical(*host_lease,
@@ -2845,8 +2865,19 @@ struct Exl3EngineCore::Impl {
                 // and a verify pass is exclusive across lanes (at C>=2 it stalls
                 // every other lane, which the per-request model does not price).
                 const bool adaptive_horizon=vericache.delta<0.5f;
+                // Sampled requests on exclusive passes (no line): blocks of at
+                // most VOIDINFER_EXL3_VERICACHE_SAMPLED_BLOCK (default 256) rows.
+                // L0 flips sampled tokens far more often than greedy ones, and a
+                // correction discards the rest of its block: sampled LCB C8
+                // 1024 / 512 / 256 -> ~314 / 343 / 343 tok/s (greedy: no gain).
+                static const int sampled_block=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_SAMPLED_BLOCK");
+                    return value?std::clamp(std::atoi(value),16,1024):256;
+                }();
+                const int max_block=!fold_line && context->device_sampling().temperature>0.0f?
+                    std::min(vericache.block,sampled_block):vericache.block;
                 int block_now=fold_line?kFoldBlock:
-                    (adaptive_horizon?horizon.choose(vericache.block):vericache.block);
+                    (adaptive_horizon?horizon.choose(max_block):max_block);
                 auto draft_mark=Clock::now();
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
@@ -2925,7 +2956,7 @@ struct Exl3EngineCore::Impl {
                         // A round may run past the chosen block (up to the pass
                         // limit): the overrun is verified in the same pass instead
                         // of cutting the round short at every block boundary.
-                        const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:vericache.block);
+                        const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:max_block);
                         const auto width=static_cast<int>(std::min<std::size_t>(
                             {round_width_limit(),room,async_verify?
                                 static_cast<std::size_t>(std::max(kAsyncLead-round->async_lead(),
@@ -3017,7 +3048,7 @@ struct Exl3EngineCore::Impl {
                         std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
                         verified.corrected,static_cast<int>(verified.tokens.size()));
                     if(adaptive_horizon && !fold_line) {
-                        block_now=horizon.choose(vericache.block);
+                        block_now=horizon.choose(max_block);
                         exact_mismatch.store(horizon.mismatch,std::memory_order_relaxed);
                     }
                     static const bool horizon_trace=std::getenv("VOIDINFER_EXL3_VERICACHE_HORIZON_TRACE")!=nullptr;

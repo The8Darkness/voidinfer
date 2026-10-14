@@ -198,14 +198,21 @@ public:
             }
             if(layer_major)prefill_layer_major(input);
             else {
+                static const bool trace=std::getenv("VOIDINFER_EXL3_PREFILL_TRACE")!=nullptr;
+                double target_ms=0,commit_ms=0;
                 for(std::size_t first=static_cast<std::size_t>(initial);first<input.size();) {
                     const int rows=static_cast<int>(std::min<std::size_t>(
                         1024,input.size()-first));
+                    auto mark=Clock::now();
                     context_->append_prefill_wide(input.subspan(first,rows),stream_);
+                    if(trace){(void)cudaStreamSynchronize(stream_);target_ms+=elapsed(mark);mark=Clock::now();}
                     commit_captured(rows,static_cast<int>(first),
                         static_cast<int>(input.size())-2048);
+                    if(trace){(void)cudaStreamSynchronize(stream_);commit_ms+=elapsed(mark);}
                     first+=rows;
                 }
+                if(trace)std::fprintf(stderr,"FRESH_PREFILL rows=%zu target_ms=%.1f commit_ms=%.1f\n",
+                    input.size(),target_ms,commit_ms);
             }
             draft_.finish_fresh_prefill(stream_);
             check(poll_then_sync(stream_),
