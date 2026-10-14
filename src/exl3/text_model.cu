@@ -1015,6 +1015,19 @@ struct Exl3TextModel::Impl {
     mutable std::shared_ptr<Exl3SharedPromptPool> shared_wmma;
     mutable std::shared_ptr<Exl3SharedPromptPool> shared_hidden;
     mutable std::shared_ptr<Exl3SharedTapPool> shared_taps;
+    // Batched-round heads (norm rows, logits, 16- and 32-row H6 workspaces):
+    // only a forward's leader uses one, from its final norm until the copies
+    // into every member's continuation; at most two run at once (the halves
+    // of a split eight-lane group). `done` follows a slot's last use.
+    struct BatchedHeadSlot {
+        std::unique_ptr<DeviceAllocation> norm,logits;
+        std::unique_ptr<Exl3CudaLinearWorkspace> workspace16,workspace32;
+        cudaEvent_t done=nullptr;
+        bool busy=false,recorded=false;
+        ~BatchedHeadSlot(){if(done)(void)cudaEventDestroy(done);}
+    };
+    mutable std::mutex batched_head_mutex;
+    mutable std::vector<std::unique_ptr<BatchedHeadSlot>> batched_head_slots;
 
     TensorPayload load_tensor(const IndexedSafetensors& input, const std::string& name) {
         const auto start = std::chrono::steady_clock::now();
@@ -1742,8 +1755,6 @@ struct Exl3TextContext::Impl {
     int trace_members = 1, trace_graph = 0, trace_member = 0;
     // Owner of batched multi-agent rounds: every agent's final-norm rows and
     // logits of one head pass (allocated on first lead).
-    std::unique_ptr<DeviceAllocation> batched_head_norm, batched_head_logits;
-    std::unique_ptr<Exl3CudaLinearWorkspace> batched_head_workspace, batched_head_workspace32;
     // Nonzero while a batched multi-agent BatchBinding owns the layers.
     int batch_bound = 0;
     // GDN live checkpoint (VOIDINFER_EXL3_GDN_LIVE_CHECKPOINT; default with
@@ -10828,34 +10839,55 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
                 static_cast<int>(peers[p].tokens.size()),base_positions[p+1],stream);
         }
     } else {
-    if(!impl_->batched_head_workspace) {
-        constexpr std::size_t capacity=static_cast<std::size_t>(8)*(kMaxBatchedPeers+1);
-        impl_->batched_head_norm=std::make_unique<DeviceAllocation>(capacity*kHidden*sizeof(std::uint16_t),
-            "allocate batched head norm rows");
-        impl_->batched_head_logits=std::make_unique<DeviceAllocation>(capacity*kVocab*sizeof(std::uint16_t),
-            "allocate batched head logits");
-        impl_->batched_head_workspace=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,kHeadTile);
-        impl_->batched_head_workspace->set_native_continuation16(true);
+    const auto& model=*impl_->model;
+    Exl3TextModel::Impl::BatchedHeadSlot* slot=nullptr;
+    {
+        std::lock_guard lock(model.batched_head_mutex);
+        for(auto& candidate:model.batched_head_slots)
+            if(!candidate->busy){slot=candidate.get();break;}
+        if(!slot) {
+            auto created=std::make_unique<Exl3TextModel::Impl::BatchedHeadSlot>();
+            constexpr std::size_t capacity=static_cast<std::size_t>(8)*(kMaxBatchedPeers+1);
+            created->norm=std::make_unique<DeviceAllocation>(capacity*kHidden*sizeof(std::uint16_t),
+                "allocate batched head norm rows");
+            created->logits=std::make_unique<DeviceAllocation>(capacity*kVocab*sizeof(std::uint16_t),
+                "allocate batched head logits");
+            created->workspace16=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,kHeadTile);
+            created->workspace16->set_native_continuation16(true);
+            cuda_check(cudaEventCreateWithFlags(&created->done,cudaEventDisableTiming),"batched head slot event");
+            slot=created.get();
+            model.batched_head_slots.push_back(std::move(created));
+        }
+        slot->busy=true;
     }
-    auto* head_norm=static_cast<std::uint16_t*>(impl_->batched_head_norm->ptr);
-    auto* head_logits=static_cast<std::uint16_t*>(impl_->batched_head_logits->ptr);
+    struct SlotRelease {
+        const Exl3TextModel::Impl& model;Exl3TextModel::Impl::BatchedHeadSlot& slot;cudaStream_t stream;
+        ~SlotRelease() {
+            slot.recorded=cudaEventRecord(slot.done,stream)==cudaSuccess;
+            std::lock_guard lock(model.batched_head_mutex);
+            slot.busy=false;
+        }
+    } slot_release{model,*slot,stream};
+    if(slot->recorded)cuda_check(cudaStreamWaitEvent(stream,slot->done,0),"order batched head slot");
+    auto* head_norm=static_cast<std::uint16_t*>(slot->norm->ptr);
+    auto* head_logits=static_cast<std::uint16_t*>(slot->logits->ptr);
     final_rms_norm_kernel<<<rows,512,0,stream>>>(impl_->last_stack_output,impl_->model->final_norm,head_norm);
     cuda_check(cudaGetLastError(),"launch batched head final RMSNorm");
     if(head32 && rows>kHeadTile) {
-        if(!impl_->batched_head_workspace32) {
-            impl_->batched_head_workspace32=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,2*kHeadTile);
-            impl_->batched_head_workspace32->enable_draft_batched();
+        if(!slot->workspace32) {
+            slot->workspace32=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,2*kHeadTile);
+            slot->workspace32->enable_draft_batched();
         }
         // Eight-lane rounds (33..64 rows): 32-row passes (the head workspace
         // and its accumulation planes stay 32 rows).
         for(int first=0;first<rows;first+=2*kHeadTile)
-            impl_->batched_head_workspace32->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+            slot->workspace32->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
                 head_norm+static_cast<std::size_t>(first)*kHidden,
                 head_logits+static_cast<std::size_t>(first)*kVocab,std::min(2*kHeadTile,rows-first),stream);
     } else
     for(int first=0;first<rows;first+=kHeadTile) {
         const int n=std::min(kHeadTile,rows-first);
-        impl_->batched_head_workspace->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+        slot->workspace16->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
             head_norm+static_cast<std::size_t>(first)*kHidden,
             head_logits+static_cast<std::size_t>(first)*kVocab,n,stream);
     }
