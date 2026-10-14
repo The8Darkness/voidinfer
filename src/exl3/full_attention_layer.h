@@ -712,17 +712,17 @@ public:
     // stream: the peer's own (transaction) stream; launches use the owner's.
     struct BatchPeer { Exl3FullAttentionLayer* layer = nullptr; int rows = 0; int position = 0;
                        cudaStream_t stream = nullptr; };
-    static constexpr std::size_t kMaxBatchPeers = 3;
+    static constexpr std::size_t kMaxBatchPeers = 7;
     struct Batch {
         int own_rows = 0;
         int peer_count = 0;
-        std::array<BatchPeer, 3> peers{};
+        std::array<BatchPeer, kMaxBatchPeers> peers{};
         // Optional: each peer's stateful core runs on its own forked stream
         // (fork_event recorded on the owner stream, join_events back) so the
         // agents' recurrence/attention kernels overlap.
-        std::array<cudaStream_t, 3> fork_streams{};
+        std::array<cudaStream_t, kMaxBatchPeers> fork_streams{};
         cudaEvent_t fork_event = nullptr;
-        std::array<cudaEvent_t, 3> join_events{};
+        std::array<cudaEvent_t, kMaxBatchPeers> join_events{};
     };
     void set_batch(const Batch* batch) noexcept { batch_ = batch; }
     // Context owning this layer: L0 decode scratch is shared by the layers of

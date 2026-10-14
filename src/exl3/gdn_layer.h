@@ -225,7 +225,9 @@ enum class Exl3GdnHistoryStorage : std::uint8_t {
 // needed to reconstruct rejected B2/B4/B8 work remain private; the shared wide
 // slab is admitted only when no graph/rejection history can survive the call.
 struct Exl3GdnScratchReuseContract {
+    // 32, or 64 for eight-lane batched rounds (VOIDINFER_EXL3_BATCH_ROWS).
     static constexpr std::size_t private_history_rows=32;
+    static constexpr std::size_t wide_private_history_rows=64;
     static constexpr std::size_t wide_features_per_row=26624;
     std::size_t row_capacity = 0;
     std::size_t private_row_capacity = 0;
@@ -233,7 +235,7 @@ struct Exl3GdnScratchReuseContract {
     std::size_t shared_wide_bytes = 0;
 
     static bool verifier_rows_supported(std::size_t rows) noexcept {
-        return (rows>=1 && rows<=8) || rows==16 || rows==24 || rows==32;
+        return (rows>=1 && rows<=8) || (rows<=64 && rows%8==0);
     }
     static bool retained_rows_supported(std::size_t rows) noexcept {
         return rows>=2 && rows<=8;
@@ -250,7 +252,8 @@ struct Exl3GdnScratchReuseContract {
         return row_capacity>0 && private_row_capacity>0 &&
             private_row_capacity<=row_capacity &&
             (private_row_capacity==row_capacity ||
-             (private_row_capacity==private_history_rows &&
+             ((private_row_capacity==private_history_rows ||
+               private_row_capacity==wide_private_history_rows) &&
               shared_wide_bytes>=wide_bytes_required(row_capacity)));
     }
     Exl3GdnHistoryStorage history_storage(
@@ -820,17 +823,17 @@ public:
     // agent's context, same model layer) runs its own stateful core on its rows.
     // stream: the peer's own (transaction) stream; launches use the owner's.
     struct BatchPeer { Exl3GdnLayer* layer = nullptr; int rows = 0; cudaStream_t stream = nullptr; };
-    static constexpr std::size_t kMaxBatchPeers = 3;
+    static constexpr std::size_t kMaxBatchPeers = 7;
     struct Batch {
         int own_rows = 0;
         int peer_count = 0;
-        std::array<BatchPeer, 3> peers{};
+        std::array<BatchPeer, kMaxBatchPeers> peers{};
         // Optional: each peer's stateful core runs on its own forked stream
         // (fork_event recorded on the owner stream, join_events back) so the
         // agents' recurrence/attention kernels overlap.
-        std::array<cudaStream_t, 3> fork_streams{};
+        std::array<cudaStream_t, kMaxBatchPeers> fork_streams{};
         cudaEvent_t fork_event = nullptr;
-        std::array<cudaEvent_t, 3> join_events{};
+        std::array<cudaEvent_t, kMaxBatchPeers> join_events{};
     };
     void set_batch(const Batch* batch) noexcept { batch_ = batch; }
     // Borrowed child pointers for enclosing-context lifetime inventory only.

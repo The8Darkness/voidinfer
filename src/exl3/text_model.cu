@@ -933,6 +933,17 @@ struct Exl3SharedPromptPool {
     ~Exl3SharedPromptPool() { for(auto* pointer:data)if(pointer)(void)cudaFree(pointer); }
 };
 
+// Rows of one batched multi-agent forward and of every context's private
+// small tier (VOIDINFER_EXL3_BATCH_ROWS, set by the Engine): 32 for groups of
+// up to four lanes (8 verifier rows each), 64 for up to eight.
+static int exl3_batch_rows() noexcept {
+    static const int rows=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_BATCH_ROWS");
+        return value && std::atoi(value)==64 ? 64 : 32;
+    }();
+    return rows;
+}
+
 // Concurrent lanes: the prompt-scale tap and embedding-trace planes (five
 // taps + embedding). One context's rows at a time: a pass claims the pool
 // (Exl3TextContext::Impl::enter_tap_pool) and its later reads stay valid until
@@ -1796,9 +1807,9 @@ struct Exl3TextContext::Impl {
     }
     // Owner-side fork streams for batched peers' stateful cores
     // (VOIDINFER_EXL3_BATCH_FORK, default on); created on first lead.
-    std::array<cudaStream_t,3> batch_fork_streams{};
+    std::array<cudaStream_t,kMaxBatchedPeers> batch_fork_streams{};
     cudaEvent_t batch_fork_event = nullptr;
-    std::array<cudaEvent_t,3> batch_join_events{};
+    std::array<cudaEvent_t,kMaxBatchedPeers> batch_join_events{};
     std::shared_ptr<DeviceAllocation> host_layer_k, host_layer_v;
     std::shared_ptr<Exl3AttentionStageStorage> attention_stage_storage;
     std::shared_ptr<Exl3AttentionStage> attention_stages;
@@ -2076,7 +2087,7 @@ struct Exl3TextContext::Impl {
     std::int64_t* token_ids = nullptr;
     std::size_t persistent_bytes = 0;
     // Rows of the last forward in the tap planes (and the embedding trace).
-    // Concurrent lanes (shared_taps): the planes keep kPrivateTapRows rows;
+    // Concurrent lanes (shared_taps): the planes keep private_tap_rows() rows;
     // prompt-scale passes write the shared pool instead (the prompt tier swaps
     // the planes like hidden A/B). Leaving the tier keeps the last rows
     // privately (logical rows [private_first,value) at index 0) and the older
@@ -2095,7 +2106,8 @@ struct Exl3TextContext::Impl {
         }
         operator int() const noexcept {return value;}
     };
-    static constexpr int kPrivateTapRows=32;
+    // The batched forward's rows: the owner's taps hold every member's rows.
+    static int private_tap_rows() noexcept {return exl3_batch_rows();}
     TapRows tap_rows;
     std::shared_ptr<Exl3SharedTapPool> shared_taps;
     std::array<void*,6> private_tap_planes{};
@@ -2130,7 +2142,7 @@ struct Exl3TextContext::Impl {
         if(!held || tap_rows.pool_rows!=tap_rows.value) {
             // The pool does not hold the current rows: bring the private ones.
             // (None when a restored row count exceeds the private tier.)
-            const bool fits=tap_rows.value-tap_rows.private_first<=kPrivateTapRows;
+            const bool fits=tap_rows.value-tap_rows.private_first<=private_tap_rows();
             const int first=fits?tap_rows.private_first:tap_rows.value;
             const int rows=tap_rows.value-first;
             for(std::size_t plane=0;plane<pool.data.size() && rows>0;++plane)
@@ -2154,7 +2166,7 @@ struct Exl3TextContext::Impl {
         std::lock_guard lock(pool.mutex);
         const bool owned=pool.owner==this && tap_rows.claim==pool.claims;
         const int end=tap_rows.value;
-        const int first=std::max(tap_rows.pool_first,end-kPrivateTapRows);
+        const int first=std::max(tap_rows.pool_first,end-private_tap_rows());
         for(std::size_t plane=0;plane<pool.data.size();++plane) {
             auto& owner=tap_plane(plane);
             if(owned && end>first)
@@ -2194,7 +2206,7 @@ struct Exl3TextContext::Impl {
         }
         if(first>=tap_rows.private_first) {
             if(tap_rows.private_first>0)trace_tap_pool("read_private",first,rows);
-            require(first+rows-tap_rows.private_first<=kPrivateTapRows,what);
+            require(first+rows-tap_rows.private_first<=private_tap_rows(),what);
             from(current,tap_rows.private_first);use(planes);return;
         }
         auto& pool=*shared_taps;
@@ -2225,7 +2237,7 @@ struct Exl3TextContext::Impl {
         // A row count restored without its rows (verified roots) can exceed
         // what the private tier holds: then it holds none.
         if(shared_taps && !tap_rows.in_pool && !(pooled && first<tap_rows.private_first) &&
-           end-tap_rows.private_first>kPrivateTapRows)
+           end-tap_rows.private_first>private_tap_rows())
             return end;
         first=std::max(first,lowest);
         if(first>=end)return end;
@@ -2237,7 +2249,7 @@ struct Exl3TextContext::Impl {
             planes[plane]=base+static_cast<std::size_t>(first-offset)*kHidden;
         }
         if(!from_pool && shared_taps && !tap_rows.in_pool)
-            require(end-tap_rows.private_first<=kPrivateTapRows,"held tap rows exceed the private tier");
+            require(end-tap_rows.private_first<=private_tap_rows(),"held tap rows exceed the private tier");
         if(tap_pool_trace() && (from_pool || first>0))trace_tap_pool(from_pool?"held_pool":"held_private",first,end);
         use(first,planes);
         if(from_pool) {
@@ -2265,7 +2277,7 @@ struct Exl3TextContext::Impl {
     // publish_tap_rows records them.
     int tap_write_first(int rows,int available_first=0) const noexcept {
         if(!shared_taps || tap_rows.in_pool)return available_first;
-        return std::max(available_first,rows-kPrivateTapRows);
+        return std::max(available_first,rows-private_tap_rows());
     }
     std::uint16_t* tap_write_plane(std::size_t plane,int first) const noexcept {
         auto* base=static_cast<std::uint16_t*>(tap_plane(plane).ptr);
@@ -5567,10 +5579,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         return value && std::strcmp(value,"1")==0;
     }();
     const auto visit_base_allocations=[&](auto&& allocate) {
-        // Concurrent lanes keep 32-row hidden planes; the prompt-block planes
+        // Concurrent lanes keep batch-row (32 or 64) hidden planes; the prompt-block planes
         // live in the model's shared pool (swapped by the prompt tier).
         const std::size_t private_hidden_bytes=share_prompt_rows?
-            static_cast<std::size_t>(32)*kHidden*sizeof(std::uint16_t):hidden_bytes;
+            static_cast<std::size_t>(exl3_batch_rows())*kHidden*sizeof(std::uint16_t):hidden_bytes;
         allocate(private_hidden_bytes,reinterpret_cast<void**>(&impl->hidden_a),"allocate E4A hidden A");
         allocate(private_hidden_bytes,reinterpret_cast<void**>(&impl->hidden_b),"allocate E4A hidden B");
         if (impl->gdn_bulk_prefill_enabled) {
@@ -5933,7 +5945,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     }();
     const bool tap_pool=share_prompt_rows && share_taps;
     const std::size_t tap_plane_bytes=tap_pool?
-        std::min(prompt_tap_plane_bytes,static_cast<std::size_t>(std::remove_reference_t<decltype(*impl)>::kPrivateTapRows)*kHidden*sizeof(std::uint16_t)):
+        std::min(prompt_tap_plane_bytes,static_cast<std::size_t>(exl3_batch_rows())*kHidden*sizeof(std::uint16_t)):
         prompt_tap_plane_bytes;
     if(capture_taps)tap_requirement.add(Exl3ResourceInventory::Domain::device,kTapLayers.size()+1,tap_plane_bytes);
     const auto tap_extent=tap_requirement.units[static_cast<unsigned>(Exl3ResourceInventory::Domain::device)];
@@ -6543,7 +6555,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(impl->persistent_bytes==expected_layer_group,"target complete layer group requirement mismatch");
     trace_stage("layers");
     if(tiered) {
-        constexpr int small_rows=32;   // four agents' verifier rows
+        const int small_rows=exl3_batch_rows();   // four (eight) agents' verifier rows
         const auto small=Exl3LinearWorkspaceRequirements::derive(17408,17408,small_rows);
         // The widest small-tier use is the paired 16-row gate/up route (two
         // stacked 10-partition planes) = 32-row M32 calls at 5 partitions x 4.
@@ -9184,7 +9196,9 @@ void Exl3TextContext::set_layer_observer_for_test(
 struct Exl3TextContext::PromptTierScope {
     PromptTierScope(Exl3TextContext& context,std::size_t rows,cudaStream_t stream)
         : context_(context),impl_(*context.impl_),stream_(stream),
-          active_(impl_.small_tier_rows && rows>static_cast<std::size_t>(impl_.small_tier_rows)) {
+          // Passes wider than 32 rows use the prompt tier even when the small
+          // tier holds a wider (64-row, eight-lane) batched forward.
+          active_(impl_.small_tier_rows && rows>static_cast<std::size_t>(std::min(impl_.small_tier_rows,32))) {
         if(active_ && impl_.prompt_tier_depth==0)impl_.select_prompt_tier(true,context_.position_,stream_);
         if(active_)++impl_.prompt_tier_depth;
     }
@@ -10566,7 +10580,7 @@ void Exl3TextContext::prepare_batched_continuation_graph(std::span<Exl3TextConte
                 (!impl.transaction || !impl.transaction->active),
             "batched continuation graph capture requires idle device-KV contexts");
     }
-    require(impl_->prefill_capacity>=rows && rows<=32,"batched continuation exceeds the owner's row capacity");
+    require(impl_->prefill_capacity>=rows && rows<=exl3_batch_rows(),"batched continuation exceeds the owner's row capacity");
     // Captured launches read the live positions from each context's
     // position_device; capture at the end of each context like the per-layer
     // graphs so capacity-sized grids cover every replay position. The owner's
@@ -10673,9 +10687,9 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         "query batched continuation stream capture state");
     require(capture_status==cudaStreamCaptureStatusNone,
         "batched continuation is unavailable during external stream capture");
-    require(impl_->prefill_capacity>=rows && rows<=32,"batched continuation exceeds the owner's row capacity");
+    require(impl_->prefill_capacity>=rows && rows<=exl3_batch_rows(),"batched continuation exceeds the owner's row capacity");
     // Owner: rows [0, own_rows); each peer's rows follow in order.
-    std::array<std::int64_t,32> ids{};
+    std::array<std::int64_t,64> ids{};
     std::array<int,kMaxBatchedPeers+1> first_row{};
     for(std::size_t c=0,offset=0;c<count_contexts;++c) {
         first_row[c]=static_cast<int>(offset);
@@ -10827,13 +10841,17 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
     auto* head_logits=static_cast<std::uint16_t*>(impl_->batched_head_logits->ptr);
     final_rms_norm_kernel<<<rows,512,0,stream>>>(impl_->last_stack_output,impl_->model->final_norm,head_norm);
     cuda_check(cudaGetLastError(),"launch batched head final RMSNorm");
-    if(head32 && rows>kHeadTile && rows<=2*kHeadTile) {
+    if(head32 && rows>kHeadTile) {
         if(!impl_->batched_head_workspace32) {
             impl_->batched_head_workspace32=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,2*kHeadTile);
             impl_->batched_head_workspace32->enable_draft_batched();
         }
-        impl_->batched_head_workspace32->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
-            head_norm,head_logits,rows,stream);
+        // Eight-lane rounds (33..64 rows): 32-row passes (the head workspace
+        // and its accumulation planes stay 32 rows).
+        for(int first=0;first<rows;first+=2*kHeadTile)
+            impl_->batched_head_workspace32->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+                head_norm+static_cast<std::size_t>(first)*kHidden,
+                head_logits+static_cast<std::size_t>(first)*kVocab,std::min(2*kHeadTile,rows-first),stream);
     } else
     for(int first=0;first<rows;first+=kHeadTile) {
         const int n=std::min(kHeadTile,rows-first);

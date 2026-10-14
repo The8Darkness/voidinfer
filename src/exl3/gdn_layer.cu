@@ -75,7 +75,15 @@ constexpr std::array<int,22> kHalfBufferFeatures={{kHidden,kQkv,kZ,kQkv,2048,204
     kIntermediate,kHidden,kHidden,kZ}};
 constexpr std::array<std::size_t,5> kSplitHalfIndices{{3,4,5,6,9}};
 // Batched multi-agent rounds of up to four agents' verifier rows (4 x 8).
-constexpr int kPrivateRetentionRows = 32;
+// Private retention rows: one batched forward's rows (VOIDINFER_EXL3_BATCH_ROWS,
+// 32, or 64 for eight-lane groups; text_model.cu exl3_batch_rows).
+static int private_retention_rows() noexcept {
+    static const int rows = [] {
+        const char* value = std::getenv("VOIDINFER_EXL3_BATCH_ROWS");
+        return value && std::atoi(value) == 64 ? 64 : 32;
+    }();
+    return rows;
+}
 constexpr std::size_t kSplitHalfFeatures =
     static_cast<std::size_t>(kHalfBufferFeatures[3]) +
     static_cast<std::size_t>(kHalfBufferFeatures[4]) +
@@ -1879,7 +1887,7 @@ std::size_t Exl3GdnLayer::workspace_bytes_required(int rows,bool borrowed_accumu
             borrowed_transform,borrowed_accumulation).owned_bytes);
     for(std::size_t i=0;i<kHalfBufferFeatures.size();++i) {
         if(borrowed_scratch && transient_half(i))continue;
-        const auto extent_rows=split_wide && is_split_half(i)?std::min(rows,kPrivateRetentionRows):rows;
+        const auto extent_rows=split_wide && is_split_half(i)?std::min(rows,private_retention_rows()):rows;
         add(static_cast<std::size_t>(extent_rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t));
     }
     add(static_cast<std::size_t>(rows)*(borrowed_scratch?(tiered_gdn_traces()?0:2):6)*kHeads*sizeof(float));
@@ -2044,7 +2052,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
         throw std::invalid_argument("GDN wide scratch capacity");
     split_wide_storage_ = wide_scratch.data != nullptr;
     private_row_capacity_ = split_wide_storage_
-        ? std::min(max_rows_, kPrivateRetentionRows) : max_rows_;
+        ? std::min(max_rows_, private_retention_rows()) : max_rows_;
     scratch_reuse_={static_cast<std::size_t>(max_rows_),
         static_cast<std::size_t>(private_row_capacity_),scratch.bytes,
         wide_scratch.bytes};

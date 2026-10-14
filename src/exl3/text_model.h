@@ -1044,7 +1044,7 @@ public:
     // N-agent batched rounds: up to kMaxBatchedPeers peers follow the owner's
     // rows in order (each 2..8 rows); each peer's transaction state belongs to
     // its `stream` (defaults to the owner's stream).
-    static constexpr std::size_t kMaxBatchedPeers = 3;
+    static constexpr std::size_t kMaxBatchedPeers = 7;
     struct BatchedPeer {
         Exl3TextContext* context = nullptr;
         std::span<const std::int64_t> tokens;

@@ -744,6 +744,17 @@ struct Exl3EngineCore::Impl {
         }
     };
     LinePassOrder line_pass_order{*this};
+    // Lanes per batched-round coordinator (VOIDINFER_EXL3_BATCHED_GROUP_LANES,
+    // 2..8, default 8): eight lanes share one 64-row forward instead of two
+    // groups of four.
+    static std::uint32_t batched_group_lanes() {
+        static const std::uint32_t lanes=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_BATCHED_GROUP_LANES");
+            const int parsed=value?std::atoi(value):static_cast<int>(Exl3BatchedVerifyCoordinator::kMaxGroup);
+            return static_cast<std::uint32_t>(std::clamp(parsed,2,static_cast<int>(Exl3BatchedVerifyCoordinator::kMaxGroup)));
+        }();
+        return lanes;
+    }
     // A lane in a prompt pass is not a batched-round candidate.
     struct BatchedInactive {
         Exl3BatchedVerifyCoordinator* coordinator;
@@ -809,6 +820,10 @@ struct Exl3EngineCore::Impl {
                 _putenv_s("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
             if(!std::getenv("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
                 _putenv_s("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"640":"1536");
+            // Batched rounds of more than four lanes: 64-row private tiers
+            // (eight lanes' verifier rows in one forward).
+            if(!std::getenv("VOIDINFER_EXL3_BATCH_ROWS") && std::min(value.max_concurrency,batched_group_lanes())>4)
+                _putenv_s("VOIDINFER_EXL3_BATCH_ROWS","64");
             // Prompt-scale passes are exclusive across lanes: one reconstruct
             // workspace serves every lane.
             if(!std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
@@ -1979,9 +1994,9 @@ struct Exl3EngineCore::Impl {
             const char* batched=std::getenv("VOIDINFER_EXL3_BATCHED_ROUNDS");
             if(!batched || std::string_view(batched)!="0") {
                 const char* wait=std::getenv("VOIDINFER_EXL3_BATCHED_ROUND_WAIT_US");
-                // Lanes [4g, 4g+4) share coordinator g; the earliest lane of a
+                // Lanes [Gg, Gg+G) share coordinator g; the earliest lane of a
                 // group leads its forward, one captured graph per group.
-                constexpr std::uint32_t group_lanes=Exl3BatchedVerifyCoordinator::kMaxGroup;
+                const std::uint32_t group_lanes=batched_group_lanes();
                 for(std::uint32_t first=0;first<value.max_concurrency;first+=group_lanes) {
                     const auto end=std::min<std::uint32_t>(first+group_lanes,value.max_concurrency);
                     if(end-first<2)break;
@@ -2694,12 +2709,16 @@ struct Exl3EngineCore::Impl {
                     coordinator->set_active(false);
                     if(std::getenv("VOIDINFER_EXL3_BATCHED_STATS")) {
                         const auto widths=coordinator->width_histogram();
-                        std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu (w2=%llu w3=%llu w4=%llu) eager=%llu solo=%llu timeouts=%llu wait_ms=%.1f\n",
-                            static_cast<unsigned long long>(coordinator->batched_rounds()),
-                            static_cast<unsigned long long>(widths[2]),static_cast<unsigned long long>(widths[3]),
-                            static_cast<unsigned long long>(widths[4]),
+                        std::string histogram;
+                        for(std::size_t w=2;w<widths.size();++w)
+                            histogram+=(w>2?" w":"w")+std::to_string(w)+"="+std::to_string(widths[w]);
+                        std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu (%s) split=%llu eager=%llu solo=%llu timeouts=%llu wait_ms=%.1f\n",
+                            static_cast<unsigned long long>(coordinator->batched_rounds()),histogram.c_str(),
+                            static_cast<unsigned long long>(coordinator->split_rounds()),
                             static_cast<unsigned long long>(coordinator->eager_rounds()),static_cast<unsigned long long>(coordinator->solo_rounds()),
                             static_cast<unsigned long long>(coordinator->timeouts()),coordinator->wait_us()/1000.0);
+                        if(std::getenv("VOIDINFER_EXL3_BATCHED_FORWARD_TIMING"))
+                            std::fprintf(stderr,"BATCHED_FORWARD_MS%s\n",coordinator->forward_timing().c_str());
                     }
                 }
             } batched_lane(lane_batched_verify[lane_index]);

@@ -5117,7 +5117,16 @@ namespace {
 // Shared 32-row execution state of batched drafting. Batched forwards are
 // serialized (one coordinator group at a time); the weights stay per model.
 struct DraftBatchedScratch {
-    static constexpr int kRows = 4 * kBlockCap;
+    // Up to eight lanes' 8-row blocks; the planes hold rows_capacity rows
+    // (32, or 64 with eight-lane batched rounds: VOIDINFER_EXL3_BATCH_ROWS).
+    static constexpr int kRows = 8 * kBlockCap;
+    static int rows_capacity() noexcept {
+        static const int rows = [] {
+            const char* value = std::getenv("VOIDINFER_EXL3_BATCH_ROWS");
+            return value && std::atoi(value) == 64 ? 64 : 32;
+        }();
+        return rows;
+    }
     std::mutex mutex;
     bool ready = false;
     std::uint16_t *x_a=nullptr,*x_b=nullptr,*ln=nullptr,*conv=nullptr,*convf=nullptr,*dyn=nullptr,
@@ -5136,7 +5145,7 @@ struct DraftBatchedScratch {
     int* ring_start=nullptr;
     DraftSelectSampling* sampling=nullptr;   // per member, uploaded every round
     struct Graph {
-        std::array<const void*,4> members{};
+        std::array<const void*,8> members{};
         int count=0,head_columns=0;
         cudaGraphExec_t exec=nullptr;
     };
@@ -5146,7 +5155,8 @@ struct DraftBatchedScratch {
         const auto alloc=[](auto*& pointer,std::size_t bytes,const char* label) {
             cuda_check(cudaMalloc(reinterpret_cast<void**>(&pointer),bytes),label);
         };
-        constexpr std::size_t two=sizeof(std::uint16_t),rows=kRows;
+        constexpr std::size_t two=sizeof(std::uint16_t);
+        const std::size_t rows=static_cast<std::size_t>(rows_capacity());
         for(auto** plane:{&x_a,&x_b,&ln,&conv,&convf,&ln2,&conv2,&convf2,&oproj,&down,&final_norm})
             alloc(*plane,rows*kHidden*two,"batched draft hidden plane");
         alloc(dyn,rows*kConvDynamic*two,"batched draft dynamic conv");
@@ -5161,8 +5171,8 @@ struct DraftBatchedScratch {
         alloc(pos,rows*sizeof(std::int32_t),"batched draft positions");
         alloc(ids,rows*sizeof(std::int64_t),"batched draft ids");
         alloc(liveness,sizeof(unsigned int),"batched draft liveness");
-        alloc(ring_start,4*sizeof(int),"batched draft ring starts");
-        alloc(sampling,4*sizeof(DraftSelectSampling),"batched draft sampling");
+        alloc(ring_start,8*sizeof(int),"batched draft ring starts");
+        alloc(sampling,8*sizeof(DraftSelectSampling),"batched draft sampling");
         alloc(tcat,rows*kLayers*kHidden*two,"batched commit tap rows");
         alloc(fc_raw,rows*kHidden*two,"batched commit fc rows");
         alloc(hctx,rows*kHidden*two,"batched commit hidden rows");
@@ -5177,11 +5187,11 @@ struct DraftBatchedScratch {
         // Narrow projections get 4x row planes: 32-row calls then split K
         // until they fill the resident M32 slots (coherent_m32_split; the
         // 17408-wide MLP already fills them at five partitions).
-        constexpr int kWideRows=4*kRows;
+        const int kWideRows=4*rows_capacity();
         ws_q=linear(kHidden,kQHeads*kHeadDim,kWideRows,true);
         ws_kv=linear(kHidden,kKVHeads*kHeadDim,kWideRows,true);
         ws_o=linear(kQHeads*kHeadDim,kHidden,kWideRows,true);
-        ws_mlp=linear(kHidden,kIntermediate,kRows,true);
+        ws_mlp=linear(kHidden,kIntermediate,rows_capacity(),true);
         ws_down=linear(kIntermediate,kHidden,kWideRows,true);
         ws_fc=linear(kLayers*kHidden,kHidden,kWideRows,true);
         // The H6 head runs in 16-row single-split tiles; more than 16
@@ -5189,7 +5199,7 @@ struct DraftBatchedScratch {
         // stream once).
         ws_head=linear(kHidden,kVocab,16,false);
         ws_head->set_native_continuation16(true);
-        ws_head32=linear(kHidden,kVocab,kRows,true);
+        ws_head32=linear(kHidden,kVocab,rows_capacity(),true);
         ready=true;
     }
 };
@@ -5199,6 +5209,15 @@ DraftBatchedScratch& draft_batched_scratch() {
 }
 } // namespace
 
+std::size_t Exl3Dflash2DraftModel::max_batched_members() noexcept {
+    // VOIDINFER_EXL3_DRAFT_BATCH_LANES caps the lanes of one batched draft.
+    static const int cap=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_DRAFT_BATCH_LANES");
+        return value?std::max(2,std::atoi(value)):8;
+    }();
+    return static_cast<std::size_t>(std::min(cap,DraftBatchedScratch::rows_capacity()/kBlockCap));
+}
+
 void Exl3Dflash2DraftModel::set_sampling(const Exl3DeviceSampling& sampling) noexcept {
     impl_->sampling=sampling;
 }
@@ -5207,7 +5226,8 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
     const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
     const Exl3CudaLinearMetadata& target_head_metadata,cudaStream_t stream) {
     const int count=static_cast<int>(members.size());
-    require(count>=1 && count<=4 && target_embedding_bf16,"batched draft member count");
+    require(count>=1 && count*kBlockCap<=DraftBatchedScratch::rows_capacity() && target_embedding_bf16,
+        "batched draft member count");
     const Impl& lead=*members[0]->draft->impl_;
     for(auto* member:members) {
         require(member && member->draft && member->draft->batched_proposal_supported(member->block) &&
@@ -5243,7 +5263,17 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
     // capacity: rows readable from `in` (32-row planes; member offsets less).
     const auto dense=[&](const std::uint16_t* in,const std::uint16_t* weight,std::uint16_t* out,int n,int k,int width,
                          int capacity) {
-        if(lead.dense_kmajor && launch_dflash_dense_rows_tc(in,weight,out,n,k,width,capacity,stream)) {
+        // Eight-lane drafts (33..64 rows): the tensor-core kernel takes 32 rows a launch.
+        const auto tc=[&] {
+            for(int first=0;first<n;first+=32) {
+                const int count=std::min(32,n-first);
+                if(!launch_dflash_dense_rows_tc(in+static_cast<std::size_t>(first)*k,weight,
+                       out+static_cast<std::size_t>(first)*width,count,k,width,capacity-first,stream))
+                    return first==0 ? false : throw std::logic_error("batched draft dense split");
+            }
+            return true;
+        };
+        if(lead.dense_kmajor && tc()) {
         } else if(!(lead.dense_kmajor && launch_dflash_dense_rows_kmajor(in,weight,out,n,k,width,stream))) {
             if(lead.dense_kmajor)
                 dflash_dense_gemm_t_kernel<true><<<dim3((width+255)/256,n),256,
@@ -5296,7 +5326,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         for(int layer=0;layer<kLayers;++layer) {
             const auto& lay=lead.layers[layer];
             rms(current,lay.input_norm,b.ln,rows);
-            dense(b.ln,lay.attn_kernel_proj,b.dyn,rows,kHidden,kConvDynamic,DraftBatchedScratch::kRows);
+            dense(b.ln,lay.attn_kernel_proj,b.dyn,rows,kHidden,kConvDynamic,DraftBatchedScratch::rows_capacity());
             dyn_conv(b.ln,b.dyn,lay.attn_base,b.conv,0,false);
             b.ws_q->forward(lay.q,lay.qm,b.conv,b.qproj,rows,stream);
             b.ws_kv->forward(lay.k,lay.km,b.conv,b.kblk,rows,stream);
@@ -5336,7 +5366,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             dyn_conv(b.oproj,b.dyn,lay.attn_base,b.convf,1,true);
             residual(current,b.convf,other);
             rms(other,lay.post_norm,b.ln2,rows);
-            dense(b.ln2,lay.mlp_kernel_proj,b.dyn2,rows,kHidden,kConvDynamic,DraftBatchedScratch::kRows);
+            dense(b.ln2,lay.mlp_kernel_proj,b.dyn2,rows,kHidden,kConvDynamic,DraftBatchedScratch::rows_capacity());
             dyn_conv(b.ln2,b.dyn2,lay.mlp_base,b.conv2,0,false);
             b.ws_mlp->forward(lay.gate,lay.gm,b.conv2,b.gate,rows,stream);
             b.ws_mlp->forward(lay.up,lay.um,b.conv2,b.up,rows,stream);
@@ -5374,7 +5404,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             Impl& m=*members[i]->draft->impl_;
             const auto* head=b.head_out+static_cast<std::size_t>(i)*P*kVocab;
             dense(b.final_norm+static_cast<std::size_t>(i)*P*kHidden,lead.hidden_proj,m.s.hidden_proj_out,
-                P,kHidden,kRank,DraftBatchedScratch::kRows-i*P);
+                P,kHidden,kRank,DraftBatchedScratch::rows_capacity()-i*P);
             launch_dflash_topk16_segmented(head,P,head_columns,m.s.cand_ids,m.s.cand_unary,m.s.topk_segments,
                 stream,kVocab);
             dflash_selector_fused_chain_kernel<<<1,kSelectorFusedThreads,0,stream>>>(
@@ -5385,7 +5415,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
         }
     };
     {
-        std::array<DraftSelectSampling,4> sampling{};
+        std::array<DraftSelectSampling,8> sampling{};
         for(int i=0;i<count;++i) {
             const auto& cfg=members[i]->draft->impl_->sampling;
             auto& value=sampling[static_cast<std::size_t>(i)];
@@ -5407,7 +5437,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
     bool graphed=graphed_drafts && dflash_ring_split_selected(kRingKeep);
     for(auto* member:members) graphed=graphed && member->draft->impl_->ring_count==kRingKeep;
     if(graphed) {
-        std::array<int,4> starts{};
+        std::array<int,8> starts{};
         for(int i=0;i<count;++i)
             starts[static_cast<std::size_t>(i)]=static_cast<int>(members[i]->draft->impl_->ring_base_abs & kRingMask);
         cuda_check(exl3_h2d_async(b.ring_start,starts.data(),count*sizeof(int),stream),
@@ -5508,7 +5538,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
         const std::lock_guard lock(b.mutex);
         b.prepare();
         constexpr int n=kKVHeads*kHeadDim;
-        constexpr int kChunk=DraftBatchedScratch::kRows;
+        constexpr int kChunk=4*kBlockCap;   // bulk prefill chunk (fixed: draft numerics)
         const auto admission=Exl3CudaLinearAdmission::draft_prefill_fc;
         const auto advance_ring=[&](int count) {
             const int dropped=std::max(0,m.ring_count+count-kRingKeep);

@@ -933,7 +933,8 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
                 candidate.coherent_wide_k6_registers_per_thread_for_test()>0 &&
                 candidate.coherent_wide_k6_shared_bytes_for_test()==12288,
             std::string("coherent wide K6 resource/owner gate: ")+shape.name);
-        require(std::string(candidate.dispatch_name(
+        const bool row_timing=env_or_empty("VOIDINFER_EXL3_TEST_ROW_TIMING")=="1";
+        require(row_timing || std::string(candidate.dispatch_name(
                 Exl3CudaLinearMetadata{shape.in_features,shape.out_features,7,
                     false,true,false},1,Admission::ordinary))!=dispatch &&
                 std::string(candidate.dispatch_name(metadata,17,
@@ -1029,6 +1030,10 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
                 cudaEventDestroy(start);cudaEventDestroy(stop);
             }
             // Wider batched rounds (4/8 agents): the routes a 64-row workspace takes.
+            // VOIDINFER_EXL3_TEST_M64=1: the serving coherent M32/M64 producer
+            // (wide K6 off) at up to 64 rows, M64 rows checked against M16.
+            const bool m64=env_or_empty("VOIDINFER_EXL3_TEST_M64")=="1";
+            if(m64)_putenv_s("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6","0");
             Exl3CudaLinearWorkspace wide(shape.in_features,shape.out_features,64,
                 false,shape.gate_up,false,shape.o,shape.z,true,false,
                 {},{},shape.qkv,false,shape.q);
@@ -1037,7 +1042,8 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             auto* wide_out=allocate_device<std::uint16_t>(d_wide_out,64u*shape.out_features,"wide timing output");
             for(int r=0;r<4;++r)cuda_check(cudaMemcpy(wide_in+static_cast<std::size_t>(r)*16*shape.in_features,input,
                 16u*shape.in_features*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice),"wide timing input copy");
-            for(int rows:{8,16,24,32}) {
+            for(int rows:{8,16,24,32,48,64}) {
+                if(rows>32 && !m64)break;
                 cudaEvent_t start,stop;
                 cuda_check(cudaEventCreate(&start),"timing event");cuda_check(cudaEventCreate(&stop),"timing event");
                 for(int i=0;i<20;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?shape.continuation:Admission::ordinary);
@@ -1064,6 +1070,22 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
                 std::size_t differ=0;
                 for(std::size_t i=0;i<wide32.size();++i)differ+=wide32[i]!=half16[i];
                 std::cout<<"ROW_M32_EXACT op="<<shape.name<<" differing="<<differ<<'\n';
+            }
+            if(m64) {
+                // M64 rows equal the M16 result of the same rows bit for bit.
+                std::vector<std::uint16_t> wide64(64u*shape.out_features),quarter16(64u*shape.out_features);
+                wide.forward(weights,metadata,wide_in,wide_out,64,nullptr,shape.continuation);
+                cuda_check(cudaMemcpy(wide64.data(),wide_out,wide64.size()*2,cudaMemcpyDeviceToHost),"m64 read");
+                for(int h=0;h<4;++h) {
+                    wide.forward(weights,metadata,wide_in+static_cast<std::size_t>(h)*16*shape.in_features,
+                        wide_out,16,nullptr,shape.continuation);
+                    cuda_check(cudaMemcpy(quarter16.data()+static_cast<std::size_t>(h)*16*shape.out_features,wide_out,
+                        16u*shape.out_features*2,cudaMemcpyDeviceToHost),"m16 read");
+                }
+                std::size_t differ=0;
+                for(std::size_t i=0;i<wide64.size();++i)differ+=wide64[i]!=quarter16[i];
+                std::cout<<"ROW_M64_EXACT op="<<shape.name<<" dispatch64="<<wide.dispatch_name(metadata,64,shape.continuation)
+                         <<" differing="<<differ<<std::endl;
             }
             continue;
         }

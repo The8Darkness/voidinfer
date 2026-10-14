@@ -560,7 +560,8 @@ public:
     // route, no observers or shared executors) and a full-width block.
     bool batched_proposal_supported(std::span<const std::int64_t> block) const noexcept;
     // Runs on `stream` after every member's queued work; members' own scratch
-    // receives their selector state. Up to four 8-row blocks.
+    // receives their selector state. Up to max_batched_members() 8-row blocks.
+    static std::size_t max_batched_members() noexcept;
     static void propose_batched(std::span<Exl3DraftBatchedRequest* const> members,
         const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
         const Exl3CudaLinearMetadata& target_head_metadata,cudaStream_t stream);

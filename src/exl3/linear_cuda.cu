@@ -3129,12 +3129,20 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     static_assert(!FusedInput || (DeepStages > 0 && AsyncA && !RegisterPipeline &&
                                   !Fp16Accumulate && !PredecodedB),
                   "fused input requires the deep async-A FP32 producer");
-    // MTiles == 2 (batched rounds of 3-4 agents, rows 17..32): two M16 A
-    // tiles share every decoded B fragment; each output row keeps the M16
-    // MMA sequence of its own tile.
-    static_assert(MTiles == 1 || (MTiles == 2 && DeepStages > 0 && AsyncA && !FusedInput &&
-                                  !RegisterPipeline && !PredecodedB),
-                  "M32 requires the deep async-A producer");
+    // MTiles 2 / 4 (batched rounds of 3-4 / 5-8 agents, rows 17..32 / 33..64):
+    // two / four M16 A tiles share every decoded B fragment; each output row
+    // keeps the M16 MMA sequence of its own tile.
+    static_assert(MTiles == 1 || ((MTiles == 2 || MTiles == 4) && DeepStages > 0 && AsyncA &&
+                                  !FusedInput && !RegisterPipeline && !PredecodedB &&
+                                  Warps * 32 >= 32 * MTiles),
+                  "M32/M64 require the deep async-A producer");
+    constexpr int kExtraTiles = MTiles > 1 ? MTiles - 1 : 1;
+    // The staged output tile covers at most two M16 tiles (32 rows): M64
+    // writes its partials in two passes through it (so it still fits the
+    // drained ring and four CTAs stay resident).
+    constexpr int kStoreTiles = MTiles > 2 ? 2 : MTiles;
+    static_assert(MTiles <= 2 || (PartialOnly && !SingleSplit && !GlobalSlices),
+                  "M64 stores partials only");
     // Deep async-A stages may stream the constant packed weights of their
     // preload groups before the dependency wait; everything else waits first.
     constexpr bool kEarlyWeights = DeepStages > 0 && AsyncA && !RegisterPipeline;
@@ -3186,12 +3194,12 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     // builds A fragments from sh_in and stages no A tiles. Launchers size
     // fused-input shared memory with exl3_fused_input_shared_bytes.
     constexpr bool alias_c = DeepStages > 0 &&
-        exl3_deep_ring_holds_output(raw_stage_count * raw_stage_half, output_tiles_per_block * MTiles);
+        exl3_deep_ring_holds_output(raw_stage_count * raw_stage_half, output_tiles_per_block * kStoreTiles);
     // M32: the 32-row output tile reuses the whole drained A + B ring
     // (launch_coherent_packed_variant), which doubles the resident CTAs per SM.
-    constexpr bool alias_c_ring = MTiles == 2 && !alias_c &&
+    constexpr bool alias_c_ring = MTiles >= 2 && !alias_c &&
         exl3_deep_ring_holds_output(raw_stage_count * (256 * MTiles + raw_stage_half),
-                                    output_tiles_per_block * MTiles);
+                                    output_tiles_per_block * kStoreTiles);
     extern __shared__ half shared[];
     half* sh_a = shared;
     auto* sh_raw = reinterpret_cast<std::uint16_t*>(
@@ -3200,7 +3208,7 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
         alias_c ? reinterpret_cast<float*>(sh_raw) : reinterpret_cast<float*>(
         sh_raw + raw_stage_count * raw_stage_half);
     half* sh_in = alias_c ? reinterpret_cast<half*>(sh_raw + raw_stage_count * raw_stage_half)
-                          : reinterpret_cast<half*>(sh_c + 16 * MTiles * output_tiles_per_block * 16);
+                          : reinterpret_cast<half*>(sh_c + 16 * kStoreTiles * output_tiles_per_block * 16);
     const int thread = static_cast<int>(threadIdx.x);
     const int warp = thread / 32;
     const int lane = thread & 31;
@@ -3259,18 +3267,19 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     }
 
     Exl3FragC c[fragments_per_warp];
-    Exl3FragC c2[MTiles == 2 ? fragments_per_warp : 1];
-    Exl3FragCHalf c2_half[MTiles == 2 ? fragments_per_warp : 1];
+    // Accumulators of the further M16 tiles (rows 16.., MTiles > 1).
+    Exl3FragC c2[kExtraTiles][MTiles > 1 ? fragments_per_warp : 1];
+    Exl3FragCHalf c2_half[kExtraTiles][MTiles > 1 ? fragments_per_warp : 1];
     Exl3FragCHalf c_half[fragments_per_warp];
     #pragma unroll
-    for (int n = 0; n < (MTiles == 2 ? fragments_per_warp : 1); ++n) {
-        c2_half[n].values[0] = __float2half2_rn(0.0f);
-        c2_half[n].values[1] = __float2half2_rn(0.0f);
-    }
-    #pragma unroll
-    for (int n = 0; n < (MTiles == 2 ? fragments_per_warp : 1); ++n) {
+    for (int m = 0; m < kExtraTiles; ++m) {
         #pragma unroll
-        for (float& value : c2[n].values) value = 0.0f;
+        for (int n = 0; n < (MTiles > 1 ? fragments_per_warp : 1); ++n) {
+            c2_half[m][n].values[0] = __float2half2_rn(0.0f);
+            c2_half[m][n].values[1] = __float2half2_rn(0.0f);
+            #pragma unroll
+            for (float& value : c2[m][n].values) value = 0.0f;
+        }
     }
     #pragma unroll
     for (int n = 0; n < fragments_per_warp; ++n) {
@@ -3292,17 +3301,19 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                 c_half[n].values[0] = __float2half2_rn(0.0f);
                 c_half[n].values[1] = __float2half2_rn(0.0f);
             }
-            if constexpr (MTiles == 2) {
+            if constexpr (MTiles > 1) {
+                #pragma unroll
+                for (int m = 0; m < MTiles - 1; ++m)
                 #pragma unroll
                 for (int n = 0; n < fragments_per_warp; ++n) {
-                    const float2 low = __half22float2(c2_half[n].values[0]);
-                    const float2 high = __half22float2(c2_half[n].values[1]);
-                    c2[n].values[0] += low.x;
-                    c2[n].values[1] += low.y;
-                    c2[n].values[2] += high.x;
-                    c2[n].values[3] += high.y;
-                    c2_half[n].values[0] = __float2half2_rn(0.0f);
-                    c2_half[n].values[1] = __float2half2_rn(0.0f);
+                    const float2 low = __half22float2(c2_half[m][n].values[0]);
+                    const float2 high = __half22float2(c2_half[m][n].values[1]);
+                    c2[m][n].values[0] += low.x;
+                    c2[m][n].values[1] += low.y;
+                    c2[m][n].values[2] += high.x;
+                    c2[m][n].values[3] += high.y;
+                    c2_half[m][n].values[0] = __float2half2_rn(0.0f);
+                    c2_half[m][n].values[1] = __float2half2_rn(0.0f);
                 }
             }
         }
@@ -3459,7 +3470,7 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             if (tile_k_begin + group * per + t >= tile_k_end) break;
             const int stage = (group % stages) * per + t;
             Exl3FragA a;
-            [[maybe_unused]] Exl3FragA a2;
+            [[maybe_unused]] Exl3FragA a2[kExtraTiles];
             if constexpr (FusedInput) {
                 // m16n8k16 A: words 0/2 hold row lane/4 at columns
                 // 2*(lane%4) and 8+2*(lane%4); words 1/3 (rows 8..15) are zero.
@@ -3478,8 +3489,11 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             const int base_c = lane / 16;
             const int c_swizzled = base_c ^ ((r >> 2) & 1);
             exl3_ldsm4(a, sh_a + stage * 256 * MTiles + r * 16 + c_swizzled * 8);
-            if constexpr (MTiles == 2)
-                exl3_ldsm4(a2, sh_a + stage * 256 * MTiles + 256 + r * 16 + c_swizzled * 8);
+            if constexpr (MTiles > 1) {
+                #pragma unroll
+                for (int m = 0; m < MTiles - 1; ++m)
+                    exl3_ldsm4(a2[m], sh_a + stage * 256 * MTiles + 256 * (m + 1) + r * 16 + c_swizzled * 8);
+            }
             }
             #pragma unroll
             for (int n2 = 0; n2 < fragments_per_warp; n2 += 2) {
@@ -3505,16 +3519,22 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                 if constexpr (Fp16Accumulate) {
                     exl3_mma_m16n8k16_half(a, b0, c_half[n2]);
                     exl3_mma_m16n8k16_half(a, b1, c_half[n2 + 1]);
-                    if constexpr (MTiles == 2) {
-                        exl3_mma_m16n8k16_half(a2, b0, c2_half[n2]);
-                        exl3_mma_m16n8k16_half(a2, b1, c2_half[n2 + 1]);
+                    if constexpr (MTiles > 1) {
+                        #pragma unroll
+                        for (int m = 0; m < MTiles - 1; ++m) {
+                            exl3_mma_m16n8k16_half(a2[m], b0, c2_half[m][n2]);
+                            exl3_mma_m16n8k16_half(a2[m], b1, c2_half[m][n2 + 1]);
+                        }
                     }
                 } else {
                 exl3_mma_m16n8k16(a, b0, c[n2]);
                 exl3_mma_m16n8k16(a, b1, c[n2 + 1]);
-                if constexpr (MTiles == 2) {
-                    exl3_mma_m16n8k16(a2, b0, c2[n2]);
-                    exl3_mma_m16n8k16(a2, b1, c2[n2 + 1]);
+                if constexpr (MTiles > 1) {
+                    #pragma unroll
+                    for (int m = 0; m < MTiles - 1; ++m) {
+                        exl3_mma_m16n8k16(a2[m], b0, c2[m][n2]);
+                        exl3_mma_m16n8k16(a2[m], b1, c2[m][n2 + 1]);
+                    }
                 }
                 }
             }
@@ -3598,6 +3618,41 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     const int r0 = lane / 4;
     const int r1 = r0 + 8;
     const int column = (lane % 4) * 2;
+    if constexpr (MTiles == 4) {
+        // Two passes of 32 rows (tiles 0-1, then 2-3) through the staged tile.
+        const std::size_t partial_stride = static_cast<std::size_t>(rows) * output_features;
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            __syncthreads();
+            #pragma unroll
+            for (int n = 0; n < fragments_per_warp; ++n) {
+                #pragma unroll
+                for (int local = 0; local < 2; ++local) {
+                    const int tile = pass * 2 + local;
+                    const Exl3FragC& fragment = tile == 0 ? c[n] : c2[tile - 1][n];
+                    if (pass * 32 + local * 16 + r0 < rows) {
+                        float* destination = sh_c + (local * 16 + r0) * output_tile_elements + (n0 + n) * 8 + column;
+                        destination[0] = fragment.values[0];
+                        destination[1] = fragment.values[1];
+                    }
+                    if (pass * 32 + local * 16 + r1 < rows) {
+                        float* destination = sh_c + (local * 16 + r1) * output_tile_elements + (n0 + n) * 8 + column;
+                        destination[0] = fragment.values[2];
+                        destination[1] = fragment.values[3];
+                    }
+                }
+            }
+            __syncthreads();
+            const int pass_rows = min(32, rows - pass * 32);
+            for (int i = thread; i < pass_rows * output_tile_elements; i += threads) {
+                const int row = pass * 32 + i / output_tile_elements;
+                const int column_index = i % output_tile_elements;
+                accum[static_cast<std::size_t>(split) * partial_stride +
+                      row * output_features + tile_base * 16 + column_index] = sh_c[i];
+            }
+        }
+        return;
+    } else {
     #pragma unroll
     for (int n = 0; n < fragments_per_warp; ++n) {
         if (r0 < rows) {
@@ -3610,18 +3665,23 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             destination[0] = c[n].values[2];
             destination[1] = c[n].values[3];
         }
-        if constexpr (MTiles == 2) {
-            if (r0 + 16 < rows) {
-                float* destination = sh_c + (r0 + 16) * output_tile_elements + (n0 + n) * 8 + column;
-                destination[0] = c2[n].values[0];
-                destination[1] = c2[n].values[1];
-            }
-            if (r1 + 16 < rows) {
-                float* destination = sh_c + (r1 + 16) * output_tile_elements + (n0 + n) * 8 + column;
-                destination[0] = c2[n].values[2];
-                destination[1] = c2[n].values[3];
+        if constexpr (MTiles > 1) {
+            #pragma unroll
+            for (int m = 0; m < MTiles - 1; ++m) {
+                const int offset = 16 * (m + 1);
+                if (r0 + offset < rows) {
+                    float* destination = sh_c + (r0 + offset) * output_tile_elements + (n0 + n) * 8 + column;
+                    destination[0] = c2[m][n].values[0];
+                    destination[1] = c2[m][n].values[1];
+                }
+                if (r1 + offset < rows) {
+                    float* destination = sh_c + (r1 + offset) * output_tile_elements + (n0 + n) * 8 + column;
+                    destination[0] = c2[m][n].values[2];
+                    destination[1] = c2[m][n].values[3];
+                }
             }
         }
+    }
     }
     __syncthreads();
     const std::size_t partial_stride =
@@ -3703,7 +3763,7 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
 // Two same-input projections of 17..32 rows in one launch: blocks below
 // grid_a run the M32 128-column producer for the first tensor, the rest for
 // the second (one shared K split).
-template <int Bits>
+template <int Bits, int MTiles = 2>
 __global__ void exl3_gemm_m32_dual_kernel(const std::uint16_t* transformed_a,
     const std::uint16_t* trellis_a, const std::int32_t* mul1_a, float* accum_a, int output_features_a,
     const std::uint16_t* transformed_b, const std::uint16_t* trellis_b, const std::int32_t* mul1_b,
@@ -3711,11 +3771,11 @@ __global__ void exl3_gemm_m32_dual_kernel(const std::uint16_t* transformed_a,
     const int block = static_cast<int>(blockIdx.x);
     if (block < grid_a)
         exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, false,
-            false, false, 4, 4, 2, false, 2>(block, transformed_a, trellis_a, mul1_a, accum_a, rows,
+            false, false, 4, 4, 2, false, MTiles>(block, transformed_a, trellis_a, mul1_a, accum_a, rows,
             input_features, output_features_a, split_count, nullptr, nullptr);
     else
         exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, false,
-            false, false, 4, 4, 2, false, 2>(block - grid_a, transformed_b, trellis_b, mul1_b, accum_b,
+            false, false, 4, 4, 2, false, MTiles>(block - grid_a, transformed_b, trellis_b, mul1_b, accum_b,
             rows, input_features, output_features_b, split_count, nullptr, nullptr);
 }
 
@@ -9780,7 +9840,7 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair_m32(
         const char* value=std::getenv("VOIDINFER_EXL3_M32_PAIR");
         return !value || std::strcmp(value,"0")!=0;
     }();
-    if(!enabled || rows<=kBatchedRows || rows>2*kBatchedRows || rows>max_rows_ ||
+    if(!enabled || rows<=kBatchedRows || rows>4*kBatchedRows || rows>max_rows_ ||
        rows>second_workspace.max_rows_ || first_metadata.K!=second_metadata.K ||
        first_metadata.K<4 || first_metadata.K>8 || in_features_!=second_workspace.in_features_ ||
        in_features_%kHadamard!=0 || out_features_%128!=0 || second_workspace.out_features_%128!=0 ||
@@ -9829,16 +9889,28 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair_m32(
     launch_input_transform_pair(stream,input,first_weights.suh,second_weights.suh,
         staged_a,staged_b,rows,in_features_);
     const int grid_a=out_a/128*split, grid_b=out_b/128*split;
+    // M32 (17..32 rows) or M64 (33..64 rows, two-pass output store); the
+    // 32-row output tile aliases the drained ring either way.
+    const int m_tiles=rows>2*kBatchedRows?4:2;
     const auto launch=[&](auto kernel,int bits) {
-        const std::size_t shared=8u*256u*2u*sizeof(half)+8u*8u*16u*static_cast<std::size_t>(bits)*
-            sizeof(std::uint16_t);
+        const std::size_t shared=8u*256u*static_cast<std::size_t>(m_tiles)*sizeof(half)+
+            8u*8u*16u*static_cast<std::size_t>(bits)*sizeof(std::uint16_t);
+        if(shared>48u*1024u)
+            cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shared)),"set M64 pair shared memory");
         exl3_launch_pdl(kernel,dim3(grid_a+grid_b),dim3(128),shared,stream,
             static_cast<const std::uint16_t*>(staged_a),first_weights.trellis,
             first_weights.mul1,accum_,out_a,static_cast<const std::uint16_t*>(staged_b),
             second_weights.trellis,second_weights.mul1,second_accum,out_b,rows,in_features_,
             split,grid_a);
     };
-    switch(first_metadata.K) {
+    if(m_tiles==4) switch(first_metadata.K) {
+    case 4: launch(exl3_gemm_m32_dual_kernel<4,4>,4); break;
+    case 5: launch(exl3_gemm_m32_dual_kernel<5,4>,5); break;
+    case 6: launch(exl3_gemm_m32_dual_kernel<6,4>,6); break;
+    case 7: launch(exl3_gemm_m32_dual_kernel<7,4>,7); break;
+    default: launch(exl3_gemm_m32_dual_kernel<8,4>,8); break;
+    } else switch(first_metadata.K) {
     case 4: launch(exl3_gemm_m32_dual_kernel<4>,4); break;
     case 5: launch(exl3_gemm_m32_dual_kernel<5>,5); break;
     case 6: launch(exl3_gemm_m32_dual_kernel<6>,6); break;
@@ -11051,7 +11123,7 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
     Exl3CudaLinearAdmission admission) const noexcept {
     if (!coherent_wide_k6_enabled_ || !allow_generic_variants_ ||
         coherent_wide_k6_resident_capacity_ <= 0 ||
-        rows < 1 || rows > 2 * kBatchedRows || rows > max_rows_ ||
+        rows < 1 || rows > 4 * kBatchedRows || rows > max_rows_ ||
         (rows > kBatchedRows && admission == Exl3CudaLinearAdmission::ordinary) ||
         metadata.in_features != in_features_ ||
         metadata.out_features != out_features_ ||
@@ -11087,7 +11159,7 @@ bool Exl3CudaLinearWorkspace::coherent_batched_rows(const Exl3CudaLinearMetadata
         const char* value=std::getenv("VOIDINFER_EXL3_TARGET_COHERENT_M32");
         return !value || std::strcmp(value,"0")!=0;
     }();
-    if(!target_m32 || rows>32 || rows>max_rows_ || out_features_%128 ||
+    if(!target_m32 || rows>64 || rows>max_rows_ || out_features_%128 ||
        metadata.K<4 || metadata.K>7 || metadata.mcg || !metadata.mul1 || metadata.has_bias)
         return false;
     const std::size_t plane=static_cast<std::size_t>(rows)*out_features_*sizeof(float);
@@ -11161,7 +11233,7 @@ bool Exl3CudaLinearWorkspace::coherent_down_k6_candidate(
     // body and five disjoint K partitions.
     return coherent_down_k6_enabled_ && allow_generic_variants_ &&
         coherent_down_k6_resident_capacity_ > 0 && rows >= 1 &&
-        (rows <= kBatchedRows || (rows <= 2 * kBatchedRows &&
+        (rows <= kBatchedRows || (rows <= 4 * kBatchedRows &&
             admission == Exl3CudaLinearAdmission::target_continuation_down)) &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
@@ -11183,7 +11255,7 @@ bool Exl3CudaLinearWorkspace::coherent_down_k7_candidate(
     Exl3CudaLinearAdmission admission) const noexcept {
     return coherent_down_k7_enabled_ && allow_generic_variants_ &&
         coherent_down_k7_resident_capacity_ > 0 && rows >= 1 &&
-        (rows <= kBatchedRows || (rows <= 2 * kBatchedRows &&
+        (rows <= kBatchedRows || (rows <= 4 * kBatchedRows &&
             admission == Exl3CudaLinearAdmission::target_continuation_down)) &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
@@ -11199,7 +11271,7 @@ bool Exl3CudaLinearWorkspace::coherent_o_k7_candidate(
     Exl3CudaLinearAdmission admission) const noexcept {
     return coherent_o_k7_enabled_ && allow_generic_variants_ &&
         coherent_o_k7_resident_capacity_ > 0 && rows >= 1 &&
-        (rows <= kBatchedRows || (rows <= 2 * kBatchedRows &&
+        (rows <= kBatchedRows || (rows <= 4 * kBatchedRows &&
             admission == Exl3CudaLinearAdmission::target_continuation_o)) &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
@@ -12025,13 +12097,15 @@ static void launch_coherent_packed_variant(
     constexpr std::size_t output_bytes = 16u * MTiles * tiles * 16u * sizeof(float);
     // M32 aliases the output tile over the drained ring (the producer's
     // alias_c_ring); the other variants keep it separate.
-    const std::size_t shared = MTiles == 2 && ring_bytes >= output_bytes ? ring_bytes :
-        ring_bytes + output_bytes;
+    // M64 stages its output 32 rows at a time (two-pass store).
+    constexpr std::size_t staged_output_bytes = MTiles > 2 ? output_bytes / 2 : output_bytes;
+    const std::size_t shared = MTiles >= 2 && ring_bytes >= staged_output_bytes ? ring_bytes :
+        ring_bytes + staged_output_bytes;
     // active_features (single K split only): launch the CTAs of the leading
     // output columns; the packed trellis stride stays output_features.
     const int grid = (active_features ? active_features : output_features) / (16 * tiles) *
         split_count;
-    if constexpr (MTiles == 2 || Fp16Acc || TilesPerWarp != 1) {
+    if constexpr (MTiles >= 2 || Fp16Acc || TilesPerWarp != 1) {
         static_assert(Stages > 0, "M32/FP16-accumulate coherent producer requires deep stages");
         if (raw_input) throw std::logic_error("M32/FP16-accumulate coherent producer reads transformed rows");
         const auto kernel = exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
@@ -12219,14 +12293,40 @@ static void launch_coherent_packed_partials(
     }();
     if (rows >= batch_min_rows && (batch_tpw == 2 || batch_tpw == 4) && !raw_input && stages == 4 &&
         warps == 4 && (per_setting ? per_setting : 2) == 2 && output_features % (64 * batch_tpw) == 0) {
+        // 33..64 rows (batched rounds of 5-8 agents): M64, four M16 A tiles.
+        if (rows > 4 * kBatchedRows)
+            throw std::logic_error("coherent batched producer takes at most 64 rows");
         if (batch_tpw == 4) {
-            if (rows > kBatchedRows)
+            if (rows > 2 * kBatchedRows)
+                launch_coherent_packed_variant<Bits, 4, 4, 2, 4, false, 4>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+            else if (rows > kBatchedRows)
                 launch_coherent_packed_variant<Bits, 4, 4, 2, 2, false, 4>(stream, transformed, trellis, mul1, accum,
                     rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
             else
                 launch_coherent_packed_variant<Bits, 4, 4, 2, 1, false, 4>(stream, transformed, trellis, mul1, accum,
                     rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
-        } else if (rows > kBatchedRows)
+        } else if (rows > 2 * kBatchedRows) {
+            // VOIDINFER_EXL3_M64_STAGES (3 or 4): the deep ring depth of the M64 producer.
+            static const int m64_stages = [] {
+                const char* value = std::getenv("VOIDINFER_EXL3_M64_STAGES");
+                return value && std::atoi(value) == 4 ? 4 : 3;
+            }();
+            static const bool m64_fp16 = [] {
+                const char* value = std::getenv("VOIDINFER_EXL3_M64_FP16_ACC");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            if (m64_fp16)
+                launch_coherent_packed_variant<Bits, 3, 4, 2, 4, true, 2>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+            else if (m64_stages == 4)
+                launch_coherent_packed_variant<Bits, 4, 4, 2, 4, false, 2>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+            else
+                launch_coherent_packed_variant<Bits, 3, 4, 2, 4, false, 2>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+        }
+        else if (rows > kBatchedRows)
             launch_coherent_packed_variant<Bits, 4, 4, 2, 2, false, 2>(stream, transformed, trellis, mul1, accum,
                 rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
         else
@@ -12303,7 +12403,7 @@ static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int row
     Exl3CudaLinearAdmission admission, int in_features, int out_features,
     std::size_t capacity, int max_rows) {
     const int split = coherent_kv_split_setting();
-    if (!split || rows < 1 || rows > 2 * kBatchedRows || rows > max_rows ||
+    if (!split || rows < 1 || rows > 4 * kBatchedRows || rows > max_rows ||
         (rows > kBatchedRows && admission != Exl3CudaLinearAdmission::target_continuation_kv) ||
         in_features != 5120 || out_features != 1024 ||
         metadata.in_features != in_features || metadata.out_features != out_features ||
