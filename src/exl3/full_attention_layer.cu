@@ -8067,6 +8067,35 @@ void Exl3FullAttentionLayer::release_l0_rows_beyond(int rows) {
     if(l0_regions_[3])l0_regions_[3]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
 }
 
+std::size_t Exl3FullAttentionLayer::l0_code_bytes(int rows) const noexcept {
+    if(!l0_regions_[0])return 0;
+    const auto heads=static_cast<std::size_t>(std::clamp(rows,0,cache_capacity_))*kKVHeads;
+    std::size_t bytes=2*heads*static_cast<std::size_t>(l0_oscar_format::code_bytes());
+    for(int plane=2;plane<4;++plane)
+        if(l0_regions_[plane])bytes+=heads*l0_oscar::kMetaFloats*sizeof(std::uint16_t);
+    return bytes;
+}
+
+void Exl3FullAttentionLayer::copy_l0_codes(std::byte* host,int rows,bool to_host,cudaStream_t stream) {
+    if(!l0_regions_[0])return;
+    const auto heads=static_cast<std::size_t>(std::clamp(rows,0,cache_capacity_))*kKVHeads;
+    for(int plane=0;plane<4;++plane) {
+        if(!l0_regions_[plane])continue;
+        const std::size_t bytes=plane<2?heads*static_cast<std::size_t>(l0_oscar_format::code_bytes()):
+            heads*l0_oscar::kMetaFloats*sizeof(std::uint16_t);
+        if(!bytes)continue;
+        auto* device=l0_regions_[plane]->data<std::byte>();
+        cuda_check(cudaMemcpyAsync(to_host?static_cast<void*>(host):device,to_host?static_cast<const void*>(device):host,
+            bytes,to_host?cudaMemcpyDeviceToHost:cudaMemcpyHostToDevice,stream),
+            to_host?"suspend L0 code plane":"resume L0 code plane");
+        host+=bytes;
+    }
+}
+
+void Exl3FullAttentionLayer::release_l0_codes() {
+    for(auto& region:l0_regions_)if(region)region->shrink(0);
+}
+
 void Exl3FullAttentionLayer::set_oscar(Exl3OscarContext* oscar, int model_layer) noexcept {
     oscar_ = oscar;
     oscar_layer_ = model_layer;

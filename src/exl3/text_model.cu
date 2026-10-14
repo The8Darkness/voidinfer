@@ -1900,6 +1900,10 @@ struct Exl3TextContext::Impl {
     void* small_tier_storage = nullptr;
     int small_tier_rows = 0;
     int prompt_tier_depth = 0;
+    // suspend_l0_codes: pinned stage of the code/meta rows [0,rows) (rows -1: resident).
+    std::byte* suspended_codes = nullptr;
+    std::size_t suspended_code_capacity = 0;
+    int suspended_code_rows = -1;
     void select_prompt_tier(bool prompt,int position,cudaStream_t stream) {
         if(shared_taps) {
             if(prompt)enter_tap_pool(stream);
@@ -2856,6 +2860,7 @@ struct Exl3TextContext::Impl {
         // Exported pages may outlive this context: fill them while the planes exist.
         try {if(kv_source)kv_source->materialize_from(0);} catch(...) {}
         if(small_tier_storage)(void)cudaFree(small_tier_storage);
+        if(suspended_codes)(void)cudaFreeHost(suspended_codes);
         if(gdn_write_flag){(void)cudaFree(gdn_write_flag);gdn_write_flag=nullptr;}
         if(transaction && transaction->live_host_root){
             (void)voidinfer::cuda_device_synchronize_outside_capture();(void)cudaFreeHost(transaction->live_host_root);
@@ -3875,6 +3880,7 @@ struct Exl3TextContext::Impl {
         // An exact line writes rows its drafting context already backs and
         // keeps no INT4 codes: nothing to grow.
         if(exact_line)return;
+        require(suspended_code_rows<0,"L0 forward on suspended codes");
         consume_kv_rewrite();
         ensure_self_fp8_history();
         // Plane growth under host memory pressure spills idle histories first.
@@ -13911,6 +13917,48 @@ std::size_t Exl3TextContext::l0_code_device_bytes() const noexcept {
     for(const auto& layer:impl_->full_layers)if(layer)bytes+=layer->l0_code_device_bytes();
     return bytes;
 }
+
+std::size_t Exl3TextContext::suspend_l0_codes(cudaStream_t stream) {
+    require(Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->exact_line && impl_->suspended_code_rows<0 &&
+            !impl_->graph_capture_active && impl_->prompt_tier_depth==0,
+        "L0 code suspension needs an idle L0 context between rounds");
+    impl_->join_repair(stream);
+    const int rows=position_;
+    std::size_t bytes=0;
+    for(const auto& layer:impl_->full_layers)if(layer)bytes+=layer->l0_code_bytes(rows);
+    if(bytes>impl_->suspended_code_capacity) {
+        if(impl_->suspended_codes)cuda_check(cudaFreeHost(impl_->suspended_codes),"free suspended L0 code stage");
+        impl_->suspended_codes=nullptr;impl_->suspended_code_capacity=0;
+        cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&impl_->suspended_codes),bytes,cudaHostAllocDefault),
+            "allocate suspended L0 code stage");
+        impl_->suspended_code_capacity=bytes;
+    }
+    auto* host=impl_->suspended_codes;
+    for(auto& layer:impl_->full_layers)if(layer) {
+        layer->copy_l0_codes(host,rows,true,stream);
+        host+=layer->l0_code_bytes(rows);
+    }
+    cuda_check(cudaStreamSynchronize(stream),"complete L0 code suspension copies");
+    const auto released=l0_code_device_bytes();
+    for(auto& layer:impl_->full_layers)if(layer)layer->release_l0_codes();
+    impl_->suspended_code_rows=rows;
+    return released;
+}
+
+void Exl3TextContext::resume_l0_codes(cudaStream_t stream) {
+    require(impl_->suspended_code_rows>=0,"L0 codes are not suspended");
+    const int rows=impl_->suspended_code_rows;
+    for(auto& layer:impl_->full_layers)if(layer)layer->ensure_l0_rows(rows);
+    auto* host=impl_->suspended_codes;
+    for(auto& layer:impl_->full_layers)if(layer) {
+        layer->copy_l0_codes(host,rows,false,stream);
+        host+=layer->l0_code_bytes(rows);
+    }
+    cuda_check(cudaStreamSynchronize(stream),"complete L0 code resumption copies");
+    impl_->suspended_code_rows=-1;
+}
+
+bool Exl3TextContext::l0_codes_suspended() const noexcept {return impl_->suspended_code_rows>=0;}
 
 void Exl3TextContext::park_l0_codes() noexcept {
     if(!Exl3NativeContextExtent::l0_oscar_enabled())return;

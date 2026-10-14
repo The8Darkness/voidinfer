@@ -733,6 +733,12 @@ public:
     // references it (request reset).
     void ensure_l0_rows(int rows);
     void release_l0_rows_beyond(int rows);
+    // Suspended lanes (device-memory pressure): bytes of code/meta rows
+    // [0,rows), their copy to or from `host` (packed plane after plane), and
+    // the release of all their device backing (no work may reference it).
+    std::size_t l0_code_bytes(int rows) const noexcept;
+    void copy_l0_codes(std::byte* host,int rows,bool to_host,cudaStream_t stream);
+    void release_l0_codes();
     // Device bytes currently backing the growable L0 code/meta planes.
     std::size_t l0_code_device_bytes() const noexcept {
         std::size_t bytes = 0;

@@ -481,8 +481,120 @@ struct Exl3EngineCore::Impl {
     }
     std::uint64_t request_code_projection(const Request& request) const {
         const auto input=request.ready_work.input_tokens().size();
-        const auto output=static_cast<std::size_t>(request.options.execution.requested_output_tokens);
+        auto output=static_cast<std::size_t>(request.options.execution.requested_output_tokens);
+        // Lanes that can suspend under pressure reserve a bounded output
+        // allowance, not the whole max_tokens (most outputs stop far earlier).
+        if(l0_suspend_enabled())output=std::min(output,l0_admit_output_tokens());
         return projected_l0_code_bytes(std::min<std::size_t>(input+output,options.max_context));
+    }
+    // Device-memory pressure between rounds (coherent-device C2+ with L0 code
+    // admission; VOIDINFER_EXL3_L0_SUSPEND=0 off): requests are admitted on
+    // their input plus VOIDINFER_EXL3_L0_ADMIT_OUTPUT_TOKENS (default 4096) of
+    // output. When free device memory falls below VOIDINFER_EXL3_L0_SUSPEND_MIB
+    // (default 256) the youngest decoding lane suspends at its next round: its
+    // L0 codes move to pinned host memory (Exl3TextContext::suspend_l0_codes)
+    // until, oldest suspended lane first, they fit again with the threshold
+    // and the code reserve to spare. The oldest decoding lane never suspends, and no request is
+    // admitted while a lane is suspended.
+    std::array<bool,kMaxLanes> lane_decoding{},lane_suspended{};
+    std::array<std::uint64_t,kMaxLanes> lane_admission{};
+    std::uint64_t next_lane_admission=1;
+    bool l0_suspend_enabled() const {
+        static const bool enabled=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_SUSPEND");
+            return !value || std::string_view(value)!="0";
+        }();
+        return enabled && l0_code_admission_enabled();
+    }
+    static std::size_t l0_admit_output_tokens() {
+        static const std::size_t tokens=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_ADMIT_OUTPUT_TOKENS");
+            return static_cast<std::size_t>(value?std::max(0L,std::atol(value)):4096L);
+        }();
+        return tokens;
+    }
+    static std::uint64_t l0_code_reserve_bytes() {
+        static const std::uint64_t reserve=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_CODE_RESERVE_MIB");
+            return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):512L)<<20;
+        }();
+        return reserve;
+    }
+    static std::uint64_t l0_suspend_threshold_bytes() {
+        static const std::uint64_t threshold=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_SUSPEND_MIB");
+            return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):256L)<<20;
+        }();
+        return threshold;
+    }
+    // Locked: lanes in their decode loop that are not suspended.
+    std::size_t running_decoders_locked(std::size_t except=kMaxLanes) const {
+        std::size_t count=0;
+        for(std::size_t i=0;i<options.max_concurrency;++i)
+            if(i!=except && lane_decoding[i] && !lane_suspended[i])++count;
+        return count;
+    }
+    // At the top of every decode round of a lane.
+    void l0_memory_gate(std::size_t lane_index,Exl3TextContext& context,cudaStream_t stream,const Request& request) {
+        if(!l0_suspend_enabled())return;
+        // One free-memory query per 20 ms across lanes (each round of each lane asks).
+        static std::atomic<std::int64_t> checked_at{0};
+        static std::atomic<std::size_t> cached_free{0};
+        const auto now_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count();
+        std::size_t free=cached_free.load(std::memory_order_relaxed);
+        if(now_ns-checked_at.load(std::memory_order_relaxed)>=20'000'000) {
+            std::size_t total=0;
+            if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return;
+            cached_free.store(free,std::memory_order_relaxed);
+            checked_at.store(now_ns,std::memory_order_relaxed);
+        }
+        if(free>=l0_suspend_threshold_bytes())return;
+        std::unique_lock lock(mutex);
+        std::size_t victim=kMaxLanes;
+        for(std::size_t i=0;i<options.max_concurrency;++i)
+            if(lane_decoding[i] && !lane_suspended[i] &&
+               (victim==kMaxLanes || lane_admission[i]>lane_admission[victim]))victim=i;
+        if(victim!=lane_index || running_decoders_locked()<2)return;
+        lane_suspended[lane_index]=true;
+        lock.unlock();
+        struct Clear {
+            Impl& engine;std::size_t lane;Exl3TextContext& context;cudaStream_t stream;
+            ~Clear() {
+                if(context.l0_codes_suspended())try {context.resume_l0_codes(stream);} catch(...) {}
+                {std::lock_guard lock(engine.mutex);engine.lane_suspended[lane]=false;}
+                engine.changed.notify_all();
+            }
+        } clear{*this,lane_index,context,stream};
+        const BatchedInactive inactive(lane_batched_verify[lane_index]);
+        // Another lane's batched round may still read these codes.
+        check(voidinfer::cuda_device_synchronize_outside_capture());
+        const auto started=Clock::now();
+        const auto released=context.suspend_l0_codes(stream);
+        checked_at.store(0,std::memory_order_relaxed); // the released bytes count from the next query
+        const double suspend_ms=std::chrono::duration<double,std::milli>(Clock::now()-started).count();
+        lock.lock();
+        changed.notify_all();
+        const auto resumable=[&] {
+            if(stopping || request.cancelled.load(std::memory_order_acquire))return true;
+            for(std::size_t i=0;i<options.max_concurrency;++i)
+                if(i!=lane_index && lane_suspended[i] && lane_admission[i]<lane_admission[lane_index])return false;
+            // The oldest suspended lane runs when no other lane decodes.
+            if(!running_decoders_locked(lane_index))return true;
+            std::size_t now=0,all=0;
+            // Above the suspension threshold by the code reserve once resumed (hysteresis).
+            return cudaMemGetInfo(&now,&all)==cudaSuccess &&
+                now>=released+l0_suspend_threshold_bytes()+l0_code_reserve_bytes();
+        };
+        while(!resumable())changed.wait_for(lock,std::chrono::milliseconds(100));
+        lock.unlock();
+        const auto waited=Clock::now();
+        context.resume_l0_codes(stream);
+        static const bool trace=std::getenv("VOIDINFER_EXL3_L0_SUSPEND_TRACE")!=nullptr;
+        if(trace)std::fprintf(stderr,"L0_SUSPEND lane=%zu rows=%d released=%.0f MiB free=%.0f MiB suspend_ms=%.1f waited_ms=%.0f resume_ms=%.1f\n",
+            lane_index,context.position(),released/1048576.0,free/1048576.0,suspend_ms,
+            std::chrono::duration<double,std::milli>(waited-started).count()-suspend_ms,
+            std::chrono::duration<double,std::milli>(Clock::now()-waited).count());
     }
     // Locked: whether `request` fits beside the other active lanes' codes.
     // Requests younger than the oldest one waiting for code memory wait as
@@ -502,6 +614,7 @@ struct Exl3EngineCore::Impl {
         return l0_codes_fit_alone_locked(request,lane_index);
     }
     bool l0_codes_fit_alone_locked(const Request& request,std::size_t lane_index) {
+        for(std::size_t i=0;i<options.max_concurrency;++i)if(lane_suspended[i])return false;
         std::uint64_t growth=0;bool any=false;
         for(std::size_t i=0;i<options.max_concurrency;++i)
             if(i!=lane_index && active[i] && lanes[i]) {
@@ -513,10 +626,7 @@ struct Exl3EngineCore::Impl {
         if(!any)return true;
         std::size_t free=0,total=0;
         if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return true;
-        static const std::uint64_t reserve=[] {
-            const char* value=std::getenv("VOIDINFER_EXL3_L0_CODE_RESERVE_MIB");
-            return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):512L)<<20;
-        }();
+        const std::uint64_t reserve=l0_code_reserve_bytes();
         // This lane's own (parked or retained) backing is reused by the request.
         const std::uint64_t own=lanes[lane_index]?lanes[lane_index]->context().l0_code_device_bytes():0;
         const std::uint64_t need=request_code_projection(request);
@@ -2728,7 +2838,18 @@ struct Exl3EngineCore::Impl {
                     }
                 } lt_report{lane_trace,lane_index,lt_lock,lt_prepare,lt_settle,lt_verify,lt_rounds,lt_begin};
                 const auto lt_ms=[](Clock::time_point from){return std::chrono::duration<double,std::milli>(Clock::now()-from).count();};
+                struct Decoding {
+                    Impl& engine;std::size_t lane;
+                    Decoding(Impl& value,std::size_t index) : engine(value),lane(index) {
+                        std::lock_guard lock(engine.mutex);engine.lane_decoding[lane]=true;
+                    }
+                    ~Decoding() {
+                        {std::lock_guard lock(engine.mutex);engine.lane_decoding[lane]=false;}
+                        engine.changed.notify_all();
+                    }
+                } decoding{*this,lane_index};
                 while(!request.cancelled && remaining) {
+                    l0_memory_gate(lane_index,*context,stream,request);
                     auto lt_mark=Clock::now();
                     std::shared_lock round_lock(coherent_prefill_mutex,std::defer_lock);
                     if(!prompt_pass_overlap)lock_round(round_lock);
@@ -3316,6 +3437,7 @@ struct Exl3EngineCore::Impl {
                         .reason=reason});
                 }
                 queue.erase(position);active[lane_index]=request;
+                lane_admission[lane_index]=next_lane_admission++;
                 lane_code_projection[lane_index]=l0_code_admission_enabled()?
                     request_code_projection(*request):0;
                 lane_frontiers[lane_index]={};

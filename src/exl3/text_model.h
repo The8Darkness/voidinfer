@@ -824,6 +824,14 @@ public:
     void park_l0_codes() noexcept;
     // Device bytes backing this context's L0 INT4 code planes (any thread).
     std::size_t l0_code_device_bytes() const noexcept;
+    // Concurrent lanes under device-memory pressure, between rounds: moves
+    // the L0 INT4 code/meta rows [0,position) to pinned host memory and
+    // returns all their device backing (returns the device bytes released).
+    // Nothing may run on this context until resume_l0_codes brought them back;
+    // the caller drains every stream that could still read them first.
+    std::size_t suspend_l0_codes(cudaStream_t stream);
+    void resume_l0_codes(cudaStream_t stream);
+    bool l0_codes_suspended() const noexcept;
     // Returns true only when a restore was submitted. A resident hit still
     // passes retirement/failed-lineage gates; callers own acquisition identity.
     bool restore_exact_host_state_if_needed(const Exl3ExactHostState& state,cudaStream_t stream=0);
