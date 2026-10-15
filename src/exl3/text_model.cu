@@ -10623,6 +10623,10 @@ void Exl3TextContext::prepare_batched_continuation_graph(std::span<Exl3TextConte
     };
     try {
         BatchBinding binding(*impl_,peer_impls,peer_rows,peer_positions,{},own_rows);
+        struct RoundNumerics {
+            RoundNumerics(){exl3_set_batched_round_numerics(true);}
+            ~RoundNumerics(){exl3_set_batched_round_numerics(false);}
+        } round_numerics;
         set_capture(true);
         graph->definition.capture(capture_stream,[&] {
             impl_->process_rows(impl_->token_ids,rows,own_position,capture_stream,nullptr,true,true,true,
@@ -10787,6 +10791,10 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
             std::span<const int>(peer_rows.data(),peers.size()),
             std::span<const int>(peer_positions.data(),peers.size()),
             std::span<const cudaStream_t>(peer_streams.data(),peers.size()),own_rows);
+        struct RoundNumerics {
+            RoundNumerics(){exl3_set_batched_round_numerics(true);}
+            ~RoundNumerics(){exl3_set_batched_round_numerics(false);}
+        } round_numerics;
         impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
             false,false,nullptr,0,kLayers,nullptr,nullptr,true);
     }

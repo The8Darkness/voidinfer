@@ -9830,6 +9830,12 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
     return true;
 }
 
+namespace {
+thread_local bool g_batched_round_numerics = false;
+}
+void exl3_set_batched_round_numerics(bool batched) noexcept { g_batched_round_numerics = batched; }
+bool exl3_batched_round_numerics() noexcept { return g_batched_round_numerics; }
+
 bool Exl3CudaLinearWorkspace::forward_merged_pair_m32(
     Exl3CudaLinearWorkspace& second_workspace,
     const Exl3CudaLinearWeights& first_weights,const Exl3CudaLinearMetadata& first_metadata,
@@ -9908,7 +9914,7 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair_m32(
         const char* value=std::getenv("VOIDINFER_EXL3_M64_FP16_ACC");
         return !value || std::strcmp(value,"0")!=0;
     }();
-    if(m_tiles==4 && m64_fp16) switch(first_metadata.K) {
+    if(m_tiles==4 && m64_fp16 && exl3_batched_round_numerics()) switch(first_metadata.K) {
     case 4: launch(exl3_gemm_m32_dual_kernel<4,4,true>,4); break;
     case 5: launch(exl3_gemm_m32_dual_kernel<5,4,true>,5); break;
     case 6: launch(exl3_gemm_m32_dual_kernel<6,4,true>,6); break;
@@ -12329,7 +12335,7 @@ static void launch_coherent_packed_partials(
                 const char* value = std::getenv("VOIDINFER_EXL3_M64_FP16_ACC");
                 return !value || std::strcmp(value, "0") != 0;
             }();
-            if (m64_fp16)
+            if (m64_fp16 && exl3_batched_round_numerics())
                 launch_coherent_packed_variant<Bits, 3, 4, 2, 4, true, 2>(stream, transformed, trellis, mul1, accum,
                     rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
             else if (m64_stages == 4)

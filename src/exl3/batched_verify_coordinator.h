@@ -9,6 +9,7 @@
 // queued work; each member resumes on its own stream after the forward. A
 // lane verifies alone when it is the only active lane or nobody joins in time.
 #include "exl3/dflash2_draft.h"
+#include "exl3/linear_cuda.h"
 #include "exl3/text_model.h"
 
 #include <cuda_runtime.h>
@@ -363,6 +364,11 @@ private:
                         check(cudaStreamWaitEvent(stream, member->ready, 0), "batched draft member order");
                     requests.push_back(&member->request);
                 }
+                // Draft rows never decide output: FP16-accumulate M64 projections.
+                struct RoundNumerics {
+                    RoundNumerics(){exl3_set_batched_round_numerics(true);}
+                    ~RoundNumerics(){exl3_set_batched_round_numerics(false);}
+                } round_numerics;
                 // Batched drafts take up to four lanes (eight with 64-row
                 // batched rounds): wider groups draft in chunks.
                 const std::size_t kDraftChunk = Exl3Dflash2DraftModel::max_batched_members();

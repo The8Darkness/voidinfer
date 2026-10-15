@@ -373,6 +373,13 @@ bool exl3_l2_prefetch_enabled();
 void exl3_l2_prefetch_fork(cudaStream_t stream,const void* data,std::size_t bytes);
 void exl3_l2_prefetch_join(cudaStream_t stream);
 
+// Batched multi-agent decode rounds (the leader's eager forward or graph
+// capture) may run their 33..64-row M64 projections with FP16 MMA
+// accumulation; every other call (exact VeriCache verify and line passes,
+// prefill) keeps FP32 accumulation. Thread-local scope flag.
+void exl3_set_batched_round_numerics(bool batched) noexcept;
+bool exl3_batched_round_numerics() noexcept;
+
 class Exl3CudaLinearWorkspace {
 public:
     explicit Exl3CudaLinearWorkspace(int max_rows = 16);
