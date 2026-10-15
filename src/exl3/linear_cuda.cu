@@ -7811,8 +7811,16 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                      impl_->mia_prefill_fp16_enabled ||
                      impl_->packed_direct_k6_enabled))
         throw std::invalid_argument("bulk down residual epilogue admission");
+    // VOIDINFER_EXL3_PREFILL_FP16_ACCUM_K5=1 (opt-in): the K5 projections
+    // accumulate in FP16 as well (K6/K7 already do). Oct 15 2026: prefill
+    // 32K 8.03 -> 7.69 s, 128K 42.83 -> 41.52 s; KL vs BF16 at 4K 0.00992 ->
+    // 0.01001 (8 fixtures), paired KL vs FP32 K5 0.0017 / 0.0023 at 4K / 16K.
+    static const bool fp16_k5=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_FP16_ACCUM_K5");
+        return value && std::strcmp(value,"1")==0;
+    }();
     const bool fp16_compute = impl_->fp16_compute_enabled &&
-        fast_fp16_destination && !fused_original && metadata.K!=5;
+        fast_fp16_destination && !fused_original && (metadata.K!=5 || fp16_k5);
     // Under the block-quantized route the FP16 transformed input is only
     // materialized if a non-quantized branch consumes it; otherwise the
     // transform is fused into activation quantization.
