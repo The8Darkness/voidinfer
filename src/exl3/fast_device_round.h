@@ -313,19 +313,31 @@ public:
         layer_major=layer_major && input.size()>=2048;
         phase_=Phase::executing;
         try {
+            static const bool trace=std::getenv("VOIDINFER_EXL3_PREFILL_TRACE")!=nullptr;
+            auto phase_mark=Clock::now();
+            double setup_ms=0,initial_ms=0,finish_ms=0;
+            const auto phase=[&](double& total) {
+                if(!trace)return;
+                (void)cudaStreamSynchronize(stream_);
+                total+=elapsed(phase_mark);
+                phase_mark=Clock::now();
+            };
             draft_.reset(stream_);
             draft_.begin_fresh_prefill(0,static_cast<long long>(input.size()),stream_);
+            phase(setup_ms);
             const int initial=layer_major?Exl3TextContext::layer_major_initial_rows():
                 static_cast<int>(std::min<std::size_t>(16,input.size()));
+            double initial_target_ms=0;
             if(initial) {
                 context_->prefill(input.first(initial),stream_);
+                phase(initial_target_ms);
                 if(layer_major && input.size()>=2064)
                     draft_.skip_fresh_prefill_block(initial,0,stream_);
                 else commit_captured(initial,0);
             }
+            phase(initial_ms);
             if(layer_major)prefill_layer_major(input);
             else {
-                static const bool trace=std::getenv("VOIDINFER_EXL3_PREFILL_TRACE")!=nullptr;
                 double target_ms=0,commit_ms=0;
                 for(std::size_t first=static_cast<std::size_t>(initial);first<input.size();) {
                     const int rows=static_cast<int>(std::min<std::size_t>(
@@ -341,9 +353,13 @@ public:
                 if(trace)std::fprintf(stderr,"FRESH_PREFILL rows=%zu target_ms=%.1f commit_ms=%.1f\n",
                     input.size(),target_ms,commit_ms);
             }
+            phase_mark=Clock::now();
             draft_.finish_fresh_prefill(stream_);
             check(poll_then_sync(stream_),
                 "fast device fresh target/draft completion");
+            phase(finish_ms);
+            if(trace)std::fprintf(stderr,"FRESH_PHASES rows=%zu setup_ms=%.1f initial_target_ms=%.1f initial_commit_ms=%.1f finish_ms=%.1f\n",
+                input.size(),setup_ms,initial_target_ms,initial_ms,finish_ms);
             phase_=Phase::unstarted;
         }catch(...) {phase_=Phase::poisoned;throw;}
     }

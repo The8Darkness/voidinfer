@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -71,8 +72,8 @@ public:
             const std::lock_guard<std::mutex> lock(mutex_);
             const std::size_t mapped = mapped_.load(std::memory_order_relaxed);
             if (mapped >= bytes) break;
-            CUmemGenericAllocationHandle handle = 0;
-            check(cuMemCreate(&handle, granularity_, &prop_, 0), "growable region create");
+            CUmemGenericAllocationHandle handle = take_pooled();
+            if (!handle) check(cuMemCreate(&handle, granularity_, &prop_, 0), "growable region create");
             const auto address = base_ + mapped;
             if (cuMemMap(address, granularity_, 0, handle, 0) != CUDA_SUCCESS) {
                 cuMemRelease(handle);
@@ -106,7 +107,7 @@ public:
             mapped -= granularity_;
             if (window_) cuMemUnmap(window_ + mapped, granularity_);
             cuMemUnmap(base_ + mapped, granularity_);
-            cuMemRelease(handles_.back());
+            give_back(handles_.back());
             handles_.pop_back();
         }
         mapped_.store(mapped, std::memory_order_release);
@@ -149,7 +150,7 @@ public:
         while (!handles_.empty()) {
             mapped -= granularity_;
             cuMemUnmap(base_ + mapped, granularity_);
-            cuMemRelease(handles_.back());
+            give_back(handles_.back());
             handles_.pop_back();
         }
         cuMemAddressFree(base_, capacity_);
@@ -163,6 +164,58 @@ public:
     std::size_t capacity_bytes() const noexcept { return capacity_; }
 
 private:
+    // Pinned host chunks released by host regions (shrink, reset) wait in a
+    // process-wide pool for the next region's growth: a fresh L0 plane set
+    // (every new conversation) then maps them instead of pinning new host
+    // memory (~2.7 GB/s; the first forward's 4096-row margin, ~260 MB, cost
+    // ~100 ms). VOIDINFER_EXL3_HOST_CHUNK_POOL_MIB (default 2048, 0 = off)
+    // bounds the pooled bytes; device regions never pool.
+    struct HostPool {
+        std::mutex mutex;
+        std::vector<CUmemGenericAllocationHandle> handles;
+        std::size_t granularity = 0;
+        CUmemLocation location{};
+    };
+    static HostPool& host_pool() {
+        static HostPool pool;
+        return pool;
+    }
+    static std::size_t host_pool_cap() {
+        static const std::size_t cap = [] {
+            const char* value = std::getenv("VOIDINFER_EXL3_HOST_CHUNK_POOL_MIB");
+            return static_cast<std::size_t>(value ? std::strtoull(value, nullptr, 10) : 2048) << 20;
+        }();
+        return cap;
+    }
+    bool host_backed() const noexcept { return prop_.location.type != CU_MEM_LOCATION_TYPE_DEVICE; }
+    bool pool_matches(const HostPool& pool) const noexcept {
+        return pool.granularity == granularity_ && pool.location.type == prop_.location.type &&
+            pool.location.id == prop_.location.id;
+    }
+    CUmemGenericAllocationHandle take_pooled() {
+        if (!host_backed()) return 0;
+        auto& pool = host_pool();
+        const std::lock_guard<std::mutex> lock(pool.mutex);
+        if (pool.handles.empty() || !pool_matches(pool)) return 0;
+        const auto handle = pool.handles.back();
+        pool.handles.pop_back();
+        return handle;
+    }
+    void give_back(CUmemGenericAllocationHandle handle) noexcept {
+        if (host_backed()) {
+            auto& pool = host_pool();
+            const std::lock_guard<std::mutex> lock(pool.mutex);
+            if (pool.handles.empty()) {
+                pool.granularity = granularity_;
+                pool.location = prop_.location;
+            }
+            if (pool_matches(pool) && (pool.handles.size() + 1) * granularity_ <= host_pool_cap()) {
+                pool.handles.push_back(handle);
+                return;
+            }
+        }
+        cuMemRelease(handle);
+    }
     static void check(CUresult result, const char* what) {
         if (result != CUDA_SUCCESS)
             throw std::runtime_error(std::string(what) + " failed (CUresult " +

@@ -3919,17 +3919,30 @@ struct Exl3TextContext::Impl {
         // An exact line writes rows its drafting context already backs and
         // keeps no INT4 codes: nothing to grow.
         if(exact_line)return;
+        static const bool trace=std::getenv("VOIDINFER_EXL3_ROW_BACKING_TRACE")!=nullptr;
+        using TraceClock=std::chrono::steady_clock;
+        auto t0=TraceClock::now();
+        const auto lap=[&](const char* what) {
+            if(!trace)return;
+            const double ms=std::chrono::duration<double,std::milli>(TraceClock::now()-t0).count();
+            if(ms>2.0)std::fprintf(stderr,"ROW_BACKING %s rows=%d ms=%.1f\n",what,rows,ms);
+            t0=TraceClock::now();
+        };
         require(suspended_code_rows<0,"L0 forward on suspended codes");
         consume_kv_rewrite();
+        lap("kv_rewrite");
         ensure_self_fp8_history();
         // Plane growth under host memory pressure spills idle histories first.
         Exl3LaneKvSource::relieve_memory_pressure(plane_growth_bytes(rows));
+        lap("pressure");
         for(auto& layer:full_layers)if(layer)layer->ensure_l0_rows(rows);
+        lap("device_rows");
         const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
         for(int layer=0;layer<kLayers;++layer) {
             if(cache_k[layer])cache_k[layer]->ensure_host_bytes(used);
             if(cache_v[layer])cache_v[layer]->ensure_host_bytes(used);
         }
+        lap("host_planes");
         const std::size_t mirror=line_fp8_bytes(rows);
         for(int layer=0;layer<kLayers;++layer)
             for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
