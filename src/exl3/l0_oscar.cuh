@@ -459,6 +459,42 @@ __host__ __device__ __forceinline__ int history_span(int end, int segments) {
     const int per = (keys + segments - 1) / segments;
     return per < 32 ? 32 : ((per + 31) / 32) * 32;
 }
+// The verifier's split of [kSink, end) when the first `light` segments also
+// run one more exact hot tile than the rest (l0_hot_cta): those take up to
+// kHotTileKeys fewer keys (an exact 32-row tile costs about as much as that
+// many INT4 keys), so every CTA finishes together. Segments stay contiguous
+// and 32-aligned, light ones first.
+#ifndef VOIDINFER_L0_HOT_TILE_KEYS
+#define VOIDINFER_L0_HOT_TILE_KEYS 128
+#endif
+constexpr int kHotTileKeys = VOIDINFER_L0_HOT_TILE_KEYS;
+struct HistorySplit {
+    int light = 0, span_light = 32, span = 32;
+    __host__ __device__ __forceinline__ int first(int segment) const {
+        return kSink + (segment < light ? segment * span_light : light * span_light + (segment - light) * span);
+    }
+    __host__ __device__ __forceinline__ int length(int segment) const { return segment < light ? span_light : span; }
+};
+__host__ __device__ __forceinline__ HistorySplit history_split(int end, int segments, int light) {
+    const int base = history_span(end, segments);
+    const int keys = end > kSink ? end - kSink : 0;
+    const int cut = light > 0 ? (kHotTileKeys < base - 32 ? kHotTileKeys : base - 32) / 32 * 32 : 0;
+    const int per = (keys + light * cut + segments - 1) / segments;
+    const int span = per < 32 ? 32 : ((per + 31) / 32) * 32;
+    HistorySplit h;
+    h.light = cut > 0 ? light : 0;
+    h.span = span;
+    h.span_light = span - cut;
+    return h;
+}
+// Segments holding history keys (a prefix of the split).
+__host__ __device__ __forceinline__ int history_live(const HistorySplit& h, int end, int segments) {
+    const int keys = end > kSink ? end - kSink : 0;
+    const int light_keys = h.light * h.span_light;
+    const int live = keys <= light_keys ? (keys + h.span_light - 1) / h.span_light :
+        h.light + (keys - light_keys + h.span - 1) / h.span;
+    return live < segments ? live : segments;
+}
 // One verifier history CTA per (segment, KV head): 42 x 4 CTAs fill the 170
 // SMs of the target GPU once.
 constexpr int kHistorySegments = 42;
