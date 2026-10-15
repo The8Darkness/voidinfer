@@ -2956,7 +2956,10 @@ struct Exl3EngineCore::Impl {
                         // A round may run past the chosen block (up to the pass
                         // limit): the overrun is verified in the same pass instead
                         // of cutting the round short at every block boundary.
-                        const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:max_block);
+                        // (The overrun limit stays the configured block: a capped
+                        // sampled block must not narrow rounds below the batched
+                        // graphs' full width near its end.)
+                        const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:vericache.block);
                         const auto width=static_cast<int>(std::min<std::size_t>(
                             {round_width_limit(),room,async_verify?
                                 static_cast<std::size_t>(std::max(kAsyncLead-round->async_lead(),
