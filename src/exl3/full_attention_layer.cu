@@ -5600,7 +5600,11 @@ __device__ __forceinline__ void mma_h(unsigned (&c)[2],const unsigned (&a)[4],
                  :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
 }
 
-constexpr int kQkHalfGroup=4;
+// FA2 prefill QK: k-steps of 16 dimensions accumulate in FP16 in groups of
+// kQkHalfGroup (8 = 128 dimensions, two FP32 adds per score; 4 until Oct 15
+// 2026): prefill 32K 7.72 -> 7.60 s, 128K 41.71 -> 41.17 s; KL vs BF16 at 4K
+// 0.01001 -> 0.00998, paired 0.0017 / 0.0018 at 4K / 16K. 16 is no faster.
+constexpr int kQkHalfGroup=8;
 __device__ __forceinline__ unsigned reg_attn_pack(half low,half high) {
     return static_cast<unsigned>(__half_as_ushort(low))|
         (static_cast<unsigned>(__half_as_ushort(high))<<16);
