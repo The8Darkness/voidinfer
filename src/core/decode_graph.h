@@ -57,6 +57,12 @@ public:
 
     void capture(cudaStream_t stream, const std::function<void()>& body);
     [[nodiscard]] bool ready() const noexcept;
+    // Nodes of the captured graph (0 when none).
+    [[nodiscard]] std::size_t node_count() const noexcept {
+        std::size_t count=0;
+        if(graph_ && cudaGraphGetNodes(graph_,nullptr,&count)!=cudaSuccess)count=0;
+        return count;
+    }
     // Caller proves final use. Failed destruction preserves the handle so its
     // enclosing resource owner can be quarantined without losing provenance.
     [[nodiscard]] cudaError_t try_reset() noexcept;

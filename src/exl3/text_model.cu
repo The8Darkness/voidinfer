@@ -10630,9 +10630,17 @@ void Exl3TextContext::prepare_batched_continuation_graph(std::span<Exl3TextConte
         });
         set_capture(false);
         graph->stack_output=impl_->last_stack_output;
+        std::size_t free_before=0,free_after=0,total=0;
+        static const bool graph_stats=std::getenv("VOIDINFER_EXL3_BATCHED_STATS")!=nullptr;
+        if(graph_stats)(void)cudaMemGetInfo(&free_before,&total);
         graph->executable.instantiate(graph->definition);
         graph->executable.upload(capture_stream);
         cuda_check(cudaStreamSynchronize(capture_stream),"prepare batched continuation graph");
+        if(graph_stats) {
+            (void)cudaMemGetInfo(&free_after,&total);
+            std::fprintf(stderr,"BATCHED_GRAPH members=%zu rows=%d nodes=%zu device_mib=%.1f\n",peers.size()+1,rows,
+                graph->definition.node_count(),(static_cast<double>(free_before)-static_cast<double>(free_after))/1048576.0);
+        }
     } catch(...) {
         set_capture(false);
         (void)cudaStreamSynchronize(capture_stream);
