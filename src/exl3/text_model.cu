@@ -11244,6 +11244,19 @@ void Exl3TextContext::restore_root(const VerifiedRoot& root,cudaStream_t stream)
     impl_->qkv_trace_valid=false;
 }
 
+void Exl3TextContext::rewind_l0_to(int position,cudaStream_t stream) {
+    require(!impl_->exact_line && position>0 && position<=position_ && !impl_->graph_capture_active &&
+            (!impl_->transaction || !impl_->transaction->active),
+            "L0 rewind needs a drafting context outside a transaction");
+    impl_->join_repair(stream);
+    impl_->kv_rows_rewritten_from(position);
+    for(auto& layer:impl_->full_layers)
+        if(layer) {
+            layer->invalidate_retained_prefix();
+            layer->l0_rewind(position,stream);
+        }
+}
+
 void Exl3TextContext::save_exact_line_root(Exl3ExactLineSlot& slot,cudaStream_t stream) const {
     require(impl_->exact_line,"exact line root needs an exact line");
     save_root(slot.state_->root,stream);

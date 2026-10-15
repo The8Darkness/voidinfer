@@ -915,7 +915,6 @@ public:
             line.save_exact_line_root(lane.root,stream_);
             lease.synced_to_root();
         }
-        context_->save_verified_root(stream_);
         draft_.save_ring_checkpoint(ring_rows,stream_);
         verified_frontier_=frontier_;
         verify_rows_=ring_rows;
@@ -1000,7 +999,6 @@ public:
            tokens.empty() || static_cast<int>(tokens.size())!=frontier_-verified_frontier_ ||
            lane_->root.position()!=line_frontier())
             throw std::logic_error("asynchronous verification launch extent");
-        context_->save_verified_root_pending(stream_);
         draft_.save_ring_checkpoint(verify_rows_,stream_,true);
         fold_tokens_=line_head_;
         fold_tokens_.insert(fold_tokens_.end(),tokens.begin(),tokens.end());
@@ -1116,7 +1114,7 @@ public:
                 if(!commit.corrected)lease.discard_pass(*lane_);
                 auto& line=lease.at_root(*lane_,*context_,context_->device_sampling());
                 if(!kept.empty()){forward_rows(line,kept,stream_);lease.ran_to_root();}
-                context_->restore_verified_root(stream_);
+                context_->rewind_l0_to(root,stream_);
                 context_->sync_exact_line_from(line,stream_,lease.fresh_outputs());
                 draft_.restore_ring_checkpoint(stream_);
                 if(!kept.empty())commit_captured(static_cast<int>(kept.size()),root);
@@ -1126,7 +1124,6 @@ public:
                     throw std::logic_error("asynchronous verification partial commit frontier");
                 line.save_exact_line_root(lane_->root,stream_);
                 lease.synced_to_root();
-                context_->save_verified_root(stream_);
                 draft_.save_ring_checkpoint(verify_rows_,stream_);
                 line_head_.clear();
                 verified_frontier_=frontier_;
@@ -1139,7 +1136,6 @@ public:
                     Exl3ExactLinePool::Lease lease(*pool_,stream_);
                     lease.accept_pass(*lane_);
                 }
-                context_->promote_verified_root_pending();
                 draft_.promote_ring_checkpoint();
                 line_head_.clear();
                 verified_frontier_+=static_cast<int>(commit.tokens.size());
@@ -1341,13 +1337,17 @@ private:
     // Correction: the line returns to its root; the drafting context re-runs
     // `tokens` (the head: kept tokens and the correction) from its root on
     // its own L0 history and re-commits them to the draft ring.
+    // The drafting context keeps no verified root of its own: it takes the
+    // line's (exact) state at the root, then re-runs the head on L0 history.
     void rewind_async(std::span<const std::int64_t> tokens) {
         const int root=async_root_;
         {
             Exl3ExactLinePool::Lease lease(*pool_,stream_);
             lease.discard_pass(*lane_);
+            auto& line=lease.at_root(*lane_,*context_,context_->device_sampling());
+            context_->rewind_l0_to(root,stream_);
+            context_->sync_exact_line_from(line,stream_);
         }
-        context_->restore_verified_root(stream_);
         forward_rows(*context_,tokens,stream_);
         draft_.restore_ring_checkpoint(stream_);
         commit_captured(static_cast<int>(tokens.size()),root);
@@ -1376,7 +1376,7 @@ private:
             const int root=line_frontier();
             auto& line=lease.at_root(*lane_,*context_,context_->device_sampling());
             if(!line_head_.empty()){forward_rows(line,line_head_,stream_);lease.ran_to_root();}
-            if(frontier_!=root)context_->restore_verified_root(stream_);
+            if(frontier_!=root)context_->rewind_l0_to(root,stream_);
             context_->sync_exact_line_from(line,stream_,lease.fresh_outputs());
             if(frontier_!=root)draft_.restore_ring_checkpoint(stream_);
             if(!line_head_.empty())commit_captured(static_cast<int>(line_head_.size()),root);

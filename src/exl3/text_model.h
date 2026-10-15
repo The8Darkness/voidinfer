@@ -1125,6 +1125,11 @@ public:
     // served another lane) its sink and window rows from that lane's planes.
     void restore_exact_line_root(const Exl3ExactLineSlot& slot, bool rebuild_window,
                                  cudaStream_t stream = nullptr);
+    // A drafting context about to take its exact line's state at `position`
+    // (sync_exact_line_from): rows from `position` on will be rewritten, and
+    // L0 aging and hot rows rewind there (restore_verified_root without its
+    // own GDN root).
+    void rewind_l0_to(int position, cudaStream_t stream = nullptr);
     // Takes `source`'s current state (GDN, L0 window, position; with
     // `outputs` also its last logits, taps and embedding rows): an exact line
     // from its drafting context, or a drafting context from its exact line.
