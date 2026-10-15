@@ -369,7 +369,9 @@ struct Exl3EngineCore::Impl {
     static int vericache_async_block() {
         static const int block=[] {
             const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC_BLOCK");
-            return value?std::clamp(std::atoi(value),1,192):64;
+            // 48 since Oct 15 (hot 256: more corrections): sampled LCB C4
+            // 98.1 vs 92.9 kept tok/s per lane (3 paired runs), C1 equal.
+            return value?std::clamp(std::atoi(value),1,192):48;
         }();
         return block;
     }
