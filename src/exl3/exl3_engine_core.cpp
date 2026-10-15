@@ -357,7 +357,7 @@ struct Exl3EngineCore::Impl {
     // Asynchronous exact VeriCache (single lane, default; VOIDINFER_EXL3_VERICACHE_ASYNC=0
     // keeps the synchronous verify pass): the line verifies a block of >= async block rows (64: one
     // FA2 row tile; the projections cost per row) while
-    // drafting runs ahead by at most kAsyncLead tokens (L0 ages rows 256+
+    // drafting runs ahead by at most async_lead_limit() tokens (L0 ages rows 256+
     // behind the frontier: they must be the line's exact ones).
     static bool vericache_async_enabled() {
         static const bool enabled=[] {
@@ -375,7 +375,15 @@ struct Exl3EngineCore::Impl {
         }();
         return block;
     }
-    static constexpr int kAsyncLead=200,kAsyncRingRows=256;
+    static constexpr int kAsyncRingRows=256;
+    // VOIDINFER_EXL3_VERICACHE_ASYNC_LEAD (16..200, default 200).
+    static int async_lead_limit() {
+        static const int lead=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC_LEAD");
+            return value?std::clamp(std::atoi(value),16,200):200;
+        }();
+        return lead;
+    }
     // One exact line per lane up to kMaxLineLanes lanes (one batched group):
     // folded or asynchronous at C1; asynchronous at C2-C4, whose line passes
     // join the ordered prompt passes. A lane verifies on its line at C1, for
@@ -2951,7 +2959,7 @@ struct Exl3EngineCore::Impl {
                     // alone: one more round then drafts a block to launch
                     // (head + one round stays inside the kAsyncRingRows checkpoint).
                     const bool async_can_draft=!terminal_seen && room &&
-                        (!async_verify || round->async_lead()<kAsyncLead || unverified.empty());
+                        (!async_verify || round->async_lead()<async_lead_limit() || unverified.empty());
                     if(async_verify) {
                         const auto rows=round->async_rows();
                         if(round->async_pending() &&
@@ -2988,7 +2996,7 @@ struct Exl3EngineCore::Impl {
                         const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:vericache.block);
                         const auto width=static_cast<int>(std::min<std::size_t>(
                             {round_width_limit(),room,async_verify?
-                                static_cast<std::size_t>(std::max(kAsyncLead-round->async_lead(),
+                                static_cast<std::size_t>(std::max(async_lead_limit()-round->async_lead(),
                                     unverified.empty()?static_cast<int>(round_width_limit()):0)):
                                 pass_limit-unverified.size()}));
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
