@@ -1747,10 +1747,24 @@ struct Exl3TextContext::Impl {
         // The worker thread makes the caller's context current (driver API).
         CUcontext context=nullptr;
         if(cuCtxGetCurrent(&context)!=CUDA_SUCCESS || !context)return;
+        // The set also backs its first forward's rows (16 + the growth
+        // margin) at its own range: binding then only mirrors those chunks
+        // into the windows instead of mapping them twice on the request path.
         next_plane_set=std::async(std::launch::async,[bytes=plane_bytes(),context] {
             if(cuCtxSetCurrent(context)!=CUDA_SUCCESS)
                 throw std::runtime_error("L0 plane set preparation context");
-            return reserve_plane_set(bytes);
+            auto set=reserve_plane_set(bytes);
+            static const bool back=[] {
+                const char* value=std::getenv("VOIDINFER_EXL3_PREPARE_PLANE_BACKING");
+                return !value || std::strcmp(value,"0")!=0;
+            }();
+            if(back) {
+                const std::size_t initial=static_cast<std::size_t>(16+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+                for(int layer=0;layer<kLayers;++layer)
+                    for(const auto& region:{set->k[layer],set->v[layer]})
+                        if(region)region->ensure(std::min(initial,bytes[layer]));
+            }
+            return set;
         });
     }
     void bind_fresh_plane_set() {

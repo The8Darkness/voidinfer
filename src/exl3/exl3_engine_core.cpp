@@ -2534,6 +2534,7 @@ struct Exl3EngineCore::Impl {
         try {
             (void)context->reset_for_request(identity.contract());
             const auto epoch=context->request_generation();
+            prefill_mark("reset");
             // Coupled sampling (sampled_select.cuh): rounds and VeriCache rows
             // share one noise stream. An unset seed (0) gets a per-request one.
             {
@@ -2559,6 +2560,7 @@ struct Exl3EngineCore::Impl {
             if(media)prepare_media_prompt(request,*context,stream);
             // VeriCache verifies against exact history: ingest the prompt exactly too.
             if(vericache.enabled)context->set_l0_exact_history(true);
+            prefill_mark("setup");
             // Conversation reuse (default; VOIDINFER_EXL3_COHERENT_ROOT_REUSE=0
             // disables): the longest retained device root whose tokens prefix
             // this input is restored (target exact state + draft ring) and only
