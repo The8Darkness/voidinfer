@@ -1032,6 +1032,24 @@ struct Exl3TextModel::Impl {
     };
     mutable std::mutex batched_head_mutex;
     mutable std::vector<std::unique_ptr<BatchedHeadSlot>> batched_head_slots;
+    // Eight-lane Engines (64 batch rows): one wider small-tier view set that
+    // every lane context's batched-round owner selects for its 33..64-row
+    // forwards (only a group of five or more lanes reaches them, so one runs
+    // at a time); each context keeps a 32-row private tier. `mutex` orders the
+    // host enqueues of successive owners, `done` follows the last use.
+    struct SharedBatchTier {
+        void* storage=nullptr;
+        Exl3SmallTierViews views;
+        cudaEvent_t done=nullptr;
+        bool recorded=false;
+        std::mutex mutex;
+        ~SharedBatchTier() {
+            if(done)(void)cudaEventDestroy(done);
+            if(storage)(void)cudaFree(storage);
+        }
+    };
+    mutable std::mutex shared_batch_tier_mutex;
+    mutable std::shared_ptr<SharedBatchTier> shared_batch_tier;
 
     TensorPayload load_tensor(const IndexedSafetensors& input, const std::string& name) {
         const auto start = std::chrono::steady_clock::now();
@@ -2016,6 +2034,11 @@ struct Exl3TextContext::Impl {
     void* small_tier_storage = nullptr;
     int small_tier_rows = 0;
     int prompt_tier_depth = 0;
+    std::shared_ptr<Exl3TextModel::Impl::SharedBatchTier> batch_tier;
+    void select_batch_tier(bool batch) {
+        for(auto& layer:full_layers)if(layer)layer->set_batch_tier(batch);
+        for(auto& layer:gdn_layers)if(layer)layer->set_batch_tier(batch);
+    }
     // suspend_l0_codes: pinned stage of the code/meta rows [0,rows) (rows -1: resident).
     std::byte* suspended_codes = nullptr;
     std::size_t suspended_code_capacity = 0;
@@ -6673,32 +6696,70 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     if(tiered) {
         // Four (eight) agents' verifier rows; the compact exact line's <= 8-row
         // forwards (its wider passes take the prompt tier).
-        const int small_rows=impl->exact_line_storage && exact_line_compact_gdn.load()?
-            static_cast<int>(Exl3GdnScratchReuseContract::line_private_history_rows):exl3_batch_rows();
-        const auto small=Exl3LinearWorkspaceRequirements::derive(17408,17408,small_rows);
-        // The widest small-tier use is the paired 16-row gate/up route (two
-        // stacked 10-partition planes) = 32-row M32 calls at 5 partitions x 4.
-        const std::size_t accumulation_bytes=small.accumulation_bytes*2;
-        const std::size_t transform_bytes=small.transformed_bytes*2;
-        const std::size_t scratch_bytes=std::max(Exl3GdnLayer::shared_scratch_bytes(small_rows),
-            Exl3FullAttentionLayer::shared_scratch_bytes(small_rows,false));
-        const std::size_t paired_accumulation_bytes=paired_up_accumulation.data?accumulation_bytes:0;
-        const std::size_t paired_transform_bytes=paired_up_transformed.data?transform_bytes:0;
+        const bool line=impl->exact_line_storage && exact_line_compact_gdn.load();
+        // Eight-lane Engines (VOIDINFER_EXL3_SHARED_BATCH_TIER=0 keeps one
+        // private 64-row tier per context): 32 private rows plus the model's
+        // shared 64-row batch views.
+        static const bool shared_batch=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_SHARED_BATCH_TIER");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        const bool split_batch=!line && shared_batch && exl3_batch_rows()>32;
+        const int small_rows=line?static_cast<int>(Exl3GdnScratchReuseContract::line_private_history_rows):
+            split_batch?32:exl3_batch_rows();
+        const bool paired_accumulation=paired_up_accumulation.data!=nullptr;
+        const bool paired_transform=paired_up_transformed.data!=nullptr;
         const auto align=[](std::size_t bytes){return (bytes+255)&~std::size_t{255};};
-        const std::size_t total=align(accumulation_bytes)+align(paired_accumulation_bytes)+
-            align(transform_bytes)+align(paired_transform_bytes)+align(scratch_bytes);
+        // One tier's views at `rows`, carved from `storage` (null: total bytes only).
+        const auto tier=[&](int rows,void* storage,Exl3SmallTierViews* out) {
+            const auto small=Exl3LinearWorkspaceRequirements::derive(17408,17408,rows);
+            // The widest small-tier use is the paired 16-row gate/up route (two
+            // stacked 10-partition planes) = 32-row M32 calls at 5 partitions x 4.
+            const std::size_t accumulation_bytes=small.accumulation_bytes*2;
+            const std::size_t transform_bytes=small.transformed_bytes*2;
+            const std::size_t scratch_bytes=std::max(Exl3GdnLayer::shared_scratch_bytes(rows),
+                Exl3FullAttentionLayer::shared_scratch_bytes(rows,false));
+            const std::size_t paired_accumulation_bytes=paired_accumulation?accumulation_bytes:0;
+            const std::size_t paired_transform_bytes=paired_transform?transform_bytes:0;
+            const std::size_t total=align(accumulation_bytes)+align(paired_accumulation_bytes)+
+                align(transform_bytes)+align(paired_transform_bytes)+align(scratch_bytes);
+            if(!out)return total;
+            auto* cursor=static_cast<std::byte*>(storage);
+            const auto carve=[&](std::size_t bytes) {auto* p=bytes?cursor:nullptr;cursor+=align(bytes);return p;};
+            out->rows=rows;
+            out->accumulation={reinterpret_cast<float*>(carve(accumulation_bytes)),accumulation_bytes};
+            out->paired_up_accumulation={reinterpret_cast<float*>(carve(paired_accumulation_bytes)),paired_accumulation_bytes};
+            out->transformed={reinterpret_cast<std::uint16_t*>(carve(transform_bytes)),transform_bytes};
+            out->paired_up_transformed={reinterpret_cast<std::uint16_t*>(carve(paired_transform_bytes)),paired_transform_bytes};
+            out->scratch={carve(scratch_bytes),scratch_bytes};
+            return total;
+        };
+        const std::size_t total=tier(small_rows,nullptr,nullptr);
         cuda_check(cudaMalloc(&impl->small_tier_storage,total),"allocate context small tier");
-        auto* cursor=static_cast<std::byte*>(impl->small_tier_storage);
-        const auto carve=[&](std::size_t bytes) {auto* p=bytes?cursor:nullptr;cursor+=align(bytes);return p;};
         Exl3SmallTierViews views;
-        views.rows=small_rows;
-        views.accumulation={reinterpret_cast<float*>(carve(accumulation_bytes)),accumulation_bytes};
-        views.paired_up_accumulation={reinterpret_cast<float*>(carve(paired_accumulation_bytes)),paired_accumulation_bytes};
-        views.transformed={reinterpret_cast<std::uint16_t*>(carve(transform_bytes)),transform_bytes};
-        views.paired_up_transformed={reinterpret_cast<std::uint16_t*>(carve(paired_transform_bytes)),paired_transform_bytes};
-        views.scratch={carve(scratch_bytes),scratch_bytes};
+        tier(small_rows,impl->small_tier_storage,&views);
         views.large_paired_up_accumulation=paired_up_accumulation.data;
         views.large_paired_up_transformed=paired_up_transformed.data;
+        Exl3SmallTierViews batch_views;
+        if(split_batch) {
+            const auto& model_impl=*impl->model;
+            std::lock_guard lock(model_impl.shared_batch_tier_mutex);
+            if(!model_impl.shared_batch_tier) {
+                auto created=std::make_shared<Exl3TextModel::Impl::SharedBatchTier>();
+                const int rows=exl3_batch_rows();
+                const std::size_t bytes=tier(rows,nullptr,nullptr);
+                cuda_check(cudaMalloc(&created->storage,bytes),"allocate shared batch tier");
+                tier(rows,created->storage,&created->views);
+                cuda_check(cudaEventCreateWithFlags(&created->done,cudaEventDisableTiming),"shared batch tier event");
+                if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE shared_batch_tier=%.1f MiB\n",bytes/1048576.0);
+                model_impl.shared_batch_tier=std::move(created);
+            }
+            impl->batch_tier=model_impl.shared_batch_tier;
+            batch_views=impl->batch_tier->views;
+            batch_views.large_paired_up_accumulation=paired_up_accumulation.data;
+            batch_views.large_paired_up_transformed=paired_up_transformed.data;
+            views.batch=&batch_views;
+        }
         for(auto& layer:impl->full_layers)if(layer)layer->enable_small_tier(views);
         for(auto& layer:impl->gdn_layers)if(layer)layer->enable_small_tier(views);
         impl->small_tier_rows=small_rows;
@@ -9333,6 +9394,34 @@ struct Exl3TextContext::PromptTierScope {
     bool active_;
 };
 
+// Selects the model's shared batch views around an owner's batched forward
+// wider than its private small tier. `fence` (eager forwards and replays, not
+// captures) holds the tier's host order and orders the stream after its last use.
+struct Exl3TextContext::BatchTierScope {
+    BatchTierScope(Impl& impl,int rows,cudaStream_t stream,bool fence)
+        : impl_(impl),stream_(stream),active_(impl.batch_tier && rows>impl.small_tier_rows),
+          fence_(active_ && fence) {
+        if(!active_)return;
+        if(fence_) {
+            lock_=std::unique_lock(impl_.batch_tier->mutex);
+            if(impl_.batch_tier->recorded)
+                cuda_check(cudaStreamWaitEvent(stream_,impl_.batch_tier->done,0),"order shared batch tier");
+        }
+        impl_.select_batch_tier(true);
+    }
+    ~BatchTierScope() {
+        if(!active_)return;
+        impl_.select_batch_tier(false);
+        if(fence_)impl_.batch_tier->recorded=cudaEventRecord(impl_.batch_tier->done,stream_)==cudaSuccess;
+    }
+    BatchTierScope(const BatchTierScope&)=delete;
+    BatchTierScope& operator=(const BatchTierScope&)=delete;
+    Impl& impl_;
+    cudaStream_t stream_;
+    bool active_,fence_;
+    std::unique_lock<std::mutex> lock_;
+};
+
 void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStream_t stream) {
     const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
     impl_->join_repair(stream);
@@ -10737,6 +10826,7 @@ void Exl3TextContext::prepare_batched_continuation_graph(std::span<Exl3TextConte
         } round_numerics;
         set_capture(true);
         graph->definition.capture(capture_stream,[&] {
+            const BatchTierScope batch_tier(*impl_,rows,capture_stream,false);
             impl_->process_rows(impl_->token_ids,rows,own_position,capture_stream,nullptr,true,true,true,
                 false,false,nullptr,0,kLayers,nullptr,nullptr,true);
         });
@@ -10868,7 +10958,10 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
         // forwards; reproduce it per agent exactly as the per-layer graphs do.
         for(std::size_t c=0;c<count_contexts;++c)
             contexts[c]->impl_->ensure_l0_rows(base_positions[c]+static_cast<int>(tokens[c].size()));
-        graph->executable.launch(stream);
+        {
+            const BatchTierScope batch_tier(*impl_,rows,stream,true);
+            graph->executable.launch(stream);
+        }
         ++batched_graph_replays_;
         impl_->last_stack_output=graph->stack_output;
         for(std::size_t c=0;c<count_contexts;++c) {
@@ -10903,6 +10996,7 @@ void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
             RoundNumerics(){exl3_set_batched_round_numerics(true);}
             ~RoundNumerics(){exl3_set_batched_round_numerics(false);}
         } round_numerics;
+        const BatchTierScope batch_tier(*impl_,rows,stream,true);
         impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
             false,false,nullptr,0,kLayers,nullptr,nullptr,true);
     }

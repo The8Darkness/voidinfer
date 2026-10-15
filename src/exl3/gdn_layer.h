@@ -630,6 +630,8 @@ public:
     // exclusive prompt/verifier passes.
     void enable_small_tier(const Exl3SmallTierViews& views);
     void set_prompt_tier(bool prompt) noexcept;
+    // Selects the shared batch views (views.batch) of the small tier.
+    void set_batch_tier(bool batch) noexcept;
     // Weights of the next layer's first projection, prefetched into L2 on a
     // side branch before this layer's down projection (M1 decode).
     void set_next_layer_prefetch(const std::uint16_t* trellis) noexcept { next_layer_prefetch_ = trellis; }
@@ -933,8 +935,14 @@ private:
     // Small tier for concurrent Engine lanes (see enable_small_tier).
     std::array<std::uint16_t*, 22> small_half_buffers_{};
     std::array<float*, 6> small_float_buffers_{};
+    std::array<std::uint16_t*, 22> batch_half_buffers_{};
+    std::array<float*, 6> batch_float_buffers_{};
+    std::array<std::size_t, 22> batch_half_buffer_bytes_{};
+    std::array<std::size_t, 6> batch_float_buffer_bytes_{};
     int small_rows_ = 0;
+    int batch_rows_ = 0;
     bool small_tier_active_ = false;
+    bool batch_tier_active_ = false;
     void* small_trace_storage_ = nullptr;
     void require_tier_rows(int rows) const;
     // Extents of the selected tier's buffers (swapped with them, set_prompt_tier).

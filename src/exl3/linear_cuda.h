@@ -137,6 +137,10 @@ struct Exl3SmallTierViews {
     const float* large_paired_up_accumulation = nullptr;
     const std::uint16_t* large_paired_up_transformed = nullptr;
     Exl3CudaLayerScratchView scratch;
+    // Eight-lane contexts: the model's shared wider views (rows > this tier's)
+    // that a batched round's owner selects for its 33..64-row forwards
+    // (Exl3TextContext batch tier scope); null keeps one private tier.
+    const Exl3SmallTierViews* batch = nullptr;
 };
 
 struct Exl3ReconstructedExactStats {
@@ -1100,6 +1104,34 @@ public:
             small_transformed_ = view.data; small_transformed_bytes_ = view.bytes;
         }
     }
+    // A wider batch tier (one model-level 64-row view set for eight-lane
+    // batched rounds, see Exl3SmallTierViews::batch): mapped like the small
+    // tier, exchanged with the active small views by swap_batch_tier.
+    void attach_batch_tier(const Exl3SmallTierViews& views) noexcept {
+        if (!accum_owned_ && accum_) {
+            const auto& view = views.large_paired_up_accumulation &&
+                accum_ == views.large_paired_up_accumulation ?
+                views.paired_up_accumulation : views.accumulation;
+            batch_accum_ = view.data; batch_accum_bytes_ = view.bytes;
+        }
+        if (!transformed_owned_ && transformed_) {
+            const auto& view = views.large_paired_up_transformed &&
+                transformed_ == views.large_paired_up_transformed ?
+                views.paired_up_transformed : views.transformed;
+            batch_transformed_ = view.data; batch_transformed_bytes_ = view.bytes;
+        }
+    }
+    // Call while the small tier is active (calls come in pairs).
+    void swap_batch_tier() noexcept {
+        if (batch_accum_) {
+            std::swap(accum_, batch_accum_);
+            std::swap(accumulation_capacity_bytes_, batch_accum_bytes_);
+        }
+        if (batch_transformed_) {
+            std::swap(transformed_, batch_transformed_);
+            std::swap(transformed_capacity_bytes_, batch_transformed_bytes_);
+        }
+    }
     // Exchanges the active views with the other tier (calls come in pairs).
     void swap_tier() noexcept {
         if (small_accum_) {
@@ -1515,6 +1547,9 @@ private:
     float* small_accum_ = nullptr;
     std::uint16_t* small_transformed_ = nullptr;
     std::size_t small_accum_bytes_ = 0, small_transformed_bytes_ = 0;
+    float* batch_accum_ = nullptr;
+    std::uint16_t* batch_transformed_ = nullptr;
+    std::size_t batch_accum_bytes_ = 0, batch_transformed_bytes_ = 0;
     const std::uint16_t* pending_residual_left_ = nullptr;
     std::uint16_t* pending_residual_out_ = nullptr;
     const std::uint16_t* pending_norm_weight_ = nullptr;

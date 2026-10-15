@@ -1389,6 +1389,7 @@ private:
     struct Impl;
     struct BatchBinding;
     struct PromptTierScope;
+    struct BatchTierScope;
     explicit Exl3TextContext(std::unique_ptr<Impl> impl);
     void reset_impl(cudaStream_t stream,bool preserve_exact_payload);
     Exl3RequestResetStats reset_for_request_impl(std::string_view contract,

@@ -750,6 +750,8 @@ public:
     // construction) is selected only around exclusive prompt/verifier passes.
     void enable_small_tier(const Exl3SmallTierViews& views);
     void set_prompt_tier(bool prompt) noexcept;
+    // Selects the shared batch views (views.batch) of the small tier.
+    void set_batch_tier(bool batch) noexcept;
 
     // Rewind L0 aging and hot rows to a verified root at `position` (VeriCache):
     // rows from history_end(position) on will be rewritten and re-encoded.
@@ -979,9 +981,12 @@ private:
     // buffers and the workspaces' small views; prompt-scale rows use the
     // (possibly shared) buffers above. TierScope selects per call.
     std::array<std::uint16_t*, 18> small_buffers_{};
+    std::array<std::uint16_t*, 18> batch_buffers_{};
     void* small_storage_ = nullptr;
     int small_rows_ = 0;
+    int batch_rows_ = 0;
     bool small_tier_active_ = false;
+    bool batch_tier_active_ = false;
     void require_tier_rows(int rows) const;
     std::array<bool, 18> buffer_owned_{};
     std::array<std::optional<Exl3LayerBufferRetirement>,18> buffer_retirements_{};

@@ -2201,9 +2201,12 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
 void Exl3GdnLayer::enable_small_tier(const Exl3SmallTierViews& views) {
     // Unbatched small-tier forwards reach min(rows, 32) rows (PromptTierScope);
     // batched ones keep only the owner's rows privately.
+    const Exl3SmallTierViews* batch=views.batch;
     if(small_rows_ || views.rows<1 ||
        std::min(views.rows,static_cast<int>(Exl3GdnScratchReuseContract::private_history_rows))>private_row_capacity_ ||
-       !views.scratch.data || views.scratch.bytes<shared_scratch_bytes(views.rows))
+       !views.scratch.data || views.scratch.bytes<shared_scratch_bytes(views.rows) ||
+       (batch && (batch->rows<=views.rows || !batch->scratch.data ||
+                  batch->scratch.bytes<shared_scratch_bytes(batch->rows))))
         throw std::invalid_argument("GDN small tier");
     // Prompt-scale transients come from the context's small scratch; retained
     // (private) buffers cover the rows above.
@@ -2223,21 +2226,57 @@ void Exl3GdnLayer::enable_small_tier(const Exl3SmallTierViews& views) {
         small_float_buffer_bytes_[i]=static_cast<std::size_t>(views.rows)*kHeads*sizeof(float);
         cursor+=small_float_buffer_bytes_[i];
     }
-    if(tiered_gdn_traces()) {
-        // Retained beta/g traces: private per layer at the small-tier rows.
-        const std::size_t bytes=static_cast<std::size_t>(views.rows)*kHeads*sizeof(float);
-        check(cudaMalloc(&small_trace_storage_,2*bytes),"allocate GDN small-tier traces");
-        small_float_buffers_[4]=static_cast<float*>(small_trace_storage_);
-        small_float_buffers_[5]=reinterpret_cast<float*>(static_cast<std::byte*>(small_trace_storage_)+bytes);
-        small_float_buffer_bytes_[4]=small_float_buffer_bytes_[5]=bytes;
+    if(batch) {
+        // The model's batch scratch holds the same transients at its rows.
+        auto* wide=static_cast<std::byte*>(batch->scratch.data);
+        batch_half_buffers_=small_half_buffers_;
+        batch_half_buffer_bytes_=small_half_buffer_bytes_;
+        for(std::size_t i=0;i<half_buffers_.size();++i) {
+            if(half_buffer_owned_[i])continue;
+            batch_half_buffers_[i]=reinterpret_cast<std::uint16_t*>(wide);
+            batch_half_buffer_bytes_[i]=static_cast<std::size_t>(batch->rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t);
+            wide+=batch_half_buffer_bytes_[i];
+        }
+        batch_float_buffers_=small_float_buffers_;
+        batch_float_buffer_bytes_=small_float_buffer_bytes_;
+        for(std::size_t i=0;i<4;++i) {
+            batch_float_buffers_[i]=reinterpret_cast<float*>(wide);
+            batch_float_buffer_bytes_[i]=static_cast<std::size_t>(batch->rows)*kHeads*sizeof(float);
+            wide+=batch_float_buffer_bytes_[i];
+        }
     }
-    for(auto* workspace:linear_workspaces_)if(workspace)workspace->attach_small_tier(views);
+    if(tiered_gdn_traces()) {
+        // Retained beta/g traces: private per layer at the widest tier's rows.
+        const int trace_rows=batch?batch->rows:views.rows;
+        const std::size_t bytes=static_cast<std::size_t>(trace_rows)*kHeads*sizeof(float);
+        check(cudaMalloc(&small_trace_storage_,2*bytes),"allocate GDN small-tier traces");
+        small_float_buffers_[4]=batch_float_buffers_[4]=static_cast<float*>(small_trace_storage_);
+        small_float_buffers_[5]=batch_float_buffers_[5]=
+            reinterpret_cast<float*>(static_cast<std::byte*>(small_trace_storage_)+bytes);
+        small_float_buffer_bytes_[4]=small_float_buffer_bytes_[5]=bytes;
+        batch_float_buffer_bytes_[4]=batch_float_buffer_bytes_[5]=bytes;
+    }
+    for(auto* workspace:linear_workspaces_)if(workspace) {
+        workspace->attach_small_tier(views);
+        if(batch)workspace->attach_batch_tier(*batch);
+    }
     small_rows_=views.rows;
+    batch_rows_=batch?batch->rows:0;
     set_prompt_tier(false);
 }
 
+void Exl3GdnLayer::set_batch_tier(bool batch) noexcept {
+    if(!batch_rows_ || !small_tier_active_ || batch==batch_tier_active_)return;
+    std::swap(half_buffers_,batch_half_buffers_);
+    std::swap(float_buffers_,batch_float_buffers_);
+    std::swap(half_buffer_bytes_,batch_half_buffer_bytes_);
+    std::swap(float_buffer_bytes_,batch_float_buffer_bytes_);
+    for(auto* workspace:linear_workspaces_)if(workspace)workspace->swap_batch_tier();
+    batch_tier_active_=batch;
+}
+
 void Exl3GdnLayer::set_prompt_tier(bool prompt) noexcept {
-    if(!small_rows_ || prompt==!small_tier_active_)return;
+    if(!small_rows_ || prompt==!small_tier_active_ || batch_tier_active_)return;
     std::swap(half_buffers_,small_half_buffers_);
     std::swap(float_buffers_,small_float_buffers_);
     std::swap(half_buffer_bytes_,small_half_buffer_bytes_);
@@ -2247,7 +2286,7 @@ void Exl3GdnLayer::set_prompt_tier(bool prompt) noexcept {
 }
 
 void Exl3GdnLayer::require_tier_rows(int rows) const {
-    if(small_tier_active_ && rows>small_rows_)
+    if(small_tier_active_ && rows>(batch_tier_active_?batch_rows_:small_rows_))
         throw std::logic_error("GDN rows exceed the small tier (prompt tier not selected)");
 }
 

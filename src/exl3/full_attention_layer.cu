@@ -7793,36 +7793,58 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
 }
 
 void Exl3FullAttentionLayer::enable_small_tier(const Exl3SmallTierViews& views) {
+    const Exl3SmallTierViews* batch=views.batch;
     if(small_storage_ || views.rows<1 || views.rows>max_rows_ || !views.scratch.data || coalesce_input_mlp_ ||
-       views.scratch.bytes<shared_scratch_bytes(views.rows,false))
+       views.scratch.bytes<shared_scratch_bytes(views.rows,false) ||
+       (batch && (batch->rows<=views.rows || batch->rows>max_rows_ || !batch->scratch.data ||
+                  batch->scratch.bytes<shared_scratch_bytes(batch->rows,false))))
         throw std::invalid_argument("full-attention small tier");
     // Rows retained across forwards (retained-prefix Q/K rotations and V)
-    // stay private; the rest share the context's small scratch.
+    // stay private (at the widest tier's rows); the rest share the context's
+    // small scratch, or the model's batch scratch for wider batched rounds.
     constexpr std::array<std::size_t,3> retained{{3,6,7}};
+    const int retained_rows=batch?batch->rows:views.rows;
     std::size_t private_bytes=0;
-    for(const auto i:retained)private_bytes+=static_cast<std::size_t>(views.rows)*kBufferFeatures[i]*sizeof(std::uint16_t);
+    for(const auto i:retained)private_bytes+=static_cast<std::size_t>(retained_rows)*kBufferFeatures[i]*sizeof(std::uint16_t);
     cuda_check(cudaMalloc(&small_storage_,private_bytes),"allocate full-attention small tier");
     auto* own=static_cast<std::byte*>(small_storage_);
     auto* shared=static_cast<std::byte*>(views.scratch.data);
+    auto* wide=batch?static_cast<std::byte*>(batch->scratch.data):nullptr;
     for(std::size_t i=0;i<kBufferFeatures.size();++i) {
-        const auto bytes=static_cast<std::size_t>(views.rows)*kBufferFeatures[i]*sizeof(std::uint16_t);
-        auto*& cursor=std::find(retained.begin(),retained.end(),i)!=retained.end()?own:shared;
-        small_buffers_[i]=reinterpret_cast<std::uint16_t*>(cursor);cursor+=bytes;
+        const auto row_bytes=static_cast<std::size_t>(kBufferFeatures[i])*sizeof(std::uint16_t);
+        if(std::find(retained.begin(),retained.end(),i)!=retained.end()) {
+            small_buffers_[i]=batch_buffers_[i]=reinterpret_cast<std::uint16_t*>(own);
+            own+=retained_rows*row_bytes;
+        } else {
+            small_buffers_[i]=reinterpret_cast<std::uint16_t*>(shared);shared+=views.rows*row_bytes;
+            if(wide){batch_buffers_[i]=reinterpret_cast<std::uint16_t*>(wide);wide+=batch->rows*row_bytes;}
+        }
     }
-    for(auto* workspace:linear_workspaces_)if(workspace)workspace->attach_small_tier(views);
+    for(auto* workspace:linear_workspaces_)if(workspace) {
+        workspace->attach_small_tier(views);
+        if(batch)workspace->attach_batch_tier(*batch);
+    }
     small_rows_=views.rows;
+    batch_rows_=batch?batch->rows:0;
     set_prompt_tier(false);
 }
 
+void Exl3FullAttentionLayer::set_batch_tier(bool batch) noexcept {
+    if(!batch_rows_ || !small_tier_active_ || batch==batch_tier_active_)return;
+    std::swap(buffers_,batch_buffers_);
+    for(auto* workspace:linear_workspaces_)if(workspace)workspace->swap_batch_tier();
+    batch_tier_active_=batch;
+}
+
 void Exl3FullAttentionLayer::set_prompt_tier(bool prompt) noexcept {
-    if(!small_rows_ || prompt==!small_tier_active_)return;
+    if(!small_rows_ || prompt==!small_tier_active_ || batch_tier_active_)return;
     std::swap(buffers_,small_buffers_);
     for(auto* workspace:linear_workspaces_)if(workspace)workspace->swap_tier();
     small_tier_active_=!prompt;
 }
 
 void Exl3FullAttentionLayer::require_tier_rows(int rows) const {
-    if(small_tier_active_ && rows>small_rows_)
+    if(small_tier_active_ && rows>(batch_tier_active_?batch_rows_:small_rows_))
         throw std::logic_error("full-attention rows exceed the small tier (prompt tier not selected)");
 }
 
