@@ -1654,6 +1654,8 @@ struct Exl3TextContext::Impl {
                 if(full_layers[layer]) {set->k[layer]=cache_k[layer]->host_region;set->v[layer]=cache_v[layer]->host_region;}
             kv_source=make_plane_source(set);
             (void)kv_source->try_bind(this);
+            prepare_next_plane_set();
+            top_up_plane_pool();
             return;
         }
         planes.cpu_visible=cpu_visible;
@@ -1662,29 +1664,97 @@ struct Exl3TextContext::Impl {
     // Binds `next` (already claimed for this context): its regions go behind
     // the plane windows; the previous set keeps its pages and becomes idle.
     void bind_plane_set(std::shared_ptr<Exl3LaneKvSource> next) {
+        static const bool trace=std::getenv("VOIDINFER_EXL3_ROW_BACKING_TRACE")!=nullptr;
+        const auto t0=std::chrono::steady_clock::now();
         auto set=std::static_pointer_cast<PlaneSet>(next->backing());
+        // ~0.4 ms per window unmap on the driver (serialized: worker threads
+        // do not help).
         for(int layer=0;layer<kLayers;++layer)
             if(full_layers[layer]) {
                 (void)cache_k[layer]->swap_backing(set->k[layer]);
                 (void)cache_v[layer]->swap_backing(set->v[layer]);
             }
+        const auto t1=std::chrono::steady_clock::now();
         if(kv_source)kv_source->unbind(this);
+        if(trace)std::fprintf(stderr,"PLANE_SET_BIND swap_ms=%.2f unbind_ms=%.2f\n",
+            std::chrono::duration<double,std::milli>(t1-t0).count(),
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t1).count());
         kv_source=std::move(next);
         ++plane_set_binds;
     }
     // A new empty plane set for a fresh conversation.
-    void bind_fresh_plane_set() {
+    // An empty plane set: one reserved host region per plane (address range
+    // only; chunks are backed as rows arrive).
+    using PlaneBytes=std::array<std::size_t,kLayers>;   // 0: no full-attention layer
+    PlaneBytes plane_bytes() const {
+        PlaneBytes bytes{};
+        for(int layer=0;layer<kLayers;++layer)if(full_layers[layer])bytes[layer]=cache_k[layer]->bytes;
+        return bytes;
+    }
+    static std::shared_ptr<PlaneSet> reserve_plane_set(const PlaneBytes& bytes) {
         auto set=std::make_shared<PlaneSet>();
         for(int layer=0;layer<kLayers;++layer)
-            if(full_layers[layer]) {
+            if(bytes[layer]) {
                 for(auto* side:{&set->k[layer],&set->v[layer]}) {
                     *side=std::make_shared<Exl3GrowableDeviceRegion>();
-                    (*side)->reserve(cache_k[layer]->bytes,true);
+                    (*side)->reserve(bytes[layer],true);
                 }
             }
+        return set;
+    }
+    // The 32 address reservations of a plane set take ~20 ms on the driver;
+    // the next fresh conversation's set is reserved off the request path
+    // (VOIDINFER_EXL3_PREPARE_PLANE_SET=0 reserves inline).
+    // A fresh set's first forward backs rows + kPlaneGrowthMarginRows of all
+    // planes; the host chunk pool is refilled to that in the background
+    // (VOIDINFER_EXL3_HOST_CHUNK_POOL_RESERVE_MIB, default 320, 0 = off).
+    void top_up_plane_pool() const {
+        static const std::size_t target=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_HOST_CHUNK_POOL_RESERVE_MIB");
+            return static_cast<std::size_t>(value?std::strtoull(value,nullptr,10):320)<<20;
+        }();
+        if(!target)return;
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer] && cache_k[layer] && cache_k[layer]->host_region) {
+                cache_k[layer]->host_region->top_up_host_pool_async(target);
+                return;
+            }
+    }
+    void prepare_next_plane_set() {
+        static const bool prepare=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_PREPARE_PLANE_SET");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        if(!prepare || next_plane_set.valid())return;
+        // The worker thread makes the caller's context current (driver API).
+        CUcontext context=nullptr;
+        if(cuCtxGetCurrent(&context)!=CUDA_SUCCESS || !context)return;
+        next_plane_set=std::async(std::launch::async,[bytes=plane_bytes(),context] {
+            if(cuCtxSetCurrent(context)!=CUDA_SUCCESS)
+                throw std::runtime_error("L0 plane set preparation context");
+            return reserve_plane_set(bytes);
+        });
+    }
+    void bind_fresh_plane_set() {
+        static const bool trace=std::getenv("VOIDINFER_EXL3_ROW_BACKING_TRACE")!=nullptr;
+        const auto t0=std::chrono::steady_clock::now();
+        std::shared_ptr<PlaneSet> set;
+        const bool prepared=next_plane_set.valid();
+        if(prepared)try{set=next_plane_set.get();}catch(...){set.reset();}
+        if(!set)set=reserve_plane_set(plane_bytes());
+        const auto t1=std::chrono::steady_clock::now();
         auto source=make_plane_source(set);
         (void)source->try_bind(this);
+        const auto t2=std::chrono::steady_clock::now();
         bind_plane_set(std::move(source));
+        prepare_next_plane_set();
+        top_up_plane_pool();
+        if(trace) {
+            const auto t3=std::chrono::steady_clock::now();
+            const auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
+            std::fprintf(stderr,"FRESH_PLANE_SET context=%p prepared=%d reserve_ms=%.2f source_ms=%.2f bind_ms=%.2f\n",
+                static_cast<const void*>(this),prepared?1:0,ms(t0,t1),ms(t1,t2),ms(t2,t3));
+        }
     }
     // Restoring a long history whose rows an idle plane set holds (the
     // agent's own set, where its last lane left it): bind that set instead of
@@ -1713,6 +1783,8 @@ struct Exl3TextContext::Impl {
         bind_plane_set(std::move(best));
     }
     std::uint64_t plane_set_binds=0;
+    // The next fresh set, reserving on a worker (std::async: destruction joins).
+    std::future<std::shared_ptr<PlaneSet>> next_plane_set;
     // Called before rows >= `row` of the L0 planes are rewritten.
     void kv_rows_rewritten_from(int row) {
         line_fp8_rewritten_from(row);
@@ -3943,6 +4015,8 @@ struct Exl3TextContext::Impl {
             if(cache_v[layer])cache_v[layer]->ensure_host_bytes(used);
         }
         lap("host_planes");
+        // Growth may have drawn on the host chunk pool: refill it off the path.
+        top_up_plane_pool();
         const std::size_t mirror=line_fp8_bytes(rows);
         for(int layer=0;layer<kLayers;++layer)
             for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})

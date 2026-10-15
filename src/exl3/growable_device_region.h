@@ -15,8 +15,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -163,6 +166,73 @@ public:
     std::size_t granularity_bytes() const noexcept { return granularity_; }
     std::size_t capacity_bytes() const noexcept { return capacity_; }
 
+    // Tops the host chunk pool up to `target` bytes (at most the pool cap) on
+    // a worker thread, with this host region's allocation properties: a fresh
+    // L0 plane set's first forward then maps pooled chunks instead of pinning
+    // ~320 MB on the request path (~2.7 GB/s). One refill runs at a time.
+    void top_up_host_pool_async(std::size_t target) const {
+        if (!host_backed() || !base_) return;
+        CUcontext context = nullptr;
+        if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || !context) return;
+        auto& pool = host_pool();
+        const std::lock_guard<std::mutex> lock(pool.mutex);
+        if (pool.refill.valid() &&
+            pool.refill.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        if (!pool.handles.empty() && !pool_matches(pool)) return;
+        const std::size_t goal = std::min(target, host_pool_cap()) / granularity_;
+        static const bool trace = std::getenv("VOIDINFER_EXL3_ROW_BACKING_TRACE") != nullptr;
+        if (pool.handles.size() >= goal) return;
+        pool.refill = std::async(std::launch::async, [prop = prop_, access = access_, granularity = granularity_,
+                                                      goal, context] {
+            if (cuCtxSetCurrent(context) != CUDA_SUCCESS) return;
+            auto& shared = host_pool();
+            const auto t0 = std::chrono::steady_clock::now();
+            std::size_t created = 0;
+            // A new chunk pays its pinning on the first mapping (~0.7 ms per
+            // 2 MiB): each one is mapped once at a scratch address here.
+            CUdeviceptr scratch = 0;
+            if (cuMemAddressReserve(&scratch, granularity, 0, 0, 0) != CUDA_SUCCESS) return;
+            struct Scratch {
+                CUdeviceptr address; std::size_t bytes;
+                ~Scratch() { cuMemAddressFree(address, bytes); }
+            } scratch_range{scratch, granularity};
+            for (;;) {
+                {
+                    const std::lock_guard<std::mutex> guard(shared.mutex);
+                    if (shared.handles.size() >= goal) {
+                        if (trace) std::fprintf(stderr, "HOST_POOL refilled created=%zu ms=%.1f\n", created,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                        return;
+                    }
+                }
+                ++created;
+                CUmemGenericAllocationHandle handle = 0;
+                if (cuMemCreate(&handle, granularity, &prop, 0) != CUDA_SUCCESS) return;
+                if (cuMemMap(scratch, granularity, 0, handle, 0) != CUDA_SUCCESS) {
+                    cuMemRelease(handle);
+                    return;
+                }
+                const bool touched = cuMemSetAccess(scratch, granularity, &access, 1) == CUDA_SUCCESS;
+                cuMemUnmap(scratch, granularity);
+                if (!touched) {
+                    cuMemRelease(handle);
+                    return;
+                }
+                const std::lock_guard<std::mutex> guard(shared.mutex);
+                if (shared.handles.empty()) {
+                    shared.granularity = granularity;
+                    shared.location = prop.location;
+                }
+                if (shared.granularity != granularity || shared.location.type != prop.location.type ||
+                    shared.location.id != prop.location.id) {
+                    cuMemRelease(handle);
+                    return;
+                }
+                shared.handles.push_back(handle);
+            }
+        });
+    }
+
 private:
     // Pinned host chunks released by host regions (shrink, reset) wait in a
     // process-wide pool for the next region's growth: a fresh L0 plane set
@@ -175,6 +245,7 @@ private:
         std::vector<CUmemGenericAllocationHandle> handles;
         std::size_t granularity = 0;
         CUmemLocation location{};
+        std::future<void> refill;
     };
     static HostPool& host_pool() {
         static HostPool pool;
