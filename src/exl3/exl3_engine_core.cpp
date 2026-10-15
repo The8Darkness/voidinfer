@@ -2786,7 +2786,15 @@ struct Exl3EngineCore::Impl {
             if(vericache.enabled) {
                 // Draft numerically ahead with L0 rounds, verify each block, then
                 // publish only verified tokens (in <= 16-token output previews).
+                // VOIDINFER_EXL3_GREEDY_LINES=1 (research): greedy requests at C2-C4 on
+                // lines too. Oct 15 (hot 256, LCB prompts): C2 4,096-token outputs
+                // +2-11% per lane, 1,024-token outputs -6%; C3/C4 neutral.
+                static const bool greedy_lines=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_GREEDY_LINES");
+                    return value && std::string_view(value)=="1";
+                }();
                 Exl3TextContext* const fold_line=options.max_concurrency==1 || context->device_sampling().temperature>0.0f ||
+                    greedy_lines ||
                     (options.max_concurrency==2 && context->position()>=kLaneLineMinContext)?
                     exact_lines[lane_index].get():nullptr;
                 const bool async_verify=fold_line && vericache_async_enabled();
