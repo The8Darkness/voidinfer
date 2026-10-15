@@ -225,9 +225,8 @@ enum class Exl3GdnHistoryStorage : std::uint8_t {
 // needed to reconstruct rejected B2/B4/B8 work remain private; the shared wide
 // slab is admitted only when no graph/rejection history can survive the call.
 struct Exl3GdnScratchReuseContract {
-    // 32, or 64 for eight-lane batched rounds (VOIDINFER_EXL3_BATCH_ROWS).
+    // A context's own small-tier rows (gdn_layer.cu private_rows_or_default).
     static constexpr std::size_t private_history_rows=32;
-    static constexpr std::size_t wide_private_history_rows=64;
     // Exact VeriCache line: its <= 8-row forwards (wider ones use the slab).
     static constexpr std::size_t line_private_history_rows=8;
     static constexpr std::size_t wide_features_per_row=26624;
@@ -255,7 +254,6 @@ struct Exl3GdnScratchReuseContract {
             private_row_capacity<=row_capacity &&
             (private_row_capacity==row_capacity ||
              ((private_row_capacity==private_history_rows ||
-               private_row_capacity==wide_private_history_rows ||
                private_row_capacity==line_private_history_rows) &&
               shared_wide_bytes>=wide_bytes_required(row_capacity)));
     }
@@ -494,9 +492,9 @@ struct Exl3GdnGraphQkvzConcurrencyView {
 struct Exl3GdnWideScratchView {
     void* data = nullptr;
     std::size_t bytes = 0;
-    // Rows the layer keeps privately beside the shared slab: 0 = one batched
-    // round's rows (VOIDINFER_EXL3_BATCH_ROWS); the exact VeriCache line, which
-    // runs no decode rounds, keeps Exl3GdnScratchReuseContract::line_private_history_rows.
+    // Rows the layer keeps privately beside the shared slab: 0 = a lane's
+    // (Exl3GdnScratchReuseContract::private_history_rows); the exact VeriCache
+    // line, which runs no decode rounds, keeps line_private_history_rows.
     int private_rows = 0;
 };
 

@@ -74,18 +74,15 @@ constexpr std::array<int,22> kHalfBufferFeatures={{kHidden,kQkv,kZ,kQkv,2048,204
     kZ,kZ,kZ,kZ,kZ,kHidden,kHidden,kHidden,kIntermediate,kIntermediate,
     kIntermediate,kHidden,kHidden,kZ}};
 constexpr std::array<std::size_t,5> kSplitHalfIndices{{3,4,5,6,9}};
-// Batched multi-agent rounds of up to four agents' verifier rows (4 x 8).
-// Private retention rows: one batched forward's rows (VOIDINFER_EXL3_BATCH_ROWS,
-// 32, or 64 for eight-lane groups; text_model.cu exl3_batch_rows).
-static int private_retention_rows() noexcept {
-    static const int rows = [] {
-        const char* value = std::getenv("VOIDINFER_EXL3_BATCH_ROWS");
-        return value && std::atoi(value) == 64 ? 64 : 32;
-    }();
-    return rows;
-}
+// Private retention rows (conv input, Q/K/V, core): a context's own rows of a
+// forward on its small tier. A batched round's owner runs its core on its own
+// <= 8 rows (peers copy theirs into their own layers, run_peer_segment), a
+// merged two-lane round writes 16 rows of conv input, and other small-tier
+// forwards reach at most 32 rows (wider ones take the prompt tier and its
+// shared wide slab). So 32 rows also with eight-lane (64-row) rounds, whose
+// all-row buffers are the small tier's transients: 154 -> 77 MiB per context.
 static int private_rows_or_default(int requested) noexcept {
-    return requested > 0 ? requested : private_retention_rows();
+    return requested > 0 ? requested : static_cast<int>(Exl3GdnScratchReuseContract::private_history_rows);
 }
 constexpr std::size_t kSplitHalfFeatures =
     static_cast<std::size_t>(kHalfBufferFeatures[3]) +
@@ -2202,11 +2199,14 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
 }
 
 void Exl3GdnLayer::enable_small_tier(const Exl3SmallTierViews& views) {
-    if(small_rows_ || views.rows<1 || views.rows>private_row_capacity_ || !views.scratch.data ||
-       views.scratch.bytes<shared_scratch_bytes(views.rows))
+    // Unbatched small-tier forwards reach min(rows, 32) rows (PromptTierScope);
+    // batched ones keep only the owner's rows privately.
+    if(small_rows_ || views.rows<1 ||
+       std::min(views.rows,static_cast<int>(Exl3GdnScratchReuseContract::private_history_rows))>private_row_capacity_ ||
+       !views.scratch.data || views.scratch.bytes<shared_scratch_bytes(views.rows))
         throw std::invalid_argument("GDN small tier");
     // Prompt-scale transients come from the context's small scratch; retained
-    // (private) buffers are already sized for the small tier.
+    // (private) buffers cover the rows above.
     auto* cursor=static_cast<std::byte*>(views.scratch.data);
     small_half_buffers_=half_buffers_;
     for(std::size_t i=0;i<half_buffers_.size();++i) {
