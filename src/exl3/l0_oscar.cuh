@@ -176,10 +176,11 @@ struct HotConfig {
     int slots = 256;                // per KV head and layer
     float log2_tau = -8.965784f;    // candidates: p > 2e-3 of the history mass
     int insert = 32;                // slots replaced per KV head and round at most
-    // Priority decay per committed token (ln units). 0.03 with 256 slots
-    // (was 0.01 for 512): sampled LCB VeriCache corrections C4 42/35 -> 22/31,
-    // C1 28/14 -> 19/17 per run, speed equal or better.
-    float lambda = 0.03f;
+    // Priority decay per committed token (ln units). 0.06 (Oct 15 sweep of
+    // 256/512/1024 slots x 0.03/0.06/0.12): with 256 slots sampled LCB C1
+    // 158 -> 172 tok/s (corrections 22 -> 3-8 per run), C4 312 -> 324-341,
+    // C8 equal; 32K LongBench equal. 0.12 is no better at any slot count.
+    float lambda = 0.06f;
 };
 inline const HotConfig& hot_config() {
     static const HotConfig value = [] {
