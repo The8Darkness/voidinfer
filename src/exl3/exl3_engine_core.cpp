@@ -850,19 +850,24 @@ struct Exl3EngineCore::Impl {
             if(!std::getenv("VOIDINFER_EXL3_BATCH_ROWS") &&
                std::min(value.max_concurrency,batched_group_lanes())*round_width_limit()>32)
                 _putenv_s("VOIDINFER_EXL3_BATCH_ROWS","64");
-            // Prompt-scale passes are exclusive across lanes: one reconstruct
-            // workspace serves every lane.
-            if(!std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
-                _putenv_s("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
-            // The default 1 KiB per-thread stack reserves ~256 MiB of local
-            // memory for every resident thread; the driver raises the limit
-            // for any kernel that needs more. VOIDINFER_EXL3_STACK_BYTES overrides.
-            {
-                const char* requested=std::getenv("VOIDINFER_EXL3_STACK_BYTES");
-                const std::size_t stack=requested?std::strtoull(requested,nullptr,10):256;
-                if(stack)(void)cudaDeviceSetLimit(cudaLimitStackSize,stack);
-            }
-
+        }
+        // Prompt-scale passes never overlap (lanes order them; at C1 the exact
+        // line and the drafting context take turns): one reconstruct workspace
+        // and one set of prompt-row planes serve every context (C1 code
+        // workload, Oct 15 2026: ~0.95 GiB more free memory, speed equal).
+        if(!std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
+            _putenv_s("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
+        // C1 keeps its verified roots on the device: in mapped host memory a
+        // root copy per verified block cost ~1.7% of decode at 4K-32K.
+        if(value.max_concurrency==1 && !std::getenv("VOIDINFER_EXL3_HOST_VERIFIED_ROOT"))
+            _putenv_s("VOIDINFER_EXL3_HOST_VERIFIED_ROOT","0");
+        // The default 1 KiB per-thread stack reserves ~256 MiB of local
+        // memory for every resident thread; the driver raises the limit
+        // for any kernel that needs more. VOIDINFER_EXL3_STACK_BYTES overrides.
+        {
+            const char* requested=std::getenv("VOIDINFER_EXL3_STACK_BYTES");
+            const std::size_t stack=requested?std::strtoull(requested,nullptr,10):256;
+            if(stack)(void)cudaDeviceSetLimit(cudaLimitStackSize,stack);
         }
         const auto flag=[](const char* name) {
             const auto* value=std::getenv(name);
