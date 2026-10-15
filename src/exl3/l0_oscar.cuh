@@ -173,14 +173,14 @@ __device__ __forceinline__ float l0_block_max(float v, float* scratch) {
 constexpr int kHotCandidates = 1024;   // per KV head and round
 constexpr int kHotMaxInsert = 64;      // per KV head and round
 struct HotConfig {
-    int slots = 256;                // per KV head and layer
+    int slots = 512;                // per KV head and layer
     float log2_tau = -8.965784f;    // candidates: p > 2e-3 of the history mass
     int insert = 32;                // slots replaced per KV head and round at most
-    // Priority decay per committed token (ln units). 0.06 (Oct 15 sweep of
-    // 256/512/1024 slots x 0.03/0.06/0.12): with 256 slots sampled LCB C1
-    // 158 -> 172 tok/s (corrections 22 -> 3-8 per run), C4 312 -> 324-341,
-    // C8 equal; 32K LongBench equal. 0.12 is no better at any slot count.
-    float lambda = 0.06f;
+    // Priority decay per committed token (ln units). 512 slots at 0.12
+    // (Oct 15 sweep of 256/512/1024 slots x 0.03/0.06/0.12): sampled LCB
+    // C1 / C4 / C8 173 / 344 / 339 tok/s vs 160 / 312 / 329 with 256 at
+    // 0.03; 0.16 GiB less free memory at C8 than 256 slots.
+    float lambda = 0.12f;
 };
 inline const HotConfig& hot_config() {
     static const HotConfig value = [] {
