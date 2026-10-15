@@ -242,7 +242,10 @@ public:
     using GrowthAdmission=std::function<std::shared_ptr<Exl3RecurrentSlab>(const Exl3RecurrentSlabLayout&,const GrowthFactory&)>;
     using BorrowAdmission=std::function<std::shared_ptr<Exl3RecurrentSlab>(const std::shared_ptr<Exl3RecurrentSlab>&)>;
 private:
-    std::array<std::shared_ptr<Exl3RecurrentSlab>,3> slots_{};
+    // Six registered slabs: each retained root borrows one, and a root without
+    // one exports to a pageable slab the resident set must VirtualLock on its
+    // admission (~144 MB, 15-50 ms of first-token time).
+    std::array<std::shared_ptr<Exl3RecurrentSlab>,6> slots_{};
     std::size_t slot_count_=0;
     GrowthAdmission admission_;
     BorrowAdmission borrow_admission_;

@@ -177,6 +177,9 @@ private:
     inline static FailedCloseStorage failed_close_storage_{};
     inline static std::atomic_bool failed_close_retained_=false;
     static constexpr std::uint64_t chunk_bytes=16ULL<<20,quota_slack=64ULL<<20;
+    // A quota change costs 4-17 ms (SetProcessWorkingSetSizeEx): the minimum
+    // grows by this much more than needed, so most admissions keep it.
+    static constexpr std::uint64_t quota_growth=256ULL<<20;
     std::uint64_t budget_,reserve_,page_=0;
     SIZE_T original_min_=0,original_max_=0,current_min_=0,current_max_=0;
     DWORD original_flags_=0,current_flags_=0;
@@ -606,10 +609,13 @@ public:
         try {
             if(added_bytes) {
                 const auto required=old_bytes+added_bytes;
-                if(required>std::numeric_limits<SIZE_T>::max()-2*quota_slack) throw std::overflow_error("resident quota overflow");
-                const SIZE_T minimum=std::max<SIZE_T>(current_min_,required+quota_slack);
+                if(required>std::numeric_limits<SIZE_T>::max()-2*quota_slack-quota_growth) throw std::overflow_error("resident quota overflow");
+                constexpr DWORD flags=QUOTA_LIMITS_HARDWS_MIN_DISABLE|QUOTA_LIMITS_HARDWS_MAX_DISABLE;
+                const SIZE_T minimum=required+quota_slack<=current_min_?current_min_:
+                    static_cast<SIZE_T>(required+quota_slack+quota_growth);
                 const SIZE_T maximum=std::max<SIZE_T>(current_max_,minimum+quota_slack);
-                set_quota(minimum,maximum,QUOTA_LIMITS_HARDWS_MIN_DISABLE|QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                if(minimum!=current_min_ || maximum!=current_max_ || flags!=current_flags_)
+                    set_quota(minimum,maximum,flags);
             }
             for(const auto& r:added) for(auto first=r.first;first<r.second;) {
                 const auto end=first+std::min<std::uint64_t>(chunk_bytes,r.second-first);

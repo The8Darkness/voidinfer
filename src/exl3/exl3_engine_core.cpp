@@ -2754,7 +2754,9 @@ struct Exl3EngineCore::Impl {
                 if(!host_lease || host_lease->ticket.request_id!=ticket.request_id)
                     throw std::logic_error("coherent-device physical/coordinator acquisition");
             }
+            prefill_mark("admit");
             draft.bind_ring_scope(host_lease->acquisition,epoch);
+            prefill_mark("ring_scope");
             // This lane's DFlash2 rounds may meet the other lane's at verification.
             struct BatchedLane {
                 Exl3BatchedVerifyCoordinator* coordinator;
@@ -2782,6 +2784,7 @@ struct Exl3EngineCore::Impl {
             round=std::make_unique<Exl3FastDeviceRound>(context,draft,
                 staging_owners[lane_index]->pointers,host_lease->acquisition,
                 epoch,false,stream);
+            prefill_mark("round");
             if(vericache.enabled)context->set_l0_exact_history(false);
             prefill_mark("coordinator");
             round->begin_prefilled();

@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1422,6 +1424,7 @@ private:
         }
         const auto required=Exl3HostResidentSet::Snapshot::descriptor_requirement(roots.size()+source_slots,range_count);
         auto fault=ResidencyFault::none;
+        double inventory_ms_trace=0;
         const auto stats=resident_.replace_reserved_snapshot(required,[&](std::uint64_t configuration) {
         if(configuration!=required.configuration)throw std::logic_error("coordinator snapshot configuration changed");
         Exl3HostResidentSet::Snapshot snapshot;
@@ -1442,8 +1445,9 @@ private:
             [&](const void* data, std::size_t bytes) {
                 if (!driver_pinned(data, bytes)) snapshot.add(data, bytes);
             }, false);
-        resident_inventory_ms_ += std::chrono::duration<double, std::milli>(
+        inventory_ms_trace = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - inventory_started).count();
+        resident_inventory_ms_ += inventory_ms_trace;
         return snapshot;
         },[&] {
         // The Engine admission seam must not be consumed by preparation-time
@@ -1459,6 +1463,11 @@ private:
                 throw std::runtime_error("injected coordinator after resident lock");
         });
         ++resident_updates_;
+        static const bool trace=std::getenv("VOIDINFER_EXL3_RESIDENT_TRACE")!=nullptr;
+        if(trace)std::fprintf(stderr,"RESIDENT_SNAPSHOT roots=%zu ranges=%zu inventory_ms=%.1f registry_ms=%.1f total_ms=%.1f new_locked=%llu unlocked=%llu\n",
+            roots.size(),range_count,inventory_ms_trace,stats.elapsed_ms,
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-inventory_started).count(),
+            static_cast<unsigned long long>(stats.new_locked_bytes),static_cast<unsigned long long>(stats.unlocked_bytes));
         resident_new_locked_bytes_ += stats.new_locked_bytes;
         resident_unlocked_bytes_ += stats.unlocked_bytes;
         resident_registry_ms_ += stats.elapsed_ms;

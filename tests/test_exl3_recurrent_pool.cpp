@@ -15,7 +15,8 @@ int main(){try{
     {
         Exl3RecurrentExportPool pool;
         auto a=pool.acquire(sizes),b=pool.acquire(sizes),c=pool.acquire(sizes);
-        need(a && b && c && !pool.acquire(sizes),"three-slot exhaustion failed");
+        auto d=pool.acquire(sizes),e=pool.acquire(sizes),f=pool.acquire(sizes);
+        need(a && b && c && d && e && f && !pool.acquire(sizes),"six-slot exhaustion failed");
         checked(cudaMemcpyAsync(a->data,source,bytes,cudaMemcpyDeviceToHost));
         checked(cudaEventRecord(a->completed));a->recorded=true;checked(cudaEventSynchronize(a->completed));
         need(reinterpret_cast<std::uint32_t*>(a->data)[bytes/4-1]==0x3f3f3f3f,"direct population failed");
@@ -29,6 +30,7 @@ int main(){try{
         need(recycled && recycled->data==address,"retired completed slot not reused");
         recycled->poisoned=true;recycled.reset();
         need(!pool.acquire(sizes),"poisoned slot reused");
+        d.reset();e.reset();f.reset();
         survivor=a;
         std::cout<<"pool allocated="<<pool.stats.allocations<<" hits="<<pool.stats.pool_hits<<" fallback="<<pool.stats.fallbacks
             <<" registration_ms="<<pool.stats.register_ms<<" allocation_ms="<<pool.stats.allocate_ms<<" lock_bytes="<<measured.locked_tensor_bytes<<"\n";
