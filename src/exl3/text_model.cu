@@ -75,6 +75,10 @@ static std::atomic<bool> exact_line_workspace_sharing{false};
 void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept {
     exact_line_workspace_sharing.store(enabled);
 }
+static std::atomic<bool> exact_line_compact_gdn{false};
+void exl3_set_exact_line_compact_gdn(bool enabled) noexcept {
+    exact_line_compact_gdn.store(enabled);
+}
 static bool exl3_exact_line_shares_prompt_workspace() {
     return exact_line_workspace_sharing.load();
 }
@@ -1304,6 +1308,24 @@ struct Exl3TextModel::Impl {
     }
 };
 
+// VeriCache root: GDN recurrent/convolution checkpoint (device, or mapped host
+// memory with concurrent lanes: l0_host_kv_plane) and frontier metadata.
+struct Exl3TextContext::VerifiedRoot {
+    std::unique_ptr<DeviceAllocation> recurrent, conv;
+    std::array<Exl3GdnLayerCheckpoint, kLayers> checkpoints{};
+    int position = -1, last_rows = 0, tap_rows = 0, embedding_rows = 0;
+};
+struct Exl3ExactLineSlot::State {
+    std::unique_ptr<Exl3TextContext::VerifiedRoot> root;
+};
+Exl3ExactLineSlot::Exl3ExactLineSlot() : state_(std::make_unique<State>()) {}
+Exl3ExactLineSlot::~Exl3ExactLineSlot() = default;
+Exl3ExactLineSlot::Exl3ExactLineSlot(Exl3ExactLineSlot&&) noexcept = default;
+Exl3ExactLineSlot& Exl3ExactLineSlot::operator=(Exl3ExactLineSlot&&) noexcept = default;
+int Exl3ExactLineSlot::position() const noexcept {
+    return state_ && state_->root ? state_->root->position : -1;
+}
+
 struct Exl3TextContext::Impl {
     Exl3GamingOptions gaming = Exl3GamingOptions::from_environment();
     GoptSubmissions gaming_submissions{};
@@ -2059,13 +2081,7 @@ struct Exl3TextContext::Impl {
     }
     // Final residual rows of the last completed layer stack (exact_row_scores).
     std::uint16_t* last_stack_output = nullptr;
-    // VeriCache verified root: device GDN recurrent/convolution checkpoint and
-    // frontier metadata, independent of the per-round transaction.
-    struct VerifiedRoot {
-        std::unique_ptr<DeviceAllocation> recurrent, conv;
-        std::array<Exl3GdnLayerCheckpoint, kLayers> checkpoints{};
-        int position = -1, last_rows = 0, tap_rows = 0, embedding_rows = 0;
-    };
+    // VeriCache verified roots, independent of the per-round transaction.
     std::unique_ptr<VerifiedRoot> verified_root;
     std::unique_ptr<VerifiedRoot> verified_root_pending;   // folded VeriCache drafting line
     // Exact line of folded VeriCache (make_exact_line): borrowed planes, no
@@ -6055,6 +6071,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     }
     if (gdn_wide_slab_enabled) {
         gdn_wide_scratch.bytes = Exl3GdnLayer::wide_scratch_bytes(impl->prefill_capacity);
+        if(impl->exact_line_storage && exact_line_compact_gdn.load())
+            gdn_wide_scratch.private_rows=static_cast<int>(Exl3GdnScratchReuseContract::line_private_history_rows);
     }
     const auto visit_shared_allocations=[&](auto&& allocate) {
         if(accumulation.bytes)allocate(accumulation.bytes,reinterpret_cast<void**>(&accumulation.data),"allocate shared target accumulation");
@@ -6203,7 +6221,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 impl->coalesce_attention_input_mlp):
             Exl3GdnLayer::workspace_bytes_required(impl->prefill_capacity,
                 accumulation.bytes!=0,transformed.bytes!=0,scratch.bytes!=0,
-                gdn_wide_scratch.bytes!=0,resident_required);
+                gdn_wide_scratch.bytes!=0,resident_required,gdn_wide_scratch.private_rows);
         // Concurrent lanes' full-attention layers may borrow every buffer.
         if(layer_requirements[layer])required_layer_group=Exl3LinearWorkspaceRequirements::append_owned_bytes(
             required_layer_group,layer_requirements[layer]);
@@ -6566,7 +6584,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(impl->persistent_bytes==expected_layer_group,"target complete layer group requirement mismatch");
     trace_stage("layers");
     if(tiered) {
-        const int small_rows=exl3_batch_rows();   // four (eight) agents' verifier rows
+        // Four (eight) agents' verifier rows; the compact exact line's <= 8-row
+        // forwards (its wider passes take the prompt tier).
+        const int small_rows=impl->exact_line_storage && exact_line_compact_gdn.load()?
+            static_cast<int>(Exl3GdnScratchReuseContract::line_private_history_rows):exl3_batch_rows();
         const auto small=Exl3LinearWorkspaceRequirements::derive(17408,17408,small_rows);
         // The widest small-tier use is the paired 16-row gate/up route (two
         // stacked 10-partition planes) = 32-row M32 calls at 5 partitions x 4.
@@ -11139,12 +11160,14 @@ void Exl3TextContext::promote_verified_root_pending() {
     std::swap(impl_->verified_root,impl_->verified_root_pending);
 }
 void Exl3TextContext::save_root_slot(bool pending,cudaStream_t stream) {
+    save_root(pending?impl_->verified_root_pending:impl_->verified_root,stream);
+}
+void Exl3TextContext::save_root(std::unique_ptr<VerifiedRoot>& slot,cudaStream_t stream) const {
     require(position_>0 && impl_->last_rows>0 && !impl_->graph_capture_active &&
             (!impl_->transaction || !impl_->transaction->active),
             "verified root needs a completed forward outside a transaction");
-    auto& slot=pending?impl_->verified_root_pending:impl_->verified_root;
     if(!slot) {
-        auto root=std::make_unique<Impl::VerifiedRoot>();
+        auto root=std::make_unique<VerifiedRoot>();
         std::size_t recurrent_bytes=0,conv_bytes=0;
         for(const auto& layer:impl_->gdn_layers) if(layer) {
             recurrent_bytes+=layer->recurrent_state_bytes();
@@ -11186,10 +11209,14 @@ void Exl3TextContext::save_root_slot(bool pending,cudaStream_t stream) {
 }
 
 void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
-    require(impl_->verified_root && impl_->verified_root->position>0 && !impl_->graph_capture_active &&
+    require(impl_->verified_root && impl_->verified_root->position>0,
+            "verified root restore needs a saved root");
+    restore_root(*impl_->verified_root,stream);
+}
+void Exl3TextContext::restore_root(const VerifiedRoot& root,cudaStream_t stream) {
+    require(root.position>0 && !impl_->graph_capture_active &&
             (!impl_->transaction || !impl_->transaction->active),
             "verified root restore needs a saved root outside a transaction");
-    auto& root=*impl_->verified_root;
     impl_->join_repair(stream);
     impl_->kv_rows_rewritten_from(root.position);
     Exl3GdnRootCopies copies;
@@ -11217,6 +11244,24 @@ void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
     impl_->qkv_trace_valid=false;
 }
 
+void Exl3TextContext::save_exact_line_root(Exl3ExactLineSlot& slot,cudaStream_t stream) const {
+    require(impl_->exact_line,"exact line root needs an exact line");
+    save_root(slot.state_->root,stream);
+}
+
+void Exl3TextContext::restore_exact_line_root(const Exl3ExactLineSlot& slot,bool rebuild_window,
+    cudaStream_t stream) {
+    require(impl_->exact_line && slot.state_->root && slot.state_->root->position>0,
+        "exact line restore needs an exact line and a saved slot");
+    const auto& root=*slot.state_->root;
+    // After another lane: sink and window rows from this lane's FP16 planes
+    // (restore_root's l0_rewind refills a small window ring).
+    if(rebuild_window)
+        for(auto& layer:impl_->full_layers)
+            if(layer)layer->l0_rebind(root.position,stream);
+    restore_root(root,stream);
+}
+
 int Exl3TextContext::verified_root_position() const noexcept {
     return impl_->verified_root?impl_->verified_root->position:-1;
 }
@@ -11226,14 +11271,21 @@ void Exl3TextContext::set_l0_exact_history(bool exact) noexcept {
 }
 
 void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
-    require(&drafting!=this && drafting.impl_->model==impl_->model,"exact line needs a drafting context of its model");
-    require(Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->host_kv.enabled && !drafting.impl_->exact_line,
+    require(Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->host_kv.enabled,
         "exact line needs L0 OSCAR contexts");
-    require(impl_->max_context==drafting.impl_->max_context,"exact line needs the drafting context's capacity");
     require(impl_->exact_line_storage,"exact line needs a context constructed as one (create_context_reserved exact_line)");
     // The line never exports exact state: no lane-backed page source.
     impl_->kv_source.reset();
     impl_->exact_line=true;
+    for(auto& layer:impl_->full_layers)
+        if(layer)layer->set_l0_exact_only(true);
+    bind_exact_line(drafting);
+}
+
+void Exl3TextContext::bind_exact_line(Exl3TextContext& drafting) {
+    require(impl_->exact_line && &drafting!=this && drafting.impl_->model==impl_->model &&
+            !drafting.impl_->exact_line,"exact line binding needs a drafting context of its model");
+    require(impl_->max_context==drafting.impl_->max_context,"exact line needs the drafting context's capacity");
     for(int layer=0;layer<kLayers;++layer) {
         if(!impl_->full_layers[layer])continue;
         require(drafting.impl_->cache_k[layer] && drafting.impl_->cache_v[layer],
@@ -11242,13 +11294,13 @@ void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
         impl_->cache_v[layer]=drafting.impl_->cache_v[layer];
         impl_->full_layers[layer]->set_kv_cache(static_cast<std::uint16_t*>(impl_->cache_k[layer]->ptr),
             static_cast<std::uint16_t*>(impl_->cache_v[layer]->ptr),impl_->max_context);
-        impl_->full_layers[layer]->set_l0_exact_only(true);
         impl_->full_layers[layer]->set_rope_map(drafting.impl_->position_device+4);
     }
     // FP8 history of the asynchronous line (VOIDINFER_EXL3_VERICACHE_LINE_FP8=1; default
     // off: the line verifies against the exact FP16 planes): half the PCIe bytes per
     // pass, 128K -4%, 254K -6% per round, but history past the window rounds to e4m3
     // (per row/head scale; KL 0.005 against FP16 history), so verification is inexact.
+    // Each drafting context owns its mirror (created on its first binding).
     static const bool line_fp8=[] {
         const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_LINE_FP8");
         return value && std::strcmp(value,"1")==0;
@@ -11256,19 +11308,23 @@ void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
     if(line_fp8) {
         auto& owner=*drafting.impl_;
         const std::size_t capacity=static_cast<std::size_t>(owner.max_context)*Impl::kLineFp8RowBytes;
+        bool created=false;
         for(int layer=0;layer<kLayers;++layer) {
             if(!impl_->full_layers[layer])continue;
-            for(auto* region:{&owner.line_fp8_k[layer],&owner.line_fp8_v[layer]}) {
-                *region=std::make_unique<Exl3GrowableDeviceRegion>();
-                (*region)->reserve(capacity,true);
+            if(!owner.line_fp8_k[layer]) {
+                for(auto* region:{&owner.line_fp8_k[layer],&owner.line_fp8_v[layer]}) {
+                    *region=std::make_unique<Exl3GrowableDeviceRegion>();
+                    (*region)->reserve(capacity,true);
+                }
+                owner.line_fp8_valid[layer].store(0);
+                created=true;
             }
-            owner.line_fp8_valid[layer].store(0);
             auto* k=owner.line_fp8_k[layer]->data<std::uint8_t>();
             auto* v=owner.line_fp8_v[layer]->data<std::uint8_t>();
             owner.full_layers[layer]->set_l0_fp8_mirror(k,v,&owner.line_fp8_valid[layer],false);
             impl_->full_layers[layer]->set_l0_fp8_mirror(k,v,&owner.line_fp8_valid[layer],true);
         }
-        owner.ensure_l0_rows(std::max(drafting.position_,0));
+        if(created)owner.ensure_l0_rows(std::max(drafting.position_,0));
     }
 }
 

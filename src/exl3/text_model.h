@@ -33,9 +33,32 @@
 namespace voidinfer::exl3 {
 
 class Exl3TextContext;
+// A lane's parked exact-line state (the Engine's one exact VeriCache line
+// verifies every lane's blocks): the line's GDN recurrent/convolution root and
+// frontier metadata at a frontier of that lane, saved and restored by
+// Exl3TextContext::save_exact_line_root / bind_exact_line. Empty until saved.
+class Exl3ExactLineSlot {
+public:
+    Exl3ExactLineSlot();
+    ~Exl3ExactLineSlot();
+    Exl3ExactLineSlot(Exl3ExactLineSlot&&) noexcept;
+    Exl3ExactLineSlot& operator=(Exl3ExactLineSlot&&) noexcept;
+    Exl3ExactLineSlot(const Exl3ExactLineSlot&) = delete;
+    Exl3ExactLineSlot& operator=(const Exl3ExactLineSlot&) = delete;
+    // Frontier of the saved root; -1 when empty.
+    int position() const noexcept;
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+    friend class Exl3TextContext;
+};
 // The Engine's single-lane exact VeriCache line shares the prompt-scale
 // workspaces with its drafting context (set before the contexts are built).
 void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept;
+// Asynchronous exact line (no decode rounds, no folded rows): its GDN layers
+// keep only the private rows of its <= 8-row forwards beside the shared wide
+// slab (set before the line is built; folded VeriCache keeps the default).
+void exl3_set_exact_line_compact_gdn(bool enabled) noexcept;
 // Small device->host readback without a copy engine (exl3_copy_async rationale:
 // the asynchronous VeriCache line's history stream occupies the copy engines
 // and a decode readback queued behind one of its pieces waits ~0.5 ms). A
@@ -1091,6 +1114,17 @@ public:
     // ring and position are its own.
     void make_exact_line(Exl3TextContext& drafting);
     bool exact_line() const noexcept;
+    // An exact line verifying another lane: reads and writes `drafting`'s FP16
+    // planes and M-RoPE map from now on (no device work, no allocation).
+    void bind_exact_line(Exl3TextContext& drafting);
+    // The line's GDN root and frontier metadata at its position, into `slot`
+    // (allocated on first use, beside the verified roots).
+    void save_exact_line_root(Exl3ExactLineSlot& slot, cudaStream_t stream = nullptr) const;
+    // The line back to `slot`'s frontier of the drafting context it is bound
+    // to: GDN state, position, and (with `rebuild_window`, after the line
+    // served another lane) its sink and window rows from that lane's planes.
+    void restore_exact_line_root(const Exl3ExactLineSlot& slot, bool rebuild_window,
+                                 cudaStream_t stream = nullptr);
     // Takes `source`'s current state (GDN, L0 window, position; with
     // `outputs` also its last logits, taps and embedding rows): an exact line
     // from its drafting context, or a drafting context from its exact line.
@@ -1359,7 +1393,13 @@ private:
     void append_prefill_impl(std::span<const std::int64_t> token_ids,
                              cudaStream_t stream, bool wide, bool exact = false);
     void canonicalize_exact_rows(cudaStream_t stream);
+    // VeriCache root: GDN recurrent/convolution checkpoint and frontier
+    // metadata (verified roots, exact-line slots).
+    struct VerifiedRoot;
     void save_root_slot(bool pending, cudaStream_t stream);
+    void save_root(std::unique_ptr<VerifiedRoot>& slot, cudaStream_t stream) const;
+    void restore_root(const VerifiedRoot& root, cudaStream_t stream);
+    friend class Exl3ExactLineSlot;
     void prepare_transaction_impl(Exl3VeriCacheServingCoordinator*,
                                   unsigned startup_fault_for_test);
     void retain_transaction_prefix_impl(int retained_rows,

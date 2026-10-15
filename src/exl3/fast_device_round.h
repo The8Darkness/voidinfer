@@ -66,6 +66,130 @@ struct Exl3VeriCacheConfig {
     }
 };
 
+// The Engine's exact VeriCache line, shared by all lanes. Line work (passes,
+// fixes, syncs) runs one at a time across lanes in the ordered passes anyway,
+// so a line per lane bought no parallelism for ~530 MiB of device memory
+// each. A lane's line state lives in its slots (mapped host memory with
+// concurrent lanes); a Lease binds the line to the lane that uses it,
+// restoring that lane's root (and its window rows) after another lane.
+//
+// The line's live state is tracked against its owner lane: at the owner's
+// root, after the owner's last pass (not saved: a later lane parks it in the
+// owner's pending slot first), or stale (a correction discarded that pass).
+class Exl3ExactLinePool {
+public:
+    struct Lane {
+        Exl3ExactLineSlot root;      // line state at the lane's line frontier
+        Exl3ExactLineSlot pending;   // after its last pass, parked by another lane
+        bool pending_parked=false;
+    };
+    explicit Exl3ExactLinePool(std::shared_ptr<Exl3TextContext> line) : line_(std::move(line)) {
+        if(!line_ || !line_->exact_line())throw std::invalid_argument("exact line pool needs an exact line");
+        if(cudaEventCreateWithFlags(&released_,cudaEventDisableTiming)!=cudaSuccess)
+            throw std::runtime_error("exact line pool event");
+    }
+    ~Exl3ExactLinePool() {if(released_)cudaEventDestroy(released_);}
+    Exl3ExactLinePool(const Exl3ExactLinePool&)=delete;
+    Exl3ExactLinePool& operator=(const Exl3ExactLinePool&)=delete;
+    // The line itself (folded VeriCache, one lane: no leases).
+    Exl3TextContext& line() noexcept {return *line_;}
+
+    // Exclusive use of the line, stream-ordered after the previous lease.
+    class Lease {
+    public:
+        Lease(Exl3ExactLinePool& pool,cudaStream_t stream) : pool_(pool),lock_(pool.mutex_),stream_(stream) {
+            if(cudaStreamWaitEvent(stream_,pool_.released_,0)!=cudaSuccess)
+                throw std::runtime_error("exact line lease wait");
+        }
+        ~Lease() {(void)cudaEventRecord(pool_.released_,stream_);}
+        Lease(const Lease&)=delete;
+        Lease& operator=(const Lease&)=delete;
+        // The line bound to `drafting` (lane `lane`), state not restored: the
+        // caller syncs it from the drafting context.
+        Exl3TextContext& bind(Lane& lane,Exl3TextContext& drafting,const Exl3DeviceSampling& sampling) {
+            take(lane,drafting,sampling);
+            pool_.holds_=Holds::other;
+            pool_.fresh_outputs_=false;
+            return *pool_.line_;
+        }
+        // The line at `lane`'s root.
+        Exl3TextContext& at_root(Lane& lane,Exl3TextContext& drafting,const Exl3DeviceSampling& sampling) {
+            const bool moved=take(lane,drafting,sampling);
+            if(moved || pool_.holds_!=Holds::root) {
+                pool_.line_->restore_exact_line_root(lane.root,moved,stream_);
+                pool_.holds_=Holds::root;
+                pool_.fresh_outputs_=false;
+            }
+            return *pool_.line_;
+        }
+        // The line ran rows for its owner past the root (a pass), or now holds
+        // the owner's root again (saved there, or a correction restored it).
+        void ran_pass() {pool_.holds_=Holds::pass;pool_.fresh_outputs_=true;}
+        void ran_to_root() {pool_.holds_=Holds::root;pool_.fresh_outputs_=true;}
+        void synced_to_root() {pool_.holds_=Holds::root;}
+        // The line still holds `lane`'s last pass (its logits are that pass's).
+        bool holds_pass_of(const Lane& lane) const noexcept {
+            return pool_.owner_==&lane && pool_.holds_==Holds::pass;
+        }
+        // The line's last logits/taps are its current state's own rows.
+        bool fresh_outputs() const noexcept {return pool_.fresh_outputs_;}
+        // Accepted block: `lane`'s pass becomes its root, saved from the line
+        // when it still holds that pass, else from its parked pending slot.
+        void accept_pass(Lane& lane) {
+            if(holds_pass_of(lane)) {
+                pool_.line_->save_exact_line_root(lane.root,stream_);
+                pool_.holds_=Holds::root;
+            } else {
+                if(!lane.pending_parked)throw std::logic_error("exact line pass neither held nor parked");
+                std::swap(lane.root,lane.pending);
+            }
+            lane.pending_parked=false;
+        }
+        // Corrected block: its pass is discarded (the root stays).
+        void discard_pass(Lane& lane) {
+            if(holds_pass_of(lane))pool_.holds_=Holds::stale;
+            lane.pending_parked=false;
+        }
+    private:
+        // Rebinds the line to `lane`, parking the previous owner's unsaved pass.
+        bool take(Lane& lane,Exl3TextContext& drafting,const Exl3DeviceSampling& sampling) {
+            auto& line=*pool_.line_;
+            const bool moved=pool_.owner_!=&lane;
+            if(moved) {
+                if(pool_.owner_ && pool_.holds_==Holds::pass) {
+                    line.save_exact_line_root(pool_.owner_->pending,stream_);
+                    pool_.owner_->pending_parked=true;
+                }
+                pool_.owner_=&lane;
+                pool_.holds_=Holds::other;
+                pool_.fresh_outputs_=false;
+            }
+            // Pointers only: the lane's current planes and M-RoPE map.
+            line.bind_exact_line(drafting);
+            // The line verifies this request's draws with the same coupled
+            // sampler (a greedy line "corrected" every sampled token).
+            line.set_device_sampling(sampling);
+            return moved;
+        }
+        Exl3ExactLinePool& pool_;
+        std::unique_lock<std::mutex> lock_;
+        cudaStream_t stream_;
+    };
+    // A lane's request ended: the line no longer belongs to it.
+    void release_lane(const Lane& lane) {
+        const std::lock_guard lock(mutex_);
+        if(owner_==&lane){owner_=nullptr;holds_=Holds::other;fresh_outputs_=false;}
+    }
+private:
+    enum class Holds {other,root,pass,stale};
+    std::mutex mutex_;
+    std::shared_ptr<Exl3TextContext> line_;
+    cudaEvent_t released_=nullptr;
+    Lane* owner_=nullptr;
+    Holds holds_=Holds::other;
+    bool fresh_outputs_=false;
+};
+
 // One physical C1 greedy request. The caller owns the five 16-row staging
 // slabs and the exclusively borrowed draft. Their lifetimes must cover finish
 // or reset. The context owner is retained so no tap or seed can outlive it.
@@ -119,6 +243,9 @@ public:
         double proposal_ms=0,verifier_ms=0,ring_commit_ms=0;
         double target_seed_ms=0,draft_api_ms=0;
         std::uint64_t verified_blocks=0,corrected_blocks=0;
+        // Shared line: last rows decided by their exact choice because another
+        // lane took the line before the next drafted token arrived.
+        std::uint64_t line_rows_unrescored=0;
         std::uint64_t accepted_checked=0,accepted_off_greedy=0;
         // VOIDINFER_EXL3_VERICACHE_STATS: synchronized step wall times.
         double restore_ms=0,forward_ms=0,scores_ms=0,fix_ms=0,commit_ms=0;
@@ -773,6 +900,29 @@ public:
         fold_armed_=false;
     }
     bool fold_active() const noexcept {return line_!=nullptr;}
+    // Asynchronous exact VeriCache on the Engine's shared line (`lane`: this
+    // lane's slots in it).
+    void begin_async_verification(Exl3ExactLinePool& pool,Exl3ExactLinePool::Lane& lane,int ring_rows) {
+        if(phase_!=Phase::ready || ring_rows<1 || ring_rows>2047)
+            throw std::logic_error("asynchronous verification begin");
+        pool_=&pool;
+        lane_=&lane;
+        {
+            const OrderedPass ordered(pass_order_,stream_);
+            Exl3ExactLinePool::Lease lease(pool,stream_);
+            auto& line=lease.bind(lane,*context_,context_->device_sampling());
+            line.sync_exact_line_from(*context_,stream_);
+            line.save_exact_line_root(lane.root,stream_);
+            lease.synced_to_root();
+        }
+        context_->save_verified_root(stream_);
+        draft_.save_ring_checkpoint(ring_rows,stream_);
+        verified_frontier_=frontier_;
+        verify_rows_=ring_rows;
+        fold_armed_=false;
+        line_head_.clear();
+        if(!async_)async_=std::make_unique<AsyncLine>();
+    }
     // The next round carries `tokens` = [verified frontier, frontier) on the line.
     void arm_fold(std::span<const std::int64_t> tokens) {
         if(phase_!=Phase::ready || !line_ || fold_armed_ || tokens.size()<2 || tokens.size()>24 ||
@@ -809,13 +959,14 @@ public:
     // End of request: the drafting context takes the line's exact state at the
     // verified frontier (drafted tokens past it are dropped).
     void end_fold() {
-        if(!line_)return;
-        if(phase_!=Phase::ready)throw std::logic_error("folded verification end");
-        if(fold_armed_){context_->set_fold_peer(nullptr,{},nullptr);fold_armed_=false;}
-        if(async_) {
+        if(pool_) {
+            if(phase_!=Phase::ready)throw std::logic_error("asynchronous verification end");
             end_async();
             return;
         }
+        if(!line_)return;
+        if(phase_!=Phase::ready)throw std::logic_error("folded verification end");
+        if(fold_armed_){context_->set_fold_peer(nullptr,{},nullptr);fold_armed_=false;}
         if(frontier_!=verified_frontier_) {
             context_->restore_verified_root(stream_);
             draft_.restore_ring_checkpoint(stream_);
@@ -827,13 +978,15 @@ public:
             throw std::logic_error("folded verification end frontier");
         line_=nullptr;
     }
-    // ===== Asynchronous exact VeriCache (one lane) =====
+    // ===== Asynchronous exact VeriCache (the Engine's shared line) =====
     // The line verifies the drafted block [verified frontier, frontier) on its
     // own stream (a worker thread) while drafting continues past it: at long
     // context the exact pass is bound by the PCIe stream of the FP16 history,
-    // which overlaps the HBM-bound drafting rounds. Same line and roots as the
-    // fold (begin_fold_verification, commit_fold, end_fold); the drafting
-    // root and draft ring checkpoint where the block ends are the pending ones.
+    // which overlaps the HBM-bound drafting rounds; with several lanes the
+    // lanes keep drafting in the batched rounds instead of leaving them for
+    // exclusive verify passes. The line's root is this lane's slot in the
+    // pool (begin_async_verification); the drafting root and draft ring
+    // checkpoint where the block ends are the pending ones.
     //
     // A correction does not re-run the history on the line: the line returns
     // to its root, the kept tokens and the exact correction (published) become
@@ -843,11 +996,10 @@ public:
     // A block ending in a terminal token is launched, settled and committed on
     // a closed round, like the synchronous verify/commit_verification.
     void launch_async(std::span<const std::int64_t> tokens,float delta) {
-        if((phase_!=Phase::ready && phase_!=Phase::closed) || !line_ || fold_armed_ || async_inflight_ || fold_commit_.pending ||
+        if((phase_!=Phase::ready && phase_!=Phase::closed) || !pool_ || async_inflight_ || fold_commit_.pending ||
            tokens.empty() || static_cast<int>(tokens.size())!=frontier_-verified_frontier_ ||
-           line_->position()!=line_frontier())
+           lane_->root.position()!=line_frontier())
             throw std::logic_error("asynchronous verification launch extent");
-        if(!async_)async_=std::make_unique<AsyncLine>();
         context_->save_verified_root_pending(stream_);
         draft_.save_ring_checkpoint(verify_rows_,stream_,true);
         fold_tokens_=line_head_;
@@ -855,7 +1007,7 @@ public:
         async_head_=line_head_.size();
         async_root_=line_frontier();
         fold_frontier_=frontier_;
-        async_->launch(*line_,fold_tokens_,delta,stream_,pass_order_);
+        async_->launch(*pool_,*lane_,*context_,fold_tokens_,async_root_,delta,stream_,pass_order_);
         async_inflight_=true;
         async_start_=Clock::now();
     }
@@ -882,17 +1034,24 @@ public:
             totals_.forward_ms+=elapsed(wait_start);
             const std::span<const std::int64_t> tokens(fold_tokens_);
             const std::size_t head=async_head_;
-            const int root=async_root_;
-            if(line_->position()!=root+static_cast<int>(tokens.size()))
-                throw std::logic_error("asynchronous verification line extent");
             std::vector<std::int64_t> next(tokens.begin()+1,tokens.end());
             next.push_back(next_token);
             // The worker scored the last row against a placeholder: rescore
-            // when the drafted next token is not the exact greedy one.
-            if(next_token>=0 && scores.back().greedy!=next_token)
-                scores=line_->exact_row_scores(next,stream_,delta);
-            else if(next_token>=0)
+            // when the drafted next token is not the exact choice, on the
+            // line's logits of that pass while it still holds them. Once
+            // another lane took the line, the exact choice replaces the
+            // drafted token (no tolerance on that one row; still exact).
+            if(next_token>=0 && scores.back().greedy!=next_token) {
+                Exl3ExactLinePool::Lease lease(*pool_,stream_);
+                if(lease.holds_pass_of(*lane_)) {
+                    scores=pool_->line().exact_row_scores(next,stream_,delta);
+                } else {
+                    scores.back().gap=std::numeric_limits<float>::infinity();
+                    ++totals_.line_rows_unrescored;
+                }
+            } else if(next_token>=0) {
                 scores.back().gap=0.0f;
+            }
             // Rows predicting published head tokens were checked before.
             VerifiedBlock result;
             std::int64_t correction=-1;
@@ -948,22 +1107,25 @@ public:
                 // The session stopped inside the block: the line runs its head
                 // and the kept prefix exactly, both lines take its state.
                 const OrderedPass ordered(pass_order_,stream_);
+                Exl3ExactLinePool::Lease lease(*pool_,stream_);
                 std::vector<std::int64_t> kept(fold_tokens_.begin(),
                     fold_tokens_.begin()+static_cast<std::ptrdiff_t>(async_head_));
                 kept.insert(kept.end(),commit.tokens.begin(),
                     commit.tokens.begin()+static_cast<std::ptrdiff_t>(retained));
                 const int root=async_root_;
-                line_->restore_verified_root(stream_);
-                if(!kept.empty())forward_rows(*line_,kept,stream_);
+                if(!commit.corrected)lease.discard_pass(*lane_);
+                auto& line=lease.at_root(*lane_,*context_,context_->device_sampling());
+                if(!kept.empty()){forward_rows(line,kept,stream_);lease.ran_to_root();}
                 context_->restore_verified_root(stream_);
-                context_->sync_exact_line_from(*line_,stream_,true);
+                context_->sync_exact_line_from(line,stream_,lease.fresh_outputs());
                 draft_.restore_ring_checkpoint(stream_);
                 if(!kept.empty())commit_captured(static_cast<int>(kept.size()),root);
                 check(poll_then_sync(stream_),"asynchronous verification partial commit");
                 frontier_=context_->position();
-                if(line_->position()!=frontier_ || draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
+                if(line.position()!=frontier_ || draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
                     throw std::logic_error("asynchronous verification partial commit frontier");
-                line_->save_verified_root(stream_);
+                line.save_exact_line_root(lane_->root,stream_);
+                lease.synced_to_root();
                 context_->save_verified_root(stream_);
                 draft_.save_ring_checkpoint(verify_rows_,stream_);
                 line_head_.clear();
@@ -973,7 +1135,10 @@ public:
                 // the head (rewind_async).
                 verified_frontier_=frontier_;
             } else {
-                line_->save_verified_root(stream_);
+                {
+                    Exl3ExactLinePool::Lease lease(*pool_,stream_);
+                    lease.accept_pass(*lane_);
+                }
                 context_->promote_verified_root_pending();
                 draft_.promote_ring_checkpoint();
                 line_head_.clear();
@@ -982,7 +1147,7 @@ public:
             phase_=Phase::ready;
         } catch(...) {phase_=Phase::poisoned;throw;}
     }
-    bool async_active() const noexcept {return async_!=nullptr;}
+    bool async_active() const noexcept {return pool_!=nullptr;}
 
     // Keeps the first `retained` verified tokens (all, or the prefix the output
     // session accepted) and moves the verified root there.
@@ -1178,40 +1343,53 @@ private:
     // its own L0 history and re-commits them to the draft ring.
     void rewind_async(std::span<const std::int64_t> tokens) {
         const int root=async_root_;
-        line_->restore_verified_root(stream_);
+        {
+            Exl3ExactLinePool::Lease lease(*pool_,stream_);
+            lease.discard_pass(*lane_);
+        }
         context_->restore_verified_root(stream_);
         forward_rows(*context_,tokens,stream_);
         draft_.restore_ring_checkpoint(stream_);
         commit_captured(static_cast<int>(tokens.size()),root);
         check(poll_then_sync(stream_),"asynchronous verification rewind");
         frontier_=context_->position();
-        if(line_->position()!=root || frontier_!=root+static_cast<int>(tokens.size()) ||
+        if(lane_->root.position()!=root || frontier_!=root+static_cast<int>(tokens.size()) ||
            draft_.ring_base_abs()+draft_.ring_count()!=frontier_)
             throw std::logic_error("asynchronous verification rewind frontier");
     }
     // End of request: the line runs any head exactly and the drafting context
     // takes its state at the published frontier.
+    // The drafting context takes the line's logits and taps only when they are
+    // its state's own rows (a line restored from the slot holds another pass's,
+    // like a restored verified root after an exclusive pass).
     void end_async() {
         if(async_inflight_) {
             // A block still in flight (cancellation): drop it.
-            async_->wait();
+            (void)async_->wait();
             async_inflight_=false;
+            Exl3ExactLinePool::Lease lease(*pool_,stream_);
+            lease.discard_pass(*lane_);
         }
-        const OrderedPass ordered(pass_order_,stream_);
-        const int root=line_frontier();
-        line_->restore_verified_root(stream_);
-        if(!line_head_.empty())forward_rows(*line_,line_head_,stream_);
-        if(frontier_!=root)context_->restore_verified_root(stream_);
-        context_->sync_exact_line_from(*line_,stream_,true);
-        if(frontier_!=root)draft_.restore_ring_checkpoint(stream_);
-        if(!line_head_.empty())commit_captured(static_cast<int>(line_head_.size()),root);
-        check(poll_then_sync(stream_),"asynchronous verification end");
-        frontier_=context_->position();
-        if(draft_.ring_base_abs()+draft_.ring_count()!=frontier_ || frontier_!=verified_frontier_ ||
-           line_->position()!=frontier_)
-            throw std::logic_error("asynchronous verification end frontier");
+        {
+            const OrderedPass ordered(pass_order_,stream_);
+            Exl3ExactLinePool::Lease lease(*pool_,stream_);
+            const int root=line_frontier();
+            auto& line=lease.at_root(*lane_,*context_,context_->device_sampling());
+            if(!line_head_.empty()){forward_rows(line,line_head_,stream_);lease.ran_to_root();}
+            if(frontier_!=root)context_->restore_verified_root(stream_);
+            context_->sync_exact_line_from(line,stream_,lease.fresh_outputs());
+            if(frontier_!=root)draft_.restore_ring_checkpoint(stream_);
+            if(!line_head_.empty())commit_captured(static_cast<int>(line_head_.size()),root);
+            check(poll_then_sync(stream_),"asynchronous verification end");
+            frontier_=context_->position();
+            if(draft_.ring_base_abs()+draft_.ring_count()!=frontier_ || frontier_!=verified_frontier_ ||
+               line.position()!=frontier_)
+                throw std::logic_error("asynchronous verification end frontier");
+        }
+        pool_->release_lane(*lane_);
         line_head_.clear();
-        line_=nullptr;
+        pool_=nullptr;
+        lane_=nullptr;
     }
     // Both lines back to the roots at the verified frontier, then `tokens`
     // exactly on the line; the drafting context takes the line's state (its
@@ -1586,12 +1764,15 @@ private:
         }
         AsyncLine(const AsyncLine&)=delete;
         AsyncLine& operator=(const AsyncLine&)=delete;
-        void launch(Exl3TextContext& line,std::span<const std::int64_t> tokens,float delta,cudaStream_t after,
-                    PassOrder* order) {
+        void launch(Exl3ExactLinePool& pool,Exl3ExactLinePool::Lane& lane,Exl3TextContext& drafting,
+                    std::span<const std::int64_t> tokens,int root,float delta,cudaStream_t after,PassOrder* order) {
             check(cudaEventRecord(fork_,after),"asynchronous verification fork");
             {
                 const std::lock_guard lock(mutex_);
-                line_=&line;
+                pool_=&pool;
+                lane_=&lane;
+                drafting_=&drafting;
+                root_=root;
                 order_=order;
                 tokens_.assign(tokens.begin(),tokens.end());
                 delta_=delta;
@@ -1616,7 +1797,10 @@ private:
                 cv_.wait(lock,[&] {return job_ || quit_;});
                 if(quit_)return;
                 job_=false;
-                Exl3TextContext& line=*line_;
+                Exl3ExactLinePool& pool=*pool_;
+                Exl3ExactLinePool::Lane& lane=*lane_;
+                Exl3TextContext& drafting=*drafting_;
+                const int root=root_;
                 const std::vector<std::int64_t> tokens=tokens_;
                 const float delta=delta_;
                 PassOrder* const order=order_;
@@ -1626,10 +1810,14 @@ private:
                 try {
                     check(cudaStreamWaitEvent(stream_,fork_,0),"asynchronous verification fork");
                     const OrderedPass ordered(order,stream_);
+                    Exl3ExactLinePool::Lease lease(pool,stream_);
+                    auto& line=lease.at_root(lane,drafting,drafting.device_sampling());
+                    if(line.position()!=root)throw std::logic_error("asynchronous verification line root");
                     forward_rows(line,tokens,stream_);
                     std::vector<std::int64_t> next(tokens.begin()+1,tokens.end());
                     next.push_back(tokens.front());
                     scores=line.exact_row_scores(next,stream_,delta);
+                    lease.ran_pass();
                 } catch(...) {error=std::current_exception();}
                 lock.lock();
                 finished_=Clock::now();
@@ -1648,7 +1836,10 @@ private:
         std::mutex mutex_;
         std::condition_variable cv_;
         bool job_=false,done_=false,quit_=false;
-        Exl3TextContext* line_=nullptr;
+        Exl3ExactLinePool* pool_=nullptr;
+        Exl3ExactLinePool::Lane* lane_=nullptr;
+        Exl3TextContext* drafting_=nullptr;
+        int root_=0;
         PassOrder* order_=nullptr;
         std::vector<std::int64_t> tokens_;
         float delta_=0.0f;
@@ -1657,6 +1848,8 @@ private:
         std::thread worker_;
     };
     std::unique_ptr<AsyncLine> async_;
+    Exl3ExactLinePool* pool_=nullptr;
+    Exl3ExactLinePool::Lane* lane_=nullptr;
     PassOrder* pass_order_=nullptr;
     bool async_inflight_=false;
     std::vector<std::int64_t> line_head_;   // published tokens the line has not run

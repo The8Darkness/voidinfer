@@ -138,10 +138,11 @@ same pass. `VOIDINFER_EXL3_VERICACHE=tolerance` accepts within 1.0 on fixed 1,02
 `=0` disables. Tokens are published only after verification, and the verified prefix becomes the next
 exact root (device GDN checkpoint plus L0 rewind).
 
-With one lane (`--max-concurrency 1`) exact verification is asynchronous: an exact line (a second
-context on the same FP16 planes with its own GDN state and window) runs each 64-token block on its
-own stream from a worker thread while DFlash2 keeps drafting past it, so the PCIe history stream
-overlaps the HBM-bound decode rounds. A correction rewinds drafting to the verified root (L0 re-run,
+Exact verification is asynchronous on an exact line (a second context on the lane's FP16 planes
+with its own GDN state and window): it runs each 48-token block on its own stream from a worker
+thread while DFlash2 keeps drafting past it, so the PCIe history stream overlaps the HBM-bound decode
+rounds. One line serves every lane (sampled requests with several lanes; every request with one):
+a lane taking the line restores its parked root from host memory. A correction rewinds drafting to the verified root (L0 re-run,
 no history stream); the kept tokens and the exact replacement lead the next block on the line. Waits
 on that path poll instead of blocking in the driver (a blocked call holds the WDDM context lock and
 stalls the other thread). `VOIDINFER_EXL3_VERICACHE_ASYNC=0` restores the synchronous pass. DFlash2
@@ -197,10 +198,10 @@ verification trees, and the CUDA 13.3 / VS 2026 toolchain move. The full commit 
   `VOIDINFER_EXL3_L0_CODE_BITS=2` stores the history as INT2 codes instead (9.2 instead of 17.4 KiB per
   token on the device): published tokens stay exact, but about 4x more VeriCache corrections cost
   40-50% of decode speed (32K, 1 / 4 / 8 lanes: 93 / 33 / 23 vs 170 / 54 / 45 tok/s per lane).
-* With one lane, verification runs on an asynchronous exact line over the FP16 history;
+* Verification runs on an asynchronous exact line over the FP16 history (one line shared by all
+  lanes; greedy requests with three or more lanes use exclusive passes);
   `VOIDINFER_EXL3_VERICACHE_LINE_FP8=1` reads history beyond the recent window through an FP8 e4m3
-  mirror instead (6-10% faster at 128K-254K, KL 0.005 against FP16 history). With several lanes,
-  verification passes are exclusive and use FP16 history.
+  mirror instead (6-10% faster at 128K-254K, KL 0.005 against FP16 history).
 * Speed gaps to NInfer (2026-10-12): prefill 1.3–1.8×, base decode 1.2×, batched concurrency 1.3–1.4×,
   single-request DFlash2 at 16K–64K 1.1–1.3×, agent resume 2.2×, image requests 1.4–1.6×.
 * The public Engine route is DFlash2-only; base decode is measured on the target-only route.

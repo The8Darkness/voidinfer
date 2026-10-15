@@ -84,6 +84,9 @@ static int private_retention_rows() noexcept {
     }();
     return rows;
 }
+static int private_rows_or_default(int requested) noexcept {
+    return requested > 0 ? requested : private_retention_rows();
+}
 constexpr std::size_t kSplitHalfFeatures =
     static_cast<std::size_t>(kHalfBufferFeatures[3]) +
     static_cast<std::size_t>(kHalfBufferFeatures[4]) +
@@ -1875,7 +1878,7 @@ std::size_t Exl3GdnLayer::fixed_owner_metadata_bytes() const noexcept {
     return bytes;
 }
 std::size_t Exl3GdnLayer::workspace_bytes_required(int rows,bool borrowed_accumulation,
-    bool borrowed_transform,bool borrowed_scratch,bool split_wide,bool resident) {
+    bool borrowed_transform,bool borrowed_scratch,bool split_wide,bool resident,int private_rows) {
     if(rows<=0 || rows>1024)throw std::invalid_argument("EXL3 GDN max_rows must be 1..1024");
     std::size_t bytes=0;
     const auto add=[&](std::size_t extent) {
@@ -1887,7 +1890,7 @@ std::size_t Exl3GdnLayer::workspace_bytes_required(int rows,bool borrowed_accumu
             borrowed_transform,borrowed_accumulation).owned_bytes);
     for(std::size_t i=0;i<kHalfBufferFeatures.size();++i) {
         if(borrowed_scratch && transient_half(i))continue;
-        const auto extent_rows=split_wide && is_split_half(i)?std::min(rows,private_retention_rows()):rows;
+        const auto extent_rows=split_wide && is_split_half(i)?std::min(rows,private_rows_or_default(private_rows)):rows;
         add(static_cast<std::size_t>(extent_rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t));
     }
     add(static_cast<std::size_t>(rows)*(borrowed_scratch?(tiered_gdn_traces()?0:2):6)*kHeads*sizeof(float));
@@ -2052,7 +2055,7 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
         throw std::invalid_argument("GDN wide scratch capacity");
     split_wide_storage_ = wide_scratch.data != nullptr;
     private_row_capacity_ = split_wide_storage_
-        ? std::min(max_rows_, private_retention_rows()) : max_rows_;
+        ? std::min(max_rows_, private_rows_or_default(wide_scratch.private_rows)) : max_rows_;
     scratch_reuse_={static_cast<std::size_t>(max_rows_),
         static_cast<std::size_t>(private_row_capacity_),scratch.bytes,
         wide_scratch.bytes};
@@ -2088,7 +2091,8 @@ Exl3GdnLayer::Exl3GdnLayer(const Exl3GdnLayerWeights& weights, int max_rows,
     }
     std::array<std::size_t,kHalfBufferFeatures.size()> half_bytes{};
     const auto required_workspace_bytes=workspace_bytes_required(max_rows_,accumulation.data!=nullptr,
-        transformed.data!=nullptr,scratch.data!=nullptr,split_wide_storage_,prefill_resident_ || gaming_[Gopt::GdnSmallResident]);
+        transformed.data!=nullptr,scratch.data!=nullptr,split_wide_storage_,prefill_resident_ || gaming_[Gopt::GdnSmallResident],
+        wide_scratch.private_rows);
     for(std::size_t i=0;i<half_bytes.size();++i) {
         const auto rows=split_wide_storage_ && is_split_half(i)?private_row_capacity_:max_rows_;
         half_bytes[i]=static_cast<std::size_t>(rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t);

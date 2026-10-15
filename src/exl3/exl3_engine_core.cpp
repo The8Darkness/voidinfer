@@ -343,9 +343,18 @@ struct Exl3EngineCore::Impl {
     std::unique_ptr<Exl3DenseVision> dense_vision;
     std::array<std::shared_ptr<ExecutionStream>,kMaxLanes> streams;
     std::array<std::shared_ptr<Exl3Dflash2DraftModel>,kMaxLanes> drafts;
-    // Folded exact VeriCache (one lane, VOIDINFER_EXL3_VERICACHE_FOLD=1): the
-    // lane's exact line verifies blocks inside its decode rounds.
-    std::array<std::shared_ptr<Exl3TextContext>,kMaxLanes> exact_lines;
+    // The exact VeriCache line, shared by every lane (Exl3ExactLinePool), and
+    // each lane's slots in it. Folded VeriCache (one lane,
+    // VOIDINFER_EXL3_VERICACHE_FOLD=1) verifies blocks on it inside the decode
+    // rounds.
+    // VOIDINFER_EXL3_VERICACHE_LINES (1..lanes, default 1) lines; lane i
+    // verifies on line i % lines.
+    std::vector<std::unique_ptr<Exl3ExactLinePool>> exact_line_pools;
+    std::array<Exl3ExactLinePool::Lane,kMaxLanes> exact_line_slots;
+    static std::uint32_t exact_line_count(std::uint32_t lanes) {
+        const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_LINES");
+        return static_cast<std::uint32_t>(std::clamp(value?std::atoi(value):1,1,static_cast<int>(lanes)));
+    }
     static bool vericache_fold_enabled() {
         static const bool enabled=[] {
             const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_FOLD");
@@ -384,26 +393,31 @@ struct Exl3EngineCore::Impl {
         }();
         return lead;
     }
-    // One exact line per lane up to kMaxLineLanes lanes (one batched group):
-    // folded or asynchronous at C1; asynchronous at C2-C4, whose line passes
-    // join the ordered prompt passes. A lane verifies on its line at C1, for
-    // every sampled request, and at C2 for greedy requests of at least
-    // kLaneLineMinContext tokens; other requests verify in exclusive passes.
+    // One exact line for all lanes (Exl3ExactLinePool): folded or asynchronous
+    // at C1; asynchronous at C2-C8, whose line passes join the ordered prompt
+    // passes. A lane verifies on the line at C1, for every sampled request,
+    // and at C2 for greedy requests of at least kLaneLineMinContext tokens;
+    // other requests verify in exclusive passes. One line instead of one per
+    // lane (~530 MiB device memory each): line passes run one at a time
+    // across lanes anyway; a lane taking the line after another restores its
+    // parked root (mapped host memory) and window rows.
     // Greedy (exact code, 1,024 tokens, HTTP C2: 16K 157 vs 115 tok/s, 31K 131
     // vs 115; 4K 198 vs 242, where the batched rounds leave the device no room
     // for a line; C4 4K 338 vs 346, 31K 172 vs 193): rare corrections, the
     // 256+-row exclusive blocks are cheaper. Sampled (T 1.0, LCB prompts, C4):
     // L0 flips one sampled token per ~150-500 past the exact window, so a
     // 256-row exclusive block keeps ~2.3 tokens per round against 3.15 on the
-    // line: 4K 313 vs 279, 12K 282 vs 222, 24K 244 vs 180 tok/s. Lines cost
-    // one context of device memory each (~540 MiB at 40K: no INT4 meta planes
-    // or hot rows), so C4 still admits four 32K-output requests at 40K.
+    // line: 4K 313 vs 279, 12K 282 vs 222, 24K 244 vs 180 tok/s. The shared
+    // line (no INT4 meta planes or hot rows, 8-row private GDN/small tier) costs
+    // ~320 MiB at C8; sampled LCB 4,096 tokens vs a line per lane / exclusive
+    // passes: C2 135 vs 135 kept tok/s per lane (+0.41 GiB free), C4 341 vs 335
+    // tok/s (+1.22 GiB), C5 345 vs 324, C6 355 vs 270, C7 361 vs 360, C8 360 vs
+    // 324 (corrections ~24 vs ~77 per 16 requests).
     static constexpr int kLaneLineMinContext=12288;
-    static constexpr std::uint32_t kMaxLineLanes=4;
     bool exact_line_planned(const EngineOptions& value) const {
         return
             (value.max_concurrency==1?vericache_fold_enabled() || vericache_async_enabled():
-                value.max_concurrency<=kMaxLineLanes && vericache_async_enabled() && prompt_pass_overlap) &&
+                vericache_async_enabled() && prompt_pass_overlap) &&
             Exl3NativeContextExtent::l0_oscar_enabled() && Exl3VeriCacheConfig::get().enabled &&
             Exl3VeriCacheConfig::get().delta<0.5f;
     }
@@ -814,6 +828,7 @@ struct Exl3EngineCore::Impl {
         {
             const bool line=exact_line_planned(value);
             exl3_set_exact_line_workspace_sharing(line);
+            exl3_set_exact_line_compact_gdn(line && vericache_async_enabled());
             voidinfer::cuda_set_poll_waits(line && vericache_async_enabled());
         }
         require_coherent_device_profile(value);
@@ -2065,14 +2080,14 @@ struct Exl3EngineCore::Impl {
             std::fputc(10,stderr);
         }
         if(exact_line_planned(value))
-            for(std::uint32_t i=0;i<value.max_concurrency;++i) {
+            for(std::uint32_t i=0;i<exact_line_count(value.max_concurrency);++i) {
                 // Eager only: graphs captured at construction would keep the
                 // line's own planes, which make_exact_line replaces.
-                auto line=target->create_context_reserved(coordinator,true,0,false,false,true);
+                std::shared_ptr<Exl3TextContext> line=target->create_context_reserved(coordinator,true,0,false,false,true);
                 line->make_exact_line(*lanes[i]->context_owner_for_device_round());
                 line->prepare_continuation_reserved(coordinator,kFoldRows,0);
                 line->bind_request_compatibility("exact-line");
-                exact_lines[i]=std::move(line);
+                exact_line_pools.push_back(std::make_unique<Exl3ExactLinePool>(std::move(line)));
             }
         // The overlapped GDN retained-prefix repair (side stream) corrupts
         // recurrent state under concurrent lanes (VeriCache corrections with
@@ -2803,13 +2818,16 @@ struct Exl3EngineCore::Impl {
                     const char* value=std::getenv("VOIDINFER_EXL3_GREEDY_LINES");
                     return value && std::string_view(value)=="1";
                 }();
-                Exl3TextContext* const fold_line=options.max_concurrency==1 || context->device_sampling().temperature>0.0f ||
-                    greedy_lines ||
-                    (options.max_concurrency==2 && context->position()>=kLaneLineMinContext)?
-                    exact_lines[lane_index].get():nullptr;
+                Exl3ExactLinePool* const line_pool=exact_line_pools.empty()?nullptr:
+                    exact_line_pools[lane_index%exact_line_pools.size()].get();
+                const bool fold_line=line_pool &&
+                    (options.max_concurrency==1 || context->device_sampling().temperature>0.0f || greedy_lines ||
+                     (options.max_concurrency==2 && context->position()>=kLaneLineMinContext));
                 const bool async_verify=fold_line && vericache_async_enabled();
                 round->set_pass_order(fold_line && options.max_concurrency>1?&line_pass_order:nullptr);
-                if(fold_line)round->begin_fold_verification(*fold_line,async_verify?kAsyncRingRows:kFoldRingRows);
+                if(async_verify)
+                    round->begin_async_verification(*line_pool,exact_line_slots[lane_index],kAsyncRingRows);
+                else if(fold_line)round->begin_fold_verification(line_pool->line(),kFoldRingRows);
                 else round->begin_verification(vericache.block);
                 // Draft length per request (VeriCache paper, Fig. 8 / Alg. 1): the
                 // block that maximizes expected kept tokens per unit time from
@@ -3187,7 +3205,7 @@ struct Exl3EngineCore::Impl {
                     const auto& t=round->totals();
                     std::fprintf(stderr,"VERICACHE blocks=%llu corrected=%llu verify_ms=%.1f block=%d delta=%.3f "
                         "checked=%llu off_greedy=%llu mean_gap=%.5f max_gap=%.4f "
-                        "restore_ms=%.1f forward_ms=%.1f scores_ms=%.1f fix_ms=%.1f commit_ms=%.1f\n",
+                        "restore_ms=%.1f forward_ms=%.1f scores_ms=%.1f fix_ms=%.1f commit_ms=%.1f unrescored=%llu\n",
                         static_cast<unsigned long long>(t.verified_blocks),
                         static_cast<unsigned long long>(t.corrected_blocks),t.verify_ms,
                         vericache.block,vericache.delta,
@@ -3195,7 +3213,7 @@ struct Exl3EngineCore::Impl {
                         static_cast<unsigned long long>(t.accepted_off_greedy),
                         t.accepted_checked?t.accepted_gap_sum/static_cast<double>(t.accepted_checked):0.0,
                         static_cast<double>(t.max_accepted_gap),t.restore_ms,t.forward_ms,t.scores_ms,
-                        t.fix_ms,t.commit_ms);
+                        t.fix_ms,t.commit_ms,static_cast<unsigned long long>(t.line_rows_unrescored));
                     std::fprintf(stderr,"VERICACHE_GAPS over>0=%llu >0.125=%llu >0.25=%llu >0.5=%llu >1=%llu >2=%llu\n",
                         static_cast<unsigned long long>(t.accepted_gap_over[0]),
                         static_cast<unsigned long long>(t.accepted_gap_over[1]),

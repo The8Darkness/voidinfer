@@ -34,9 +34,12 @@ flowchart LR
    8 rows) per lane. Rejected rows roll back exactly (device KV transactions with checkpoint graphs,
    retained-prefix GDN repair).
 5. **VeriCache**: drafted tokens are published only after an exact pass rescored them against FP16
-   history streamed from host memory. With one lane the pass runs asynchronously on an exact line (a
-   second context on the same planes, its own GDN state and stream). With several lanes passes are
-   exclusive.
+   history streamed from host memory. The pass runs asynchronously on the exact line (a second
+   context on the lane's planes with its own GDN state and stream) while the lane keeps drafting: for
+   every request with one lane, for sampled requests with several lanes (greedy ones from 12K tokens
+   at two lanes). One line serves all lanes (`Exl3ExactLinePool`): each lane parks the line's GDN
+   root in its own host slots and a lane taking the line restores its root and window rows. Other
+   requests verify in exclusive passes.
 6. **Publication and reuse**: the verified prefix becomes the next exact root (device GDN checkpoint
    plus L0 rewind). A finished conversation's root keeps its plane set; a follow-up turn resumes by
    remapping that set behind the lane's window. Media prompts neither reuse nor publish roots.

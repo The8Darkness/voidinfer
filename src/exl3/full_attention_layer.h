@@ -754,6 +754,10 @@ public:
     // Rewind L0 aging and hot rows to a verified root at `position` (VeriCache):
     // rows from history_end(position) on will be rewritten and re-encoded.
     void l0_rewind(int position, cudaStream_t stream);
+    // Exact line moved to another lane's planes: its sink rows (and a full-size
+    // window ring, which l0_rewind leaves alone) from those planes, aging state
+    // cleared; the l0_rewind of the restored root follows.
+    void l0_rebind(int position, cudaStream_t stream);
     // K/V cache rows an accepted sibling carries into its chain slot.
     void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,
                                    int destination) const;

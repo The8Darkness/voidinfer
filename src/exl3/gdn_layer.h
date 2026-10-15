@@ -228,6 +228,8 @@ struct Exl3GdnScratchReuseContract {
     // 32, or 64 for eight-lane batched rounds (VOIDINFER_EXL3_BATCH_ROWS).
     static constexpr std::size_t private_history_rows=32;
     static constexpr std::size_t wide_private_history_rows=64;
+    // Exact VeriCache line: its <= 8-row forwards (wider ones use the slab).
+    static constexpr std::size_t line_private_history_rows=8;
     static constexpr std::size_t wide_features_per_row=26624;
     std::size_t row_capacity = 0;
     std::size_t private_row_capacity = 0;
@@ -253,7 +255,8 @@ struct Exl3GdnScratchReuseContract {
             private_row_capacity<=row_capacity &&
             (private_row_capacity==row_capacity ||
              ((private_row_capacity==private_history_rows ||
-               private_row_capacity==wide_private_history_rows) &&
+               private_row_capacity==wide_private_history_rows ||
+               private_row_capacity==line_private_history_rows) &&
               shared_wide_bytes>=wide_bytes_required(row_capacity)));
     }
     Exl3GdnHistoryStorage history_storage(
@@ -491,6 +494,10 @@ struct Exl3GdnGraphQkvzConcurrencyView {
 struct Exl3GdnWideScratchView {
     void* data = nullptr;
     std::size_t bytes = 0;
+    // Rows the layer keeps privately beside the shared slab: 0 = one batched
+    // round's rows (VOIDINFER_EXL3_BATCH_ROWS); the exact VeriCache line, which
+    // runs no decode rounds, keeps Exl3GdnScratchReuseContract::line_private_history_rows.
+    int private_rows = 0;
 };
 
 // Device copies of one GDN layer's verified-root save or restore (null
@@ -844,7 +851,8 @@ public:
         return result;
     }
     static std::size_t workspace_bytes_required(int rows,bool borrowed_accumulation,
-        bool borrowed_transform,bool borrowed_scratch,bool split_wide,bool resident);
+        bool borrowed_transform,bool borrowed_scratch,bool split_wide,bool resident,
+        int private_rows = 0);
     static constexpr std::size_t kStateElements = Exl3GdnRecurrentLayout::recurrent_elements;
     static constexpr std::size_t kStateBytes = Exl3GdnRecurrentLayout::recurrent_bytes;
     static constexpr std::size_t kConvStateElements = Exl3GdnRecurrentLayout::convolution_history_elements;

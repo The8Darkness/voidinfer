@@ -8180,6 +8180,20 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
     }
 }
 
+void Exl3FullAttentionLayer::l0_rebind(int position, cudaStream_t stream) {
+    if(!l0_.k_ring || position<=0) return;
+    if(l0_ring_rows_<l0_oscar::kRingRows) {
+        constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim*sizeof(std::uint16_t);
+        const int sink=std::min(position,l0_oscar::kSink);
+        cuda_check(cudaMemcpyAsync(l0_.k_sink,k_cache_,sink*row,cudaMemcpyDefault,stream),"L0 line sink rebind");
+        cuda_check(cudaMemcpyAsync(l0_.v_sink,v_cache_,sink*row,cudaMemcpyDefault,stream),"L0 line sink rebind");
+        cuda_check(cudaMemsetAsync(l0_.state,0,2*sizeof(int),stream),"L0 line state rebind");
+    } else {
+        l0_refresh_window(position,stream);
+    }
+    invalidate_retained_prefix();
+}
+
 void Exl3FullAttentionLayer::l0_rewind(int position, cudaStream_t stream) {
     if(!l0_.k_codes) return;
     // An exact line keeps no hot rows (its hot arrays were never initialized).

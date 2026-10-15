@@ -556,8 +556,9 @@ The server owns one resident Engine with `--max-concurrency` lanes (`1..8`). Eve
 batches all decode-ready lanes into one DFlash2 round: the draft proposes seven tokens per lane and
 one target pass verifies every lane's rows. A lane is admitted only when its L0 history codes fit in
 free VRAM; a request that does not fit waits in FIFO order instead of oversubscribing device memory.
-With one lane, exact verification runs asynchronously on a second exact context (the exact line);
-with several lanes, verification passes are exclusive.
+Exact verification runs asynchronously on a second exact context (the exact line), shared by all
+lanes: every request with one lane, sampled requests with several lanes. Other requests verify in
+exclusive passes.
 
 `--max-pending-requests` bounds the requests waiting behind the active lanes. The total request
 capacity is `max_concurrency + max_pending_requests`, including requests still in CPU/media
