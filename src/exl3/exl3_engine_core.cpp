@@ -2882,6 +2882,16 @@ struct Exl3EngineCore::Impl {
                     const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_SAMPLED_BLOCK");
                     return value?std::clamp(std::atoi(value),16,1024):256;
                 }();
+                // First verify block of a request (VOIDINFER_EXL3_VERICACHE_FIRST_BLOCK,
+                // default 32 rows on exclusive passes, 16 on lines; 0 = off): tokens are
+                // published only after verification, so a 256+-row first block held
+                // the first token for seconds at C5-C8.
+                static const int first_block_setting=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_FIRST_BLOCK");
+                    return value?std::clamp(std::atoi(value),0,1024):32;
+                }();
+                const int first_block=fold_line?(first_block_setting?std::min(first_block_setting,16):0):
+                    first_block_setting;
                 const int max_block=!fold_line && context->device_sampling().temperature>0.0f?
                     std::min(vericache.block,sampled_block):vericache.block;
                 int block_now=fold_line?kFoldBlock:
@@ -2953,14 +2963,20 @@ struct Exl3EngineCore::Impl {
                                 async_tail_terminal=terminal_seen;
                             }
                         } else if(!round->async_pending() && !unverified.empty() &&
-                                  (unverified.size()>=static_cast<std::size_t>(vericache_async_block()) ||
+                                  (unverified.size()>=static_cast<std::size_t>(committed.empty() && first_block?
+                                       std::min(first_block,vericache_async_block()):vericache_async_block()) ||
                                    !async_can_draft)) {
                             round->launch_async(unverified,vericache.delta);
                             continue;
                         }
                     }
+                    // Nothing published yet: the first verify block is short
+                    // (time to first token; the block policy's cost fit skips it).
+                    const bool first_pass=!fold_line && first_block && committed.empty();
+                    const std::size_t verify_at=first_pass?
+                        std::min<std::size_t>(block,static_cast<std::size_t>(first_block)):block;
                     if(async_verify?!async_block && async_can_draft:
-                       !terminal_seen && room && unverified.size()<block) {
+                       !terminal_seen && room && unverified.size()<verify_at) {
                         // A round may run past the chosen block (up to the pass
                         // limit): the overrun is verified in the same pass instead
                         // of cutting the round short at every block boundary.
@@ -3055,6 +3071,7 @@ struct Exl3EngineCore::Impl {
                         static_cast<int>(unverified.size()));
                     const auto pass_start=Clock::now();
                     const auto verified=folded?std::move(*folded):round->verify(unverified,vericache.delta);
+                    if(!first_pass)
                     horizon.observe_pass(static_cast<int>(unverified.size()),
                         std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
                         verified.corrected,static_cast<int>(verified.tokens.size()));
