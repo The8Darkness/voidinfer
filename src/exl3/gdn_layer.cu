@@ -2209,15 +2209,19 @@ void Exl3GdnLayer::enable_small_tier(const Exl3SmallTierViews& views) {
     // (private) buffers cover the rows above.
     auto* cursor=static_cast<std::byte*>(views.scratch.data);
     small_half_buffers_=half_buffers_;
+    small_half_buffer_bytes_=half_buffer_bytes_;
     for(std::size_t i=0;i<half_buffers_.size();++i) {
         if(half_buffer_owned_[i])continue;
         small_half_buffers_[i]=reinterpret_cast<std::uint16_t*>(cursor);
-        cursor+=static_cast<std::size_t>(views.rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t);
+        small_half_buffer_bytes_[i]=static_cast<std::size_t>(views.rows)*kHalfBufferFeatures[i]*sizeof(std::uint16_t);
+        cursor+=small_half_buffer_bytes_[i];
     }
     small_float_buffers_=float_buffers_;
+    small_float_buffer_bytes_=float_buffer_bytes_;
     for(std::size_t i=0;i<4;++i) {
         small_float_buffers_[i]=reinterpret_cast<float*>(cursor);
-        cursor+=static_cast<std::size_t>(views.rows)*kHeads*sizeof(float);
+        small_float_buffer_bytes_[i]=static_cast<std::size_t>(views.rows)*kHeads*sizeof(float);
+        cursor+=small_float_buffer_bytes_[i];
     }
     if(tiered_gdn_traces()) {
         // Retained beta/g traces: private per layer at the small-tier rows.
@@ -2225,6 +2229,7 @@ void Exl3GdnLayer::enable_small_tier(const Exl3SmallTierViews& views) {
         check(cudaMalloc(&small_trace_storage_,2*bytes),"allocate GDN small-tier traces");
         small_float_buffers_[4]=static_cast<float*>(small_trace_storage_);
         small_float_buffers_[5]=reinterpret_cast<float*>(static_cast<std::byte*>(small_trace_storage_)+bytes);
+        small_float_buffer_bytes_[4]=small_float_buffer_bytes_[5]=bytes;
     }
     for(auto* workspace:linear_workspaces_)if(workspace)workspace->attach_small_tier(views);
     small_rows_=views.rows;
@@ -2235,6 +2240,8 @@ void Exl3GdnLayer::set_prompt_tier(bool prompt) noexcept {
     if(!small_rows_ || prompt==!small_tier_active_)return;
     std::swap(half_buffers_,small_half_buffers_);
     std::swap(float_buffers_,small_float_buffers_);
+    std::swap(half_buffer_bytes_,small_half_buffer_bytes_);
+    std::swap(float_buffer_bytes_,small_float_buffer_bytes_);
     for(auto* workspace:linear_workspaces_)if(workspace)workspace->swap_tier();
     small_tier_active_=!prompt;
 }

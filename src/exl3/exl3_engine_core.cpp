@@ -2942,6 +2942,18 @@ struct Exl3EngineCore::Impl {
                             rounds?(prepare+settle)/rounds:0.0);
                     }
                 } lt_report{lane_trace,lane_index,lt_lock,lt_prepare,lt_settle,lt_verify,lt_rounds,lt_begin};
+                // Rounds that start while the asynchronous line runs a pass vs while
+                // it idles (VOIDINFER_EXL3_LANE_TRACE): the line's contention cost.
+                struct LineOverlapReport {
+                    bool enabled;std::size_t lane;
+                    double busy_ms=0,idle_ms=0;std::uint64_t busy=0,idle=0;
+                    ~LineOverlapReport() {
+                        if(!enabled || !(busy+idle))return;
+                        std::fprintf(stderr,"LINE_OVERLAP lane=%zu busy_rounds=%llu busy_ms_per_round=%.2f idle_rounds=%llu idle_ms_per_round=%.2f\n",
+                            lane,static_cast<unsigned long long>(busy),busy?busy_ms/busy:0.0,
+                            static_cast<unsigned long long>(idle),idle?idle_ms/idle:0.0);
+                    }
+                } line_overlap{lane_trace,lane_index};
                 const auto lt_ms=[](Clock::time_point from){return std::chrono::duration<double,std::milli>(Clock::now()-from).count();};
                 struct Decoding {
                     Impl& engine;std::size_t lane;
@@ -3017,6 +3029,8 @@ struct Exl3EngineCore::Impl {
                                 static_cast<std::size_t>(std::max(async_lead_limit()-round->async_lead(),
                                     unverified.empty()?static_cast<int>(round_width_limit()):0)):
                                 pass_limit-unverified.size()}));
+                        const auto overlap_start=Clock::now();
+                        const bool line_busy=async_verify && round->async_pending() && !round->async_ready();
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
                         lt_prepare+=lt_ms(lt_mark);lt_mark=Clock::now();++lt_rounds;
                         pending_ticket=prepared_round.ticket;
@@ -3035,6 +3049,11 @@ struct Exl3EngineCore::Impl {
                         } catch(...) {pending_ticket.reset();throw;}
                         pending_ticket.reset();
                         lt_settle+=lt_ms(lt_mark);
+                        if(lane_trace && async_verify) {
+                            const double ms=lt_ms(overlap_start);
+                            (line_busy?line_overlap.busy_ms:line_overlap.idle_ms)+=ms;
+                            ++(line_busy?line_overlap.busy:line_overlap.idle);
+                        }
                         unverified.insert(unverified.end(),settled.committed_tokens.begin(),
                             settled.committed_tokens.end());
                         terminal_seen=settled.terminal;

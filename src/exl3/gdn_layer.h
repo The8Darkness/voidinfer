@@ -937,9 +937,12 @@ private:
     bool small_tier_active_ = false;
     void* small_trace_storage_ = nullptr;
     void require_tier_rows(int rows) const;
+    // Extents of the selected tier's buffers (swapped with them, set_prompt_tier).
     std::array<std::size_t,22> half_buffer_bytes_{};
     std::array<std::size_t,5> wide_half_buffer_bytes_{};
     std::array<std::size_t,6> float_buffer_bytes_{};
+    std::array<std::size_t,22> small_half_buffer_bytes_{};
+    std::array<std::size_t,6> small_float_buffer_bytes_{};
     std::size_t prefill_normalized_bytes_ = 0;
     std::array<std::optional<Exl3LayerBufferRetirement>,34> buffer_retirements_{};
     std::array<bool, 22> half_buffer_owned_{};
