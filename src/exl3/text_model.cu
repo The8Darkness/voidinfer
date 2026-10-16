@@ -2057,6 +2057,7 @@ struct Exl3TextContext::Impl {
     void* small_tier_storage = nullptr;
     int small_tier_rows = 0;
     int prompt_tier_depth = 0;
+    std::function<void(cudaStream_t)> prefill_yield;
     std::shared_ptr<Exl3TextModel::Impl::SharedBatchTier> batch_tier;
     void select_batch_tier(bool batch) {
         for(auto& layer:full_layers)if(layer)layer->set_batch_tier(batch);
@@ -9647,10 +9648,19 @@ bool Exl3TextContext::l0_layer_major_headroom() const {
     return free_bytes>=reserve && existing+free_bytes-reserve>=minimum_cache;
 }
 
+void Exl3TextContext::set_prefill_yield(std::function<void(cudaStream_t)> yield) {
+    impl_->prefill_yield=std::move(yield);
+}
+
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
-    const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
+    // The L0 block loop selects the prompt tier per block (each block and
+    // row-major chunk holds its own scope), so a yield between blocks leaves
+    // the shared prompt-scale buffers to other contexts' passes.
+    std::optional<PromptTierScope> prompt_tier;
+    if (!Exl3NativeContextExtent::l0_oscar_enabled() || impl_->l0_layer_major_block)
+        prompt_tier.emplace(*this,token_ids.size(),stream);
     if (Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->l0_layer_major_block) {
         // L0 OSCAR contexts hold per-row buffers for one block of
         // kL0PrefillBlockRows: the suffix is ingested layer-major block by
@@ -9698,6 +9708,7 @@ void Exl3TextContext::append_prefill_layer_major(
             at+=rows;
         }
         for (std::size_t p = 0; p < parts.size(); ++p) {
+            if (p && impl_->prefill_yield) impl_->prefill_yield(stream);
             auto ids = token_ids.subspan(parts[p].first, parts[p].second);
             const RetainedTapTail* retained = p + 1 == parts.size() ? retained_taps : nullptr;
             if (position_ == 0 && !layer_major_from_zero()) {

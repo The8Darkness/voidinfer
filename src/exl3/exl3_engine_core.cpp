@@ -774,8 +774,13 @@ struct Exl3EngineCore::Impl {
         std::mutex mutex;
         std::condition_variable changed;
         bool busy=false;
+        PassClass holder=kIngestPass;
         std::array<int,3> waiting{};
         int streak=0;
+        // A long ingestion yielding between its blocks: the verification
+        // passes waiting then run first, other ingestions wait for it.
+        int yielding=0;
+        std::uint64_t verify_done=0;
         void lock(PassClass type) {
             std::unique_lock guard(mutex);
             ++waiting[type];
@@ -783,17 +788,46 @@ struct Exl3EngineCore::Impl {
                 if(busy)return false;
                 if(type==kFirstVerifyPass)return true;
                 if(waiting[kFirstVerifyPass])return false;
-                if(type==kVerifyPass)return !waiting[kIngestPass] || streak<kVerifyStreak;
+                if(type==kVerifyPass)return yielding || !waiting[kIngestPass] || streak<kVerifyStreak;
+                if(yielding)return false;
                 return !waiting[kVerifyPass] || streak>=kVerifyStreak;
             });
             --waiting[type];
             if(type==kVerifyPass)streak=waiting[kIngestPass]?streak+1:0;
             else if(type==kIngestPass)streak=0;
             busy=true;
+            holder=type;
         }
         void unlock() {
-            {const std::lock_guard guard(mutex);busy=false;}
+            {
+                const std::lock_guard guard(mutex);
+                busy=false;
+                if(holder!=kIngestPass)++verify_done;
+            }
             changed.notify_all();
+        }
+        bool verify_waiting() {
+            const std::lock_guard guard(mutex);
+            return waiting[kVerifyPass] || waiting[kFirstVerifyPass];
+        }
+        // Held by an ingestion: lets the verification passes waiting now run,
+        // then takes the queue back ahead of other ingestions.
+        void yield() {
+            std::unique_lock guard(mutex);
+            const int let=waiting[kVerifyPass]+waiting[kFirstVerifyPass];
+            if(!let)return;
+            const auto target=verify_done+static_cast<std::uint64_t>(let);
+            busy=false;
+            ++yielding;
+            changed.notify_all();
+            changed.wait(guard,[&] {
+                return !busy && (verify_done>=target ||
+                    (!waiting[kVerifyPass] && !waiting[kFirstVerifyPass]));
+            });
+            --yielding;
+            busy=true;
+            holder=kIngestPass;
+            streak=0;
         }
     } prompt_pass_queue;
     cudaEvent_t prompt_pass_done=nullptr;
@@ -2600,6 +2634,29 @@ struct Exl3EngineCore::Impl {
         std::optional<PromptPass> prefill_pass;
         runtime_memory_mark("prefill_begin",lane_index);
         prefill_pass.emplace(*this,stream);
+        // Long prompts (several L0 blocks) let the other lanes' waiting
+        // verification passes run between blocks: their decoding would
+        // otherwise stall for the whole ingestion (VOIDINFER_EXL3_PREFILL_YIELD=0 off).
+        static const bool prefill_yield=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_YIELD");
+            return !value || std::string_view(value)!="0";
+        }();
+        struct PrefillYield {
+            Exl3TextContext* context=nullptr;
+            ~PrefillYield() {if(context)context->set_prefill_yield({});}
+        } yield_scope;
+        if(prefill_yield && prompt_pass_overlap && options.max_concurrency>1) {
+            context->set_prefill_yield([this](cudaStream_t pass_stream) {
+                if(!prompt_pass_queue.verify_waiting())return;
+                if(!prompt_pass_done &&
+                   cudaEventCreateWithFlags(&prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
+                    prompt_pass_done=nullptr;
+                if(prompt_pass_done)check(cudaEventRecord(prompt_pass_done,pass_stream));
+                prompt_pass_queue.yield();
+                if(prompt_pass_done)check(cudaStreamWaitEvent(pass_stream,prompt_pass_done,0));
+            });
+            yield_scope.context=context.get();
+        }
         // VOIDINFER_EXL3_PREFILL_TRACE: request-start phases (stream-synchronized marks).
         static const bool prefill_trace=std::getenv("VOIDINFER_EXL3_PREFILL_TRACE")!=nullptr;
         std::string prefill_phases;
@@ -2875,6 +2932,8 @@ struct Exl3EngineCore::Impl {
             prefill_mark("begin_round");
             if(prefill_trace)std::fprintf(stderr,"PREFILL_PHASES lane=%zu prompt=%zu%s\n",lane_index,ids.size(),
                 prefill_phases.c_str());
+            context->set_prefill_yield({});
+            yield_scope.context=nullptr;
             prefill_pass.reset();
             runtime_memory_mark("prefill_end",lane_index);
             device_lease=coordinator.enter_device_logical(*host_lease,

@@ -1063,6 +1063,10 @@ public:
     // set, every full-attention layer attends to its history from the FP16 L2
     // planes instead of the INT4 codes and hot rows.
     void set_l0_exact_history(bool exact) noexcept;
+    // Called between the blocks of a multi-block L0 prompt ingestion, outside
+    // the prompt tier (concurrent Engine lanes: other lanes' verification
+    // passes run there). Empty: no yield.
+    void set_prefill_yield(std::function<void(cudaStream_t)> yield);
     // Batched multi-agent rounds: one target forward over this context's
     // verifier rows followed by the peer's (each 2..8 rows), sharing every
     // row-independent projection; each context keeps its own KV, recurrent
