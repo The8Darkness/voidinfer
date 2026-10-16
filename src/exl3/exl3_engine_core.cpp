@@ -2978,6 +2978,17 @@ struct Exl3EngineCore::Impl {
                 auto draft_mark=Clock::now();
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
+                // The first round's first token (sampled from the exactly ingested
+                // prompt's last row) is never checked by a verification pass: it is
+                // published as soon as the round settles (VOIDINFER_EXL3_EARLY_FIRST_TOKEN=0
+                // waits for the first verified block). Its block then commits it
+                // without publishing it again.
+                static const bool early_first_token=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_EARLY_FIRST_TOKEN");
+                    return !value || std::string_view(value)!="0";
+                }();
+                bool early_attempted=false;
+                std::vector<std::int64_t> early_published;
                 // VOIDINFER_EXL3_LANE_TRACE: per-request lane time attribution.
                 static const bool lane_trace=std::getenv("VOIDINFER_EXL3_LANE_TRACE")!=nullptr;
                 double lt_lock=0,lt_prepare=0,lt_settle=0,lt_verify=0;std::uint64_t lt_rounds=0;
@@ -3025,7 +3036,7 @@ struct Exl3EngineCore::Impl {
                     if(!output.pending_control_tokens().empty())
                         throw std::invalid_argument(
                             "coherent-device EXL3 does not admit injected control tokens");
-                    const auto budget=output.model_token_budget_remaining(remaining);
+                    const auto budget=output.model_token_budget_remaining(remaining)+early_published.size();
                     if(!budget)throw std::logic_error(
                         "coherent-device output has no model budget or control path");
                     const std::size_t room=budget>unverified.size()?budget-unverified.size():0;
@@ -3109,6 +3120,54 @@ struct Exl3EngineCore::Impl {
                             settled.committed_tokens.end());
                         terminal_seen=settled.terminal;
                         presence.sync(committed,unverified,round->frontier(),stream);
+                        if(early_first_token && !early_attempted && committed.empty() && !unverified.empty() &&
+                           (async_verify || !fold_line) && remaining>1 &&
+                           std::find(terminal_tokens.begin(),terminal_tokens.end(),unverified.front())==
+                               terminal_tokens.end()) {
+                            early_attempted=true;
+                            const auto chunk=std::span<const std::int64_t>(unverified).first(1);
+                            const auto boundary=request.publication_boundary.begin(
+                                device_lease->acquisition,epoch,
+                                Exl3ControlPublicationBoundary::Kind::model);
+                            if(!request.publication_boundary.numerical_ready(boundary))
+                                throw std::logic_error("coherent-device early token readiness ordering");
+                            auto tokens=request.round_tokens.assign(chunk);
+                            const auto decision=output.preview_model(tokens.span(),remaining,limit);
+                            if(!request.publication_boundary.prepare_output(boundary))
+                                throw std::logic_error("coherent-device early token preview ordering");
+                            request.require_output_storage();
+                            if(!decision.accepted_tokens) {
+                                if(!request.publication_boundary.abandon_private(boundary))
+                                    throw std::logic_error("coherent-device early token empty preview ordering");
+                                publish_preview(request);
+                                if(decision.finished())
+                                    throw std::logic_error("coherent-device early token finished the output");
+                            } else {
+                                const auto selected=request.round_tokens.repair().span();
+                                request.require_result_slots(selected.size());
+                                if(!request.publication_boundary.resume_numerical(boundary) ||
+                                   !request.publication_boundary.numerical_ready(boundary) ||
+                                   !request.publication_boundary.prepare_output(boundary) ||
+                                   !request.publication_boundary.begin_publication(boundary))
+                                    throw std::logic_error("coherent-device early token publication ordering");
+                                const auto publication=coordinator.publish_device_logical_window(
+                                    *device_lease,selected);
+                                device_lease=publication.lease;
+                                if(!request.publication_boundary.resident_committed(boundary))
+                                    throw std::logic_error("coherent-device early token logical commit ordering");
+                                early_published.assign(selected.begin(),selected.end());
+                                result.generated_token_ids.insert(
+                                    result.generated_token_ids.end(),tokens.begin(),tokens.end());
+                                remaining-=static_cast<std::uint32_t>(selected.size());
+                                result.token_accounting.visible_model_tokens+=selected.size();
+                                route.record_publication(selected.size(),selected.size(),0u);
+                                result.timings.first_token_seconds=
+                                    seconds(request.submitted)+result.timings.prepare_seconds;
+                                publish_preview(request,boundary);
+                                if(decision.finished())
+                                    throw std::logic_error("coherent-device early token finished the output");
+                            }
+                        }
                         ++result.speculative.rounds;
                         result.speculative.accepted_tokens+=settled.verification.accepted;
                         result.speculative.accepted_prefix_per_round.push_back(
@@ -3196,7 +3255,17 @@ struct Exl3EngineCore::Impl {
                     }
                     std::vector<std::int64_t> retained;
                     bool finished=false;
-                    for(std::size_t at=0;at<verified.tokens.size();) {
+                    std::size_t first_unpublished=0;
+                    if(!early_published.empty()) {
+                        if(verified.tokens.size()<early_published.size() ||
+                           !std::equal(early_published.begin(),early_published.end(),verified.tokens.begin()))
+                            throw std::logic_error("coherent-device early token not kept by verification");
+                        committed.insert(committed.end(),early_published.begin(),early_published.end());
+                        retained.insert(retained.end(),early_published.begin(),early_published.end());
+                        first_unpublished=early_published.size();
+                        early_published.clear();
+                    }
+                    for(std::size_t at=first_unpublished;at<verified.tokens.size();) {
                         const auto chunk=std::span<const std::int64_t>(verified.tokens).subspan(
                             at,std::min<std::size_t>(16,verified.tokens.size()-at));
                         const auto boundary=request.publication_boundary.begin(
