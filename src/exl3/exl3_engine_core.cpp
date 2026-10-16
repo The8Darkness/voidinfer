@@ -718,7 +718,40 @@ struct Exl3EngineCore::Impl {
     // 227 -> 346 tok/s, C2 207 -> 225 (means of 2-3 noisy runs), 15 runs
     // without error (an Oct 9 build once hit an illegal address in draft
     // completion at C2). VOIDINFER_EXL3_PROMPT_PASS_OVERLAP=0: exclusive passes.
-    std::mutex prompt_pass_mutex;
+    // One pass at a time, in three classes. A request's first verification (its
+    // first published tokens) goes first, other verification passes (lines'
+    // passes and fixes, exclusive verify / rewind passes: tens of rows) alternate
+    // with queued prompt ingestions (up to whole prompts). FIFO passes held every
+    // lane's first verified block, hence its first token, behind a burst's
+    // prefills (C8 first wave: all 8 TTFTs 4.61 s).
+    enum PassClass {kIngestPass,kVerifyPass,kFirstVerifyPass};
+    struct PassQueue {
+        static constexpr int kVerifyStreak=1;
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool busy=false;
+        std::array<int,3> waiting{};
+        int streak=0;
+        void lock(PassClass type) {
+            std::unique_lock guard(mutex);
+            ++waiting[type];
+            changed.wait(guard,[&] {
+                if(busy)return false;
+                if(type==kFirstVerifyPass)return true;
+                if(waiting[kFirstVerifyPass])return false;
+                if(type==kVerifyPass)return !waiting[kIngestPass] || streak<kVerifyStreak;
+                return !waiting[kVerifyPass] || streak>=kVerifyStreak;
+            });
+            --waiting[type];
+            if(type==kVerifyPass)streak=waiting[kIngestPass]?streak+1:0;
+            else if(type==kIngestPass)streak=0;
+            busy=true;
+        }
+        void unlock() {
+            {const std::lock_guard guard(mutex);busy=false;}
+            changed.notify_all();
+        }
+    } prompt_pass_queue;
     cudaEvent_t prompt_pass_done=nullptr;
     bool prompt_pass_overlap=[] {
         const char* value=std::getenv("VOIDINFER_EXL3_PROMPT_PASS_OVERLAP");
@@ -727,11 +760,13 @@ struct Exl3EngineCore::Impl {
     struct PromptPass {
         Impl& engine;
         cudaStream_t stream;
-        std::unique_lock<std::mutex> ordered;
+        bool ordered=false;
         std::unique_lock<std::shared_mutex> exclusive;
-        PromptPass(Impl& value,cudaStream_t pass_stream) : engine(value),stream(pass_stream) {
+        PromptPass(Impl& value,cudaStream_t pass_stream,PassClass type=kIngestPass) :
+            engine(value),stream(pass_stream) {
             if(engine.prompt_pass_overlap) {
-                ordered=std::unique_lock(engine.prompt_pass_mutex);
+                engine.prompt_pass_queue.lock(type);
+                ordered=true;
                 if(engine.prompt_pass_done)
                     check(cudaStreamWaitEvent(stream,engine.prompt_pass_done,0));
             } else {
@@ -741,11 +776,12 @@ struct Exl3EngineCore::Impl {
             }
         }
         ~PromptPass() {
-            if(!ordered.owns_lock())return;
+            if(!ordered)return;
             if(!engine.prompt_pass_done &&
                cudaEventCreateWithFlags(&engine.prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
                 engine.prompt_pass_done=nullptr;
             if(engine.prompt_pass_done)(void)cudaEventRecord(engine.prompt_pass_done,stream);
+            engine.prompt_pass_queue.unlock();
         }
         PromptPass(const PromptPass&)=delete;
         PromptPass& operator=(const PromptPass&)=delete;
@@ -754,9 +790,10 @@ struct Exl3EngineCore::Impl {
     // order as PromptPass with overlap.
     struct LinePassOrder final : Exl3FastDeviceRound::PassOrder {
         Impl& engine;
-        explicit LinePassOrder(Impl& value) : engine(value) {}
+        PassClass type;
+        LinePassOrder(Impl& value,PassClass pass) : engine(value),type(pass) {}
         void enter(cudaStream_t stream) override {
-            engine.prompt_pass_mutex.lock();
+            engine.prompt_pass_queue.lock(type);
             if(engine.prompt_pass_done)check(cudaStreamWaitEvent(stream,engine.prompt_pass_done,0));
         }
         void leave(cudaStream_t stream) override {
@@ -764,10 +801,10 @@ struct Exl3EngineCore::Impl {
                cudaEventCreateWithFlags(&engine.prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
                 engine.prompt_pass_done=nullptr;
             if(engine.prompt_pass_done)(void)cudaEventRecord(engine.prompt_pass_done,stream);
-            engine.prompt_pass_mutex.unlock();
+            engine.prompt_pass_queue.unlock();
         }
     };
-    LinePassOrder line_pass_order{*this};
+    LinePassOrder line_pass_order{*this,kVerifyPass},first_line_pass_order{*this,kFirstVerifyPass};
     // Lanes per batched-round coordinator (VOIDINFER_EXL3_BATCHED_GROUP_LANES,
     // 2..8, default 8): eight lanes share one 64-row forward instead of two
     // groups of four.
@@ -2834,7 +2871,8 @@ struct Exl3EngineCore::Impl {
                     (options.max_concurrency==1 || context->device_sampling().temperature>0.0f || greedy_lines ||
                      (options.max_concurrency==2 && context->position()>=kLaneLineMinContext));
                 const bool async_verify=fold_line && vericache_async_enabled();
-                round->set_pass_order(fold_line && options.max_concurrency>1?&line_pass_order:nullptr);
+                const bool ordered_line=fold_line && options.max_concurrency>1;
+                round->set_pass_order(ordered_line?&first_line_pass_order:nullptr);
                 if(async_verify)
                     round->begin_async_verification(*line_pool,exact_line_slots[lane_index],kAsyncRingRows);
                 else if(fold_line)round->begin_fold_verification(line_pool->line(),kFoldRingRows);
@@ -3123,7 +3161,7 @@ struct Exl3EngineCore::Impl {
                     lt_mark=Clock::now();
                     const BatchedInactive verify_inactive(fold_line?nullptr:lane_batched_verify[lane_index]);
                     std::optional<PromptPass> verify_pass;
-                    if(!fold_line)verify_pass.emplace(*this,stream);
+                    if(!fold_line)verify_pass.emplace(*this,stream,committed.empty()?kFirstVerifyPass:kVerifyPass);
                     horizon.observe_draft(std::chrono::duration<double,std::milli>(Clock::now()-draft_mark).count(),
                         static_cast<int>(unverified.size()));
                     const auto pass_start=Clock::now();
@@ -3211,6 +3249,7 @@ struct Exl3EngineCore::Impl {
                         if(decision.finished()) {result.finish_reason=decision.finish_reason;finished=true;break;}
                         if(selected.size()<chunk.size())break;
                     }
+                    if(ordered_line && !committed.empty())round->set_pass_order(&line_pass_order);
                     if(async_verify)round->commit_async(retained.size());
                     else if(fold_line)round->commit_fold(retained.size());
                     else round->commit_verification(retained);
@@ -3227,7 +3266,7 @@ struct Exl3EngineCore::Impl {
                 if(fold_line)round->end_fold();
                 else if(round->frontier()!=round->verified_frontier()) {
                     const BatchedInactive rewind_inactive(lane_batched_verify[lane_index]);
-                    const PromptPass rewind_pass(*this,stream);
+                    const PromptPass rewind_pass(*this,stream,kVerifyPass);
                     round->commit_verification({});
                 }
                 if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")) {
