@@ -847,6 +847,18 @@ public:
     void park_l0_codes() noexcept;
     // Device bytes backing this context's L0 INT4 code planes (any thread).
     std::size_t l0_code_device_bytes() const noexcept;
+    // Retained layer-major projection cache (reconstructed FP16 weights) of
+    // this context's prompt workspace, shared by concurrent lanes; any thread.
+    std::size_t prompt_projection_cache_bytes() const noexcept;
+    // Frees the cache down to keep_bytes and caps its regrowth by the next
+    // layer-major blocks at that size (returns the bytes released; 0 while a
+    // layer-major block holds the cache). Waits for the device.
+    std::size_t release_prompt_projection_cache(std::size_t keep_bytes);
+    // Device bytes the Engine has promised to admitted lanes' L0 code growth
+    // (projections not yet backed); layer-major blocks size their cache and
+    // headroom beside it.
+    static void set_reserved_l0_code_growth(std::uint64_t bytes) noexcept;
+    static std::uint64_t reserved_l0_code_growth() noexcept;
     // Concurrent lanes under device-memory pressure, between rounds: moves
     // the L0 INT4 code/meta rows [0,position) to pinned host memory and
     // returns all their device backing (returns the device bytes released).

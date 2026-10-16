@@ -7191,6 +7191,12 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     std::size_t reuse_used = 0;
     bool reuse_active = false;
     std::size_t reuse_scope_count = 0;
+    // Held from begin_layer_reuse to end_layer_reuse (the prompt thread);
+    // release_layer_reuse takes it from other threads.
+    std::mutex reuse_mutex;
+    bool reuse_locked = false;
+    std::atomic<std::size_t> reuse_limit{std::numeric_limits<std::size_t>::max()};
+    std::atomic<std::size_t> reuse_bytes{0};
     int diagnostic_remaining = 0;
 };
 
@@ -7511,11 +7517,14 @@ Exl3ReconstructGemmStats Exl3CudaReconstructGemmWorkspace::stats() const noexcep
 
 void Exl3CudaReconstructGemmWorkspace::begin_layer_reuse(
     std::size_t max_cached_bytes, bool allow_k5) {
-    if (!impl_ || impl_->reuse_active || !impl_->accept_all_model_shapes || !max_cached_bytes)
+    if (!impl_ || impl_->reuse_active || !impl_->accept_all_model_shapes)
         throw std::invalid_argument("layer-major weight reuse admission");
+    impl_->reuse_mutex.lock();
+    impl_->reuse_locked = true;
     impl_->reuse_active = true;
     impl_->k5_scope_enabled = allow_k5 && impl_->k5_layer_prefill_enabled;
-    impl_->reuse_budget = max_cached_bytes;
+    impl_->reuse_budget = std::min(max_cached_bytes,
+        impl_->reuse_limit.load(std::memory_order_relaxed));
     impl_->reuse_used = 0;
     const char* profile=std::getenv("VOIDINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
     impl_->diagnostic_remaining = impl_->reuse_scope_count==0 && profile &&
@@ -7552,6 +7561,48 @@ void Exl3CudaReconstructGemmWorkspace::end_layer_reuse() noexcept {
         slot.valid = false;
         slot.prefetch_pending = false;
     }
+    impl_->reuse_bytes.store(impl_->reuse_capacity, std::memory_order_relaxed);
+    if (impl_->reuse_locked) {
+        impl_->reuse_locked = false;
+        impl_->reuse_mutex.unlock();
+    }
+}
+
+std::size_t Exl3CudaReconstructGemmWorkspace::release_layer_reuse(std::size_t keep_bytes) {
+    if (!impl_) return 0;
+    std::unique_lock lock(impl_->reuse_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return 0;
+    impl_->reuse_limit.store(keep_bytes, std::memory_order_relaxed);
+    std::size_t released = 0;
+    while (impl_->reuse_capacity > keep_bytes) {
+        decltype(impl_->reuse_slots.data()) largest = nullptr;
+        for (auto& slot : impl_->reuse_slots)
+            if (slot.data && (!largest || slot.capacity > largest->capacity)) largest = &slot;
+        if (!largest) break;
+        // cudaFree waits for the device: GEMMs of an earlier scope may still read the slot.
+        cuda_check(cudaFree(largest->data), "release layer-major weight slot");
+        largest->data = nullptr;
+        impl_->reuse_capacity -= largest->capacity;
+        released += largest->capacity;
+        largest->capacity = 0;
+        largest->valid = false;
+    }
+    impl_->stats.cached_weight_capacity_bytes = impl_->reuse_capacity;
+    impl_->reuse_bytes.store(impl_->reuse_capacity, std::memory_order_relaxed);
+    return released;
+}
+
+std::unique_lock<std::mutex> Exl3CudaReconstructGemmWorkspace::lock_layer_reuse_budget() {
+    if (!impl_) throw std::logic_error("layer-major reuse budget without a workspace");
+    return std::unique_lock<std::mutex>(impl_->reuse_mutex);
+}
+
+void Exl3CudaReconstructGemmWorkspace::set_layer_reuse_limit(std::size_t bytes) noexcept {
+    if (impl_) impl_->reuse_limit.store(bytes, std::memory_order_relaxed);
+}
+
+std::size_t Exl3CudaReconstructGemmWorkspace::layer_reuse_bytes() const noexcept {
+    return impl_ ? impl_->reuse_bytes.load(std::memory_order_relaxed) : 0;
 }
 
 bool Exl3CudaReconstructGemmWorkspace::prefetch_numeric_weight(

@@ -9624,13 +9624,17 @@ bool Exl3TextContext::l0_layer_major_headroom() const {
     if(row_major)return false;
     std::size_t free_bytes=0,total_bytes=0;
     cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes),"query layer-major headroom");
+    // Concurrent lanes: memory promised to admitted lanes' code growth is not
+    // headroom for cache growth (running on the retained cache allocates nothing).
+    const std::size_t raw_free=free_bytes;
+    free_bytes-=std::min<std::size_t>(free_bytes,reserved_l0_code_growth());
     const std::size_t existing=impl_->numeric_prefill_projection_workspace?
-        impl_->numeric_prefill_projection_workspace->stats().cached_weight_capacity_bytes:0;
+        impl_->numeric_prefill_projection_workspace->layer_reuse_bytes():0;
     const std::size_t reserve=l0_layer_major_reserve_bytes();
     constexpr std::size_t minimum_cache=256ull*1024*1024;
     // A retained cache that already covers the minimum needs no growth: half
     // the reserve then suffices (the block reuses what it holds).
-    if(existing>=minimum_cache && free_bytes>=reserve/2)return true;
+    if(existing>=minimum_cache && raw_free>=reserve/2)return true;
     return free_bytes>=reserve && existing+free_bytes-reserve>=minimum_cache;
 }
 
@@ -9703,8 +9707,9 @@ void Exl3TextContext::append_prefill_layer_major(
                 (void)cudaMemGetInfo(&free_bytes, &total_bytes);
                 const std::size_t cached = impl_->numeric_prefill_projection_workspace ?
                     impl_->numeric_prefill_projection_workspace->stats().cached_weight_capacity_bytes : 0;
-                std::fprintf(stderr, "L0_PREFILL_BLOCK rows=%zu position=%d route=%s free_mib=%zu cache_mib=%zu\n",
-                    ids.size(), position_, layer_major ? "layer-major" : "row-major", free_bytes >> 20, cached >> 20);
+                std::fprintf(stderr, "L0_PREFILL_BLOCK rows=%zu position=%d route=%s free_mib=%zu cache_mib=%zu reserved_mib=%zu\n",
+                    ids.size(), position_, layer_major ? "layer-major" : "row-major", free_bytes >> 20, cached >> 20,
+                    static_cast<std::size_t>(reserved_l0_code_growth() >> 20));
             }
             if (layer_major) {
                 impl_->l0_layer_major_block = true;
@@ -9761,9 +9766,18 @@ void Exl3TextContext::append_prefill_layer_major(
             "layer-major prefill rejects external graph capture");
     impl_->validate_target_projection_execution(stream);
     impl_->retain_host_kv_forward_stream(stream);
+    // Sized under the reuse lock: a concurrent release (Engine admission or
+    // memory pressure) lands before the free-memory query or caps the result.
+    auto budget_lock=impl_->numeric_prefill_projection_workspace->lock_layer_reuse_budget();
     std::size_t free_bytes=0,total_bytes=0;
     cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes),
                "budget layer-major projection cache");
+    // L0 OSCAR lanes: the cache grows only beside the code growth promised to
+    // admitted lanes; within that budget it may again reach its full limit
+    // (release_prompt_projection_cache capped it under pressure).
+    const std::size_t raw_free_bytes=free_bytes;
+    if(Exl3NativeContextExtent::l0_oscar_enabled())
+        free_bytes-=std::min<std::size_t>(free_bytes,reserved_l0_code_growth());
     // The guarded device transaction has already retained its physical target
     // and draft owners. Keep a smaller, still explicit free-space reserve for
     // its bounded projection reuse; ordinary routes retain their 2 GiB floor.
@@ -9785,14 +9799,16 @@ void Exl3TextContext::append_prefill_layer_major(
     constexpr std::size_t minimum_cache=256ull*1024*1024;
     auto& workspace=*impl_->numeric_prefill_projection_workspace;
     const auto existing_cache=workspace.stats().cached_weight_capacity_bytes;
-    // Retained cache covering the minimum: run on it without growth when the
-    // device is below the reserve (concurrent lanes hold the rest).
+    const bool growth_room=free_bytes>=reserve_bytes && existing_cache<=cache_limit &&
+        existing_cache+free_bytes-reserve_bytes>=minimum_cache;
+    // L0 OSCAR blocks without room to grow run on the retained cache, which
+    // allocates nothing (concurrent lanes hold the rest). l0_layer_major_headroom
+    // admitted the block; a release since then may have left less than the
+    // minimum, or none (every chunk then reconstructs its projections).
     const bool reuse_only=Exl3NativeContextExtent::l0_oscar_enabled() &&
-        existing_cache>=minimum_cache && existing_cache<=cache_limit &&
-        free_bytes>=reserve_bytes/2 && free_bytes<reserve_bytes;
-    if(!reuse_only && (free_bytes<reserve_bytes ||
-       existing_cache>cache_limit ||
-       existing_cache+free_bytes-reserve_bytes<minimum_cache))
+        existing_cache<=cache_limit && !growth_room;
+    (void)raw_free_bytes;
+    if(!reuse_only && !growth_room)
         throw std::runtime_error(
             "layer-major projection cache lacks bounded device headroom: free_mib="+
             std::to_string(free_bytes/(1024*1024))+
@@ -9809,6 +9825,8 @@ void Exl3TextContext::append_prefill_layer_major(
         cache_budget=std::max(existing_cache,cache_budget-l0_cache_slack);
     require(workspace.stats().cached_weight_capacity_bytes<=cache_budget,
             "retained layer-major cache exceeds current device budget");
+    workspace.set_layer_reuse_limit(cache_budget);
+    budget_lock.unlock();
     const char* injected_layer=std::getenv("VOIDINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
     const int fail_after_layer=injected_layer ? std::atoi(injected_layer) : -1;
     require(!injected_layer ||
@@ -14246,6 +14264,26 @@ std::size_t Exl3TextContext::l0_code_device_bytes() const noexcept {
     std::size_t bytes=0;
     for(const auto& layer:impl_->full_layers)if(layer)bytes+=layer->l0_code_device_bytes();
     return bytes;
+}
+
+std::size_t Exl3TextContext::prompt_projection_cache_bytes() const noexcept {
+    return impl_->numeric_prefill_projection_workspace?
+        impl_->numeric_prefill_projection_workspace->layer_reuse_bytes():0;
+}
+
+std::size_t Exl3TextContext::release_prompt_projection_cache(std::size_t keep_bytes) {
+    return impl_->numeric_prefill_projection_workspace?
+        impl_->numeric_prefill_projection_workspace->release_layer_reuse(keep_bytes):0;
+}
+
+namespace {
+std::atomic<std::uint64_t> reserved_l0_code_growth_bytes{0};
+}
+void Exl3TextContext::set_reserved_l0_code_growth(std::uint64_t bytes) noexcept {
+    reserved_l0_code_growth_bytes.store(bytes,std::memory_order_relaxed);
+}
+std::uint64_t Exl3TextContext::reserved_l0_code_growth() noexcept {
+    return reserved_l0_code_growth_bytes.load(std::memory_order_relaxed);
 }
 
 std::size_t Exl3TextContext::suspend_l0_codes(cudaStream_t stream) {

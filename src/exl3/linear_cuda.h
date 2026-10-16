@@ -12,6 +12,7 @@
 #include <atomic>
 #include <optional>
 #include <limits>
+#include <mutex>
 
 namespace voidinfer::exl3 {
 
@@ -292,6 +293,19 @@ public:
     // owns the stream ordering and closes the scope before the next layer.
     void begin_layer_reuse(std::size_t max_cached_bytes, bool allow_k5 = false);
     void end_layer_reuse() noexcept;
+    // The reuse slots stay allocated between prompts. Concurrent Engine lanes
+    // reclaim them for L0 codes under memory pressure: release_layer_reuse
+    // frees slots (largest first) down to keep_bytes and caps later scopes at
+    // that size until set_layer_reuse_limit raises it again. Any thread; it
+    // frees nothing (returns 0) while a layer scope is open.
+    std::size_t release_layer_reuse(std::size_t keep_bytes);
+    void set_layer_reuse_limit(std::size_t bytes) noexcept;
+    // Held while a prompt block sizes its cache (free memory, reservations,
+    // set_layer_reuse_limit), so a release either precedes the sizing or caps
+    // its result. Not while a layer scope is open on this thread.
+    std::unique_lock<std::mutex> lock_layer_reuse_budget();
+    // Current slot bytes, readable from any thread.
+    std::size_t layer_reuse_bytes() const noexcept;
     // Model layer of the active layer-major reuse scope (-1 outside one); the
     // NVFP4 mode 3 policy keeps layers >= 56 on MXFP8.
     void set_prefill_layer(int layer) noexcept;

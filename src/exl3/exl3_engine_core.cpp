@@ -572,8 +572,23 @@ struct Exl3EngineCore::Impl {
             if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return;
             cached_free.store(free,std::memory_order_relaxed);
             checked_at.store(now_ns,std::memory_order_relaxed);
+            // Lanes back their projected codes as they grow: refresh the
+            // reservation the layer-major cache budget subtracts.
+            std::lock_guard lock(mutex);
+            publish_l0_code_growth_locked();
         }
         if(free>=l0_suspend_threshold_bytes())return;
+        // The retained layer-major projection cache goes before any lane's
+        // codes (0 while a prompt block holds it).
+        static const bool cache_trace=std::getenv("VOIDINFER_EXL3_L0_SUSPEND_TRACE")!=nullptr;
+        if(const auto released=context.release_prompt_projection_cache(0)) {
+            checked_at.store(0,std::memory_order_relaxed);
+            if(cache_trace)std::fprintf(stderr,"L0_CACHE_RELEASE lane=%zu released=%.0f MiB free=%.0f MiB\n",
+                lane_index,released/1048576.0,free/1048576.0);
+            return;
+        }
+        if(cache_trace)std::fprintf(stderr,"L0_CACHE_KEPT lane=%zu cache=%.0f MiB free=%.0f MiB\n",lane_index,
+            context.prompt_projection_cache_bytes()/1048576.0,free/1048576.0);
         std::unique_lock lock(mutex);
         std::size_t victim=kMaxLanes;
         for(std::size_t i=0;i<options.max_concurrency;++i)
@@ -654,7 +669,36 @@ struct Exl3EngineCore::Impl {
         // This lane's own (parked or retained) backing is reused by the request.
         const std::uint64_t own=lanes[lane_index]?lanes[lane_index]->context().l0_code_device_bytes():0;
         const std::uint64_t need=request_code_projection(request);
-        return growth+reserve+(need>own?need-own:0)<=free;
+        const std::uint64_t required=growth+reserve+(need>own?need-own:0);
+        if(required<=free)return true;
+        // The shared layer-major projection cache yields to codes: prompt
+        // blocks then run with a smaller cache (or row-major).
+        if(!lanes[lane_index])return false;
+        auto& context=lanes[lane_index]->context();
+        const std::uint64_t cache=context.prompt_projection_cache_bytes();
+        if(required>free+cache)return false;
+        // A prompt block sizing its cache after the release sees this request's
+        // codes as promised (the next publication corrects it if not admitted).
+        Exl3TextContext::set_reserved_l0_code_growth(growth+(need>own?need-own:0));
+        const auto released=context.release_prompt_projection_cache(
+            static_cast<std::size_t>(cache-(required-free)));
+        static const bool trace=std::getenv("VOIDINFER_EXL3_L0_SUSPEND_TRACE")!=nullptr;
+        if(trace)std::fprintf(stderr,"L0_CACHE_ADMIT lane=%zu released=%.0f MiB cache=%.0f MiB short=%.0f MiB\n",
+            lane_index,released/1048576.0,cache/1048576.0,(required-free)/1048576.0);
+        if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return true;
+        return required<=free;
+    }
+    // Locked: publishes the code growth still ahead of the active lanes
+    // (projection minus backed codes) for the layer-major cache budget.
+    void publish_l0_code_growth_locked() {
+        if(!l0_code_admission_enabled())return;
+        std::uint64_t growth=0;
+        for(std::size_t i=0;i<options.max_concurrency;++i)
+            if(active[i] && lanes[i]) {
+                const std::uint64_t backed=lanes[i]->context().l0_code_device_bytes();
+                if(lane_code_projection[i]>backed)growth+=lane_code_projection[i]-backed;
+            }
+        Exl3TextContext::set_reserved_l0_code_growth(growth);
     }
     Exl3ReadyWorkSnapshotAuthority ready_work_authority;
     struct LaneFrontier {
@@ -3695,6 +3739,7 @@ struct Exl3EngineCore::Impl {
                 lane_admission[lane_index]=next_lane_admission++;
                 lane_code_projection[lane_index]=l0_code_admission_enabled()?
                     request_code_projection(*request):0;
+                publish_l0_code_growth_locked();
                 lane_frontiers[lane_index]={};
                 if(request_affinity) {
                     if(affine)++stats.request_affinity_assignments;
@@ -4331,6 +4376,7 @@ struct Exl3EngineCore::Impl {
             request->result.timings.total_seconds=seconds(request->submitted)+request->result.timings.prepare_seconds;
             {std::lock_guard lock(request->mutex);request->done=true;}request->changed.notify_all();
             {std::lock_guard lock(mutex);active[lane_index].reset();lane_code_projection[lane_index]=0;--outstanding;
+                publish_l0_code_growth_locked();
                 ready_work_authority.revise();--stats.running_requests;}
             changed.notify_all();
         }
