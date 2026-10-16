@@ -472,10 +472,10 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--host-kv-mib N` | exact FP16 history in host memory | `max(8192, max-context × 64 KiB)` |
+| `--host-kv-mib N` | exact FP16 history in host memory (retained conversation roots) | `max(8192, max-context × 64 KiB, 40% of physical memory)` |
 | `--host-state-slots N`, `--device-state-slots N` | host/device checkpoint slots | `8` / `max-concurrency` |
-| `--max-private-continuations N` | conversation roots kept for follow-up turns | `2 × max-concurrency` |
-| `--max-shared-prefixes N` | cross-conversation shared-prefix roots kept for reuse (not evicted by conversation turnover) | `max-concurrency` |
+| `--max-private-continuations N` | conversation roots kept for follow-up turns (with shared prefixes at most 64) | `max(2 × max-concurrency, 32)` |
+| `--max-shared-prefixes N` | cross-conversation shared-prefix roots kept for reuse (not evicted by conversation turnover) | `max(max-concurrency, 16)` |
 | `--max-long-anchors-per-continuation N`, `--max-cache-markers-per-request N` | continuation descriptor bounds | `2` / `4` |
 | `--no-prefix-reuse` | serve every request without reusing a cached prefix | reuse on |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |

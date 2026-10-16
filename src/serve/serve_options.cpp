@@ -1,5 +1,12 @@
 #include "serve/serve_options.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -276,9 +283,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--target and --draft are required");
     }
     if (!host_kv_explicit) {
+        // Retained conversation roots (exact FP16 history, 64 KiB per token)
+        // may use 40% of physical memory, so agents beyond the lanes resume
+        // without a new prefill; the KV spill tier covers memory pressure.
+        std::size_t physical = 0;
+#ifdef _WIN32
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) physical = static_cast<std::size_t>(status.ullTotalPhys);
+#endif
         options.context_cache.host_kv_capacity_bytes =
-            std::max<std::size_t>(kDefaultHostKvCapacityBytes,
-                                  static_cast<std::size_t>(options.max_context) * 65536);
+            std::max<std::size_t>({kDefaultHostKvCapacityBytes,
+                                   static_cast<std::size_t>(options.max_context) * 65536,
+                                   physical / 5 * 2});
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

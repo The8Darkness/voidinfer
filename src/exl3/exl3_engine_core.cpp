@@ -2726,8 +2726,10 @@ struct Exl3EngineCore::Impl {
                         admitted.admitted?1:0,10);
             }
             if(split) {
-                if(base) base=extend_device(base,stable,base_resident);
-                else {
+                if(base) {
+                    base=extend_device(base,stable,base_resident);
+                    prefill_mark("split_extend");
+                } else {
                     {
                         Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
                             1,epoch,false,stream);

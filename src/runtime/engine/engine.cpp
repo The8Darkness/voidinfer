@@ -7,6 +7,7 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -36,10 +37,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
 
     cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
-    const std::uint64_t default_private = 2ULL * concurrency;
+    // Agents outnumber lanes: their conversation roots wait in host memory for
+    // the next turn (bounded by host_kv_capacity_bytes, spilled to disk under
+    // memory pressure). The prefix index holds at most 64 roots in all.
+    const std::uint64_t default_private = std::max<std::uint64_t>(2ULL * concurrency, 32);
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
-    cache.max_shared_prefixes               = cache.max_shared_prefixes.value_or(concurrency);
+    cache.max_shared_prefixes               = cache.max_shared_prefixes.value_or(
+        std::max<std::uint32_t>(concurrency, 16U));
     cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
     cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
 

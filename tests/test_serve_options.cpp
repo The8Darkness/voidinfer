@@ -2,6 +2,14 @@
 #include "serve/translate.h"
 #include "voidinfer/engine.h"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+#include <algorithm>
+
 #include <iostream>
 #include <string>
 #include <utility>
@@ -56,9 +64,17 @@ int main() {
     failures += check(rejects([] { (void)parse({"voidinfer-serve", "model-dir"}); }),
                       "a positional model path was accepted");
     failures += check(defaults.max_context == 32768, "--max-context does not default to 32768");
+    // Host KV default: max(8 GiB, max-context x 64 KiB, 40% of physical memory).
+    std::size_t physical = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) physical = static_cast<std::size_t>(status.ullTotalPhys);
+#endif
+    const std::size_t memory_share = physical / 5 * 2;
     failures += check(defaults.context_cache.host_kv_capacity_bytes ==
-                          voidinfer::kDefaultHostKvCapacityBytes,
-                      "host KV does not default to 8 GiB at 32K");
+                          std::max<std::size_t>(voidinfer::kDefaultHostKvCapacityBytes, memory_share),
+                      "host KV does not default to max(8 GiB, 40% of memory) at 32K");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures += check(defaults.preserve_thinking, "thinking history not preserved by default");
     failures += check(defaults.request_log_jsonl.empty(), "request log enabled by default");
@@ -79,7 +95,8 @@ int main() {
                       "--vision did not select the BF16 Vision tower");
 
     const ServeOptions long_context = parse(package({"--max-context", "262144"}));
-    failures += check(long_context.context_cache.host_kv_capacity_bytes == 262144ULL * 65536,
+    failures += check(long_context.context_cache.host_kv_capacity_bytes ==
+                          std::max<std::size_t>(262144ULL * 65536, memory_share),
                       "host KV does not scale to one exact snapshot of max-context");
     const ServeOptions explicit_host_kv =
         parse(package({"--max-context", "262144", "--host-kv-mib", "20000"}));

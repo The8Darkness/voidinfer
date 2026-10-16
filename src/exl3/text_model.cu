@@ -1788,14 +1788,23 @@ struct Exl3TextContext::Impl {
                 static_cast<const void*>(this),prepared?1:0,ms(t0,t1),ms(t1,t2),ms(t2,t3));
         }
     }
-    // Restoring a long history whose rows an idle plane set holds (the
-    // agent's own set, where its last lane left it): bind that set instead of
-    // copying the rows into the current one. Rebinding remaps every plane
-    // window (~0.2 s); below kAdoptMinPages pages the plane-to-plane copy
-    // (~27 GB/s) is cheaper.
-    static constexpr std::size_t kAdoptMinPages=1024;
+    // Restoring a history whose rows an idle plane set holds (the agent's own
+    // set, where its last lane left it): bind that set instead of copying the
+    // rows into the current one, whose outgoing pages then stay in place (the
+    // copy path packs them out first). Rebinding remaps every plane window
+    // (~13 ms + ~3.7 ms per 1K rows); measured on 8 agents over 4 lanes the
+    // copy path took 125-190 ms at 16K and 0.5-3.3 s at 60K (adoption 95-105
+    // ms / 270-310 ms). Below VOIDINFER_EXL3_ADOPT_MIN_PAGES (default 32
+    // pages, 2K rows) the plane-to-plane copy is as cheap.
+    static std::size_t adopt_min_pages() {
+        static const std::size_t pages=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_ADOPT_MIN_PAGES");
+            return static_cast<std::size_t>(value?std::strtoull(value,nullptr,10):32);
+        }();
+        return pages;
+    }
     void adopt_plane_set_of(const Exl3ExactHostState& state) {
-        if(!kv_source || !kv_source->backing() || exact_line || state.kv_pages_.size()<kAdoptMinPages)return;
+        if(!kv_source || !kv_source->backing() || exact_line || state.kv_pages_.size()<adopt_min_pages())return;
         std::shared_ptr<Exl3LaneKvSource> best;
         std::size_t best_count=0;
         {
