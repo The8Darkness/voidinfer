@@ -40,7 +40,9 @@ int main(){try{
     std::vector<std::shared_ptr<Exl3RecurrentSlab>> owners;
     for(int i=0;i<3;++i){auto pool=std::make_unique<Exl3RecurrentExportPool>();for(int n=0;n<3;++n){auto slab=pool->acquire(sizes);if(slab)owners.push_back(std::move(slab));}pools.push_back(std::move(pool));}
     const auto peak=Exl3RecurrentPinBudget::snapshot();
-    need(owners.size()==6 && peak[0]==7*bytes && peak[0]<=Exl3RecurrentPinBudget::cap,"process cap excludes survivors");
+    // Survivor plus nine acquires, bounded by the process cap.
+    const std::size_t capped=std::min<std::size_t>(9,Exl3RecurrentPinBudget::cap()/bytes-1);
+    need(owners.size()==capped && peak[0]==(capped+1)*bytes && peak[0]<=Exl3RecurrentPinBudget::cap(),"process cap excludes survivors");
     owners.clear();pools.clear();survivor.reset();checked(cudaFree(source));
     need(Exl3RecurrentPinBudget::snapshot()[0]==0,"registration remains after all owners retire");
     std::cout<<"PASS_RECURRENT_POOL cap_peak="<<peak[1]<<" final_live=0\n";return 0;

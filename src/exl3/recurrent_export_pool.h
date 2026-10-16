@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -44,12 +45,28 @@ struct Exl3RecurrentSlabLayout {
 // Shared by all physical contexts and retained immutable roots in this process.
 // Registration is an additional DMA property, never a substitute for VirtualLock.
 struct Exl3RecurrentPinBudget {
-    static constexpr std::uint64_t cap=1ULL<<30,reserve=8ULL<<30;
+    // Process cap on registered recurrent slabs (144 MB each at 6bpw): 1/24 of
+    // physical memory within 1..4 GiB (VOIDINFER_EXL3_RECURRENT_PIN_CAP_MIB
+    // overrides). Each request's two roots hold one each; past the cap they
+    // export to pageable slabs that the resident set VirtualLocks on the
+    // request path (eight lanes exhausted the former fixed 1 GiB).
+    static std::uint64_t cap() {
+        static const std::uint64_t value=[] {
+            if(const char* text=std::getenv("VOIDINFER_EXL3_RECURRENT_PIN_CAP_MIB"))
+                return static_cast<std::uint64_t>(std::strtoull(text,nullptr,10))<<20;
+            MEMORYSTATUSEX m{};m.dwLength=sizeof(m);
+            const std::uint64_t total=GlobalMemoryStatusEx(&m)?m.ullTotalPhys:0;
+            return std::clamp<std::uint64_t>(total/24,1ULL<<30,4ULL<<30);
+        }();
+        return value;
+    }
+    static constexpr std::uint64_t reserve=8ULL<<30;
     inline static std::mutex mutex;
     inline static std::uint64_t live=0,peak=0,quarantined=0;
     static bool claim(std::size_t bytes){
         std::lock_guard<std::mutex> lock(mutex);MEMORYSTATUSEX m{};m.dwLength=sizeof(m);
-        if(bytes>cap-live || !GlobalMemoryStatusEx(&m) || m.ullAvailPhys<reserve+bytes)return false;
+        const auto limit=cap();
+        if(bytes>limit || live>limit-bytes || !GlobalMemoryStatusEx(&m) || m.ullAvailPhys<reserve+bytes)return false;
         live+=bytes;peak=std::max(peak,live);return true;
     }
     static void release(std::size_t bytes){std::lock_guard<std::mutex> lock(mutex);live-=bytes;}
