@@ -118,6 +118,11 @@ double graph_trace_free_mib() {
 void graph_trace_report(const char* stage,double before,std::size_t nodes) {
     if(before<0)return;
     const double after=graph_trace_free_mib();
+    // Running total over all instantiations/uploads (most take < 1 MiB each).
+    static double total=0;static std::size_t count=0;
+    total+=before-after;
+    if(++count%250==0)
+        std::fprintf(stderr,"GRAPH_MEMORY_TOTAL graphs=%zu took=%.1f MiB%c",count,total,10);
     if(before-after>=1.0)
         std::fprintf(stderr,"GRAPH_MEMORY %s nodes=%zu took=%.1f MiB free=%.1f MiB%c",
             stage,nodes,before-after,after,10);
@@ -131,11 +136,13 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     }
     CUDA_CHECK(try_reset());
 
+    const double before=graph_trace_free_mib();
     const cudaError_t err = provider_.instantiate(&exec_, definition.graph_);
     if (err != cudaSuccess) {
         (void)try_reset();
         CUDA_CHECK(err);
     }
+    graph_trace_report("instantiate",before,0);
 }
 
 void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
