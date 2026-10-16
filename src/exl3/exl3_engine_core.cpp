@@ -2959,12 +2959,15 @@ struct Exl3EngineCore::Impl {
                     return value?std::clamp(std::atoi(value),16,1024):256;
                 }();
                 // First verify block of a request (VOIDINFER_EXL3_VERICACHE_FIRST_BLOCK,
-                // default 32 rows on exclusive passes, 16 on lines; 0 = off): tokens are
-                // published only after verification, so a 256+-row first block held
-                // the first token for seconds at C5-C8.
+                // default 4 rows, at most 16 on lines; 0 = off): tokens are published
+                // only after verification, so a 256+-row first block held the first
+                // token for seconds at C5-C8. 4 (was 32 / 16 on lines): the first round's
+                // tokens are verified at once; 128-token outputs C1 1060 / 2060-token
+                // prompts TTFT 0.51 / 0.73 -> 0.45 / 0.67 s, LCB first-wave C1 389 ->
+                // 287 ms, C2 0.79 -> 0.66 s, C8 mean 3.39 -> 3.27 s; tok/s within noise.
                 static const int first_block_setting=[] {
                     const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_FIRST_BLOCK");
-                    return value?std::clamp(std::atoi(value),0,1024):32;
+                    return value?std::clamp(std::atoi(value),0,1024):4;
                 }();
                 const int first_block=fold_line?(first_block_setting?std::min(first_block_setting,16):0):
                     first_block_setting;
