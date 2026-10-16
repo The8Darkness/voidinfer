@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <span>
 #include <source_location>
@@ -76,6 +77,45 @@ public:
     };
     void add(Allocation value,
         std::source_location location=std::source_location::current()) {
+        validate(value,location);
+        for(const auto& prior:allocations_) if(same_owner(prior.owner,value.owner) && prior.slot==value.slot) {
+            require_same(prior,value);
+            return;
+        }
+        allocations_.push_back(std::move(value));
+    }
+    // add() for every allocation of `other`, with an (owner, slot) index
+    // instead of a scan per allocation (quadratic at eight lanes' inventories).
+    void append(const Exl3ResourceInventory& other,
+        std::source_location location=std::source_location::current()) {
+        if(other.allocations_.empty())return;
+        std::map<SlotKey,std::size_t,SlotKeyLess> index;
+        for(std::size_t i=0;i<allocations_.size();++i)
+            index.try_emplace(SlotKey{allocations_[i].owner,allocations_[i].slot},i);
+        for(const auto& value:other.allocations_) {
+            validate(value,location);
+            const auto [found,inserted]=index.try_emplace(SlotKey{value.owner,value.slot},allocations_.size());
+            if(!inserted) {
+                require_same(allocations_[found->second],value);
+                continue;
+            }
+            allocations_.push_back(value);
+        }
+    }
+private:
+    struct SlotKey {
+        std::shared_ptr<const void> owner;
+        std::uint64_t slot=0;
+    };
+    // Equal keys exactly when same_owner and the slots match.
+    struct SlotKeyLess {
+        bool operator()(const SlotKey& a,const SlotKey& b) const noexcept {
+            if(a.owner.owner_before(b.owner))return true;
+            if(b.owner.owner_before(a.owner))return false;
+            return a.slot<b.slot;
+        }
+    };
+    static void validate(const Allocation& value,const std::source_location& location) {
         if(!value.owner || !value.owner.use_count())
             throw std::invalid_argument("resource allocation declaration missing owner");
         if(!value.units)
@@ -91,18 +131,16 @@ public:
             throw std::invalid_argument("resource allocation declaration device retire domain");
         if(value.registration_lifetime_retire && value.domain!=Domain::cuda_registered_host)
             throw std::invalid_argument("resource allocation declaration registration retire domain");
-        for(const auto& prior:allocations_) if(same_owner(prior.owner,value.owner) && prior.slot==value.slot) {
-            if(prior.domain!=value.domain || prior.units!=value.units || prior.lifetime_retire!=value.lifetime_retire ||
-                prior.device_lifetime_retire!=value.device_lifetime_retire ||
-                prior.registration_lifetime_retire!=value.registration_lifetime_retire ||
-                prior.retired_slot!=value.retired_slot ||
-                prior.retired_owner.owner_before(value.retired_owner) || value.retired_owner.owner_before(prior.retired_owner))
-                throw std::invalid_argument("resource owner slot changed extent/domain");
-            return;
-        }
-        allocations_.push_back(std::move(value));
     }
-    void append(const Exl3ResourceInventory& other) {for(const auto& value:other.allocations_)add(value);}
+    static void require_same(const Allocation& prior,const Allocation& value) {
+        if(prior.domain!=value.domain || prior.units!=value.units || prior.lifetime_retire!=value.lifetime_retire ||
+            prior.device_lifetime_retire!=value.device_lifetime_retire ||
+            prior.registration_lifetime_retire!=value.registration_lifetime_retire ||
+            prior.retired_slot!=value.retired_slot ||
+            prior.retired_owner.owner_before(value.retired_owner) || value.retired_owner.owner_before(prior.retired_owner))
+            throw std::invalid_argument("resource owner slot changed extent/domain");
+    }
+public:
     std::optional<Allocation> first_lifetime_retirement() const {
         for(const auto& value:allocations_)if(value.lifetime_retire || value.device_lifetime_retire || value.registration_lifetime_retire)return value;
         return {};
@@ -186,13 +224,25 @@ public:
     static Totals transition_union(const Exl3ResourceInventory& old,
         const Exl3ResourceInventory& next,const Exl3ResourceInventory& pending={},
         const Exl3ResourceInventory& quarantined={}) {
-        struct Charge {
+        // Charges keyed by (owner control block, slot): owner_before order, so
+        // keys compare equal exactly when same_owner and the slots match
+        // (a linear scan was quadratic: ~42 ms per call at eight lanes).
+        struct Key {
             std::shared_ptr<const void> owner;
             std::uint64_t slot=0;
+        };
+        struct KeyLess {
+            bool operator()(const Key& a,const Key& b) const noexcept {
+                if(a.owner.owner_before(b.owner))return true;
+                if(b.owner.owner_before(a.owner))return false;
+                return a.slot<b.slot;
+            }
+        };
+        struct Charge {
             Domain domain=Domain::device;
             std::uint64_t units=0;
         };
-        std::vector<Charge> charges;
+        std::map<Key,Charge,KeyLess> charges;
         Totals result{};
         const std::weak_ptr<const void> empty;
         const auto append=[&](const Exl3ResourceInventory& inventory) {
@@ -202,11 +252,10 @@ public:
                 auto physical=tracked?value.retired_owner.lock():std::shared_ptr<const void>{};
                 const auto slot=physical?value.retired_slot:value.slot;
                 if(!physical)physical=value.owner;
-                auto found=std::find_if(charges.begin(),charges.end(),[&](const Charge& prior) {
-                    return same_owner(prior.owner,physical) && prior.slot==slot;
-                });
-                if(found!=charges.end()) {
-                    if(found->domain!=value.domain || found->units!=value.units)
+                const auto [found,inserted]=charges.try_emplace(Key{std::move(physical),slot},
+                    Charge{value.domain,value.units});
+                if(!inserted) {
+                    if(found->second.domain!=value.domain || found->second.units!=value.units)
                         throw std::invalid_argument("resource transition alias changed extent/domain");
                     continue;
                 }
@@ -214,7 +263,6 @@ public:
                 if(value.units>std::numeric_limits<std::uint64_t>::max()-total)
                     throw std::overflow_error("resource transition extent overflow");
                 total+=value.units;
-                charges.push_back({std::move(physical),slot,value.domain,value.units});
             }
         };
         append(old);append(next);append(pending);append(quarantined);
