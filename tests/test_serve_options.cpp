@@ -63,7 +63,7 @@ int main() {
                       "a server without --draft was accepted");
     failures += check(rejects([] { (void)parse({"voidinfer-serve", "model-dir"}); }),
                       "a positional model path was accepted");
-    failures += check(defaults.max_context == 32768, "--max-context does not default to 32768");
+    failures += check(defaults.max_context == 262144, "--max-context does not default to 262144");
     // Host KV default: max(8 GiB, max-context x 64 KiB, 40% of physical memory).
     std::size_t physical = 0;
 #ifdef _WIN32
@@ -73,8 +73,8 @@ int main() {
 #endif
     const std::size_t memory_share = physical / 5 * 2;
     failures += check(defaults.context_cache.host_kv_capacity_bytes ==
-                          std::max<std::size_t>(voidinfer::kDefaultHostKvCapacityBytes, memory_share),
-                      "host KV does not default to max(8 GiB, 40% of memory) at 32K");
+                          std::max<std::size_t>({voidinfer::kDefaultHostKvCapacityBytes, 262144ULL * 65536, memory_share}),
+                      "host KV does not default to max(8 GiB, 262144 x 64 KiB, 40% of memory) at the default context");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures += check(defaults.preserve_thinking, "thinking history not preserved by default");
     failures += check(defaults.request_log_jsonl.empty(), "request log enabled by default");

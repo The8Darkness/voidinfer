@@ -26,7 +26,7 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => the loaded model identity
     std::string request_log_jsonl;                // empty => structured request logging disabled
-    std::uint32_t max_context          = 32768;
+    std::uint32_t max_context          = 262144;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

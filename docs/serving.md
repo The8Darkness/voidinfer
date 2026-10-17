@@ -467,7 +467,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | public OpenAI model alias | target weights id |
 | `--device N` | CUDA device index | `0` |
-| `--max-context N` | context ceiling of each request, `2048..262144` | `32768` |
+| `--max-context N` | context ceiling of each request, `2048..262144` | `262144` |
 | `--max-concurrency N` | lanes (concurrent requests), `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
