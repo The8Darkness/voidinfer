@@ -22,6 +22,7 @@
 #include "exl3/engine_target_q.h"
 #include "exl3/engine_greedy_packet_batch.h"
 #include "exl3/registered_kv_backing.h"
+#include "exl3/host_memory_available.h"
 #include "exl3/kv_transfer_lease.h"
 #include "exl3/kv_registration_cache.h"
 #include "exl3/registered_kv_upload.h"
@@ -173,7 +174,7 @@ struct ExecutionStream {
     }
     ~ExecutionStream(){retire_idle();}
 };
-std::uint64_t available(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);if(!GlobalMemoryStatusEx(&m))throw std::runtime_error("EXL3 physical memory query");return m.ullAvailPhys;}
+std::uint64_t available(){const auto bytes=exl3_available_host_bytes();if(!bytes)throw std::runtime_error("EXL3 physical memory query");return *bytes;}
 std::uint64_t total_memory(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);if(!GlobalMemoryStatusEx(&m))throw std::runtime_error("EXL3 physical memory query");return m.ullTotalPhys;}
 std::uint64_t resident_budget(const EngineOptions& options) {
     constexpr std::uint64_t reserve=8ULL<<30;

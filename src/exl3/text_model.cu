@@ -2063,9 +2063,17 @@ struct Exl3TextContext::Impl {
         for(auto& layer:full_layers)if(layer)layer->set_batch_tier(batch);
         for(auto& layer:gdn_layers)if(layer)layer->set_batch_tier(batch);
     }
-    // suspend_l0_codes: pinned stage of the code/meta rows [0,rows) (rows -1: resident).
+    // suspend_l0_codes: stage of the code/meta rows [0,rows) (rows -1: resident),
+    // pinned unless the driver refused page-locked memory (then pageable).
     std::byte* suspended_codes = nullptr;
     std::size_t suspended_code_capacity = 0;
+    bool suspended_codes_pinned = false;
+    void free_suspended_codes() noexcept {
+        if(!suspended_codes)return;
+        if(suspended_codes_pinned)(void)cudaFreeHost(suspended_codes);
+        else ::operator delete(suspended_codes);
+        suspended_codes=nullptr;suspended_code_capacity=0;
+    }
     int suspended_code_rows = -1;
     void select_prompt_tier(bool prompt,int position,cudaStream_t stream) {
         if(shared_taps) {
@@ -3018,7 +3026,7 @@ struct Exl3TextContext::Impl {
         // Exported pages may outlive this context: fill them while the planes exist.
         try {if(kv_source)kv_source->materialize_from(0);} catch(...) {}
         if(small_tier_storage)(void)cudaFree(small_tier_storage);
-        if(suspended_codes)(void)cudaFreeHost(suspended_codes);
+        free_suspended_codes();
         if(gdn_write_flag){(void)cudaFree(gdn_write_flag);gdn_write_flag=nullptr;}
         if(transaction && transaction->live_host_root){
             (void)voidinfer::cuda_device_synchronize_outside_capture();(void)cudaFreeHost(transaction->live_host_root);
@@ -14367,10 +14375,17 @@ std::size_t Exl3TextContext::suspend_l0_codes(cudaStream_t stream) {
     std::size_t bytes=0;
     for(const auto& layer:impl_->full_layers)if(layer)bytes+=layer->l0_code_bytes(rows);
     if(bytes>impl_->suspended_code_capacity) {
-        if(impl_->suspended_codes)cuda_check(cudaFreeHost(impl_->suspended_codes),"free suspended L0 code stage");
-        impl_->suspended_codes=nullptr;impl_->suspended_code_capacity=0;
-        cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&impl_->suspended_codes),bytes,cudaHostAllocDefault),
-            "allocate suspended L0 code stage");
+        impl_->free_suspended_codes();
+        // When the driver refuses page-locked memory, a pageable stage only
+        // makes these copies synchronous: it replaces the stage instead of
+        // failing the engine.
+        if(cudaHostAlloc(reinterpret_cast<void**>(&impl_->suspended_codes),bytes,cudaHostAllocDefault)==cudaSuccess)
+            impl_->suspended_codes_pinned=true;
+        else {
+            (void)cudaGetLastError();
+            impl_->suspended_codes=static_cast<std::byte*>(::operator new(bytes));
+            impl_->suspended_codes_pinned=false;
+        }
         impl_->suspended_code_capacity=bytes;
     }
     auto* host=impl_->suspended_codes;

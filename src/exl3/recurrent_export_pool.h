@@ -1,4 +1,5 @@
 #pragma once
+#include "exl3/host_memory_available.h"
 #include "exl3/reconstruction_control_allocator.h"
 #include "exl3/resource_inventory.h"
 #include <cuda_runtime.h>
@@ -64,9 +65,10 @@ struct Exl3RecurrentPinBudget {
     inline static std::mutex mutex;
     inline static std::uint64_t live=0,peak=0,quarantined=0;
     static bool claim(std::size_t bytes){
-        std::lock_guard<std::mutex> lock(mutex);MEMORYSTATUSEX m{};m.dwLength=sizeof(m);
+        std::lock_guard<std::mutex> lock(mutex);
         const auto limit=cap();
-        if(bytes>limit || live>limit-bytes || !GlobalMemoryStatusEx(&m) || m.ullAvailPhys<reserve+bytes)return false;
+        const auto available=exl3_available_host_bytes();
+        if(bytes>limit || live>limit-bytes || !available || *available<reserve+bytes)return false;
         live+=bytes;peak=std::max(peak,live);return true;
     }
     static void release(std::size_t bytes){std::lock_guard<std::mutex> lock(mutex);live-=bytes;}

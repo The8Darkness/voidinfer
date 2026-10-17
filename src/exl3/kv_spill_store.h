@@ -11,6 +11,7 @@
 // spill volume (default 32768): spills that would cut into it stay in RAM, and
 // a failed write pauses spilling for a minute (the pages stay resident).
 #include "exl3/exact_kv_extent.h"
+#include "exl3/host_memory_available.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -58,10 +59,9 @@ public:
             const char* value = std::getenv("VOIDINFER_EXL3_KV_SPILL_FREE_MIB");
             return static_cast<std::uint64_t>(value ? std::strtoull(value, nullptr, 10) : 12288) << 20;
         }();
-        MEMORYSTATUSEX memory{};
-        memory.dwLength = sizeof(memory);
-        if (!GlobalMemoryStatusEx(&memory)) return false;
-        return memory.ullAvailPhys < (hard ? floor / 2 : floor) + extra;
+        const auto available = exl3_available_host_bytes();
+        if (!available) return false;
+        return *available < (hard ? floor / 2 : floor) + extra;
     }
 
     // Room for `bytes` more of spill on the volume above the reserve, and no

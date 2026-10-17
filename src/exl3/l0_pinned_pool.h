@@ -48,8 +48,12 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (free_.empty()) {
             void* slab = nullptr;
-            if (cudaHostAlloc(&slab, block_bytes() * kSlabBlocks, cudaHostAllocPortable) != cudaSuccess)
-                throw std::runtime_error("L0 OSCAR pinned chunk slab allocation");
+            // When the driver refuses page-locked memory the slab is pageable:
+            // its uploads and downloads become synchronous, nothing fails.
+            if (cudaHostAlloc(&slab, block_bytes() * kSlabBlocks, cudaHostAllocPortable) != cudaSuccess) {
+                (void)cudaGetLastError();
+                slab = ::operator new(block_bytes() * kSlabBlocks);
+            }
             slabs_.push_back(slab);
             for (std::size_t i = 0; i < kSlabBlocks; ++i)
                 free_.push_back(static_cast<std::uint8_t*>(slab) + i * block_bytes());

@@ -9,6 +9,7 @@
 #include <psapi.h>
 #include "exl3/resource_inventory.h"
 #include "exl3/merge_resident_ranges.h"
+#include "exl3/host_memory_available.h"
 #include "exl3/retained_descriptor_ledger.h"
 #include "exl3/bounded_shared_owner.h"
 #include "exl3/reserved_host_payload_union.h"
@@ -282,9 +283,9 @@ private:
         }
     }
     void check_reserve(std::uint64_t missing=0) const {
-        MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
-        if(!GlobalMemoryStatusEx(&memory)) throw error("available memory");
-        if(memory.ullAvailPhys<reserve_ || missing>memory.ullAvailPhys-reserve_)
+        const auto available=exl3_available_host_bytes();
+        if(!available) throw error("available memory");
+        if(*available<reserve_ || missing>*available-reserve_)
             throw Exl3HostResidentReserveExhausted();
     }
     void set_quota(SIZE_T minimum,SIZE_T maximum,DWORD flags) {
