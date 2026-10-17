@@ -482,7 +482,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | media preprocessing workers; `0` selects up to 16 | `0` |
-| `--default-max-tokens N` | output limit when a request omits one | `8192` |
+| `--default-max-tokens N` | output limit when a request omits one | `262144` (clamped to the remaining context) |
 | `--default-thinking-budget N` | thinking cap for thinking-enabled requests (currently rejected by the Engine) | unset |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--no-preserve-thinking` | drop closed-turn reasoning from later prompts | keep (template default) |
