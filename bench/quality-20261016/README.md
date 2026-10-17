@@ -1,6 +1,6 @@
 # Quality benchmark 2026-10-16: VoidInfer EXL3 6 bpw vs NInfer NVFP4
 
-Report: `results/REPORT.md` (tables with every CI: `results/REPORT_TABLES.md`; frozen inputs: `results/MANIFEST.json`).
+Report: `docs/quality-comparison-2026-10-16.md` (tables with every CI: `docs/quality-comparison-2026-10-16-tables.md`; frozen inputs: `docs/quality-comparison-2026-10-16-manifest.json`).
 Working directory of the run: `D:\AI\quality-bench-20261016` (panels, references, raw records, task runs, logs).
 
 Pipeline (each step resumable):
