@@ -648,6 +648,7 @@ private:
         auto* store = Exl3KvSpillStore::get();
         auto* buffer = Exl3KvSpillStore::aligned_buffer();
         const std::size_t bytes = page.packed.size();
+        if (!store->has_room(bytes)) return;  // stays packed in RAM
         std::memcpy(buffer, page.packed.data(), bytes);
         const auto slot = store->allocate();
         try {
@@ -683,6 +684,7 @@ private:
                     return;
                 }
                 if (page->source_id.load() != this || page->payload_deferred() || !sized(*page)) return;
+                if (!Exl3KvSpillStore::get()->has_room(page_bytes(*page))) return;  // stays filled in RAM
                 auto* buffer = Exl3KvSpillStore::aligned_buffer();
                 auto* words = reinterpret_cast<std::uint16_t*>(buffer);
                 const std::size_t count = static_cast<std::size_t>(page->rows) * kRowWords;
@@ -865,8 +867,11 @@ private:
 
     // Caller holds mutex_ and the payload mutex exclusively: the pages' rows
     // go from these planes to spill slots, in windows of kSpillPages pages.
+    // Returns the pages left in the planes (no room on the spill volume, or a
+    // failed write), in order, for the caller to fill into RAM instead.
     static constexpr std::size_t kSpillPages = 16;
-    void spill_from_planes_locked(const std::vector<Exl3ExactKVPage*>& pages) {
+    std::vector<Exl3ExactKVPage*> spill_from_planes_locked(const std::vector<Exl3ExactKVPage*>& pages) {
+        std::vector<Exl3ExactKVPage*> unspilled;
         auto* store = Exl3KvSpillStore::get();
         // Pool threads below see their own thread_locals: bind this thread's.
         thread_local std::vector<std::uint8_t*> window_buffers;
@@ -881,6 +886,12 @@ private:
         };
         for (std::size_t begin = 0; begin < pages.size(); begin += kSpillPages) {
             const std::size_t end = std::min(pages.size(), begin + kSpillPages);
+            std::uint64_t window_bytes = 0;
+            for (std::size_t index = begin; index < end; ++index) window_bytes += page_bytes(*pages[index]);
+            if (!store->has_room(window_bytes)) {
+                unspilled.insert(unspilled.end(), pages.begin() + begin, pages.end());
+                return unspilled;
+            }
             for (std::size_t index = begin; index < end; ++index) window_buffer(index - begin);
             // Rows of the window's pages (one DMA per bank and plane when the
             // window is contiguous), packed into the slot buffers.
@@ -920,15 +931,26 @@ private:
             for (auto& slot : slots) slot = store->allocate();
             std::vector<std::size_t> order(end - begin);
             for (std::size_t index = 0; index < order.size(); ++index) order[index] = index;
+            std::vector<char> written(end - begin, 0);
             par_each(order.begin(), order.end(), [&](std::size_t index) {
-                store->write(slots[index], buffers[index], page_bytes(*pages[begin + index]));
+                try {
+                    store->write(slots[index], buffers[index], page_bytes(*pages[begin + index]));
+                    written[index] = 1;
+                } catch (...) {
+                }
             });
             for (std::size_t index = begin; index < end; ++index) {
+                if (!written[index - begin]) {
+                    store->release(slots[index - begin]);
+                    unspilled.push_back(pages[index]);
+                    continue;
+                }
                 release_payload(*pages[index]);
                 pages[index]->spill.store(slots[index - begin]);
                 pages[index]->spill_packed_bytes = 0;
             }
         }
+        return unspilled;
     }
 
     // Caller holds mutex_ and the payload mutex exclusively. Unless a reader
@@ -962,9 +984,10 @@ private:
         if (may_spill && Exl3KvSpillStore::get()) {
             std::uint64_t bytes = 0;
             for (const auto* page : pages) bytes += page_bytes(*page);
-            if (Exl3KvSpillStore::under_pressure(bytes, true)) {
-                spill_from_planes_locked(pages);
-                return;
+            if (Exl3KvSpillStore::under_pressure(bytes, true) && Exl3KvSpillStore::get()->has_room(bytes)) {
+                auto rest = spill_from_planes_locked(pages);
+                if (rest.empty()) return;
+                pages.swap(rest);  // these stay in RAM below
             }
         }
         for (auto* page : pages)

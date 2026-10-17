@@ -1019,6 +1019,14 @@ public:
         for(const auto& request:requests) if(request && request->projected_) rings.push_back(request->projected_);
         return Exl3DraftHostRing::visit_allocations(rings);
     }
+    // Logical bytes of the requests' lane-backed exact-KV pages (not host
+    // allocations of the image, so visit_host_allocations skips them).
+    static std::uint64_t lane_backed_kv_bytes(std::span<const std::shared_ptr<const Exl3VeriCacheRequest>> requests) {
+        std::vector<std::shared_ptr<const Exl3ExactHostState>> images;
+        images.reserve(requests.size());
+        for(const auto& request:requests) if(request && request->state_) images.push_back(request->state_);
+        return Exl3ExactHostState::lane_backed_kv_bytes(images);
+    }
     static void visit_host_allocations(std::span<const std::shared_ptr<const Exl3VeriCacheRequest>> requests,
         const std::function<void(const void*,std::size_t)>& visitor,bool include_unused_capacity=true) {
         if(!visitor) throw std::invalid_argument("request allocation visitor missing");
@@ -1515,6 +1523,12 @@ public:
         std::size_t entries=0;
         std::uint64_t payload_allocated_bytes=0;
         std::uint64_t identity_allocated_bytes=0;
+        // Retained exact KV of lane-backed pages: once their lane moves on the
+        // rows are filled into host planes, packed or spilled to disk, none of
+        // which is a host allocation of the image, but all of it is retained
+        // by this cache (without it the byte budget never saw long histories
+        // and spills grew without bound).
+        std::uint64_t lane_backed_bytes=0;
         std::uint64_t accounted_bytes=0;
         // Inline owner storage, not evictable entry data. Already included when
         // the enclosing cache object is inventoried by sizeof; do not add twice.
@@ -2017,7 +2031,8 @@ private:
             });
         if(result.identity_allocated_bytes>std::numeric_limits<std::uint64_t>::max()-result.payload_allocated_bytes)
             throw std::overflow_error("prefix index total accounting overflow");
-        result.accounted_bytes=result.payload_allocated_bytes+result.identity_allocated_bytes;
+        if(!roots.empty()) result.lane_backed_bytes=Exl3VeriCacheRequest::lane_backed_kv_bytes(roots);
+        result.accounted_bytes=result.payload_allocated_bytes+result.identity_allocated_bytes+result.lane_backed_bytes;
         return result;
     }
     StorageStats current_stats_locked() const {

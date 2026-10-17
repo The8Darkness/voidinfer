@@ -7,6 +7,9 @@
 // VOIDINFER_EXL3_KV_SPILL=0 disables. VOIDINFER_EXL3_KV_SPILL_DIR picks the
 // directory (default: the temp directory). VOIDINFER_EXL3_KV_SPILL_FREE_MIB is
 // the available physical memory to keep (default 12288).
+// VOIDINFER_EXL3_KV_SPILL_DISK_RESERVE_MIB is the free space to leave on the
+// spill volume (default 32768): spills that would cut into it stay in RAM, and
+// a failed write pauses spilling for a minute (the pages stay resident).
 #include "exl3/exact_kv_extent.h"
 
 #ifndef NOMINMAX
@@ -59,6 +62,20 @@ public:
         memory.dwLength = sizeof(memory);
         if (!GlobalMemoryStatusEx(&memory)) return false;
         return memory.ullAvailPhys < (hard ? floor / 2 : floor) + extra;
+    }
+
+    // Room for `bytes` more of spill on the volume above the reserve, and no
+    // write failure in the last minute.
+    bool has_room(std::uint64_t bytes) const {
+        static const std::uint64_t reserve = [] {
+            const char* value = std::getenv("VOIDINFER_EXL3_KV_SPILL_DISK_RESERVE_MIB");
+            return static_cast<std::uint64_t>(value ? std::strtoull(value, nullptr, 10) : 32768) << 20;
+        }();
+        const auto failed = failed_at_.load(std::memory_order_relaxed);
+        if (failed && GetTickCount64() - failed < 60000) return false;
+        ULARGE_INTEGER available{};
+        if (!GetDiskFreeSpaceExW(directory_.c_str(), &available, nullptr, nullptr)) return false;
+        return available.QuadPart >= reserve + bytes;
     }
 
     std::int64_t allocate() {
@@ -127,6 +144,7 @@ private:
         std::filesystem::path directory;
         if (const char* value = std::getenv("VOIDINFER_EXL3_KV_SPILL_DIR")) directory = value;
         else directory = std::filesystem::temp_directory_path();
+        directory_ = std::filesystem::absolute(directory).wstring();
         const auto path = directory / ("voidinfer-kv-spill-" + std::to_string(GetCurrentProcessId()) + ".bin");
         file_ = CreateFileW(path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
             FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
@@ -152,10 +170,13 @@ private:
         const bool ok = (started || GetLastError() == ERROR_IO_PENDING) &&
             GetOverlappedResult(file_, &overlapped, &done, TRUE) && done == rounded;
         CloseHandle(overlapped.hEvent);
+        if (!ok && write) failed_at_.store(GetTickCount64() | 1, std::memory_order_relaxed);
         if (!ok) throw std::runtime_error(write ? "KV spill write" : "KV spill read");
     }
 
     HANDLE file_ = INVALID_HANDLE_VALUE;
+    std::wstring directory_;
+    std::atomic<std::uint64_t> failed_at_{0};
     std::size_t sector_ = 4096;
     mutable std::mutex mutex_;
     std::vector<std::int64_t> free_;

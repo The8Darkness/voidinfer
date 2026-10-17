@@ -9702,6 +9702,21 @@ void Exl3TextContext::append_prefill_layer_major(
         const std::size_t total=token_ids.size();
         const std::size_t count=(total+block-1)/block;
         std::vector<std::pair<std::size_t,std::size_t>> parts;
+        // The retained tap tail (2032..2063 rows) must lie in the last block;
+        // with blocks of fewer rows than 2 x tail (the 4096-row blocks of
+        // concurrent lanes) equal blocks can be shorter than it, so the last
+        // block then takes exactly the tail and the rest splits equally.
+        const std::size_t tail=retained_taps?static_cast<std::size_t>(retained_taps->rows):0;
+        if (count>1 && tail<=block && total/count<tail) {
+            std::size_t earlier=count-1;
+            while (total-tail>earlier*block) ++earlier;
+            for (std::size_t p=0,at=0;p<earlier;++p) {
+                const std::size_t rows=(total-tail-at)/(earlier-p);
+                parts.push_back({at,rows});
+                at+=rows;
+            }
+            parts.push_back({total-tail,tail});
+        } else
         for (std::size_t p=0,at=0;p<count;++p) {
             const std::size_t rows=(total-at)/(count-p);
             parts.push_back({at,rows});
@@ -11613,6 +11628,23 @@ void Exl3TextContext::sync_exact_line_from(Exl3TextContext& source,cudaStream_t 
                                 rows_bytes(rows-held),cudaMemcpyDeviceToDevice,stream),"exact line taps");
                     });
             impl_->publish_tap_rows(rows,std::min(first,rows));
+            // Rows below the private tier stay in the shared pool under the
+            // source's claim (a line pass of more rows than the tier): this
+            // context takes the claim over, so readers of the whole pass (the
+            // draft ring's re-commit) still find [pool_first,first).
+            if(impl_->shared_taps && impl_->shared_taps==from.shared_taps && !impl_->tap_rows.in_pool &&
+               !from.tap_rows.in_pool && first>0) {
+                auto& pool=*impl_->shared_taps;
+                std::lock_guard lock(pool.mutex);
+                if(pool.owner==&from && from.tap_rows.claim==pool.claims && from.tap_rows.pool_rows==rows &&
+                   !pool.owner_in_pass) {
+                    pool.owner=impl_.get();
+                    impl_->tap_rows.claim=pool.claims;
+                    impl_->tap_rows.pool_first=from.tap_rows.pool_first;
+                    impl_->tap_rows.pool_rows=rows;
+                    from.trace_tap_pool("handover",rows,from.tap_rows.pool_first);
+                }
+            }
         } else {
         for(std::size_t tap=0;tap<kTapLayers.size();++tap)
             if(impl_->taps[tap] && from.taps[tap] && from.tap_rows>0)
@@ -13707,6 +13739,24 @@ void Exl3ExactHostState::visit_host_allocations(
         for(const auto& plane:state->taps_) visit(plane);
         visit(state->logits_);visit(state->embedding_);
     }
+}
+
+std::uint64_t Exl3ExactHostState::lane_backed_kv_bytes(
+    std::span<const std::shared_ptr<const Exl3ExactHostState>> requests) {
+    std::unordered_set<const Exl3ExactHostState*> images;
+    std::unordered_set<const Exl3ExactKVPage*> pages;
+    std::uint64_t bytes=0;
+    for(const auto& state:requests) {
+        if(!state || !images.insert(state.get()).second) continue;
+        for(const auto& page:state->kv_pages_) {
+            if(!page->source_id.load() || !pages.insert(page.get()).second) continue;
+            // K and V banks of every full-attention layer: FP16 [4][256] rows,
+            // or L2 FP8 rows of 516 words.
+            const std::uint64_t row_words=page->fp8?516:static_cast<std::uint64_t>(kKVHeads)*kHeadDim;
+            bytes+=static_cast<std::uint64_t>(page->rows)*row_words*sizeof(std::uint16_t)*2*page->k.size();
+        }
+    }
+    return bytes;
 }
 
 Exl3RecurrentExportStats Exl3TextContext::recurrent_export_stats() const {return impl_->recurrent_export.snapshot();}

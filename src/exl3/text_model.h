@@ -407,6 +407,11 @@ public:
     static void visit_host_allocations(
         std::span<const std::shared_ptr<const Exl3ExactHostState>> requests,
         const std::function<void(const void*,std::size_t)>& visitor,bool include_unused_capacity=true);
+    // Logical exact-KV bytes of the lane-backed pages (deduplicated), which
+    // visit_host_allocations skips: wherever their rows live (lane planes,
+    // filled host planes, packed RAM or the spill file), retaining them costs
+    // this much, so retention budgets count it.
+    static std::uint64_t lane_backed_kv_bytes(std::span<const std::shared_ptr<const Exl3ExactHostState>> requests);
 private:
     static std::shared_ptr<Exl3ExactHostState> create();
     std::shared_ptr<const int> model_identity_;
