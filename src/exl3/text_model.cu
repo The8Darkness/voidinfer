@@ -8451,6 +8451,8 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     cuda_check(cudaMemsetAsync(impl_->position_device, 0, 3*sizeof(int), stream),
                "reset E4B2 position parameter");
     if (impl_->oscar) impl_->oscar->reset();
+    for (auto& layer : impl_->full_layers)
+        if (layer) layer->l0_reset_history(stream);
     position_ = 0;
     for(auto& chunks:impl_->l0_prefix_chunks) chunks.clear();
     impl_->tap_rows = 0;

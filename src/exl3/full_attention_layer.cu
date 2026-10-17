@@ -8220,12 +8220,36 @@ void Exl3FullAttentionLayer::l0_rebind(int position, cudaStream_t stream) {
     invalidate_retained_prefix();
 }
 
+void Exl3FullAttentionLayer::l0_reset_history(cudaStream_t stream) {
+    if(!l0_.k_codes) return;
+    cuda_check(cudaMemsetAsync(l0_.state,0,2*sizeof(int),stream),"L0 OSCAR history reset");
+    if(l0_.hot_slots && !l0_exact_only_) {
+        l0_oscar::hot_clear_kernel<<<64,256,0,stream>>>(l0_oscar::hot_view(l0_));
+        cuda_check(cudaGetLastError(),"L0 OSCAR hot rows reset");
+    }
+}
+
 void Exl3FullAttentionLayer::l0_rewind(int position, cudaStream_t stream) {
     if(!l0_.k_codes) return;
     // An exact line keeps no hot rows (its hot arrays were never initialized).
     l0_oscar::rewind_kernel<<<16,256,0,stream>>>(l0_.state,
         l0_exact_only_?l0_oscar::HotView{}:l0_oscar::hot_view(l0_),position);
     cuda_check(cudaGetLastError(),"L0 OSCAR verified-root rewind");
+    // Hot rows are keyed by row index and filled from the FP16 planes, which
+    // a root restore or a lane's next request may have held for another
+    // history in the meantime (multi-lane prefix reuse served stale rows:
+    // NoLiMa 4K on a C2 server differed from C1 on 10-19 of 60 answers, 0
+    // with this clear). Every rewind starts them empty; they refill within a
+    // few rounds (VOIDINFER_EXL3_L0_REWIND_KEEP_HOT=1 keeps rows below the
+    // window, the previous behavior, for research).
+    static const bool keep_hot=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_REWIND_KEEP_HOT");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    if(!keep_hot && l0_.hot_slots && !l0_exact_only_) {
+        l0_oscar::hot_clear_kernel<<<64,256,0,stream>>>(l0_oscar::hot_view(l0_));
+        cuda_check(cudaGetLastError(),"L0 OSCAR hot rows rewind");
+    }
     // A window ring smaller than 2048 rows no longer holds the window of a
     // rewound position: rebuild it from the FP16 L2 record.
     if(l0_.k_ring && l0_ring_rows_<l0_oscar::kRingRows && k_cache_ && v_cache_) {
