@@ -65,8 +65,9 @@ def wait_health(port, proc, limit=1200):
     raise RuntimeError("server never became healthy")
 
 
-def run_suite(port, config, name, conc, limit, ids=None):
+def run_suite(port, config, name, conc, limit, ids=None, max_tokens_override=0, save_reasoning=False):
     items_fn, _, max_tokens, thinking = SUITES[name]
+    max_tokens = max_tokens_override or max_tokens
     items = list(items_fn())[:limit] if limit else list(items_fn())
     os.makedirs(os.path.join(OUT, config), exist_ok=True)
     path = os.path.join(OUT, config, name + ".jsonl")
@@ -88,6 +89,8 @@ def run_suite(port, config, name, conc, limit, ids=None):
             msg = r["choices"][0]["message"]
             rec = {"id": it["id"], "content": msg.get("content") or "", "reasoning_chars": len(msg.get("reasoning_content") or ""),
                    "finish_reason": r["choices"][0].get("finish_reason"), "usage": r.get("usage"), "seconds": time.time() - t0}
+            if save_reasoning:
+                rec["reasoning"] = msg.get("reasoning_content") or ""
         except Exception as e:
             detail = e.read().decode(errors="ignore")[:500] if hasattr(e, "read") else ""
             rec = {"id": it["id"], "error": f"{e} {detail}", "seconds": time.time() - t0}
@@ -112,6 +115,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--env", default="", help="NAME=VALUE;... added to the server environment")
     ap.add_argument("--ids", default="", help="comma-separated item ids to run (default: all)")
+    ap.add_argument("--max-tokens", type=int, default=0, help="override the suite's output budget")
+    ap.add_argument("--save-reasoning", action="store_true", help="store reasoning_content in each record")
     a = ap.parse_args()
     os.makedirs(os.path.join(OUT, a.config), exist_ok=True)
     log = open(os.path.join(OUT, a.config, f"server.{int(time.time())}.log"), "w", encoding="utf-8")
@@ -120,7 +125,8 @@ def main():
     try:
         wait_health(a.port, proc)
         for name in a.suites.split(","):
-            run_suite(a.port, a.config, name, a.conc, a.limit, set(filter(None, a.ids.split(","))))
+            run_suite(a.port, a.config, name, a.conc, a.limit, set(filter(None, a.ids.split(","))),
+                      a.max_tokens, a.save_reasoning)
     finally:
         proc.terminate()
         try:
