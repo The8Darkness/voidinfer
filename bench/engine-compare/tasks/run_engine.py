@@ -65,7 +65,12 @@ def wait_health(port, proc, limit=1200):
     raise RuntimeError("server never became healthy")
 
 
-def run_suite(port, config, name, conc, limit, ids=None, max_tokens_override=0, save_reasoning=False):
+# Qwen3.8 model-card sampling for thinking mode (min_p 0 and repetition penalty 1.0 are both engines' defaults).
+SAMPLING = {"greedy": {"temperature": 0, "presence_penalty": 0},
+            "recommended": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0}}
+
+
+def run_suite(port, config, name, conc, limit, ids=None, max_tokens_override=0, save_reasoning=False, sampling="greedy"):
     items_fn, _, max_tokens, thinking = SUITES[name]
     max_tokens = max_tokens_override or max_tokens
     items = list(items_fn())[:limit] if limit else list(items_fn())
@@ -82,7 +87,7 @@ def run_suite(port, config, name, conc, limit, ids=None, max_tokens_override=0, 
     def one(it):
         messages = it.get("messages") or [{"role": "user", "content": it["prompt"]}]
         body = {"model": "qwen3.8-27b", "messages": messages,
-                "max_tokens": max_tokens, "temperature": 0, "presence_penalty": 0, "enable_thinking": thinking}
+                "max_tokens": max_tokens, **SAMPLING[sampling], "enable_thinking": thinking}
         t0 = time.time()
         try:
             r = post(port, body)
@@ -117,16 +122,18 @@ def main():
     ap.add_argument("--ids", default="", help="comma-separated item ids to run (default: all)")
     ap.add_argument("--max-tokens", type=int, default=0, help="override the suite's output budget")
     ap.add_argument("--save-reasoning", action="store_true", help="store reasoning_content in each record")
+    ap.add_argument("--sampling", choices=sorted(SAMPLING), default="greedy")
+    ap.add_argument("--server-args", default="", help="extra server arguments (space-separated)")
     a = ap.parse_args()
     os.makedirs(os.path.join(OUT, a.config), exist_ok=True)
     log = open(os.path.join(OUT, a.config, f"server.{int(time.time())}.log"), "w", encoding="utf-8")
-    cmd = command(a.config, a.port, a.conc, a.max_context)
+    cmd = command(a.config, a.port, a.conc, a.max_context) + a.server_args.split()
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=environment(a.env), cwd=os.path.dirname(cmd[0]))
     try:
         wait_health(a.port, proc)
         for name in a.suites.split(","):
             run_suite(a.port, a.config, name, a.conc, a.limit, set(filter(None, a.ids.split(","))),
-                      a.max_tokens, a.save_reasoning)
+                      a.max_tokens, a.save_reasoning, a.sampling)
     finally:
         proc.terminate()
         try:

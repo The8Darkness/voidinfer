@@ -4,7 +4,7 @@ wall time), run-to-run agreement, and per-problem tables (correct / tokens / sec
   compare_runs.py --runs D:\\...\\runs_200k_r1 D:\\...\\runs_200k_r2 --configs ours nv.fp8 \\
                   --suites math500 aime2025 --walls queue.log --out report_dir
 
-Wall times come from "Q200K r=<n> <config> <suite> ... wall=<s>s" lines in --walls (the queue output);
+Wall times come from "Q<tag> r=<n> <config> <suite> ... wall=<s>s" lines in --walls (the queue output);
 without them the per-item seconds are summed (latency, not exclusive time under concurrency).
 """
 import argparse, csv, json, math, os, re, sys
@@ -38,7 +38,7 @@ def main():
     walls = {}
     if a.walls:
         for l in open(a.walls, encoding="utf-8", errors="ignore"):
-            m = re.search(r"Q200K r=(\d+) (\S+) (\S+) conc=\d+ rc=\d+ wall=(\d+)s", l)
+            m = re.search(r"Q\w* r=(\d+) (\S+) (\S+) conc=\d+ rc=\d+ wall=(\d+)s", l)
             if m:
                 walls[(int(m[1]), m[2], m[3])] = int(m[4])
     md = ["# Repeated-run comparison", ""]

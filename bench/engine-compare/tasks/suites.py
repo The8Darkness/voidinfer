@@ -223,6 +223,26 @@ def compmath_score(item, text):
     return math500_score(item, text)
 
 
+# ---- MathArena final-answer competitions and the FrontierMath public problems (thinking) -------------
+MATHARENA = ("aime_2026", "hmmt_feb_2026", "hmmt_nov_2025", "smt_2025", "cmimc_2025", "brumo_2025", "apex_2025")
+MATHARENA_EXT = ("apex_shortlist", "arxivmath_0826", "arxivmath_0926")
+
+
+def matharena_items(names):
+    def items():
+        for name in names:
+            for r in _jsonl("matharena_" + name):
+                yield {"id": f"{name}-{r['problem_idx']}", "prompt": f"{r['problem']}\n{BOXED}", "gold": r["answer"]}
+    return items
+
+
+def frontiermath_items():
+    # The 12 public problems from epoch.ai/frontiermath (Tiers 1-4). Epoch grades a submitted Python
+    # answer() function; here the boxed final answer is checked with math_verify instead.
+    for r in _jsonl("frontiermath"):
+        yield {"id": f"frontiermath-{r['problem_idx']}", "prompt": f"{r['problem']}\n{BOXED}", "gold": r["answer"]}
+
+
 # ---- OpenAI MRCR (official grading: hash prefix required, then difflib ratio) ----------------------
 def mrcr_score(item, text):
     from difflib import SequenceMatcher
@@ -240,6 +260,9 @@ SUITES = {
     "humaneval": (humaneval_items, humaneval_score, 2048, False),
     "aime2025": (aime_items, aime_score, 32768, True),
     "compmath": (compmath_items, compmath_score, 32768, True),
+    "matharena": (matharena_items(MATHARENA), compmath_score, 81920, True),
+    "matharena_ext": (matharena_items(MATHARENA_EXT), compmath_score, 81920, True),
+    "frontiermath": (frontiermath_items, compmath_score, 81920, True),
     "longctx_32k": (lambda: longctx_items("32k"), longctx_score, 256, False),
     "longctx_64k": (lambda: longctx_items("64k"), longctx_score, 256, False),
     "longctx_128k": (lambda: longctx_items("128k"), longctx_score, 256, False),
