@@ -37,6 +37,7 @@
 // for lock-free identity checks. A source's own mutex guards its page list
 // and is always taken before the payload mutex.
 #include "exl3/exact_kv_extent.h"
+#include "exl3/growable_device_region.h"
 #include "exl3/kv_spill_store.h"
 #include "exl3/l0_kv_pack.cuh"
 
@@ -99,8 +100,8 @@ public:
     const Planes& planes() const noexcept { return planes_; }
 
     // Plane set ownership (see above). `release_rows` shrinks the backing to
-    // the given rows (called on idle sets once no page rows are deferred).
-    void set_backing(std::shared_ptr<void> backing, std::function<void(int)> release_rows) {
+    // the given rows and returns the bytes it released (idle sets only).
+    void set_backing(std::shared_ptr<void> backing, std::function<std::uint64_t(int)> release_rows) {
         backing_ = std::move(backing);
         release_rows_ = std::move(release_rows);
     }
@@ -189,17 +190,18 @@ public:
 
     // Host memory is short: spills filled and packed lane-backed pages of
     // every source (idle histories) until `extra` more bytes fit above the
-    // spill floor.
-    // Below the floor a background pass restores the margin off the lanes'
-    // critical path; only growth that would reach into the lower half of the
-    // floor is relieved by the caller.
+    // spill floor. Below the floor a background pass restores the margin off
+    // the lanes' critical path. Plane growth (`extra`) that would come within
+    // the relief floor is relieved by the caller: after spilling it releases
+    // the pooled host chunks and evicts retained prefix roots (oldest first),
+    // since a live request's history takes precedence over cached ones.
     static void relieve_memory_pressure(std::uint64_t extra) {
-        if (!Exl3KvSpillStore::get() || !Exl3KvSpillStore::under_pressure(extra)) return;
-        if (!Exl3KvSpillStore::under_pressure(extra, true)) {
+        if (!Exl3KvSpillStore::under_pressure(extra)) return;
+        if (!extra || !exl3_host_memory_short(extra)) {
             background_relief();
             return;
         }
-        relieve_now(extra);
+        relieve_now(extra, true);
     }
 
 private:
@@ -209,6 +211,8 @@ private:
         bool requested = false;
         int device = 0;
     };
+    // One pass at a time, at most one per second: requests meanwhile
+    // coalesce. Below the relief floor the pass also reclaims (see above).
     static void background_relief() {
         // Leaked: the worker outlives static destruction at process exit.
         static BackgroundRelief* relief = [] {
@@ -223,10 +227,11 @@ private:
                         state->requested = false;
                     }
                     try {
-                        relieve_now(0);
+                        relieve_now(0, exl3_host_memory_short());
                     } catch (const std::exception& error) {
                         std::fprintf(stderr, "KV relief failed: %s\n", error.what());
                     }
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
             }).detach();
             return state;
@@ -237,40 +242,46 @@ private:
         }
         relief->wake.notify_one();
     }
-    static void relieve_now(std::uint64_t extra) {
+    static void relieve_now(std::uint64_t extra, bool reclaim) {
         static std::mutex relief_mutex;
         std::lock_guard relieving(relief_mutex);
         if (!Exl3KvSpillStore::under_pressure(extra)) return;
-        std::vector<std::shared_ptr<Exl3LaneKvSource>> sources;
-        {
-            std::lock_guard lock(registry_mutex());
-            for (const auto& weak : registry())
-                if (auto source = weak.lock()) sources.push_back(std::move(source));
-        }
-        for (const auto& source : sources) {
-            source->spill_filled(extra);
-            if (!Exl3KvSpillStore::under_pressure(extra)) return;
-        }
-        // Idle plane sets: their deferred rows are packed (spilled while the
-        // pressure lasts) and the planes released.
-        static const char relief_owner = 0;
-        for (const auto& source : sources) {
-            if (!source->backing_ || !source->try_bind(&relief_owner)) continue;
-            try {
-                source->fill_where([](const Exl3ExactKVPage& page) { return page.pins.load() == 0; });
-                source->spill_filled(extra);
-                if (!source->deferred_beyond(0) && source->release_rows_) source->release_rows_(0);
-            } catch (...) {
-                source->unbind(&relief_owner);
-                throw;
+        if (Exl3KvSpillStore::get()) {
+            std::vector<std::shared_ptr<Exl3LaneKvSource>> sources;
+            {
+                std::lock_guard lock(registry_mutex());
+                for (const auto& weak : registry())
+                    if (auto source = weak.lock()) sources.push_back(std::move(source));
             }
-            source->unbind(&relief_owner);
-            if (!Exl3KvSpillStore::under_pressure(extra)) return;
+            for (const auto& source : sources) {
+                source->spill_filled(extra);
+                if (!Exl3KvSpillStore::under_pressure(extra)) return;
+            }
+            // Idle plane sets: their deferred rows are packed (spilled while the
+            // pressure lasts) and the planes released.
+            static const char relief_owner = 0;
+            for (const auto& source : sources) {
+                if (!source->backing_ || !source->try_bind(&relief_owner)) continue;
+                try {
+                    source->fill_where([](const Exl3ExactKVPage& page) { return page.pins.load() == 0; });
+                    source->spill_filled(extra);
+                    if (!source->deferred_beyond(0) && source->release_rows_) source->release_rows_(0);
+                } catch (...) {
+                    source->unbind(&relief_owner);
+                    throw;
+                }
+                source->unbind(&relief_owner);
+                if (!Exl3KvSpillStore::under_pressure(extra)) return;
+            }
         }
+        if (!reclaim || !exl3_host_memory_short(extra)) return;
+        Exl3GrowableDeviceRegion::release_host_pool();
+        auto& eviction = Exl3HostMemoryEviction::instance();
+        std::lock_guard lock(eviction.mutex);
+        if (eviction.evict) eviction.evict(extra);
     }
 
 public:
-
     // Fills every page of this source holding a row >= `row`.
     void materialize_from(int row) {
         fill_where([&](const Exl3ExactKVPage& page) { return page.first + page.rows > row; });
@@ -419,6 +430,47 @@ public:
                 if (holds(*page) && page->first + page->rows > row) return true;
         return false;
     }
+
+    // Idle plane sets keep only the rows their deferred pages still name: the
+    // rows beyond them (the growth margin, rows whose pages expired since) are
+    // referenced by nothing and would otherwise stay backed until host memory
+    // pressure. Called when a lane binds another set; sets bound to a lane or
+    // a relief pass are skipped.
+    static void release_idle_unreferenced_rows() {
+        std::vector<std::shared_ptr<Exl3LaneKvSource>> sources;
+        {
+            std::lock_guard lock(registry_mutex());
+            for (const auto& weak : registry())
+                if (auto source = weak.lock()) sources.push_back(std::move(source));
+        }
+        for (const auto& source : sources) source->release_unreferenced_rows();
+    }
+
+private:
+    void release_unreferenced_rows() {
+        if (!backing_ || !release_rows_) return;
+        static const char owner = 0;
+        if (!try_bind(&owner)) return;
+        try {
+            int end = 0;
+            {
+                std::lock_guard lock(mutex_);
+                for (const auto& weak : pages_)
+                    if (auto page = weak.lock())
+                        if (holds(*page)) end = std::max(end, page->first + page->rows);
+            }
+            const auto released = release_rows_(end);
+            static const bool trace = std::getenv("VOIDINFER_EXL3_ROW_BACKING_TRACE") != nullptr;
+            if (trace && released) std::fprintf(stderr, "IDLE_SET_RELEASE source=%p kept_rows=%d released_mib=%llu\n",
+                static_cast<const void*>(this), end, static_cast<unsigned long long>(released >> 20));
+        } catch (...) {
+            unbind(&owner);
+            throw;
+        }
+        unbind(&owner);
+    }
+
+public:
 
     // Copies the rows of a contiguous run of this source's deferred pages
     // straight into another lane's planes (a restore there), without filling
@@ -973,7 +1025,7 @@ private:
                             packed.push_back(page);
                             bytes += page->packed.size();
                         }
-                    if (!packed.empty() && Exl3KvSpillStore::under_pressure(bytes, true))
+                    if (!packed.empty() && exl3_host_memory_short(bytes))
                         par_each(packed.begin(), packed.end(), [&](Exl3ExactKVPage* page) { spill_packed_locked(*page); });
                 }
                 std::sort(rest.begin(), rest.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
@@ -984,7 +1036,7 @@ private:
         if (may_spill && Exl3KvSpillStore::get()) {
             std::uint64_t bytes = 0;
             for (const auto* page : pages) bytes += page_bytes(*page);
-            if (Exl3KvSpillStore::under_pressure(bytes, true) && Exl3KvSpillStore::get()->has_room(bytes)) {
+            if (exl3_host_memory_short(bytes) && Exl3KvSpillStore::get()->has_room(bytes)) {
                 auto rest = spill_from_planes_locked(pages);
                 if (rest.empty()) return;
                 pages.swap(rest);  // these stay in RAM below
@@ -1039,7 +1091,7 @@ private:
 
     Planes planes_;
     std::shared_ptr<void> backing_;
-    std::function<void(int)> release_rows_;
+    std::function<std::uint64_t(int)> release_rows_;
     std::atomic<const void*> bound_{nullptr};
     std::mutex mutex_;
     std::vector<std::weak_ptr<Exl3ExactKVPage>> pages_;
@@ -1078,5 +1130,10 @@ inline void exl3_require_kv_payload(const Exl3ExactKVPage& page) {
         owner->materialize(page);
     }
 }
+
+inline const bool exl3_idle_plane_rows_registered = [] {
+    exl3_release_idle_plane_rows.store(&Exl3LaneKvSource::release_idle_unreferenced_rows);
+    return true;
+}();
 
 }  // namespace voidinfer::exl3

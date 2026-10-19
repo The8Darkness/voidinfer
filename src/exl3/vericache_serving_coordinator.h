@@ -218,6 +218,20 @@ public:
     Exl3VeriCacheServingCoordinator& operator=(
         const Exl3VeriCacheServingCoordinator&) = delete;
 
+    // Host memory pressure on a lane's path (lane_kv_source.h): evicts
+    // retained roots until `extra` more bytes fit above the relief floor.
+    // Returns the evicted count; none while the coordinator is closing or a
+    // runtime allocation runs on this thread.
+    std::size_t evict_retained_for_memory(std::uint64_t extra) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (runtime_allocating_ && allocation_thread_ == std::this_thread::get_id()) return 0;
+        allocation_changed_.wait(lock, [&] { return !runtime_allocating_; });
+        if (closed_ || closing_started_ || allocating_) return 0;
+        std::size_t evicted = 0;
+        while (exl3_host_memory_short(extra) && evict_retained_locked()) ++evicted;
+        return evicted;
+    }
+
     Ticket admit(std::shared_ptr<const Exl3VeriCacheRequest> root) {
         validate_root(root);
         std::unique_lock<std::mutex> lock(mutex_);
@@ -1350,7 +1364,37 @@ private:
             throw std::invalid_argument(
                 "serving coordinator stale/missing physical retirement");
     }
+    // Host memory below the residency reserve: retained prefix roots are
+    // evicted (oldest first) until the update fits, since a live request's
+    // history takes precedence over cached ones.
     Exl3HostResidentSet::Stats replace_resident_locked(
+        std::span<const std::pair<std::uint64_t,
+            std::shared_ptr<const Exl3VeriCacheRequest>>> replacements,
+        std::uint64_t removed_id, bool request_admission = false) {
+        for (;;) {
+            try {
+                return replace_resident_once_locked(replacements, removed_id, request_admission);
+            } catch (const Exl3HostResidentReserveExhausted&) {
+                if (!evict_retained_locked()) throw;
+            }
+        }
+    }
+    // Drops the oldest retained root from the prefix cache and from the
+    // resident union at once: the union owns every root it locked, so only
+    // then are its pages unlocked and freed. Idle plane sets then give back
+    // the rows only that root named. False when the cache is empty.
+    bool evict_retained_locked() {
+        auto root = cache_.evict_oldest_root();
+        if (!root) return false;
+        (void)replace_resident_once_locked({}, 0);
+        root.reset();
+        if (const auto release = exl3_release_idle_plane_rows.load()) release();
+        static const bool trace = std::getenv("VOIDINFER_EXL3_VERICACHE_STATS") != nullptr;
+        if (trace) std::fprintf(stderr, "HOST_PRESSURE evicted_root available_mib=%llu\n",
+            static_cast<unsigned long long>(exl3_available_host_bytes().value_or(0) >> 20));
+        return true;
+    }
+    Exl3HostResidentSet::Stats replace_resident_once_locked(
         std::span<const std::pair<std::uint64_t,
             std::shared_ptr<const Exl3VeriCacheRequest>>> replacements,
         std::uint64_t removed_id, bool request_admission = false) {

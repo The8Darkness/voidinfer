@@ -1641,8 +1641,14 @@ struct Exl3TextContext::Impl {
         auto source=Exl3LaneKvSource::create(planes);
         source->set_backing(set,[set](int rows) {
             const std::size_t used=static_cast<std::size_t>(std::max(rows,0))*kPlaneRowBytes;
+            std::uint64_t released=0;
             for(int layer=0;layer<kLayers;++layer)
-                for(const auto& region:{set->k[layer],set->v[layer]})if(region)region->shrink(used);
+                for(const auto& region:{set->k[layer],set->v[layer]})if(region) {
+                    const auto before=region->mapped_bytes();
+                    region->shrink(used);
+                    released+=before-region->mapped_bytes();
+                }
+            return released;
         });
         return source;
     }
@@ -1694,6 +1700,9 @@ struct Exl3TextContext::Impl {
             }
         const auto t1=std::chrono::steady_clock::now();
         if(kv_source)kv_source->unbind(this);
+        // The outgoing set and every other idle set keep only the rows their
+        // deferred pages name.
+        Exl3LaneKvSource::release_idle_unreferenced_rows();
         if(trace)std::fprintf(stderr,"PLANE_SET_BIND swap_ms=%.2f unbind_ms=%.2f\n",
             std::chrono::duration<double,std::milli>(t1-t0).count(),
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t1).count());

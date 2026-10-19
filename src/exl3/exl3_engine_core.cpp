@@ -177,7 +177,7 @@ struct ExecutionStream {
 std::uint64_t available(){const auto bytes=exl3_available_host_bytes();if(!bytes)throw std::runtime_error("EXL3 physical memory query");return *bytes;}
 std::uint64_t total_memory(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);if(!GlobalMemoryStatusEx(&m))throw std::runtime_error("EXL3 physical memory query");return m.ullTotalPhys;}
 std::uint64_t resident_budget(const EngineOptions& options) {
-    constexpr std::uint64_t reserve=8ULL<<30;
+    constexpr std::uint64_t reserve=kExl3HostReserveBytes;
     const auto total=total_memory();
     if(total<=reserve)throw std::invalid_argument("EXL3 physical memory is below the resident reserve");
     return total-reserve;
@@ -471,6 +471,18 @@ struct Exl3EngineCore::Impl {
     Exl3VeriCacheServingIdentity identity;
     Exl3VeriCacheServingPrefixCache cache;
     Exl3VeriCacheServingCoordinator coordinator;
+    // Host memory pressure on a lane's path (lane_kv_source.h) evicts the
+    // retained roots of this cache through the coordinator.
+    struct CacheEviction {
+        explicit CacheEviction(Exl3VeriCacheServingCoordinator& coordinator) {
+            Exl3HostMemoryEviction::set([&coordinator](std::uint64_t extra) {
+                return coordinator.evict_retained_for_memory(extra);
+            });
+        }
+        ~CacheEviction() {Exl3HostMemoryEviction::set({});}
+        CacheEviction(const CacheEviction&)=delete;
+        CacheEviction& operator=(const CacheEviction&)=delete;
+    } cache_eviction{coordinator};
     LoadSummary load;
     mutable std::mutex mutex;
     std::mutex admission_mutex;
@@ -935,9 +947,9 @@ struct Exl3EngineCore::Impl {
             "coherent-device-P1-K6-B8-greedy",dense_vision_enabled?"text+bf16-vision":"text"},
         cache(Exl3VeriCacheServingPrefixCache::Policy{
             std::max(1U,value.context_cache.max_private_continuations.value_or(2*value.max_concurrency)),64,
-            std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30,
+            std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),kExl3HostReserveBytes,
             value.context_cache.max_shared_prefixes.value_or(value.max_concurrency)},identity),
-        coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
+        coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),kExl3HostReserveBytes}) {
         // A single exact-VeriCache lane gets an exact line (below): its
         // contexts share prompt workspaces, and with the asynchronous line two
         // host threads drive the device (polled waits, core/poll_wait.h).

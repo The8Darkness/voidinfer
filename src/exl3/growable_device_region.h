@@ -11,6 +11,8 @@
 // window address while the backing behind it changes (L0 plane sets of
 // agents trade places in a lane by remapping, not by copying), and the
 // backing stays reachable at its own address meanwhile.
+#include "exl3/host_memory_available.h"
+
 #include <cuda.h>
 
 #include <algorithm>
@@ -166,12 +168,27 @@ public:
     std::size_t granularity_bytes() const noexcept { return granularity_; }
     std::size_t capacity_bytes() const noexcept { return capacity_; }
 
+    // Host memory pressure: releases every pooled host chunk.
+    static void release_host_pool() noexcept {
+        auto& pool = host_pool();
+        std::vector<CUmemGenericAllocationHandle> handles;
+        {
+            const std::lock_guard<std::mutex> lock(pool.mutex);
+            handles.swap(pool.handles);
+        }
+        for (const auto handle : handles) cuMemRelease(handle);
+    }
+
     // Tops the host chunk pool up to `target` bytes (at most the pool cap) on
     // a worker thread, with this host region's allocation properties: a fresh
     // L0 plane set's first forward then maps pooled chunks instead of pinning
     // ~320 MB on the request path (~2.7 GB/s). One refill runs at a time.
+    // Under host memory pressure (within 2 GiB plus `target` of the refusal
+    // reserve) the pool is not refilled.
     void top_up_host_pool_async(std::size_t target) const {
         if (!host_backed() || !base_) return;
+        const auto available = exl3_available_host_bytes();
+        if (!available || *available < kExl3HostReliefBytes + target) return;
         CUcontext context = nullptr;
         if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || !context) return;
         auto& pool = host_pool();
@@ -273,7 +290,8 @@ private:
         return handle;
     }
     void give_back(CUmemGenericAllocationHandle handle) noexcept {
-        if (host_backed()) {
+        const auto available = exl3_available_host_bytes();
+        if (host_backed() && available && *available >= kExl3HostReliefBytes) {
             auto& pool = host_pool();
             const std::lock_guard<std::mutex> lock(pool.mutex);
             if (pool.handles.empty()) {

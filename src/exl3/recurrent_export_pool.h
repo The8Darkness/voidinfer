@@ -61,7 +61,7 @@ struct Exl3RecurrentPinBudget {
         }();
         return value;
     }
-    static constexpr std::uint64_t reserve=8ULL<<30;
+    static constexpr std::uint64_t reserve=kExl3HostReserveBytes;
     inline static std::mutex mutex;
     inline static std::uint64_t live=0,peak=0,quarantined=0;
     static bool claim(std::size_t bytes){

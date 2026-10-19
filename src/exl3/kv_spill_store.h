@@ -52,16 +52,15 @@ public:
         return store;
     }
 
-    // Available physical memory below the configured floor (plus `extra`);
-    // `hard`: below half the floor (plus `extra`).
-    static bool under_pressure(std::uint64_t extra = 0, bool hard = false) {
+    // Available host memory below the configured floor (plus `extra`).
+    static bool under_pressure(std::uint64_t extra = 0) {
         static const std::uint64_t floor = [] {
             const char* value = std::getenv("VOIDINFER_EXL3_KV_SPILL_FREE_MIB");
             return static_cast<std::uint64_t>(value ? std::strtoull(value, nullptr, 10) : 12288) << 20;
         }();
         const auto available = exl3_available_host_bytes();
         if (!available) return false;
-        return *available < (hard ? floor / 2 : floor) + extra;
+        return *available < floor + extra;
     }
 
     // Room for `bytes` more of spill on the volume above the reserve, and no

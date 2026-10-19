@@ -1871,6 +1871,20 @@ public:
         if(evicted) *evicted=count;return stats;
     }
 
+    // Host memory pressure: removes the oldest conversation root (shared
+    // prefixes last) and hands it to the caller, which drops it outside the
+    // index lock. Null when the index is empty.
+    std::shared_ptr<const Exl3VeriCacheRequest> evict_oldest() {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        if(entries_.empty())return nullptr;
+        auto victim=std::find_if(entries_.begin(),entries_.end(),
+            [](const Entry& entry){return !entry.shared;});
+        if(victim==entries_.end())victim=entries_.begin();
+        auto root=std::move(victim->root);
+        entries_.erase(victim);rebuild_lengths();
+        return root;
+    }
+
     struct PolicyTrim {
         bool inputs_current=false,budget_met=false;
         std::size_t evicted=0;
@@ -2375,6 +2389,9 @@ public:
             available_physical_bytes,policy_.physical_reserve_bytes,std::nullopt,true);
     }
     bool refresh(const std::shared_ptr<const Exl3VeriCacheRequest>& root) {return index_.refresh(root);}
+    // Host memory pressure (the serving coordinator): removes the oldest
+    // retained root under the index lock alone, as copy_roots_into reads it.
+    std::shared_ptr<const Exl3VeriCacheRequest> evict_oldest_root() {return index_.evict_oldest();}
 
     // One-shot cold concurrent preparation fault after numerical completion,
     // before index mutation. Warm hits do not consume it.
