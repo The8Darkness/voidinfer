@@ -2757,6 +2757,38 @@ struct Exl3EngineCore::Impl {
             if(reuse_allowed && shared_minimum)
                 for(const auto& candidate:cache.roots())
                     if(candidate)shared=std::max(shared,candidate->common_prefix_tokens(ids)/64*64);
+            // Burst coalescing: a text request waiting in the queue or running
+            // on another lane that shares at least the shared minimum of
+            // leading tokens with this input (agents dispatched together with
+            // one system prompt and tool set) makes this request publish that
+            // opening as a shared prefix root, so the others restore it
+            // instead of each prefilling it once more. Only the split point
+            // changes; every ingested row is computed exactly as before.
+            // VOIDINFER_EXL3_BURST_SHARED_PREFIX=0 disables.
+            static const bool burst_shared=[] {
+                const auto* value=std::getenv("VOIDINFER_EXL3_BURST_SHARED_PREFIX");
+                return !value || std::string_view(value)!="0";
+            }();
+            std::size_t burst_common=0;
+            if(reuse_allowed && shared_minimum && burst_shared) {
+                const auto common=[&](std::span<const std::int64_t> other) {
+                    const auto n=std::min(other.size(),ids.size());
+                    std::size_t i=0;
+                    while(i<n && other[i]==ids[i])++i;
+                    return i/64*64;
+                };
+                const auto text_only=[](const Request& other) {
+                    return !targets::qwen3_6::PreparedPromptAccess::view(other.prompt).has_media();
+                };
+                std::lock_guard lock(mutex);
+                for(const auto& other:queue)
+                    if(other && other.get()!=&request && text_only(*other))
+                        burst_common=std::max(burst_common,common(other->ready_work.input_tokens()));
+                for(std::size_t i=0;i<active.size();++i)
+                    if(i!=lane_index && active[i] && active[i].get()!=&request && text_only(*active[i]))
+                        burst_common=std::max(burst_common,common(active[i]->ready_work.input_tokens()));
+                shared=std::max(shared,burst_common);
+            }
             const std::size_t reused_rows=reused?reused->token_count():0;
             const bool shared_split=shared_minimum && shared>=shared_minimum &&
                 shared>=reused_rows+shared_minimum && shared<stable;
@@ -2765,8 +2797,8 @@ struct Exl3EngineCore::Impl {
                 stable>split_floor;
             const auto span_ids=std::span<const std::int64_t>(ids);
             if(std::getenv("VOIDINFER_EXL3_MEMORY_TRACE"))
-                std::fprintf(stderr,"PROMPT_ROUTE ids=%zu reused=%zu shared=%zu shared_split=%d stable=%zu split=%d%c",
-                    ids.size(),reused_rows,shared,shared_split?1:0,stable,split?1:0,10);
+                std::fprintf(stderr,"PROMPT_ROUTE ids=%zu reused=%zu shared=%zu burst=%zu shared_split=%d stable=%zu split=%d%c",
+                    ids.size(),reused_rows,shared,burst_common,shared_split?1:0,stable,split?1:0,10);
             const auto extend_device=[&](const std::shared_ptr<const Exl3VeriCacheRequest>& from,std::size_t end,
                                          bool resident) {
                 const auto first=from->token_count();
