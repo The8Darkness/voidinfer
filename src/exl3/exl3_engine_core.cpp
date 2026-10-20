@@ -4567,6 +4567,24 @@ void Exl3EngineCore::require_startup_retirement_available(const EngineOptions& o
 Exl3EngineCore::Exl3EngineCore(const EngineOptions& options,unsigned shared_allocation_fault_for_test,unsigned draft_clone_fault_for_test,unsigned first_draft_fault_for_test,unsigned context_startup_fault_for_test,
     Exl3DeviceAvailability::Provider device_availability_provider_for_test) {
     apply_engine_profile();
+    // Exact hot-row budget sized by lane count (VOIDINFER_EXL3_L0_HOT unset):
+    // published tokens are verified against exact history either way, so hot
+    // rows only change how often VeriCache corrects a drafted block. The
+    // Oct 15 sweep (sampled LCB, decay 0.12) measured 1024 rows against 512
+    // at C1 / C4 / C8: 175 / 358 / 381 vs 173 / 344 / 339 tok/s; the Oct 20
+    // recheck (sampled LCB, 32K, 2 reps) halved C4 corrections (5 vs 11 of
+    // ~1190 blocks) at equal ms/round (41.7 vs 41.9; C1 22.2 vs 22.1). 1024
+    // rows cost 32 MiB more per context (C4 free 6.16 vs 6.30 GiB), so they
+    // are taken where that memory is a small share of the resident context
+    // (one to four lanes); five to eight lanes keep 512 rows for code capacity.
+    if(const char* set=std::getenv("VOIDINFER_EXL3_L0_HOT"); set==nullptr || *set=='\0') {
+        const char* slots=options.max_concurrency<=4?"1024":"512";
+#ifdef _WIN32
+        _putenv_s("VOIDINFER_EXL3_L0_HOT",slots);
+#else
+        setenv("VOIDINFER_EXL3_L0_HOT",slots,0);
+#endif
+    }
     if(!options.prefill_chunk)
         throw std::invalid_argument("EXL3 Engine prefill_chunk must be nonzero");
     require_startup_retirement_available(options);
