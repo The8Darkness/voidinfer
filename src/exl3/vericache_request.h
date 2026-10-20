@@ -1600,6 +1600,17 @@ public:
         if(it==entries_.end())return false;
         std::rotate(it,it+1,entries_.end());rebuild_lengths();return true;
     }
+    // Optional queue demand for eviction (Belady-style): the queue position
+    // of the earliest waiting request whose input this root prefixes, or
+    // nullopt when no waiting request would restore it. Whenever a bound
+    // forces an eviction, roots nobody waits for go first (oldest first),
+    // then the root the queue needs last. Retention only: which roots exist
+    // never changes what a request computes.
+    using DemandFunction=std::function<std::optional<std::size_t>(const Exl3VeriCacheRequest&)>;
+    void set_demand(DemandFunction demand) {
+        auto next=demand?std::make_shared<const DemandFunction>(std::move(demand)):nullptr;
+        std::lock_guard<std::mutex> lock(demand_mutex_);demand_=std::move(next);
+    }
     void exhaust_generations_for_test() {
         std::unique_lock<std::shared_mutex> lock(mutex_);next_generation_=std::numeric_limits<std::uint64_t>::max();
     }
@@ -1821,16 +1832,34 @@ public:
         }
         // The candidate's class bound evicts that class's least recently used
         // roots; the byte bound then evicts the oldest conversation roots before
-        // any shared prefix. The candidate itself is always kept.
+        // any shared prefix. The candidate itself is kept, except under queue
+        // demand: a candidate no waiting request restores is not admitted when
+        // admitting it would evict a root a waiting request does restore.
         std::vector<const Entry*> selected(prospective);
-        while(class_entries(selected)>class_capacity)
-            selected.erase(std::find_if(selected.begin(),selected.end(),
-                [&](const Entry* entry){return entry->shared==shared;}));
+        const auto demand=demand_snapshot();
+        const auto deref=[](const Entry* entry)->const Entry&{return *entry;};
+        const bool candidate_idle=demand && *demand && candidate.root && !(*demand)(*candidate.root);
+        const auto demanded=[&](const Entry* entry) {
+            return demand && *demand && entry->root && (*demand)(*entry->root).has_value();
+        };
+        const auto decline=[&] {result.storage=current_stats_locked();return result;};
+        while(class_entries(selected)>class_capacity) {
+            // The candidate is last and never a victim.
+            auto victim=demand_victim(selected.begin(),selected.end()-1,demand,
+                [&](const Entry& entry){return entry.shared==shared;},deref);
+            if(victim==selected.end()-1)
+                victim=std::find_if(selected.begin(),selected.end(),
+                    [&](const Entry* entry){return entry->shared==shared;});
+            if(candidate_idle && victim!=selected.end()-1 && demanded(*victim))return decline();
+            selected.erase(victim);
+        }
         auto stats=account(selected);
         while(stats.accounted_bytes>result.effective_budget_bytes && selected.size()>1) {
-            auto victim=std::find_if(selected.begin(),selected.end()-1,
-                [](const Entry* entry){return !entry->shared;});
-            if(victim==selected.end()-1)victim=selected.begin();
+            auto victim=demand_victim(selected.begin(),selected.end()-1,demand,
+                [](const Entry& entry){return !entry.shared;},deref);
+            if(victim==selected.end()-1)victim=demand_victim(selected.begin(),selected.end()-1,demand,
+                [](const Entry&){return true;},deref);
+            if(candidate_idle && demanded(*victim))return decline();
             selected.erase(victim);stats=account(selected);
         }
         if(retention && fail_policy_commit_) {fail_policy_commit_=false;throw std::bad_alloc();}
@@ -1862,10 +1891,13 @@ public:
             std::min(byte_budget,available_physical_bytes-physical_reserve_bytes):0;
         std::unique_lock<std::shared_mutex> lock(mutex_);std::size_t count=0;auto stats=current_stats_locked();
         while(!entries_.empty() && stats.accounted_bytes>effective) {
-            // Oldest conversation roots first; shared prefixes last.
-            auto victim=std::find_if(entries_.begin(),entries_.end(),
-                [](const Entry& entry){return !entry.shared;});
-            if(victim==entries_.end())victim=entries_.begin();
+            // Oldest conversation roots first; shared prefixes last (roots the
+            // queue waits for after the others within each class).
+            const auto demand=demand_snapshot();
+            auto victim=demand_victim(entries_.begin(),entries_.end(),demand,
+                [](const Entry& entry){return !entry.shared;},[](const Entry& entry)->const Entry&{return entry;});
+            if(victim==entries_.end())victim=demand_victim(entries_.begin(),entries_.end(),demand,
+                [](const Entry&){return true;},[](const Entry& entry)->const Entry&{return entry;});
             entries_.erase(victim);rebuild_lengths();++count;stats=current_stats_locked();
         }
         if(evicted) *evicted=count;return stats;
@@ -1877,9 +1909,11 @@ public:
     std::shared_ptr<const Exl3VeriCacheRequest> evict_oldest() {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         if(entries_.empty())return nullptr;
-        auto victim=std::find_if(entries_.begin(),entries_.end(),
-            [](const Entry& entry){return !entry.shared;});
-        if(victim==entries_.end())victim=entries_.begin();
+        const auto demand=demand_snapshot();
+        auto victim=demand_victim(entries_.begin(),entries_.end(),demand,
+            [](const Entry& entry){return !entry.shared;},[](const Entry& entry)->const Entry&{return entry;});
+        if(victim==entries_.end())victim=demand_victim(entries_.begin(),entries_.end(),demand,
+            [](const Entry&){return true;},[](const Entry& entry)->const Entry&{return entry;});
         auto root=std::move(victim->root);
         entries_.erase(victim);rebuild_lengths();
         return root;
@@ -2067,6 +2101,28 @@ private:
     const std::size_t capacity_,shared_capacity_;
     HashFunction hasher_;
     mutable std::shared_mutex mutex_;
+    mutable std::mutex demand_mutex_;
+    std::shared_ptr<const DemandFunction> demand_;
+    std::shared_ptr<const DemandFunction> demand_snapshot() const {
+        std::lock_guard<std::mutex> lock(demand_mutex_);return demand_;
+    }
+    // First eligible entry in [first,last) that no waiting request needs
+    // (publication / LRU order); otherwise the eligible entry needed last.
+    // last when nothing is eligible.
+    template<class It,class Eligible,class Deref>
+    static It demand_victim(It first,It last,const std::shared_ptr<const DemandFunction>& demand,
+        Eligible eligible,Deref deref) {
+        It needed_last=last;std::size_t needed_rank=0;
+        for(It it=first;it!=last;++it) {
+            const Entry& entry=deref(*it);
+            if(!eligible(entry))continue;
+            if(!demand || !*demand || !entry.root)return it;
+            const auto rank=(*demand)(*entry.root);
+            if(!rank)return it;
+            if(needed_last==last || *rank>needed_rank) {needed_last=it;needed_rank=*rank;}
+        }
+        return needed_last;
+    }
     std::vector<Entry> entries_;
     bool fail_publication_growth_=false;
     bool fail_policy_commit_=false;
@@ -2389,6 +2445,7 @@ public:
             available_physical_bytes,policy_.physical_reserve_bytes,std::nullopt,true);
     }
     bool refresh(const std::shared_ptr<const Exl3VeriCacheRequest>& root) {return index_.refresh(root);}
+    void set_demand(Exl3VeriCachePrefixIndex::DemandFunction demand) {index_.set_demand(std::move(demand));}
     // Host memory pressure (the serving coordinator): removes the oldest
     // retained root under the index lock alone, as copy_roots_into reads it.
     std::shared_ptr<const Exl3VeriCacheRequest> evict_oldest_root() {return index_.evict_oldest();}

@@ -266,6 +266,9 @@ struct Exl3EngineCore::Request {
     OutputConsumerMode consumer;
     Clock::time_point submitted,deadline;
     std::atomic<bool> cancelled{false};
+    // Set once the prefill has looked up (and holds) its retained root: until
+    // then a lane's request still counts as prefix cache demand.
+    std::atomic<bool> prefix_resolved{false};
     // Coherent-device lane affinity: the longest retained root this input
     // extends, resolved once while queued (engine mutex).
     bool affinity_resolved=false;
@@ -489,6 +492,46 @@ struct Exl3EngineCore::Impl {
     std::condition_variable changed;
     ReservedRequestQueue<Request> queue;
     std::array<std::shared_ptr<Request>,kMaxLanes> active;
+    // Queue demand for the prefix cache's eviction order
+    // (Exl3VeriCachePrefixIndex::set_demand): the lanes' requests that have
+    // not yet looked up their root (prefill passes run one at a time, so a
+    // lane can wait seconds for its lookup), then the waiting requests in
+    // queue order; republished under `mutex` whenever the queue changes, so
+    // the cache never takes the Engine lock. VOIDINFER_EXL3_DEMAND_EVICTION=0 off.
+    std::atomic<std::shared_ptr<const std::vector<std::shared_ptr<Request>>>> demand_order;
+    void publish_demand_locked() {
+        auto next=std::make_shared<std::vector<std::shared_ptr<Request>>>();
+        next->reserve(active.size()+queue.size());
+        for(const auto& lane:active)if(lane && !lane->prefix_resolved.load())next->push_back(lane);
+        for(const auto& waiting:queue)if(waiting)next->push_back(waiting);
+        demand_order.store(std::move(next));
+    }
+    struct DemandRegistration {
+        Exl3VeriCacheServingPrefixCache& cache;
+        DemandRegistration(Exl3VeriCacheServingPrefixCache& prefix_cache,
+            std::atomic<std::shared_ptr<const std::vector<std::shared_ptr<Request>>>>& order) : cache(prefix_cache) {
+            static const bool enabled=[] {
+                const auto* value=std::getenv("VOIDINFER_EXL3_DEMAND_EVICTION");
+                return !value || std::string_view(value)!="0";
+            }();
+            if(!enabled)return;
+            cache.set_demand([&order](const Exl3VeriCacheRequest& root)->std::optional<std::size_t> {
+                const auto waiting=order.load();
+                if(!waiting)return std::nullopt;
+                const auto rows=root.token_count();
+                for(std::size_t i=0;i<waiting->size();++i) {
+                    const auto& request=(*waiting)[i];
+                    if(request->cancelled.load() || request->prefix_resolved.load())continue;
+                    const auto ids=request->ready_work.input_tokens();
+                    if(rows<=ids.size() && root.matches_tokens(ids.first(rows)))return i;
+                }
+                return std::nullopt;
+            });
+        }
+        ~DemandRegistration() {cache.set_demand({});}
+        DemandRegistration(const DemandRegistration&)=delete;
+        DemandRegistration& operator=(const DemandRegistration&)=delete;
+    } demand_registration{cache,demand_order};
     // L0 OSCAR code memory of concurrent lanes (coherent-device C>=2): the
     // INT4 code/meta planes grow with each lane's context on the device.
     // Past physical VRAM, WDDM silently demotes allocations to system memory
@@ -2737,6 +2780,7 @@ struct Exl3EngineCore::Impl {
                        candidate->matches_tokens(std::span<const std::int64_t>(ids).first(candidate->token_count())))
                         reused=candidate;
             if(reused)(void)cache.refresh(reused);
+            request.prefix_resolved.store(true);
             // The turn-closure frontier is the rendered prefix the next turn of
             // this conversation agrees with: it gets its own retained root.
             std::size_t stable=ids.size();
@@ -2843,7 +2887,12 @@ struct Exl3EngineCore::Impl {
                     prefill_mark("root");
                 }
                 base_resident=true;
-                (void)cache.admit_input_authority(base,span_ids.first(stable),available());
+                const auto admitted=cache.admit_input_authority(base,span_ids.first(stable),available());
+                if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
+                    std::fprintf(stderr,"PREFIX_ADMIT kind=stable tokens=%zu admitted=%d evicted=%zu entries=%zu "
+                        "accounted_mib=%.0f effective_mib=%.0f%c",stable,admitted.admitted?1:0,admitted.evicted,
+                        admitted.storage.entries,admitted.storage.accounted_bytes/1048576.0,
+                        admitted.effective_budget_bytes/1048576.0,10);
                 prefill_mark("admit_root");
             }
             if(base) {
@@ -3687,6 +3736,11 @@ struct Exl3EngineCore::Impl {
                    host_lease->root->state()->position()>=64) {
                     const auto admitted=cache.admit_completed_authority(
                         host_lease->root,available());
+                    if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
+                        std::fprintf(stderr,"PREFIX_ADMIT kind=completed tokens=%zu admitted=%d evicted=%zu entries=%zu "
+                            "accounted_mib=%.0f effective_mib=%.0f%c",host_lease->root->token_count(),
+                            admitted.admitted?1:0,admitted.evicted,admitted.storage.entries,
+                            admitted.storage.accounted_bytes/1048576.0,admitted.effective_budget_bytes/1048576.0,10);
                     if(admitted.admitted) {
                         std::lock_guard lock(mutex);
                         ++stats.completed_prefix_admissions;
@@ -3775,7 +3829,7 @@ struct Exl3EngineCore::Impl {
             request.result.timings.total_seconds=seconds(request.submitted)+request.result.timings.prepare_seconds;
             request.done=true;
         }
-        queue.erase(found);--outstanding;
+        queue.erase(found);--outstanding;publish_demand_locked();
         ready_work_authority.revise();
         stats.waiting_requests=static_cast<std::uint32_t>(queue.size());
         request.changed.notify_all();changed.notify_all();
@@ -3841,7 +3895,7 @@ struct Exl3EngineCore::Impl {
                         .locality_costs_complete=selected->locality_costs_complete,
                         .reason=reason});
                 }
-                queue.erase(position);active[lane_index]=request;
+                queue.erase(position);active[lane_index]=request;publish_demand_locked();
                 lane_admission[lane_index]=next_lane_admission++;
                 lane_code_projection[lane_index]=l0_code_admission_enabled()?
                     request_code_projection(*request):0;
@@ -4021,6 +4075,7 @@ struct Exl3EngineCore::Impl {
                     --outstanding;
                 }
                 while(!queue.empty())queue.pop_front();
+                publish_demand_locked();
                 ready_work_authority.revise();
                 stats.waiting_requests=0;
             }
@@ -5470,6 +5525,7 @@ Exl3EngineCore::Submission Exl3EngineCore::submit(targets::qwen3_6::PreparedProm
             }
             queued->changed.notify_all();
             pending=impl_->queue.erase(pending);
+            impl_->publish_demand_locked();
             impl_->ready_work_authority.revise();
             --impl_->outstanding;
         }
@@ -5477,7 +5533,7 @@ Exl3EngineCore::Submission Exl3EngineCore::submit(targets::qwen3_6::PreparedProm
         if(impl_->outstanding>=impl_->queue.capacity())
             throw RequestError(RequestErrorKind::Overloaded,"EXL3 request queue full");
         r->host_preparation_generation=ready_generation;
-        impl_->queue.push_back(r);++impl_->outstanding;
+        impl_->queue.push_back(r);++impl_->outstanding;impl_->publish_demand_locked();
         r->window_publication_fault.store(
             impl_->window_publication_fault.exchange(false,std::memory_order_acq_rel),
             std::memory_order_release);
