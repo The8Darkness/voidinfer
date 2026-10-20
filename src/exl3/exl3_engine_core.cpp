@@ -3179,7 +3179,13 @@ struct Exl3EngineCore::Impl {
                         // passes ~72 ms vs ~512-row ~215 ms), so after an early
                         // correction the fit drove whole runs onto 16..32-row blocks
                         // (19-45 passes per request, 27-37 vs 53 ms/round). Only the
-                        // reconstruct route's blocks then.
+                        // reconstruct route's blocks then. Oct 20: exact corrections at
+                        // C4 (~0.16% of rows, deterministic L0/exact near-ties) discard
+                        // 16-37% of a burst's drafted rows at this floor, but floors of
+                        // 64 / 128 rows (reconstruct route from 128) cut the discards by
+                        // 35-55% for no throughput (16 x 512 bursts 170.8 / 172.9 vs
+                        // 172.8 tok/s): the extra exclusive passes cost what the batched
+                        // rounds of discarded rows did.
                         const int smallest=pass_weight>1.0 && limit>=256?256:0;
                         int best=std::min(limit,std::max(smallest,kCandidates[0]));
                         double best_rate=-1;
@@ -3496,9 +3502,10 @@ struct Exl3EngineCore::Impl {
                     }
                     static const bool horizon_trace=std::getenv("VOIDINFER_EXL3_VERICACHE_HORIZON_TRACE")!=nullptr;
                     if(horizon_trace)
-                        std::fprintf(stderr,"VERICACHE_HORIZON rows=%zu corrected=%d tok_ms=%.2f pass=%.1f+%.3fx mismatch=%.4f next=%d\n",
-                            unverified.size(),verified.corrected?1:0,horizon.tok_ms,horizon.pass_a,horizon.pass_b,
-                            horizon.mismatch,block_now);
+                        std::fprintf(stderr,"VERICACHE_HORIZON lane=%d rows=%zu corrected=%d kept=%zu committed=%zu pass_ms=%.1f tok_ms=%.2f pass=%.1f+%.3fx mismatch=%.4f next=%d\n",
+                            static_cast<int>(lane_index),unverified.size(),verified.corrected?1:0,verified.tokens.size(),
+                            committed.size(),std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
+                            horizon.tok_ms,horizon.pass_a,horizon.pass_b,horizon.mismatch,block_now);
                     runtime_memory_mark("verify",lane_index);
                     lt_verify+=lt_ms(lt_mark);
                     unverified.clear();

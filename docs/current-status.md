@@ -24,6 +24,18 @@ Measured, not kept: per-request verification-tree calibration (`VOIDINFER_EXL3_D
 - greedy code_4k tokens per round on vs off C1 3.17 / 3.22 vs 3.23 / 3.31, C4 3.13 / 3.01 vs 3.02 / 3.08;
 sampled LCB C1 4.37 / 4.32 vs 4.43 / 4.42 (off 1.5-2% better).
 
+Measured, not kept: smaller exact-verification blocks at C2-C8. In C4 bursts (16 x 22.9K-token prompts,
+greedy, 512 outputs, exclusive verify passes) some requests commit 1-1.6 tokens per round at ~3.7
+accepted per round: about 0.16% of rows flip under exact verification (L0/exact near-ties, exact gap
+0.08-0.19, at fixed output positions per prompt) and each flip discards the rest of a >= 256-row block
+(16-37% of a burst's drafted rows). Block floors of 64 / 128 rows (`DraftHorizon::choose`; the
+reconstruct+GEMM route from 128 rows instead of 256) cut the discarded rows by 55% / 35% and rounds by
+9%, but aggregate throughput was unchanged (170.8 / 172.9 vs 172.8 tok/s, 3 runs each): the extra
+exclusive passes cost what the discarded rows did, which ride along in batched rounds. Closing a
+block at a low top-1/top-2 margin was not built: 5.9% of rows have an exact margin below 0.25 (2.7%
+below 0.125), so it would verify every ~17-37 rows. `VOIDINFER_EXL3_VERICACHE_HORIZON_TRACE` prints
+each pass's rows, correction, kept rows and pass ms per lane.
+
 Fixed (pre-existing, Oct 20 late): the batched-draft scratch (activation planes and the shared draft
 K/V and fc projection workspaces) was shared by `propose_batched` and the fresh-prefill
 `commit_prefill_bulk`, and the bulk commit released its mutex with its GPU work still queued, so another
