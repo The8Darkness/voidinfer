@@ -85,6 +85,30 @@ def mmlu_pro_items():
         yield {"id": f"mmlu_pro-{r['question_id']}", "prompt": prompt, "gold": r["answer"], "category": r["category"]}
 
 
+def mmlu_pro_direct_items():
+    """All 12,032 questions, no reasoning: the answer letter alone tests weight fidelity at prefill cost."""
+    for r in _jsonl("mmlu_pro"):
+        opts = "\n".join(f"{LETTERS[k]}. {o}" for k, o in enumerate(r["options"]))
+        prompt = (f"The following is a multiple choice question about {r['category']}. Reply with only the letter "
+                  f"of the correct option.\n\nQuestion: {r['question']}\nOptions:\n{opts}")
+        yield {"id": f"mmlu_pro-{r['question_id']}", "prompt": prompt, "gold": r["answer"], "category": r["category"]}
+
+
+def mmlu_pro_direct_score(item, text):
+    m = re.search(r"\b([A-J])\b", text)
+    return float(bool(m) and m.group(1) == item["gold"])
+
+
+def supergpqa_direct_items():
+    """All 26,529 SuperGPQA questions, answer letter only, scored like mmlu_pro_direct."""
+    for r in _jsonl("supergpqa"):
+        opts = "\n".join(f"{LETTERS[k]}. {o}" for k, o in enumerate(r["options"]))
+        prompt = (f"The following is a multiple choice question about {r['field']}. Reply with only the letter "
+                  f"of the correct option.\n\nQuestion: {r['question']}\nOptions:\n{opts}")
+        yield {"id": f"supergpqa-{r['uuid']}", "prompt": prompt, "gold": r["answer_letter"],
+               "category": r["discipline"], "difficulty": r["difficulty"], "is_calculation": r["is_calculation"]}
+
+
 def mmlu_pro_score(item, text):
     m = re.findall(r"answer is \(?([A-J])\)?", text)
     if not m:
@@ -256,6 +280,8 @@ SUITES = {
     "gsm8k": (gsm8k_items, gsm8k_score, 4096, False),
     "math500": (math500_items, math500_score, 4096, False),
     "mmlu_pro": (mmlu_pro_items, mmlu_pro_score, 4096, False),
+    "mmlu_pro_direct": (mmlu_pro_direct_items, mmlu_pro_direct_score, 16, False),
+    "supergpqa_direct": (supergpqa_direct_items, mmlu_pro_direct_score, 16, False),
     "ifeval": (ifeval_items, ifeval_score, 4096, False),
     "humaneval": (humaneval_items, humaneval_score, 2048, False),
     "aime2025": (aime_items, aime_score, 32768, True),
