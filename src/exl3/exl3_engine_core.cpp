@@ -885,7 +885,27 @@ struct Exl3EngineCore::Impl {
             holder=kIngestPass;
             streak=0;
         }
+        // Held by an ingestion: hands the queue to verification passes (as
+        // yield) and keeps it released until `done` holds or `limit` passes,
+        // then takes it back ahead of other ingestions.
+        template<class Done> void pause(std::chrono::microseconds limit,Done&& done) {
+            std::unique_lock guard(mutex);
+            busy=false;
+            ++yielding;
+            changed.notify_all();
+            const auto until=std::chrono::steady_clock::now()+limit;
+            while(!done() && std::chrono::steady_clock::now()<until)
+                changed.wait_until(guard,std::min(until,
+                    std::chrono::steady_clock::now()+std::chrono::microseconds(500)));
+            changed.wait(guard,[&] {return !busy;});
+            --yielding;
+            busy=true;
+            holder=kIngestPass;
+            streak=0;
+        }
     } prompt_pass_queue;
+    // Decode rounds completed per lane (prefill policy decode-priority).
+    std::array<std::atomic<std::uint64_t>,kMaxLanes> lane_rounds{};
     cudaEvent_t prompt_pass_done=nullptr;
     bool prompt_pass_overlap=[] {
         const char* value=std::getenv("VOIDINFER_EXL3_PROMPT_PASS_OVERLAP");
@@ -2701,14 +2721,53 @@ struct Exl3EngineCore::Impl {
             Exl3TextContext* context=nullptr;
             ~PrefillYield() {if(context)context->set_prefill_yield({});}
         } yield_scope;
-        if(prefill_yield && prompt_pass_overlap && options.max_concurrency>1) {
-            context->set_prefill_yield([this](cudaStream_t pass_stream) {
-                if(!prompt_pass_queue.verify_waiting())return;
+        // VOIDINFER_EXL3_PREFILL_POLICY: balanced (default; the yield above),
+        // decode-priority (at each block boundary the queue stays released
+        // until every other decoding lane completed VOIDINFER_EXL3_PREFILL_DECODE_ROUNDS
+        // rounds, default 2, at most VOIDINFER_EXL3_PREFILL_DECODE_WAIT_MS, default 120)
+        // or prefill-priority (no yield). Only the timing between blocks
+        // changes: the blocks and their arithmetic are the same.
+        static const int prefill_policy=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_POLICY");
+            if(!value || !*value || std::string_view(value)=="balanced")return 0;
+            if(std::string_view(value)=="decode-priority")return 1;
+            if(std::string_view(value)=="prefill-priority")return 2;
+            throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_POLICY must be balanced, decode-priority or prefill-priority");
+        }();
+        if(prefill_yield && prefill_policy!=2 && prompt_pass_overlap && options.max_concurrency>1) {
+            context->set_prefill_yield([this,lane_index](cudaStream_t pass_stream) {
+                static const int decode_rounds=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_DECODE_ROUNDS");
+                    return value?std::clamp(std::atoi(value),1,16):2;
+                }();
+                static const int decode_wait_ms=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_DECODE_WAIT_MS");
+                    return value?std::clamp(std::atoi(value),1,2000):120;
+                }();
+                std::array<std::uint64_t,kMaxLanes> started{};
+                std::array<bool,kMaxLanes> decoding{};
+                bool any_decoding=false;
+                if(prefill_policy==1) {
+                    std::lock_guard lock(mutex);
+                    for(std::size_t i=0;i<kMaxLanes;++i)
+                        if(i!=lane_index && active[i] && lane_decoding[i] && !lane_suspended[i]) {
+                            decoding[i]=true;any_decoding=true;
+                            started[i]=lane_rounds[i].load(std::memory_order_relaxed);
+                        }
+                }
+                if(!any_decoding && !prompt_pass_queue.verify_waiting())return;
                 if(!prompt_pass_done &&
                    cudaEventCreateWithFlags(&prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
                     prompt_pass_done=nullptr;
                 if(prompt_pass_done)check(cudaEventRecord(prompt_pass_done,pass_stream));
-                prompt_pass_queue.yield();
+                if(any_decoding)
+                    prompt_pass_queue.pause(std::chrono::milliseconds(decode_wait_ms),[&] {
+                        for(std::size_t i=0;i<kMaxLanes;++i)
+                            if(decoding[i] && lane_rounds[i].load(std::memory_order_relaxed)<
+                               started[i]+static_cast<std::uint64_t>(decode_rounds))return false;
+                        return true;
+                    });
+                else prompt_pass_queue.yield();
                 if(prompt_pass_done)check(cudaStreamWaitEvent(pass_stream,prompt_pass_done,0));
             });
             yield_scope.context=context.get();
@@ -3367,7 +3426,7 @@ struct Exl3EngineCore::Impl {
                                     throw std::logic_error("coherent-device early token finished the output");
                             }
                         }
-                        ++result.speculative.rounds;
+                        ++result.speculative.rounds;lane_rounds[lane_index].fetch_add(1,std::memory_order_relaxed);
                         result.speculative.accepted_tokens+=settled.verification.accepted;
                         result.speculative.accepted_prefix_per_round.push_back(
                             static_cast<std::uint8_t>(settled.verification.accepted));
@@ -3397,7 +3456,7 @@ struct Exl3EngineCore::Impl {
                                     candidate.committed_tokens.size());
                             } catch(...) {pending_ticket.reset();throw;}
                             pending_ticket.reset();
-                            ++result.speculative.rounds;
+                            ++result.speculative.rounds;lane_rounds[lane_index].fetch_add(1,std::memory_order_relaxed);
                             result.speculative.accepted_tokens+=settled.verification.accepted;
                             result.speculative.accepted_prefix_per_round.push_back(
                                 static_cast<std::uint8_t>(settled.verification.accepted));
@@ -3625,7 +3684,7 @@ struct Exl3EngineCore::Impl {
                         throw std::logic_error("coherent-device empty preview ordering");
                     if(request.cancelled) {output.discard_preview();break;}
                     publish_preview(request);
-                    ++result.speculative.rounds;
+                    ++result.speculative.rounds;lane_rounds[lane_index].fetch_add(1,std::memory_order_relaxed);
                     if(decision.finished()) {
                         result.finish_reason=decision.finish_reason;
                         break;
@@ -3680,7 +3739,7 @@ struct Exl3EngineCore::Impl {
                     result.timings.first_token_seconds=
                         seconds(request.submitted)+result.timings.prepare_seconds;
                 publish_preview(request,boundary);
-                ++result.speculative.rounds;
+                ++result.speculative.rounds;lane_rounds[lane_index].fetch_add(1,std::memory_order_relaxed);
                 result.speculative.accepted_tokens+=settled.verification.accepted;
                 result.speculative.accepted_prefix_per_round.push_back(
                     static_cast<std::uint8_t>(settled.verification.accepted));
