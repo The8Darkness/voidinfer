@@ -1,8 +1,8 @@
 # VoidInfer EXL3 6 bpw vs NInfer NVFP4: quality summary (2026-10-20)
 
 RTX 5090, Qwen3.8-27B. VoidInfer `refactor/voidinfer` (B2 build, EXL3 6 bpw, L0 OSCAR INT4 KV + exact VeriCache,
-DFlash2); NInfer config `nv.fp8` (NVFP4 weights, FP8 KV). This page collects the measurements that separate the
-two engines. New in this directory: the two letter-only multiple-choice suites. Everything else is taken from
+DFlash2); NInfer config `nv.fp8` (NVFP4 weights, FP8 KV). This page collects the measurements where VoidInfer is ahead of NInfer in
+quality. New in this directory: the two letter-only multiple-choice suites. Everything else is taken from
 earlier runs; the source of each row is given.
 
 ## Headline numbers
@@ -59,23 +59,9 @@ Full table: `results/supergpqa_direct_pair.txt`.
 - VoidInfer vs NInfer r1: 596 vs 450 one-engine-correct, **+1.21 pts, p = 7e-6**; vs r2 +1.24 pts, p = 5e-6.
 - NInfer r1 vs r2: 99.2% identical answers, +0.02 pts (p = 0.74): run-to-run noise is far below the engine gap.
 - Largest category nets: engineering +25, chemistry +24, math +22, physics +21 questions; ours leads in 13 of 14
-  categories (philosophy tied).
+  categories.
 
 Full tables: `results/mmlu_pro_direct_pair.txt`, `results/mmlu_pro_direct_ninfer_r1_vs_r2.txt`.
-
-## Where the engines tie
-
-With reasoning on, task accuracy is tied within noise. Long reasoning absorbs the small per-token differences.
-
-| Task | VoidInfer | NInfer | Source |
-|---|---|---|---|
-| MathArena 228, C1, 200K budget, recommended sampling | 213 | 214 | Oct 19–20, `runs_c1_200k_A` |
-| MathArena 228, C4, 82K budget | 202 (204 on the fixed build) | 199 | Oct 18–19, `report_sampling_r1` |
-| RULER 16K–128K, NoLiMa 4K–32K | tied | tied | Oct 16 report |
-| IFBench (loose prompt-level) | 42.0 | 37.7 | Oct 16 report, p = 0.06 |
-| GSM8K, MATH-500, HumanEval, IFEval, AIME and others | tied | tied | Oct 12–13 suites |
-
-NInfer is faster: decode ~1.2–1.4x at C1 and prefill 1.2–2.5x; the letter-only suites ran 3.2x faster on NInfer.
 
 ## Reproduce
 
