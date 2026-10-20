@@ -23,8 +23,40 @@ earlier runs; the source of each row is given.
 For reference, BF16-compute transformers scores 0.0012 KL and 99.46% top-1 against the same FP32 reference, so
 6 bpw EXL3 sits close to the BF16 noise floor while NVFP4 adds about 30x more error.
 
-Weight panel and KV panel: `bench/quality-20261016/results/REPORT.md`. On-policy check:
-`bench/engine-compare/quality/onpolicy_bf16.py` / `onpolicy_report.py` (run Oct 13; per-token output not committed).
+## How each measurement was made
+
+**Builds.** Oct 16 panels: VoidInfer `refactor/voidinfer` @ 07bf1c9e, NInfer @ a0cf1c17. Oct 20 suites: VoidInfer
+B2 build of `refactor/voidinfer` (host-memory fix 29e01156), NInfer @ a0cf1c17 (`ninfer-serve`, NVFP4 artifact
+`qwen3_8_27b_nvfp4.ninfer`, FP8 KV). Same RTX 5090 throughout.
+
+**Weight panel (Oct 16; rows 1–5).** Teacher-forced next-token distributions on fixed text, compared with a
+reference model.
+- Text: 70 streams of exactly 2,048 tokens, 10 each of C++/CUDA, Python, math (MATH-500 solutions), English,
+  German, Chinese and reasoning traces. Positions 64–2047 are scored: 138,880 tokens. NInfer's record digest
+  confirms both engines scored identical token ids.
+- Reference: the BF16 checkpoint run in FP32 compute (transformers Qwen3.5 modules, weights upcast exactly, TF32
+  off, FP32 lm_head).
+- VoidInfer: EXL3 6 bpw through the serving decode route, FP16 KV, to isolate the weights. NInfer: `ninfer-perplexity`
+  as one 2,048-token window, BF16 KV; this is its serving prefill and DFlash-verify route (W4A4 NVFP4).
+- Metrics: KL(reference ‖ engine) over the reference top-100 (a missing token gets the engine's 100th log-prob,
+  an upper bound); top-1 agreement = the engine's argmax equals the reference argmax; "difficult" tokens are those
+  where the reference's top-1 probability is below 0.5; perplexity from target NLL vs the reference; per-stream
+  wins by KL. CIs: 95% cluster bootstrap over streams, 10,000 resamples.
+- Scripts: `bench/quality-20261016/` (`build_panel.py`, `bf16_ref_panel.py`, `panel_ours.ps1`, `panel_ninfer.sh`,
+  `analyze_panel.py`); full report `bench/quality-20261016/results/REPORT.md`.
+
+**Long-context KV panel (Oct 16; 128K row).** 12 streams of at least 131,584 tokens (English, German, Chinese,
+code, Python, reasoning). For the 128K window, the first 128K + 512 tokens are fed and the last 512 targets scored
+with full causal context (6,144 tokens). Reference: BF16 compute with block-masked attention. VoidInfer runs its
+serving KV path (OSCAR INT4 + hot rows + exact VeriCache); NInfer runs FP8 KV. Metric: top-1 agreement as above.
+Same report.
+
+**On-policy check (Oct 13; served-answers row).** Each engine's served greedy answers (thinking off) on 382 items
+(GSM8K 100, MATH-500 100, IFEval 100, HumanEval 82) are appended to the chat-templated prompt and scored by the
+BF16 model in one teacher-forced pass. Metric: the share of answer tokens (plus the stop token) that equal the BF16
+argmax. Unlike the panels, this covers the whole serving path: prompt ingestion, KV tier, speculative decoding and
+verification. Answers are re-tokenized identically for both engines. Scripts:
+`bench/engine-compare/quality/onpolicy_bf16.py`, `onpolicy_report.py`.
 
 ## Letter-only multiple choice (new)
 
