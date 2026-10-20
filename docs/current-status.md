@@ -1,5 +1,33 @@
 # Current status
 
+## Status 2026-10-20 (quality-neutral speed changes)
+
+Six scheduling and kernel-selection changes screened for speed without a quality cost (Qwen3.8-27B EXL3
+6bpw, DFlash2 + exact VeriCache, RTX 5090). Exact VeriCache greedy text is not reproducible run to run
+(gt_none code_4k r1 != r2 on the same binary), so exactness evidence is root hashes
+(`VOIDINFER_EXL3_TEST_ENGINE_ROOT_HASH=1`, `VOIDINFER_EXL3_SHARE_TAPS=0`), identity rates against A/A
+and the paired NLL/KL gate (`ours_nll.ps1 -Windows 4096 -L0`, 8 windows, against the 2026-09-23 B2 build):
+new defaults dNLL +0.00007 +/- 0.00024, KL vs B2 0.0010, KL vs BF16 0.01037 (B2 0.01029), top-1 97.56%
+(B2 97.56%); new + hot 1024 + GEMM table -0.00009 +/- 0.00028, KL 0.0013 / 0.01014, 97.53%; B2 + hot
+1024 +0.00018 +/- 0.00029, KL 0.0013 / 0.01029, 97.49% (all within the CI).
+
+| Change | State/default | Measured (2026-10-20) |
+| --- | --- | --- |
+| Burst shared-opening coalescing | Default: a text request whose opening (at least the shared-prefix minimum) is shared with a request waiting or running on another lane publishes that opening as a shared prefix root, so the burst's other members restore it (`PROMPT_ROUTE ... burst=`); only the split point moves. `VOIDINFER_EXL3_BURST_SHARED_PREFIX=0` off | 8 requests dispatched together on 4 lanes, one 22.8K-token system prompt + a short own question, greedy, 256 outputs: computed prefill 45,977 -> 23,129 tokens (off, the first two members prefill the whole opening before a shared root exists; on, only the first: `burst=22848 shared_split=1`, the others `reused=22848`), wall 25.3 -> 19.1-19.4 s, TTFT mean 15.05 -> 9.5-10.3 s. Prefill root hashes equal for 9 of 10 roots; the first member's differs because its prefill is split at the shared boundary (prefill is not split-invariant, the same as every shared-prefix split) |
+| Hot rows by lane count | Default with `VOIDINFER_EXL3_L0_HOT` unset: 1024 exact hot rows at max_concurrency <= 4, 512 above (code capacity at C5-C8) | Sampled LCB 4,096 tokens, 32K context, 2 reps, 1024 vs 512: C1 22.17 / 22.29 vs 22.08 / 22.19 ms/round, 1 vs 0 of ~415 blocks corrected, free 8.46 vs 8.50 GiB; C4 41.55 / 41.88 vs 42.74 / 41.09 ms/round, 5 vs 11 of ~1,190 blocks corrected, free 6.16 vs 6.30 GiB; aggregate tok/s within run spread. NLL gate: B2 + hot 1024 +0.00018 +/- 0.00029 |
+| Queue-aware prefix cache eviction | Default: the Engine publishes its prefix demand (lane requests that have not yet looked up their root - prefill passes run one at a time - then the waiting queue in order); eviction takes roots no pending request restores first, otherwise the one needed last, and a new root no pending request restores is not admitted when it would evict one that a pending request restores. `VERICACHE_STATS` prints `PREFIX_ADMIT` per admission. `VOIDINFER_EXL3_DEMAND_EVICTION=0` restores publication-order eviction | 8 agents x 60K on 4 lanes, `--host-kv-mib 16384` (~3 agents' roots, 4.4 GiB per 68K-token root), short-answer turns, 2 reps, off vs on, resumed turn: computed prefill 510,940 / 441,487 vs 323,211 / 326,781 tokens (0-1 vs 3 agents restored), wall 172.7 / 159.9 vs 116.2 / 109.4 s, TTFT mean 95.2 / 82.5 vs 51.3 / 63.6 s. Roots are restored exactly; only which roots are retained changes. Without host pressure (default host KV) nothing is evicted and nothing changes |
+| Prefill policy between prompt blocks | `VOIDINFER_EXL3_PREFILL_POLICY`: `balanced` (default, the existing yield to waiting verification passes), `decode-priority` (at each block boundary the pass queue stays released until every other decoding lane completed `VOIDINFER_EXL3_PREFILL_DECODE_ROUNDS` rounds, default 2, at most `VOIDINFER_EXL3_PREFILL_DECODE_WAIT_MS`, default 120) or `prefill-priority` (no yield). Only the timing between blocks changes | 8 x 60K agents on 4 lanes: decode of running lanes during other lanes' prefill 32.3 (balanced) vs 41.9 / 42.9 tok/s (decode-priority), wall 198.2 vs 198.0 / 193.3 s, completion mean 135.3 vs 135.3 / 132.2 s. Balanced stays the default (decode-priority does not win wall time beyond run spread) |
+| Bit-identical cuBLASLt GEMM table | Opt-in: `VOIDINFER_EXL3_GEMM_TABLE=<file>` selects per exact shape a cuBLASLt algorithm whose output was verified bitwise equal to the default algorithm; `VOIDINFER_EXL3_GEMM_TUNE=1` measures candidates in situ and writes the table (per exact row count; 3-13% faster bit-identical algorithms on about half the shapes) | C1 prefill none vs table: 4K 3,432 vs 3,469 (+1.1%), 32K 3,812 vs 3,888 (+2.0%), 128K 2,998 vs 3,083 tok/s (+2.8%); decode ms/round unchanged; root hashes equal at 4K and 32K (prompt 2048 / 4053 / 4054 and 2048 / 32642 / 32643). Not default: the table is per GPU and driver |
+| Profiles (no change) | - | GDN retained-prefix repair (`reconstruct_conv_prefix_kernel` + `gdn_recurrence_chunk_kernel` graphs), C1 greedy code, 8 s nsys windows: 1.86% / 1.71% of GPU time at 4K / 32K, 1.01% / 0.94% on the critical path (~0.2 ms per round; the rest overlaps); a per-row state stash would write ~1.1 GB per round (more than the repair costs), so the stash-and-fold was not built. Verify rows per round (`VOIDINFER_EXL3_ROUND_WIDTH`, 4K, 2 reps): 8 / 4 / 2 rows 22.40 / 22.01 / 21.24 ms per round; 8-row verify ~1.12x a 1-row decode (1-row extrapolated at the 2-4 row slope against the 12.6 ms base decode), below the 1.15 at which a column-invariant MMA GEMV would pay |
+
+Measured, not kept: per-request verification-tree calibration (`VOIDINFER_EXL3_DFLASH2_TREE_CALIBRATION`)
+- greedy code_4k tokens per round on vs off C1 3.17 / 3.22 vs 3.23 / 3.31, C4 3.13 / 3.01 vs 3.02 / 3.08;
+sampled LCB C1 4.37 / 4.32 vs 4.43 / 4.42 (off 1.5-2% better).
+
+Open (pre-existing, also with every new switch off): intermittently at C4 with the shared tap pool,
+"batched draft head logits non-finite; proposals would be degenerate" followed by "EXL3 engine unavailable"
+(seen in a burst-off and a balanced-policy run).
+
 ## Status 2026-10-12 (VoidInfer-only engine)
 
 The EXL3 coherent-device lane engine is the only engine. Removed with the inherited route: the
