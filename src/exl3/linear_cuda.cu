@@ -21,12 +21,14 @@
 #undef cublas_check
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <cstdio>
+#include <filesystem>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -5048,16 +5050,22 @@ __global__ void exl3_split_plane_discriminator_compare_kernel(
 
 
 // Recorded FP16 prefill GEMM algorithms (after crit-hub kestrel's
-// gemm_table.txt, restricted to bit-identical results).
-// VOIDINFER_EXL3_GEMM_TABLE=<file> names the table. With
-// VOIDINFER_EXL3_GEMM_TUNE=1 a GEMM shape the table lacks is tuned on first
-// use (outside stream capture): every cuBLASLt heuristic candidate runs on
-// the real operands, only candidates whose output is bitwise identical to
-// cuBLAS's default for that exact shape are timed, and the fastest is
-// recorded when it beats the default by VOIDINFER_EXL3_GEMM_TUNE_MIN_GAIN
-// (percent, default 3); otherwise the default is recorded. Shapes without an
-// entry, and recorded algorithms the shape does not support, run cuBLAS's
-// default: a table never changes a result.
+// gemm_table.txt, restricted to bit-identical results). Default: a per-user
+// table named for the GPU, its driver and the cuBLASLt version
+// (%LOCALAPPDATA%\VoidInfer\gemm-table\..., else $XDG_CACHE_HOME or
+// ~/.cache/voidinfer/gemm-table), so a table is never reused on another
+// device or library. VOIDINFER_EXL3_GEMM_TABLE=<file> names another table,
+// =0 disables. A GEMM shape the table lacks is tuned on first use (outside
+// stream capture) when its row count is a multiple of 128 (whole prompt
+// blocks; VOIDINFER_EXL3_GEMM_TUNE=1 tunes every row count, =0 none): every
+// cuBLASLt heuristic candidate runs on the real operands, only candidates
+// whose output is bitwise identical to cuBLAS's default for that exact shape
+// are timed, and the fastest is recorded when it beats the default by
+// VOIDINFER_EXL3_GEMM_TUNE_MIN_GAIN (percent, default 3); otherwise the
+// default is recorded. A tune that fails (device memory) runs the default
+// and is retried by the next process. Shapes without an entry, and recorded
+// algorithms the shape does not support, run cuBLAS's default: a table never
+// changes a result.
 __global__ void exl3_gemm_bitwise_diff_kernel(const std::uint32_t* a,const std::uint32_t* b,
     std::size_t words,int* diff) {
     for(std::size_t i=blockIdx.x*static_cast<std::size_t>(blockDim.x)+threadIdx.x;i<words;
@@ -5069,7 +5077,7 @@ public:
     struct Entry {bool lt=false;cublasLtMatmulAlgo_t algo{};};
     static Exl3GemmTable& get() {static Exl3GemmTable table;return table;}
     bool enabled() const noexcept {return !path_.empty();}
-    bool tune() const noexcept {return tune_;}
+    bool tune(int rows) const noexcept {return tune_==2 || (tune_==1 && rows%128==0);}
     double min_gain() const noexcept {return min_gain_;}
     static std::uint64_t key(bool fp16_compute,bool fp16_output,int in,int out,int rows) {
         return (fp16_compute?1ull<<63:0ull)|(fp16_output?1ull<<62:0ull)|
@@ -5096,8 +5104,13 @@ public:
     }
 private:
     Exl3GemmTable() {
-        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TABLE"))path_=value;
-        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TUNE"))tune_=std::strcmp(value,"1")==0;
+        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TUNE"))
+            tune_=std::strcmp(value,"1")==0?2:std::strcmp(value,"0")==0?0:1;
+        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TABLE"); value && *value) {
+            if(std::strcmp(value,"0")!=0)path_=value;
+        } else {
+            path_=default_path();
+        }
         if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TUNE_MIN_GAIN"))
             min_gain_=std::clamp(std::atof(value),0.0,50.0);
         if(path_.empty())return;
@@ -5120,8 +5133,39 @@ private:
         }
         std::fclose(f);
     }
+    static std::string default_path() {
+        try {
+            int device=0,driver=0;
+            cudaDeviceProp properties{};
+            if(cudaGetDevice(&device)!=cudaSuccess ||
+               cudaGetDeviceProperties(&properties,device)!=cudaSuccess ||
+               cudaDriverGetVersion(&driver)!=cudaSuccess)return {};
+            std::filesystem::path root;
+#ifdef _WIN32
+            if(const char* local=std::getenv("LOCALAPPDATA"); local && *local)
+                root=std::filesystem::path(local)/"VoidInfer";
+#else
+            if(const char* cache=std::getenv("XDG_CACHE_HOME"); cache && *cache)
+                root=std::filesystem::path(cache)/"voidinfer";
+            else if(const char* home=std::getenv("HOME"); home && *home)
+                root=std::filesystem::path(home)/".cache"/"voidinfer";
+#endif
+            if(root.empty())return {};
+            std::string gpu;
+            for(const char* c=properties.name;*c;++c)
+                gpu+=std::isalnum(static_cast<unsigned char>(*c))?*c:'-';
+            const auto directory=root/"gemm-table";
+            std::filesystem::create_directories(directory);
+            char version[96];
+            std::snprintf(version,sizeof(version),"_sm%d%d_driver%d_cublaslt%zu.txt",
+                properties.major,properties.minor,driver,cublasLtGetVersion());
+            return (directory/(gpu+version)).string();
+        } catch(...) {
+            return {};  // no writable cache directory: the table is off
+        }
+    }
     std::string path_;
-    bool tune_=false;
+    int tune_=1;  // 0 never, 1 row counts that are multiples of 128, 2 every row count
     double min_gain_=3.0;
     std::mutex mutex_;
     std::unordered_map<std::uint64_t,Entry> entries_;
@@ -8941,10 +8985,11 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         auto entry = gemm_table.find(table_key);
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         cuda_check(cudaStreamIsCapturing(stream, &capture), "GEMM table capture query");
-        if (!entry && gemm_table.tune() && capture == cudaStreamCaptureStatusNone) {
+        if (!entry && gemm_table.tune(rows) && capture == cudaStreamCaptureStatusNone) {
             // Tune on the real operands: default output as the reference,
             // then every candidate into a second buffer, compared bitwise.
             Exl3GemmTable::Entry chosen{};
+            bool persist = true;
             auto& plan = make_plan();
             const std::size_t bytes = static_cast<std::size_t>(metadata.out_features) * rows *
                 (output_type == CUDA_R_16F ? 2u : 4u);
@@ -9014,9 +9059,14 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                 cleanup();
             } catch (...) {
                 cleanup();
-                throw;
+                // A failed allocation or query leaves the device usable: run
+                // the default and let the next process tune this shape again.
+                (void)cudaGetLastError();
+                if (cudaStreamSynchronize(stream) != cudaSuccess) throw;
+                chosen = {};
+                persist = false;
             }
-            gemm_table.record(table_key, chosen, true);
+            gemm_table.record(table_key, chosen, persist);
             entry = chosen;
         }
         if (entry && entry->lt) {
