@@ -25,6 +25,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <memory>
+#include <optional>
+#include <cstdio>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -5044,6 +5046,86 @@ __global__ void exl3_split_plane_discriminator_compare_kernel(
     if(index<count&&selected[index]!=candidate[index])atomicAdd(mismatches,1ULL);
 }
 
+
+// Recorded FP16 prefill GEMM algorithms (after crit-hub kestrel's
+// gemm_table.txt, restricted to bit-identical results).
+// VOIDINFER_EXL3_GEMM_TABLE=<file> names the table. With
+// VOIDINFER_EXL3_GEMM_TUNE=1 a GEMM shape the table lacks is tuned on first
+// use (outside stream capture): every cuBLASLt heuristic candidate runs on
+// the real operands, only candidates whose output is bitwise identical to
+// cuBLAS's default for that exact shape are timed, and the fastest is
+// recorded when it beats the default by VOIDINFER_EXL3_GEMM_TUNE_MIN_GAIN
+// (percent, default 3); otherwise the default is recorded. Shapes without an
+// entry, and recorded algorithms the shape does not support, run cuBLAS's
+// default: a table never changes a result.
+__global__ void exl3_gemm_bitwise_diff_kernel(const std::uint32_t* a,const std::uint32_t* b,
+    std::size_t words,int* diff) {
+    for(std::size_t i=blockIdx.x*static_cast<std::size_t>(blockDim.x)+threadIdx.x;i<words;
+        i+=static_cast<std::size_t>(gridDim.x)*blockDim.x)
+        if(a[i]!=b[i]) {atomicExch(diff,1);return;}
+}
+class Exl3GemmTable {
+public:
+    struct Entry {bool lt=false;cublasLtMatmulAlgo_t algo{};};
+    static Exl3GemmTable& get() {static Exl3GemmTable table;return table;}
+    bool enabled() const noexcept {return !path_.empty();}
+    bool tune() const noexcept {return tune_;}
+    double min_gain() const noexcept {return min_gain_;}
+    static std::uint64_t key(bool fp16_compute,bool fp16_output,int in,int out,int rows) {
+        return (fp16_compute?1ull<<63:0ull)|(fp16_output?1ull<<62:0ull)|
+            (static_cast<std::uint64_t>(in&0xFFFFF)<<40)|
+            (static_cast<std::uint64_t>(out&0xFFFFF)<<20)|static_cast<std::uint64_t>(rows&0xFFFFF);
+    }
+    std::optional<Entry> find(std::uint64_t k) {
+        std::lock_guard lock(mutex_);
+        const auto it=entries_.find(k);
+        if(it==entries_.end())return std::nullopt;
+        return it->second;
+    }
+    void record(std::uint64_t k,const Entry& entry,bool persist) {
+        std::lock_guard lock(mutex_);
+        entries_[k]=entry;
+        if(!persist)return;
+        if(std::FILE* f=std::fopen(path_.c_str(),"a")) {
+            std::fprintf(f,"%016llx %d ",static_cast<unsigned long long>(k),entry.lt?1:0);
+            const auto* bytes=reinterpret_cast<const unsigned char*>(&entry.algo);
+            for(std::size_t i=0;i<sizeof(entry.algo);++i)std::fprintf(f,"%02x",bytes[i]);
+            std::fprintf(f,"\n");
+            std::fclose(f);
+        }
+    }
+private:
+    Exl3GemmTable() {
+        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TABLE"))path_=value;
+        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TUNE"))tune_=std::strcmp(value,"1")==0;
+        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TUNE_MIN_GAIN"))
+            min_gain_=std::clamp(std::atof(value),0.0,50.0);
+        if(path_.empty())return;
+        std::FILE* f=std::fopen(path_.c_str(),"r");
+        if(!f)return;
+        char line[512];
+        while(std::fgets(line,sizeof(line),f)) {
+            unsigned long long k=0;int lt=0;char hex[200]{};
+            if(std::sscanf(line,"%llx %d %199s",&k,&lt,hex)!=3)continue;
+            Entry entry;entry.lt=lt!=0;
+            auto* bytes=reinterpret_cast<unsigned char*>(&entry.algo);
+            if(std::strlen(hex)!=2*sizeof(entry.algo))continue;
+            bool ok=true;
+            for(std::size_t i=0;i<sizeof(entry.algo);++i) {
+                unsigned v=0;
+                if(std::sscanf(hex+2*i,"%2x",&v)!=1){ok=false;break;}
+                bytes[i]=static_cast<unsigned char>(v);
+            }
+            if(ok)entries_[k]=entry;
+        }
+        std::fclose(f);
+    }
+    std::string path_;
+    bool tune_=false;
+    double min_gain_=3.0;
+    std::mutex mutex_;
+    std::unordered_map<std::uint64_t,Entry> entries_;
+};
 } // namespace
 
 Exl3Mul1LookupDiscriminator exl3_mul1_lookup_discriminator_for_test(
@@ -7155,6 +7237,8 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
         std::size_t workspace_bytes = 0;
     };
     std::unordered_map<std::uint64_t,LtPlan> lt_plans;
+    // Recorded-algorithm plans (Exl3GemmTable), keyed by Exl3GemmTable::key.
+    std::unordered_map<std::uint64_t,LtPlan> table_plans;
     bool k5_lt_enabled = false;
     bool large_lt_enabled = false;
     bool mxfp8_enabled = false;
@@ -7484,6 +7568,12 @@ Exl3CudaReconstructGemmWorkspace::~Exl3CudaReconstructGemmWorkspace() {
     if (!impl_) return;
     if (impl_->weight_prefetch_stream)
         (void)cudaStreamSynchronize(impl_->weight_prefetch_stream);
+    for (auto& [key, plan] : impl_->table_plans) {
+        if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+        if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+        if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+        if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+    }
     for (auto& [key, plan] : impl_->lt_plans) {
         if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
         if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
@@ -8785,7 +8875,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         else ++impl_->stats.large_lt_calls;
         used_lt=true;
     }
-    if (!used_lt) {
+    const auto default_gemm=[&](void* destination) {
         cublas_check(cublasGemmEx(
             impl_->handle, CUBLAS_OP_N, CUBLAS_OP_N,
             metadata.out_features, rows, metadata.in_features,
@@ -8795,13 +8885,154 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
             gemm_input, CUDA_R_16F, metadata.in_features,
             fp16_compute ? static_cast<const void*>(&beta_half)
                          : static_cast<const void*>(&beta),
-            gemm_output, output_type, metadata.out_features,
+            destination, output_type, metadata.out_features,
             fp16_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
             fp16_compute ? "T69 same-weights FP16-compute GEMM"
                          : (fused_original ? "T69 fused original-basis GEMM"
                                             : "T69 FP32-compute GEMM"));
+    };
+    // Recorded algorithms (Exl3GemmTable): only bit-identical ones are recorded.
+    auto& gemm_table = Exl3GemmTable::get();
+    if (!used_lt && gemm_table.enabled() && rows > 1) {
+        const bool fp16_output = output_type == CUDA_R_16F;
+        const auto table_key = Exl3GemmTable::key(fp16_compute, fp16_output,
+            metadata.in_features, metadata.out_features, rows);
+        constexpr std::size_t lt_limit = 16u * 1024u * 1024u;
+        const auto make_plan = [&]() -> Impl::LtPlan& {
+            auto found = impl_->table_plans.find(table_key);
+            if (found != impl_->table_plans.end()) return found->second;
+            if (!impl_->lt_handle)
+                cublas_check(cublasLtCreate(&impl_->lt_handle), "create table cuBLASLt handle");
+            Impl::LtPlan plan{};
+            try {
+                cublas_check(cublasLtMatmulDescCreate(&plan.operation,
+                    fp16_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
+                    fp16_compute ? CUDA_R_16F : CUDA_R_32F), "create table Lt operation");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_16F,
+                    metadata.out_features, metadata.in_features, metadata.out_features),
+                    "create table Lt A layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_16F,
+                    metadata.in_features, rows, metadata.in_features),
+                    "create table Lt B layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.c, output_type,
+                    metadata.out_features, rows, metadata.out_features),
+                    "create table Lt C layout");
+            } catch (...) {
+                if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+                if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+                if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+                if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+                throw;
+            }
+            return impl_->table_plans.emplace(table_key, plan).first->second;
+        };
+        const auto run_lt = [&](const Impl::LtPlan& plan, const cublasLtMatmulAlgo_t& algo,
+                                std::size_t workspace, void* destination) {
+            cublas_check(cublasLtMatmul(impl_->lt_handle, plan.operation,
+                fp16_compute ? static_cast<const void*>(&alpha_half)
+                             : static_cast<const void*>(&alpha),
+                reconstructed, plan.a, gemm_input, plan.b,
+                fp16_compute ? static_cast<const void*>(&beta_half)
+                             : static_cast<const void*>(&beta),
+                destination, plan.c, destination, plan.c, &algo,
+                impl_->cublas_workspace, workspace, stream), "table cuBLASLt GEMM");
+        };
+        auto entry = gemm_table.find(table_key);
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream, &capture), "GEMM table capture query");
+        if (!entry && gemm_table.tune() && capture == cudaStreamCaptureStatusNone) {
+            // Tune on the real operands: default output as the reference,
+            // then every candidate into a second buffer, compared bitwise.
+            Exl3GemmTable::Entry chosen{};
+            auto& plan = make_plan();
+            const std::size_t bytes = static_cast<std::size_t>(metadata.out_features) * rows *
+                (output_type == CUDA_R_16F ? 2u : 4u);
+            void* reference = nullptr; void* trial = nullptr; int* diff = nullptr;
+            cudaEvent_t begin = nullptr, end = nullptr;
+            const auto cleanup = [&] {
+                if (reference) (void)cudaFree(reference);
+                if (trial) (void)cudaFree(trial);
+                if (diff) (void)cudaFree(diff);
+                if (begin) (void)cudaEventDestroy(begin);
+                if (end) (void)cudaEventDestroy(end);
+            };
+            try {
+                cuda_check(cudaStreamSynchronize(stream), "GEMM tune sync");
+                cuda_check(cudaMalloc(&reference, bytes), "GEMM tune reference");
+                cuda_check(cudaMalloc(&trial, bytes), "GEMM tune trial");
+                cuda_check(cudaMalloc(reinterpret_cast<void**>(&diff), sizeof(int)), "GEMM tune flag");
+                cuda_check(cudaEventCreate(&begin), "GEMM tune event");
+                cuda_check(cudaEventCreate(&end), "GEMM tune event");
+                const auto time = [&](const auto& launch) {
+                    launch();  // warm-up
+                    cuda_check(cudaEventRecord(begin, stream), "GEMM tune begin");
+                    for (int i = 0; i < 5; ++i) launch();
+                    cuda_check(cudaEventRecord(end, stream), "GEMM tune end");
+                    cuda_check(cudaEventSynchronize(end), "GEMM tune wait");
+                    float ms = 0.0f;
+                    cuda_check(cudaEventElapsedTime(&ms, begin, end), "GEMM tune elapsed");
+                    return ms / 5.0f;
+                };
+                const float default_ms = time([&] {default_gemm(reference);});
+                cublasLtMatmulPreference_t preference = nullptr;
+                cublas_check(cublasLtMatmulPreferenceCreate(&preference), "GEMM tune preference");
+                cublasLtMatmulHeuristicResult_t candidates[16]{};
+                int count = 0;
+                const auto status_limit = cublasLtMatmulPreferenceSetAttribute(preference,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &lt_limit, sizeof(lt_limit));
+                const auto status_query = status_limit == CUBLAS_STATUS_SUCCESS ?
+                    cublasLtMatmulAlgoGetHeuristic(impl_->lt_handle, plan.operation, plan.a,
+                        plan.b, plan.c, plan.c, preference, 16, candidates, &count) : status_limit;
+                cublasLtMatmulPreferenceDestroy(preference);
+                float best_ms = default_ms;
+                if (status_query == CUBLAS_STATUS_SUCCESS)
+                for (int i = 0; i < count; ++i) {
+                    if (candidates[i].state != CUBLAS_STATUS_SUCCESS ||
+                        candidates[i].workspaceSize > lt_limit) continue;
+                    run_lt(plan, candidates[i].algo, candidates[i].workspaceSize, trial);
+                    cuda_check(cudaMemsetAsync(diff, 0, sizeof(int), stream), "GEMM tune flag clear");
+                    exl3_gemm_bitwise_diff_kernel<<<1024, 256, 0, stream>>>(
+                        static_cast<const std::uint32_t*>(reference),
+                        static_cast<const std::uint32_t*>(trial), bytes / 4, diff);
+                    cuda_check(cudaGetLastError(), "GEMM tune compare");
+                    int host_diff = 1;
+                    cuda_check(cudaMemcpyAsync(&host_diff, diff, sizeof(int),
+                        cudaMemcpyDeviceToHost, stream), "GEMM tune flag read");
+                    cuda_check(cudaStreamSynchronize(stream), "GEMM tune compare sync");
+                    if (host_diff) continue;  // not bit-identical: never recorded
+                    const float ms = time([&] {
+                        run_lt(plan, candidates[i].algo, candidates[i].workspaceSize, trial);});
+                    if (ms < best_ms) {best_ms = ms; chosen.lt = true; chosen.algo = candidates[i].algo;}
+                }
+                if (chosen.lt && best_ms > default_ms * (1.0 - gemm_table.min_gain() / 100.0))
+                    chosen = {};
+                if (std::getenv("VOIDINFER_EXL3_GEMM_TUNE_TRACE"))
+                    std::fprintf(stderr, "GEMM_TUNE in=%d out=%d rows=%d fp16c=%d default_ms=%.4f best_ms=%.4f lt=%d candidates=%d\n",
+                        metadata.in_features, metadata.out_features, rows, fp16_compute ? 1 : 0,
+                        default_ms, chosen.lt ? best_ms : default_ms, chosen.lt ? 1 : 0, count);
+                cleanup();
+            } catch (...) {
+                cleanup();
+                throw;
+            }
+            gemm_table.record(table_key, chosen, true);
+            entry = chosen;
+        }
+        if (entry && entry->lt) {
+            auto& plan = make_plan();
+            cublasLtMatmulHeuristicResult_t check_result{};
+            if (cublasLtMatmulAlgoCheck(impl_->lt_handle, plan.operation, plan.a, plan.b,
+                    plan.c, plan.c, &entry->algo, &check_result) == CUBLAS_STATUS_SUCCESS &&
+                check_result.workspaceSize <= lt_limit) {
+                run_lt(plan, entry->algo, check_result.workspaceSize, gemm_output);
+                used_lt = true;
+            } else {
+                gemm_table.record(table_key, {}, false);  // unsupported here: default from now on
+            }
+        }
     }
+    if (!used_lt) default_gemm(gemm_output);
     if (timing) cuda_check(cudaEventRecord(events[3], stream), "T69 GEMM event");
 
     if (!fused_original) {
