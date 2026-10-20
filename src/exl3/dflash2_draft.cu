@@ -5150,6 +5150,10 @@ struct DraftBatchedScratch {
         cudaGraphExec_t exec=nullptr;
     };
     std::vector<Graph> graphs;
+    // The planes and workspaces are shared by every lane's stream. The mutex
+    // orders host enqueues only: `done` marks the last user's GPU work, and the
+    // next user waits for it on its own stream before touching any plane.
+    cudaEvent_t done=nullptr;
     void prepare() {
         if(ready)return;
         const auto alloc=[](auto*& pointer,std::size_t bytes,const char* label) {
@@ -5178,6 +5182,7 @@ struct DraftBatchedScratch {
         alloc(hctx,rows*kHidden*two,"batched commit hidden rows");
         alloc(cpos,rows*sizeof(std::int32_t),"batched commit positions");
         alloc(tap_ptr,kLayers*sizeof(const std::uint16_t*),"batched commit tap pointers");
+        cuda_check(cudaEventCreateWithFlags(&done,cudaEventDisableTiming),"batched draft scratch fence");
         const auto linear=[](int input,int output,int max_rows,bool batched) {
             Exl3CudaLinearWorkspace::Owner owner(std::make_unique<Exl3CudaLinearWorkspace>(
                 input,output,max_rows,true).release());
@@ -5207,6 +5212,24 @@ DraftBatchedScratch& draft_batched_scratch() {
     static DraftBatchedScratch scratch;
     return scratch;
 }
+// Holds the scratch for one user: waits for the previous user's GPU work on
+// `stream` and records this user's work there when the scope ends (also on
+// failure: the enqueued work may still run).
+class DraftBatchedScratchUse {
+public:
+    DraftBatchedScratchUse(DraftBatchedScratch& scratch,cudaStream_t stream)
+        : scratch_(scratch),lock_(scratch.mutex),stream_(stream) {
+        scratch_.prepare();
+        cuda_check(cudaStreamWaitEvent(stream_,scratch_.done,0),"batched draft scratch wait");
+    }
+    ~DraftBatchedScratchUse() {(void)cudaEventRecord(scratch_.done,stream_);}
+    DraftBatchedScratchUse(const DraftBatchedScratchUse&)=delete;
+    DraftBatchedScratchUse& operator=(const DraftBatchedScratchUse&)=delete;
+private:
+    DraftBatchedScratch& scratch_;
+    std::lock_guard<std::mutex> lock_;
+    cudaStream_t stream_;
+};
 } // namespace
 
 std::size_t Exl3Dflash2DraftModel::max_batched_members() noexcept {
@@ -5241,8 +5264,7 @@ void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* c
             "batched draft block must extend its committed ring");
     }
     auto& b=draft_batched_scratch();
-    const std::lock_guard lock(b.mutex);
-    b.prepare();
+    const DraftBatchedScratchUse use(b,stream);
     constexpr int L=kBlockCap,P=kBlockCap-1;
     const int rows=count*L;
     std::array<std::int64_t,DraftBatchedScratch::kRows> ids{};
@@ -5535,8 +5557,7 @@ void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps
         m.invalidate_ring_witness();
         if(m.ring_count==0)m.ring_base_abs=abs_pos0;
         auto& b=draft_batched_scratch();
-        const std::lock_guard lock(b.mutex);
-        b.prepare();
+        const DraftBatchedScratchUse use(b,stream);
         constexpr int n=kKVHeads*kHeadDim;
         constexpr int kChunk=4*kBlockCap;   // bulk prefill chunk (fixed: draft numerics)
         const auto admission=Exl3CudaLinearAdmission::draft_prefill_fc;

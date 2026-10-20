@@ -24,9 +24,15 @@ Measured, not kept: per-request verification-tree calibration (`VOIDINFER_EXL3_D
 - greedy code_4k tokens per round on vs off C1 3.17 / 3.22 vs 3.23 / 3.31, C4 3.13 / 3.01 vs 3.02 / 3.08;
 sampled LCB C1 4.37 / 4.32 vs 4.43 / 4.42 (off 1.5-2% better).
 
-Open (pre-existing, also with every new switch off): intermittently at C4 with the shared tap pool,
-"batched draft head logits non-finite; proposals would be degenerate" followed by "EXL3 engine unavailable"
-(seen in a burst-off and a balanced-policy run).
+Fixed (pre-existing, Oct 20 late): the batched-draft scratch (activation planes and the shared draft
+K/V and fc projection workspaces) was shared by `propose_batched` and the fresh-prefill
+`commit_prefill_bulk`, and the bulk commit released its mutex with its GPU work still queued, so another
+lane's batched draft on another stream wrote the same planes concurrently (instrumented: one overlap per
+C4 burst run, right after a lane's fresh prefill). An event fence now orders every user of the scratch
+after the previous one on the GPU. The intermittent C4 "batched draft head logits non-finite; proposals
+would be degenerate" -> "EXL3 engine unavailable" (2 of about 40 C4 runs on Oct 20, both right after a
+lane's prefill) is attributed to this race; after the fix 10 burst-off + 2 agents C4 runs had no error,
+C4 burst ms/round unchanged (42.8-51.1 vs 43.1-51.1).
 
 ## Status 2026-10-12 (VoidInfer-only engine)
 
