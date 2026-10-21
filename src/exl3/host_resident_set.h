@@ -604,7 +604,12 @@ public:
             if(locked) throw std::invalid_argument("resident page has a foreign lock");
             if(!valid) missing+=page_;
         });
-        if(added_bytes) check_reserve(missing);
+        // Only pages that are not resident yet take memory: locking pages
+        // already backed (a root exported from the planes its prefill just
+        // filled) commits nothing, so it never trips the reserve. Refusing it
+        // there freed nothing either and turned every admission under host
+        // pressure into a 429 after a full prefill.
+        if(missing) check_reserve(missing);
         const auto previous_min=current_min_,previous_max=current_max_;const auto previous_flags=current_flags_;
         Range attempted{};
         try {
@@ -628,7 +633,8 @@ public:
                 query(completed.back(),[&](auto,bool valid,bool locked) {
                     if(!valid || !locked) throw std::runtime_error("new resident lock not witnessed");
                 });
-                check_reserve();++stats.lock_calls;
+                if(missing) check_reserve();
+                ++stats.lock_calls;
                 if(after_lock) after_lock(completed.size());
                 first=end;
             }

@@ -12,6 +12,7 @@
 // agents trade places in a lane by remapping, not by copying), and the
 // backing stays reachable at its own address meanwhile.
 #include "exl3/host_memory_available.h"
+#include "exl3/host_memory_ledger.h"
 
 #include <cuda.h>
 
@@ -97,6 +98,7 @@ public:
                 throw std::runtime_error("growable region window map");
             }
             handles_.push_back(handle);
+            if (host_backed()) Exl3HostMemoryLedger::get().plane_bytes += static_cast<std::int64_t>(granularity_);
             mapped_.store(mapped + granularity_, std::memory_order_release);
         }
     }
@@ -114,6 +116,7 @@ public:
             cuMemUnmap(base_ + mapped, granularity_);
             give_back(handles_.back());
             handles_.pop_back();
+            if (host_backed()) Exl3HostMemoryLedger::get().plane_bytes -= static_cast<std::int64_t>(granularity_);
         }
         mapped_.store(mapped, std::memory_order_release);
     }
@@ -157,6 +160,7 @@ public:
             cuMemUnmap(base_ + mapped, granularity_);
             give_back(handles_.back());
             handles_.pop_back();
+            if (host_backed()) Exl3HostMemoryLedger::get().plane_bytes -= static_cast<std::int64_t>(granularity_);
         }
         cuMemAddressFree(base_, capacity_);
         base_ = 0;
@@ -175,6 +179,7 @@ public:
         {
             const std::lock_guard<std::mutex> lock(pool.mutex);
             handles.swap(pool.handles);
+            Exl3HostMemoryLedger::get().plane_pool_bytes -= static_cast<std::int64_t>(handles.size() * pool.granularity);
         }
         for (const auto handle : handles) cuMemRelease(handle);
     }
@@ -246,6 +251,7 @@ public:
                     return;
                 }
                 shared.handles.push_back(handle);
+                Exl3HostMemoryLedger::get().plane_pool_bytes += static_cast<std::int64_t>(granularity);
             }
         });
     }
@@ -287,6 +293,7 @@ private:
         if (pool.handles.empty() || !pool_matches(pool)) return 0;
         const auto handle = pool.handles.back();
         pool.handles.pop_back();
+        Exl3HostMemoryLedger::get().plane_pool_bytes -= static_cast<std::int64_t>(granularity_);
         return handle;
     }
     void give_back(CUmemGenericAllocationHandle handle) noexcept {
@@ -300,6 +307,7 @@ private:
             }
             if (pool_matches(pool) && (pool.handles.size() + 1) * granularity_ <= host_pool_cap()) {
                 pool.handles.push_back(handle);
+                Exl3HostMemoryLedger::get().plane_pool_bytes += static_cast<std::int64_t>(granularity_);
                 return;
             }
         }

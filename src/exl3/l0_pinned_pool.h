@@ -3,6 +3,7 @@
 // so a resume uploads them with asynchronous DMA, carved from 64-block slabs
 // so parking does not pay a page-locking call per chunk. Blocks return to a
 // process-wide free list; slabs are kept for reuse.
+#include "exl3/host_memory_ledger.h"
 #include "exl3/l0_oscar_format.h"
 
 #include <cuda_runtime.h>
@@ -55,11 +56,14 @@ public:
                 slab = ::operator new(block_bytes() * kSlabBlocks);
             }
             slabs_.push_back(slab);
+            Exl3HostMemoryLedger::get().code_slab_bytes += static_cast<std::int64_t>(block_bytes() * kSlabBlocks);
+            Exl3HostMemoryLedger::get().code_free_bytes += static_cast<std::int64_t>(block_bytes() * kSlabBlocks);
             for (std::size_t i = 0; i < kSlabBlocks; ++i)
                 free_.push_back(static_cast<std::uint8_t*>(slab) + i * block_bytes());
         }
         auto* p = free_.back();
         free_.pop_back();
+        Exl3HostMemoryLedger::get().code_free_bytes -= static_cast<std::int64_t>(block_bytes());
         return Block(p);
     }
 
@@ -67,6 +71,7 @@ private:
     void give_back(std::uint8_t* p) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         free_.push_back(p);
+        Exl3HostMemoryLedger::get().code_free_bytes += static_cast<std::int64_t>(block_bytes());
     }
     std::mutex mutex_;
     std::vector<void*> slabs_;

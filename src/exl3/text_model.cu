@@ -1,3 +1,4 @@
+#include "exl3/host_memory_ledger.h"
 #include "exl3/l0_history_mark.h"
 #include "core/capture_guard.h"
 #include "core/poll_wait.h"
@@ -2079,6 +2080,7 @@ struct Exl3TextContext::Impl {
     bool suspended_codes_pinned = false;
     void free_suspended_codes() noexcept {
         if(!suspended_codes)return;
+        Exl3HostMemoryLedger::get().suspended_bytes-=static_cast<std::int64_t>(suspended_code_capacity);
         if(suspended_codes_pinned)(void)cudaFreeHost(suspended_codes);
         else ::operator delete(suspended_codes);
         suspended_codes=nullptr;suspended_code_capacity=0;
@@ -14396,6 +14398,7 @@ std::size_t Exl3TextContext::suspend_l0_codes(cudaStream_t stream) {
             impl_->suspended_codes_pinned=false;
         }
         impl_->suspended_code_capacity=bytes;
+        Exl3HostMemoryLedger::get().suspended_bytes+=static_cast<std::int64_t>(bytes);
     }
     auto* host=impl_->suspended_codes;
     for(auto& layer:impl_->full_layers)if(layer) {

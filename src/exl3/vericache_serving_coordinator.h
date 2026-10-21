@@ -1,5 +1,6 @@
 #pragma once
 
+#include "exl3/host_memory_ledger.h"
 #include "exl3/host_resident_set.h"
 #include "exl3/vericache_request.h"
 #include "exl3/device_page_key.h"
@@ -227,6 +228,7 @@ public:
         if (runtime_allocating_ && allocation_thread_ == std::this_thread::get_id()) return 0;
         allocation_changed_.wait(lock, [&] { return !runtime_allocating_; });
         if (closed_ || closing_started_ || allocating_) return 0;
+        if (exl3_host_memory_short(extra)) (void)release_stale_resident_locked();
         std::size_t evicted = 0;
         while (exl3_host_memory_short(extra) && evict_retained_locked()) ++evicted;
         return evicted;
@@ -1371,13 +1373,37 @@ private:
         std::span<const std::pair<std::uint64_t,
             std::shared_ptr<const Exl3VeriCacheRequest>>> replacements,
         std::uint64_t removed_id, bool request_admission = false) {
+        bool refreshed = false;
         for (;;) {
             try {
                 return replace_resident_once_locked(replacements, removed_id, request_admission);
             } catch (const Exl3HostResidentReserveExhausted&) {
+                if (!refreshed) {
+                    refreshed = true;
+                    if (release_stale_resident_locked()) continue;
+                }
                 if (!evict_retained_locked()) throw;
             }
         }
+    }
+    // The committed resident union keeps every root it locked until the next
+    // commit, also roots the prefix cache has evicted since (its own budget
+    // evictions do not commit here). Under host memory pressure such stale
+    // roots kept whole idle plane sets backed (8 agents x 110K on 4 lanes:
+    // ~29 GB pinned with an empty cache) and every admission was refused, so
+    // no commit ever dropped them. A commit without the refused update only
+    // removes pages and cannot fail the reserve check; the caller retries
+    // once. False when that commit is refused too.
+    bool release_stale_resident_locked() {
+        try {
+            (void)replace_resident_once_locked({}, 0);
+        } catch (const Exl3HostResidentReserveExhausted&) {
+            return false;
+        }
+        if (const auto release = exl3_release_idle_plane_rows.load()) release();
+        static const bool trace = std::getenv("VOIDINFER_EXL3_VERICACHE_STATS") != nullptr;
+        if (trace) Exl3HostMemoryLedger::print("released_stale_resident");
+        return true;
     }
     // Drops the oldest retained root from the prefix cache and from the
     // resident union at once: the union owns every root it locked, so only
@@ -1390,8 +1416,7 @@ private:
         root.reset();
         if (const auto release = exl3_release_idle_plane_rows.load()) release();
         static const bool trace = std::getenv("VOIDINFER_EXL3_VERICACHE_STATS") != nullptr;
-        if (trace) std::fprintf(stderr, "HOST_PRESSURE evicted_root available_mib=%llu\n",
-            static_cast<unsigned long long>(exl3_available_host_bytes().value_or(0) >> 20));
+        if (trace) Exl3HostMemoryLedger::print("evicted_root");
         return true;
     }
     Exl3HostResidentSet::Stats replace_resident_once_locked(

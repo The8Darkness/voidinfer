@@ -1,6 +1,7 @@
 #include "exl3/exl3_engine_core.h"
 #include "core/capture_guard.h"
 #include "exl3/engine_profile.h"
+#include "exl3/host_memory_ledger.h"
 #include "exl3/environment_options.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/reconstruction_control_allocator.h"
@@ -3041,6 +3042,7 @@ struct Exl3EngineCore::Impl {
                 catch(const Exl3HostResidentBudgetExhausted&) {
                     throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds the resident page budget");
                 } catch(const Exl3HostResidentReserveExhausted&) {
+                    if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")) Exl3HostMemoryLedger::print("refused");
                     throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available host memory");
                 }
                 host_lease=coordinator.acquire();
@@ -3866,6 +3868,7 @@ struct Exl3EngineCore::Impl {
             // request only; the lane and its peers stay usable.
             try {throw;}
             catch(const Exl3HostResidentReserveExhausted&) {
+                if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")) Exl3HostMemoryLedger::print("refused");
                 throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available host memory");
             } catch(const Exl3HostResidentBudgetExhausted&) {
                 throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds the resident page budget");
