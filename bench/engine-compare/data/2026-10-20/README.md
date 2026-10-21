@@ -10,10 +10,10 @@ limits in `limits.json` (latest build) and `limits_b2.json` (Oct 9 B2 build).
 
 | Lanes | VoidInfer | NInfer (fill) | NInfer start limit default / slots0 |
 |---|---|---|---|
-| C1 | 257,024 (262,144 window) | 208,896 | 177,152 / 182,272 |
+| C1 | 262,144 (258,089 prompt + 4,055 generated, stops at the window) | 208,896 | 177,152 / 182,272 |
 | C2 | 192,512 each | 86,016 each | 139,264 / 151,552 |
 | C4 | 69,632 each (B2: 65,536) | 26,624 each | 65,536 / 89,088 |
-| C8 | >= 12,288 each (B2: 8,192) | 3,072 each | 8,192 / 13,312 |
+| C8 | 11,264 each (3/3; 12,288 passes 3/5, VRAM-aware lane admission holds the 8th lane) | 3,072 each | 8,192 / 13,312 |
 
 Asymmetric C2 (first lane full, second gets the rest): VoidInfer 262K + 135,168;
 NInfer 151,552 + 38,912 (pool 184,320).
@@ -83,7 +83,28 @@ applies only when pages still have to be faulted in.
 Disk spill (`%TEMP%\voidinfer-kv-spill-<pid>.bin`, delete-on-close) wrote 0 bytes
 in the C1-C8 capacity runs; only the 8-agent run spilled (above).
 
-Not run: VoidInfer C8 fill above 12,288 and NInfer 8 agents on 2 lanes.
+## Vision (vision_compare_20261021.py, C2 servers, greedy, 256 tokens)
+
+Both engines answer all 8 requests (2 single images, two images in one turn, an image inside a
+3.5K-token prompt, a 1,164-token video, text after media, 2 concurrent image requests) with the
+same content: chart title, red-circle counts and the star, the first function in the code, the
+video's phase sequence. Identical prompt token counts (404 / 411 / 505 / 3,506 / 1,164).
+
+| Request | VoidInfer (s) | NInfer (s) |
+|---|---|---|
+| scene image | 1.96 | 1.48 |
+| chart image | 1.84 | 1.21 |
+| two images | 0.96 | 0.81 |
+| image in 3.5K prompt | 1.59 | 1.03 |
+| video | 1.78 | 1.38 |
+| 2 concurrent images | 2.59 s, 198 tok/s, identical to serial | 1.42 s, 360 tok/s, differs from serial |
+| startup with vision | 18.6 s | 33.6 s |
+
+VoidInfer's BF16 tower (weights in pinned host memory, streamed to the GPU) against the Hugging
+Face FP32 tower: cosine mean 0.99980 / 0.99993, min 0.9909 / 0.9976, rel L2 0.045 / 0.018 (scene /
+chart); HF's own BF16 tower: 0.99990 / 0.99994, rel L2 0.025 / 0.026 (`vision/ref.txt`).
+
+Not run: NInfer 8 agents on 2 lanes.
 
 Notes: the numbers are single runs unless a range is given; ranges are repeats.
 VoidInfer stays at 6 bpw / L0 OSCAR / exact VeriCache (the higher-quality path:

@@ -14,9 +14,10 @@
  "ours_fill_c1": 257024,
  "ours_fill_c2": 192512,
  "ours_fill_c4": 69632,
- "ours_fill_c8": 12288,
+ "ours_fill_c8": 11264,
  "ours_asym_second": 135168,
  "nv_asym_pool": 184320,
  "nv_asym_first": 151552,
- "nv_asym_second": 38912
+ "nv_asym_second": 38912,
+ "ours_window_c1": 262144
 }

@@ -1,0 +1,9 @@
+natural_scene.png grid=[[1, 32, 48]] hf_tokens=384 ours=384 (vision_2_0_1x32x48.f16)
+  ours     vs fp32: cos mean 0.999796 min 0.990938  rel_l2 0.04468
+  hf_bf16  vs fp32: cos mean 0.999896 min 0.998055  rel_l2 0.02520
+  ours     vs hf_bf16: cos mean 0.999824 min 0.995279  rel_l2 0.03494
+visual_chart.png grid=[[1, 32, 48]] hf_tokens=384 ours=384 (vision_3_0_1x32x48.f16)
+  ours     vs fp32: cos mean 0.999928 min 0.997613  rel_l2 0.01764
+  hf_bf16  vs fp32: cos mean 0.999938 min 0.997965  rel_l2 0.02611
+  ours     vs hf_bf16: cos mean 0.999924 min 0.997166  rel_l2 0.01968
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
