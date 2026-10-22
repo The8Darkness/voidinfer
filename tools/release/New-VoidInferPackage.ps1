@@ -98,6 +98,6 @@ $zip = Join-Path $OutDir "$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
 $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
-"$hash  $name.zip" | Set-Content -Encoding ascii "$zip.sha256"
+[System.IO.File]::WriteAllText("$zip.sha256", "$hash  $name.zip`n")  # LF, so sha256sum -c accepts it
 Write-Host "Shipped DLLs: $(($shipped.Keys | Sort-Object) -join ', ')"
 Write-Host "$zip ($([math]::Round((Get-Item $zip).Length / 1MB)) MB) sha256 $hash"
