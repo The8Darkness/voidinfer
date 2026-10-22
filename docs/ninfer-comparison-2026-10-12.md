@@ -352,4 +352,3 @@ lanes fit 108K-token agents' INT4 codes in VRAM, so the eight agents decode in f
 * VoidInfer's base decode and target-only prefill use its target-only route; its public Engine is
   DFlash2-only.
 * Single machine, single day; greedy only; thinking disabled.
-

@@ -73,4 +73,3 @@ foreach($case in $Prompts){
         } else { "FAIL base $name"; $log | Select -Last 8 }
     }
 }
-
