@@ -75,7 +75,7 @@ std::string serve_usage_text(const char* argv0) {
            "directory with the BF16 Vision tower (`model.visual.*`, e.g. the BF16 checkpoint)\n"
            "and enables image and video input.\n"
            "--max-context defaults to 262144 (2048..262144); one to eight concurrent requests.\n"
-           "--host-kv-mib defaults to max(8192, max-context x 64 KiB) of exact host history.\n"
+           "--host-kv-mib defaults to max(8192, max-context x 64 KiB, 40% of physical memory) of exact host history.\n"
            "--default-max-tokens defaults to " + std::to_string(kDefaultMaxTokens) + " when a request omits max_tokens.\n"
            "--max-request-mib defaults to 384 and is enforced before JSON parsing.\n"
            "--media-cache-mib defaults to 1024 (0 disables retained media reuse); --media-live-mib\n"
