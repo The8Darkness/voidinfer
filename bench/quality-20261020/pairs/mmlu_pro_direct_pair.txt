@@ -1,0 +1,38 @@
+A: 7236/12032 = 60.14%  records=12032 errors=0
+B: 7090/12032 = 58.93%  records=12032 errors=0
+paired n=12032  identical answers 9830 (81.7%)
+discordant 1046: A-only 596, B-only 450, diff +1.21 pts, exact McNemar p=7.1e-06
+by category:
+  engineering          n=  969 A  50.9%  A-only   81 B-only   56 net  +25 (+2.58 pts) p=0.04
+  chemistry            n= 1132 A  42.5%  A-only   86 B-only   62 net  +24 (+2.12 pts) p=0.058
+  math                 n= 1351 A  47.2%  A-only   86 B-only   64 net  +22 (+1.63 pts) p=0.086
+  physics              n= 1299 A  45.1%  A-only   93 B-only   72 net  +21 (+1.62 pts) p=0.12
+  economics            n=  844 A  78.0%  A-only   23 B-only   12 net  +11 (+1.30 pts) p=0.09
+  law                  n= 1101 A  58.9%  A-only   56 B-only   47 net   +9 (+0.82 pts) p=0.43
+  other                n=  924 A  64.4%  A-only   26 B-only   18 net   +8 (+0.87 pts) p=0.29
+  health               n=  818 A  74.7%  A-only   26 B-only   18 net   +8 (+0.98 pts) p=0.29
+  biology              n=  717 A  86.1%  A-only   15 B-only    9 net   +6 (+0.84 pts) p=0.31
+  business             n=  789 A  47.1%  A-only   49 B-only   44 net   +5 (+0.63 pts) p=0.68
+  psychology           n=  798 A  81.0%  A-only   19 B-only   14 net   +5 (+0.63 pts) p=0.49
+  history              n=  381 A  70.6%  A-only    9 B-only    8 net   +1 (+0.26 pts) p=1
+  computer science     n=  410 A  68.0%  A-only   13 B-only   12 net   +1 (+0.24 pts) p=1
+  philosophy           n=  499 A  68.7%  A-only   14 B-only   14 net   +0 (+0.00 pts) p=1
+A: 7236/12032 = 60.14%  records=12032 errors=0
+B: 7087/12032 = 58.90%  records=12032 errors=0
+paired n=12032  identical answers 9826 (81.7%)
+discordant 1055: A-only 602, B-only 453, diff +1.24 pts, exact McNemar p=5e-06
+by category:
+  engineering          n=  969 A  50.9%  A-only   85 B-only   59 net  +26 (+2.68 pts) p=0.037
+  physics              n= 1299 A  45.1%  A-only   95 B-only   70 net  +25 (+1.92 pts) p=0.061
+  chemistry            n= 1132 A  42.5%  A-only   86 B-only   65 net  +21 (+1.86 pts) p=0.1
+  math                 n= 1351 A  47.2%  A-only   85 B-only   65 net  +20 (+1.48 pts) p=0.12
+  economics            n=  844 A  78.0%  A-only   23 B-only   12 net  +11 (+1.30 pts) p=0.09
+  law                  n= 1101 A  58.9%  A-only   56 B-only   47 net   +9 (+0.82 pts) p=0.43
+  other                n=  924 A  64.4%  A-only   26 B-only   17 net   +9 (+0.97 pts) p=0.22
+  health               n=  818 A  74.7%  A-only   27 B-only   18 net   +9 (+1.10 pts) p=0.23
+  psychology           n=  798 A  81.0%  A-only   20 B-only   14 net   +6 (+0.75 pts) p=0.39
+  biology              n=  717 A  86.1%  A-only   15 B-only    9 net   +6 (+0.84 pts) p=0.31
+  business             n=  789 A  47.1%  A-only   48 B-only   43 net   +5 (+0.63 pts) p=0.68
+  history              n=  381 A  70.6%  A-only    9 B-only    8 net   +1 (+0.26 pts) p=1
+  philosophy           n=  499 A  68.7%  A-only   14 B-only   13 net   +1 (+0.20 pts) p=1
+  computer science     n=  410 A  68.0%  A-only   13 B-only   13 net   +0 (+0.00 pts) p=1

@@ -1,0 +1,25 @@
+A: 10666/26529 = 40.21%  records=26529 errors=0
+B: 10126/26529 = 38.17%  records=26529 errors=0
+paired n=26529  identical answers 19279 (72.7%)
+discordant 2958: A-only 1749, B-only 1209, diff +2.04 pts, exact McNemar p=2.8e-23
+by category:
+  Science              n= 9838 A  33.8%  A-only  745 B-only  497 net +248 (+2.52 pts) p=2e-12
+  Engineering          n= 7892 A  39.9%  A-only  558 B-only  370 net +188 (+2.38 pts) p=7.3e-10
+  Medicine             n= 2755 A  51.6%  A-only  158 B-only  124 net  +34 (+1.23 pts) p=0.049
+  Education            n=  484 A  59.1%  A-only   32 B-only   12 net  +20 (+4.13 pts) p=0.0037
+  Literature and Arts  n= 1676 A  37.4%  A-only   71 B-only   51 net  +20 (+1.19 pts) p=0.085
+  Economics            n=  873 A  51.4%  A-only   50 B-only   32 net  +18 (+2.06 pts) p=0.06
+  Law                  n=  656 A  54.1%  A-only   33 B-only   19 net  +14 (+2.13 pts) p=0.07
+  Military Science     n=  205 A  52.2%  A-only   13 B-only    8 net   +5 (+2.44 pts) p=0.38
+  Sociology            n=  143 A  49.7%  A-only   12 B-only    9 net   +3 (+2.10 pts) p=0.66
+  Agronomy             n=  485 A  45.6%  A-only   22 B-only   21 net   +1 (+0.21 pts) p=1
+  History              n=  674 A  27.9%  A-only   33 B-only   36 net   -3 (-0.45 pts) p=0.81
+  Management           n=  501 A  52.1%  A-only   12 B-only   15 net   -3 (-0.60 pts) p=0.7
+  Philosophy           n=  347 A  58.8%  A-only   10 B-only   15 net   -5 (-1.44 pts) p=0.42
+by difficulty:
+  middle               n=11748 A  44.3%  A-only  781 B-only  558 net +223 (+1.90 pts) p=1.2e-09
+  hard                 n= 7050 A  22.3%  A-only  588 B-only  391 net +197 (+2.79 pts) p=3.3e-10
+  easy                 n= 7731 A  50.2%  A-only  380 B-only  260 net +120 (+1.55 pts) p=2.4e-06
+by is_calculation:
+  True                 n=11229 A  27.9%  A-only  975 B-only  622 net +353 (+3.14 pts) p=9.2e-19
+  False                n=15300 A  49.2%  A-only  774 B-only  587 net +187 (+1.22 pts) p=4.4e-07

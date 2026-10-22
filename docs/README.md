@@ -10,6 +10,7 @@
 - [EXL3 dual loading](EXL3_DUAL_LOADING.md): verified C:/D: mirror reads.
 - [Limitations](limitations.md): scope and known gaps.
 - Engine comparisons: [capacity, speed and agents 2026-10-20](../bench/engine-compare/data/2026-10-20/README.md),
+  [quality summary and MMLU-Pro/SuperGPQA 2026-10-20](../bench/quality-20261020/README.md),
   [model quality 2026-10-16](quality-comparison-2026-10-16.md), [2026-10-12](ninfer-comparison-2026-10-12.md),
   [2026-10-08](ninfer-comparison-2026-10-08.md).
 - [Engineering case study](engineering-case-study.md) and [interview and demo guide](interview-guide.md).
