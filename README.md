@@ -65,8 +65,16 @@ the prompt actually prefilled and answered)
   **18.6 vs 33.6 s**, and the BF16 tower matches the Hugging Face FP32 tower at cosine
   0.9998–0.9999.
 
-NInfer is faster on raw speed (prefill, batched throughput, agent resume); those numbers are in the
-same reports.
+**Speed** ([2026-10-20/22](bench/engine-compare/data/2026-10-20/README.md)). NInfer is faster on raw
+speed; the fidelity above costs decode and prefill throughput.
+
+| | VoidInfer | NInfer |
+|---|---:|---:|
+| Decode, 1 request (4K prompt, 1,024 tokens) | 147 tok/s | **190 tok/s** |
+| Decode, 2 requests at once (total) | 228 tok/s | **329 tok/s** |
+| Prefill, 3K / 32K / 128K prompt | 3.5K / 3.9K / 3.2K tok/s | **9.3K / 10.3K / 6.2K tok/s** |
+| Time to first token, 32K / 128K prompt | 8.1 / 40.8 s | **3.1 / 20.9 s** |
+| Agent resume (100K-token agent) | 0.75–0.89 s | **0.13–0.26 s** |
 
 ## Model weights
 
