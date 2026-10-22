@@ -80,6 +80,14 @@ The target directory also needs the OSCAR rotations in `l0_oscar/` (33 MB, not p
 Face repository). The prebuilt package ships them; they are fitted on captured K/V as described in
 [tools/oscar](tools/oscar/README.md) and [KV-tier fidelity](docs/OSCAR_KV_FIDELITY.md).
 
+## Host RAM
+
+The exact FP16 attention history is kept in host RAM: **64 KiB per token of context**, so 2 GiB per
+32K tokens and 16 GiB for one full 262K window. Eight agents with ~110K tokens each (880K tokens of
+context) were served on 4 lanes for 3 turns on a PC with **96 GB RAM**; in that run about four
+agents' histories stayed cached and the others were prefilled again on their next turn. Details:
+[host memory](docs/build-and-run.md#host-memory).
+
 ## Run the prebuilt package
 
 Each [release](https://github.com/The8Darkness/voidinfer/releases) has a self-contained Windows zip
