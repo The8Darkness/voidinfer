@@ -4,6 +4,21 @@ ours = VoidInfer EXL3 6 bpw, L0 OSCAR + exact VeriCache (ours.prev: the build be
 gw.fp8 / nv.fp8 = NInfer a0cf1c17 groupwise / NVFP4 with FP8 KV. agree = answer token equals the BF16 argmax;
 clear = the same excluding near-ties (BF16 top-1/top-2 gap <= 0.5 nats); off>1/k = tokens per 1000 BF16 rejects by > 1 nat.
 
+Main set: 382 items (GSM8K 100, MATH-500 100, IFEval 100, HumanEval 82), onpolicy_short.json
+
+
+== all suites (382 items)
+engine       tokens   agree   clear   regret  off>1/k     nll
+ours         184645  99.31%  99.83%   0.0085     1.91  0.1009
+gw.fp8       184442  96.01%  98.04%   0.0340    11.16  0.1278
+nv.fp8       185413  96.11%  98.09%   0.0325    10.89  0.1254
+  paired 95% CI (agree, engine - ours): gw.fp8 [-0.0366, -0.0294], nv.fp8 [-0.0356, -0.0284]
+  paired 95% CI (regret, engine - ours): gw.fp8 [+0.0198, +0.0298], nv.fp8 [+0.0180, +0.0285]
+  paired 95% CI (off1_per_k, engine - ours): gw.fp8 [+7.6640, +10.6221], nv.fp8 [+7.3120, +10.4202]
+
+Rerun after the Oct 13 fixes: 190 items, onpolicy_merged.json (ours.prev = the earlier build)
+
+
 
 == all suites (190 items)
 engine       tokens   agree   clear   regret  off>1/k     nll

@@ -43,7 +43,7 @@ reference model.
   where the reference's top-1 probability is below 0.5; perplexity from target NLL vs the reference; per-stream
   wins by KL. CIs: 95% cluster bootstrap over streams, 10,000 resamples.
 - Scripts: `bench/quality-20261016/` (`build_panel.py`, `bf16_ref_panel.py`, `panel_ours.ps1`, `panel_ninfer.sh`,
-  `analyze_panel.py`); full report `bench/quality-20261016/results/REPORT.md`.
+  `analyze_panel.py`); full report [docs/quality-comparison-2026-10-16.md](../../docs/quality-comparison-2026-10-16.md).
 
 **Long-context KV panel (Oct 16; 128K row).** 12 streams of at least 131,584 tokens (English, German, Chinese,
 code, Python, reasoning). For the 128K window, the first 128K + 512 tokens are fed and the last 512 targets scored
@@ -78,7 +78,7 @@ records stay in the run directories, not in git.
 - The gap grows with calculation and difficulty: calculation +3.14 pts vs no calculation +1.22; hard +2.79,
   middle +1.90, easy +1.55. Science +2.52, Engineering +2.38. One run per engine.
 
-Full table: `results/supergpqa_direct_pair.txt`.
+Full table: [`pairs/supergpqa_direct_pair.txt`](pairs/supergpqa_direct_pair.txt).
 
 ### MMLU-Pro (12,032 questions)
 
@@ -93,7 +93,7 @@ Full table: `results/supergpqa_direct_pair.txt`.
 - Largest category nets: engineering +25, chemistry +24, math +22, physics +21 questions; ours leads in 13 of 14
   categories.
 
-Full tables: `results/mmlu_pro_direct_pair.txt`, `results/mmlu_pro_direct_ninfer_r1_vs_r2.txt`.
+Full tables: [`pairs/mmlu_pro_direct_pair.txt`](pairs/mmlu_pro_direct_pair.txt), [`pairs/mmlu_pro_direct_ninfer_r1_vs_r2.txt`](pairs/mmlu_pro_direct_ninfer_r1_vs_r2.txt).
 
 ## Reproduce
 

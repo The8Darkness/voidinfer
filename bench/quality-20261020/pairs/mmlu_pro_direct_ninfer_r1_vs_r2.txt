@@ -1,0 +1,19 @@
+A: 7090/12032 = 58.93%  records=12032 errors=0
+B: 7087/12032 = 58.90%  records=12032 errors=0
+paired n=12032  identical answers 11931 (99.2%)
+discordant 35: A-only 19, B-only 16, diff +0.02 pts, exact McNemar p=0.74
+by category:
+  physics              n= 1299 A  43.5%  A-only    6 B-only    2 net   +4 (+0.31 pts) p=0.29
+  psychology           n=  798 A  80.3%  A-only    1 B-only    0 net   +1 (+0.13 pts) p=1
+  other                n=  924 A  63.5%  A-only    1 B-only    0 net   +1 (+0.11 pts) p=1
+  health               n=  818 A  73.7%  A-only    1 B-only    0 net   +1 (+0.12 pts) p=1
+  philosophy           n=  499 A  68.7%  A-only    1 B-only    0 net   +1 (+0.20 pts) p=1
+  engineering          n=  969 A  48.3%  A-only    5 B-only    4 net   +1 (+0.10 pts) p=1
+  business             n=  789 A  46.5%  A-only    1 B-only    1 net   +0 (+0.00 pts) p=1
+  law                  n= 1101 A  58.1%  A-only    0 B-only    0 net   +0 (+0.00 pts) p=1
+  biology              n=  717 A  85.2%  A-only    0 B-only    0 net   +0 (+0.00 pts) p=1
+  history              n=  381 A  70.3%  A-only    0 B-only    0 net   +0 (+0.00 pts) p=1
+  economics            n=  844 A  76.7%  A-only    1 B-only    1 net   +0 (+0.00 pts) p=1
+  computer science     n=  410 A  67.8%  A-only    0 B-only    1 net   -1 (-0.24 pts) p=1
+  math                 n= 1351 A  45.5%  A-only    1 B-only    3 net   -2 (-0.15 pts) p=0.62
+  chemistry            n= 1132 A  40.4%  A-only    1 B-only    4 net   -3 (-0.27 pts) p=0.38

@@ -35,12 +35,15 @@ of upstream `81c8ce0`) ran its official NVFP4 and groupwise artifacts with FP8 K
 | Weights only: KL to the FP32 reference, 138,880 tokens in 7 domains ([10-16](docs/quality-comparison-2026-10-16.md)) | **0.0025** | 0.036 |
 | Weights only: top-1 agreement / on hard (high-entropy) tokens | **98.7% / 95.1%** | 94.0% / 80.2% |
 | Weights only: KL on German / Chinese / C++ and CUDA | **0.0021 / 0.0015 / 0.0007** | 0.063 / 0.038 / 0.016 |
-| BF16 argmax agrees with each engine's served greedy answers, 190 GSM8K / MATH-500 / HumanEval / IFEval items ([on-policy](bench/engine-compare/data/quality/onpolicy_20261013.txt)) | **99.2%** | 95.9–96.0% |
+| BF16 argmax agrees with each engine's served greedy answers, 382 GSM8K / MATH-500 / IFEval / HumanEval items ([on-policy](bench/engine-compare/data/quality/onpolicy_20261013.txt)) | **99.3%** | 96.0–96.1% |
 | Paired NLL on real text, 4K–32K, 12,288 tokens | **reference** | +0.016 nats/token (95% CI excludes 0) |
+| SuperGPQA, answer letter only, all 26,529 questions ([10-20](bench/quality-20261020/README.md)) | **40.21%** | 38.17% (McNemar p = 3e-23) |
+| MMLU-Pro, answer letter only, all 12,032 questions | **60.14%** | 58.93% (p = 7e-6) |
 
-Task accuracy (GSM8K, MATH-500, MMLU-Pro, IFEval, HumanEval, competition math, RULER, NoLiMa, MRCR
-to 196K, IFBench) is statistically tied: no suite shows a difference that survives
-multiple-comparison correction.
+On the two full-size multiple-choice sets the fidelity lead shows up as accuracy, growing with
+difficulty (SuperGPQA calculation questions +3.1 points, hard +2.8). The smaller task suites (GSM8K,
+MATH-500, a 1,000-question step-by-step MMLU-Pro sample, IFEval, HumanEval, competition math, RULER,
+NoLiMa, MRCR to 196K, IFBench) are statistically tied.
 
 **Maximum context per lane** ([2026-10-20/21](bench/engine-compare/data/2026-10-20/README.md),
 the prompt actually prefilled and answered)
@@ -114,6 +117,7 @@ to eight lanes. The endpoints and options are in [serving](docs/serving.md); the
 ## Documentation
 
 * Results: [capacity/speed/agents 2026-10-20](bench/engine-compare/data/2026-10-20/README.md),
+  [quality summary and MMLU-Pro/SuperGPQA 2026-10-20](bench/quality-20261020/README.md),
   [model quality 2026-10-16](docs/quality-comparison-2026-10-16.md),
   [NInfer comparison 2026-10-12](docs/ninfer-comparison-2026-10-12.md), [KV-tier fidelity](docs/OSCAR_KV_FIDELITY.md),
   [benchmark harness](bench/engine-compare/README.md).
