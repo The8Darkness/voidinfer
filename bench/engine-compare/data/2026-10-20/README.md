@@ -37,6 +37,10 @@ NInfer 151,552 + 38,912 (pool 184,320).
 | C4 | 286-300 / 239-280, 2.7-3.1 s | 497-514 / 467-482, 1.0 s |
 | C8 | 328-343 / 262-294, 5.5 s | 689-775 / 673-755, 1.8 s |
 
+Recheck 2026-10-22 (release build v2026.10.22, code_4k, 1,024 tokens, greedy, 2 alternating runs,
+wall time including TTFT): C1 143 / 150 vs 190 / 189 tok/s; C2 226 / 230 vs 317 / 342 tok/s
+aggregate (VoidInfer vs NInfer).
+
 ## Agent switching / resume (100K-token agents, C1, TTFT)
 
 | | Cold A / B | Switch to A | Same agent A | Switch to B |
