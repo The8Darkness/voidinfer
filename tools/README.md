@@ -10,6 +10,7 @@ Python tools from the repository root with Python 3.11+. The benchmark harness l
 | Protocol clients (Chat, Responses, Messages; SSE parsing) | [`voidinfer_serve/`](voidinfer_serve/), [`streaming_http/`](streaming_http/) |
 | OSCAR rotation calibration, QKV capture and INT2 golden fixtures | [`oscar/`](oscar/README.md) |
 | Repository cleanup and host-only contract checks | [`maintenance/`](maintenance/) |
+| Prebuilt Windows release zip | [`release/New-VoidInferPackage.ps1`](release/New-VoidInferPackage.ps1) ([usage](../docs/build-and-run.md#prebuilt-windows-package)) |
 | Sustained device-memory bandwidth | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu) (standalone `nvcc` build) |
 | Model-file read throughput | [`model_read_probe.cpp`](model_read_probe.cpp) (standalone) |
 

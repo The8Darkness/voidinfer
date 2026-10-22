@@ -74,10 +74,18 @@ same reports.
 | Vision tower (optional), BF16 | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) |
 
 The target directory also needs the OSCAR rotations in `l0_oscar/` (33 MB, not part of the Hugging
-Face repository); they are fitted on captured K/V as described in [tools/oscar](tools/oscar/README.md)
-and [KV-tier fidelity](docs/OSCAR_KV_FIDELITY.md).
+Face repository). The prebuilt package ships them; they are fitted on captured K/V as described in
+[tools/oscar](tools/oscar/README.md) and [KV-tier fidelity](docs/OSCAR_KV_FIDELITY.md).
 
-## Build and try it
+## Run the prebuilt package
+
+Each [release](https://github.com/The8Darkness/voidinfer/releases) has a self-contained Windows zip
+(executables, every DLL they need, the OSCAR rotations): extract it, download the two models above,
+copy its `l0_oscar` folder into the target directory and start `voidinfer-serve.exe`. It needs an RTX
+5090 and a CUDA 13.3-capable driver, nothing else. Step by step:
+[prebuilt Windows package](docs/build-and-run.md#prebuilt-windows-package).
+
+## Build from source
 
 Requirements: Windows 11 x64, an RTX 5090, **Visual Studio 2026 Build Tools** (MSVC 14.51) with the
 C++ workload, **CUDA 13.3**, CMake 3.28+, Ninja, and the pinned vcpkg dependencies described in

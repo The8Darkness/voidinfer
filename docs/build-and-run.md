@@ -18,6 +18,51 @@ ctest --test-dir build --output-on-failure
 `BUILD_TESTING`. Tests that need the model skip (exit 77) unless `VOIDINFER_EXL3_TARGET_PATH` and
 `VOIDINFER_EXL3_DFLASH2_PATH` name it.
 
+## Prebuilt Windows package
+
+[GitHub Releases](https://github.com/The8Darkness/voidinfer/releases) carry
+`voidinfer-<version>-win64-sm120a.zip`: `voidinfer.exe`, `voidinfer-serve.exe`, every DLL they load
+(FFmpeg, libcurl, zlib, cuBLAS/cuBLASLt, the MSVC runtime), the OSCAR rotations in `l0_oscar\` and
+the license notices. No Visual Studio, CUDA toolkit, vcpkg or VC++ redistributable is needed.
+
+Requirements: Windows 11 x64, an RTX 5090 with an NVIDIA driver that supports CUDA 13.3 (tested with
+621.01), and host RAM for the exact attention history (measured with 96 GB). The binaries contain
+`sm_120a` code only and do not run on other GPUs.
+
+1. Extract the zip and check it against the `.sha256` file published next to it:
+   `(Get-FileHash -Algorithm SHA256 voidinfer-<version>-win64-sm120a.zip).Hash`.
+2. Download the weights (with `pip install -U huggingface_hub`):
+
+   ```powershell
+   hf download Mia-AiLab/Qwen3.8-27B-EXL3 --revision SC_6.00bpw_H6_V6 --local-dir C:\models\Qwen3.8-27B-exl3-6bpw-H6-V6
+   hf download Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw --local-dir C:\models\Qwen3.8-27B-DFlash2-EXL3-5bpw
+   ```
+
+   For image and video input, also download the BF16 checkpoint (`hf download Qwen/Qwen3.8-27B
+   --local-dir C:\models\Qwen3.8-27B-bf16`); only its `model.visual.*` tensors are read.
+3. Copy the package's `l0_oscar` folder into the target directory
+   (`Copy-Item -Recurse .\l0_oscar C:\models\Qwen3.8-27B-exl3-6bpw-H6-V6\`), or point
+   `VOIDINFER_EXL3_L0_OSCAR_ROT` at it. The rotations belong to this exact target revision.
+4. Run one prompt, then the server:
+
+   ```powershell
+   .\voidinfer.exe --target C:\models\Qwen3.8-27B-exl3-6bpw-H6-V6 --draft C:\models\Qwen3.8-27B-DFlash2-EXL3-5bpw `
+       --prompt 'What is the capital of France? Answer in one sentence.' --no-thinking --greedy --max-new 32
+   .\voidinfer-serve.exe --target C:\models\Qwen3.8-27B-exl3-6bpw-H6-V6 --draft C:\models\Qwen3.8-27B-DFlash2-EXL3-5bpw `
+       --model-id qwen3.8-27b --max-context 65536 --port 8080 --webui
+   ```
+
+   The server speaks the OpenAI (`/v1/chat/completions`, `/v1/responses`) and Anthropic
+   (`/v1/messages`) protocols at `http://127.0.0.1:8080`; `--webui` also downloads and serves the llama.cpp chat page there. Add
+   `--vision C:\models\Qwen3.8-27B-bf16` for media, `--max-concurrency N` (1-8) for concurrent
+   requests and `--max-context 262144` for the full window at one lane. All options:
+   [serving](serving.md) and [CLI](cli.md).
+
+Maintainers build the package from a Release build in a VS 2026 developer shell with
+`tools\release\New-VoidInferPackage.ps1 -BuildDir build -RotationsDir <target>\l0_oscar`, which
+walks the executables' DLL dependencies, writes `dist\voidinfer-<yyyy.MM.dd>-<commit>-win64-sm120a.zip`
+and its SHA-256, and fails on any dependency it cannot place.
+
 ## Model package
 
 Weights are not in Git. The Engine needs:
