@@ -24,9 +24,9 @@ Weights are not in Git. The Engine needs:
 
 | Directory | Contents |
 |---|---|
-| target | Qwen3.8-27B EXL3 6 bpw (`Qwen3.8-27B-exl3-6bpw-H6-V6`), with the OSCAR rotations in `l0_oscar/` |
-| draft | the DFlash2 draft (`Qwen3.8-27B-DFlash2-EXL3-5bpw`) |
-| vision (optional) | the BF16 checkpoint or any directory with the `model.visual.*` tensors |
+| target | Qwen3.8-27B EXL3 6 bpw ([Mia-AiLab/Qwen3.8-27B-EXL3](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-EXL3/tree/SC_6.00bpw_H6_V6), branch `SC_6.00bpw_H6_V6`), with the OSCAR rotations in `l0_oscar/` (fitted locally, [tools/oscar](../tools/oscar/README.md)) |
+| draft | the DFlash2 draft ([Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw](https://huggingface.co/Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw)) |
+| vision (optional) | the BF16 checkpoint ([Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)) or any directory with the `model.visual.*` tensors |
 
 A `<target>/.voidinfer/dual-load.json` manifest lets the loader read weights from verified C: and D:
 mirrors concurrently ([EXL3 dual loading](EXL3_DUAL_LOADING.md)).
